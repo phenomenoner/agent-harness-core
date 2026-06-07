@@ -1,12 +1,14 @@
 use std::env;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use openclaw_harness_core::{
     AgentRegistry, ConflictPolicy, DryRunImportOptions, ExecuteImportOptions, ImportPhaseStatus,
-    ImportReport, OpenClawSource, PromptAssemblyOptions, PromptBundle, SkillIndex,
-    SkillSelectionQuery, TurnPlan, TurnPlanInput, assemble_prompt_bundle, build_dry_run_report,
-    build_harness_skill_index, build_import_plan, build_source_skill_index, build_turn_plan,
-    execute_import, export_harness_registry_files, inventory, load_agent_registry, select_skills,
+    ImportReport, NativeCronPlan, NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions,
+    PromptBundle, SkillIndex, SkillSelectionQuery, TurnPlan, TurnPlanInput, assemble_prompt_bundle,
+    build_dry_run_report, build_harness_skill_index, build_import_plan, build_source_skill_index,
+    build_turn_plan, execute_import, export_harness_registry_files, inventory, load_agent_registry,
+    load_native_cron_store, plan_native_cron, select_skills, write_native_cron_plan,
     write_prompt_bundle, write_report_files, write_skill_index, write_turn_plan,
 };
 
@@ -25,6 +27,7 @@ fn main() {
         "skills" => run_skills(&rest),
         "turn-plan" => run_turn_plan(&rest),
         "prompt-bundle" => run_prompt_bundle(&rest),
+        "cron-plan" => run_cron_plan(&rest),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -310,6 +313,29 @@ fn run_prompt_bundle(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_cron_plan(args: &[String]) -> Result<(), String> {
+    let args = cron_plan_args_from_args(args)?;
+    let store = load_native_cron_store(&args.source).map_err(|err| err.to_string())?;
+    let registry = load_agent_registry(&args.source).map_err(|err| err.to_string())?;
+    let plan = plan_native_cron(
+        &store,
+        &registry,
+        NativeCronPlanInput {
+            now_ms: args.now_ms,
+            resume_enabled: args.resume_cron,
+        },
+    );
+
+    print_cron_plan(&plan, args.limit);
+
+    if let Some(output_dir) = args.output_dir {
+        let file = write_native_cron_plan(&plan, output_dir).map_err(|err| err.to_string())?;
+        println!("Native cron plan JSON: {}", file.json.display());
+    }
+
+    Ok(())
+}
+
 fn source_from_args(args: &[String]) -> Result<OpenClawSource, String> {
     let mut home = default_openclaw_home();
     let mut workspace = None;
@@ -387,6 +413,14 @@ struct TurnPlanArgs {
     skill_limit: usize,
     max_prompt_file_bytes: usize,
     max_skill_file_bytes: usize,
+}
+
+struct CronPlanArgs {
+    source: OpenClawSource,
+    output_dir: Option<PathBuf>,
+    now_ms: i64,
+    resume_cron: bool,
+    limit: usize,
 }
 
 fn dry_run_args_from_args(args: &[String]) -> Result<DryRunArgs, String> {
@@ -816,6 +850,74 @@ fn turn_plan_args_from_args(args: &[String]) -> Result<TurnPlanArgs, String> {
     })
 }
 
+fn cron_plan_args_from_args(args: &[String]) -> Result<CronPlanArgs, String> {
+    let mut home = default_openclaw_home();
+    let mut workspace = None;
+    let mut output_dir = None;
+    let mut now_ms = current_time_ms()?;
+    let mut resume_cron = false;
+    let mut limit = 20;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--openclaw-home" => {
+                i += 1;
+                home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--openclaw-home requires a path".to_string())?;
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            "--output" => {
+                i += 1;
+                output_dir = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--output requires a path".to_string())?,
+                );
+            }
+            "--now-ms" => {
+                i += 1;
+                now_ms = args
+                    .get(i)
+                    .ok_or_else(|| "--now-ms requires epoch milliseconds".to_string())
+                    .and_then(|value| parse_i64(value, "--now-ms"))?;
+            }
+            "--resume-cron" => resume_cron = true,
+            "--limit" => {
+                i += 1;
+                limit = args
+                    .get(i)
+                    .ok_or_else(|| "--limit requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let source = match workspace {
+        Some(workspace) => OpenClawSource::with_workspace(home, workspace),
+        None => OpenClawSource::new(home),
+    };
+
+    Ok(CronPlanArgs {
+        source,
+        output_dir,
+        now_ms,
+        resume_cron,
+        limit,
+    })
+}
+
 fn default_openclaw_home() -> PathBuf {
     if let Ok(value) = env::var("OPENCLAW_HOME") {
         return PathBuf::from(value);
@@ -857,6 +959,20 @@ fn parse_limit(value: &str) -> Result<usize, String> {
         .ok()
         .filter(|value| *value > 0)
         .ok_or_else(|| format!("invalid limit: {value}; expected a positive integer"))
+}
+
+fn parse_i64(value: &str, flag: &str) -> Result<i64, String> {
+    value
+        .parse::<i64>()
+        .map_err(|_| format!("{flag} requires a signed integer, got: {value}"))
+}
+
+fn current_time_ms() -> Result<i64, String> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system time is before Unix epoch: {error}"))?;
+    i64::try_from(duration.as_millis())
+        .map_err(|_| "current epoch milliseconds exceed i64".to_string())
 }
 
 fn format_status(status: &ImportPhaseStatus) -> &'static str {
@@ -1154,6 +1270,47 @@ fn print_prompt_bundle(bundle: &PromptBundle) {
     }
 }
 
+fn print_cron_plan(plan: &NativeCronPlan, limit: usize) {
+    println!("OpenClaw native cron plan");
+    println!("Source home: {}", plan.source_home.display());
+    println!("Now ms: {}", plan.now_ms);
+    println!("Resume cron: {}", yes_no(plan.resume_enabled));
+    println!("Jobs: {}", plan.summary.total_jobs);
+    println!("Disabled: {}", plan.summary.disabled);
+    println!("Cutover held: {}", plan.summary.cutover_held);
+    println!("Enqueue agent turns: {}", plan.summary.enqueue_agent_turns);
+    println!("Waiting schedule: {}", plan.summary.waiting_schedule);
+    println!("Cron registered: {}", plan.summary.cron_registered);
+    println!("Missing agent: {}", plan.summary.missing_agent);
+    println!(
+        "Unsupported schedule: {}",
+        plan.summary.unsupported_schedule
+    );
+    if !plan.entries.is_empty() {
+        println!();
+        println!("Entries:");
+        for entry in plan.entries.iter().take(limit) {
+            println!(
+                "- {} {:?} agent={} session={} reason={}",
+                entry.job_id,
+                entry.action,
+                entry.agent_id.as_deref().unwrap_or("-"),
+                entry.session_key.as_deref().unwrap_or("-"),
+                entry.reason
+            );
+        }
+        if plan.entries.len() > limit {
+            println!("... {} more entries", plan.entries.len() - limit);
+        }
+    }
+    if !plan.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &plan.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
 fn print_help() {
     println!("openclaw-harness");
     println!();
@@ -1167,6 +1324,7 @@ fn print_help() {
     println!("  skills          Build a skill-first index and optionally match a task");
     println!("  turn-plan       Plan routing, commands, prompts, and skills for one turn");
     println!("  prompt-bundle   Assemble prompt files, selected skills, and message");
+    println!("  cron-plan       Dry-run OpenClaw native agent-turn cron dispatch");
     println!();
     println!("Options:");
     println!("  --openclaw-home <path>  Source .openclaw directory");
@@ -1189,4 +1347,6 @@ fn print_help() {
     println!("  --skill-limit <n>       Maximum selected skills for turn-plan");
     println!("  --max-prompt-file-bytes <n> Cap each prompt file in prompt-bundle");
     println!("  --max-skill-file-bytes <n>  Cap each skill file in prompt-bundle");
+    println!("  --now-ms <n>           Epoch milliseconds for cron-plan");
+    println!("  --resume-cron          Release native cron from cutover hold in dry-run");
 }

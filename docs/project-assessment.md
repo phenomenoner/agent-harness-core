@@ -290,6 +290,7 @@ Current implemented foundation:
 - `skills` builds a skill-first index from source OpenClaw skill directories or an imported harness home, preserves skill metadata/capability flags, writes `skill-index.json`, and can deterministically rank skills for a task turn using query, agent, channel, and workspace hints.
 - `turn-plan` builds a runtime-facing dry-run plan for one inbound message: command-vs-agent dispatch, OpenClaw agent routing, session key mapping, provider/model policy, prompt file availability, and selected skills before any model/tool execution.
 - `prompt-bundle` consumes an agent turn plan and writes `prompt-bundle.json` plus `prompt.md` containing runtime context, imported prompt file bodies, selected `SKILL.md` bodies, and the inbound message with byte caps.
+- `cron-plan` parses OpenClaw native agent-turn cron jobs/state and produces a dry-run dispatch plan with cutover hold safety; it validates agent ids, extracts cron payload text when possible, classifies due `at` jobs, and registers cron expressions for future scheduler evaluation without firing anything.
 
 ### Phase 0: Foundation
 
@@ -326,6 +327,7 @@ Current implemented foundation:
 - Add local direct-message CLI or HTTP channel for testing.
 - Use the imported multi-agent registry to route direct messages and cron payloads by `agentId`.
 - Feed `prompt-bundle` output into the Codex app-server adapter and persist execution receipts.
+- Extend `cron-plan` into a real native scheduler after the Codex adapter and transcript writer exist.
 - Mirror replies into OpenClaw-compatible transcript files.
 
 ### Phase 3: Messaging Channels

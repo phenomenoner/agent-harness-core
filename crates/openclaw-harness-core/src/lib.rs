@@ -3,6 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub mod channel_commands;
+pub mod cron;
 pub mod harness_registry;
 pub mod importer;
 pub mod prompt;
@@ -12,6 +13,12 @@ pub mod turns;
 
 pub use channel_commands::{
     ChannelCommand, ChannelCommandIntent, parse_channel_command, parse_channel_command_intent,
+};
+pub use cron::{
+    NativeCronJob, NativeCronJobState, NativeCronPlan, NativeCronPlanAction, NativeCronPlanEntry,
+    NativeCronPlanFile, NativeCronPlanInput, NativeCronPlanSummary, NativeCronSchedule,
+    NativeCronStore, NativeCronStoreSummary, load_native_cron_store, plan_native_cron,
+    write_native_cron_plan,
 };
 pub use harness_registry::{
     CredentialStatus, HarnessAgent, HarnessPlugin, HarnessProvider, HarnessRegistry,
