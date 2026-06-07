@@ -1,7 +1,10 @@
 use std::env;
 use std::path::PathBuf;
 
-use openclaw_harness_core::{ImportPhaseStatus, OpenClawSource, build_import_plan, inventory};
+use openclaw_harness_core::{
+    ConflictPolicy, DryRunImportOptions, ImportPhaseStatus, ImportReport, OpenClawSource,
+    build_dry_run_report, build_import_plan, inventory, write_report_files,
+};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -11,6 +14,7 @@ fn main() {
     let result = match command.as_str() {
         "doctor" => run_doctor(&rest),
         "import-plan" => run_import_plan(&rest),
+        "import-dry-run" => run_import_dry_run(&rest),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -92,6 +96,26 @@ fn run_import_plan(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_import_dry_run(args: &[String]) -> Result<(), String> {
+    let args = dry_run_args_from_args(args)?;
+    let report = build_dry_run_report(DryRunImportOptions {
+        source: args.source,
+        destination_home: args.target_home,
+        conflict_policy: args.conflict_policy,
+    })
+    .map_err(|err| err.to_string())?;
+
+    print_dry_run_summary(&report);
+
+    if let Some(output_dir) = args.output_dir {
+        let files = write_report_files(&report, output_dir).map_err(|err| err.to_string())?;
+        println!("Report JSON: {}", files.json.display());
+        println!("Report summary: {}", files.summary.display());
+    }
+
+    Ok(())
+}
+
 fn source_from_args(args: &[String]) -> Result<OpenClawSource, String> {
     let mut home = default_openclaw_home();
     let mut workspace = None;
@@ -125,6 +149,78 @@ fn source_from_args(args: &[String]) -> Result<OpenClawSource, String> {
     })
 }
 
+struct DryRunArgs {
+    source: OpenClawSource,
+    target_home: PathBuf,
+    conflict_policy: ConflictPolicy,
+    output_dir: Option<PathBuf>,
+}
+
+fn dry_run_args_from_args(args: &[String]) -> Result<DryRunArgs, String> {
+    let mut home = default_openclaw_home();
+    let mut workspace = None;
+    let mut target_home = default_harness_home();
+    let mut conflict_policy = ConflictPolicy::Skip;
+    let mut output_dir = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--openclaw-home" => {
+                i += 1;
+                home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--openclaw-home requires a path".to_string())?;
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            "--target-home" => {
+                i += 1;
+                target_home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+            }
+            "--conflict" => {
+                i += 1;
+                conflict_policy = args
+                    .get(i)
+                    .ok_or_else(|| "--conflict requires skip, overwrite, or rename".to_string())
+                    .and_then(|value| parse_conflict_policy(value))?;
+            }
+            "--output" => {
+                i += 1;
+                output_dir = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--output requires a path".to_string())?,
+                );
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let source = match workspace {
+        Some(workspace) => OpenClawSource::with_workspace(home, workspace),
+        None => OpenClawSource::new(home),
+    };
+
+    Ok(DryRunArgs {
+        source,
+        target_home,
+        conflict_policy,
+        output_dir,
+    })
+}
+
 fn default_openclaw_home() -> PathBuf {
     if let Ok(value) = env::var("OPENCLAW_HOME") {
         return PathBuf::from(value);
@@ -135,6 +231,29 @@ fn default_openclaw_home() -> PathBuf {
     }
 
     PathBuf::from(".openclaw")
+}
+
+fn default_harness_home() -> PathBuf {
+    if let Ok(value) = env::var("OPENCLAW_HARNESS_HOME") {
+        return PathBuf::from(value);
+    }
+
+    if let Ok(value) = env::var("USERPROFILE") {
+        return PathBuf::from(value).join(".openclaw-harness");
+    }
+
+    PathBuf::from(".openclaw-harness")
+}
+
+fn parse_conflict_policy(value: &str) -> Result<ConflictPolicy, String> {
+    match value {
+        "skip" => Ok(ConflictPolicy::Skip),
+        "overwrite" => Ok(ConflictPolicy::Overwrite),
+        "rename" => Ok(ConflictPolicy::Rename),
+        other => Err(format!(
+            "unknown conflict policy: {other}; expected skip, overwrite, or rename"
+        )),
+    }
 }
 
 fn format_status(status: &ImportPhaseStatus) -> &'static str {
@@ -149,14 +268,49 @@ fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
+fn print_dry_run_summary(report: &ImportReport) {
+    println!("OpenClaw import dry run");
+    println!("Source home: {}", report.source_home.display());
+    println!("Source workspace: {}", report.source_workspace.display());
+    println!("Target home: {}", report.destination_home.display());
+    println!("Conflict policy: {:?}", report.conflict_policy);
+    println!("Items: {}", report.summary.total_items);
+    println!("Planned: {}", report.summary.planned);
+    println!("Already matches: {}", report.summary.already_matches);
+    println!("Conflicts: {}", report.summary.conflicts);
+    println!("Missing: {}", report.summary.missing);
+
+    if report.summary.conflicts > 0 {
+        println!();
+        println!("Conflicts:");
+        for item in report
+            .items
+            .iter()
+            .filter(|item| item.status == openclaw_harness_core::ImportItemStatus::Conflict)
+        {
+            println!(
+                "- {:?}: {} -> {} ({})",
+                item.kind,
+                item.source.display(),
+                item.destination.display(),
+                item.reason
+            );
+        }
+    }
+}
+
 fn print_help() {
     println!("openclaw-harness");
     println!();
     println!("Commands:");
-    println!("  doctor       Inspect an OpenClaw home directory");
-    println!("  import-plan  Print staged import readiness");
+    println!("  doctor          Inspect an OpenClaw home directory");
+    println!("  import-plan     Print staged import readiness");
+    println!("  import-dry-run  Build a read-only migration report");
     println!();
     println!("Options:");
     println!("  --openclaw-home <path>  Source .openclaw directory");
     println!("  --workspace <path>      Override workspace directory");
+    println!("  --target-home <path>    Destination harness home for import-dry-run");
+    println!("  --conflict <policy>     skip, overwrite, or rename");
+    println!("  --output <path>         Write report.json and summary.md");
 }

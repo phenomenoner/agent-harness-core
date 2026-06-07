@@ -2,6 +2,14 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub mod importer;
+
+pub use importer::{
+    ConflictPolicy, DryRunImportOptions, ImportAction, ImportItem, ImportItemKind,
+    ImportItemStatus, ImportReport, ImportReportSummary, ReportFiles, build_dry_run_report,
+    write_report_files,
+};
+
 pub const PROMPT_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "SOUL.md",

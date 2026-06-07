@@ -37,6 +37,8 @@ Additional local findings on 2026-06-08:
 - Agent-local sessions live under `/root/.openclaw/agents/<agent-id>/sessions`.
 - The container workspace bind mount is readable directly on the Windows host at `D:\Warehouse\Research\OpenClaw_WSL`; this should be accepted as an explicit `--workspace` source when importing.
 - If the Docker container is stopped but not deleted, host-mounted workspace files remain readable from Windows. Container-internal state such as `/root/.openclaw` still needs Docker volume/container copy access or a previous export snapshot.
+- The host path `D:\Warehouse\Research\OpenClaw_WSL` is a broad workspace root with multiple OpenClaw workspace subdirectories such as `openclaw-workspace-cron`; dry-run import should target the active workspace subdirectory when importing a specific agent workspace.
+- Some workspace entries created from Linux appear on Windows as reparse points, such as `openclaw-workspace-cron\tools`; deterministic cron import needs explicit symlink/reparse handling or a container/WSL-side export to avoid missing linked runner files.
 
 ## Recommended Architecture
 
@@ -256,6 +258,14 @@ The third risk is import correctness. Sessions, memory DBs, WAL files, channel q
 
 ## Implementation Phases
 
+Current implemented foundation:
+
+- `doctor` performs read-only OpenClaw layout inventory.
+- `import-plan` reports staged readiness across config, workspace, agents, skills, sessions, native cron, deterministic cron, subagents, memory, and plugins.
+- `import-dry-run` builds a structured migration report, supports `skip`, `overwrite`, and `rename` conflict policies, and can write `report.json` plus `summary.md`.
+- The dry-run planner currently covers config, prompt files, skill directories, agent directories, native cron store, deterministic cron stores, subagent store, memory store, plugin install record, and plugin-state directory.
+- The command is still planner-only. It does not copy files, parse OpenClaw JSON semantics, migrate secrets, or enable runtime execution yet.
+
 ### Phase 0: Foundation
 
 - Initialize git repo.
@@ -268,7 +278,7 @@ The third risk is import correctness. Sessions, memory DBs, WAL files, channel q
 ### Phase 1: Importer
 
 - Add JSON parsing for `openclaw.json` and `sessions.json`.
-- Add copy planner with dry-run receipts.
+- Extend the copy planner from dry-run receipts to safe execute mode.
 - Add Docker source adapter for exporting `/root/.openclaw` safely.
 - Add explicit workspace override support for `D:\Warehouse\Research\OpenClaw_WSL`.
 - Add conflict policy, backup-on-overwrite, report redaction, and per-item receipts following the Hermes migrate shape.
@@ -316,10 +326,10 @@ The third risk is import correctness. Sessions, memory DBs, WAL files, channel q
 
 ## Current Project Decision
 
-The project will begin as a Rust workspace with no external dependencies. This keeps the first build reliable on a fresh Windows Rust install. External crates will be introduced when the module that needs them is implemented:
+The project began as a Rust workspace with no external dependencies. Now that import reports and OpenClaw JSON parsing are in scope, `serde` and `serde_json` are part of the foundation. Additional crates should still be introduced only when the module that needs them is implemented:
 
+- `serde` and `serde_json` for report/config/session parsing and serialization.
 - `tokio` for async runtime.
-- `serde` and `serde_json` for config/session parsing.
 - `tracing` for logs.
 - `clap` for CLI.
 - `teloxide` for Telegram.
