@@ -3,10 +3,10 @@ use std::path::PathBuf;
 
 use openclaw_harness_core::{
     AgentRegistry, ConflictPolicy, DryRunImportOptions, ExecuteImportOptions, ImportPhaseStatus,
-    ImportReport, OpenClawSource, SkillIndex, SkillSelectionQuery, build_dry_run_report,
-    build_harness_skill_index, build_import_plan, build_source_skill_index, execute_import,
-    export_harness_registry_files, inventory, load_agent_registry, select_skills,
-    write_report_files, write_skill_index,
+    ImportReport, OpenClawSource, SkillIndex, SkillSelectionQuery, TurnPlan, TurnPlanInput,
+    build_dry_run_report, build_harness_skill_index, build_import_plan, build_source_skill_index,
+    build_turn_plan, execute_import, export_harness_registry_files, inventory, load_agent_registry,
+    select_skills, write_report_files, write_skill_index, write_turn_plan,
 };
 
 fn main() {
@@ -22,6 +22,7 @@ fn main() {
         "registry" => run_registry(&rest),
         "registry-export" => run_registry_export(&rest),
         "skills" => run_skills(&rest),
+        "turn-plan" => run_turn_plan(&rest),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -230,6 +231,40 @@ fn run_skills(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_turn_plan(args: &[String]) -> Result<(), String> {
+    let args = turn_plan_args_from_args(args)?;
+    let registry = load_agent_registry(&args.source).map_err(|err| err.to_string())?;
+    let skill_index = match &args.harness_home {
+        Some(harness_home) => build_harness_skill_index(harness_home),
+        None => build_source_skill_index(&args.source),
+    }
+    .map_err(|err| err.to_string())?;
+    let plan = build_turn_plan(
+        &args.source,
+        &registry,
+        &skill_index,
+        TurnPlanInput {
+            platform: args.platform,
+            channel_id: args.channel_id,
+            user_id: args.user_id,
+            text: args.message,
+            requested_agent_id: args.agent_id,
+            session_hint: args.session_key,
+            skill_limit: args.skill_limit,
+        },
+    )
+    .map_err(|err| err.to_string())?;
+
+    print_turn_plan(&plan);
+
+    if let Some(output_dir) = args.output_dir {
+        let file = write_turn_plan(&plan, output_dir).map_err(|err| err.to_string())?;
+        println!("Turn plan JSON: {}", file.json.display());
+    }
+
+    Ok(())
+}
+
 fn source_from_args(args: &[String]) -> Result<OpenClawSource, String> {
     let mut home = default_openclaw_home();
     let mut workspace = None;
@@ -292,6 +327,19 @@ struct SkillsArgs {
     channel: Option<String>,
     match_workspace: Option<String>,
     limit: usize,
+}
+
+struct TurnPlanArgs {
+    source: OpenClawSource,
+    harness_home: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    platform: String,
+    channel_id: String,
+    user_id: String,
+    agent_id: Option<String>,
+    session_key: Option<String>,
+    message: String,
+    skill_limit: usize,
 }
 
 fn dry_run_args_from_args(args: &[String]) -> Result<DryRunArgs, String> {
@@ -578,6 +626,129 @@ fn skills_args_from_args(args: &[String]) -> Result<SkillsArgs, String> {
     })
 }
 
+fn turn_plan_args_from_args(args: &[String]) -> Result<TurnPlanArgs, String> {
+    let mut home = default_openclaw_home();
+    let mut workspace = None;
+    let mut harness_home = None;
+    let mut output_dir = None;
+    let mut platform = "local".to_string();
+    let mut channel_id = "local".to_string();
+    let mut user_id = "operator".to_string();
+    let mut agent_id = None;
+    let mut session_key = None;
+    let mut message = None;
+    let mut skill_limit = 5;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--openclaw-home" => {
+                i += 1;
+                home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--openclaw-home requires a path".to_string())?;
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            "--harness-home" => {
+                i += 1;
+                harness_home = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--harness-home requires a path".to_string())?,
+                );
+            }
+            "--output" => {
+                i += 1;
+                output_dir = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--output requires a path".to_string())?,
+                );
+            }
+            "--platform" => {
+                i += 1;
+                platform = args
+                    .get(i)
+                    .cloned()
+                    .ok_or_else(|| "--platform requires a name".to_string())?;
+            }
+            "--channel-id" => {
+                i += 1;
+                channel_id = args
+                    .get(i)
+                    .cloned()
+                    .ok_or_else(|| "--channel-id requires an id".to_string())?;
+            }
+            "--user-id" => {
+                i += 1;
+                user_id = args
+                    .get(i)
+                    .cloned()
+                    .ok_or_else(|| "--user-id requires an id".to_string())?;
+            }
+            "--agent" => {
+                i += 1;
+                agent_id = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--agent requires an id".to_string())?,
+                );
+            }
+            "--session-key" => {
+                i += 1;
+                session_key = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--session-key requires a value".to_string())?,
+                );
+            }
+            "--message" => {
+                i += 1;
+                message = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--message requires text".to_string())?,
+                );
+            }
+            "--skill-limit" => {
+                i += 1;
+                skill_limit = args
+                    .get(i)
+                    .ok_or_else(|| "--skill-limit requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let source = match workspace {
+        Some(workspace) => OpenClawSource::with_workspace(home, workspace),
+        None => OpenClawSource::new(home),
+    };
+
+    Ok(TurnPlanArgs {
+        source,
+        harness_home,
+        output_dir,
+        platform,
+        channel_id,
+        user_id,
+        agent_id,
+        session_key,
+        message: message.ok_or_else(|| "--message is required".to_string())?,
+        skill_limit,
+    })
+}
+
 fn default_openclaw_home() -> PathBuf {
     if let Ok(value) = env::var("OPENCLAW_HOME") {
         return PathBuf::from(value);
@@ -843,6 +1014,52 @@ fn print_skill_index(index: &SkillIndex) {
     }
 }
 
+fn print_turn_plan(plan: &TurnPlan) {
+    println!("OpenClaw turn plan");
+    println!("Dispatch: {:?}", plan.dispatch);
+    println!("Platform: {}", plan.platform);
+    println!("Channel: {}", plan.channel_id);
+    println!("User: {}", plan.user_id);
+    println!("Session key: {}", plan.session_key);
+    if let Some(agent) = &plan.agent {
+        println!(
+            "Agent: {} enabled={} dir={} sessions={}",
+            agent.id,
+            agent.enabled.map(yes_no).unwrap_or("unknown"),
+            yes_no(agent.directory_exists),
+            yes_no(agent.sessions_index_exists)
+        );
+    } else {
+        println!("Agent: none");
+    }
+    println!(
+        "Model policy: provider={} model={}",
+        plan.model_policy.provider.as_deref().unwrap_or("-"),
+        plan.model_policy.model.as_deref().unwrap_or("-")
+    );
+    if let Some(command) = &plan.command {
+        println!("Command: {}", command.name());
+    }
+    println!(
+        "Prompt files present: {} / {}",
+        plan.prompt_files.iter().filter(|file| file.exists).count(),
+        plan.prompt_files.len()
+    );
+    println!("Selected skills: {}", plan.selected_skills.len());
+    for skill in &plan.selected_skills {
+        println!(
+            "- {} [{:?}] score={} title={}",
+            skill.skill_id, skill.source_kind, skill.score, skill.title
+        );
+    }
+    if !plan.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &plan.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
 fn print_help() {
     println!("openclaw-harness");
     println!();
@@ -854,6 +1071,7 @@ fn print_help() {
     println!("  registry        Inspect parsed multi-agent registry state");
     println!("  registry-export Write target harness registry state");
     println!("  skills          Build a skill-first index and optionally match a task");
+    println!("  turn-plan       Plan routing, commands, prompts, and skills for one turn");
     println!();
     println!("Options:");
     println!("  --openclaw-home <path>  Source .openclaw directory");
@@ -868,4 +1086,10 @@ fn print_help() {
     println!("  --channel <name>        Channel hint for skill matching");
     println!("  --match-workspace <txt> Workspace hint for skill matching");
     println!("  --limit <n>             Maximum matched skills to print");
+    println!("  --message <text>        Incoming channel message for turn-plan");
+    println!("  --platform <name>       local, telegram, discord, or cron");
+    println!("  --channel-id <id>       Channel identity for session mapping");
+    println!("  --user-id <id>          User identity for session mapping");
+    println!("  --session-key <key>     Existing session key override");
+    println!("  --skill-limit <n>       Maximum selected skills for turn-plan");
 }

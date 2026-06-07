@@ -1,4 +1,7 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
+use serde::Serialize;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ChannelCommand {
     New { topic: Option<String> },
     Think { instruction: Option<String> },
@@ -9,7 +12,8 @@ pub enum ChannelCommand {
     Status { scope: Option<String> },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ChannelCommandIntent {
     StartNewSession { topic: Option<String> },
     SetThinkingMode { instruction: Option<String> },

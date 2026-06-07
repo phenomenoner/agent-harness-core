@@ -7,6 +7,7 @@ pub mod harness_registry;
 pub mod importer;
 pub mod registry;
 pub mod skills;
+pub mod turns;
 
 pub use channel_commands::{
     ChannelCommand, ChannelCommandIntent, parse_channel_command, parse_channel_command_intent,
@@ -32,6 +33,10 @@ pub use skills::{
     SkillIndex, SkillIndexFile, SkillIndexOrigin, SkillIndexSummary, SkillRecord, SkillSelection,
     SkillSelectionQuery, SkillSourceKind, build_harness_skill_index, build_source_skill_index,
     select_skills, write_skill_index,
+};
+pub use turns::{
+    TurnAgent, TurnDispatch, TurnModelPolicy, TurnPlan, TurnPlanFile, TurnPlanInput,
+    TurnPromptFile, build_turn_plan, write_turn_plan,
 };
 
 pub const PROMPT_FILE_NAMES: &[&str] = &[
