@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use openclaw_harness_core::{
-    AgentRegistry, ChannelStep, CodexRuntimePlanOptions, CodexRuntimePlanReport, ConflictPolicy,
+    AgentRegistry, ChannelStep, CodexRuntimePlanOptions, CodexRuntimePlanReport,
+    CodexRuntimePreflightOptions, CodexRuntimePreflightReport, ConflictPolicy,
     DeterministicCronPlan, DeterministicCronPlanInput, DryRunImportOptions, ExecuteImportOptions,
     ImportPhaseStatus, ImportReport, NativeCronPlan, NativeCronPlanInput, OpenClawSource,
     PromptAssemblyOptions, PromptBundle, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
@@ -13,9 +14,10 @@ use openclaw_harness_core::{
     build_source_skill_index, build_turn_plan, enqueue_channel_step, execute_import,
     export_harness_registry_files, inventory, load_agent_registry, load_deterministic_cron_store,
     load_native_cron_store, load_subagent_ledger, plan_codex_runtime, plan_deterministic_cron,
-    plan_native_cron, plan_subagents, prepare_runtime_queue_item, select_skills,
-    write_channel_step, write_deterministic_cron_plan, write_native_cron_plan, write_prompt_bundle,
-    write_report_files, write_skill_index, write_subagent_plan, write_turn_plan,
+    plan_native_cron, plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
+    select_skills, write_channel_step, write_deterministic_cron_plan, write_native_cron_plan,
+    write_prompt_bundle, write_report_files, write_skill_index, write_subagent_plan,
+    write_turn_plan,
 };
 
 fn main() {
@@ -36,6 +38,7 @@ fn main() {
         "queue-enqueue" => run_queue_enqueue(&rest),
         "queue-prepare" => run_queue_prepare(&rest),
         "codex-plan" => run_codex_plan(&rest),
+        "codex-preflight" => run_codex_preflight(&rest),
         "prompt-bundle" => run_prompt_bundle(&rest),
         "cron-plan" => run_cron_plan(&rest),
         "deterministic-cron-plan" => run_deterministic_cron_plan(&rest),
@@ -383,6 +386,19 @@ fn run_codex_plan(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_codex_preflight(args: &[String]) -> Result<(), String> {
+    let args = codex_preflight_args_from_args(args)?;
+    let report = preflight_codex_runtime(CodexRuntimePreflightOptions {
+        harness_home: args.target_home,
+        execution_dir: args.execution_dir,
+        plan_file: args.plan_file,
+    })
+    .map_err(|err| err.to_string())?;
+
+    print_codex_runtime_preflight_report(&report);
+    Ok(())
+}
+
 fn run_prompt_bundle(args: &[String]) -> Result<(), String> {
     let args = turn_plan_args_from_args(args)?;
     let registry = load_agent_registry(&args.source).map_err(|err| err.to_string())?;
@@ -586,6 +602,12 @@ struct CodexPlanArgs {
     target_home: PathBuf,
     execution_dir: Option<PathBuf>,
     codex_exe: Option<PathBuf>,
+}
+
+struct CodexPreflightArgs {
+    target_home: PathBuf,
+    execution_dir: Option<PathBuf>,
+    plan_file: Option<PathBuf>,
 }
 
 struct CronPlanArgs {
@@ -1171,6 +1193,49 @@ fn codex_plan_args_from_args(args: &[String]) -> Result<CodexPlanArgs, String> {
         target_home,
         execution_dir,
         codex_exe,
+    })
+}
+
+fn codex_preflight_args_from_args(args: &[String]) -> Result<CodexPreflightArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut execution_dir = None;
+    let mut plan_file = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target-home" => {
+                i += 1;
+                target_home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+            }
+            "--execution-dir" => {
+                i += 1;
+                execution_dir = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--execution-dir requires a path".to_string())?,
+                );
+            }
+            "--plan-file" => {
+                i += 1;
+                plan_file = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--plan-file requires a path".to_string())?,
+                );
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(CodexPreflightArgs {
+        target_home,
+        execution_dir,
+        plan_file,
     })
 }
 
@@ -1863,6 +1928,35 @@ fn print_codex_runtime_plan_report(report: &CodexRuntimePlanReport) {
     }
 }
 
+fn print_codex_runtime_preflight_report(report: &CodexRuntimePreflightReport) {
+    println!("OpenClaw Codex runtime preflight");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Receipts file: {}", report.receipts_file.display());
+    println!("Receipt: {:?}", report.receipt.status);
+    println!("Reason: {}", report.receipt.reason);
+    if let Some(execution_dir) = &report.execution_dir {
+        println!("Execution dir: {}", execution_dir.display());
+    }
+    if let Some(plan_file) = &report.plan_file {
+        println!("Plan file: {}", plan_file.display());
+    }
+    if let Some(preflight_file) = &report.preflight_file {
+        println!("Preflight file: {}", preflight_file.display());
+    }
+    if !report.checks.is_empty() {
+        println!("Checks:");
+        for check in &report.checks {
+            println!("- {:?} {}: {}", check.status, check.name, check.detail);
+        }
+    }
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
 fn print_prompt_bundle(bundle: &PromptBundle) {
     println!("OpenClaw prompt bundle");
     println!("Dispatch: {:?}", bundle.dispatch);
@@ -2036,6 +2130,7 @@ fn print_help() {
     println!("  queue-enqueue   Persist one channel agent turn to the runtime queue");
     println!("  queue-prepare   Prepare one queued runtime item for Codex execution");
     println!("  codex-plan      Plan Codex app-server invocation for prepared execution");
+    println!("  codex-preflight Check a Codex runtime plan before process start");
     println!("  prompt-bundle   Assemble prompt files, selected skills, and message");
     println!("  cron-plan       Dry-run OpenClaw native agent-turn cron dispatch");
     println!("  deterministic-cron-plan Dry-run deterministic cron without LLM access");
@@ -2062,6 +2157,7 @@ fn print_help() {
     println!("  --queue-id <id>         Select one runtime queue item for queue-prepare");
     println!("  --execution-dir <path>  Prepared execution directory for codex-plan");
     println!("  --codex-exe <path>      Codex executable path for codex-plan");
+    println!("  --plan-file <path>      Codex runtime plan file for codex-preflight");
     println!("  --skill-limit <n>       Maximum selected skills for turn-plan");
     println!("  --max-prompt-file-bytes <n> Cap each prompt file in prompt-bundle");
     println!("  --max-skill-file-bytes <n>  Cap each skill file in prompt-bundle");

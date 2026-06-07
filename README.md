@@ -17,11 +17,12 @@ The project starts with a small, testable foundation:
 - A durable runtime queue writer that appends channel agent turns to `state/runtime-queue/pending.jsonl` with receipts and planned transcript paths.
 - A runtime queue prepare worker that reads pending items, assembles prompt bundles, and writes execution receipts before the Codex adapter is connected.
 - A Codex runtime planner that turns a prepared queue execution into an inspectable `codex app-server` invocation plan and output-path contract.
+- A Codex runtime preflight checker that validates the plan, executable, prompt files, output directories, and required environment variables before process start.
 - A prompt bundle assembler that turns an agent turn plan into inspectable prompt files, selected skill bodies, and the inbound message.
 - A native agent-turn cron parser and dry-run dispatch planner with cutover hold safety.
 - A deterministic cron parser and no-LLM dry-run planner for workspace cron runners.
 - A subagent ledger parser and dry-run planner for `/subagents/runs.json` cutover safety.
-- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `skills`, `turn-plan`, `channel-step`, `queue-enqueue`, `queue-prepare`, `codex-plan`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
+- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `skills`, `turn-plan`, `channel-step`, `queue-enqueue`, `queue-prepare`, `codex-plan`, `codex-preflight`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
 - Minimal external crates: `serde` and `serde_json` for stable report/config/session JSON handling.
 
 ## Quick Start
@@ -41,6 +42,7 @@ cargo run -p openclaw-harness-cli -- channel-step --openclaw-home C:\path\to\.op
 cargo run -p openclaw-harness-cli -- queue-enqueue --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron"
 cargo run -p openclaw-harness-cli -- queue-prepare --target-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- codex-plan --target-home C:\path\to\.openclaw-harness --codex-exe C:\path\to\codex.exe
+cargo run -p openclaw-harness-cli -- codex-preflight --target-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- prompt-bundle --openclaw-home C:\path\to\.openclaw --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron" --output imports\prompt
 cargo run -p openclaw-harness-cli -- cron-plan --openclaw-home C:\path\to\.openclaw --output imports\cron
 cargo run -p openclaw-harness-cli -- deterministic-cron-plan --workspace C:\path\to\workspace --output imports\deterministic-cron
@@ -78,6 +80,8 @@ Telegram and Discord adapters should share the same channel command parser and i
 `queue-prepare` reads one queued runtime item, rebuilds the turn context from its stored source/workspace/session metadata, assembles `prompt-bundle.json` plus `prompt.md` under `state/runtime-queue/executions/<queue-id>/`, and writes `execution-receipt.json` plus `execution-receipts.jsonl`. This is the handoff point for the future Codex app-server worker; it does not call a model yet.
 
 `codex-plan` reads the latest prepared execution or an explicit `--execution-dir`, writes `codex-runtime-plan.json` plus `codex-runtime-receipt.json`, and appends `codex-runtime-receipts.jsonl`. It plans a stdio `codex app-server` invocation, model/env requirements, and OpenClaw-compatible transcript/trajectory/Codex binding output paths. It still does not start Codex or make a model request.
+
+`codex-preflight` reads the latest `codex-runtime-plan.json`, or an explicit `--execution-dir`/`--plan-file`, and writes `codex-runtime-preflight.json` plus `codex-runtime-preflight-receipts.jsonl`. It checks that the Codex executable can be resolved, prompt files exist, output parents stay under the harness home and are writable, and required environment variables such as `OPENAI_API_KEY` or `OPENROUTER_API_KEY` are present. It still does not start Codex or make a model request.
 
 `prompt-bundle` consumes the same turn plan and assembles the prompt context that a Codex runtime adapter will eventually send: runtime context, existing OpenClaw prompt files, selected `SKILL.md` bodies, and the inbound message. It writes `prompt-bundle.json` and `prompt.md`, and uses per-file byte caps so oversized imported state can be inspected safely.
 

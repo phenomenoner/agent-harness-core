@@ -1,17 +1,26 @@
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const CODEX_RUNTIME_PLAN_SCHEMA: &str = "openclaw-harness.codex-runtime-plan.v1";
+const CODEX_RUNTIME_PREFLIGHT_SCHEMA: &str = "openclaw-harness.codex-runtime-preflight.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRuntimePlanOptions {
     pub harness_home: PathBuf,
     pub execution_dir: Option<PathBuf>,
     pub codex_executable: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexRuntimePreflightOptions {
+    pub harness_home: PathBuf,
+    pub execution_dir: Option<PathBuf>,
+    pub plan_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -29,6 +38,20 @@ pub struct CodexRuntimePlanReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CodexRuntimePreflightReport {
+    pub schema: &'static str,
+    pub harness_home: PathBuf,
+    pub execution_dir: Option<PathBuf>,
+    pub plan_file: Option<PathBuf>,
+    pub preflight_file: Option<PathBuf>,
+    pub receipts_file: PathBuf,
+    pub receipt: CodexRuntimePreflightReceipt,
+    pub checks: Vec<CodexRuntimePreflightCheck>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CodexRuntimePlan {
     pub queue_id: Option<String>,
     pub agent_id: Option<String>,
@@ -41,7 +64,7 @@ pub struct CodexRuntimePlan {
     pub outputs: CodexOutputPlan,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexInvocationPlan {
     pub executable: PathBuf,
@@ -53,26 +76,60 @@ pub struct CodexInvocationPlan {
     pub model_argument: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CodexTransportPlan {
     StdioJsonRpcAppServer,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexEnvRequirement {
     pub name: String,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexOutputPlan {
     pub transcript_file: PathBuf,
     pub trajectory_file: PathBuf,
     pub codex_binding_file: PathBuf,
     pub runtime_receipt_file: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRuntimePreflightReceipt {
+    pub queue_id: Option<String>,
+    pub status: CodexRuntimePreflightStatus,
+    pub execution_dir: Option<PathBuf>,
+    pub plan_file: Option<PathBuf>,
+    pub preflight_file: Option<PathBuf>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexRuntimePreflightStatus {
+    Ready,
+    Blocked,
+    NoRuntimePlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRuntimePreflightCheck {
+    pub name: String,
+    pub status: CodexRuntimePreflightCheckStatus,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexRuntimePreflightCheckStatus {
+    Pass,
+    Fail,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -90,6 +147,20 @@ pub struct CodexRuntimeReceipt {
 pub enum CodexRuntimeReceiptStatus {
     Planned,
     NoPreparedExecution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexRuntimePlanFile {
+    pub queue_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub session_key: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub prompt_bundle_json: PathBuf,
+    pub prompt_markdown: PathBuf,
+    pub invocation: CodexInvocationPlan,
+    pub outputs: CodexOutputPlan,
 }
 
 pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexRuntimePlanReport> {
@@ -195,6 +266,114 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
     })
 }
 
+pub fn preflight_codex_runtime(
+    options: CodexRuntimePreflightOptions,
+) -> io::Result<CodexRuntimePreflightReport> {
+    let queue_dir = options.harness_home.join("state").join("runtime-queue");
+    let receipts_file = queue_dir.join("codex-runtime-preflight-receipts.jsonl");
+    fs::create_dir_all(&queue_dir)?;
+    let mut warnings = Vec::new();
+
+    let Some(plan_file) = resolve_preflight_plan_file(&options, &mut warnings)? else {
+        let receipt = CodexRuntimePreflightReceipt {
+            queue_id: None,
+            status: CodexRuntimePreflightStatus::NoRuntimePlan,
+            execution_dir: None,
+            plan_file: None,
+            preflight_file: None,
+            reason: "no codex runtime plan found; run codex-plan first".to_string(),
+        };
+        append_json_line(&receipts_file, &receipt)?;
+        return Ok(CodexRuntimePreflightReport {
+            schema: CODEX_RUNTIME_PREFLIGHT_SCHEMA,
+            harness_home: options.harness_home,
+            execution_dir: None,
+            plan_file: None,
+            preflight_file: None,
+            receipts_file,
+            receipt,
+            checks: Vec::new(),
+            warnings,
+        });
+    };
+
+    let plan: CodexRuntimePlanFile = read_json_file_as(&plan_file)?;
+    let execution_dir = plan_file
+        .parent()
+        .map(Path::to_path_buf)
+        .or(options.execution_dir);
+    let preflight_file = execution_dir
+        .as_ref()
+        .map(|dir| dir.join("codex-runtime-preflight.json"));
+    let mut checks = Vec::new();
+    checks.push(pass_check(
+        "runtime-plan",
+        format!("loaded {}", plan_file.display()),
+    ));
+    checks.push(check_executable(&plan.invocation.executable));
+    checks.push(check_existing_file(
+        "prompt-bundle-json",
+        &plan.prompt_bundle_json,
+    ));
+    checks.push(check_existing_file(
+        "prompt-markdown",
+        &plan.prompt_markdown,
+    ));
+    checks.push(check_existing_file(
+        "prompt-input-file",
+        &plan.invocation.prompt_input_file,
+    ));
+    checks.extend(check_output_paths(&options.harness_home, &plan.outputs)?);
+    checks.extend(check_env_requirements(&plan.invocation.env_requirements));
+    let has_failures = checks
+        .iter()
+        .any(|check| check.status == CodexRuntimePreflightCheckStatus::Fail);
+    let status = if has_failures {
+        CodexRuntimePreflightStatus::Blocked
+    } else {
+        CodexRuntimePreflightStatus::Ready
+    };
+    let failed_count = checks
+        .iter()
+        .filter(|check| check.status == CodexRuntimePreflightCheckStatus::Fail)
+        .count();
+    let reason = match status {
+        CodexRuntimePreflightStatus::Ready => {
+            "codex runtime plan passed local preflight checks".to_string()
+        }
+        CodexRuntimePreflightStatus::Blocked => {
+            format!("codex runtime preflight blocked by {failed_count} failed check(s)")
+        }
+        CodexRuntimePreflightStatus::NoRuntimePlan => unreachable!(),
+    };
+    let receipt = CodexRuntimePreflightReceipt {
+        queue_id: plan.queue_id,
+        status,
+        execution_dir: execution_dir.clone(),
+        plan_file: Some(plan_file.clone()),
+        preflight_file: preflight_file.clone(),
+        reason,
+    };
+    let report = CodexRuntimePreflightReport {
+        schema: CODEX_RUNTIME_PREFLIGHT_SCHEMA,
+        harness_home: options.harness_home,
+        execution_dir,
+        plan_file: Some(plan_file),
+        preflight_file: preflight_file.clone(),
+        receipts_file: receipts_file.clone(),
+        receipt,
+        checks,
+        warnings,
+    };
+    if let Some(preflight_file) = preflight_file {
+        let report_json = serde_json::to_string_pretty(&report).map_err(io::Error::other)?;
+        fs::write(preflight_file, report_json)?;
+    }
+    append_json_line(&receipts_file, &report.receipt)?;
+
+    Ok(report)
+}
+
 fn resolve_execution_dir(
     options: &CodexRuntimePlanOptions,
     warnings: &mut Vec<String>,
@@ -252,6 +431,52 @@ fn resolve_execution_dir(
     Ok(latest)
 }
 
+fn resolve_preflight_plan_file(
+    options: &CodexRuntimePreflightOptions,
+    warnings: &mut Vec<String>,
+) -> io::Result<Option<PathBuf>> {
+    if let Some(plan_file) = &options.plan_file {
+        if plan_file.is_file() {
+            return Ok(Some(plan_file.clone()));
+        }
+        warnings.push(format!(
+            "codex runtime plan file not found at {}",
+            plan_file.display()
+        ));
+        return Ok(None);
+    }
+
+    if let Some(execution_dir) = &options.execution_dir {
+        let plan_file = execution_dir.join("codex-runtime-plan.json");
+        if plan_file.is_file() {
+            return Ok(Some(plan_file));
+        }
+        warnings.push(format!(
+            "codex runtime plan file not found under {}",
+            execution_dir.display()
+        ));
+        return Ok(None);
+    }
+
+    let plan_options = CodexRuntimePlanOptions {
+        harness_home: options.harness_home.clone(),
+        execution_dir: None,
+        codex_executable: None,
+    };
+    let Some(execution_dir) = resolve_execution_dir(&plan_options, warnings)? else {
+        return Ok(None);
+    };
+    let plan_file = execution_dir.join("codex-runtime-plan.json");
+    if plan_file.is_file() {
+        return Ok(Some(plan_file));
+    }
+    warnings.push(format!(
+        "latest prepared execution has no codex runtime plan at {}",
+        plan_file.display()
+    ));
+    Ok(None)
+}
+
 fn env_requirements(provider: Option<&str>) -> Vec<CodexEnvRequirement> {
     match provider.map(str::to_ascii_lowercase).as_deref() {
         Some(provider) if provider.contains("openrouter") => vec![CodexEnvRequirement {
@@ -262,6 +487,203 @@ fn env_requirements(provider: Option<&str>) -> Vec<CodexEnvRequirement> {
             name: "OPENAI_API_KEY".to_string(),
             reason: "Codex/OpenAI app-server execution requires OpenAI credentials".to_string(),
         }],
+    }
+}
+
+fn check_executable(executable: &Path) -> CodexRuntimePreflightCheck {
+    match resolve_executable(executable) {
+        Some(path) => pass_check(
+            "codex-executable",
+            format!("resolved {} to {}", executable.display(), path.display()),
+        ),
+        None => fail_check(
+            "codex-executable",
+            format!("could not resolve executable {}", executable.display()),
+        ),
+    }
+}
+
+fn resolve_executable(executable: &Path) -> Option<PathBuf> {
+    if executable.components().count() > 1 || executable.is_absolute() {
+        return executable.is_file().then(|| executable.to_path_buf());
+    }
+
+    let paths = env::var_os("PATH")?;
+    for dir in env::split_paths(&paths) {
+        for candidate in executable_candidates(&dir, executable) {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn executable_candidates(dir: &Path, executable: &Path) -> Vec<PathBuf> {
+    let direct = dir.join(executable);
+    #[cfg(windows)]
+    {
+        if executable.extension().is_some() {
+            return vec![direct];
+        }
+        let pathext = env::var_os("PATHEXT")
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .split(';')
+                    .filter(|ext| !ext.is_empty())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![".EXE".to_string(), ".CMD".to_string(), ".BAT".to_string()]);
+        let mut candidates = vec![direct];
+        let name = executable.to_string_lossy();
+        candidates.extend(
+            pathext
+                .into_iter()
+                .map(|ext| dir.join(format!("{name}{ext}"))),
+        );
+        candidates
+    }
+    #[cfg(not(windows))]
+    {
+        vec![direct]
+    }
+}
+
+fn check_existing_file(name: &str, path: &Path) -> CodexRuntimePreflightCheck {
+    if path.is_file() {
+        pass_check(name, format!("found {}", path.display()))
+    } else {
+        fail_check(name, format!("file not found at {}", path.display()))
+    }
+}
+
+fn check_output_paths(
+    harness_home: &Path,
+    outputs: &CodexOutputPlan,
+) -> io::Result<Vec<CodexRuntimePreflightCheck>> {
+    let mut checks = Vec::new();
+    for (name, path) in [
+        ("transcript-output", &outputs.transcript_file),
+        ("trajectory-output", &outputs.trajectory_file),
+        ("codex-binding-output", &outputs.codex_binding_file),
+        ("runtime-receipt-output", &outputs.runtime_receipt_file),
+    ] {
+        checks.push(check_output_parent_writable(harness_home, name, path)?);
+    }
+    Ok(checks)
+}
+
+fn check_output_parent_writable(
+    harness_home: &Path,
+    name: &str,
+    path: &Path,
+) -> io::Result<CodexRuntimePreflightCheck> {
+    let Some(parent) = path.parent() else {
+        return Ok(fail_check(
+            name,
+            format!("output path has no parent: {}", path.display()),
+        ));
+    };
+    if !path_within(parent, harness_home)? {
+        return Ok(fail_check(
+            name,
+            format!(
+                "refusing preflight write outside harness home: {}",
+                parent.display()
+            ),
+        ));
+    }
+    fs::create_dir_all(parent)?;
+    let probe = parent.join(".openclaw-harness-preflight.tmp");
+    match fs::write(&probe, b"preflight") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            Ok(pass_check(
+                name,
+                format!("parent directory is writable: {}", parent.display()),
+            ))
+        }
+        Err(error) => Ok(fail_check(
+            name,
+            format!(
+                "parent directory is not writable: {} ({error})",
+                parent.display()
+            ),
+        )),
+    }
+}
+
+fn path_within(candidate: &Path, root: &Path) -> io::Result<bool> {
+    let candidate = absolute_lexical_path(candidate)?;
+    let root = absolute_lexical_path(root)?;
+    Ok(candidate.starts_with(root))
+}
+
+fn absolute_lexical_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    Ok(normalize_lexical_path(&absolute))
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+fn check_env_requirements(requirements: &[CodexEnvRequirement]) -> Vec<CodexRuntimePreflightCheck> {
+    if requirements.is_empty() {
+        return vec![pass_check(
+            "environment",
+            "runtime plan declares no required environment variables",
+        )];
+    }
+    requirements
+        .iter()
+        .map(|requirement| {
+            if env::var_os(&requirement.name).is_some() {
+                pass_check(
+                    format!("env:{}", requirement.name),
+                    format!("{} is present", requirement.name),
+                )
+            } else {
+                fail_check(
+                    format!("env:{}", requirement.name),
+                    format!("{} is missing: {}", requirement.name, requirement.reason),
+                )
+            }
+        })
+        .collect()
+}
+
+fn pass_check(name: impl Into<String>, detail: impl Into<String>) -> CodexRuntimePreflightCheck {
+    CodexRuntimePreflightCheck {
+        name: name.into(),
+        status: CodexRuntimePreflightCheckStatus::Pass,
+        detail: detail.into(),
+    }
+}
+
+fn fail_check(name: impl Into<String>, detail: impl Into<String>) -> CodexRuntimePreflightCheck {
+    CodexRuntimePreflightCheck {
+        name: name.into(),
+        status: CodexRuntimePreflightCheckStatus::Fail,
+        detail: detail.into(),
     }
 }
 
@@ -299,6 +721,11 @@ fn with_appended_file_name(path: &Path, suffix: &str) -> PathBuf {
 }
 
 fn read_json_file(path: &Path) -> io::Result<Value> {
+    let text = fs::read_to_string(path)?;
+    serde_json::from_str(&text).map_err(io::Error::other)
+}
+
+fn read_json_file_as<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
     let text = fs::read_to_string(path)?;
     serde_json::from_str(&text).map_err(io::Error::other)
 }
@@ -420,6 +847,108 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn preflight_codex_runtime_reports_ready_when_local_gates_pass() {
+        let root = temp_root("preflight_codex_runtime_reports_ready_when_local_gates_pass");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+
+        let report = preflight_codex_runtime(CodexRuntimePreflightOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimePreflightStatus::Ready);
+        assert!(report.receipts_file.is_file());
+        assert!(report.preflight_file.unwrap().is_file());
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|check| check.status == CodexRuntimePreflightCheckStatus::Pass)
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "codex-executable")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preflight_codex_runtime_blocks_missing_environment() {
+        let root = temp_root("preflight_codex_runtime_blocks_missing_environment");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let missing_env = format!("OPENCLAW_HARNESS_TEST_MISSING_ENV_{}", std::process::id());
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(
+            plan_file,
+            serde_json::json!([
+                {
+                    "name": missing_env,
+                    "reason": "test missing env"
+                }
+            ]),
+        );
+
+        let report = preflight_codex_runtime(CodexRuntimePreflightOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimePreflightStatus::Blocked);
+        assert!(report.checks.iter().any(|check| {
+            check.name.starts_with("env:") && check.status == CodexRuntimePreflightCheckStatus::Fail
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preflight_codex_runtime_reports_no_runtime_plan() {
+        let root = temp_root("preflight_codex_runtime_reports_no_runtime_plan");
+        let harness_home = root.join(".openclaw-harness");
+
+        let report = preflight_codex_runtime(CodexRuntimePreflightOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.receipt.status,
+            CodexRuntimePreflightStatus::NoRuntimePlan
+        );
+        assert!(report.receipts_file.is_file());
+        assert!(report.preflight_file.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn enqueue_and_prepare(source: &crate::OpenClawSource, harness_home: &Path) {
         let registry = load_agent_registry(source).unwrap();
         let skills = build_source_skill_index(source).unwrap();
@@ -453,6 +982,12 @@ mod tests {
             prompt_options: PromptAssemblyOptions::default(),
         })
         .unwrap();
+    }
+
+    fn replace_env_requirements(plan_file: &Path, requirements: Value) {
+        let mut value: Value = serde_json::from_slice(&fs::read(plan_file).unwrap()).unwrap();
+        value["invocation"]["envRequirements"] = requirements;
+        fs::write(plan_file, serde_json::to_string_pretty(&value).unwrap()).unwrap();
     }
 
     fn write_codex_runtime_source(root: &Path) -> crate::OpenClawSource {
