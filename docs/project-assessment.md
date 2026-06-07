@@ -35,6 +35,8 @@ Additional local findings on 2026-06-08:
 - Subagent state exists at `/root/.openclaw/subagents/runs.json`.
 - Agent-local state exists under `/root/.openclaw/agents/<agent-id>/agent`, commonly `models.json`, `auth-profiles.json`, `auth-state.json`, and sometimes `auth.json`.
 - Agent-local sessions live under `/root/.openclaw/agents/<agent-id>/sessions`.
+- The container workspace bind mount is readable directly on the Windows host at `D:\Warehouse\Research\OpenClaw_WSL`; this should be accepted as an explicit `--workspace` source when importing.
+- If the Docker container is stopped but not deleted, host-mounted workspace files remain readable from Windows. Container-internal state such as `/root/.openclaw` still needs Docker volume/container copy access or a previous export snapshot.
 
 ## Recommended Architecture
 
@@ -69,9 +71,35 @@ The project should be split into small boundaries:
    - Use gateway/pack/search contracts instead of direct SQLite mutation where possible.
    - Preserve raw Markdown memory, JSONL observation logs, SQLite DBs, LanceDB/Qdrant/Postgres side data, and receipts.
 
+7. Skill-first runtime
+   - Treat skills as procedural memory that the harness can discover, rank, view, create, patch, and reference per task.
+   - Keep a small indexed summary for each skill and load full `SKILL.md` plus `references/`, `templates/`, `scripts/`, and `assets/` only when selected.
+   - Import OpenClaw workspace skills, managed OpenClaw skills, and project `.agents/skills` into a stable skill registry before runtime prompt assembly.
+   - Add a skill writer/linter path so agents can turn repeated task procedures into reviewed skills instead of growing global prompt files.
+
 ## Import Strategy
 
 Use a staged import. The first stage is read-only and produces an import plan. Later stages perform copy/transform/resume.
+
+Hermes Agent is a useful design reference here. Its OpenClaw migration skill uses `hermes claw migrate`, starts with `--dry-run`, emits structured reports, supports presets such as `user-data` and `full`, keeps secrets opt-in, and handles file conflicts with `skip`, `overwrite`, or `rename`. The same safety shape should be reused, but not copied blindly: Hermes can archive some OpenClaw cron and multi-agent data because Hermes has its own scheduler/profile model. This Rust harness must actively preserve and execute OpenClaw native cron, deterministic cron, multi-agent routing, and subagent ledgers for gateway handoff.
+
+Hermes references checked:
+
+- [Hermes Agent README](https://github.com/NousResearch/hermes-agent)
+- [Hermes Skills System](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills/)
+- [Hermes OpenClaw migration guide](https://hermes-agent.nousresearch.com/docs/zh-Hans/guides/migrate-from-openclaw)
+- [OpenClaw migration skill](https://github.com/NousResearch/hermes-agent/blob/main/optional-skills/migration/openclaw-migration/SKILL.md)
+- [OpenClaw to Hermes migration script](https://github.com/NousResearch/hermes-agent/blob/main/optional-skills/migration/openclaw-migration/scripts/openclaw_to_hermes.py)
+
+Importer policy borrowed from Hermes:
+
+- Always provide dry-run first and write `report.json` plus `summary.md` with per-item status, source, destination, reason, and redacted details.
+- Use presets: `user-data` for normal handoff, `full` for operator-approved deep import, and module include/exclude flags for narrow repair runs.
+- Treat secrets as opt-in. Resolve environment references and known credential fields only when the operator explicitly enables secret migration; otherwise write redacted receipts and prompt for re-entry.
+- Use conflict modes: `skip`, `overwrite` with backup, and `rename`. Hash identical files and mark them as already matched rather than overwriting.
+- Keep source fallback logic: OpenClaw home workspace, `workspace.default`, `workspace-main`, per-agent workspaces, and explicit Windows host path overrides such as `D:\Warehouse\Research\OpenClaw_WSL`.
+- Rebrand only human-readable prompt text where needed. Do not rewrite code, scripts, serialized state, memory DB rows, or historical transcripts in place.
+- Keep cron and multi-agent import as active runtime state for this harness, even where Hermes archives those records for manual recreation.
 
 1. Config import
    - Read `openclaw.json`.
@@ -88,41 +116,49 @@ Use a staged import. The first stage is read-only and produces an import plan. L
    - Preserve `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `USER.md`, `IDENTITY.md`, `HEARTBEAT.md`, `BOOTSTRAP.md`.
    - Preserve `skills/<skill>/SKILL.md`.
    - Preserve workspace-local `memory/`, tools, scripts, handoffs, and operational state.
+   - Support host-mounted workspace import from `D:\Warehouse\Research\OpenClaw_WSL` when the Docker container is stopped.
 
-4. Session import
+4. Skill import
+   - Import skills from workspace `skills/`, `.openclaw/skills/`, `.agents/skills/`, and workspace `.agents/skills/`.
+   - Preserve the full skill directory shape: `SKILL.md`, `references/`, `templates/`, `scripts/`, and `assets/`.
+   - Store imported OpenClaw skills in a distinct namespace or category such as `openclaw-imports` while retaining original ids for reference.
+   - Build a progressive disclosure index: skill list metadata first, full skill body on demand, referenced files only when the selected skill asks for them.
+   - Provide agent-managed skill operations: propose, create, patch, lint, and archive, with receipts and review gates for scripts or destructive shell snippets.
+
+5. Session import
    - Read `/agents/<agent-id>/sessions/sessions.json`.
    - Preserve session transcript files: `*.jsonl`.
    - Preserve trajectories: `*.trajectory.jsonl` and `*.trajectory-path.json`.
    - Preserve Codex binding mirrors: `*.jsonl.codex-app-server.json`.
    - Initial Rust support should expose these as searchable historical context before attempting active native resume.
 
-5. Native cron import
+6. Native cron import
    - Read `/cron/jobs.json` and `/cron/jobs-state.json`.
    - Preserve `id`, `name`, `agentId`, `enabled`, `schedule`, `wakeMode`, `sessionTarget`, `delivery`, and payload metadata.
    - Preserve `runs/*.jsonl` as historical execution receipts.
    - On first cutover, do not immediately fire overdue jobs. Compute a cutover watermark and require an explicit `resume-cron` command.
    - Runtime implementation needs an agent-turn scheduler that can enqueue a message into the selected agent's session and invoke the LLM-backed runtime.
 
-6. Deterministic cron import
+7. Deterministic cron import
    - Read workspace crontabs and job scripts under `tools/cron-runner` and `tools/backup-cron-runner`.
    - Preserve `locks/`, `state/`, and `logs/` as operational evidence.
    - Run these jobs through a deterministic job runner path with no LLM/model request capability.
    - Prefer native Rust process supervision on Windows; use WSL/Docker only as a compatibility fallback for shell scripts that are not portable yet.
 
-7. Subagent import
+8. Subagent import
    - Preserve `/subagents/runs.json`.
    - Preserve subagent ready/running/completed ledgers before enabling native worker execution.
    - Keep subagent execution behind a queue with per-agent concurrency limits, cancellation, retries, and receipt files.
 
-8. Memory import
+9. Memory import
    - Preserve `.openclaw/memory/*.md`, `openclaw-mem.sqlite`, `openclaw-mem-observations.jsonl`, `openclaw-mem-episodes.jsonl`, mem-engine DBs, LanceDB data, and graph/vector sidecars.
    - SQLite files should be copied from a stopped gateway or through a backup API to avoid WAL loss.
 
-9. Plugin import
+10. Plugin import
    - Import install records and config, but execute plugins through the sidecar initially.
    - Refresh or rebuild stale plugin registry state instead of trusting stale persisted paths.
 
-10. Credential and login-state import
+11. Credential and login-state import
    - Importing raw login state is best-effort only.
    - Provider API keys, Telegram/Discord bot tokens, and OpenClaw gateway secrets should be migrated into Windows Credential Manager or an encrypted harness vault.
    - Browser/session cookies and service-specific login state should be treated as non-portable unless the source plugin explicitly supports export/import.
@@ -163,29 +199,35 @@ Required for a real cutover:
    - Support shell/tool approval policy and audit logs.
    - Keep deterministic cron jobs on a separate execution path that cannot call model runtime.
 
-6. Messaging channels
+6. Skill-first task context
+   - Load skill metadata before prompt assembly.
+   - Select relevant skills by task, agent id, channel, platform, and required tools.
+   - Allow agents to propose new skills or patch existing skills after repeated procedures.
+   - Treat executable skill snippets as reviewed code paths, not free-form prompt text.
+
+7. Messaging channels
    - Telegram bot receive/send, direct-message mapping, delivery receipts, and retry queue.
    - Discord bot receive/send, DM/thread/channel mapping, delivery receipts, and retry queue.
    - Imported channel identity must map to the same OpenClaw session key shape where practical.
 
-7. Cron scheduler
+8. Cron scheduler
    - Native agent-turn cron scheduler for `/cron/jobs.json`.
    - Runtime state writer for `/cron/jobs-state.json`.
    - Run logs compatible with `/cron/runs/*.jsonl`.
    - Deterministic cron scheduler for workspace crontabs and shell jobs.
    - Cutover safety: no automatic catch-up storm on first boot.
 
-8. Memory
+9. Memory
    - First-class `openclaw-mem` gateway client for pack/search/propose.
    - Import raw memory files and DB snapshots.
    - Restore mem-engine lookup/writeback jobs.
    - Treat imported memory as evidence, not executable instruction.
 
-9. Plugin compatibility
+10. Plugin compatibility
    - Node plugin-host sidecar that can load OpenClaw plugins, expose tools/hooks/memory slots, and return typed receipts.
    - Rust-native plugin ABI can wait until the bridge has real coverage.
 
-10. Operations
+11. Operations
    - Windows service or scheduled startup.
    - Structured logs.
    - Health endpoint.
@@ -195,13 +237,14 @@ Required for a real cutover:
 Minimum viable handoff order:
 
 1. Import state and agents.
-2. Bring up Codex runtime adapter.
-3. Bring up Telegram/Discord.
-4. Bring up memory pack/search.
-5. Enable native cron in dry-run.
-6. Enable deterministic cron.
-7. Enable plugin sidecar tools.
-8. Stop Docker gateway and run Rust harness with cron catch-up disabled.
+2. Import and index skills.
+3. Bring up Codex runtime adapter.
+4. Bring up Telegram/Discord.
+5. Bring up memory pack/search.
+6. Enable native cron in dry-run.
+7. Enable deterministic cron.
+8. Enable plugin sidecar tools.
+9. Stop Docker gateway and run Rust harness with cron catch-up disabled.
 
 ## Major Risks
 
@@ -227,13 +270,24 @@ The third risk is import correctness. Sessions, memory DBs, WAL files, channel q
 - Add JSON parsing for `openclaw.json` and `sessions.json`.
 - Add copy planner with dry-run receipts.
 - Add Docker source adapter for exporting `/root/.openclaw` safely.
+- Add explicit workspace override support for `D:\Warehouse\Research\OpenClaw_WSL`.
+- Add conflict policy, backup-on-overwrite, report redaction, and per-item receipts following the Hermes migrate shape.
 - Add SQLite backup strategy notes and checks.
+
+### Phase 1.5: Skill-First Substrate
+
+- Import skill directories from workspace, OpenClaw home, and `.agents/skills`.
+- Build a skill metadata index and full-body loader.
+- Add skill conflict modes: skip, overwrite with backup, and rename.
+- Add skill lint/security checks for scripts, shell snippets, and platform constraints.
+- Add agent-managed skill create/patch/archive receipts.
 
 ### Phase 2: Runtime MVP
 
 - Add Codex app-server client.
 - Add local direct-message CLI or HTTP channel for testing.
 - Add prompt assembly from imported workspace files.
+- Add skill selection before prompt assembly.
 - Mirror replies into OpenClaw-compatible transcript files.
 
 ### Phase 3: Messaging Channels
@@ -253,6 +307,7 @@ The third risk is import correctness. Sessions, memory DBs, WAL files, channel q
 
 - `openclaw/openclaw`: data layout, config shape, plugin system, channel behavior, Codex harness split.
 - `openai/codex`: app-server protocol, MCP server interface, Rust implementation patterns.
+- `nousresearch/hermes-agent`: skill-first procedural memory, native Windows packaging references, and OpenClaw migration safety patterns.
 - `phenomenoner/openclaw-mem`: memory sidecar, ContextPack, gateway approach.
 - `teloxide/teloxide`: Telegram bot framework for Rust.
 - `serenity-rs/serenity` and `serenity-rs/poise`: Discord bot and command framework.

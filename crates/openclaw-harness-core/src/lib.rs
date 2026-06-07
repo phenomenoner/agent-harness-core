@@ -12,6 +12,8 @@ pub const PROMPT_FILE_NAMES: &[&str] = &[
     "BOOTSTRAP.md",
 ];
 
+pub const SKILL_FILE_NAME: &str = "SKILL.md";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenClawSource {
     pub home: PathBuf,
@@ -44,6 +46,9 @@ pub struct OpenClawInventory {
     pub transcript_files: usize,
     pub trajectory_files: usize,
     pub codex_binding_files: usize,
+    pub workspace_skill_dirs: usize,
+    pub managed_skill_dirs: usize,
+    pub project_agent_skill_dirs: usize,
     pub native_cron_jobs: bool,
     pub native_cron_state: bool,
     pub native_cron_run_logs: usize,
@@ -66,6 +71,9 @@ impl OpenClawInventory {
             && self.transcript_files == 0
             && self.trajectory_files == 0
             && self.codex_binding_files == 0
+            && self.workspace_skill_dirs == 0
+            && self.managed_skill_dirs == 0
+            && self.project_agent_skill_dirs == 0
             && !self.native_cron_jobs
             && !self.native_cron_state
             && self.native_cron_run_logs == 0
@@ -110,6 +118,10 @@ pub fn inventory(source: OpenClawSource) -> io::Result<OpenClawInventory> {
     let trajectory_files = count_files_with_suffix(&agents_root, ".trajectory.jsonl")?;
     let codex_binding_files =
         count_files_with_suffix(&agents_root, ".jsonl.codex-app-server.json")?;
+    let workspace_skill_dirs = count_skill_dirs(&source.workspace.join("skills"))?;
+    let managed_skill_dirs = count_skill_dirs(&source.home.join("skills"))?;
+    let project_agent_skill_dirs =
+        count_skill_dirs(&source.workspace.join(".agents").join("skills"))?;
     let cron_root = source.home.join("cron");
     let native_cron_jobs = cron_root.join("jobs.json").is_file();
     let native_cron_state = cron_root.join("jobs-state.json").is_file();
@@ -161,6 +173,9 @@ pub fn inventory(source: OpenClawSource) -> io::Result<OpenClawInventory> {
         transcript_files,
         trajectory_files,
         codex_binding_files,
+        workspace_skill_dirs,
+        managed_skill_dirs,
+        project_agent_skill_dirs,
         native_cron_jobs,
         native_cron_state,
         native_cron_run_logs,
@@ -176,6 +191,8 @@ pub fn inventory(source: OpenClawSource) -> io::Result<OpenClawInventory> {
 
 pub fn build_import_plan(inv: &OpenClawInventory) -> ImportPlan {
     let mut phases = Vec::new();
+    let total_skill_dirs =
+        inv.workspace_skill_dirs + inv.managed_skill_dirs + inv.project_agent_skill_dirs;
 
     phases.push(ImportPhase {
         name: "config",
@@ -217,6 +234,20 @@ pub fn build_import_plan(inv: &OpenClawInventory) -> ImportPlan {
         notes: vec![format!(
             "{} agent directories, {} agent-local config/auth/model files; preserve multi-agent routing and per-agent sessions",
             inv.agent_dirs, inv.agent_config_files
+        )],
+    });
+
+    phases.push(ImportPhase {
+        name: "skills",
+        required: false,
+        status: if total_skill_dirs == 0 {
+            ImportPhaseStatus::Missing
+        } else {
+            ImportPhaseStatus::Ready
+        },
+        notes: vec![format!(
+            "{} workspace, {} managed, {} project .agents skill directories; import into a skill-first index with explicit conflict policy",
+            inv.workspace_skill_dirs, inv.managed_skill_dirs, inv.project_agent_skill_dirs
         )],
     });
 
@@ -354,6 +385,21 @@ fn count_child_dirs(root: &Path) -> io::Result<usize> {
     Ok(count)
 }
 
+fn count_skill_dirs(root: &Path) -> io::Result<usize> {
+    if !root.exists() {
+        return Ok(0);
+    }
+
+    let mut count = 0;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && entry.path().join(SKILL_FILE_NAME).is_file() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn count_agent_config_files(root: &Path) -> io::Result<usize> {
     const AGENT_CONFIG_NAMES: &[&str] = &[
         "auth.json",
@@ -433,6 +479,9 @@ mod tests {
         let cron_runs = home.join("cron").join("runs");
         let deterministic_jobs = workspace.join("tools").join("cron-runner").join("jobs");
         let deterministic_logs = workspace.join("tools").join("cron-runner").join("logs");
+        let workspace_skill = workspace.join("skills").join("triage");
+        let managed_skill = home.join("skills").join("memory-maintenance");
+        let project_agent_skill = workspace.join(".agents").join("skills").join("handoff");
         fs::create_dir_all(&workspace).unwrap();
         fs::create_dir_all(&agent_sessions).unwrap();
         fs::create_dir_all(&agent_home).unwrap();
@@ -443,6 +492,9 @@ mod tests {
         fs::create_dir_all(home.join("plugins")).unwrap();
         fs::create_dir_all(home.join("plugin-state")).unwrap();
         fs::create_dir_all(home.join("subagents")).unwrap();
+        fs::create_dir_all(&workspace_skill).unwrap();
+        fs::create_dir_all(&managed_skill).unwrap();
+        fs::create_dir_all(&project_agent_skill).unwrap();
 
         fs::write(home.join("openclaw.json"), "{}").unwrap();
         fs::write(workspace.join("AGENTS.md"), "# Agent").unwrap();
@@ -452,6 +504,9 @@ mod tests {
         fs::write(agent_sessions.join("abc.jsonl"), "{}\n").unwrap();
         fs::write(agent_sessions.join("abc.trajectory.jsonl"), "{}\n").unwrap();
         fs::write(agent_sessions.join("abc.jsonl.codex-app-server.json"), "{}").unwrap();
+        fs::write(workspace_skill.join(SKILL_FILE_NAME), "# Triage").unwrap();
+        fs::write(managed_skill.join(SKILL_FILE_NAME), "# Memory").unwrap();
+        fs::write(project_agent_skill.join(SKILL_FILE_NAME), "# Handoff").unwrap();
         fs::write(home.join("cron").join("jobs.json"), "{\"jobs\":[]}").unwrap();
         fs::write(home.join("cron").join("jobs-state.json"), "{\"jobs\":{}}").unwrap();
         fs::write(cron_runs.join("run.jsonl"), "{}\n").unwrap();
@@ -486,6 +541,9 @@ mod tests {
         assert_eq!(inv.transcript_files, 1);
         assert_eq!(inv.trajectory_files, 1);
         assert_eq!(inv.codex_binding_files, 1);
+        assert_eq!(inv.workspace_skill_dirs, 1);
+        assert_eq!(inv.managed_skill_dirs, 1);
+        assert_eq!(inv.project_agent_skill_dirs, 1);
         assert!(inv.native_cron_jobs);
         assert!(inv.native_cron_state);
         assert_eq!(inv.native_cron_run_logs, 1);
@@ -512,6 +570,9 @@ mod tests {
             transcript_files: 2,
             trajectory_files: 1,
             codex_binding_files: 1,
+            workspace_skill_dirs: 2,
+            managed_skill_dirs: 1,
+            project_agent_skill_dirs: 1,
             native_cron_jobs: true,
             native_cron_state: true,
             native_cron_run_logs: 8,
@@ -526,15 +587,25 @@ mod tests {
 
         let plan = build_import_plan(&inv);
 
-        assert_eq!(plan.phases[0].status, ImportPhaseStatus::Ready);
-        assert_eq!(plan.phases[1].status, ImportPhaseStatus::Ready);
-        assert_eq!(plan.phases[2].status, ImportPhaseStatus::Ready);
-        assert_eq!(plan.phases[3].status, ImportPhaseStatus::Ready);
-        assert_eq!(plan.phases[4].status, ImportPhaseStatus::Ready);
-        assert_eq!(plan.phases[5].status, ImportPhaseStatus::Ready);
-        assert_eq!(plan.phases[6].status, ImportPhaseStatus::Ready);
-        assert_eq!(plan.phases[7].status, ImportPhaseStatus::Ready);
-        assert_eq!(plan.phases[8].status, ImportPhaseStatus::Deferred);
+        assert_phase_status(&plan, "config", ImportPhaseStatus::Ready);
+        assert_phase_status(&plan, "workspace", ImportPhaseStatus::Ready);
+        assert_phase_status(&plan, "agents", ImportPhaseStatus::Ready);
+        assert_phase_status(&plan, "skills", ImportPhaseStatus::Ready);
+        assert_phase_status(&plan, "sessions", ImportPhaseStatus::Ready);
+        assert_phase_status(&plan, "native-cron", ImportPhaseStatus::Ready);
+        assert_phase_status(&plan, "deterministic-cron", ImportPhaseStatus::Ready);
+        assert_phase_status(&plan, "subagents", ImportPhaseStatus::Ready);
+        assert_phase_status(&plan, "memory", ImportPhaseStatus::Ready);
+        assert_phase_status(&plan, "plugins", ImportPhaseStatus::Deferred);
+    }
+
+    fn assert_phase_status(plan: &ImportPlan, name: &str, expected: ImportPhaseStatus) {
+        let phase = plan
+            .phases
+            .iter()
+            .find(|phase| phase.name == name)
+            .unwrap_or_else(|| panic!("missing phase {name}"));
+        assert_eq!(phase.status, expected);
     }
 
     fn temp_root(test_name: &str) -> PathBuf {

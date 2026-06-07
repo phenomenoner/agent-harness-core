@@ -5,7 +5,7 @@ Minimal Rust/Windows agent harness inspired by OpenClaw.
 The project starts with a small, testable foundation:
 
 - Import planning for an existing OpenClaw home directory.
-- A core crate with data-layout detection logic for config, workspace prompts, agents, sessions, native cron, deterministic cron, subagents, memory, and plugins.
+- A core crate with data-layout detection logic for config, workspace prompts, agents, skills, sessions, native cron, deterministic cron, subagents, memory, and plugins.
 - A CLI crate with `doctor` and `import-plan` commands.
 - No external crates yet, so the first build works immediately after installing Rust.
 
@@ -26,6 +26,8 @@ $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 ## Current Direction
 
 The recommended path is a Rust harness core that delegates native coding-agent execution to Codex app-server, keeps OpenClaw-compatible workspace/session/memory import semantics, and initially bridges OpenClaw plugins through a sidecar instead of reimplementing the full TypeScript plugin SDK.
+
+Skills are first-class runtime state, not documentation leftovers. The importer should preserve OpenClaw workspace skills, managed OpenClaw skills, and project `.agents/skills`, then expose them through a progressive disclosure index so agents can discover, write, patch, and reference task skills before falling back to broad prompt context.
 
 Cron import has two separate lanes: OpenClaw native agent-turn cron under `.openclaw/cron`, and deterministic workspace cron runners under `workspace/tools/cron-runner` plus `workspace/tools/backup-cron-runner`. The Rust harness must keep those paths separate because only the native lane is allowed to enqueue LLM-backed agent turns.
 

@@ -45,6 +45,12 @@ fn run_doctor(args: &[String]) -> Result<(), String> {
     println!("Transcript files: {}", inv.transcript_files);
     println!("Trajectory files: {}", inv.trajectory_files);
     println!("Codex binding mirrors: {}", inv.codex_binding_files);
+    println!("Workspace skill directories: {}", inv.workspace_skill_dirs);
+    println!("Managed skill directories: {}", inv.managed_skill_dirs);
+    println!(
+        "Project .agents skill directories: {}",
+        inv.project_agent_skill_dirs
+    );
     println!("Native cron jobs file: {}", yes_no(inv.native_cron_jobs));
     println!("Native cron state file: {}", yes_no(inv.native_cron_state));
     println!("Native cron run logs: {}", inv.native_cron_run_logs);
