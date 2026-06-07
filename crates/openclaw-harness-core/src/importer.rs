@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::{OpenClawSource, PROMPT_FILE_NAMES, SKILL_FILE_NAME};
 
@@ -66,6 +68,7 @@ pub struct ImportReport {
     pub destination_home: PathBuf,
     pub conflict_policy: ConflictPolicy,
     pub summary: ImportReportSummary,
+    pub semantics: ImportSemantics,
     pub items: Vec<ImportItem>,
 }
 
@@ -77,6 +80,55 @@ pub struct ImportReportSummary {
     pub already_matches: usize,
     pub missing: usize,
     pub conflicts: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSemantics {
+    pub config: ConfigSemantics,
+    pub sessions: SessionSemantics,
+    pub native_cron: NativeCronSemantics,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigSemantics {
+    pub parsed: bool,
+    pub parse_error: Option<String>,
+    pub agent_count: usize,
+    pub provider_count: usize,
+    pub plugin_count: usize,
+    pub telegram_configured: bool,
+    pub discord_configured: bool,
+    pub provider_ids: Vec<String>,
+    pub plugin_ids: Vec<String>,
+    pub memory_plugins: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSemantics {
+    pub parsed_indexes: usize,
+    pub failed_indexes: usize,
+    pub total_records: usize,
+    pub records_by_agent: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeCronSemantics {
+    pub parsed_jobs_file: bool,
+    pub jobs_parse_error: Option<String>,
+    pub parsed_state_file: bool,
+    pub state_parse_error: Option<String>,
+    pub total_jobs: usize,
+    pub enabled_jobs: usize,
+    pub disabled_jobs: usize,
+    pub state_entries: usize,
+    pub jobs_by_agent: BTreeMap<String, usize>,
+    pub schedule_types: BTreeMap<String, usize>,
+    pub wake_modes: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -353,6 +405,7 @@ impl ImportReportBuilder {
 
     fn finish(self) -> ImportReport {
         let summary = summarize(&self.items);
+        let semantics = build_semantics(&self.options.source);
         ImportReport {
             schema: REPORT_SCHEMA,
             dry_run: true,
@@ -361,9 +414,317 @@ impl ImportReportBuilder {
             destination_home: self.options.destination_home,
             conflict_policy: self.options.conflict_policy,
             summary,
+            semantics,
             items: self.items,
         }
     }
+}
+
+fn build_semantics(source: &OpenClawSource) -> ImportSemantics {
+    let mut semantics = ImportSemantics::default();
+    read_config_semantics(source, &mut semantics);
+    read_session_semantics(source, &mut semantics);
+    read_native_cron_semantics(source, &mut semantics);
+    semantics
+}
+
+fn read_config_semantics(source: &OpenClawSource, semantics: &mut ImportSemantics) {
+    let path = source.home.join("openclaw.json");
+    if !path.exists() {
+        return;
+    }
+
+    let Some(value) = read_json(&path, &mut semantics.config.parse_error) else {
+        return;
+    };
+    semantics.config.parsed = true;
+    semantics.config.agent_count = count_agents(&value);
+
+    let provider_ids = collect_provider_ids(&value);
+    semantics.config.provider_count = provider_ids.len();
+    semantics.config.provider_ids = provider_ids;
+
+    let plugin_ids = collect_plugin_ids(&value);
+    semantics.config.plugin_count = plugin_ids.len();
+    semantics.config.telegram_configured =
+        contains_key_recursive(&value, "telegram") || contains_id(&plugin_ids, "telegram");
+    semantics.config.discord_configured =
+        contains_key_recursive(&value, "discord") || contains_id(&plugin_ids, "discord");
+    semantics.config.memory_plugins = plugin_ids
+        .iter()
+        .filter(|id| {
+            let lower = id.to_ascii_lowercase();
+            lower.contains("openclaw-mem") || lower.contains("mem-engine")
+        })
+        .cloned()
+        .collect();
+    semantics.config.plugin_ids = plugin_ids;
+}
+
+fn read_session_semantics(source: &OpenClawSource, semantics: &mut ImportSemantics) {
+    let agents_root = source.home.join("agents");
+    let session_indexes = match find_named_files(&agents_root, "sessions.json") {
+        Ok(paths) => paths,
+        Err(error) => {
+            semantics.warnings.push(format!(
+                "failed to scan session indexes under {}: {error}",
+                agents_root.display()
+            ));
+            return;
+        }
+    };
+
+    for path in session_indexes {
+        let mut parse_error = None;
+        let Some(value) = read_json(&path, &mut parse_error) else {
+            semantics.sessions.failed_indexes += 1;
+            if let Some(error) = parse_error {
+                semantics
+                    .warnings
+                    .push(format!("failed to parse {}: {error}", path.display()));
+            }
+            continue;
+        };
+
+        let count = count_named_records(&value, "sessions");
+        let agent_id = agent_id_for_path(source, &path).unwrap_or_else(|| "unknown".to_string());
+        semantics.sessions.parsed_indexes += 1;
+        semantics.sessions.total_records += count;
+        increment(&mut semantics.sessions.records_by_agent, agent_id, count);
+    }
+}
+
+fn read_native_cron_semantics(source: &OpenClawSource, semantics: &mut ImportSemantics) {
+    let jobs_path = source.home.join("cron").join("jobs.json");
+    if jobs_path.exists()
+        && let Some(value) = read_json(&jobs_path, &mut semantics.native_cron.jobs_parse_error)
+    {
+        semantics.native_cron.parsed_jobs_file = true;
+        for job in records_for_key(&value, "jobs") {
+            read_cron_job(job, &mut semantics.native_cron);
+        }
+    }
+
+    let state_path = source.home.join("cron").join("jobs-state.json");
+    if state_path.exists()
+        && let Some(value) = read_json(&state_path, &mut semantics.native_cron.state_parse_error)
+    {
+        semantics.native_cron.parsed_state_file = true;
+        semantics.native_cron.state_entries = count_named_records(&value, "jobs");
+    }
+}
+
+fn read_cron_job(job: &Value, cron: &mut NativeCronSemantics) {
+    cron.total_jobs += 1;
+    if job.get("enabled").and_then(Value::as_bool) == Some(false) {
+        cron.disabled_jobs += 1;
+    } else {
+        cron.enabled_jobs += 1;
+    }
+
+    let agent_id = string_field(job, &["agentId", "agent_id"])
+        .unwrap_or("unassigned")
+        .to_string();
+    increment(&mut cron.jobs_by_agent, agent_id, 1);
+
+    increment(&mut cron.schedule_types, schedule_type(job), 1);
+
+    if let Some(wake_mode) = string_field(job, &["wakeMode", "wake_mode"]) {
+        increment(&mut cron.wake_modes, wake_mode.to_string(), 1);
+    }
+}
+
+fn read_json(path: &Path, parse_error: &mut Option<String>) -> Option<Value> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) => {
+            *parse_error = Some(format!("read failed: {error}"));
+            return None;
+        }
+    };
+
+    match serde_json::from_str(&text) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            *parse_error = Some(error.to_string());
+            None
+        }
+    }
+}
+
+fn count_agents(value: &Value) -> usize {
+    for path in ["/agents/list", "/agents/items", "/agent/list"] {
+        if let Some(value) = value.pointer(path) {
+            return count_collection(value);
+        }
+    }
+
+    if let Some(agents) = value.get("agents") {
+        if let Some(object) = agents.as_object()
+            && object.contains_key("defaults")
+        {
+            return object
+                .keys()
+                .filter(|key| key.as_str() != "defaults")
+                .count();
+        }
+        return count_collection(agents);
+    }
+
+    0
+}
+
+fn collect_provider_ids(value: &Value) -> Vec<String> {
+    let mut ids = BTreeMap::new();
+    for path in [
+        "/models/providers",
+        "/models/customProviders",
+        "/models/custom_providers",
+        "/providers",
+        "/modelProviders",
+    ] {
+        collect_keys_at_path(value, path, &mut ids);
+    }
+    ids.into_keys().collect()
+}
+
+fn collect_plugin_ids(value: &Value) -> Vec<String> {
+    let mut ids = BTreeMap::new();
+    for path in ["/plugins", "/extensions", "/pluginSlots", "/plugin_slots"] {
+        if let Some(value) = value.pointer(path) {
+            collect_collection_ids(value, &mut ids);
+        }
+    }
+    ids.into_keys().collect()
+}
+
+fn collect_keys_at_path(value: &Value, path: &str, ids: &mut BTreeMap<String, ()>) {
+    let Some(value) = value.pointer(path) else {
+        return;
+    };
+    if let Some(object) = value.as_object() {
+        for key in object.keys() {
+            ids.insert(key.clone(), ());
+        }
+    } else {
+        collect_collection_ids(value, ids);
+    }
+}
+
+fn collect_collection_ids(value: &Value, ids: &mut BTreeMap<String, ()>) {
+    if let Some(object) = value.as_object() {
+        for (key, value) in object {
+            if let Some(id) = string_field(value, &["id", "name", "package", "plugin"]) {
+                ids.insert(id.to_string(), ());
+            } else {
+                ids.insert(key.clone(), ());
+            }
+        }
+    } else if let Some(array) = value.as_array() {
+        for value in array {
+            if let Some(id) = string_field(value, &["id", "name", "package", "plugin"]) {
+                ids.insert(id.to_string(), ());
+            }
+        }
+    }
+}
+
+fn contains_key_recursive(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case(needle) || contains_key_recursive(value, needle)
+        }),
+        Value::Array(array) => array
+            .iter()
+            .any(|value| contains_key_recursive(value, needle)),
+        _ => false,
+    }
+}
+
+fn contains_id(ids: &[String], needle: &str) -> bool {
+    ids.iter().any(|id| id.eq_ignore_ascii_case(needle))
+}
+
+fn records_for_key<'a>(value: &'a Value, key: &str) -> Vec<&'a Value> {
+    if let Some(value) = value.get(key) {
+        return collection_values(value);
+    }
+    collection_values(value)
+}
+
+fn collection_values(value: &Value) -> Vec<&Value> {
+    if let Some(array) = value.as_array() {
+        array.iter().collect()
+    } else if let Some(object) = value.as_object() {
+        object.values().collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn count_named_records(value: &Value, key: &str) -> usize {
+    if let Some(value) = value.get(key) {
+        return count_collection(value);
+    }
+    count_collection(value)
+}
+
+fn count_collection(value: &Value) -> usize {
+    if let Some(array) = value.as_array() {
+        array.len()
+    } else if let Some(object) = value.as_object() {
+        object.len()
+    } else {
+        0
+    }
+}
+
+fn string_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    for key in keys {
+        if let Some(text) = value.get(*key).and_then(Value::as_str) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn schedule_type(job: &Value) -> String {
+    let Some(schedule) = job.get("schedule") else {
+        return "missing".to_string();
+    };
+
+    if let Some(kind) = string_field(schedule, &["type", "kind"]) {
+        return kind.to_ascii_lowercase();
+    }
+
+    if schedule.get("cron").is_some() || schedule.get("expression").is_some() {
+        return "cron".to_string();
+    }
+
+    if schedule.get("at").is_some() || schedule.get("time").is_some() {
+        return "at".to_string();
+    }
+
+    if let Some(text) = schedule.as_str() {
+        if text.split_whitespace().count() >= 5 {
+            return "cron".to_string();
+        }
+        return "string".to_string();
+    }
+
+    "unknown".to_string()
+}
+
+fn agent_id_for_path(source: &OpenClawSource, path: &Path) -> Option<String> {
+    let agents_root = source.home.join("agents");
+    let relative = path.strip_prefix(agents_root).ok()?;
+    let component = relative.components().next()?;
+    let value = component.as_os_str().to_str()?;
+    Some(value.to_string())
+}
+
+fn increment(map: &mut BTreeMap<String, usize>, key: String, amount: usize) {
+    *map.entry(key).or_default() += amount;
 }
 
 fn resolve_destination(
@@ -458,6 +819,35 @@ fn child_directories(root: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
+fn find_named_files(root: &Path, name: &str) -> io::Result<Vec<PathBuf>> {
+    let mut matches = Vec::new();
+    visit_files(root, &mut |path| {
+        if path.file_name().and_then(|value| value.to_str()) == Some(name) {
+            matches.push(path.to_path_buf());
+        }
+    })?;
+    Ok(matches)
+}
+
+fn visit_files(root: &Path, on_file: &mut impl FnMut(&Path)) -> io::Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            visit_files(&path, on_file)?;
+        } else if file_type.is_file() {
+            on_file(&path);
+        }
+    }
+
+    Ok(())
+}
+
 fn skill_directories(root: &Path) -> io::Result<Vec<PathBuf>> {
     let dirs = child_directories(root)?
         .into_iter()
@@ -513,6 +903,44 @@ fn render_summary_markdown(report: &ImportReport) -> String {
     ));
     out.push_str(&format!("- Conflicts: `{}`\n", report.summary.conflicts));
     out.push_str(&format!("- Missing: `{}`\n\n", report.summary.missing));
+
+    out.push_str("## Semantic Summary\n\n");
+    out.push_str(&format!(
+        "- Config parsed: `{}`\n",
+        report.semantics.config.parsed
+    ));
+    out.push_str(&format!(
+        "- Configured agents: `{}`\n",
+        report.semantics.config.agent_count
+    ));
+    out.push_str(&format!(
+        "- Providers: `{}`\n",
+        report.semantics.config.provider_count
+    ));
+    out.push_str(&format!(
+        "- Plugins: `{}`\n",
+        report.semantics.config.plugin_count
+    ));
+    out.push_str(&format!(
+        "- Telegram configured: `{}`\n",
+        report.semantics.config.telegram_configured
+    ));
+    out.push_str(&format!(
+        "- Discord configured: `{}`\n",
+        report.semantics.config.discord_configured
+    ));
+    out.push_str(&format!(
+        "- Session records: `{}`\n",
+        report.semantics.sessions.total_records
+    ));
+    out.push_str(&format!(
+        "- Native cron jobs: `{}`\n",
+        report.semantics.native_cron.total_jobs
+    ));
+    out.push_str(&format!(
+        "- Native cron enabled jobs: `{}`\n\n",
+        report.semantics.native_cron.enabled_jobs
+    ));
 
     out.push_str("| Status | Kind | Source | Destination | Reason |\n");
     out.push_str("| --- | --- | --- | --- | --- |\n");
@@ -682,6 +1110,124 @@ mod tests {
                 .unwrap()
                 .contains("OpenClaw Import Dry Run")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dry_run_report_extracts_non_secret_semantics() {
+        let root = temp_root("dry_run_report_extracts_non_secret_semantics");
+        let source_home = root.join(".openclaw");
+        let workspace = source_home.join("workspace");
+        let main_sessions = source_home.join("agents").join("main").join("sessions");
+        let cron_sessions = source_home
+            .join("agents")
+            .join("cron-lite")
+            .join("sessions");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&main_sessions).unwrap();
+        fs::create_dir_all(&cron_sessions).unwrap();
+        fs::create_dir_all(source_home.join("cron")).unwrap();
+
+        fs::write(
+            source_home.join("openclaw.json"),
+            r#"{
+              "agents": {
+                "defaults": { "workspace": "workspace" },
+                "list": [
+                  { "id": "main" },
+                  { "id": "cron-lite" }
+                ]
+              },
+              "models": {
+                "providers": {
+                  "openai": {},
+                  "openrouter": {}
+                }
+              },
+              "plugins": [
+                { "id": "telegram" },
+                { "id": "discord" },
+                { "id": "openclaw-mem-engine" }
+              ]
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            main_sessions.join("sessions.json"),
+            r#"{ "sessions": [{ "id": "a" }, { "id": "b" }] }"#,
+        )
+        .unwrap();
+        fs::write(
+            cron_sessions.join("sessions.json"),
+            r#"{ "sessions": { "c": {}, "d": {}, "e": {} } }"#,
+        )
+        .unwrap();
+        fs::write(
+            source_home.join("cron").join("jobs.json"),
+            r#"{
+              "jobs": [
+                {
+                  "id": "job-1",
+                  "enabled": true,
+                  "agentId": "main",
+                  "schedule": { "type": "cron", "expression": "* * * * *" },
+                  "wakeMode": "now"
+                },
+                {
+                  "id": "job-2",
+                  "enabled": false,
+                  "agentId": "cron-lite",
+                  "schedule": { "type": "at", "time": "2026-06-08T00:00:00Z" },
+                  "wakeMode": "next-heartbeat"
+                },
+                {
+                  "id": "job-3",
+                  "agentId": "main",
+                  "schedule": "* * * * *"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            source_home.join("cron").join("jobs-state.json"),
+            r#"{ "jobs": { "job-1": {}, "job-2": {} } }"#,
+        )
+        .unwrap();
+
+        let report = build_dry_run_report(DryRunImportOptions {
+            source: OpenClawSource::new(&source_home),
+            destination_home: root.join("harness-home"),
+            conflict_policy: ConflictPolicy::Skip,
+        })
+        .unwrap();
+
+        assert!(report.semantics.config.parsed);
+        assert_eq!(report.semantics.config.agent_count, 2);
+        assert_eq!(
+            report.semantics.config.provider_ids,
+            ["openai", "openrouter"]
+        );
+        assert_eq!(report.semantics.config.plugin_count, 3);
+        assert!(report.semantics.config.telegram_configured);
+        assert!(report.semantics.config.discord_configured);
+        assert_eq!(
+            report.semantics.config.memory_plugins,
+            ["openclaw-mem-engine"]
+        );
+        assert_eq!(report.semantics.sessions.parsed_indexes, 2);
+        assert_eq!(report.semantics.sessions.total_records, 5);
+        assert_eq!(report.semantics.sessions.records_by_agent["main"], 2);
+        assert_eq!(report.semantics.sessions.records_by_agent["cron-lite"], 3);
+        assert_eq!(report.semantics.native_cron.total_jobs, 3);
+        assert_eq!(report.semantics.native_cron.enabled_jobs, 2);
+        assert_eq!(report.semantics.native_cron.disabled_jobs, 1);
+        assert_eq!(report.semantics.native_cron.state_entries, 2);
+        assert_eq!(report.semantics.native_cron.jobs_by_agent["main"], 2);
+        assert_eq!(report.semantics.native_cron.jobs_by_agent["cron-lite"], 1);
+        assert_eq!(report.semantics.native_cron.schedule_types["cron"], 2);
+        assert_eq!(report.semantics.native_cron.schedule_types["at"], 1);
 
         let _ = fs::remove_dir_all(root);
     }

@@ -279,6 +279,44 @@ fn print_dry_run_summary(report: &ImportReport) {
     println!("Already matches: {}", report.summary.already_matches);
     println!("Conflicts: {}", report.summary.conflicts);
     println!("Missing: {}", report.summary.missing);
+    println!();
+    println!("Semantic summary:");
+    println!("Config parsed: {}", yes_no(report.semantics.config.parsed));
+    println!("Configured agents: {}", report.semantics.config.agent_count);
+    println!("Providers: {}", report.semantics.config.provider_count);
+    println!("Plugins: {}", report.semantics.config.plugin_count);
+    println!(
+        "Telegram configured: {}",
+        yes_no(report.semantics.config.telegram_configured)
+    );
+    println!(
+        "Discord configured: {}",
+        yes_no(report.semantics.config.discord_configured)
+    );
+    println!(
+        "Session indexes parsed: {}",
+        report.semantics.sessions.parsed_indexes
+    );
+    println!(
+        "Session records: {}",
+        report.semantics.sessions.total_records
+    );
+    println!(
+        "Native cron jobs parsed: {}",
+        yes_no(report.semantics.native_cron.parsed_jobs_file)
+    );
+    println!(
+        "Native cron jobs: {}",
+        report.semantics.native_cron.total_jobs
+    );
+    println!(
+        "Native cron enabled jobs: {}",
+        report.semantics.native_cron.enabled_jobs
+    );
+    print_counts(
+        "Cron jobs by agent",
+        &report.semantics.native_cron.jobs_by_agent,
+    );
 
     if report.summary.conflicts > 0 {
         println!();
@@ -296,6 +334,20 @@ fn print_dry_run_summary(report: &ImportReport) {
                 item.reason
             );
         }
+    }
+}
+
+fn print_counts(label: &str, counts: &std::collections::BTreeMap<String, usize>) {
+    if counts.is_empty() {
+        return;
+    }
+
+    println!("{label}:");
+    for (key, count) in counts.iter().take(8) {
+        println!("  {key}: {count}");
+    }
+    if counts.len() > 8 {
+        println!("  ... {} more", counts.len() - 8);
     }
 }
 

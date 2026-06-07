@@ -79,11 +79,26 @@ The project should be split into small boundaries:
    - Import OpenClaw workspace skills, managed OpenClaw skills, and project `.agents/skills` into a stable skill registry before runtime prompt assembly.
    - Add a skill writer/linter path so agents can turn repeated task procedures into reviewed skills instead of growing global prompt files.
 
+## Hermes Design References
+
+Hermes contributes two separate ideas, and the harness should keep them separate in implementation:
+
+1. Migration strategy
+   - This is about safely moving OpenClaw state into the new harness home.
+   - It should use dry-run first, structured reports, redacted receipts, presets, and conflict policies.
+   - It should not decide per-turn runtime behavior.
+
+2. Skill-first runtime
+   - This happens at the start of every agent turn, after channel command parsing and before prompt assembly.
+   - The harness should match task-relevant skills by agent, channel, workspace, tools, and current user intent.
+   - During or after the turn, the harness should detect reusable procedures and propose or apply skill create/patch/archive operations with receipts.
+   - Imported skills are only one source. Runtime-created and runtime-improved skills must become future turn context through the same index.
+
 ## Import Strategy
 
 Use a staged import. The first stage is read-only and produces an import plan. Later stages perform copy/transform/resume.
 
-Hermes Agent is a useful design reference here. Its OpenClaw migration skill uses `hermes claw migrate`, starts with `--dry-run`, emits structured reports, supports presets such as `user-data` and `full`, keeps secrets opt-in, and handles file conflicts with `skip`, `overwrite`, or `rename`. The same safety shape should be reused, but not copied blindly: Hermes can archive some OpenClaw cron and multi-agent data because Hermes has its own scheduler/profile model. This Rust harness must actively preserve and execute OpenClaw native cron, deterministic cron, multi-agent routing, and subagent ledgers for gateway handoff.
+Hermes Agent is a useful migration reference here. Its OpenClaw migration skill uses `hermes claw migrate`, starts with `--dry-run`, emits structured reports, supports presets such as `user-data` and `full`, keeps secrets opt-in, and handles file conflicts with `skip`, `overwrite`, or `rename`. The same safety shape should be reused, but not copied blindly: Hermes can archive some OpenClaw cron and multi-agent data because Hermes has its own scheduler/profile model. This Rust harness must actively preserve and execute OpenClaw native cron, deterministic cron, multi-agent routing, and subagent ledgers for gateway handoff.
 
 Hermes references checked:
 
@@ -211,6 +226,8 @@ Required for a real cutover:
    - Telegram bot receive/send, direct-message mapping, delivery receipts, and retry queue.
    - Discord bot receive/send, DM/thread/channel mapping, delivery receipts, and retry queue.
    - Imported channel identity must map to the same OpenClaw session key shape where practical.
+   - Shared channel command parser for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, `/status`, and future OpenClaw-compatible chat commands.
+   - Commands must be parsed before ordinary message dispatch and must behave consistently across Telegram DM and Discord DM.
 
 8. Cron scheduler
    - Native agent-turn cron scheduler for `/cron/jobs.json`.
@@ -220,8 +237,8 @@ Required for a real cutover:
    - Cutover safety: no automatic catch-up storm on first boot.
 
 9. Memory
-   - First-class `openclaw-mem` gateway client for pack/search/propose.
-   - Import raw memory files and DB snapshots.
+   - Import raw memory files and DB snapshots without requiring a running gateway.
+   - Optional `openclaw-mem` gateway adapter for pack/search/propose when an operator enables it.
    - Restore mem-engine lookup/writeback jobs.
    - Treat imported memory as evidence, not executable instruction.
 
@@ -242,11 +259,12 @@ Minimum viable handoff order:
 2. Import and index skills.
 3. Bring up Codex runtime adapter.
 4. Bring up Telegram/Discord.
-5. Bring up memory pack/search.
-6. Enable native cron in dry-run.
-7. Enable deterministic cron.
-8. Enable plugin sidecar tools.
-9. Stop Docker gateway and run Rust harness with cron catch-up disabled.
+5. Bring up shared channel commands in Telegram/Discord DM.
+6. Bring up memory import and whichever memory adapter is enabled.
+7. Enable native cron in dry-run.
+8. Enable deterministic cron.
+9. Enable plugin sidecar tools.
+10. Stop Docker gateway and run Rust harness with cron catch-up disabled.
 
 ## Major Risks
 
@@ -262,9 +280,10 @@ Current implemented foundation:
 
 - `doctor` performs read-only OpenClaw layout inventory.
 - `import-plan` reports staged readiness across config, workspace, agents, skills, sessions, native cron, deterministic cron, subagents, memory, and plugins.
-- `import-dry-run` builds a structured migration report, supports `skip`, `overwrite`, and `rename` conflict policies, and can write `report.json` plus `summary.md`.
+- `import-dry-run` builds a structured migration report, supports `skip`, `overwrite`, and `rename` conflict policies, extracts non-secret semantic summaries from OpenClaw config/session/cron JSON, and can write `report.json` plus `summary.md`.
 - The dry-run planner currently covers config, prompt files, skill directories, agent directories, native cron store, deterministic cron stores, subagent store, memory store, plugin install record, and plugin-state directory.
-- The command is still planner-only. It does not copy files, parse OpenClaw JSON semantics, migrate secrets, or enable runtime execution yet.
+- The command is still planner-only. It does not copy files, migrate secrets, or enable runtime execution yet.
+- A shared channel command parser exists for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`.
 
 ### Phase 0: Foundation
 
@@ -305,6 +324,7 @@ Current implemented foundation:
 - Add Telegram channel.
 - Add Discord channel.
 - Implement channel session key compatibility.
+- Route `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status` through a shared command parser before ordinary message dispatch.
 - Implement approval UX for shell/tool requests.
 
 ### Phase 4: Plugin And Memory Bridge
