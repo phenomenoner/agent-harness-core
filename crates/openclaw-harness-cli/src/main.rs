@@ -5,10 +5,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use openclaw_harness_core::{
     AgentRegistry, ChannelStep, ConflictPolicy, DeterministicCronPlan, DeterministicCronPlanInput,
     DryRunImportOptions, ExecuteImportOptions, ImportPhaseStatus, ImportReport, NativeCronPlan,
-    NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions, PromptBundle, SkillIndex,
-    SkillSelectionQuery, SubagentPlan, SubagentPlanInput, TurnPlan, TurnPlanInput,
-    assemble_prompt_bundle, build_channel_step, build_dry_run_report, build_harness_skill_index,
-    build_import_plan, build_source_skill_index, build_turn_plan, execute_import,
+    NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions, PromptBundle,
+    RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, SkillIndex, SkillSelectionQuery,
+    SubagentPlan, SubagentPlanInput, TurnPlan, TurnPlanInput, assemble_prompt_bundle,
+    build_channel_step, build_dry_run_report, build_harness_skill_index, build_import_plan,
+    build_source_skill_index, build_turn_plan, enqueue_channel_step, execute_import,
     export_harness_registry_files, inventory, load_agent_registry, load_deterministic_cron_store,
     load_native_cron_store, load_subagent_ledger, plan_deterministic_cron, plan_native_cron,
     plan_subagents, select_skills, write_channel_step, write_deterministic_cron_plan,
@@ -31,6 +32,7 @@ fn main() {
         "skills" => run_skills(&rest),
         "turn-plan" => run_turn_plan(&rest),
         "channel-step" => run_channel_step(&rest),
+        "queue-enqueue" => run_queue_enqueue(&rest),
         "prompt-bundle" => run_prompt_bundle(&rest),
         "cron-plan" => run_cron_plan(&rest),
         "deterministic-cron-plan" => run_deterministic_cron_plan(&rest),
@@ -312,6 +314,43 @@ fn run_channel_step(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_queue_enqueue(args: &[String]) -> Result<(), String> {
+    let args = queue_enqueue_args_from_args(args)?;
+    let registry = load_agent_registry(&args.turn.source).map_err(|err| err.to_string())?;
+    let skill_index = match &args.turn.harness_home {
+        Some(harness_home) => build_harness_skill_index(harness_home),
+        None => build_source_skill_index(&args.turn.source),
+    }
+    .map_err(|err| err.to_string())?;
+    let plan = build_turn_plan(
+        &args.turn.source,
+        &registry,
+        &skill_index,
+        TurnPlanInput {
+            platform: args.turn.platform,
+            channel_id: args.turn.channel_id,
+            user_id: args.turn.user_id,
+            text: args.turn.message,
+            requested_agent_id: args.turn.agent_id,
+            session_hint: args.turn.session_key,
+            skill_limit: args.turn.skill_limit,
+        },
+    )
+    .map_err(|err| err.to_string())?;
+    let step = build_channel_step(&registry, &plan);
+    let report = enqueue_channel_step(
+        &step,
+        RuntimeQueueEnqueueOptions {
+            harness_home: args.target_home,
+            now_ms: args.now_ms,
+        },
+    )
+    .map_err(|err| err.to_string())?;
+
+    print_runtime_queue_enqueue_report(&report);
+    Ok(())
+}
+
 fn run_prompt_bundle(args: &[String]) -> Result<(), String> {
     let args = turn_plan_args_from_args(args)?;
     let registry = load_agent_registry(&args.source).map_err(|err| err.to_string())?;
@@ -496,6 +535,12 @@ struct TurnPlanArgs {
     skill_limit: usize,
     max_prompt_file_bytes: usize,
     max_skill_file_bytes: usize,
+}
+
+struct QueueEnqueueArgs {
+    turn: TurnPlanArgs,
+    target_home: PathBuf,
+    now_ms: i64,
 }
 
 struct CronPlanArgs {
@@ -944,6 +989,47 @@ fn turn_plan_args_from_args(args: &[String]) -> Result<TurnPlanArgs, String> {
         skill_limit,
         max_prompt_file_bytes,
         max_skill_file_bytes,
+    })
+}
+
+fn queue_enqueue_args_from_args(args: &[String]) -> Result<QueueEnqueueArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut now_ms = None;
+    let mut turn_args = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target-home" => {
+                i += 1;
+                target_home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+            }
+            "--now-ms" => {
+                i += 1;
+                now_ms = Some(
+                    args.get(i)
+                        .ok_or_else(|| "--now-ms requires epoch milliseconds".to_string())
+                        .and_then(|value| parse_i64(value, "--now-ms"))?,
+                );
+            }
+            _ => turn_args.push(args[i].clone()),
+        }
+        i += 1;
+    }
+
+    let turn = turn_plan_args_from_args(&turn_args)?;
+    let now_ms = match now_ms {
+        Some(now_ms) => now_ms,
+        None => current_time_ms()?,
+    };
+
+    Ok(QueueEnqueueArgs {
+        turn,
+        target_home,
+        now_ms,
     })
 }
 
@@ -1498,6 +1584,44 @@ fn print_channel_step(step: &ChannelStep) {
     }
 }
 
+fn print_runtime_queue_enqueue_report(report: &RuntimeQueueEnqueueReport) {
+    println!("OpenClaw runtime queue enqueue");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Queue file: {}", report.queue_file.display());
+    println!("Receipts file: {}", report.receipts_file.display());
+    println!("Receipt: {:?}", report.receipt.status);
+    println!("Reason: {}", report.receipt.reason);
+    if let Some(item) = &report.item {
+        println!("Queue id: {}", item.queue_id);
+        println!("Agent: {}", item.agent_id);
+        println!("Session key: {}", item.session_key);
+        println!(
+            "Model policy: provider={} model={}",
+            item.provider.as_deref().unwrap_or("-"),
+            item.model.as_deref().unwrap_or("-")
+        );
+        println!(
+            "Prompt files: {}/{}",
+            item.prompt_files_present, item.prompt_files_total
+        );
+        println!("Selected skills: {}", item.selected_skill_ids.len());
+        println!(
+            "Planned transcript: {}",
+            item.planned_transcript_file.display()
+        );
+        println!(
+            "Planned trajectory: {}",
+            item.planned_trajectory_file.display()
+        );
+    }
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
 fn print_prompt_bundle(bundle: &PromptBundle) {
     println!("OpenClaw prompt bundle");
     println!("Dispatch: {:?}", bundle.dispatch);
@@ -1668,6 +1792,7 @@ fn print_help() {
     println!("  skills          Build a skill-first index and optionally match a task");
     println!("  turn-plan       Plan routing, commands, prompts, and skills for one turn");
     println!("  channel-step    Plan shared channel reply or agent dispatch for one DM");
+    println!("  queue-enqueue   Persist one channel agent turn to the runtime queue");
     println!("  prompt-bundle   Assemble prompt files, selected skills, and message");
     println!("  cron-plan       Dry-run OpenClaw native agent-turn cron dispatch");
     println!("  deterministic-cron-plan Dry-run deterministic cron without LLM access");
@@ -1694,7 +1819,7 @@ fn print_help() {
     println!("  --skill-limit <n>       Maximum selected skills for turn-plan");
     println!("  --max-prompt-file-bytes <n> Cap each prompt file in prompt-bundle");
     println!("  --max-skill-file-bytes <n>  Cap each skill file in prompt-bundle");
-    println!("  --now-ms <n>           Epoch milliseconds for cron-plan");
+    println!("  --now-ms <n>           Epoch milliseconds for cron-plan or queue-enqueue");
     println!("  --resume-cron          Release native cron from cutover hold in dry-run");
     println!("  --allow-deterministic-run Release deterministic cron hold in dry-run");
     println!("  --resume-subagents    Mark queued/running subagents as resume candidates");

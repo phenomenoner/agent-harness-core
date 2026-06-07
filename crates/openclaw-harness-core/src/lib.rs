@@ -10,6 +10,7 @@ pub mod harness_registry;
 pub mod importer;
 pub mod prompt;
 pub mod registry;
+pub mod runtime_queue;
 pub mod skills;
 pub mod subagents;
 pub mod turns;
@@ -55,6 +56,11 @@ pub use prompt::{
 pub use registry::{
     AgentDefaults, AgentProfile, AgentProfileSource, AgentRegistry, ChannelRegistry, PluginProfile,
     ProviderProfile, load_agent_registry,
+};
+pub use runtime_queue::{
+    RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, RuntimeQueueItem,
+    RuntimeQueueItemStatus, RuntimeQueueReceipt, RuntimeQueueReceiptStatus, RuntimeQueueSource,
+    RuntimeQueueSourceKind, enqueue_channel_step,
 };
 pub use skills::{
     SkillIndex, SkillIndexFile, SkillIndexOrigin, SkillIndexSummary, SkillRecord, SkillSelection,
