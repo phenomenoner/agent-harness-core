@@ -289,6 +289,7 @@ Current implemented foundation:
 - A shared channel command parser and runtime-intent mapper exists for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`; `/model` covers show/switch model, and `/status` covers global/scoped status requests.
 - `skills` builds a skill-first index from source OpenClaw skill directories or an imported harness home, preserves skill metadata/capability flags, writes `skill-index.json`, and can deterministically rank skills for a task turn using query, agent, channel, and workspace hints.
 - `turn-plan` builds a runtime-facing dry-run plan for one inbound message: command-vs-agent dispatch, OpenClaw agent routing, session key mapping, provider/model policy, prompt file availability, and selected skills before any model/tool execution.
+- `channel-step` builds the shared Telegram/Discord-style channel bridge contract for one inbound DM: command turns produce typed command effects plus outbound reply text, and ordinary messages produce an agent-turn dispatch envelope for the future runtime queue.
 - `prompt-bundle` consumes an agent turn plan and writes `prompt-bundle.json` plus `prompt.md` containing runtime context, imported prompt file bodies, selected `SKILL.md` bodies, and the inbound message with byte caps.
 - `cron-plan` parses OpenClaw native agent-turn cron jobs/state and produces a dry-run dispatch plan with cutover hold safety; it validates agent ids, extracts cron payload text when possible, classifies due `at` jobs, and registers cron expressions for future scheduler evaluation without firing anything.
 - `deterministic-cron-plan` parses workspace `tools/cron-runner` and `tools/backup-cron-runner` crontabs, resolves deterministic `jobs/*` scripts, classifies Windows shell compatibility and missing scripts, and preserves `llmAccessAllowed=false` throughout the dry-run plan.
@@ -339,7 +340,8 @@ Current implemented foundation:
 - Add Telegram channel.
 - Add Discord channel.
 - Implement channel session key compatibility.
-- Route `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status` through a shared command parser before ordinary message dispatch.
+- Route real Telegram/Discord bot events into `channel-step`, preserving the existing shared parser and command effects for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`.
+- Persist command effects such as model switch, new session, steering notes, and stop requests into runtime state instead of only returning typed dry-run plans.
 - Implement approval UX for shell/tool requests.
 
 ### Phase 4: Plugin And Memory Bridge

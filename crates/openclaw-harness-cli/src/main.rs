@@ -3,16 +3,17 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use openclaw_harness_core::{
-    AgentRegistry, ConflictPolicy, DeterministicCronPlan, DeterministicCronPlanInput,
+    AgentRegistry, ChannelStep, ConflictPolicy, DeterministicCronPlan, DeterministicCronPlanInput,
     DryRunImportOptions, ExecuteImportOptions, ImportPhaseStatus, ImportReport, NativeCronPlan,
     NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions, PromptBundle, SkillIndex,
     SkillSelectionQuery, SubagentPlan, SubagentPlanInput, TurnPlan, TurnPlanInput,
-    assemble_prompt_bundle, build_dry_run_report, build_harness_skill_index, build_import_plan,
-    build_source_skill_index, build_turn_plan, execute_import, export_harness_registry_files,
-    inventory, load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
-    load_subagent_ledger, plan_deterministic_cron, plan_native_cron, plan_subagents, select_skills,
-    write_deterministic_cron_plan, write_native_cron_plan, write_prompt_bundle, write_report_files,
-    write_skill_index, write_subagent_plan, write_turn_plan,
+    assemble_prompt_bundle, build_channel_step, build_dry_run_report, build_harness_skill_index,
+    build_import_plan, build_source_skill_index, build_turn_plan, execute_import,
+    export_harness_registry_files, inventory, load_agent_registry, load_deterministic_cron_store,
+    load_native_cron_store, load_subagent_ledger, plan_deterministic_cron, plan_native_cron,
+    plan_subagents, select_skills, write_channel_step, write_deterministic_cron_plan,
+    write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
+    write_subagent_plan, write_turn_plan,
 };
 
 fn main() {
@@ -29,6 +30,7 @@ fn main() {
         "registry-export" => run_registry_export(&rest),
         "skills" => run_skills(&rest),
         "turn-plan" => run_turn_plan(&rest),
+        "channel-step" => run_channel_step(&rest),
         "prompt-bundle" => run_prompt_bundle(&rest),
         "cron-plan" => run_cron_plan(&rest),
         "deterministic-cron-plan" => run_deterministic_cron_plan(&rest),
@@ -270,6 +272,41 @@ fn run_turn_plan(args: &[String]) -> Result<(), String> {
     if let Some(output_dir) = args.output_dir {
         let file = write_turn_plan(&plan, output_dir).map_err(|err| err.to_string())?;
         println!("Turn plan JSON: {}", file.json.display());
+    }
+
+    Ok(())
+}
+
+fn run_channel_step(args: &[String]) -> Result<(), String> {
+    let args = turn_plan_args_from_args(args)?;
+    let registry = load_agent_registry(&args.source).map_err(|err| err.to_string())?;
+    let skill_index = match &args.harness_home {
+        Some(harness_home) => build_harness_skill_index(harness_home),
+        None => build_source_skill_index(&args.source),
+    }
+    .map_err(|err| err.to_string())?;
+    let plan = build_turn_plan(
+        &args.source,
+        &registry,
+        &skill_index,
+        TurnPlanInput {
+            platform: args.platform,
+            channel_id: args.channel_id,
+            user_id: args.user_id,
+            text: args.message,
+            requested_agent_id: args.agent_id,
+            session_hint: args.session_key,
+            skill_limit: args.skill_limit,
+        },
+    )
+    .map_err(|err| err.to_string())?;
+    let step = build_channel_step(&registry, &plan);
+
+    print_channel_step(&step);
+
+    if let Some(output_dir) = args.output_dir {
+        let file = write_channel_step(&step, output_dir).map_err(|err| err.to_string())?;
+        println!("Channel step JSON: {}", file.json.display());
     }
 
     Ok(())
@@ -1423,6 +1460,44 @@ fn print_turn_plan(plan: &TurnPlan) {
     }
 }
 
+fn print_channel_step(step: &ChannelStep) {
+    println!("OpenClaw channel step");
+    println!("Action: {:?}", step.action);
+    println!("Platform: {}", step.platform);
+    println!("Channel: {}", step.channel_id);
+    println!("User: {}", step.user_id);
+    println!("Session key: {}", step.session_key);
+    if let Some(effect) = &step.command_effect {
+        println!("Command effect: {:?}", effect);
+    }
+    if let Some(agent_turn) = &step.agent_turn {
+        println!(
+            "Agent turn: agent={} provider={} model={} prompt_files={}/{} skills={}",
+            agent_turn.agent_id,
+            agent_turn.provider.as_deref().unwrap_or("-"),
+            agent_turn.model.as_deref().unwrap_or("-"),
+            agent_turn.prompt_files_present,
+            agent_turn.prompt_files_total,
+            agent_turn.selected_skill_ids.len()
+        );
+        for skill_id in &agent_turn.selected_skill_ids {
+            println!("- skill {skill_id}");
+        }
+    }
+    if !step.outbound_messages.is_empty() {
+        println!("Outbound messages:");
+        for message in &step.outbound_messages {
+            println!("- {:?}: {}", message.kind, message.text);
+        }
+    }
+    if !step.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &step.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
 fn print_prompt_bundle(bundle: &PromptBundle) {
     println!("OpenClaw prompt bundle");
     println!("Dispatch: {:?}", bundle.dispatch);
@@ -1592,6 +1667,7 @@ fn print_help() {
     println!("  registry-export Write target harness registry state");
     println!("  skills          Build a skill-first index and optionally match a task");
     println!("  turn-plan       Plan routing, commands, prompts, and skills for one turn");
+    println!("  channel-step    Plan shared channel reply or agent dispatch for one DM");
     println!("  prompt-bundle   Assemble prompt files, selected skills, and message");
     println!("  cron-plan       Dry-run OpenClaw native agent-turn cron dispatch");
     println!("  deterministic-cron-plan Dry-run deterministic cron without LLM access");

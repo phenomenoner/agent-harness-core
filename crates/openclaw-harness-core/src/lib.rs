@@ -3,6 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub mod channel_commands;
+pub mod channel_runtime;
 pub mod cron;
 pub mod deterministic_cron;
 pub mod harness_registry;
@@ -15,6 +16,11 @@ pub mod turns;
 
 pub use channel_commands::{
     ChannelCommand, ChannelCommandIntent, parse_channel_command, parse_channel_command_intent,
+};
+pub use channel_runtime::{
+    ChannelAgentTurnDispatch, ChannelCommandEffect, ChannelOutboundMessage,
+    ChannelOutboundMessageKind, ChannelStatusSnapshot, ChannelStep, ChannelStepAction,
+    ChannelStepFile, build_channel_step, write_channel_step,
 };
 pub use cron::{
     NativeCronJob, NativeCronJobState, NativeCronPlan, NativeCronPlanAction, NativeCronPlanEntry,
