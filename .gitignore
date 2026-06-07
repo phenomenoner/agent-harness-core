@@ -1,0 +1,19 @@
+/target/
+/.idea/
+/.vscode/
+*.pdb
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Local state and secrets
+.env
+.env.*
+!.env.example
+state/
+data/
+secrets/
+
+# Imported OpenClaw state should be staged intentionally.
+imports/
