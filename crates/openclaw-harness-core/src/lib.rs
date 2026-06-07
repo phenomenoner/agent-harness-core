@@ -6,6 +6,7 @@ pub mod channel_commands;
 pub mod harness_registry;
 pub mod importer;
 pub mod registry;
+pub mod skills;
 
 pub use channel_commands::{
     ChannelCommand, ChannelCommandIntent, parse_channel_command, parse_channel_command_intent,
@@ -26,6 +27,11 @@ pub use importer::{
 pub use registry::{
     AgentDefaults, AgentProfile, AgentProfileSource, AgentRegistry, ChannelRegistry, PluginProfile,
     ProviderProfile, load_agent_registry,
+};
+pub use skills::{
+    SkillIndex, SkillIndexFile, SkillIndexOrigin, SkillIndexSummary, SkillRecord, SkillSelection,
+    SkillSelectionQuery, SkillSourceKind, build_harness_skill_index, build_source_skill_index,
+    select_skills, write_skill_index,
 };
 
 pub const PROMPT_FILE_NAMES: &[&str] = &[

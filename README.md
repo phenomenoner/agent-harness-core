@@ -11,7 +11,8 @@ The project starts with a small, testable foundation:
 - A target harness registry exporter that writes non-secret agent/provider/plugin/channel state with receipts.
 - A safe-copy import executor that copies planned non-sensitive state, skips raw secrets by default, backs up overwrite targets, and writes receipts.
 - A shared channel command parser and runtime-intent contract for OpenClaw-style DM commands.
-- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, and `registry-export` commands.
+- A skill-first indexer and deterministic task matcher for imported or source OpenClaw skills.
+- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, and `skills` commands.
 - Minimal external crates: `serde` and `serde_json` for stable report/config/session JSON handling.
 
 ## Quick Start
@@ -24,6 +25,8 @@ cargo run -p openclaw-harness-cli -- import-dry-run --openclaw-home C:\path\to\.
 cargo run -p openclaw-harness-cli -- import-execute --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --conflict skip
 cargo run -p openclaw-harness-cli -- registry --openclaw-home C:\path\to\.openclaw
 cargo run -p openclaw-harness-cli -- registry-export --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --conflict skip
+cargo run -p openclaw-harness-cli -- skills --openclaw-home C:\path\to\.openclaw --query "repair memory cron" --agent mem-cron --limit 3
+cargo run -p openclaw-harness-cli -- skills --harness-home C:\path\to\.openclaw-harness --output imports\skills
 ```
 
 If `cargo` is not visible in a newly opened terminal, restart the terminal or use:
@@ -36,7 +39,7 @@ $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
 The recommended path is a Rust harness core that delegates native coding-agent execution to Codex app-server, keeps OpenClaw-compatible workspace/session/memory import semantics, and initially bridges OpenClaw plugins through a sidecar instead of reimplementing the full TypeScript plugin SDK.
 
-Skills are first-class runtime state, not documentation leftovers. The importer should preserve OpenClaw workspace skills, managed OpenClaw skills, and project `.agents/skills`; the runtime should then match relevant skills at the start of each agent turn and let agents create or patch reusable skills for future turns.
+Skills are first-class runtime state, not documentation leftovers. The importer preserves OpenClaw workspace skills, managed OpenClaw skills, and project `.agents/skills`; the `skills` command can index those source directories or the imported `skills/openclaw-imports/*` namespace and match task-relevant skills before prompt assembly. Agent-created skill propose/patch/archive flows are still pending.
 
 The first importer command is intentionally read-only. `import-dry-run` produces a structured migration report, flags conflicts, supports `skip`, `overwrite`, and `rename` policies, and can write `report.json` plus `summary.md` when `--output` is provided.
 

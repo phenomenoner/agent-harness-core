@@ -287,6 +287,7 @@ Current implemented foundation:
 - `import-execute` safe-copies planned prompt files, skills, agent directories, sessions, cron stores, subagent ledgers, memory snapshots, and plugin records; it skips raw sensitive items by default, omits known auth/secret files inside copied directories unless `--include-sensitive` is set, backs up overwrite targets, and writes `state/import-execute-receipts.json`.
 - Runtime execution, SQLite-consistent backup, Docker volume export, credential vault migration, and plugin execution are still pending.
 - A shared channel command parser and runtime-intent mapper exists for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`; `/model` covers show/switch model, and `/status` covers global/scoped status requests.
+- `skills` builds a skill-first index from source OpenClaw skill directories or an imported harness home, preserves skill metadata/capability flags, writes `skill-index.json`, and can deterministically rank skills for a task turn using query, agent, channel, and workspace hints.
 
 ### Phase 0: Foundation
 
@@ -311,7 +312,8 @@ Current implemented foundation:
 ### Phase 1.5: Skill-First Substrate
 
 - Import skill directories from workspace, OpenClaw home, and `.agents/skills`.
-- Build a skill metadata index and full-body loader.
+- Build a skill metadata index and deterministic task matcher.
+- Add selected-skill full-body/reference loading for prompt assembly.
 - Add skill conflict modes: skip, overwrite with backup, and rename.
 - Add skill lint/security checks for scripts, shell snippets, and platform constraints.
 - Add agent-managed skill create/patch/archive receipts.

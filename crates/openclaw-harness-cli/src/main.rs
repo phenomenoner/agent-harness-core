@@ -3,8 +3,10 @@ use std::path::PathBuf;
 
 use openclaw_harness_core::{
     AgentRegistry, ConflictPolicy, DryRunImportOptions, ExecuteImportOptions, ImportPhaseStatus,
-    ImportReport, OpenClawSource, build_dry_run_report, build_import_plan, execute_import,
-    export_harness_registry_files, inventory, load_agent_registry, write_report_files,
+    ImportReport, OpenClawSource, SkillIndex, SkillSelectionQuery, build_dry_run_report,
+    build_harness_skill_index, build_import_plan, build_source_skill_index, execute_import,
+    export_harness_registry_files, inventory, load_agent_registry, select_skills,
+    write_report_files, write_skill_index,
 };
 
 fn main() {
@@ -19,6 +21,7 @@ fn main() {
         "import-execute" => run_import_execute(&rest),
         "registry" => run_registry(&rest),
         "registry-export" => run_registry_export(&rest),
+        "skills" => run_skills(&rest),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -184,6 +187,49 @@ fn run_registry_export(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_skills(args: &[String]) -> Result<(), String> {
+    let args = skills_args_from_args(args)?;
+    let index = match &args.harness_home {
+        Some(harness_home) => build_harness_skill_index(harness_home),
+        None => build_source_skill_index(&args.source),
+    }
+    .map_err(|err| err.to_string())?;
+
+    print_skill_index(&index);
+
+    if let Some(output_dir) = args.output_dir {
+        let file = write_skill_index(&index, output_dir).map_err(|err| err.to_string())?;
+        println!("Skill index JSON: {}", file.json.display());
+    }
+
+    if let Some(query) = args.query {
+        let selections = select_skills(
+            &index,
+            &SkillSelectionQuery {
+                text: query,
+                agent_id: args.agent_id,
+                channel: args.channel,
+                workspace: args.match_workspace,
+                limit: args.limit,
+            },
+        );
+        println!();
+        println!("Matched skills: {}", selections.len());
+        for selection in selections {
+            println!(
+                "- {} [{:?}] score={} title={}",
+                selection.skill_id, selection.source_kind, selection.score, selection.title
+            );
+            if !selection.reasons.is_empty() {
+                println!("  {}", selection.reasons.join("; "));
+            }
+            println!("  {}", selection.directory.display());
+        }
+    }
+
+    Ok(())
+}
+
 fn source_from_args(args: &[String]) -> Result<OpenClawSource, String> {
     let mut home = default_openclaw_home();
     let mut workspace = None;
@@ -235,6 +281,17 @@ struct RegistryExportArgs {
     source: OpenClawSource,
     target_home: PathBuf,
     conflict_policy: ConflictPolicy,
+}
+
+struct SkillsArgs {
+    source: OpenClawSource,
+    harness_home: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    query: Option<String>,
+    agent_id: Option<String>,
+    channel: Option<String>,
+    match_workspace: Option<String>,
+    limit: usize,
 }
 
 fn dry_run_args_from_args(args: &[String]) -> Result<DryRunArgs, String> {
@@ -415,6 +472,112 @@ fn registry_export_args_from_args(args: &[String]) -> Result<RegistryExportArgs,
     })
 }
 
+fn skills_args_from_args(args: &[String]) -> Result<SkillsArgs, String> {
+    let mut home = default_openclaw_home();
+    let mut workspace = None;
+    let mut harness_home = None;
+    let mut output_dir = None;
+    let mut query = None;
+    let mut agent_id = None;
+    let mut channel = None;
+    let mut match_workspace = None;
+    let mut limit = 5;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--openclaw-home" => {
+                i += 1;
+                home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--openclaw-home requires a path".to_string())?;
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            "--harness-home" => {
+                i += 1;
+                harness_home = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--harness-home requires a path".to_string())?,
+                );
+            }
+            "--output" => {
+                i += 1;
+                output_dir = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--output requires a path".to_string())?,
+                );
+            }
+            "--query" => {
+                i += 1;
+                query = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--query requires text".to_string())?,
+                );
+            }
+            "--agent" => {
+                i += 1;
+                agent_id = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--agent requires an id".to_string())?,
+                );
+            }
+            "--channel" => {
+                i += 1;
+                channel = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--channel requires a name".to_string())?,
+                );
+            }
+            "--match-workspace" => {
+                i += 1;
+                match_workspace = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--match-workspace requires text".to_string())?,
+                );
+            }
+            "--limit" => {
+                i += 1;
+                limit = args
+                    .get(i)
+                    .ok_or_else(|| "--limit requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let source = match workspace {
+        Some(workspace) => OpenClawSource::with_workspace(home, workspace),
+        None => OpenClawSource::new(home),
+    };
+
+    Ok(SkillsArgs {
+        source,
+        harness_home,
+        output_dir,
+        query,
+        agent_id,
+        channel,
+        match_workspace,
+        limit,
+    })
+}
+
 fn default_openclaw_home() -> PathBuf {
     if let Ok(value) = env::var("OPENCLAW_HOME") {
         return PathBuf::from(value);
@@ -448,6 +611,14 @@ fn parse_conflict_policy(value: &str) -> Result<ConflictPolicy, String> {
             "unknown conflict policy: {other}; expected skip, overwrite, or rename"
         )),
     }
+}
+
+fn parse_limit(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("invalid limit: {value}; expected a positive integer"))
 }
 
 fn format_status(status: &ImportPhaseStatus) -> &'static str {
@@ -620,6 +791,58 @@ fn print_registry(registry: &AgentRegistry) {
     }
 }
 
+fn print_skill_index(index: &SkillIndex) {
+    println!("OpenClaw skill index");
+    println!("Origin: {:?}", index.origin);
+    if let Some(home) = &index.source_home {
+        println!("Source home: {}", home.display());
+    }
+    if let Some(workspace) = &index.source_workspace {
+        println!("Source workspace: {}", workspace.display());
+    }
+    if let Some(harness_home) = &index.harness_home {
+        println!("Harness home: {}", harness_home.display());
+    }
+    println!("Skills: {}", index.summary.total_skills);
+    println!("Workspace skills: {}", index.summary.workspace_skills);
+    println!("Managed skills: {}", index.summary.managed_skills);
+    println!(
+        "Project .agents skills: {}",
+        index.summary.project_agent_skills
+    );
+    println!(
+        "Imported workspace skills: {}",
+        index.summary.imported_workspace_skills
+    );
+    println!(
+        "Imported managed skills: {}",
+        index.summary.imported_managed_skills
+    );
+    println!(
+        "Imported project .agents skills: {}",
+        index.summary.imported_project_agent_skills
+    );
+    println!("Skills with scripts: {}", index.summary.skills_with_scripts);
+
+    if !index.skills.is_empty() {
+        println!();
+        println!("Skills:");
+        for skill in &index.skills {
+            println!(
+                "- {} [{:?}] title={} files={} refs={} templates={} scripts={} assets={}",
+                skill.id,
+                skill.source_kind,
+                skill.title,
+                skill.file_count,
+                yes_no(skill.has_references),
+                yes_no(skill.has_templates),
+                yes_no(skill.has_scripts),
+                yes_no(skill.has_assets),
+            );
+        }
+    }
+}
+
 fn print_help() {
     println!("openclaw-harness");
     println!();
@@ -630,12 +853,19 @@ fn print_help() {
     println!("  import-execute  Copy planned non-sensitive state and write receipts");
     println!("  registry        Inspect parsed multi-agent registry state");
     println!("  registry-export Write target harness registry state");
+    println!("  skills          Build a skill-first index and optionally match a task");
     println!();
     println!("Options:");
     println!("  --openclaw-home <path>  Source .openclaw directory");
     println!("  --workspace <path>      Override workspace directory");
     println!("  --target-home <path>    Destination harness home for import/export commands");
+    println!("  --harness-home <path>   Existing harness home for imported skill indexing");
     println!("  --conflict <policy>     skip, overwrite, or rename");
     println!("  --output <path>         Write report.json and summary.md");
     println!("  --include-sensitive     Copy raw sensitive files during import-execute");
+    println!("  --query <text>          Match skills for a task turn");
+    println!("  --agent <id>            Agent hint for skill matching");
+    println!("  --channel <name>        Channel hint for skill matching");
+    println!("  --match-workspace <txt> Workspace hint for skill matching");
+    println!("  --limit <n>             Maximum matched skills to print");
 }
