@@ -8,6 +8,7 @@ The project starts with a small, testable foundation:
 - A core crate with data-layout detection logic for config, workspace prompts, agents, skills, sessions, native cron, deterministic cron, subagents, memory, and plugins.
 - A read-only importer dry-run report with Hermes-style conflict policy and receipts.
 - A read-only multi-agent registry parser for OpenClaw agents, providers, plugins, channels, and local agent state.
+- A target harness registry exporter that writes non-secret agent/provider/plugin/channel state with receipts.
 - A shared channel command parser for OpenClaw-style DM commands.
 - A CLI crate with `doctor`, `import-plan`, and `import-dry-run` commands.
 - Minimal external crates: `serde` and `serde_json` for stable report/config/session JSON handling.
@@ -20,6 +21,7 @@ cargo run -p openclaw-harness-cli -- doctor
 cargo run -p openclaw-harness-cli -- import-plan --openclaw-home C:\path\to\.openclaw
 cargo run -p openclaw-harness-cli -- import-dry-run --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --conflict skip --output imports\dry-run
 cargo run -p openclaw-harness-cli -- registry --openclaw-home C:\path\to\.openclaw
+cargo run -p openclaw-harness-cli -- registry-export --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --conflict skip
 ```
 
 If `cargo` is not visible in a newly opened terminal, restart the terminal or use:
@@ -37,6 +39,8 @@ Skills are first-class runtime state, not documentation leftovers. The importer 
 The first importer command is intentionally read-only. `import-dry-run` produces a structured migration report, flags conflicts, supports `skip`, `overwrite`, and `rename` policies, and can write `report.json` plus `summary.md` when `--output` is provided.
 
 The registry command is also read-only. It merges `openclaw.json` agent config with `/agents/<id>` directories and reports per-agent model/provider/workspace plus local session/auth/model state.
+
+`registry-export` writes the first target harness state files under `state/harness-registry.json` and `state/harness-registry-receipts.json`. It records credential presence as metadata only; it does not copy raw API keys, tokens, or login state.
 
 Telegram and Discord adapters should share the same channel command parser. Current parser coverage is `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`.
 

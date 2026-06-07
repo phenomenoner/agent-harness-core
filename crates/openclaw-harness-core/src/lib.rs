@@ -3,10 +3,17 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub mod channel_commands;
+pub mod harness_registry;
 pub mod importer;
 pub mod registry;
 
 pub use channel_commands::{ChannelCommand, parse_channel_command};
+pub use harness_registry::{
+    CredentialStatus, HarnessAgent, HarnessPlugin, HarnessProvider, HarnessRegistry,
+    HarnessRegistryExport, HarnessRegistryReceipt, HarnessRegistryReceiptFile,
+    HarnessRegistryReceiptKind, HarnessRegistryReceiptStatus, build_harness_registry,
+    export_harness_registry_files,
+};
 pub use importer::{
     ConfigSemantics, ConflictPolicy, DryRunImportOptions, ImportAction, ImportItem, ImportItemKind,
     ImportItemStatus, ImportReport, ImportReportSummary, ImportSemantics, NativeCronSemantics,

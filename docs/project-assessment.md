@@ -282,6 +282,7 @@ Current implemented foundation:
 - `import-plan` reports staged readiness across config, workspace, agents, skills, sessions, native cron, deterministic cron, subagents, memory, and plugins.
 - `import-dry-run` builds a structured migration report, supports `skip`, `overwrite`, and `rename` conflict policies, extracts non-secret semantic summaries from OpenClaw config/session/cron JSON, and can write `report.json` plus `summary.md`.
 - `registry` builds a read-only multi-agent registry from `openclaw.json` plus `/agents/<id>` directories, including provider/model/workspace metadata and local auth/session/model file presence.
+- `registry-export` writes the target harness registry state to `state/harness-registry.json` plus `state/harness-registry-receipts.json`, with conflict policy support and no raw secret migration.
 - The dry-run planner currently covers config, prompt files, skill directories, agent directories, native cron store, deterministic cron stores, subagent store, memory store, plugin install record, and plugin-state directory.
 - The command is still planner-only. It does not copy files, migrate secrets, or enable runtime execution yet.
 - A shared channel command parser exists for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`.
@@ -299,11 +300,13 @@ Current implemented foundation:
 
 - Add JSON parsing for `openclaw.json` and `sessions.json`.
 - Extend registry parsing into a persisted target harness registry with import receipts.
+- Add raw state safe copy execution for prompt files, agent directories, sessions, cron stores, subagent ledgers, memory snapshots, and plugin records.
 - Extend the copy planner from dry-run receipts to safe execute mode.
 - Add Docker source adapter for exporting `/root/.openclaw` safely.
 - Add explicit workspace override support for `D:\Warehouse\Research\OpenClaw_WSL`.
 - Add conflict policy, backup-on-overwrite, report redaction, and per-item receipts following the Hermes migrate shape.
 - Add SQLite backup strategy notes and checks.
+- Add Windows credential vault integration for provider/channel/plugin secret re-entry and best-effort secret import.
 
 ### Phase 1.5: Skill-First Substrate
 

@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use openclaw_harness_core::{
     AgentRegistry, ConflictPolicy, DryRunImportOptions, ImportPhaseStatus, ImportReport,
-    OpenClawSource, build_dry_run_report, build_import_plan, inventory, load_agent_registry,
-    write_report_files,
+    OpenClawSource, build_dry_run_report, build_import_plan, export_harness_registry_files,
+    inventory, load_agent_registry, write_report_files,
 };
 
 fn main() {
@@ -17,6 +17,7 @@ fn main() {
         "import-plan" => run_import_plan(&rest),
         "import-dry-run" => run_import_dry_run(&rest),
         "registry" => run_registry(&rest),
+        "registry-export" => run_registry_export(&rest),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -125,6 +126,30 @@ fn run_registry(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_registry_export(args: &[String]) -> Result<(), String> {
+    let args = registry_export_args_from_args(args)?;
+    let registry = load_agent_registry(&args.source).map_err(|err| err.to_string())?;
+    let export = export_harness_registry_files(&registry, args.target_home, args.conflict_policy)
+        .map_err(|err| err.to_string())?;
+
+    println!("Harness registry export");
+    println!("Wrote files: {}", yes_no(export.wrote_files));
+    println!("Conflicts: {}", export.conflicts);
+    println!("Registry file: {}", export.registry_file.display());
+    println!("Receipts file: {}", export.receipts_file.display());
+    for receipt in export.receipts {
+        println!(
+            "- {:?}: {:?} {} ({})",
+            receipt.kind,
+            receipt.status,
+            receipt.path.display(),
+            receipt.reason
+        );
+    }
+
+    Ok(())
+}
+
 fn source_from_args(args: &[String]) -> Result<OpenClawSource, String> {
     let mut home = default_openclaw_home();
     let mut workspace = None;
@@ -163,6 +188,12 @@ struct DryRunArgs {
     target_home: PathBuf,
     conflict_policy: ConflictPolicy,
     output_dir: Option<PathBuf>,
+}
+
+struct RegistryExportArgs {
+    source: OpenClawSource,
+    target_home: PathBuf,
+    conflict_policy: ConflictPolicy,
 }
 
 fn dry_run_args_from_args(args: &[String]) -> Result<DryRunArgs, String> {
@@ -227,6 +258,61 @@ fn dry_run_args_from_args(args: &[String]) -> Result<DryRunArgs, String> {
         target_home,
         conflict_policy,
         output_dir,
+    })
+}
+
+fn registry_export_args_from_args(args: &[String]) -> Result<RegistryExportArgs, String> {
+    let mut home = default_openclaw_home();
+    let mut workspace = None;
+    let mut target_home = default_harness_home();
+    let mut conflict_policy = ConflictPolicy::Skip;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--openclaw-home" => {
+                i += 1;
+                home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--openclaw-home requires a path".to_string())?;
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            "--target-home" => {
+                i += 1;
+                target_home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+            }
+            "--conflict" => {
+                i += 1;
+                conflict_policy = args
+                    .get(i)
+                    .ok_or_else(|| "--conflict requires skip, overwrite, or rename".to_string())
+                    .and_then(|value| parse_conflict_policy(value))?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let source = match workspace {
+        Some(workspace) => OpenClawSource::with_workspace(home, workspace),
+        None => OpenClawSource::new(home),
+    };
+
+    Ok(RegistryExportArgs {
+        source,
+        target_home,
+        conflict_policy,
     })
 }
 
@@ -443,6 +529,7 @@ fn print_help() {
     println!("  import-plan     Print staged import readiness");
     println!("  import-dry-run  Build a read-only migration report");
     println!("  registry        Inspect parsed multi-agent registry state");
+    println!("  registry-export Write target harness registry state");
     println!();
     println!("Options:");
     println!("  --openclaw-home <path>  Source .openclaw directory");
