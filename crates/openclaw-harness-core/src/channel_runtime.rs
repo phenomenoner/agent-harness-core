@@ -238,7 +238,7 @@ fn command_effect(
     registry: &AgentRegistry,
     turn: &TurnPlan,
     intent: ChannelCommandIntent,
-    warnings: &mut Vec<String>,
+    _warnings: &mut Vec<String>,
 ) -> ChannelCommandEffect {
     match intent {
         ChannelCommandIntent::StartNewSession { topic } => ChannelCommandEffect::StartNewSession {
@@ -260,18 +260,12 @@ fn command_effect(
             provider: turn.model_policy.provider.clone(),
             model: turn.model_policy.model.clone(),
         },
-        ChannelCommandIntent::SwitchModel { target } => {
-            warnings.push(
-                "model switch is planned but not persisted until the runtime state writer is enabled"
-                    .to_string(),
-            );
-            ChannelCommandEffect::SwitchModel {
-                agent_id: turn.agent.as_ref().map(|agent| agent.id.clone()),
-                target,
-                current_provider: turn.model_policy.provider.clone(),
-                current_model: turn.model_policy.model.clone(),
-            }
-        }
+        ChannelCommandIntent::SwitchModel { target } => ChannelCommandEffect::SwitchModel {
+            agent_id: turn.agent.as_ref().map(|agent| agent.id.clone()),
+            target,
+            current_provider: turn.model_policy.provider.clone(),
+            current_model: turn.model_policy.model.clone(),
+        },
         ChannelCommandIntent::ShowStatus { scope } => ChannelCommandEffect::ShowStatus {
             snapshot: status_snapshot(registry, turn, scope.clone()),
             scope,
@@ -512,8 +506,8 @@ mod tests {
     }
 
     #[test]
-    fn channel_step_plans_model_switch_without_persisting() {
-        let root = temp_root("channel_step_plans_model_switch_without_persisting");
+    fn channel_step_plans_model_switch_effect() {
+        let root = temp_root("channel_step_plans_model_switch_effect");
         let source = write_channel_source(&root);
         let registry = load_agent_registry(&source).unwrap();
         let skills = build_source_skill_index(&source).unwrap();
@@ -541,11 +535,7 @@ mod tests {
                 .text
                 .contains("Model switch planned")
         );
-        assert!(
-            step.warnings
-                .iter()
-                .any(|warning| warning.contains("not persisted"))
-        );
+        assert!(step.warnings.is_empty());
         assert!(matches!(
             step.command_effect,
             Some(ChannelCommandEffect::SwitchModel { ref target, .. })

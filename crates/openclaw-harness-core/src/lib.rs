@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 pub mod channel_commands;
 pub mod channel_runtime;
+pub mod channel_state;
 pub mod codex_runtime;
 pub mod cron;
 pub mod deterministic_cron;
@@ -24,6 +25,11 @@ pub use channel_runtime::{
     ChannelAgentTurnDispatch, ChannelCommandEffect, ChannelOutboundMessage,
     ChannelOutboundMessageKind, ChannelStatusSnapshot, ChannelStep, ChannelStepAction,
     ChannelStepFile, build_channel_step, write_channel_step,
+};
+pub use channel_state::{
+    ChannelCommandApplyOptions, ChannelCommandApplyReceipt, ChannelCommandApplyReceiptStatus,
+    ChannelCommandApplyReport, ChannelCommandEvent, ChannelSessionNote, ChannelSessionState,
+    apply_channel_command_step,
 };
 pub use codex_runtime::{
     CodexEnvRequirement, CodexInvocationPlan, CodexOutputPlan, CodexRuntimeLaunchProbeOptions,
