@@ -292,6 +292,7 @@ Current implemented foundation:
 - `channel-step` builds the shared Telegram/Discord-style channel bridge contract for one inbound DM: command turns produce typed command effects plus outbound reply text, and ordinary messages produce an agent-turn dispatch envelope for the future runtime queue.
 - `queue-enqueue` persists channel agent-turn dispatches to `state/runtime-queue/pending.jsonl`, appends receipts to `state/runtime-queue/receipts.jsonl`, and precomputes OpenClaw-compatible transcript/trajectory paths for the future Codex runtime worker.
 - `queue-prepare` reads pending runtime queue items, rebuilds turn context from queued source/workspace/session metadata, writes `prompt-bundle.json` plus `prompt.md` under `state/runtime-queue/executions/<queue-id>/`, and records execution receipts without invoking a model.
+- `codex-plan` reads a prepared runtime execution, writes `codex-runtime-plan.json` and `codex-runtime-receipt.json`, records the stdio `codex app-server` invocation contract, and maps outputs to OpenClaw-compatible transcript/trajectory/Codex binding files without starting the process.
 - `prompt-bundle` consumes an agent turn plan and writes `prompt-bundle.json` plus `prompt.md` containing runtime context, imported prompt file bodies, selected `SKILL.md` bodies, and the inbound message with byte caps.
 - `cron-plan` parses OpenClaw native agent-turn cron jobs/state and produces a dry-run dispatch plan with cutover hold safety; it validates agent ids, extracts cron payload text when possible, classifies due `at` jobs, and registers cron expressions for future scheduler evaluation without firing anything.
 - `deterministic-cron-plan` parses workspace `tools/cron-runner` and `tools/backup-cron-runner` crontabs, resolves deterministic `jobs/*` scripts, classifies Windows shell compatibility and missing scripts, and preserves `llmAccessAllowed=false` throughout the dry-run plan.
@@ -331,7 +332,7 @@ Current implemented foundation:
 - Add Codex app-server client.
 - Add local direct-message CLI or HTTP channel for testing.
 - Use the imported multi-agent registry to route direct messages and cron payloads by `agentId`.
-- Extend the runtime worker from prepare-only into Codex app-server execution: consume prepared prompt bundles, start/resume sessions, stream events, and persist transcript/trajectory/Codex binding receipts.
+- Extend the runtime worker from prepare-and-plan into Codex app-server execution: consume prepared prompt bundles, start/resume sessions, stream events, and persist transcript/trajectory/Codex binding receipts.
 - Extend `cron-plan` into a real native scheduler after the Codex adapter and transcript writer exist.
 - Extend `deterministic-cron-plan` into a supervised Windows process runner with explicit WSL/Git Bash fallback policy and no model/tool-runtime access.
 - Extend `subagent-plan` into a worker queue with per-agent concurrency limits, cancellation, retry policy, and run receipts after the Codex runtime adapter exists.

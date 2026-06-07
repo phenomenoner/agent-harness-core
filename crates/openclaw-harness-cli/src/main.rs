@@ -3,19 +3,19 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use openclaw_harness_core::{
-    AgentRegistry, ChannelStep, ConflictPolicy, DeterministicCronPlan, DeterministicCronPlanInput,
-    DryRunImportOptions, ExecuteImportOptions, ImportPhaseStatus, ImportReport, NativeCronPlan,
-    NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions, PromptBundle,
-    RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions,
-    RuntimeQueuePrepareReport, SkillIndex, SkillSelectionQuery, SubagentPlan, SubagentPlanInput,
-    TurnPlan, TurnPlanInput, assemble_prompt_bundle, build_channel_step, build_dry_run_report,
-    build_harness_skill_index, build_import_plan, build_source_skill_index, build_turn_plan,
-    enqueue_channel_step, execute_import, export_harness_registry_files, inventory,
-    load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
-    load_subagent_ledger, plan_deterministic_cron, plan_native_cron, plan_subagents,
-    prepare_runtime_queue_item, select_skills, write_channel_step, write_deterministic_cron_plan,
-    write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
-    write_subagent_plan, write_turn_plan,
+    AgentRegistry, ChannelStep, CodexRuntimePlanOptions, CodexRuntimePlanReport, ConflictPolicy,
+    DeterministicCronPlan, DeterministicCronPlanInput, DryRunImportOptions, ExecuteImportOptions,
+    ImportPhaseStatus, ImportReport, NativeCronPlan, NativeCronPlanInput, OpenClawSource,
+    PromptAssemblyOptions, PromptBundle, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
+    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, SkillIndex, SkillSelectionQuery,
+    SubagentPlan, SubagentPlanInput, TurnPlan, TurnPlanInput, assemble_prompt_bundle,
+    build_channel_step, build_dry_run_report, build_harness_skill_index, build_import_plan,
+    build_source_skill_index, build_turn_plan, enqueue_channel_step, execute_import,
+    export_harness_registry_files, inventory, load_agent_registry, load_deterministic_cron_store,
+    load_native_cron_store, load_subagent_ledger, plan_codex_runtime, plan_deterministic_cron,
+    plan_native_cron, plan_subagents, prepare_runtime_queue_item, select_skills,
+    write_channel_step, write_deterministic_cron_plan, write_native_cron_plan, write_prompt_bundle,
+    write_report_files, write_skill_index, write_subagent_plan, write_turn_plan,
 };
 
 fn main() {
@@ -35,6 +35,7 @@ fn main() {
         "channel-step" => run_channel_step(&rest),
         "queue-enqueue" => run_queue_enqueue(&rest),
         "queue-prepare" => run_queue_prepare(&rest),
+        "codex-plan" => run_codex_plan(&rest),
         "prompt-bundle" => run_prompt_bundle(&rest),
         "cron-plan" => run_cron_plan(&rest),
         "deterministic-cron-plan" => run_deterministic_cron_plan(&rest),
@@ -369,6 +370,19 @@ fn run_queue_prepare(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_codex_plan(args: &[String]) -> Result<(), String> {
+    let args = codex_plan_args_from_args(args)?;
+    let report = plan_codex_runtime(CodexRuntimePlanOptions {
+        harness_home: args.target_home,
+        execution_dir: args.execution_dir,
+        codex_executable: args.codex_exe,
+    })
+    .map_err(|err| err.to_string())?;
+
+    print_codex_runtime_plan_report(&report);
+    Ok(())
+}
+
 fn run_prompt_bundle(args: &[String]) -> Result<(), String> {
     let args = turn_plan_args_from_args(args)?;
     let registry = load_agent_registry(&args.source).map_err(|err| err.to_string())?;
@@ -566,6 +580,12 @@ struct QueuePrepareArgs {
     queue_id: Option<String>,
     max_prompt_file_bytes: usize,
     max_skill_file_bytes: usize,
+}
+
+struct CodexPlanArgs {
+    target_home: PathBuf,
+    execution_dir: Option<PathBuf>,
+    codex_exe: Option<PathBuf>,
 }
 
 struct CronPlanArgs {
@@ -1108,6 +1128,49 @@ fn queue_prepare_args_from_args(args: &[String]) -> Result<QueuePrepareArgs, Str
         queue_id,
         max_prompt_file_bytes,
         max_skill_file_bytes,
+    })
+}
+
+fn codex_plan_args_from_args(args: &[String]) -> Result<CodexPlanArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut execution_dir = None;
+    let mut codex_exe = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target-home" => {
+                i += 1;
+                target_home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+            }
+            "--execution-dir" => {
+                i += 1;
+                execution_dir = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--execution-dir requires a path".to_string())?,
+                );
+            }
+            "--codex-exe" => {
+                i += 1;
+                codex_exe = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--codex-exe requires a path".to_string())?,
+                );
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(CodexPlanArgs {
+        target_home,
+        execution_dir,
+        codex_exe,
     })
 }
 
@@ -1741,6 +1804,65 @@ fn print_runtime_queue_prepare_report(report: &RuntimeQueuePrepareReport) {
     }
 }
 
+fn print_codex_runtime_plan_report(report: &CodexRuntimePlanReport) {
+    println!("OpenClaw Codex runtime plan");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Receipts file: {}", report.receipts_file.display());
+    println!("Receipt: {:?}", report.receipt.status);
+    println!("Reason: {}", report.receipt.reason);
+    if let Some(execution_dir) = &report.execution_dir {
+        println!("Execution dir: {}", execution_dir.display());
+    }
+    if let Some(plan_file) = &report.plan_file {
+        println!("Plan file: {}", plan_file.display());
+    }
+    if let Some(plan) = &report.plan {
+        println!("Queue id: {}", plan.queue_id.as_deref().unwrap_or("-"));
+        println!("Agent: {}", plan.agent_id.as_deref().unwrap_or("-"));
+        println!("Session key: {}", plan.session_key);
+        println!(
+            "Model policy: provider={} model={}",
+            plan.provider.as_deref().unwrap_or("-"),
+            plan.model.as_deref().unwrap_or("-")
+        );
+        println!("Executable: {}", plan.invocation.executable.display());
+        println!("Transport: {:?}", plan.invocation.transport);
+        println!("Arguments: {}", plan.invocation.arguments.join(" "));
+        println!(
+            "Working directory: {}",
+            plan.invocation.working_directory.display()
+        );
+        println!(
+            "Prompt input: {}",
+            plan.invocation.prompt_input_file.display()
+        );
+        println!("Prompt bundle JSON: {}", plan.prompt_bundle_json.display());
+        println!("Prompt markdown: {}", plan.prompt_markdown.display());
+        println!("Transcript: {}", plan.outputs.transcript_file.display());
+        println!("Trajectory: {}", plan.outputs.trajectory_file.display());
+        println!(
+            "Codex binding: {}",
+            plan.outputs.codex_binding_file.display()
+        );
+        println!(
+            "Runtime receipt: {}",
+            plan.outputs.runtime_receipt_file.display()
+        );
+        if !plan.invocation.env_requirements.is_empty() {
+            println!("Environment requirements:");
+            for requirement in &plan.invocation.env_requirements {
+                println!("- {}: {}", requirement.name, requirement.reason);
+            }
+        }
+    }
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
 fn print_prompt_bundle(bundle: &PromptBundle) {
     println!("OpenClaw prompt bundle");
     println!("Dispatch: {:?}", bundle.dispatch);
@@ -1913,6 +2035,7 @@ fn print_help() {
     println!("  channel-step    Plan shared channel reply or agent dispatch for one DM");
     println!("  queue-enqueue   Persist one channel agent turn to the runtime queue");
     println!("  queue-prepare   Prepare one queued runtime item for Codex execution");
+    println!("  codex-plan      Plan Codex app-server invocation for prepared execution");
     println!("  prompt-bundle   Assemble prompt files, selected skills, and message");
     println!("  cron-plan       Dry-run OpenClaw native agent-turn cron dispatch");
     println!("  deterministic-cron-plan Dry-run deterministic cron without LLM access");
@@ -1937,6 +2060,8 @@ fn print_help() {
     println!("  --user-id <id>          User identity for session mapping");
     println!("  --session-key <key>     Existing session key override");
     println!("  --queue-id <id>         Select one runtime queue item for queue-prepare");
+    println!("  --execution-dir <path>  Prepared execution directory for codex-plan");
+    println!("  --codex-exe <path>      Codex executable path for codex-plan");
     println!("  --skill-limit <n>       Maximum selected skills for turn-plan");
     println!("  --max-prompt-file-bytes <n> Cap each prompt file in prompt-bundle");
     println!("  --max-skill-file-bytes <n>  Cap each skill file in prompt-bundle");
