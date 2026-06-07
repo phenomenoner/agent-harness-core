@@ -284,7 +284,8 @@ Current implemented foundation:
 - `registry` builds a read-only multi-agent registry from `openclaw.json` plus `/agents/<id>` directories, including provider/model/workspace metadata and local auth/session/model file presence.
 - `registry-export` writes the target harness registry state to `state/harness-registry.json` plus `state/harness-registry-receipts.json`, with conflict policy support and no raw secret migration.
 - The dry-run planner currently covers config, prompt files, skill directories, agent directories, native cron store, deterministic cron stores, subagent store, memory store, plugin install record, and plugin-state directory.
-- The command is still planner-only. It does not copy files, migrate secrets, or enable runtime execution yet.
+- `import-execute` safe-copies planned prompt files, skills, agent directories, sessions, cron stores, subagent ledgers, memory snapshots, and plugin records; it skips raw sensitive items by default, omits known auth/secret files inside copied directories unless `--include-sensitive` is set, backs up overwrite targets, and writes `state/import-execute-receipts.json`.
+- Runtime execution, SQLite-consistent backup, Docker volume export, credential vault migration, and plugin execution are still pending.
 - A shared channel command parser exists for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`.
 
 ### Phase 0: Foundation
@@ -300,11 +301,10 @@ Current implemented foundation:
 
 - Add JSON parsing for `openclaw.json` and `sessions.json`.
 - Extend registry parsing into a persisted target harness registry with import receipts.
-- Add raw state safe copy execution for prompt files, agent directories, sessions, cron stores, subagent ledgers, memory snapshots, and plugin records.
-- Extend the copy planner from dry-run receipts to safe execute mode.
+- Extend raw state safe copy execution beyond the current file/directory copy path with SQLite online backup support, reparse/symlink policy, and module include/exclude presets.
 - Add Docker source adapter for exporting `/root/.openclaw` safely.
 - Add explicit workspace override support for `D:\Warehouse\Research\OpenClaw_WSL`.
-- Add conflict policy, backup-on-overwrite, report redaction, and per-item receipts following the Hermes migrate shape.
+- Keep expanding conflict policy, backup-on-overwrite, report redaction, and per-item receipts following the Hermes migrate shape.
 - Add SQLite backup strategy notes and checks.
 - Add Windows credential vault integration for provider/channel/plugin secret re-entry and best-effort secret import.
 

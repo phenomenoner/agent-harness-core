@@ -15,9 +15,11 @@ pub use harness_registry::{
     export_harness_registry_files,
 };
 pub use importer::{
-    ConfigSemantics, ConflictPolicy, DryRunImportOptions, ImportAction, ImportItem, ImportItemKind,
-    ImportItemStatus, ImportReport, ImportReportSummary, ImportSemantics, NativeCronSemantics,
-    ReportFiles, SessionSemantics, build_dry_run_report, write_report_files,
+    ConfigSemantics, ConflictPolicy, DryRunImportOptions, ExecuteImportOptions, ImportAction,
+    ImportExecuteReceipt, ImportExecuteReport, ImportExecuteStatus, ImportExecuteSummary,
+    ImportItem, ImportItemKind, ImportItemStatus, ImportReport, ImportReportSummary,
+    ImportSemantics, NativeCronSemantics, ReportFiles, SessionSemantics, build_dry_run_report,
+    execute_import, write_report_files,
 };
 pub use registry::{
     AgentDefaults, AgentProfile, AgentProfileSource, AgentRegistry, ChannelRegistry, PluginProfile,

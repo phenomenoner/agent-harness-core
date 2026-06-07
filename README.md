@@ -9,8 +9,9 @@ The project starts with a small, testable foundation:
 - A read-only importer dry-run report with Hermes-style conflict policy and receipts.
 - A read-only multi-agent registry parser for OpenClaw agents, providers, plugins, channels, and local agent state.
 - A target harness registry exporter that writes non-secret agent/provider/plugin/channel state with receipts.
+- A safe-copy import executor that copies planned non-sensitive state, skips raw secrets by default, backs up overwrite targets, and writes receipts.
 - A shared channel command parser for OpenClaw-style DM commands.
-- A CLI crate with `doctor`, `import-plan`, and `import-dry-run` commands.
+- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, and `registry-export` commands.
 - Minimal external crates: `serde` and `serde_json` for stable report/config/session JSON handling.
 
 ## Quick Start
@@ -20,6 +21,7 @@ cargo test
 cargo run -p openclaw-harness-cli -- doctor
 cargo run -p openclaw-harness-cli -- import-plan --openclaw-home C:\path\to\.openclaw
 cargo run -p openclaw-harness-cli -- import-dry-run --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --conflict skip --output imports\dry-run
+cargo run -p openclaw-harness-cli -- import-execute --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --conflict skip
 cargo run -p openclaw-harness-cli -- registry --openclaw-home C:\path\to\.openclaw
 cargo run -p openclaw-harness-cli -- registry-export --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --conflict skip
 ```
@@ -37,6 +39,8 @@ The recommended path is a Rust harness core that delegates native coding-agent e
 Skills are first-class runtime state, not documentation leftovers. The importer should preserve OpenClaw workspace skills, managed OpenClaw skills, and project `.agents/skills`; the runtime should then match relevant skills at the start of each agent turn and let agents create or patch reusable skills for future turns.
 
 The first importer command is intentionally read-only. `import-dry-run` produces a structured migration report, flags conflicts, supports `skip`, `overwrite`, and `rename` policies, and can write `report.json` plus `summary.md` when `--output` is provided.
+
+`import-execute` applies the same plan as safe copy. It copies prompt files, skills, agent directories, sessions, cron stores, subagent ledgers, memory snapshots, and plugin records when planned. Raw sensitive items are skipped by default, sensitive files inside copied directories are omitted, and `--include-sensitive` is required to copy raw config/auth/plugin-state. `overwrite` creates `.bak` receipts before replacing a destination.
 
 The registry command is also read-only. It merges `openclaw.json` agent config with `/agents/<id>` directories and reports per-agent model/provider/workspace plus local session/auth/model state.
 

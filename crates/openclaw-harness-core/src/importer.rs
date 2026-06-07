@@ -58,6 +58,14 @@ pub struct DryRunImportOptions {
     pub conflict_policy: ConflictPolicy,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecuteImportOptions {
+    pub source: OpenClawSource,
+    pub destination_home: PathBuf,
+    pub conflict_policy: ConflictPolicy,
+    pub include_sensitive: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportReport {
@@ -150,6 +158,57 @@ pub struct ReportFiles {
     pub summary: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportExecuteReport {
+    pub schema: &'static str,
+    pub source_home: PathBuf,
+    pub source_workspace: PathBuf,
+    pub destination_home: PathBuf,
+    pub conflict_policy: ConflictPolicy,
+    pub include_sensitive: bool,
+    pub receipts_file: PathBuf,
+    pub summary: ImportExecuteSummary,
+    pub receipts: Vec<ImportExecuteReceipt>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportExecuteSummary {
+    pub total_items: usize,
+    pub copied: usize,
+    pub backed_up_and_copied: usize,
+    pub already_matches: usize,
+    pub skipped_conflicts: usize,
+    pub skipped_sensitive: usize,
+    pub skipped_sensitive_files: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportExecuteReceipt {
+    pub id: usize,
+    pub kind: ImportItemKind,
+    pub action: ImportAction,
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub status: ImportExecuteStatus,
+    pub reason: String,
+    pub backup_path: Option<PathBuf>,
+    pub sensitive: bool,
+    pub skipped_sensitive_files: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImportExecuteStatus {
+    Copied,
+    BackedUpAndCopied,
+    AlreadyMatches,
+    SkippedConflict,
+    SkippedSensitive,
+}
+
 pub fn build_dry_run_report(options: DryRunImportOptions) -> io::Result<ImportReport> {
     let mut builder = ImportReportBuilder::new(options);
     builder.add_file(
@@ -212,7 +271,7 @@ pub fn build_dry_run_report(options: DryRunImportOptions) -> io::Result<ImportRe
         ImportItemKind::AgentDirectory,
         builder.options.source.home.join("agents"),
         builder.options.destination_home.join("agents"),
-        true,
+        false,
     )?;
     builder.add_directory(
         ImportItemKind::NativeCronStore,
@@ -289,6 +348,39 @@ pub fn build_dry_run_report(options: DryRunImportOptions) -> io::Result<ImportRe
     Ok(builder.finish())
 }
 
+pub fn execute_import(options: ExecuteImportOptions) -> io::Result<ImportExecuteReport> {
+    let dry_run = build_dry_run_report(DryRunImportOptions {
+        source: options.source,
+        destination_home: options.destination_home,
+        conflict_policy: options.conflict_policy,
+    })?;
+
+    let mut receipts = Vec::new();
+    for item in &dry_run.items {
+        receipts.push(execute_item(item, options.include_sensitive)?);
+    }
+
+    let summary = summarize_execute(&receipts);
+    let receipts_file = dry_run
+        .destination_home
+        .join("state")
+        .join("import-execute-receipts.json");
+    let report = ImportExecuteReport {
+        schema: "openclaw-harness.import-execute-report.v1",
+        source_home: dry_run.source_home,
+        source_workspace: dry_run.source_workspace,
+        destination_home: dry_run.destination_home,
+        conflict_policy: dry_run.conflict_policy,
+        include_sensitive: options.include_sensitive,
+        receipts_file,
+        summary,
+        receipts,
+    };
+
+    write_execute_receipts(&report)?;
+    Ok(report)
+}
+
 pub fn write_report_files(
     report: &ImportReport,
     output_dir: impl AsRef<Path>,
@@ -304,6 +396,222 @@ pub fn write_report_files(
     fs::write(&summary, render_summary_markdown(report))?;
 
     Ok(ReportFiles { json, summary })
+}
+
+fn execute_item(item: &ImportItem, include_sensitive: bool) -> io::Result<ImportExecuteReceipt> {
+    if item.status == ImportItemStatus::AlreadyMatches {
+        return Ok(execute_receipt(
+            item,
+            ImportExecuteStatus::AlreadyMatches,
+            "destination already matches source".to_string(),
+            None,
+            0,
+        ));
+    }
+
+    if item.status == ImportItemStatus::Conflict {
+        return Ok(execute_receipt(
+            item,
+            ImportExecuteStatus::SkippedConflict,
+            item.reason.clone(),
+            None,
+            0,
+        ));
+    }
+
+    if item.sensitive && !include_sensitive {
+        return Ok(execute_receipt(
+            item,
+            ImportExecuteStatus::SkippedSensitive,
+            "sensitive item skipped; rerun with include-sensitive to copy raw state".to_string(),
+            None,
+            0,
+        ));
+    }
+
+    let backup_path = if item.destination.exists() {
+        let backup_path = backup_path_for(&item.destination);
+        let mut skipped_backup_sensitive_files = 0;
+        copy_path(
+            &item.destination,
+            &backup_path,
+            true,
+            &mut skipped_backup_sensitive_files,
+        )?;
+        remove_path(&item.destination)?;
+        Some(backup_path)
+    } else {
+        None
+    };
+
+    let mut skipped_sensitive_files = 0;
+    copy_path(
+        &item.source,
+        &item.destination,
+        include_sensitive,
+        &mut skipped_sensitive_files,
+    )?;
+
+    let status = if backup_path.is_some() {
+        ImportExecuteStatus::BackedUpAndCopied
+    } else {
+        ImportExecuteStatus::Copied
+    };
+    let reason = if backup_path.is_some() {
+        "copied after backing up existing destination".to_string()
+    } else {
+        "copied".to_string()
+    };
+
+    Ok(execute_receipt(
+        item,
+        status,
+        reason,
+        backup_path,
+        skipped_sensitive_files,
+    ))
+}
+
+fn execute_receipt(
+    item: &ImportItem,
+    status: ImportExecuteStatus,
+    reason: String,
+    backup_path: Option<PathBuf>,
+    skipped_sensitive_files: usize,
+) -> ImportExecuteReceipt {
+    ImportExecuteReceipt {
+        id: item.id,
+        kind: item.kind,
+        action: item.action,
+        source: item.source.clone(),
+        destination: item.destination.clone(),
+        status,
+        reason,
+        backup_path,
+        sensitive: item.sensitive,
+        skipped_sensitive_files,
+    }
+}
+
+fn copy_path(
+    source: &Path,
+    destination: &Path,
+    include_sensitive: bool,
+    skipped_sensitive_files: &mut usize,
+) -> io::Result<()> {
+    if source.is_dir() {
+        copy_directory(
+            source,
+            destination,
+            include_sensitive,
+            skipped_sensitive_files,
+        )
+    } else {
+        copy_file(source, destination)
+    }
+}
+
+fn copy_file(source: &Path, destination: &Path) -> io::Result<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, destination)?;
+    Ok(())
+}
+
+fn copy_directory(
+    source: &Path,
+    destination: &Path,
+    include_sensitive: bool,
+    skipped_sensitive_files: &mut usize,
+) -> io::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_directory(
+                &source_path,
+                &destination_path,
+                include_sensitive,
+                skipped_sensitive_files,
+            )?;
+        } else if file_type.is_file() {
+            if !include_sensitive && is_sensitive_file(&source_path) {
+                *skipped_sensitive_files += 1;
+                continue;
+            }
+            copy_file(&source_path, &destination_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_path(path: &Path) -> io::Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+fn is_sensitive_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    matches!(
+        name,
+        "auth.json"
+            | "auth-profiles.json"
+            | "auth-state.json"
+            | "credentials.json"
+            | "secrets.json"
+            | ".env"
+    )
+}
+
+fn backup_path_for(path: &Path) -> PathBuf {
+    let mut index = 1;
+    loop {
+        let suffix = if index == 1 {
+            ".bak".to_string()
+        } else {
+            format!(".bak-{index}")
+        };
+        let candidate = destination_with_suffix(path, &suffix);
+        if !candidate.exists() {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn summarize_execute(receipts: &[ImportExecuteReceipt]) -> ImportExecuteSummary {
+    let mut summary = ImportExecuteSummary {
+        total_items: receipts.len(),
+        ..ImportExecuteSummary::default()
+    };
+    for receipt in receipts {
+        match receipt.status {
+            ImportExecuteStatus::Copied => summary.copied += 1,
+            ImportExecuteStatus::BackedUpAndCopied => summary.backed_up_and_copied += 1,
+            ImportExecuteStatus::AlreadyMatches => summary.already_matches += 1,
+            ImportExecuteStatus::SkippedConflict => summary.skipped_conflicts += 1,
+            ImportExecuteStatus::SkippedSensitive => summary.skipped_sensitive += 1,
+        }
+        summary.skipped_sensitive_files += receipt.skipped_sensitive_files;
+    }
+    summary
+}
+
+fn write_execute_receipts(report: &ImportExecuteReport) -> io::Result<()> {
+    if let Some(parent) = report.receipts_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(report).map_err(io::Error::other)?;
+    fs::write(&report.receipts_file, json)
 }
 
 struct ImportReportBuilder {
@@ -1228,6 +1536,133 @@ mod tests {
         assert_eq!(report.semantics.native_cron.jobs_by_agent["cron-lite"], 1);
         assert_eq!(report.semantics.native_cron.schedule_types["cron"], 2);
         assert_eq!(report.semantics.native_cron.schedule_types["at"], 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn execute_import_copies_state_and_skips_sensitive_files_by_default() {
+        let root = temp_root("execute_import_copies_state_and_skips_sensitive_files_by_default");
+        let source_home = root.join(".openclaw");
+        let workspace = source_home.join("workspace");
+        let agent_root = source_home.join("agents").join("main");
+        let agent_state = agent_root.join("agent");
+        let agent_sessions = agent_root.join("sessions");
+        let destination_home = root.join("harness-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&agent_state).unwrap();
+        fs::create_dir_all(&agent_sessions).unwrap();
+
+        fs::write(source_home.join("openclaw.json"), "{}").unwrap();
+        fs::write(workspace.join("AGENTS.md"), "# Agent").unwrap();
+        fs::write(agent_state.join("models.json"), "{}").unwrap();
+        fs::write(agent_state.join("auth.json"), "{\"token\":\"secret\"}").unwrap();
+        fs::write(agent_sessions.join("sessions.json"), "{\"sessions\":[]}").unwrap();
+
+        let report = execute_import(ExecuteImportOptions {
+            source: OpenClawSource::new(&source_home),
+            destination_home: destination_home.clone(),
+            conflict_policy: ConflictPolicy::Skip,
+            include_sensitive: false,
+        })
+        .unwrap();
+
+        assert!(
+            destination_home
+                .join("workspace")
+                .join("AGENTS.md")
+                .is_file()
+        );
+        assert!(
+            destination_home
+                .join("agents")
+                .join("main")
+                .join("agent")
+                .join("models.json")
+                .is_file()
+        );
+        assert!(
+            destination_home
+                .join("agents")
+                .join("main")
+                .join("sessions")
+                .join("sessions.json")
+                .is_file()
+        );
+        assert!(
+            !destination_home
+                .join("agents")
+                .join("main")
+                .join("agent")
+                .join("auth.json")
+                .exists()
+        );
+        assert!(!destination_home.join("openclaw.json").exists());
+        assert_eq!(report.summary.skipped_sensitive, 1);
+        assert_eq!(report.summary.skipped_sensitive_files, 1);
+        assert!(report.receipts_file.is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn execute_import_overwrite_backs_up_existing_destination() {
+        let root = temp_root("execute_import_overwrite_backs_up_existing_destination");
+        let source_home = root.join(".openclaw");
+        let workspace = source_home.join("workspace");
+        let destination_home = root.join("harness-home");
+        let destination_workspace = destination_home.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&destination_workspace).unwrap();
+        fs::write(workspace.join("AGENTS.md"), "source").unwrap();
+        fs::write(destination_workspace.join("AGENTS.md"), "dest").unwrap();
+
+        let report = execute_import(ExecuteImportOptions {
+            source: OpenClawSource::new(&source_home),
+            destination_home: destination_home.clone(),
+            conflict_policy: ConflictPolicy::Overwrite,
+            include_sensitive: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination_workspace.join("AGENTS.md")).unwrap(),
+            "source"
+        );
+        assert_eq!(
+            fs::read_to_string(destination_workspace.join("AGENTS.bak.md")).unwrap(),
+            "dest"
+        );
+        assert_eq!(report.summary.backed_up_and_copied, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn execute_import_skip_conflict_preserves_destination() {
+        let root = temp_root("execute_import_skip_conflict_preserves_destination");
+        let source_home = root.join(".openclaw");
+        let workspace = source_home.join("workspace");
+        let destination_home = root.join("harness-home");
+        let destination_workspace = destination_home.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&destination_workspace).unwrap();
+        fs::write(workspace.join("AGENTS.md"), "source").unwrap();
+        fs::write(destination_workspace.join("AGENTS.md"), "dest").unwrap();
+
+        let report = execute_import(ExecuteImportOptions {
+            source: OpenClawSource::new(&source_home),
+            destination_home: destination_home.clone(),
+            conflict_policy: ConflictPolicy::Skip,
+            include_sensitive: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination_workspace.join("AGENTS.md")).unwrap(),
+            "dest"
+        );
+        assert_eq!(report.summary.skipped_conflicts, 1);
 
         let _ = fs::remove_dir_all(root);
     }

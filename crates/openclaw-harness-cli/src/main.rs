@@ -2,9 +2,9 @@ use std::env;
 use std::path::PathBuf;
 
 use openclaw_harness_core::{
-    AgentRegistry, ConflictPolicy, DryRunImportOptions, ImportPhaseStatus, ImportReport,
-    OpenClawSource, build_dry_run_report, build_import_plan, export_harness_registry_files,
-    inventory, load_agent_registry, write_report_files,
+    AgentRegistry, ConflictPolicy, DryRunImportOptions, ExecuteImportOptions, ImportPhaseStatus,
+    ImportReport, OpenClawSource, build_dry_run_report, build_import_plan, execute_import,
+    export_harness_registry_files, inventory, load_agent_registry, write_report_files,
 };
 
 fn main() {
@@ -16,6 +16,7 @@ fn main() {
         "doctor" => run_doctor(&rest),
         "import-plan" => run_import_plan(&rest),
         "import-dry-run" => run_import_dry_run(&rest),
+        "import-execute" => run_import_execute(&rest),
         "registry" => run_registry(&rest),
         "registry-export" => run_registry_export(&rest),
         "help" | "-h" | "--help" => {
@@ -119,6 +120,39 @@ fn run_import_dry_run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_import_execute(args: &[String]) -> Result<(), String> {
+    let args = execute_args_from_args(args)?;
+    let report = execute_import(ExecuteImportOptions {
+        source: args.source,
+        destination_home: args.target_home,
+        conflict_policy: args.conflict_policy,
+        include_sensitive: args.include_sensitive,
+    })
+    .map_err(|err| err.to_string())?;
+
+    println!("OpenClaw import execute");
+    println!("Target home: {}", report.destination_home.display());
+    println!("Receipts file: {}", report.receipts_file.display());
+    println!("Items: {}", report.summary.total_items);
+    println!("Copied: {}", report.summary.copied);
+    println!(
+        "Backed up and copied: {}",
+        report.summary.backed_up_and_copied
+    );
+    println!("Already matches: {}", report.summary.already_matches);
+    println!("Skipped conflicts: {}", report.summary.skipped_conflicts);
+    println!(
+        "Skipped sensitive items: {}",
+        report.summary.skipped_sensitive
+    );
+    println!(
+        "Skipped sensitive files: {}",
+        report.summary.skipped_sensitive_files
+    );
+
+    Ok(())
+}
+
 fn run_registry(args: &[String]) -> Result<(), String> {
     let source = source_from_args(args)?;
     let registry = load_agent_registry(&source).map_err(|err| err.to_string())?;
@@ -190,6 +224,13 @@ struct DryRunArgs {
     output_dir: Option<PathBuf>,
 }
 
+struct ExecuteArgs {
+    source: OpenClawSource,
+    target_home: PathBuf,
+    conflict_policy: ConflictPolicy,
+    include_sensitive: bool,
+}
+
 struct RegistryExportArgs {
     source: OpenClawSource,
     target_home: PathBuf,
@@ -258,6 +299,64 @@ fn dry_run_args_from_args(args: &[String]) -> Result<DryRunArgs, String> {
         target_home,
         conflict_policy,
         output_dir,
+    })
+}
+
+fn execute_args_from_args(args: &[String]) -> Result<ExecuteArgs, String> {
+    let mut home = default_openclaw_home();
+    let mut workspace = None;
+    let mut target_home = default_harness_home();
+    let mut conflict_policy = ConflictPolicy::Skip;
+    let mut include_sensitive = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--openclaw-home" => {
+                i += 1;
+                home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--openclaw-home requires a path".to_string())?;
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            "--target-home" => {
+                i += 1;
+                target_home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+            }
+            "--conflict" => {
+                i += 1;
+                conflict_policy = args
+                    .get(i)
+                    .ok_or_else(|| "--conflict requires skip, overwrite, or rename".to_string())
+                    .and_then(|value| parse_conflict_policy(value))?;
+            }
+            "--include-sensitive" => include_sensitive = true,
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let source = match workspace {
+        Some(workspace) => OpenClawSource::with_workspace(home, workspace),
+        None => OpenClawSource::new(home),
+    };
+
+    Ok(ExecuteArgs {
+        source,
+        target_home,
+        conflict_policy,
+        include_sensitive,
     })
 }
 
@@ -528,13 +627,15 @@ fn print_help() {
     println!("  doctor          Inspect an OpenClaw home directory");
     println!("  import-plan     Print staged import readiness");
     println!("  import-dry-run  Build a read-only migration report");
+    println!("  import-execute  Copy planned non-sensitive state and write receipts");
     println!("  registry        Inspect parsed multi-agent registry state");
     println!("  registry-export Write target harness registry state");
     println!();
     println!("Options:");
     println!("  --openclaw-home <path>  Source .openclaw directory");
     println!("  --workspace <path>      Override workspace directory");
-    println!("  --target-home <path>    Destination harness home for import-dry-run");
+    println!("  --target-home <path>    Destination harness home for import/export commands");
     println!("  --conflict <policy>     skip, overwrite, or rename");
     println!("  --output <path>         Write report.json and summary.md");
+    println!("  --include-sensitive     Copy raw sensitive files during import-execute");
 }
