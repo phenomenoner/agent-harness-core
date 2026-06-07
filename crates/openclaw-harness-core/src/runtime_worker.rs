@@ -1,8 +1,9 @@
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
@@ -48,7 +49,7 @@ pub struct RuntimeQueuePreparedItem {
     pub selected_skill_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeExecutionReceipt {
     pub queue_id: Option<String>,
@@ -59,10 +60,11 @@ pub struct RuntimeExecutionReceipt {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeExecutionReceiptStatus {
     Prepared,
+    AlreadyPrepared,
     NoPendingItem,
 }
 
@@ -90,7 +92,36 @@ pub fn prepare_runtime_queue_item(
     fs::create_dir_all(&queue_dir)?;
 
     let mut warnings = Vec::new();
-    let Some(pending) = read_pending_item(&queue_file, options.queue_id.as_deref(), &mut warnings)?
+    let prepared_receipts = read_prepared_receipts(&execution_receipts_file, &mut warnings)?;
+    if let Some(requested_queue_id) = options.queue_id.as_deref()
+        && let Some(prepared) = prepared_receipts.get(requested_queue_id)
+    {
+        let receipt = RuntimeExecutionReceipt {
+            queue_id: Some(requested_queue_id.to_string()),
+            status: RuntimeExecutionReceiptStatus::AlreadyPrepared,
+            execution_dir: prepared.execution_dir.clone(),
+            prompt_bundle_json: prepared.prompt_bundle_json.clone(),
+            prompt_markdown: prepared.prompt_markdown.clone(),
+            reason: "requested runtime queue item was already prepared".to_string(),
+        };
+        append_json_line(&execution_receipts_file, &receipt)?;
+        return Ok(RuntimeQueuePrepareReport {
+            schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
+            harness_home: options.harness_home,
+            queue_file,
+            execution_receipts_file,
+            item: None,
+            receipt,
+            warnings,
+        });
+    }
+    let prepared_ids = prepared_receipts.keys().cloned().collect::<HashSet<_>>();
+    let Some(pending) = read_pending_item(
+        &queue_file,
+        options.queue_id.as_deref(),
+        &prepared_ids,
+        &mut warnings,
+    )?
     else {
         let receipt = RuntimeExecutionReceipt {
             queue_id: options.queue_id,
@@ -187,6 +218,7 @@ pub fn prepare_runtime_queue_item(
 fn read_pending_item(
     queue_file: &Path,
     requested_queue_id: Option<&str>,
+    prepared_ids: &HashSet<String>,
     warnings: &mut Vec<String>,
 ) -> io::Result<Option<PendingQueueItem>> {
     if !queue_file.is_file() {
@@ -226,6 +258,12 @@ fn read_pending_item(
             ));
             continue;
         }
+        if prepared_ids.contains(queue_id) {
+            warnings.push(format!(
+                "runtime queue item `{queue_id}` already has a prepared receipt; skipping"
+            ));
+            continue;
+        }
         match parse_pending_item(&value) {
             Some(item) => return Ok(Some(item)),
             None => warnings.push(format!(
@@ -235,6 +273,39 @@ fn read_pending_item(
     }
 
     Ok(None)
+}
+
+fn read_prepared_receipts(
+    receipts_file: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<HashMap<String, RuntimeExecutionReceipt>> {
+    let mut receipts = HashMap::new();
+    if !receipts_file.is_file() {
+        return Ok(receipts);
+    }
+
+    let text = fs::read_to_string(receipts_file)?;
+    for (index, line) in text.lines().enumerate() {
+        let line_number = index + 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let receipt: RuntimeExecutionReceipt = match serde_json::from_str(trimmed) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                warnings.push(format!(
+                    "runtime execution receipt line {line_number} is not valid JSON: {error}"
+                ));
+                continue;
+            }
+        };
+        if receipt.status == RuntimeExecutionReceiptStatus::Prepared && receipt.queue_id.is_some() {
+            let queue_id = receipt.queue_id.clone().unwrap();
+            receipts.insert(queue_id, receipt);
+        }
+    }
+    Ok(receipts)
 }
 
 fn parse_pending_item(value: &Value) -> Option<PendingQueueItem> {
@@ -387,6 +458,60 @@ mod tests {
             RuntimeExecutionReceiptStatus::NoPendingItem
         );
         assert!(report.execution_receipts_file.is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_runtime_queue_item_is_idempotent_for_prepared_items() {
+        let root = temp_root("prepare_runtime_queue_item_is_idempotent_for_prepared_items");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        enqueue_fixture_turn(&source, &harness_home);
+
+        let first = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        let queue_id = first.receipt.queue_id.clone().unwrap();
+        assert_eq!(
+            first.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+
+        let second = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert!(second.item.is_none());
+        assert_eq!(
+            second.receipt.status,
+            RuntimeExecutionReceiptStatus::NoPendingItem
+        );
+        assert!(
+            second
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("already has a prepared receipt"))
+        );
+
+        let explicit = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home,
+            queue_id: Some(queue_id),
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert!(explicit.item.is_none());
+        assert_eq!(
+            explicit.receipt.status,
+            RuntimeExecutionReceiptStatus::AlreadyPrepared
+        );
+        assert!(explicit.receipt.execution_dir.is_some());
+        assert!(explicit.receipt.prompt_bundle_json.is_some());
 
         let _ = fs::remove_dir_all(root);
     }

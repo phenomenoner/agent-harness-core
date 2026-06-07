@@ -2040,6 +2040,16 @@ fn print_runtime_queue_prepare_report(report: &RuntimeQueuePrepareReport) {
             item.planned_trajectory_file.display()
         );
         println!("Selected skills: {}", item.selected_skill_ids.len());
+    } else {
+        if let Some(execution_dir) = &report.receipt.execution_dir {
+            println!("Execution dir: {}", execution_dir.display());
+        }
+        if let Some(prompt_bundle_json) = &report.receipt.prompt_bundle_json {
+            println!("Prompt bundle JSON: {}", prompt_bundle_json.display());
+        }
+        if let Some(prompt_markdown) = &report.receipt.prompt_markdown {
+            println!("Prompt markdown: {}", prompt_markdown.display());
+        }
     }
     if !report.warnings.is_empty() {
         println!("Warnings:");
