@@ -3,12 +3,14 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use openclaw_harness_core::{
-    AgentRegistry, ConflictPolicy, DryRunImportOptions, ExecuteImportOptions, ImportPhaseStatus,
-    ImportReport, NativeCronPlan, NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions,
-    PromptBundle, SkillIndex, SkillSelectionQuery, TurnPlan, TurnPlanInput, assemble_prompt_bundle,
-    build_dry_run_report, build_harness_skill_index, build_import_plan, build_source_skill_index,
-    build_turn_plan, execute_import, export_harness_registry_files, inventory, load_agent_registry,
-    load_native_cron_store, plan_native_cron, select_skills, write_native_cron_plan,
+    AgentRegistry, ConflictPolicy, DeterministicCronPlan, DeterministicCronPlanInput,
+    DryRunImportOptions, ExecuteImportOptions, ImportPhaseStatus, ImportReport, NativeCronPlan,
+    NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions, PromptBundle, SkillIndex,
+    SkillSelectionQuery, TurnPlan, TurnPlanInput, assemble_prompt_bundle, build_dry_run_report,
+    build_harness_skill_index, build_import_plan, build_source_skill_index, build_turn_plan,
+    execute_import, export_harness_registry_files, inventory, load_agent_registry,
+    load_deterministic_cron_store, load_native_cron_store, plan_deterministic_cron,
+    plan_native_cron, select_skills, write_deterministic_cron_plan, write_native_cron_plan,
     write_prompt_bundle, write_report_files, write_skill_index, write_turn_plan,
 };
 
@@ -28,6 +30,7 @@ fn main() {
         "turn-plan" => run_turn_plan(&rest),
         "prompt-bundle" => run_prompt_bundle(&rest),
         "cron-plan" => run_cron_plan(&rest),
+        "deterministic-cron-plan" => run_deterministic_cron_plan(&rest),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -336,6 +339,27 @@ fn run_cron_plan(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_deterministic_cron_plan(args: &[String]) -> Result<(), String> {
+    let args = deterministic_cron_plan_args_from_args(args)?;
+    let store = load_deterministic_cron_store(&args.source).map_err(|err| err.to_string())?;
+    let plan = plan_deterministic_cron(
+        &store,
+        DeterministicCronPlanInput {
+            allow_deterministic_run: args.allow_deterministic_run,
+        },
+    );
+
+    print_deterministic_cron_plan(&plan, args.limit);
+
+    if let Some(output_dir) = args.output_dir {
+        let file =
+            write_deterministic_cron_plan(&plan, output_dir).map_err(|err| err.to_string())?;
+        println!("Deterministic cron plan JSON: {}", file.json.display());
+    }
+
+    Ok(())
+}
+
 fn source_from_args(args: &[String]) -> Result<OpenClawSource, String> {
     let mut home = default_openclaw_home();
     let mut workspace = None;
@@ -420,6 +444,13 @@ struct CronPlanArgs {
     output_dir: Option<PathBuf>,
     now_ms: i64,
     resume_cron: bool,
+    limit: usize,
+}
+
+struct DeterministicCronPlanArgs {
+    source: OpenClawSource,
+    output_dir: Option<PathBuf>,
+    allow_deterministic_run: bool,
     limit: usize,
 }
 
@@ -918,6 +949,67 @@ fn cron_plan_args_from_args(args: &[String]) -> Result<CronPlanArgs, String> {
     })
 }
 
+fn deterministic_cron_plan_args_from_args(
+    args: &[String],
+) -> Result<DeterministicCronPlanArgs, String> {
+    let mut home = default_openclaw_home();
+    let mut workspace = None;
+    let mut output_dir = None;
+    let mut allow_deterministic_run = false;
+    let mut limit = 20;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--openclaw-home" => {
+                i += 1;
+                home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--openclaw-home requires a path".to_string())?;
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            "--output" => {
+                i += 1;
+                output_dir = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--output requires a path".to_string())?,
+                );
+            }
+            "--allow-deterministic-run" => allow_deterministic_run = true,
+            "--limit" => {
+                i += 1;
+                limit = args
+                    .get(i)
+                    .ok_or_else(|| "--limit requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let source = match workspace {
+        Some(workspace) => OpenClawSource::with_workspace(home, workspace),
+        None => OpenClawSource::new(home),
+    };
+
+    Ok(DeterministicCronPlanArgs {
+        source,
+        output_dir,
+        allow_deterministic_run,
+        limit,
+    })
+}
+
 fn default_openclaw_home() -> PathBuf {
     if let Ok(value) = env::var("OPENCLAW_HOME") {
         return PathBuf::from(value);
@@ -1311,6 +1403,55 @@ fn print_cron_plan(plan: &NativeCronPlan, limit: usize) {
     }
 }
 
+fn print_deterministic_cron_plan(plan: &DeterministicCronPlan, limit: usize) {
+    println!("OpenClaw deterministic cron plan");
+    println!("Source workspace: {}", plan.source_workspace.display());
+    println!(
+        "Allow deterministic run: {}",
+        yes_no(plan.allow_deterministic_run)
+    );
+    println!("LLM access allowed: {}", yes_no(plan.llm_access_allowed));
+    println!("Entries: {}", plan.summary.total_entries);
+    println!("Cutover held: {}", plan.summary.cutover_held);
+    println!("Ready commands: {}", plan.summary.ready_commands);
+    println!(
+        "Shell compatibility required: {}",
+        plan.summary.shell_compatibility_required
+    );
+    println!("Missing script: {}", plan.summary.missing_script);
+    println!(
+        "External command review: {}",
+        plan.summary.external_command_review
+    );
+    println!("Unsupported entries: {}", plan.summary.unsupported_entries);
+    if !plan.entries.is_empty() {
+        println!();
+        println!("Entries:");
+        for entry in plan.entries.iter().take(limit) {
+            println!(
+                "- {} {:?} script={} command={}",
+                entry.entry_id,
+                entry.action,
+                entry
+                    .script_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                entry.command
+            );
+        }
+        if plan.entries.len() > limit {
+            println!("... {} more entries", plan.entries.len() - limit);
+        }
+    }
+    if !plan.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &plan.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
 fn print_help() {
     println!("openclaw-harness");
     println!();
@@ -1325,6 +1466,7 @@ fn print_help() {
     println!("  turn-plan       Plan routing, commands, prompts, and skills for one turn");
     println!("  prompt-bundle   Assemble prompt files, selected skills, and message");
     println!("  cron-plan       Dry-run OpenClaw native agent-turn cron dispatch");
+    println!("  deterministic-cron-plan Dry-run deterministic cron without LLM access");
     println!();
     println!("Options:");
     println!("  --openclaw-home <path>  Source .openclaw directory");
@@ -1349,4 +1491,5 @@ fn print_help() {
     println!("  --max-skill-file-bytes <n>  Cap each skill file in prompt-bundle");
     println!("  --now-ms <n>           Epoch milliseconds for cron-plan");
     println!("  --resume-cron          Release native cron from cutover hold in dry-run");
+    println!("  --allow-deterministic-run Release deterministic cron hold in dry-run");
 }

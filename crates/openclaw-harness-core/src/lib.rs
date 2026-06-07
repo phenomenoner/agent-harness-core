@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 pub mod channel_commands;
 pub mod cron;
+pub mod deterministic_cron;
 pub mod harness_registry;
 pub mod importer;
 pub mod prompt;
@@ -19,6 +20,13 @@ pub use cron::{
     NativeCronPlanFile, NativeCronPlanInput, NativeCronPlanSummary, NativeCronSchedule,
     NativeCronStore, NativeCronStoreSummary, load_native_cron_store, plan_native_cron,
     write_native_cron_plan,
+};
+pub use deterministic_cron::{
+    DeterministicCronEntry, DeterministicCronPlan, DeterministicCronPlanAction,
+    DeterministicCronPlanEntry, DeterministicCronPlanFile, DeterministicCronPlanInput,
+    DeterministicCronPlanSummary, DeterministicCronRunner, DeterministicCronRunnerKind,
+    DeterministicCronSchedule, DeterministicCronStore, DeterministicCronStoreSummary,
+    load_deterministic_cron_store, plan_deterministic_cron, write_deterministic_cron_plan,
 };
 pub use harness_registry::{
     CredentialStatus, HarnessAgent, HarnessPlugin, HarnessProvider, HarnessRegistry,
