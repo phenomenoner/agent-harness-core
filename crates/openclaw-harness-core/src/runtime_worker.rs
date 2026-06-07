@@ -120,6 +120,7 @@ pub fn prepare_runtime_queue_item(
         &registry,
         &skill_index,
         crate::TurnPlanInput {
+            harness_home: Some(options.harness_home.clone()),
             platform: pending.platform.clone(),
             channel_id: pending.channel_id.clone(),
             user_id: pending.user_id.clone(),
@@ -398,6 +399,7 @@ mod tests {
             &registry,
             &skills,
             TurnPlanInput {
+                harness_home: None,
                 platform: "telegram".to_string(),
                 channel_id: "dm-42".to_string(),
                 user_id: "user-7".to_string(),

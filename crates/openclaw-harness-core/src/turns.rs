@@ -5,15 +5,16 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::{
-    AgentProfile, AgentRegistry, ChannelCommand, ChannelCommandIntent, OpenClawSource,
-    PROMPT_FILE_NAMES, SkillIndex, SkillSelection, SkillSelectionQuery, parse_channel_command,
-    select_skills,
+    AgentProfile, AgentRegistry, ChannelCommand, ChannelCommandIntent, ChannelSessionState,
+    OpenClawSource, PROMPT_FILE_NAMES, SkillIndex, SkillSelection, SkillSelectionQuery,
+    parse_channel_command, read_channel_session_state, select_skills,
 };
 
 const TURN_PLAN_SCHEMA: &str = "openclaw-harness.turn-plan.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnPlanInput {
+    pub harness_home: Option<PathBuf>,
     pub platform: String,
     pub channel_id: String,
     pub user_id: String,
@@ -37,6 +38,7 @@ pub struct TurnPlan {
     pub dispatch: TurnDispatch,
     pub agent: Option<TurnAgent>,
     pub model_policy: TurnModelPolicy,
+    pub channel_state: Option<ChannelSessionState>,
     pub command: Option<ChannelCommand>,
     pub command_intent: Option<ChannelCommandIntent>,
     pub prompt_files: Vec<TurnPromptFile>,
@@ -93,7 +95,7 @@ pub fn build_turn_plan(
     let mut warnings = Vec::new();
     let selected_agent = select_agent(registry, input.requested_agent_id.as_deref(), &mut warnings);
     let agent = selected_agent.map(turn_agent);
-    let model_policy = selected_agent.map(turn_model_policy).unwrap_or_default();
+    let mut model_policy = selected_agent.map(turn_model_policy).unwrap_or_default();
     let command = parse_channel_command(&input.text);
     let command_intent = command.clone().map(ChannelCommand::into_intent);
     let dispatch = if command.is_some() {
@@ -107,12 +109,40 @@ pub fn build_turn_plan(
         warnings.push("no OpenClaw agent is available for this turn".to_string());
     }
 
+    let channel_state = load_channel_state(
+        input.harness_home.as_deref(),
+        &input.platform,
+        &input.channel_id,
+        &input.user_id,
+        &mut warnings,
+    );
+    if let Some(state) = &channel_state {
+        apply_model_override(&mut model_policy, state);
+    }
+    let session_key = input
+        .session_hint
+        .clone()
+        .or_else(|| {
+            channel_state
+                .as_ref()
+                .map(|state| state.active_session_key.clone())
+        })
+        .unwrap_or_else(|| {
+            session_key(
+                &input.platform,
+                &input.channel_id,
+                &input.user_id,
+                agent.as_ref().map(|agent| agent.id.as_str()),
+            )
+        });
+
     let prompt_files = prompt_files(&source.workspace)?;
+    let skill_query_text = channel_state_query_text(&input.text, channel_state.as_ref());
     let selected_skills = if dispatch == TurnDispatch::AgentTurn {
         select_skills(
             skill_index,
             &SkillSelectionQuery {
-                text: input.text.clone(),
+                text: skill_query_text,
                 agent_id: agent.as_ref().map(|agent| agent.id.clone()),
                 channel: Some(input.platform.clone()),
                 workspace: agent
@@ -125,15 +155,6 @@ pub fn build_turn_plan(
     } else {
         Vec::new()
     };
-    let session_key = input.session_hint.clone().unwrap_or_else(|| {
-        session_key(
-            &input.platform,
-            &input.channel_id,
-            &input.user_id,
-            agent.as_ref().map(|agent| agent.id.as_str()),
-        )
-    });
-
     Ok(TurnPlan {
         schema: TURN_PLAN_SCHEMA,
         source_home: source.home.clone(),
@@ -146,6 +167,7 @@ pub fn build_turn_plan(
         dispatch,
         agent,
         model_policy,
+        channel_state,
         command,
         command_intent,
         prompt_files,
@@ -210,6 +232,56 @@ fn turn_model_policy(agent: &AgentProfile) -> TurnModelPolicy {
         provider: agent.provider.clone(),
         model: agent.model.clone(),
     }
+}
+
+fn load_channel_state(
+    harness_home: Option<&Path>,
+    platform: &str,
+    channel_id: &str,
+    user_id: &str,
+    warnings: &mut Vec<String>,
+) -> Option<ChannelSessionState> {
+    let harness_home = harness_home?;
+    match read_channel_session_state(harness_home, platform, channel_id, user_id) {
+        Ok(state) => state,
+        Err(error) => {
+            warnings.push(format!(
+                "channel session state could not be read from {}: {}",
+                harness_home.display(),
+                error
+            ));
+            None
+        }
+    }
+}
+
+fn apply_model_override(model_policy: &mut TurnModelPolicy, state: &ChannelSessionState) {
+    if let Some(provider) = &state.model_override_provider {
+        model_policy.provider = Some(provider.clone());
+    }
+    if let Some(model) = &state.model_override_model {
+        model_policy.model = Some(model.clone());
+    }
+}
+
+fn channel_state_query_text(message: &str, state: Option<&ChannelSessionState>) -> String {
+    let Some(state) = state else {
+        return message.to_string();
+    };
+    let mut text = message.to_string();
+    if let Some(instruction) = &state.thinking_instruction {
+        text.push_str("\nthink: ");
+        text.push_str(instruction);
+    }
+    for note in state.steering_notes.iter().rev().take(6).rev() {
+        text.push_str("\nsteer: ");
+        text.push_str(&note.text);
+    }
+    for note in state.btw_notes.iter().rev().take(6).rev() {
+        text.push_str("\nbtw: ");
+        text.push_str(&note.text);
+    }
+    text
 }
 
 fn prompt_files(workspace: &Path) -> io::Result<Vec<TurnPromptFile>> {
@@ -283,6 +355,7 @@ mod tests {
             &registry,
             &skills,
             TurnPlanInput {
+                harness_home: None,
                 platform: "telegram".to_string(),
                 channel_id: "dm-42".to_string(),
                 user_id: "user-7".to_string(),
@@ -321,6 +394,7 @@ mod tests {
             &registry,
             &skills,
             TurnPlanInput {
+                harness_home: None,
                 platform: "discord".to_string(),
                 channel_id: "dm#42".to_string(),
                 user_id: "user#7".to_string(),
@@ -357,6 +431,7 @@ mod tests {
             &registry,
             &skills,
             TurnPlanInput {
+                harness_home: None,
                 platform: "telegram".to_string(),
                 channel_id: "dm".to_string(),
                 user_id: "user".to_string(),
@@ -390,6 +465,7 @@ mod tests {
             &registry,
             &skills,
             TurnPlanInput {
+                harness_home: None,
                 platform: "telegram".to_string(),
                 channel_id: "dm".to_string(),
                 user_id: "user".to_string(),
@@ -402,6 +478,80 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan.session_key, "imported-session-key");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn turn_plan_applies_channel_state_session_model_and_skill_context() {
+        let root = temp_root("turn_plan_applies_channel_state_session_model_and_skill_context");
+        let source = write_turn_source(&root);
+        let skill = source.workspace.join("skills").join("openrouter-routing");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join(crate::SKILL_FILE_NAME),
+            "# OpenRouter Routing\n\nUse this when steering mentions OpenRouter.",
+        )
+        .unwrap();
+        let harness_home = root.join(".openclaw-harness");
+        write_channel_state(
+            &harness_home,
+            r#"{
+              "schema": "openclaw-harness.channel-session-state.v1",
+              "platform": "telegram",
+              "channelId": "dm",
+              "userId": "user",
+              "activeSessionKey": "telegram:dm:user:main:new",
+              "agentId": "main",
+              "provider": "openai",
+              "model": "gpt-5",
+              "sessionTopic": "routing",
+              "modelOverride": "openrouter/anthropic/claude-sonnet-4",
+              "modelOverrideProvider": "openrouter",
+              "modelOverrideModel": "anthropic/claude-sonnet-4",
+              "thinkingEnabled": true,
+              "thinkingInstruction": "compare provider constraints",
+              "stopRequested": false,
+              "stopReason": null,
+              "steeringNotes": [
+                { "atMs": 1000, "text": "prefer OpenRouter routing skill" }
+              ],
+              "btwNotes": [],
+              "lastCommand": "steer",
+              "updatedAtMs": 1000
+            }"#,
+        );
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+
+        let plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "continue".to_string(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.session_key, "telegram:dm:user:main:new");
+        assert_eq!(plan.model_policy.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            plan.model_policy.model.as_deref(),
+            Some("anthropic/claude-sonnet-4")
+        );
+        assert!(plan.channel_state.is_some());
+        assert_eq!(
+            plan.selected_skills[0].skill_id,
+            "workspace:openrouter-routing"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -433,6 +583,18 @@ mod tests {
         )
         .unwrap();
         OpenClawSource::with_workspace(home, workspace)
+    }
+
+    fn write_channel_state(harness_home: &Path, state_json: &str) {
+        let state_file = harness_home
+            .join("state")
+            .join("channels")
+            .join("telegram")
+            .join("dm")
+            .join("user")
+            .join("state.json");
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        fs::write(state_file, state_json).unwrap();
     }
 
     fn temp_root(test_name: &str) -> PathBuf {

@@ -29,7 +29,7 @@ pub use channel_runtime::{
 pub use channel_state::{
     ChannelCommandApplyOptions, ChannelCommandApplyReceipt, ChannelCommandApplyReceiptStatus,
     ChannelCommandApplyReport, ChannelCommandEvent, ChannelSessionNote, ChannelSessionState,
-    apply_channel_command_step,
+    apply_channel_command_step, channel_session_state_file, read_channel_session_state,
 };
 pub use codex_runtime::{
     CodexEnvRequirement, CodexInvocationPlan, CodexOutputPlan, CodexRuntimeLaunchProbeOptions,

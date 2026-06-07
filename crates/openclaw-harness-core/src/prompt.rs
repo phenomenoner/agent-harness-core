@@ -41,6 +41,7 @@ pub struct PromptBundle {
 #[serde(rename_all = "camelCase")]
 pub struct PromptBundleSummary {
     pub prompt_files_included: usize,
+    pub channel_state_sections_included: usize,
     pub skills_included: usize,
     pub user_messages_included: usize,
     pub bytes_included: usize,
@@ -63,6 +64,7 @@ pub struct PromptSection {
 #[serde(rename_all = "kebab-case")]
 pub enum PromptSectionKind {
     RuntimeContext,
+    ChannelState,
     PromptFile,
     Skill,
     UserMessage,
@@ -82,6 +84,9 @@ pub fn assemble_prompt_bundle(
     let mut warnings = plan.warnings.clone();
 
     sections.push(runtime_context_section(plan));
+    if let Some(state) = &plan.channel_state {
+        sections.push(channel_state_section(state));
+    }
 
     if plan.dispatch != TurnDispatch::AgentTurn {
         warnings.push(format!(
@@ -188,6 +193,55 @@ fn runtime_context_section(plan: &TurnPlan) -> PromptSection {
     }
 }
 
+fn channel_state_section(state: &crate::ChannelSessionState) -> PromptSection {
+    let mut content = String::new();
+    content.push_str(&format!(
+        "active_session_key: {}\n",
+        state.active_session_key
+    ));
+    content.push_str(&format!(
+        "session_topic: {}\n",
+        state.session_topic.as_deref().unwrap_or("-")
+    ));
+    content.push_str(&format!(
+        "model_override: {}\n",
+        state.model_override.as_deref().unwrap_or("-")
+    ));
+    content.push_str(&format!("thinking_enabled: {}\n", state.thinking_enabled));
+    content.push_str(&format!(
+        "thinking_instruction: {}\n",
+        state.thinking_instruction.as_deref().unwrap_or("-")
+    ));
+    content.push_str(&format!("stop_requested: {}\n", state.stop_requested));
+    content.push_str(&format!(
+        "stop_reason: {}\n",
+        state.stop_reason.as_deref().unwrap_or("-")
+    ));
+    push_notes(&mut content, "steering", &state.steering_notes);
+    push_notes(&mut content, "btw", &state.btw_notes);
+    let bytes = content.len();
+    PromptSection {
+        kind: PromptSectionKind::ChannelState,
+        title: "Channel command state".to_string(),
+        path: None,
+        bytes_original: bytes,
+        bytes_included: bytes,
+        truncated: false,
+        content,
+    }
+}
+
+fn push_notes(out: &mut String, label: &str, notes: &[crate::ChannelSessionNote]) {
+    out.push_str(&format!("{label}_notes_recent:\n"));
+    if notes.is_empty() {
+        out.push_str("- -\n");
+        return;
+    }
+    for note in notes.iter().rev().take(8).rev() {
+        out.push_str(&format!("- [{}] {}\n", note.at_ms, note.text));
+    }
+}
+
 fn read_limited_section(
     kind: PromptSectionKind,
     title: String,
@@ -215,6 +269,7 @@ fn summarize_sections(sections: &[PromptSection]) -> PromptBundleSummary {
     for section in sections {
         match section.kind {
             PromptSectionKind::RuntimeContext => {}
+            PromptSectionKind::ChannelState => summary.channel_state_sections_included += 1,
             PromptSectionKind::PromptFile => summary.prompt_files_included += 1,
             PromptSectionKind::Skill => summary.skills_included += 1,
             PromptSectionKind::UserMessage => summary.user_messages_included += 1,
@@ -244,6 +299,10 @@ fn render_prompt_markdown(bundle: &PromptBundle) -> String {
     out.push_str(&format!(
         "- Prompt files: `{}`\n",
         bundle.summary.prompt_files_included
+    ));
+    out.push_str(&format!(
+        "- Channel state sections: `{}`\n",
+        bundle.summary.channel_state_sections_included
     ));
     out.push_str(&format!("- Skills: `{}`\n", bundle.summary.skills_included));
     out.push_str(&format!(
@@ -303,6 +362,7 @@ mod tests {
             &registry,
             &skills,
             TurnPlanInput {
+                harness_home: None,
                 platform: "telegram".to_string(),
                 channel_id: "dm".to_string(),
                 user_id: "user".to_string(),
@@ -354,6 +414,7 @@ mod tests {
             &registry,
             &skills,
             TurnPlanInput {
+                harness_home: None,
                 platform: "telegram".to_string(),
                 channel_id: "dm".to_string(),
                 user_id: "user".to_string(),
@@ -388,6 +449,73 @@ mod tests {
     }
 
     #[test]
+    fn prompt_bundle_includes_channel_command_state() {
+        let root = temp_root("prompt_bundle_includes_channel_command_state");
+        let source = write_prompt_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        write_channel_state(
+            &harness_home,
+            r#"{
+              "schema": "openclaw-harness.channel-session-state.v1",
+              "platform": "telegram",
+              "channelId": "dm",
+              "userId": "user",
+              "activeSessionKey": "telegram:dm:user:main:new",
+              "agentId": "main",
+              "provider": "openai",
+              "model": "gpt-5",
+              "sessionTopic": "handoff",
+              "modelOverride": "openrouter/anthropic/claude-sonnet-4",
+              "modelOverrideProvider": "openrouter",
+              "modelOverrideModel": "anthropic/claude-sonnet-4",
+              "thinkingEnabled": true,
+              "thinkingInstruction": "check imported cron state",
+              "stopRequested": false,
+              "stopReason": null,
+              "steeringNotes": [
+                { "atMs": 1000, "text": "keep migration notes explicit" }
+              ],
+              "btwNotes": [
+                { "atMs": 1001, "text": "user prefers Codex OAuth" }
+              ],
+              "lastCommand": "btw",
+              "updatedAtMs": 1001
+            }"#,
+        );
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "continue migration".to_string(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        let bundle = assemble_prompt_bundle(&plan, PromptAssemblyOptions::default()).unwrap();
+
+        assert_eq!(bundle.summary.channel_state_sections_included, 1);
+        assert_eq!(bundle.provider.as_deref(), Some("openrouter"));
+        assert_eq!(bundle.model.as_deref(), Some("anthropic/claude-sonnet-4"));
+        assert!(bundle.sections.iter().any(|section| {
+            section.kind == PromptSectionKind::ChannelState
+                && section.content.contains("keep migration notes explicit")
+                && section.content.contains("user prefers Codex OAuth")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn prompt_bundle_does_not_assemble_command_as_agent_prompt() {
         let root = temp_root("prompt_bundle_does_not_assemble_command_as_agent_prompt");
         let source = write_prompt_source(&root);
@@ -398,6 +526,7 @@ mod tests {
             &registry,
             &skills,
             TurnPlanInput {
+                harness_home: None,
                 platform: "discord".to_string(),
                 channel_id: "dm".to_string(),
                 user_id: "user".to_string(),
@@ -436,6 +565,7 @@ mod tests {
             &registry,
             &skills,
             TurnPlanInput {
+                harness_home: None,
                 platform: "telegram".to_string(),
                 channel_id: "dm".to_string(),
                 user_id: "user".to_string(),
@@ -499,6 +629,18 @@ mod tests {
         )
         .unwrap();
         OpenClawSource::with_workspace(home, workspace)
+    }
+
+    fn write_channel_state(harness_home: &Path, state_json: &str) {
+        let state_file = harness_home
+            .join("state")
+            .join("channels")
+            .join("telegram")
+            .join("dm")
+            .join("user")
+            .join("state.json");
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        fs::write(state_file, state_json).unwrap();
     }
 
     fn temp_root(test_name: &str) -> PathBuf {

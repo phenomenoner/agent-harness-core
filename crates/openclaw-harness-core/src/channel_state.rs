@@ -98,7 +98,7 @@ pub fn apply_channel_command_step(
     step: &ChannelStep,
     options: ChannelCommandApplyOptions,
 ) -> io::Result<ChannelCommandApplyReport> {
-    let state_dir = channel_state_dir(
+    let state_dir = channel_session_state_dir(
         &options.harness_home,
         &step.platform,
         &step.channel_id,
@@ -178,6 +178,29 @@ pub fn apply_channel_command_step(
         receipt,
         warnings,
     })
+}
+
+pub fn read_channel_session_state(
+    harness_home: impl AsRef<Path>,
+    platform: &str,
+    channel_id: &str,
+    user_id: &str,
+) -> io::Result<Option<ChannelSessionState>> {
+    read_channel_state(&channel_session_state_file(
+        harness_home.as_ref(),
+        platform,
+        channel_id,
+        user_id,
+    ))
+}
+
+pub fn channel_session_state_file(
+    harness_home: &Path,
+    platform: &str,
+    channel_id: &str,
+    user_id: &str,
+) -> PathBuf {
+    channel_session_state_dir(harness_home, platform, channel_id, user_id).join("state.json")
 }
 
 fn read_channel_state(path: &Path) -> io::Result<Option<ChannelSessionState>> {
@@ -336,7 +359,7 @@ fn split_model_target(target: &str) -> (Option<String>, Option<String>) {
     }
 }
 
-fn channel_state_dir(
+fn channel_session_state_dir(
     harness_home: &Path,
     platform: &str,
     channel_id: &str,

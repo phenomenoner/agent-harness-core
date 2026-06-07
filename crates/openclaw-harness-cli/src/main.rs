@@ -268,6 +268,7 @@ fn run_turn_plan(args: &[String]) -> Result<(), String> {
         &registry,
         &skill_index,
         TurnPlanInput {
+            harness_home: args.harness_home.clone(),
             platform: args.platform,
             channel_id: args.channel_id,
             user_id: args.user_id,
@@ -302,6 +303,7 @@ fn run_channel_step(args: &[String]) -> Result<(), String> {
         &registry,
         &skill_index,
         TurnPlanInput {
+            harness_home: args.harness_home.clone(),
             platform: args.platform,
             channel_id: args.channel_id,
             user_id: args.user_id,
@@ -337,6 +339,7 @@ fn run_channel_apply(args: &[String]) -> Result<(), String> {
         &registry,
         &skill_index,
         TurnPlanInput {
+            harness_home: Some(args.target_home.clone()),
             platform: args.turn.platform,
             channel_id: args.turn.channel_id,
             user_id: args.turn.user_id,
@@ -374,6 +377,7 @@ fn run_queue_enqueue(args: &[String]) -> Result<(), String> {
         &registry,
         &skill_index,
         TurnPlanInput {
+            harness_home: Some(args.target_home.clone()),
             platform: args.turn.platform,
             channel_id: args.turn.channel_id,
             user_id: args.turn.user_id,
@@ -467,6 +471,7 @@ fn run_prompt_bundle(args: &[String]) -> Result<(), String> {
         &registry,
         &skill_index,
         TurnPlanInput {
+            harness_home: args.harness_home.clone(),
             platform: args.platform,
             channel_id: args.channel_id,
             user_id: args.user_id,
@@ -1851,6 +1856,17 @@ fn print_turn_plan(plan: &TurnPlan) {
         plan.model_policy.provider.as_deref().unwrap_or("-"),
         plan.model_policy.model.as_deref().unwrap_or("-")
     );
+    if let Some(state) = &plan.channel_state {
+        println!(
+            "Channel state: active_session={} model_override={} thinking={} steering_notes={} btw_notes={} stop_requested={}",
+            state.active_session_key,
+            state.model_override.as_deref().unwrap_or("-"),
+            yes_no(state.thinking_enabled),
+            state.steering_notes.len(),
+            state.btw_notes.len(),
+            yes_no(state.stop_requested)
+        );
+    }
     if let Some(command) = &plan.command {
         println!("Command: {}", command.name());
     }

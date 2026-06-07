@@ -1506,6 +1506,7 @@ mod tests {
             &registry,
             &skills,
             TurnPlanInput {
+                harness_home: None,
                 platform: "telegram".to_string(),
                 channel_id: "dm-42".to_string(),
                 user_id: "user-7".to_string(),
