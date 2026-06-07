@@ -10,7 +10,7 @@ The project starts with a small, testable foundation:
 - A read-only multi-agent registry parser for OpenClaw agents, providers, plugins, channels, and local agent state.
 - A target harness registry exporter that writes non-secret agent/provider/plugin/channel state with receipts.
 - A safe-copy import executor that copies planned non-sensitive state, skips raw secrets by default, backs up overwrite targets, and writes receipts.
-- A shared channel command parser for OpenClaw-style DM commands.
+- A shared channel command parser and runtime-intent contract for OpenClaw-style DM commands.
 - A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, and `registry-export` commands.
 - Minimal external crates: `serde` and `serde_json` for stable report/config/session JSON handling.
 
@@ -46,7 +46,7 @@ The registry command is also read-only. It merges `openclaw.json` agent config w
 
 `registry-export` writes the first target harness state files under `state/harness-registry.json` and `state/harness-registry-receipts.json`. It records credential presence as metadata only; it does not copy raw API keys, tokens, or login state.
 
-Telegram and Discord adapters should share the same channel command parser. Current parser coverage is `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`.
+Telegram and Discord adapters should share the same channel command parser and intent mapper. Current parser coverage is `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`; `/model` maps to show-or-switch model intents, and `/status` maps to scoped or global status intents.
 
 Cron import has two separate lanes: OpenClaw native agent-turn cron under `.openclaw/cron`, and deterministic workspace cron runners under `workspace/tools/cron-runner` plus `workspace/tools/backup-cron-runner`. The Rust harness must keep those paths separate because only the native lane is allowed to enqueue LLM-backed agent turns.
 

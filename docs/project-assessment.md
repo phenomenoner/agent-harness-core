@@ -286,7 +286,7 @@ Current implemented foundation:
 - The dry-run planner currently covers config, prompt files, skill directories, agent directories, native cron store, deterministic cron stores, subagent store, memory store, plugin install record, and plugin-state directory.
 - `import-execute` safe-copies planned prompt files, skills, agent directories, sessions, cron stores, subagent ledgers, memory snapshots, and plugin records; it skips raw sensitive items by default, omits known auth/secret files inside copied directories unless `--include-sensitive` is set, backs up overwrite targets, and writes `state/import-execute-receipts.json`.
 - Runtime execution, SQLite-consistent backup, Docker volume export, credential vault migration, and plugin execution are still pending.
-- A shared channel command parser exists for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`.
+- A shared channel command parser and runtime-intent mapper exists for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`; `/model` covers show/switch model, and `/status` covers global/scoped status requests.
 
 ### Phase 0: Foundation
 

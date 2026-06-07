@@ -7,7 +7,9 @@ pub mod harness_registry;
 pub mod importer;
 pub mod registry;
 
-pub use channel_commands::{ChannelCommand, parse_channel_command};
+pub use channel_commands::{
+    ChannelCommand, ChannelCommandIntent, parse_channel_command, parse_channel_command_intent,
+};
 pub use harness_registry::{
     CredentialStatus, HarnessAgent, HarnessPlugin, HarnessProvider, HarnessRegistry,
     HarnessRegistryExport, HarnessRegistryReceipt, HarnessRegistryReceiptFile,

@@ -9,6 +9,51 @@ pub enum ChannelCommand {
     Status { scope: Option<String> },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelCommandIntent {
+    StartNewSession { topic: Option<String> },
+    SetThinkingMode { instruction: Option<String> },
+    StopCurrentRun { reason: Option<String> },
+    AddSteering { instruction: String },
+    AddBtwNote { note: String },
+    ShowModel,
+    SwitchModel { target: String },
+    ShowStatus { scope: Option<String> },
+}
+
+impl ChannelCommand {
+    pub fn name(&self) -> &'static str {
+        match self {
+            ChannelCommand::New { .. } => "new",
+            ChannelCommand::Think { .. } => "think",
+            ChannelCommand::Stop { .. } => "stop",
+            ChannelCommand::Steer { .. } => "steer",
+            ChannelCommand::Btw { .. } => "btw",
+            ChannelCommand::Model { .. } => "model",
+            ChannelCommand::Status { .. } => "status",
+        }
+    }
+
+    pub fn into_intent(self) -> ChannelCommandIntent {
+        match self {
+            ChannelCommand::New { topic } => ChannelCommandIntent::StartNewSession { topic },
+            ChannelCommand::Think { instruction } => {
+                ChannelCommandIntent::SetThinkingMode { instruction }
+            }
+            ChannelCommand::Stop { reason } => ChannelCommandIntent::StopCurrentRun { reason },
+            ChannelCommand::Steer { instruction } => {
+                ChannelCommandIntent::AddSteering { instruction }
+            }
+            ChannelCommand::Btw { note } => ChannelCommandIntent::AddBtwNote { note },
+            ChannelCommand::Model { target } => match target {
+                Some(target) => ChannelCommandIntent::SwitchModel { target },
+                None => ChannelCommandIntent::ShowModel,
+            },
+            ChannelCommand::Status { scope } => ChannelCommandIntent::ShowStatus { scope },
+        }
+    }
+}
+
 pub fn parse_channel_command(input: &str) -> Option<ChannelCommand> {
     let trimmed = input.trim();
     let command_text = trimmed.strip_prefix('/')?;
@@ -34,6 +79,10 @@ pub fn parse_channel_command(input: &str) -> Option<ChannelCommand> {
         }),
         _ => None,
     }
+}
+
+pub fn parse_channel_command_intent(input: &str) -> Option<ChannelCommandIntent> {
+    parse_channel_command(input).map(ChannelCommand::into_intent)
 }
 
 fn split_command(value: &str) -> (&str, &str) {
@@ -119,6 +168,70 @@ mod tests {
             parse_channel_command("/status"),
             Some(ChannelCommand::Status { scope: None })
         );
+    }
+
+    #[test]
+    fn maps_commands_to_runtime_intents() {
+        assert_eq!(
+            parse_channel_command_intent("/new weekly review"),
+            Some(ChannelCommandIntent::StartNewSession {
+                topic: Some("weekly review".to_string())
+            })
+        );
+        assert_eq!(
+            parse_channel_command_intent("/think"),
+            Some(ChannelCommandIntent::SetThinkingMode { instruction: None })
+        );
+        assert_eq!(
+            parse_channel_command_intent("/stop user canceled"),
+            Some(ChannelCommandIntent::StopCurrentRun {
+                reason: Some("user canceled".to_string())
+            })
+        );
+        assert_eq!(
+            parse_channel_command_intent("/steer use agent main"),
+            Some(ChannelCommandIntent::AddSteering {
+                instruction: "use agent main".to_string()
+            })
+        );
+        assert_eq!(
+            parse_channel_command_intent("/btw check cron state"),
+            Some(ChannelCommandIntent::AddBtwNote {
+                note: "check cron state".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn maps_model_and_status_to_runtime_intents() {
+        assert_eq!(
+            parse_channel_command_intent("/model"),
+            Some(ChannelCommandIntent::ShowModel)
+        );
+        assert_eq!(
+            parse_channel_command_intent("/model openrouter/anthropic/claude-sonnet-4"),
+            Some(ChannelCommandIntent::SwitchModel {
+                target: "openrouter/anthropic/claude-sonnet-4".to_string()
+            })
+        );
+        assert_eq!(
+            parse_channel_command_intent("/status"),
+            Some(ChannelCommandIntent::ShowStatus { scope: None })
+        );
+        assert_eq!(
+            parse_channel_command_intent("/status cron"),
+            Some(ChannelCommandIntent::ShowStatus {
+                scope: Some("cron".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn exposes_stable_command_names_for_channel_adapters() {
+        let command = parse_channel_command("/model openai/gpt-5").unwrap();
+        assert_eq!(command.name(), "model");
+        let command = parse_channel_command("/status agents").unwrap();
+        assert_eq!(command.name(), "status");
     }
 
     #[test]
