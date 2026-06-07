@@ -39,10 +39,22 @@ fn run_doctor(args: &[String]) -> Result<(), String> {
 
     println!("Config: {}", yes_no(inv.has_config));
     println!("Prompt files: {}", inv.prompt_files.len());
+    println!("Agent directories: {}", inv.agent_dirs);
+    println!("Agent config/auth/model files: {}", inv.agent_config_files);
     println!("Session indexes: {}", inv.session_indexes.len());
     println!("Transcript files: {}", inv.transcript_files);
     println!("Trajectory files: {}", inv.trajectory_files);
     println!("Codex binding mirrors: {}", inv.codex_binding_files);
+    println!("Native cron jobs file: {}", yes_no(inv.native_cron_jobs));
+    println!("Native cron state file: {}", yes_no(inv.native_cron_state));
+    println!("Native cron run logs: {}", inv.native_cron_run_logs);
+    println!("Deterministic crontabs: {}", inv.deterministic_crontabs);
+    println!(
+        "Deterministic cron job scripts: {}",
+        inv.deterministic_cron_job_scripts
+    );
+    println!("Deterministic cron logs: {}", inv.deterministic_cron_logs);
+    println!("Subagent state files: {}", inv.subagent_state_files);
     println!("Memory files: {}", inv.memory_files);
     println!(
         "Plugin install record: {}",

@@ -13,11 +13,28 @@ The initial local inspection found an existing Docker OpenClaw stack:
 - OpenClaw state mount inside container: `/root/.openclaw`
 - Workspace bind mount: `D:\Warehouse\Research\OpenClaw_WSL` to `/workspace`
 - Runtime version: `2026.5.26`
-- Agents: 11 active configured agents
+- Agents: 11 active configured agents reported by status; deeper filesystem inventory found 24 agent directories under `/root/.openclaw/agents`
 - Sessions: 161 session records reported by status
 - Channels: Telegram and Discord enabled
 - Memory slot: `openclaw-mem-engine`
 - Loaded relevant plugins: `codex`, `openai`, `openrouter`, `telegram`, `discord`, `openclaw-mem`, `openclaw-mem-engine`, `openclaw-context-budget`, `acpx`
+
+Additional local findings on 2026-06-08:
+
+- OpenClaw native agent-turn cron lives in `/root/.openclaw/cron`.
+- Native cron source files: `jobs.json`, `jobs-state.json`, and `runs/*.jsonl`.
+- Current native cron count: 110 jobs, 65 enabled.
+- Native cron job distribution by agent: `main` 55, `cron-lite` 35, `steamer-cron` 13, `mem-cron` 3, `comms-cron` 2, unassigned 2.
+- Native cron schedules: 105 `cron` schedules and 5 `at` schedules.
+- Native cron wake modes: 82 `now`, 28 `next-heartbeat`.
+- Native cron job schema includes `agentId`, `createdAtMs`, `delivery`, `enabled`, `id`, `name`, `payload`, `schedule`, `sessionTarget`, `wakeMode`, `failureAlert`, `description`, and per-job `state`.
+- Deterministic cron lives under workspace tools, not under native cron: `/root/.openclaw/workspace/tools/cron-runner` and `/root/.openclaw/workspace/tools/backup-cron-runner`.
+- Deterministic cron runner files include crontabs, shell job scripts, locks, state, logs, and bundled `supercronic`.
+- Current deterministic cron crontabs contain 18 main job entries and 4 backup job entries after ignoring env/header lines.
+- `pgrep -af supercronic` did not show a running supercronic process during inspection, so import should preserve configuration/state but startup should be explicit.
+- Subagent state exists at `/root/.openclaw/subagents/runs.json`.
+- Agent-local state exists under `/root/.openclaw/agents/<agent-id>/agent`, commonly `models.json`, `auth-profiles.json`, `auth-state.json`, and sometimes `auth.json`.
+- Agent-local sessions live under `/root/.openclaw/agents/<agent-id>/sessions`.
 
 ## Recommended Architecture
 
@@ -61,25 +78,130 @@ Use a staged import. The first stage is read-only and produces an import plan. L
    - Preserve provider ids, agent ids, channel configs, plugin entries, plugin slots, and model fallbacks.
    - Move secrets to Windows Credential Manager or an encrypted local key store rather than writing them back to plain text.
 
-2. Workspace import
+2. Agent import
+   - Preserve `/agents/<agent-id>` directories, not only `openclaw.json`.
+   - Preserve per-agent `sessions/`, `agent/models.json`, `agent/auth-profiles.json`, `agent/auth-state.json`, and non-secret runtime metadata.
+   - Import the OpenClaw multi-agent routing model before enabling cron, because cron jobs reference `agentId`.
+   - Keep inactive/probe agents available but disabled until their provider credentials are validated.
+
+3. Workspace import
    - Preserve `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `USER.md`, `IDENTITY.md`, `HEARTBEAT.md`, `BOOTSTRAP.md`.
    - Preserve `skills/<skill>/SKILL.md`.
    - Preserve workspace-local `memory/`, tools, scripts, handoffs, and operational state.
 
-3. Session import
+4. Session import
    - Read `/agents/<agent-id>/sessions/sessions.json`.
    - Preserve session transcript files: `*.jsonl`.
    - Preserve trajectories: `*.trajectory.jsonl` and `*.trajectory-path.json`.
    - Preserve Codex binding mirrors: `*.jsonl.codex-app-server.json`.
    - Initial Rust support should expose these as searchable historical context before attempting active native resume.
 
-4. Memory import
+5. Native cron import
+   - Read `/cron/jobs.json` and `/cron/jobs-state.json`.
+   - Preserve `id`, `name`, `agentId`, `enabled`, `schedule`, `wakeMode`, `sessionTarget`, `delivery`, and payload metadata.
+   - Preserve `runs/*.jsonl` as historical execution receipts.
+   - On first cutover, do not immediately fire overdue jobs. Compute a cutover watermark and require an explicit `resume-cron` command.
+   - Runtime implementation needs an agent-turn scheduler that can enqueue a message into the selected agent's session and invoke the LLM-backed runtime.
+
+6. Deterministic cron import
+   - Read workspace crontabs and job scripts under `tools/cron-runner` and `tools/backup-cron-runner`.
+   - Preserve `locks/`, `state/`, and `logs/` as operational evidence.
+   - Run these jobs through a deterministic job runner path with no LLM/model request capability.
+   - Prefer native Rust process supervision on Windows; use WSL/Docker only as a compatibility fallback for shell scripts that are not portable yet.
+
+7. Subagent import
+   - Preserve `/subagents/runs.json`.
+   - Preserve subagent ready/running/completed ledgers before enabling native worker execution.
+   - Keep subagent execution behind a queue with per-agent concurrency limits, cancellation, retries, and receipt files.
+
+8. Memory import
    - Preserve `.openclaw/memory/*.md`, `openclaw-mem.sqlite`, `openclaw-mem-observations.jsonl`, `openclaw-mem-episodes.jsonl`, mem-engine DBs, LanceDB data, and graph/vector sidecars.
    - SQLite files should be copied from a stopped gateway or through a backup API to avoid WAL loss.
 
-5. Plugin import
+9. Plugin import
    - Import install records and config, but execute plugins through the sidecar initially.
    - Refresh or rebuild stale plugin registry state instead of trusting stale persisted paths.
+
+10. Credential and login-state import
+   - Importing raw login state is best-effort only.
+   - Provider API keys, Telegram/Discord bot tokens, and OpenClaw gateway secrets should be migrated into Windows Credential Manager or an encrypted harness vault.
+   - Browser/session cookies and service-specific login state should be treated as non-portable unless the source plugin explicitly supports export/import.
+   - The handoff path should assume credentials may need to be re-entered and make that flow cheap.
+
+## Gateway Handoff Requirements
+
+To shut down the Docker OpenClaw gateway and let the Rust Windows harness take over current work, the MVP needs more than import. It needs runtime parity for the active surfaces currently doing work.
+
+Required for a real cutover:
+
+1. State export/import
+   - A read-only `doctor` and `import-plan`.
+   - A copy planner that maps `/root/.openclaw` to a Windows harness home.
+   - SQLite-safe backup for memory/plugin DBs.
+   - Receipts for every copied or skipped path.
+
+2. Multi-agent registry
+   - Parse `openclaw.json` `agents.defaults` and `agents.list`.
+   - Load agent directories from `/agents/<agent-id>`.
+   - Resolve per-agent model/provider/auth settings.
+   - Route each inbound channel message or cron job to the correct agent id.
+
+3. Codex runtime adapter
+   - Start and supervise the custom Codex CLI/app-server.
+   - Create/resume sessions per agent.
+   - Feed prompt files, memory pack, channel envelope, and imported session context.
+   - Persist transcript, trajectory, and Codex binding mirror files in an OpenClaw-compatible layout.
+
+4. Provider routing
+   - Support Codex/OpenAI as the primary path.
+   - Support OpenRouter/OpenAI-compatible providers with model selection and fallback.
+   - Preserve provider/model policy per agent and per cron payload.
+
+5. Tool execution and approval
+   - Implement a tool registry.
+   - Bridge OpenClaw plugin tools through a Node sidecar first.
+   - Support shell/tool approval policy and audit logs.
+   - Keep deterministic cron jobs on a separate execution path that cannot call model runtime.
+
+6. Messaging channels
+   - Telegram bot receive/send, direct-message mapping, delivery receipts, and retry queue.
+   - Discord bot receive/send, DM/thread/channel mapping, delivery receipts, and retry queue.
+   - Imported channel identity must map to the same OpenClaw session key shape where practical.
+
+7. Cron scheduler
+   - Native agent-turn cron scheduler for `/cron/jobs.json`.
+   - Runtime state writer for `/cron/jobs-state.json`.
+   - Run logs compatible with `/cron/runs/*.jsonl`.
+   - Deterministic cron scheduler for workspace crontabs and shell jobs.
+   - Cutover safety: no automatic catch-up storm on first boot.
+
+8. Memory
+   - First-class `openclaw-mem` gateway client for pack/search/propose.
+   - Import raw memory files and DB snapshots.
+   - Restore mem-engine lookup/writeback jobs.
+   - Treat imported memory as evidence, not executable instruction.
+
+9. Plugin compatibility
+   - Node plugin-host sidecar that can load OpenClaw plugins, expose tools/hooks/memory slots, and return typed receipts.
+   - Rust-native plugin ABI can wait until the bridge has real coverage.
+
+10. Operations
+   - Windows service or scheduled startup.
+   - Structured logs.
+   - Health endpoint.
+   - Backup/export command.
+   - Dry-run cutover checklist.
+
+Minimum viable handoff order:
+
+1. Import state and agents.
+2. Bring up Codex runtime adapter.
+3. Bring up Telegram/Discord.
+4. Bring up memory pack/search.
+5. Enable native cron in dry-run.
+6. Enable deterministic cron.
+7. Enable plugin sidecar tools.
+8. Stop Docker gateway and run Rust harness with cron catch-up disabled.
 
 ## Major Risks
 

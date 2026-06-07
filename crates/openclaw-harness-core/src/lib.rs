@@ -38,10 +38,19 @@ pub struct OpenClawInventory {
     pub source: OpenClawSource,
     pub has_config: bool,
     pub prompt_files: Vec<PathBuf>,
+    pub agent_dirs: usize,
+    pub agent_config_files: usize,
     pub session_indexes: Vec<PathBuf>,
     pub transcript_files: usize,
     pub trajectory_files: usize,
     pub codex_binding_files: usize,
+    pub native_cron_jobs: bool,
+    pub native_cron_state: bool,
+    pub native_cron_run_logs: usize,
+    pub deterministic_crontabs: usize,
+    pub deterministic_cron_job_scripts: usize,
+    pub deterministic_cron_logs: usize,
+    pub subagent_state_files: usize,
     pub memory_files: usize,
     pub plugin_install_record: bool,
     pub plugin_state_db: bool,
@@ -51,10 +60,19 @@ impl OpenClawInventory {
     pub fn is_empty(&self) -> bool {
         !self.has_config
             && self.prompt_files.is_empty()
+            && self.agent_dirs == 0
+            && self.agent_config_files == 0
             && self.session_indexes.is_empty()
             && self.transcript_files == 0
             && self.trajectory_files == 0
             && self.codex_binding_files == 0
+            && !self.native_cron_jobs
+            && !self.native_cron_state
+            && self.native_cron_run_logs == 0
+            && self.deterministic_crontabs == 0
+            && self.deterministic_cron_job_scripts == 0
+            && self.deterministic_cron_logs == 0
+            && self.subagent_state_files == 0
             && self.memory_files == 0
             && !self.plugin_install_record
             && !self.plugin_state_db
@@ -84,12 +102,47 @@ pub enum ImportPhaseStatus {
 pub fn inventory(source: OpenClawSource) -> io::Result<OpenClawInventory> {
     let has_config = source.home.join("openclaw.json").is_file();
     let prompt_files = existing_prompt_files(&source.workspace);
-    let session_indexes = find_named_files(&source.home.join("agents"), "sessions.json")?;
-    let transcript_files = count_transcript_files(&source.home.join("agents"))?;
-    let trajectory_files =
-        count_files_with_suffix(&source.home.join("agents"), ".trajectory.jsonl")?;
+    let agents_root = source.home.join("agents");
+    let agent_dirs = count_child_dirs(&agents_root)?;
+    let agent_config_files = count_agent_config_files(&agents_root)?;
+    let session_indexes = find_named_files(&agents_root, "sessions.json")?;
+    let transcript_files = count_transcript_files(&agents_root)?;
+    let trajectory_files = count_files_with_suffix(&agents_root, ".trajectory.jsonl")?;
     let codex_binding_files =
-        count_files_with_suffix(&source.home.join("agents"), ".jsonl.codex-app-server.json")?;
+        count_files_with_suffix(&agents_root, ".jsonl.codex-app-server.json")?;
+    let cron_root = source.home.join("cron");
+    let native_cron_jobs = cron_root.join("jobs.json").is_file();
+    let native_cron_state = cron_root.join("jobs-state.json").is_file();
+    let native_cron_run_logs = count_files_with_suffix(&cron_root.join("runs"), ".jsonl")?;
+    let deterministic_crontabs = count_named_files_under(&source.workspace, "crontab")?
+        + count_files_with_suffix(&source.workspace, ".crontab")?;
+    let deterministic_cron_job_scripts = count_regular_files(
+        &source
+            .workspace
+            .join("tools")
+            .join("cron-runner")
+            .join("jobs"),
+    )? + count_regular_files(
+        &source
+            .workspace
+            .join("tools")
+            .join("backup-cron-runner")
+            .join("jobs"),
+    )?;
+    let deterministic_cron_logs = count_regular_files(
+        &source
+            .workspace
+            .join("tools")
+            .join("cron-runner")
+            .join("logs"),
+    )? + count_regular_files(
+        &source
+            .workspace
+            .join("tools")
+            .join("backup-cron-runner")
+            .join("logs"),
+    )?;
+    let subagent_state_files = count_regular_files(&source.home.join("subagents"))?;
     let memory_files = count_regular_files(&source.home.join("memory"))?;
     let plugin_install_record = source.home.join("plugins").join("installs.json").is_file();
     let plugin_state_db = source
@@ -102,10 +155,19 @@ pub fn inventory(source: OpenClawSource) -> io::Result<OpenClawInventory> {
         source,
         has_config,
         prompt_files,
+        agent_dirs,
+        agent_config_files,
         session_indexes,
         transcript_files,
         trajectory_files,
         codex_binding_files,
+        native_cron_jobs,
+        native_cron_state,
+        native_cron_run_logs,
+        deterministic_crontabs,
+        deterministic_cron_job_scripts,
+        deterministic_cron_logs,
+        subagent_state_files,
         memory_files,
         plugin_install_record,
         plugin_state_db,
@@ -145,6 +207,20 @@ pub fn build_import_plan(inv: &OpenClawInventory) -> ImportPlan {
     });
 
     phases.push(ImportPhase {
+        name: "agents",
+        required: true,
+        status: if inv.agent_dirs == 0 {
+            ImportPhaseStatus::Missing
+        } else {
+            ImportPhaseStatus::Ready
+        },
+        notes: vec![format!(
+            "{} agent directories, {} agent-local config/auth/model files; preserve multi-agent routing and per-agent sessions",
+            inv.agent_dirs, inv.agent_config_files
+        )],
+    });
+
+    phases.push(ImportPhase {
         name: "sessions",
         required: false,
         status: if inv.session_indexes.is_empty() {
@@ -158,6 +234,50 @@ pub fn build_import_plan(inv: &OpenClawInventory) -> ImportPlan {
             inv.transcript_files,
             inv.trajectory_files,
             inv.codex_binding_files
+        )],
+    });
+
+    phases.push(ImportPhase {
+        name: "native-cron",
+        required: true,
+        status: if inv.native_cron_jobs {
+            ImportPhaseStatus::Ready
+        } else {
+            ImportPhaseStatus::Missing
+        },
+        notes: vec![format!(
+            "jobs.json: {}, jobs-state.json: {}, {} run logs; import OpenClaw agent-turn cron before gateway handoff",
+            inv.native_cron_jobs, inv.native_cron_state, inv.native_cron_run_logs
+        )],
+    });
+
+    phases.push(ImportPhase {
+        name: "deterministic-cron",
+        required: false,
+        status: if inv.deterministic_crontabs == 0 && inv.deterministic_cron_job_scripts == 0 {
+            ImportPhaseStatus::Missing
+        } else {
+            ImportPhaseStatus::Ready
+        },
+        notes: vec![format!(
+            "{} crontab files, {} job scripts, {} log/state files; run without LLM request path",
+            inv.deterministic_crontabs,
+            inv.deterministic_cron_job_scripts,
+            inv.deterministic_cron_logs
+        )],
+    });
+
+    phases.push(ImportPhase {
+        name: "subagents",
+        required: false,
+        status: if inv.subagent_state_files == 0 {
+            ImportPhaseStatus::Missing
+        } else {
+            ImportPhaseStatus::Ready
+        },
+        notes: vec![format!(
+            "{} subagent state files found; preserve ready queue/run ledger before enabling native worker execution",
+            inv.subagent_state_files
         )],
     });
 
@@ -208,6 +328,48 @@ fn find_named_files(root: &Path, name: &str) -> io::Result<Vec<PathBuf>> {
         }
     })?;
     Ok(matches)
+}
+
+fn count_named_files_under(root: &Path, name: &str) -> io::Result<usize> {
+    let mut count = 0;
+    visit_files(root, &mut |path| {
+        if path.file_name().and_then(|value| value.to_str()) == Some(name) {
+            count += 1;
+        }
+    })?;
+    Ok(count)
+}
+
+fn count_child_dirs(root: &Path) -> io::Result<usize> {
+    if !root.exists() {
+        return Ok(0);
+    }
+
+    let mut count = 0;
+    for entry in fs::read_dir(root)? {
+        if entry?.file_type()?.is_dir() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn count_agent_config_files(root: &Path) -> io::Result<usize> {
+    const AGENT_CONFIG_NAMES: &[&str] = &[
+        "auth.json",
+        "auth-profiles.json",
+        "auth-state.json",
+        "models.json",
+    ];
+
+    let mut count = 0;
+    visit_files(root, &mut |path| {
+        let name = path.file_name().and_then(|value| value.to_str());
+        if name.is_some_and(|name| AGENT_CONFIG_NAMES.contains(&name)) {
+            count += 1;
+        }
+    })?;
+    Ok(count)
 }
 
 fn count_regular_files(root: &Path) -> io::Result<usize> {
@@ -267,18 +429,49 @@ mod tests {
         let home = root.join(".openclaw");
         let workspace = home.join("workspace");
         let agent_sessions = home.join("agents").join("main").join("sessions");
+        let agent_home = home.join("agents").join("main").join("agent");
+        let cron_runs = home.join("cron").join("runs");
+        let deterministic_jobs = workspace.join("tools").join("cron-runner").join("jobs");
+        let deterministic_logs = workspace.join("tools").join("cron-runner").join("logs");
         fs::create_dir_all(&workspace).unwrap();
         fs::create_dir_all(&agent_sessions).unwrap();
+        fs::create_dir_all(&agent_home).unwrap();
+        fs::create_dir_all(&cron_runs).unwrap();
+        fs::create_dir_all(&deterministic_jobs).unwrap();
+        fs::create_dir_all(&deterministic_logs).unwrap();
         fs::create_dir_all(home.join("memory")).unwrap();
         fs::create_dir_all(home.join("plugins")).unwrap();
         fs::create_dir_all(home.join("plugin-state")).unwrap();
+        fs::create_dir_all(home.join("subagents")).unwrap();
 
         fs::write(home.join("openclaw.json"), "{}").unwrap();
         fs::write(workspace.join("AGENTS.md"), "# Agent").unwrap();
+        fs::write(agent_home.join("models.json"), "{}").unwrap();
+        fs::write(agent_home.join("auth-state.json"), "{}").unwrap();
         fs::write(agent_sessions.join("sessions.json"), "{}").unwrap();
         fs::write(agent_sessions.join("abc.jsonl"), "{}\n").unwrap();
         fs::write(agent_sessions.join("abc.trajectory.jsonl"), "{}\n").unwrap();
         fs::write(agent_sessions.join("abc.jsonl.codex-app-server.json"), "{}").unwrap();
+        fs::write(home.join("cron").join("jobs.json"), "{\"jobs\":[]}").unwrap();
+        fs::write(home.join("cron").join("jobs-state.json"), "{\"jobs\":{}}").unwrap();
+        fs::write(cron_runs.join("run.jsonl"), "{}\n").unwrap();
+        fs::create_dir_all(workspace.join("tools").join("cron-runner").join("crontab")).unwrap();
+        fs::write(
+            workspace
+                .join("tools")
+                .join("cron-runner")
+                .join("crontab")
+                .join("openclaw-mem.crontab"),
+            "* * * * * jobs/episodic_extract_1m.sh\n",
+        )
+        .unwrap();
+        fs::write(
+            deterministic_jobs.join("episodic_extract_1m.sh"),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
+        fs::write(deterministic_logs.join("supercronic.log"), "").unwrap();
+        fs::write(home.join("subagents").join("runs.json"), "{\"runs\":[]}").unwrap();
         fs::write(home.join("memory").join("2026-06-08.md"), "# Memory").unwrap();
         fs::write(home.join("plugins").join("installs.json"), "{}").unwrap();
         fs::write(home.join("plugin-state").join("state.sqlite"), "").unwrap();
@@ -287,10 +480,19 @@ mod tests {
 
         assert!(inv.has_config);
         assert_eq!(inv.prompt_files.len(), 1);
+        assert_eq!(inv.agent_dirs, 1);
+        assert_eq!(inv.agent_config_files, 2);
         assert_eq!(inv.session_indexes.len(), 1);
         assert_eq!(inv.transcript_files, 1);
         assert_eq!(inv.trajectory_files, 1);
         assert_eq!(inv.codex_binding_files, 1);
+        assert!(inv.native_cron_jobs);
+        assert!(inv.native_cron_state);
+        assert_eq!(inv.native_cron_run_logs, 1);
+        assert_eq!(inv.deterministic_crontabs, 1);
+        assert_eq!(inv.deterministic_cron_job_scripts, 1);
+        assert_eq!(inv.deterministic_cron_logs, 1);
+        assert_eq!(inv.subagent_state_files, 1);
         assert_eq!(inv.memory_files, 1);
         assert!(inv.plugin_install_record);
         assert!(inv.plugin_state_db);
@@ -304,10 +506,19 @@ mod tests {
             source: OpenClawSource::new("unused"),
             has_config: true,
             prompt_files: vec![PathBuf::from("AGENTS.md")],
+            agent_dirs: 2,
+            agent_config_files: 4,
             session_indexes: vec![PathBuf::from("sessions.json")],
             transcript_files: 2,
             trajectory_files: 1,
             codex_binding_files: 1,
+            native_cron_jobs: true,
+            native_cron_state: true,
+            native_cron_run_logs: 8,
+            deterministic_crontabs: 2,
+            deterministic_cron_job_scripts: 6,
+            deterministic_cron_logs: 3,
+            subagent_state_files: 1,
             memory_files: 3,
             plugin_install_record: true,
             plugin_state_db: true,
@@ -319,7 +530,11 @@ mod tests {
         assert_eq!(plan.phases[1].status, ImportPhaseStatus::Ready);
         assert_eq!(plan.phases[2].status, ImportPhaseStatus::Ready);
         assert_eq!(plan.phases[3].status, ImportPhaseStatus::Ready);
-        assert_eq!(plan.phases[4].status, ImportPhaseStatus::Deferred);
+        assert_eq!(plan.phases[4].status, ImportPhaseStatus::Ready);
+        assert_eq!(plan.phases[5].status, ImportPhaseStatus::Ready);
+        assert_eq!(plan.phases[6].status, ImportPhaseStatus::Ready);
+        assert_eq!(plan.phases[7].status, ImportPhaseStatus::Ready);
+        assert_eq!(plan.phases[8].status, ImportPhaseStatus::Deferred);
     }
 
     fn temp_root(test_name: &str) -> PathBuf {
