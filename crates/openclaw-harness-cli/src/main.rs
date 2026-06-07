@@ -3,10 +3,11 @@ use std::path::PathBuf;
 
 use openclaw_harness_core::{
     AgentRegistry, ConflictPolicy, DryRunImportOptions, ExecuteImportOptions, ImportPhaseStatus,
-    ImportReport, OpenClawSource, SkillIndex, SkillSelectionQuery, TurnPlan, TurnPlanInput,
-    build_dry_run_report, build_harness_skill_index, build_import_plan, build_source_skill_index,
-    build_turn_plan, execute_import, export_harness_registry_files, inventory, load_agent_registry,
-    select_skills, write_report_files, write_skill_index, write_turn_plan,
+    ImportReport, OpenClawSource, PromptAssemblyOptions, PromptBundle, SkillIndex,
+    SkillSelectionQuery, TurnPlan, TurnPlanInput, assemble_prompt_bundle, build_dry_run_report,
+    build_harness_skill_index, build_import_plan, build_source_skill_index, build_turn_plan,
+    execute_import, export_harness_registry_files, inventory, load_agent_registry, select_skills,
+    write_prompt_bundle, write_report_files, write_skill_index, write_turn_plan,
 };
 
 fn main() {
@@ -23,6 +24,7 @@ fn main() {
         "registry-export" => run_registry_export(&rest),
         "skills" => run_skills(&rest),
         "turn-plan" => run_turn_plan(&rest),
+        "prompt-bundle" => run_prompt_bundle(&rest),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -265,6 +267,49 @@ fn run_turn_plan(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_prompt_bundle(args: &[String]) -> Result<(), String> {
+    let args = turn_plan_args_from_args(args)?;
+    let registry = load_agent_registry(&args.source).map_err(|err| err.to_string())?;
+    let skill_index = match &args.harness_home {
+        Some(harness_home) => build_harness_skill_index(harness_home),
+        None => build_source_skill_index(&args.source),
+    }
+    .map_err(|err| err.to_string())?;
+    let plan = build_turn_plan(
+        &args.source,
+        &registry,
+        &skill_index,
+        TurnPlanInput {
+            platform: args.platform,
+            channel_id: args.channel_id,
+            user_id: args.user_id,
+            text: args.message,
+            requested_agent_id: args.agent_id,
+            session_hint: args.session_key,
+            skill_limit: args.skill_limit,
+        },
+    )
+    .map_err(|err| err.to_string())?;
+    let bundle = assemble_prompt_bundle(
+        &plan,
+        PromptAssemblyOptions {
+            max_prompt_file_bytes: args.max_prompt_file_bytes,
+            max_skill_file_bytes: args.max_skill_file_bytes,
+        },
+    )
+    .map_err(|err| err.to_string())?;
+
+    print_prompt_bundle(&bundle);
+
+    if let Some(output_dir) = args.output_dir {
+        let files = write_prompt_bundle(&bundle, output_dir).map_err(|err| err.to_string())?;
+        println!("Prompt bundle JSON: {}", files.json.display());
+        println!("Prompt markdown: {}", files.markdown.display());
+    }
+
+    Ok(())
+}
+
 fn source_from_args(args: &[String]) -> Result<OpenClawSource, String> {
     let mut home = default_openclaw_home();
     let mut workspace = None;
@@ -340,6 +385,8 @@ struct TurnPlanArgs {
     session_key: Option<String>,
     message: String,
     skill_limit: usize,
+    max_prompt_file_bytes: usize,
+    max_skill_file_bytes: usize,
 }
 
 fn dry_run_args_from_args(args: &[String]) -> Result<DryRunArgs, String> {
@@ -638,6 +685,8 @@ fn turn_plan_args_from_args(args: &[String]) -> Result<TurnPlanArgs, String> {
     let mut session_key = None;
     let mut message = None;
     let mut skill_limit = 5;
+    let mut max_prompt_file_bytes = PromptAssemblyOptions::default().max_prompt_file_bytes;
+    let mut max_skill_file_bytes = PromptAssemblyOptions::default().max_skill_file_bytes;
     let mut i = 0;
 
     while i < args.len() {
@@ -725,6 +774,22 @@ fn turn_plan_args_from_args(args: &[String]) -> Result<TurnPlanArgs, String> {
                     .ok_or_else(|| "--skill-limit requires a positive integer".to_string())
                     .and_then(|value| parse_limit(value))?;
             }
+            "--max-prompt-file-bytes" => {
+                i += 1;
+                max_prompt_file_bytes = args
+                    .get(i)
+                    .ok_or_else(|| {
+                        "--max-prompt-file-bytes requires a positive integer".to_string()
+                    })
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--max-skill-file-bytes" => {
+                i += 1;
+                max_skill_file_bytes = args
+                    .get(i)
+                    .ok_or_else(|| "--max-skill-file-bytes requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
             flag => return Err(format!("unknown argument: {flag}")),
         }
         i += 1;
@@ -746,6 +811,8 @@ fn turn_plan_args_from_args(args: &[String]) -> Result<TurnPlanArgs, String> {
         session_key,
         message: message.ok_or_else(|| "--message is required".to_string())?,
         skill_limit,
+        max_prompt_file_bytes,
+        max_skill_file_bytes,
     })
 }
 
@@ -1060,6 +1127,33 @@ fn print_turn_plan(plan: &TurnPlan) {
     }
 }
 
+fn print_prompt_bundle(bundle: &PromptBundle) {
+    println!("OpenClaw prompt bundle");
+    println!("Dispatch: {:?}", bundle.dispatch);
+    println!("Session key: {}", bundle.session_key);
+    println!("Agent: {}", bundle.agent_id.as_deref().unwrap_or("-"));
+    println!(
+        "Model policy: provider={} model={}",
+        bundle.provider.as_deref().unwrap_or("-"),
+        bundle.model.as_deref().unwrap_or("-")
+    );
+    println!(
+        "Sections: {} prompt_files={} skills={} user_messages={}",
+        bundle.sections.len(),
+        bundle.summary.prompt_files_included,
+        bundle.summary.skills_included,
+        bundle.summary.user_messages_included
+    );
+    println!("Bytes included: {}", bundle.summary.bytes_included);
+    println!("Truncated sections: {}", bundle.summary.truncated_sections);
+    if !bundle.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &bundle.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
 fn print_help() {
     println!("openclaw-harness");
     println!();
@@ -1072,6 +1166,7 @@ fn print_help() {
     println!("  registry-export Write target harness registry state");
     println!("  skills          Build a skill-first index and optionally match a task");
     println!("  turn-plan       Plan routing, commands, prompts, and skills for one turn");
+    println!("  prompt-bundle   Assemble prompt files, selected skills, and message");
     println!();
     println!("Options:");
     println!("  --openclaw-home <path>  Source .openclaw directory");
@@ -1092,4 +1187,6 @@ fn print_help() {
     println!("  --user-id <id>          User identity for session mapping");
     println!("  --session-key <key>     Existing session key override");
     println!("  --skill-limit <n>       Maximum selected skills for turn-plan");
+    println!("  --max-prompt-file-bytes <n> Cap each prompt file in prompt-bundle");
+    println!("  --max-skill-file-bytes <n>  Cap each skill file in prompt-bundle");
 }

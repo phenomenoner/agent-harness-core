@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 pub mod channel_commands;
 pub mod harness_registry;
 pub mod importer;
+pub mod prompt;
 pub mod registry;
 pub mod skills;
 pub mod turns;
@@ -24,6 +25,10 @@ pub use importer::{
     ImportItem, ImportItemKind, ImportItemStatus, ImportReport, ImportReportSummary,
     ImportSemantics, NativeCronSemantics, ReportFiles, SessionSemantics, build_dry_run_report,
     execute_import, write_report_files,
+};
+pub use prompt::{
+    PromptAssemblyOptions, PromptBundle, PromptBundleFiles, PromptBundleSummary, PromptSection,
+    PromptSectionKind, assemble_prompt_bundle, write_prompt_bundle,
 };
 pub use registry::{
     AgentDefaults, AgentProfile, AgentProfileSource, AgentRegistry, ChannelRegistry, PluginProfile,
