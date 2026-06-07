@@ -6,12 +6,13 @@ use openclaw_harness_core::{
     AgentRegistry, ConflictPolicy, DeterministicCronPlan, DeterministicCronPlanInput,
     DryRunImportOptions, ExecuteImportOptions, ImportPhaseStatus, ImportReport, NativeCronPlan,
     NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions, PromptBundle, SkillIndex,
-    SkillSelectionQuery, TurnPlan, TurnPlanInput, assemble_prompt_bundle, build_dry_run_report,
-    build_harness_skill_index, build_import_plan, build_source_skill_index, build_turn_plan,
-    execute_import, export_harness_registry_files, inventory, load_agent_registry,
-    load_deterministic_cron_store, load_native_cron_store, plan_deterministic_cron,
-    plan_native_cron, select_skills, write_deterministic_cron_plan, write_native_cron_plan,
-    write_prompt_bundle, write_report_files, write_skill_index, write_turn_plan,
+    SkillSelectionQuery, SubagentPlan, SubagentPlanInput, TurnPlan, TurnPlanInput,
+    assemble_prompt_bundle, build_dry_run_report, build_harness_skill_index, build_import_plan,
+    build_source_skill_index, build_turn_plan, execute_import, export_harness_registry_files,
+    inventory, load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
+    load_subagent_ledger, plan_deterministic_cron, plan_native_cron, plan_subagents, select_skills,
+    write_deterministic_cron_plan, write_native_cron_plan, write_prompt_bundle, write_report_files,
+    write_skill_index, write_subagent_plan, write_turn_plan,
 };
 
 fn main() {
@@ -31,6 +32,7 @@ fn main() {
         "prompt-bundle" => run_prompt_bundle(&rest),
         "cron-plan" => run_cron_plan(&rest),
         "deterministic-cron-plan" => run_deterministic_cron_plan(&rest),
+        "subagent-plan" => run_subagent_plan(&rest),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -360,6 +362,26 @@ fn run_deterministic_cron_plan(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_subagent_plan(args: &[String]) -> Result<(), String> {
+    let args = subagent_plan_args_from_args(args)?;
+    let ledger = load_subagent_ledger(&args.source).map_err(|err| err.to_string())?;
+    let plan = plan_subagents(
+        &ledger,
+        SubagentPlanInput {
+            resume_subagents: args.resume_subagents,
+        },
+    );
+
+    print_subagent_plan(&plan, args.limit);
+
+    if let Some(output_dir) = args.output_dir {
+        let file = write_subagent_plan(&plan, output_dir).map_err(|err| err.to_string())?;
+        println!("Subagent plan JSON: {}", file.json.display());
+    }
+
+    Ok(())
+}
+
 fn source_from_args(args: &[String]) -> Result<OpenClawSource, String> {
     let mut home = default_openclaw_home();
     let mut workspace = None;
@@ -451,6 +473,13 @@ struct DeterministicCronPlanArgs {
     source: OpenClawSource,
     output_dir: Option<PathBuf>,
     allow_deterministic_run: bool,
+    limit: usize,
+}
+
+struct SubagentPlanArgs {
+    source: OpenClawSource,
+    output_dir: Option<PathBuf>,
+    resume_subagents: bool,
     limit: usize,
 }
 
@@ -1010,6 +1039,65 @@ fn deterministic_cron_plan_args_from_args(
     })
 }
 
+fn subagent_plan_args_from_args(args: &[String]) -> Result<SubagentPlanArgs, String> {
+    let mut home = default_openclaw_home();
+    let mut workspace = None;
+    let mut output_dir = None;
+    let mut resume_subagents = false;
+    let mut limit = 20;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--openclaw-home" => {
+                i += 1;
+                home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--openclaw-home requires a path".to_string())?;
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            "--output" => {
+                i += 1;
+                output_dir = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--output requires a path".to_string())?,
+                );
+            }
+            "--resume-subagents" => resume_subagents = true,
+            "--limit" => {
+                i += 1;
+                limit = args
+                    .get(i)
+                    .ok_or_else(|| "--limit requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let source = match workspace {
+        Some(workspace) => OpenClawSource::with_workspace(home, workspace),
+        None => OpenClawSource::new(home),
+    };
+
+    Ok(SubagentPlanArgs {
+        source,
+        output_dir,
+        resume_subagents,
+        limit,
+    })
+}
+
 fn default_openclaw_home() -> PathBuf {
     if let Ok(value) = env::var("OPENCLAW_HOME") {
         return PathBuf::from(value);
@@ -1452,6 +1540,46 @@ fn print_deterministic_cron_plan(plan: &DeterministicCronPlan, limit: usize) {
     }
 }
 
+fn print_subagent_plan(plan: &SubagentPlan, limit: usize) {
+    println!("OpenClaw subagent plan");
+    println!("Source home: {}", plan.source_home.display());
+    println!("Resume subagents: {}", yes_no(plan.resume_subagents));
+    println!("Runs: {}", plan.summary.total_runs);
+    println!("Completed noop: {}", plan.summary.completed_noop);
+    println!("Failed noop: {}", plan.summary.failed_noop);
+    println!("Canceled noop: {}", plan.summary.canceled_noop);
+    println!("Cutover held: {}", plan.summary.cutover_held);
+    println!("Resume candidates: {}", plan.summary.resume_candidates);
+    println!(
+        "Unknown status review: {}",
+        plan.summary.unknown_status_review
+    );
+    if !plan.entries.is_empty() {
+        println!();
+        println!("Entries:");
+        for entry in plan.entries.iter().take(limit) {
+            println!(
+                "- {} {:?} agent={} parent={} session={} reason={}",
+                entry.run_id,
+                entry.action,
+                entry.agent_id.as_deref().unwrap_or("-"),
+                entry.parent_agent_id.as_deref().unwrap_or("-"),
+                entry.session_key.as_deref().unwrap_or("-"),
+                entry.reason
+            );
+        }
+        if plan.entries.len() > limit {
+            println!("... {} more entries", plan.entries.len() - limit);
+        }
+    }
+    if !plan.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &plan.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
 fn print_help() {
     println!("openclaw-harness");
     println!();
@@ -1467,6 +1595,7 @@ fn print_help() {
     println!("  prompt-bundle   Assemble prompt files, selected skills, and message");
     println!("  cron-plan       Dry-run OpenClaw native agent-turn cron dispatch");
     println!("  deterministic-cron-plan Dry-run deterministic cron without LLM access");
+    println!("  subagent-plan   Dry-run subagent ledger cutover/resume planning");
     println!();
     println!("Options:");
     println!("  --openclaw-home <path>  Source .openclaw directory");
@@ -1492,4 +1621,5 @@ fn print_help() {
     println!("  --now-ms <n>           Epoch milliseconds for cron-plan");
     println!("  --resume-cron          Release native cron from cutover hold in dry-run");
     println!("  --allow-deterministic-run Release deterministic cron hold in dry-run");
+    println!("  --resume-subagents    Mark queued/running subagents as resume candidates");
 }

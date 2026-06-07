@@ -292,6 +292,7 @@ Current implemented foundation:
 - `prompt-bundle` consumes an agent turn plan and writes `prompt-bundle.json` plus `prompt.md` containing runtime context, imported prompt file bodies, selected `SKILL.md` bodies, and the inbound message with byte caps.
 - `cron-plan` parses OpenClaw native agent-turn cron jobs/state and produces a dry-run dispatch plan with cutover hold safety; it validates agent ids, extracts cron payload text when possible, classifies due `at` jobs, and registers cron expressions for future scheduler evaluation without firing anything.
 - `deterministic-cron-plan` parses workspace `tools/cron-runner` and `tools/backup-cron-runner` crontabs, resolves deterministic `jobs/*` scripts, classifies Windows shell compatibility and missing scripts, and preserves `llmAccessAllowed=false` throughout the dry-run plan.
+- `subagent-plan` parses `.openclaw/subagents/runs.json`, summarizes queued/running/completed/failed/canceled/unknown runs, holds queued/running work at cutover by default, and only marks them as resume candidates when `--resume-subagents` is explicitly set.
 
 ### Phase 0: Foundation
 
@@ -330,6 +331,7 @@ Current implemented foundation:
 - Feed `prompt-bundle` output into the Codex app-server adapter and persist execution receipts.
 - Extend `cron-plan` into a real native scheduler after the Codex adapter and transcript writer exist.
 - Extend `deterministic-cron-plan` into a supervised Windows process runner with explicit WSL/Git Bash fallback policy and no model/tool-runtime access.
+- Extend `subagent-plan` into a worker queue with per-agent concurrency limits, cancellation, retry policy, and run receipts after the Codex runtime adapter exists.
 - Mirror replies into OpenClaw-compatible transcript files.
 
 ### Phase 3: Messaging Channels

@@ -10,6 +10,7 @@ pub mod importer;
 pub mod prompt;
 pub mod registry;
 pub mod skills;
+pub mod subagents;
 pub mod turns;
 
 pub use channel_commands::{
@@ -53,6 +54,11 @@ pub use skills::{
     SkillIndex, SkillIndexFile, SkillIndexOrigin, SkillIndexSummary, SkillRecord, SkillSelection,
     SkillSelectionQuery, SkillSourceKind, build_harness_skill_index, build_source_skill_index,
     select_skills, write_skill_index,
+};
+pub use subagents::{
+    SubagentLedger, SubagentLedgerSummary, SubagentPlan, SubagentPlanAction, SubagentPlanEntry,
+    SubagentPlanFile, SubagentPlanInput, SubagentPlanSummary, SubagentRun, SubagentRunStatus,
+    load_subagent_ledger, plan_subagents, write_subagent_plan,
 };
 pub use turns::{
     TurnAgent, TurnDispatch, TurnModelPolicy, TurnPlan, TurnPlanFile, TurnPlanInput,
