@@ -26,11 +26,13 @@ pub use channel_runtime::{
     ChannelStepFile, build_channel_step, write_channel_step,
 };
 pub use codex_runtime::{
-    CodexEnvRequirement, CodexInvocationPlan, CodexOutputPlan, CodexRuntimePlan,
-    CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimePreflightCheck,
-    CodexRuntimePreflightCheckStatus, CodexRuntimePreflightOptions, CodexRuntimePreflightReceipt,
-    CodexRuntimePreflightReport, CodexRuntimePreflightStatus, CodexRuntimeReceipt,
-    CodexRuntimeReceiptStatus, CodexTransportPlan, plan_codex_runtime, preflight_codex_runtime,
+    CodexEnvRequirement, CodexInvocationPlan, CodexOutputPlan, CodexRuntimeLaunchProbeOptions,
+    CodexRuntimeLaunchProbeReceipt, CodexRuntimeLaunchProbeReport, CodexRuntimeLaunchProbeStatus,
+    CodexRuntimeLaunchProcess, CodexRuntimePlan, CodexRuntimePlanOptions, CodexRuntimePlanReport,
+    CodexRuntimePreflightCheck, CodexRuntimePreflightCheckStatus, CodexRuntimePreflightOptions,
+    CodexRuntimePreflightReceipt, CodexRuntimePreflightReport, CodexRuntimePreflightStatus,
+    CodexRuntimeReceipt, CodexRuntimeReceiptStatus, CodexTransportPlan, plan_codex_runtime,
+    preflight_codex_runtime, probe_codex_runtime_launch,
 };
 pub use cron::{
     NativeCronJob, NativeCronJobState, NativeCronPlan, NativeCronPlanAction, NativeCronPlanEntry,

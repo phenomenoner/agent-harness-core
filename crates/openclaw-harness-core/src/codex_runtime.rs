@@ -2,12 +2,16 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const CODEX_RUNTIME_PLAN_SCHEMA: &str = "openclaw-harness.codex-runtime-plan.v1";
 const CODEX_RUNTIME_PREFLIGHT_SCHEMA: &str = "openclaw-harness.codex-runtime-preflight.v1";
+const CODEX_RUNTIME_LAUNCH_PROBE_SCHEMA: &str = "openclaw-harness.codex-runtime-launch-probe.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRuntimePlanOptions {
@@ -21,6 +25,14 @@ pub struct CodexRuntimePreflightOptions {
     pub harness_home: PathBuf,
     pub execution_dir: Option<PathBuf>,
     pub plan_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexRuntimeLaunchProbeOptions {
+    pub harness_home: PathBuf,
+    pub execution_dir: Option<PathBuf>,
+    pub plan_file: Option<PathBuf>,
+    pub startup_probe_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -47,6 +59,21 @@ pub struct CodexRuntimePreflightReport {
     pub receipts_file: PathBuf,
     pub receipt: CodexRuntimePreflightReceipt,
     pub checks: Vec<CodexRuntimePreflightCheck>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRuntimeLaunchProbeReport {
+    pub schema: &'static str,
+    pub harness_home: PathBuf,
+    pub execution_dir: Option<PathBuf>,
+    pub plan_file: Option<PathBuf>,
+    pub preflight_file: Option<PathBuf>,
+    pub launch_file: Option<PathBuf>,
+    pub receipts_file: PathBuf,
+    pub receipt: CodexRuntimeLaunchProbeReceipt,
+    pub process: Option<CodexRuntimeLaunchProcess>,
     pub warnings: Vec<String>,
 }
 
@@ -130,6 +157,43 @@ pub struct CodexRuntimePreflightCheck {
 pub enum CodexRuntimePreflightCheckStatus {
     Pass,
     Fail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRuntimeLaunchProbeReceipt {
+    pub queue_id: Option<String>,
+    pub status: CodexRuntimeLaunchProbeStatus,
+    pub execution_dir: Option<PathBuf>,
+    pub plan_file: Option<PathBuf>,
+    pub launch_file: Option<PathBuf>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexRuntimeLaunchProbeStatus {
+    StartedAndStopped,
+    ExitedEarly,
+    PreflightBlocked,
+    NoRuntimePlan,
+    SpawnFailed,
+    TerminationFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRuntimeLaunchProcess {
+    pub executable: PathBuf,
+    pub arguments: Vec<String>,
+    pub working_directory: PathBuf,
+    pub pid: Option<u32>,
+    pub startup_probe_ms: u64,
+    pub elapsed_ms: u128,
+    pub exit_status: Option<String>,
+    pub terminated: bool,
+    pub stdout_log: Option<PathBuf>,
+    pub stderr_log: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -374,6 +438,297 @@ pub fn preflight_codex_runtime(
     Ok(report)
 }
 
+pub fn probe_codex_runtime_launch(
+    options: CodexRuntimeLaunchProbeOptions,
+) -> io::Result<CodexRuntimeLaunchProbeReport> {
+    let queue_dir = options.harness_home.join("state").join("runtime-queue");
+    let receipts_file = queue_dir.join("codex-runtime-launch-receipts.jsonl");
+    fs::create_dir_all(&queue_dir)?;
+
+    let preflight = preflight_codex_runtime(CodexRuntimePreflightOptions {
+        harness_home: options.harness_home.clone(),
+        execution_dir: options.execution_dir.clone(),
+        plan_file: options.plan_file.clone(),
+    })?;
+    let launch_file = preflight
+        .execution_dir
+        .as_ref()
+        .map(|dir| dir.join("codex-runtime-launch-probe.json"));
+    let mut warnings = preflight.warnings.clone();
+
+    match preflight.receipt.status {
+        CodexRuntimePreflightStatus::NoRuntimePlan => {
+            let receipt = CodexRuntimeLaunchProbeReceipt {
+                queue_id: preflight.receipt.queue_id,
+                status: CodexRuntimeLaunchProbeStatus::NoRuntimePlan,
+                execution_dir: preflight.execution_dir,
+                plan_file: preflight.plan_file,
+                launch_file: launch_file.clone(),
+                reason: "no codex runtime plan found; run codex-plan first".to_string(),
+            };
+            return write_launch_probe_report(
+                CodexRuntimeLaunchProbeReport {
+                    schema: CODEX_RUNTIME_LAUNCH_PROBE_SCHEMA,
+                    harness_home: options.harness_home,
+                    execution_dir: receipt.execution_dir.clone(),
+                    plan_file: receipt.plan_file.clone(),
+                    preflight_file: preflight.preflight_file,
+                    launch_file,
+                    receipts_file,
+                    receipt,
+                    process: None,
+                    warnings,
+                },
+                true,
+            );
+        }
+        CodexRuntimePreflightStatus::Blocked => {
+            let receipt = CodexRuntimeLaunchProbeReceipt {
+                queue_id: preflight.receipt.queue_id,
+                status: CodexRuntimeLaunchProbeStatus::PreflightBlocked,
+                execution_dir: preflight.execution_dir,
+                plan_file: preflight.plan_file,
+                launch_file: launch_file.clone(),
+                reason: "codex runtime launch blocked by preflight failures".to_string(),
+            };
+            return write_launch_probe_report(
+                CodexRuntimeLaunchProbeReport {
+                    schema: CODEX_RUNTIME_LAUNCH_PROBE_SCHEMA,
+                    harness_home: options.harness_home,
+                    execution_dir: receipt.execution_dir.clone(),
+                    plan_file: receipt.plan_file.clone(),
+                    preflight_file: preflight.preflight_file,
+                    launch_file,
+                    receipts_file,
+                    receipt,
+                    process: None,
+                    warnings,
+                },
+                true,
+            );
+        }
+        CodexRuntimePreflightStatus::Ready => {}
+    }
+
+    let Some(plan_file) = preflight.plan_file.clone() else {
+        warnings.push("preflight reported ready without a runtime plan file".to_string());
+        let receipt = CodexRuntimeLaunchProbeReceipt {
+            queue_id: preflight.receipt.queue_id,
+            status: CodexRuntimeLaunchProbeStatus::NoRuntimePlan,
+            execution_dir: preflight.execution_dir,
+            plan_file: None,
+            launch_file: launch_file.clone(),
+            reason: "preflight reported ready without a runtime plan file".to_string(),
+        };
+        return write_launch_probe_report(
+            CodexRuntimeLaunchProbeReport {
+                schema: CODEX_RUNTIME_LAUNCH_PROBE_SCHEMA,
+                harness_home: options.harness_home,
+                execution_dir: receipt.execution_dir.clone(),
+                plan_file: None,
+                preflight_file: preflight.preflight_file,
+                launch_file,
+                receipts_file,
+                receipt,
+                process: None,
+                warnings,
+            },
+            true,
+        );
+    };
+
+    let plan: CodexRuntimePlanFile = read_json_file_as(&plan_file)?;
+    let probe_result = spawn_launch_probe(&plan, options.startup_probe_ms)?;
+    let status = match probe_result.status {
+        LaunchProbeProcessStatus::StartedAndStopped => {
+            CodexRuntimeLaunchProbeStatus::StartedAndStopped
+        }
+        LaunchProbeProcessStatus::ExitedEarly => CodexRuntimeLaunchProbeStatus::ExitedEarly,
+        LaunchProbeProcessStatus::SpawnFailed => CodexRuntimeLaunchProbeStatus::SpawnFailed,
+        LaunchProbeProcessStatus::TerminationFailed => {
+            CodexRuntimeLaunchProbeStatus::TerminationFailed
+        }
+    };
+    let reason = match status {
+        CodexRuntimeLaunchProbeStatus::StartedAndStopped => {
+            "codex app-server process started and was stopped after launch probe".to_string()
+        }
+        CodexRuntimeLaunchProbeStatus::ExitedEarly => {
+            "codex app-server process exited before the launch probe window elapsed".to_string()
+        }
+        CodexRuntimeLaunchProbeStatus::SpawnFailed => {
+            "failed to spawn codex app-server process".to_string()
+        }
+        CodexRuntimeLaunchProbeStatus::TerminationFailed => {
+            "codex app-server process started but could not be terminated cleanly".to_string()
+        }
+        CodexRuntimeLaunchProbeStatus::PreflightBlocked
+        | CodexRuntimeLaunchProbeStatus::NoRuntimePlan => unreachable!(),
+    };
+    let receipt = CodexRuntimeLaunchProbeReceipt {
+        queue_id: plan.queue_id,
+        status,
+        execution_dir: preflight.execution_dir,
+        plan_file: Some(plan_file),
+        launch_file: launch_file.clone(),
+        reason,
+    };
+    write_launch_probe_report(
+        CodexRuntimeLaunchProbeReport {
+            schema: CODEX_RUNTIME_LAUNCH_PROBE_SCHEMA,
+            harness_home: options.harness_home,
+            execution_dir: receipt.execution_dir.clone(),
+            plan_file: receipt.plan_file.clone(),
+            preflight_file: preflight.preflight_file,
+            launch_file,
+            receipts_file,
+            receipt,
+            process: Some(probe_result.process),
+            warnings,
+        },
+        true,
+    )
+}
+
+fn write_launch_probe_report(
+    report: CodexRuntimeLaunchProbeReport,
+    append_receipt: bool,
+) -> io::Result<CodexRuntimeLaunchProbeReport> {
+    if let Some(launch_file) = &report.launch_file {
+        let report_json = serde_json::to_string_pretty(&report).map_err(io::Error::other)?;
+        fs::write(launch_file, report_json)?;
+    }
+    if append_receipt {
+        append_json_line(&report.receipts_file, &report.receipt)?;
+    }
+    Ok(report)
+}
+
+struct LaunchProbeProcessResult {
+    status: LaunchProbeProcessStatus,
+    process: CodexRuntimeLaunchProcess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchProbeProcessStatus {
+    StartedAndStopped,
+    ExitedEarly,
+    SpawnFailed,
+    TerminationFailed,
+}
+
+fn spawn_launch_probe(
+    plan: &CodexRuntimePlanFile,
+    startup_probe_ms: u64,
+) -> io::Result<LaunchProbeProcessResult> {
+    fs::create_dir_all(&plan.invocation.working_directory)?;
+    let stdout_log = plan
+        .invocation
+        .working_directory
+        .join("codex-runtime-launch.stdout.log");
+    let stderr_log = plan
+        .invocation
+        .working_directory
+        .join("codex-runtime-launch.stderr.log");
+    let stdout = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stdout_log)?;
+    let stderr = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_log)?;
+    let started = Instant::now();
+    let mut command = Command::new(&plan.invocation.executable);
+    command
+        .args(&plan.invocation.arguments)
+        .current_dir(&plan.invocation.working_directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return Ok(LaunchProbeProcessResult {
+                status: LaunchProbeProcessStatus::SpawnFailed,
+                process: CodexRuntimeLaunchProcess {
+                    executable: plan.invocation.executable.clone(),
+                    arguments: plan.invocation.arguments.clone(),
+                    working_directory: plan.invocation.working_directory.clone(),
+                    pid: None,
+                    startup_probe_ms,
+                    elapsed_ms: started.elapsed().as_millis(),
+                    exit_status: Some(error.to_string()),
+                    terminated: false,
+                    stdout_log: Some(stdout_log),
+                    stderr_log: Some(stderr_log),
+                },
+            });
+        }
+    };
+    let pid = child.id();
+    let probe_window = Duration::from_millis(startup_probe_ms);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(LaunchProbeProcessResult {
+                status: LaunchProbeProcessStatus::ExitedEarly,
+                process: CodexRuntimeLaunchProcess {
+                    executable: plan.invocation.executable.clone(),
+                    arguments: plan.invocation.arguments.clone(),
+                    working_directory: plan.invocation.working_directory.clone(),
+                    pid: Some(pid),
+                    startup_probe_ms,
+                    elapsed_ms: started.elapsed().as_millis(),
+                    exit_status: Some(status.to_string()),
+                    terminated: false,
+                    stdout_log: Some(stdout_log),
+                    stderr_log: Some(stderr_log),
+                },
+            });
+        }
+        if started.elapsed() >= probe_window {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let kill_result = child.kill();
+    let wait_result = child.wait();
+    match (kill_result, wait_result) {
+        (Ok(()), Ok(status)) => Ok(LaunchProbeProcessResult {
+            status: LaunchProbeProcessStatus::StartedAndStopped,
+            process: CodexRuntimeLaunchProcess {
+                executable: plan.invocation.executable.clone(),
+                arguments: plan.invocation.arguments.clone(),
+                working_directory: plan.invocation.working_directory.clone(),
+                pid: Some(pid),
+                startup_probe_ms,
+                elapsed_ms: started.elapsed().as_millis(),
+                exit_status: Some(status.to_string()),
+                terminated: true,
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+            },
+        }),
+        (Err(error), _) | (_, Err(error)) => Ok(LaunchProbeProcessResult {
+            status: LaunchProbeProcessStatus::TerminationFailed,
+            process: CodexRuntimeLaunchProcess {
+                executable: plan.invocation.executable.clone(),
+                arguments: plan.invocation.arguments.clone(),
+                working_directory: plan.invocation.working_directory.clone(),
+                pid: Some(pid),
+                startup_probe_ms,
+                elapsed_ms: started.elapsed().as_millis(),
+                exit_status: Some(error.to_string()),
+                terminated: false,
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+            },
+        }),
+    }
+}
+
 fn resolve_execution_dir(
     options: &CodexRuntimePlanOptions,
     warnings: &mut Vec<String>,
@@ -485,7 +840,9 @@ fn env_requirements(provider: Option<&str>) -> Vec<CodexEnvRequirement> {
         }],
         _ => vec![CodexEnvRequirement {
             name: "OPENAI_API_KEY".to_string(),
-            reason: "Codex/OpenAI app-server execution requires OpenAI credentials".to_string(),
+            reason:
+                "Codex/OpenAI app-server execution requires OpenAI API key or Codex OAuth auth state"
+                    .to_string(),
         }],
     }
 }
@@ -655,19 +1012,86 @@ fn check_env_requirements(requirements: &[CodexEnvRequirement]) -> Vec<CodexRunt
     }
     requirements
         .iter()
-        .map(|requirement| {
-            if env::var_os(&requirement.name).is_some() {
-                pass_check(
-                    format!("env:{}", requirement.name),
-                    format!("{} is present", requirement.name),
-                )
-            } else {
-                fail_check(
-                    format!("env:{}", requirement.name),
-                    format!("{} is missing: {}", requirement.name, requirement.reason),
-                )
-            }
-        })
+        .flat_map(check_credential_requirement)
+        .collect()
+}
+
+fn check_credential_requirement(
+    requirement: &CodexEnvRequirement,
+) -> Vec<CodexRuntimePreflightCheck> {
+    if requirement.name == "OPENAI_API_KEY" {
+        return check_openai_or_codex_oauth_requirement(requirement);
+    }
+    vec![check_env_requirement(requirement)]
+}
+
+fn check_openai_or_codex_oauth_requirement(
+    requirement: &CodexEnvRequirement,
+) -> Vec<CodexRuntimePreflightCheck> {
+    if env::var_os("OPENAI_API_KEY").is_some() {
+        return vec![pass_check(
+            "credential:openai-or-codex-oauth",
+            "OPENAI_API_KEY is present",
+        )];
+    }
+    let candidates = codex_oauth_auth_candidates();
+    check_openai_or_codex_oauth_requirement_with_candidates(requirement, &candidates)
+}
+
+fn check_openai_or_codex_oauth_requirement_with_candidates(
+    requirement: &CodexEnvRequirement,
+    candidates: &[PathBuf],
+) -> Vec<CodexRuntimePreflightCheck> {
+    if let Some(path) = candidates.iter().find(|path| path.is_file()) {
+        return vec![pass_check(
+            "credential:openai-or-codex-oauth",
+            format!("Codex OAuth auth state found at {}", path.display()),
+        )];
+    }
+    vec![fail_check(
+        "credential:openai-or-codex-oauth",
+        format!(
+            "{} is missing and no Codex OAuth auth state was found at {}: {}",
+            requirement.name,
+            candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            requirement.reason
+        ),
+    )]
+}
+
+fn check_env_requirement(requirement: &CodexEnvRequirement) -> CodexRuntimePreflightCheck {
+    if env::var_os(&requirement.name).is_some() {
+        pass_check(
+            format!("env:{}", requirement.name),
+            format!("{} is present", requirement.name),
+        )
+    } else {
+        fail_check(
+            format!("env:{}", requirement.name),
+            format!("{} is missing: {}", requirement.name, requirement.reason),
+        )
+    }
+}
+
+fn codex_oauth_auth_candidates() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = env::var_os("CODEX_HOME") {
+        roots.push(PathBuf::from(home));
+    }
+    if let Some(profile) = env::var_os("USERPROFILE") {
+        roots.push(PathBuf::from(profile).join(".codex"));
+    }
+    if let Some(home) = env::var_os("HOME") {
+        roots.push(PathBuf::from(home).join(".codex"));
+    }
+    roots.dedup();
+    roots
+        .into_iter()
+        .flat_map(|root| [root.join("auth.json"), root.join("auth.toml")])
         .collect()
 }
 
@@ -949,6 +1373,131 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn openai_codex_credential_gate_accepts_oauth_auth_file() {
+        let root = temp_root("openai_codex_credential_gate_accepts_oauth_auth_file");
+        let auth_file = root.join("auth.json");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&auth_file, "{}").unwrap();
+        let requirement = CodexEnvRequirement {
+            name: "OPENAI_API_KEY".to_string(),
+            reason: "test credential".to_string(),
+        };
+
+        let checks =
+            check_openai_or_codex_oauth_requirement_with_candidates(&requirement, &[auth_file]);
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, CodexRuntimePreflightCheckStatus::Pass);
+        assert_eq!(checks[0].name, "credential:openai-or-codex-oauth");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn probe_codex_runtime_launch_starts_and_stops_process() {
+        let root = temp_root("probe_codex_runtime_launch_starts_and_stops_process");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = long_running_probe_command();
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = probe_codex_runtime_launch(CodexRuntimeLaunchProbeOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            startup_probe_ms: 150,
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.receipt.status,
+            CodexRuntimeLaunchProbeStatus::StartedAndStopped
+        );
+        assert!(report.receipts_file.is_file());
+        assert!(report.launch_file.unwrap().is_file());
+        let process = report.process.unwrap();
+        assert!(process.pid.is_some());
+        assert!(process.terminated);
+        assert!(process.stdout_log.unwrap().is_file());
+        assert!(process.stderr_log.unwrap().is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn probe_codex_runtime_launch_respects_preflight_block() {
+        let root = temp_root("probe_codex_runtime_launch_respects_preflight_block");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(
+            plan_file,
+            serde_json::json!([
+                {
+                    "name": format!("OPENCLAW_HARNESS_TEST_MISSING_ENV_{}", std::process::id()),
+                    "reason": "test missing env"
+                }
+            ]),
+        );
+
+        let report = probe_codex_runtime_launch(CodexRuntimeLaunchProbeOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            startup_probe_ms: 50,
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.receipt.status,
+            CodexRuntimeLaunchProbeStatus::PreflightBlocked
+        );
+        assert!(report.process.is_none());
+        assert!(report.launch_file.unwrap().is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn probe_codex_runtime_launch_reports_no_runtime_plan() {
+        let root = temp_root("probe_codex_runtime_launch_reports_no_runtime_plan");
+        let harness_home = root.join(".openclaw-harness");
+
+        let report = probe_codex_runtime_launch(CodexRuntimeLaunchProbeOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            startup_probe_ms: 50,
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.receipt.status,
+            CodexRuntimeLaunchProbeStatus::NoRuntimePlan
+        );
+        assert!(report.process.is_none());
+        assert!(report.receipts_file.is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn enqueue_and_prepare(source: &crate::OpenClawSource, harness_home: &Path) {
         let registry = load_agent_registry(source).unwrap();
         let skills = build_source_skill_index(source).unwrap();
@@ -988,6 +1537,32 @@ mod tests {
         let mut value: Value = serde_json::from_slice(&fs::read(plan_file).unwrap()).unwrap();
         value["invocation"]["envRequirements"] = requirements;
         fs::write(plan_file, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    }
+
+    fn replace_invocation(plan_file: &Path, executable: PathBuf, arguments: Vec<String>) {
+        let mut value: Value = serde_json::from_slice(&fs::read(plan_file).unwrap()).unwrap();
+        value["invocation"]["executable"] = serde_json::json!(executable);
+        value["invocation"]["arguments"] = serde_json::json!(arguments);
+        fs::write(plan_file, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn long_running_probe_command() -> (PathBuf, Vec<String>) {
+        let system_cmd = PathBuf::from(r"C:\Windows\System32\cmd.exe");
+        let executable = if system_cmd.is_file() {
+            system_cmd
+        } else {
+            PathBuf::from("cmd.exe")
+        };
+        (executable, vec!["/K".to_string()])
+    }
+
+    #[cfg(not(windows))]
+    fn long_running_probe_command() -> (PathBuf, Vec<String>) {
+        (
+            PathBuf::from("sh"),
+            vec!["-c".to_string(), "while true; do sleep 1; done".to_string()],
+        )
     }
 
     fn write_codex_runtime_source(root: &Path) -> crate::OpenClawSource {
