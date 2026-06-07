@@ -7,6 +7,7 @@ The project starts with a small, testable foundation:
 - Import planning for an existing OpenClaw home directory.
 - A core crate with data-layout detection logic for config, workspace prompts, agents, skills, sessions, native cron, deterministic cron, subagents, memory, and plugins.
 - A read-only importer dry-run report with Hermes-style conflict policy and receipts.
+- A read-only multi-agent registry parser for OpenClaw agents, providers, plugins, channels, and local agent state.
 - A shared channel command parser for OpenClaw-style DM commands.
 - A CLI crate with `doctor`, `import-plan`, and `import-dry-run` commands.
 - Minimal external crates: `serde` and `serde_json` for stable report/config/session JSON handling.
@@ -18,6 +19,7 @@ cargo test
 cargo run -p openclaw-harness-cli -- doctor
 cargo run -p openclaw-harness-cli -- import-plan --openclaw-home C:\path\to\.openclaw
 cargo run -p openclaw-harness-cli -- import-dry-run --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --conflict skip --output imports\dry-run
+cargo run -p openclaw-harness-cli -- registry --openclaw-home C:\path\to\.openclaw
 ```
 
 If `cargo` is not visible in a newly opened terminal, restart the terminal or use:
@@ -33,6 +35,8 @@ The recommended path is a Rust harness core that delegates native coding-agent e
 Skills are first-class runtime state, not documentation leftovers. The importer should preserve OpenClaw workspace skills, managed OpenClaw skills, and project `.agents/skills`; the runtime should then match relevant skills at the start of each agent turn and let agents create or patch reusable skills for future turns.
 
 The first importer command is intentionally read-only. `import-dry-run` produces a structured migration report, flags conflicts, supports `skip`, `overwrite`, and `rename` policies, and can write `report.json` plus `summary.md` when `--output` is provided.
+
+The registry command is also read-only. It merges `openclaw.json` agent config with `/agents/<id>` directories and reports per-agent model/provider/workspace plus local session/auth/model state.
 
 Telegram and Discord adapters should share the same channel command parser. Current parser coverage is `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`.
 

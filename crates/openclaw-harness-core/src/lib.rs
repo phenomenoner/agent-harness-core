@@ -4,12 +4,17 @@ use std::path::{Path, PathBuf};
 
 pub mod channel_commands;
 pub mod importer;
+pub mod registry;
 
 pub use channel_commands::{ChannelCommand, parse_channel_command};
 pub use importer::{
     ConfigSemantics, ConflictPolicy, DryRunImportOptions, ImportAction, ImportItem, ImportItemKind,
     ImportItemStatus, ImportReport, ImportReportSummary, ImportSemantics, NativeCronSemantics,
     ReportFiles, SessionSemantics, build_dry_run_report, write_report_files,
+};
+pub use registry::{
+    AgentDefaults, AgentProfile, AgentProfileSource, AgentRegistry, ChannelRegistry, PluginProfile,
+    ProviderProfile, load_agent_registry,
 };
 
 pub const PROMPT_FILE_NAMES: &[&str] = &[

@@ -2,8 +2,9 @@ use std::env;
 use std::path::PathBuf;
 
 use openclaw_harness_core::{
-    ConflictPolicy, DryRunImportOptions, ImportPhaseStatus, ImportReport, OpenClawSource,
-    build_dry_run_report, build_import_plan, inventory, write_report_files,
+    AgentRegistry, ConflictPolicy, DryRunImportOptions, ImportPhaseStatus, ImportReport,
+    OpenClawSource, build_dry_run_report, build_import_plan, inventory, load_agent_registry,
+    write_report_files,
 };
 
 fn main() {
@@ -15,6 +16,7 @@ fn main() {
         "doctor" => run_doctor(&rest),
         "import-plan" => run_import_plan(&rest),
         "import-dry-run" => run_import_dry_run(&rest),
+        "registry" => run_registry(&rest),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -113,6 +115,13 @@ fn run_import_dry_run(args: &[String]) -> Result<(), String> {
         println!("Report summary: {}", files.summary.display());
     }
 
+    Ok(())
+}
+
+fn run_registry(args: &[String]) -> Result<(), String> {
+    let source = source_from_args(args)?;
+    let registry = load_agent_registry(&source).map_err(|err| err.to_string())?;
+    print_registry(&registry);
     Ok(())
 }
 
@@ -351,6 +360,81 @@ fn print_counts(label: &str, counts: &std::collections::BTreeMap<String, usize>)
     }
 }
 
+fn print_registry(registry: &AgentRegistry) {
+    println!("OpenClaw agent registry");
+    println!("Source home: {}", registry.source_home.display());
+    println!("Source workspace: {}", registry.source_workspace.display());
+    println!("Config found: {}", yes_no(registry.config_found));
+    println!("Config parsed: {}", yes_no(registry.config_parsed));
+    if let Some(error) = &registry.config_parse_error {
+        println!("Config parse error: {error}");
+    }
+    println!("Agents: {}", registry.agents.len());
+    println!("Providers: {}", registry.providers.len());
+    println!("Plugins: {}", registry.plugins.len());
+    println!(
+        "Telegram configured: {}",
+        yes_no(registry.channels.telegram)
+    );
+    println!("Discord configured: {}", yes_no(registry.channels.discord));
+
+    if !registry.agents.is_empty() {
+        println!();
+        println!("Agents:");
+        for agent in &registry.agents {
+            println!(
+                "- {} [{:?}] provider={} model={} workspace={} dir={} sessions={} auth={} models={}",
+                agent.id,
+                agent.source,
+                agent.provider.as_deref().unwrap_or("-"),
+                agent.model.as_deref().unwrap_or("-"),
+                agent.workspace.as_deref().unwrap_or("-"),
+                yes_no(agent.directory_exists),
+                yes_no(agent.sessions_index_exists),
+                yes_no(agent.auth_file || agent.auth_profiles_file || agent.auth_state_file),
+                yes_no(agent.local_models_file),
+            );
+        }
+    }
+
+    if !registry.providers.is_empty() {
+        println!();
+        println!("Providers:");
+        for provider in &registry.providers {
+            println!(
+                "- {} [{}] base_url={} api_key_ref={}",
+                provider.id,
+                provider.source,
+                yes_no(provider.has_base_url),
+                yes_no(provider.has_api_key_reference)
+            );
+        }
+    }
+
+    if !registry.plugins.is_empty() {
+        println!();
+        println!("Plugins:");
+        for plugin in &registry.plugins {
+            println!(
+                "- {} [{}] enabled={} memory={} channel={}",
+                plugin.id,
+                plugin.source,
+                plugin.enabled.map(yes_no).unwrap_or("unknown"),
+                yes_no(plugin.memory_related),
+                yes_no(plugin.channel_related)
+            );
+        }
+    }
+
+    if !registry.warnings.is_empty() {
+        println!();
+        println!("Warnings:");
+        for warning in &registry.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
 fn print_help() {
     println!("openclaw-harness");
     println!();
@@ -358,6 +442,7 @@ fn print_help() {
     println!("  doctor          Inspect an OpenClaw home directory");
     println!("  import-plan     Print staged import readiness");
     println!("  import-dry-run  Build a read-only migration report");
+    println!("  registry        Inspect parsed multi-agent registry state");
     println!();
     println!("Options:");
     println!("  --openclaw-home <path>  Source .openclaw directory");
