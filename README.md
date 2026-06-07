@@ -15,11 +15,12 @@ The project starts with a small, testable foundation:
 - A turn planner that maps one inbound channel message to command handling, agent/session/model routing, prompt files, and selected skills.
 - A shared channel runtime bridge that maps one Telegram/Discord-style DM into either an immediate command reply or an agent-turn dispatch envelope.
 - A durable runtime queue writer that appends channel agent turns to `state/runtime-queue/pending.jsonl` with receipts and planned transcript paths.
+- A runtime queue prepare worker that reads pending items, assembles prompt bundles, and writes execution receipts before the Codex adapter is connected.
 - A prompt bundle assembler that turns an agent turn plan into inspectable prompt files, selected skill bodies, and the inbound message.
 - A native agent-turn cron parser and dry-run dispatch planner with cutover hold safety.
 - A deterministic cron parser and no-LLM dry-run planner for workspace cron runners.
 - A subagent ledger parser and dry-run planner for `/subagents/runs.json` cutover safety.
-- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `skills`, `turn-plan`, `channel-step`, `queue-enqueue`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
+- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `skills`, `turn-plan`, `channel-step`, `queue-enqueue`, `queue-prepare`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
 - Minimal external crates: `serde` and `serde_json` for stable report/config/session JSON handling.
 
 ## Quick Start
@@ -37,6 +38,7 @@ cargo run -p openclaw-harness-cli -- skills --harness-home C:\path\to\.openclaw-
 cargo run -p openclaw-harness-cli -- turn-plan --openclaw-home C:\path\to\.openclaw --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron"
 cargo run -p openclaw-harness-cli -- channel-step --openclaw-home C:\path\to\.openclaw --platform discord --channel-id dm-123 --user-id user-456 --agent main --message "/status channels" --output imports\channel
 cargo run -p openclaw-harness-cli -- queue-enqueue --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron"
+cargo run -p openclaw-harness-cli -- queue-prepare --target-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- prompt-bundle --openclaw-home C:\path\to\.openclaw --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron" --output imports\prompt
 cargo run -p openclaw-harness-cli -- cron-plan --openclaw-home C:\path\to\.openclaw --output imports\cron
 cargo run -p openclaw-harness-cli -- deterministic-cron-plan --workspace C:\path\to\workspace --output imports\deterministic-cron
@@ -70,6 +72,8 @@ Telegram and Discord adapters should share the same channel command parser and i
 `channel-step` is the shared channel bridge that Telegram and Discord adapters should call after receiving a DM. It consumes the same turn plan and writes `channel-step.json`. Command turns such as `/status` and `/model` produce immediate outbound command replies plus typed command effects. Plain user messages produce an agent-turn dispatch envelope for the future runtime queue and no immediate model call.
 
 `queue-enqueue` persists the agent-turn side of `channel-step`. It appends queued turns to `state/runtime-queue/pending.jsonl`, appends every queued/skipped attempt to `state/runtime-queue/receipts.jsonl`, and precomputes OpenClaw-compatible transcript and trajectory paths under `agents/<agent-id>/sessions/`. Command-only channel steps are recorded as skipped receipts and are not sent to the agent queue.
+
+`queue-prepare` reads one queued runtime item, rebuilds the turn context from its stored source/workspace/session metadata, assembles `prompt-bundle.json` plus `prompt.md` under `state/runtime-queue/executions/<queue-id>/`, and writes `execution-receipt.json` plus `execution-receipts.jsonl`. This is the handoff point for the future Codex app-server worker; it does not call a model yet.
 
 `prompt-bundle` consumes the same turn plan and assembles the prompt context that a Codex runtime adapter will eventually send: runtime context, existing OpenClaw prompt files, selected `SKILL.md` bodies, and the inbound message. It writes `prompt-bundle.json` and `prompt.md`, and uses per-file byte caps so oversized imported state can be inspected safely.
 

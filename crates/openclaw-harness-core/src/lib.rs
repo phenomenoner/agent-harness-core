@@ -11,6 +11,7 @@ pub mod importer;
 pub mod prompt;
 pub mod registry;
 pub mod runtime_queue;
+pub mod runtime_worker;
 pub mod skills;
 pub mod subagents;
 pub mod turns;
@@ -61,6 +62,10 @@ pub use runtime_queue::{
     RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, RuntimeQueueItem,
     RuntimeQueueItemStatus, RuntimeQueueReceipt, RuntimeQueueReceiptStatus, RuntimeQueueSource,
     RuntimeQueueSourceKind, enqueue_channel_step,
+};
+pub use runtime_worker::{
+    RuntimeExecutionReceipt, RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions,
+    RuntimeQueuePrepareReport, RuntimeQueuePreparedItem, prepare_runtime_queue_item,
 };
 pub use skills::{
     SkillIndex, SkillIndexFile, SkillIndexOrigin, SkillIndexSummary, SkillRecord, SkillSelection,
