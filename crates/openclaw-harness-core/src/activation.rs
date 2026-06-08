@@ -94,7 +94,7 @@ pub fn check_activation_readiness(
         check_agents(registry, &mut checks);
         check_channels(registry, &mut checks);
         check_providers(registry, &mut checks);
-        check_plugins(registry, &mut checks);
+        check_plugins(registry, &options.harness_home, &mut checks);
     }
     check_activation_plan_doc(&mut checks);
     check_harness_skills(&options.harness_home, &mut checks);
@@ -210,7 +210,11 @@ fn check_providers(registry: &Value, checks: &mut Vec<ActivationReadinessCheck>)
     }
 }
 
-fn check_plugins(registry: &Value, checks: &mut Vec<ActivationReadinessCheck>) {
+fn check_plugins(
+    registry: &Value,
+    harness_home: &Path,
+    checks: &mut Vec<ActivationReadinessCheck>,
+) {
     let sidecar_required = registry
         .get("plugins")
         .and_then(Value::as_array)
@@ -231,11 +235,67 @@ fn check_plugins(registry: &Value, checks: &mut Vec<ActivationReadinessCheck>) {
             "plugin-sidecar",
             format!("{sidecar_required} imported plugin(s) require the Node sidecar, which is not enabled yet"),
         ));
+        check_plugin_sidecar_probe(harness_home, checks);
     } else {
         checks.push(pass(
             "plugin-sidecar",
             "no sidecar-required plugins reported by registry",
         ));
+    }
+}
+
+fn check_plugin_sidecar_probe(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let path = harness_home
+        .join("state")
+        .join("plugin-sidecar")
+        .join("probe-receipts.jsonl");
+    match latest_jsonl_value(&path) {
+        Ok(Some(value)) => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let sidecar_required = value
+                .get("sidecarRequired")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let reason = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason recorded");
+            if status == "contract-ready" {
+                checks.push(pass(
+                    "plugin-sidecar-probe",
+                    format!(
+                        "sidecar probe contract-ready for {sidecar_required} plugin(s) at {}",
+                        path.display()
+                    ),
+                ));
+            } else {
+                checks.push(fail(
+                    "plugin-sidecar-probe",
+                    format!(
+                        "sidecar probe status={status} at {}: {reason}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        Ok(None) => checks.push(warn(
+            "plugin-sidecar-probe",
+            format!("no sidecar probe receipt lines found at {}", path.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+            "plugin-sidecar-probe",
+            format!(
+                "not found yet: {}; run plugin-sidecar-probe before plugin handoff",
+                path.display()
+            ),
+        )),
+        Err(error) => checks.push(warn(
+            "plugin-sidecar-probe",
+            format!("could not read {}: {error}", path.display()),
+        )),
     }
 }
 
@@ -751,6 +811,44 @@ mod tests {
             check.name == "codex-runtime-launch-probe"
                 && check.status == ActivationReadinessStatus::Fail
                 && check.detail.contains("spawn-failed")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readiness_reports_plugin_sidecar_probe_contract() {
+        let root = temp_root("readiness_reports_plugin_sidecar_probe_contract");
+        let harness_home = root.join(".openclaw-harness");
+        let state = harness_home.join("state");
+        let sidecar = state.join("plugin-sidecar");
+        fs::create_dir_all(&sidecar).unwrap();
+        fs::write(
+            state.join("harness-registry.json"),
+            r#"{
+              "schema": "openclaw-harness.target-registry.v1",
+              "agents": [
+                { "id": "main", "enabled": true }
+              ],
+              "providers": [],
+              "plugins": [
+                { "id": "openclaw-mem-engine", "sidecarRequired": true }
+              ],
+              "channels": { "telegram": false, "discord": false }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            sidecar.join("probe-receipts.jsonl"),
+            r#"{"status":"contract-ready","sidecarRequired":1,"reason":"plugin sidecar probe loaded harness registry"}"#,
+        )
+        .unwrap();
+
+        let report =
+            check_activation_readiness(ActivationReadinessOptions { harness_home }).unwrap();
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "plugin-sidecar-probe" && check.status == ActivationReadinessStatus::Pass
         }));
 
         let _ = fs::remove_dir_all(root);

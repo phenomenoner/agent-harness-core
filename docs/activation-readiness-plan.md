@@ -141,6 +141,7 @@ These should be run before stopping the Docker gateway.
    - Memory pack/search/propose integration into prompt assembly.
 
 6. Plugin sidecar
+   - Run `plugin-sidecar-probe` and confirm `enable-check` reports `plugin-sidecar-probe` as pass.
    - Node sidecar process contract.
    - Tool/hook/memory slot JSON-RPC bridge.
    - Health check surfaced in `enable-check`.
@@ -161,6 +162,7 @@ As of 2026-06-08 local verification:
 - `openclaw-mem.sqlite` is present as a snapshot/audit source.
 - Offline `/status` channel smoke passes against the imported registry: 24 enabled agents, 2 providers, 13 plugins, Telegram and Discord enabled.
 - Runtime queue prepare, Codex plan, Codex preflight, and Codex launch probe pass when using workspace-local `@openai/codex` via `.tools/codex-cli/node_modules/.bin/codex.cmd`.
+- Plugin sidecar probe passes and sees 6 sidecar-required plugins, but OpenClaw plugin hook/tool execution bridge remains pending.
 - The Codex Desktop MSIX `codex.exe` path is not spawnable from this harness environment and should not be used for service runtime.
 - Remaining `enable-check` failures are `TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN`, and `plugin-sidecar`.
 
@@ -174,6 +176,7 @@ cargo run -p openclaw-harness-cli -- help
 cargo run -p openclaw-harness-cli -- enable-check --harness-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- channel-run-once --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw --platform telegram --channel-id smoke --user-id operator --message /status
 cargo run -p openclaw-harness-cli -- codex-launch-probe --harness-home C:\path\to\.openclaw-harness --execution-dir C:\path\to\prepared-execution --startup-probe-ms 750
+cargo run -p openclaw-harness-cli -- plugin-sidecar-probe --harness-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- telegram-poll-once --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.cmd --poll-timeout-seconds 1 --max-updates 10
 cargo run -p openclaw-harness-cli -- telegram-loop --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.cmd --iterations 1 --idle-ms 1000
 cargo run -p openclaw-harness-cli -- discord-outbox-send-once --harness-home C:\path\to\.openclaw-harness --outbox-limit 20

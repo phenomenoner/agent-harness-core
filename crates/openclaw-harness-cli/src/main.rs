@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -58,6 +59,7 @@ fn main() {
         "telegram-poll-once" => run_telegram_poll_once(&rest),
         "telegram-loop" => run_telegram_loop(&rest),
         "discord-outbox-send-once" => run_discord_outbox_send_once(&rest),
+        "plugin-sidecar-probe" => run_plugin_sidecar_probe(&rest),
         "queue-enqueue" => run_queue_enqueue(&rest),
         "queue-prepare" => run_queue_prepare(&rest),
         "runtime-run-once" => run_runtime_run_once(&rest),
@@ -808,6 +810,41 @@ fn run_discord_outbox_send_once(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_plugin_sidecar_probe(args: &[String]) -> Result<(), String> {
+    let args = plugin_sidecar_probe_args_from_args(args)?;
+    let output = Command::new(&args.node_exe)
+        .arg(&args.sidecar_script)
+        .arg("--harness-home")
+        .arg(&args.target_home)
+        .arg("--probe")
+        .arg("--write-receipt")
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to spawn plugin sidecar probe via {}: {err}",
+                args.node_exe.display()
+            )
+        })?;
+
+    println!("OpenClaw plugin sidecar probe");
+    println!("Harness home: {}", args.target_home.display());
+    println!("Node executable: {}", args.node_exe.display());
+    println!("Sidecar script: {}", args.sidecar_script.display());
+    if !output.stdout.is_empty() {
+        println!("{}", String::from_utf8_lossy(&output.stdout).trim_end());
+    }
+    if !output.stderr.is_empty() {
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr).trim_end());
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "plugin sidecar probe exited with {}",
+            output.status
+        ));
+    }
+    Ok(())
+}
+
 fn run_queue_enqueue(args: &[String]) -> Result<(), String> {
     let args = queue_enqueue_args_from_args(args)?;
     let registry = load_agent_registry(&args.turn.source).map_err(|err| err.to_string())?;
@@ -1211,6 +1248,12 @@ struct TelegramLoopArgs {
 struct DiscordOutboxSendOnceArgs {
     target_home: PathBuf,
     outbox_limit: usize,
+}
+
+struct PluginSidecarProbeArgs {
+    target_home: PathBuf,
+    node_exe: PathBuf,
+    sidecar_script: PathBuf,
 }
 
 struct DiscordOutboxSendOnceReport {
@@ -2279,6 +2322,46 @@ fn discord_outbox_send_once_args_from_args(
     Ok(DiscordOutboxSendOnceArgs {
         target_home,
         outbox_limit,
+    })
+}
+
+fn plugin_sidecar_probe_args_from_args(args: &[String]) -> Result<PluginSidecarProbeArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut node_exe = PathBuf::from("node");
+    let mut sidecar_script = PathBuf::from("tools")
+        .join("openclaw-plugin-sidecar")
+        .join("index.mjs");
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--node-exe" => {
+                i += 1;
+                node_exe = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--node-exe requires a path".to_string())?;
+            }
+            "--sidecar-script" => {
+                i += 1;
+                sidecar_script = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--sidecar-script requires a path".to_string())?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(PluginSidecarProbeArgs {
+        target_home,
+        node_exe,
+        sidecar_script,
     })
 }
 
@@ -4222,6 +4305,7 @@ fn print_help() {
     println!("  telegram-poll-once Poll Telegram once, run DM pipeline, and deliver replies");
     println!("  telegram-loop     Run Telegram polling continuously until stopped");
     println!("  discord-outbox-send-once Send pending Discord outbox messages once");
+    println!("  plugin-sidecar-probe Probe the Node OpenClaw plugin sidecar contract");
     println!("  queue-enqueue   Persist one channel agent turn to the runtime queue");
     println!("  queue-prepare   Prepare one queued runtime item for Codex execution");
     println!("  runtime-run-once Prepare, run, and outbox one queued runtime item");
@@ -4266,6 +4350,8 @@ fn print_help() {
     println!("  --max-consecutive-errors <n> Telegram loop failure threshold");
     println!("  TELEGRAM_BOT_TOKEN      Environment variable used by Telegram adapters");
     println!("  DISCORD_BOT_TOKEN       Environment variable used by Discord adapters");
+    println!("  --node-exe <path>       Node executable for plugin-sidecar-probe");
+    println!("  --sidecar-script <path> Plugin sidecar script path");
     println!("  --queue-id <id>         Select one runtime queue item for queue-prepare");
     println!("  --execution-dir <path>  Prepared execution directory for codex-plan");
     println!("  --codex-exe <path>      Codex executable path for codex-plan/runtime-run-once");

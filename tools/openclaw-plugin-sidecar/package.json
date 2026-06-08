@@ -1,0 +1,9 @@
+{
+  "name": "openclaw-plugin-sidecar",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "bin": {
+    "openclaw-plugin-sidecar": "./index.mjs"
+  }
+}
