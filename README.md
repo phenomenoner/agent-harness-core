@@ -32,10 +32,11 @@ The project starts with a small, testable foundation:
 - A Codex runtime runner that drives one prepared `codex app-server` JSONL turn, records stdout/stderr logs, and writes OpenClaw-compatible completion outputs.
 - A Codex completion recorder that writes assistant output into OpenClaw-compatible transcript, trajectory, and Codex binding files.
 - A prompt bundle assembler that turns an agent turn plan into inspectable OpenClaw context payloads and uses a per-session injection ledger to avoid repeating prompt files/skill bodies.
+- A Windows supervisor planner that writes Task Scheduler install/start/stop/uninstall scripts for runtime, Telegram, and Discord loops without directly registering tasks.
 - A native agent-turn cron parser and dry-run dispatch planner with cutover hold safety.
 - A deterministic cron parser and no-LLM dry-run planner for workspace cron runners.
 - A subagent ledger parser and dry-run planner for `/subagents/runs.json` cutover safety.
-- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `enable-check`, `status`, `harness-skills-sync`, `skills`, `turn-plan`, `channel-step`, `channel-apply`, `channel-receive`, `channel-run-once`, `channel-outbox-plan`, `channel-delivery-record`, `telegram-poll-once`, `telegram-loop`, `discord-outbox-send-once`, `queue-enqueue`, `queue-prepare`, `runtime-run-once`, `runtime-loop`, `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
+- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `channel-credentials-export`, `registry`, `registry-export`, `enable-check`, `status`, `supervisor-plan`, `harness-skills-sync`, `skills`, `turn-plan`, `channel-step`, `channel-apply`, `channel-receive`, `channel-run-once`, `channel-outbox-plan`, `channel-delivery-record`, `telegram-poll-once`, `telegram-loop`, `discord-outbox-send-once`, `discord-event-run-once`, `discord-gateway-probe`, `discord-gateway-loop`, `plugin-sidecar-probe`, `plugin-sidecar-call`, `queue-enqueue`, `queue-prepare`, `runtime-run-once`, `runtime-loop`, `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
 - Minimal external crates for current scope: `serde`/`serde_json` for stable JSON reports and `ureq` for the first Telegram/Discord REST smoke adapters.
 
 ## Quick Start
@@ -48,9 +49,11 @@ cargo run -p openclaw-harness-cli -- import-dry-run --openclaw-home C:\path\to\.
 cargo run -p openclaw-harness-cli -- import-execute --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --conflict skip
 cargo run -p openclaw-harness-cli -- registry --openclaw-home C:\path\to\.openclaw
 cargo run -p openclaw-harness-cli -- registry-export --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --conflict skip
+cargo run -p openclaw-harness-cli -- channel-credentials-export --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --include-sensitive
 cargo run -p openclaw-harness-cli -- harness-skills-sync --target-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- enable-check --target-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- status --target-home C:\path\to\.openclaw-harness --json
+cargo run -p openclaw-harness-cli -- supervisor-plan --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --harness-cli C:\path\to\openclaw-harness.exe --codex-exe C:\path\to\codex.cmd --agent main
 cargo run -p openclaw-harness-cli -- skills --openclaw-home C:\path\to\.openclaw --query "repair memory cron" --agent mem-cron --limit 3
 cargo run -p openclaw-harness-cli -- skills --harness-home C:\path\to\.openclaw-harness --output imports\skills
 cargo run -p openclaw-harness-cli -- turn-plan --openclaw-home C:\path\to\.openclaw --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron"
@@ -100,11 +103,15 @@ The registry command is also read-only. It merges `openclaw.json` agent config w
 
 `registry-export` writes the first target harness state files under `state/harness-registry.json` and `state/harness-registry-receipts.json`. It records credential presence as metadata only; it does not copy raw API keys, tokens, or login state.
 
+`channel-credentials-export` is the explicit channel-secret handoff path. It reads Telegram/Discord bot tokens plus known allow-list, chat, channel, and guild IDs from an existing OpenClaw `openclaw.json` and writes them to the target harness `secrets/channel-credentials.env` only when `--include-sensitive` is passed. Receipts in `secrets/channel-credentials-receipts.json` stay redacted and record names, source paths, lengths, and export status, not raw values.
+
 `harness-skills-sync` writes the bundled `openclaw-windows-harness` skill and `.openclaw-harness-builtins.json` manifest into the target harness home. It follows the Hermes-style bundled-skill safety rule: current files are left alone, manifest-matched old files are updated, user-modified files are skipped unless `--force` is set.
 
 `enable-check` is the formal cutover readiness report. It checks the exported registry, enabled agents, Telegram/Discord token presence when those channels are enabled, provider credentials, plugin sidecar blockers, runtime queue receipts, channel outbox/state, Telegram offset state, Telegram/Discord adapter log evidence, Codex auth, memory-adapter status, and whether `state/logs/harness.jsonl` is writable. It appends an activation event to that log every time it runs.
 
 `status` is the operator health summary for handoff and monitoring. It aggregates readiness, queued/open/prepared/completed runtime work, channel outbox delivery state, Telegram/Discord smoke evidence, memory backend presence, plugin sidecar receipts, and operational log event coverage. Use `--json` when a scheduled task or monitor needs machine-readable output.
+
+`supervisor-plan` writes a Windows Task Scheduler handoff bundle under `state/supervisor/windows-scheduled-tasks` by default. It generates runner scripts for `runtime-loop`, `telegram-loop`, and `discord-gateway-loop`, plus install/start/stop/uninstall scripts and `supervisor-plan.json`. It uses stop files for graceful loop shutdown and writes absolute paths so tasks do not depend on the scheduler working directory. It does not register or start tasks by itself.
 
 Runtime operations write an append-only JSONL operational log at `state/logs/harness.jsonl`. Current events include activation checks, Telegram poll-once summaries, `channel-receive`, `queue-prepare`, `runtime-run-once`, `runtime-loop`, `codex-run`, `codex-complete`, and channel delivery receipts, with level, component, event name, message, queue id, session key, agent/channel ids, and relevant paths. This complements receipts and transcript/trajectory files and is the file to tail for monitoring/debugging.
 
@@ -124,11 +131,11 @@ Telegram and Discord adapters should share the same channel command parser and i
 
 `telegram-poll-once` is the first real Telegram Bot API smoke adapter. It reads `TELEGRAM_BOT_TOKEN` from the environment or `secrets/channel-credentials.env`, stores the next update offset at `state/channels/telegram-offset.json`, normalizes text updates into `channel-run-once`, delivers pending Telegram outbox messages through `sendMessage`, records delivery receipts, and logs a `telegram.poll-once` summary.
 
-`telegram-loop` wraps the same poll-once core in a continuous polling loop with `--iterations`, `--idle-ms`, and `--max-consecutive-errors`. Use `--iterations 1` or another finite count for controlled tests and `--iterations 0` for an operator-run handoff loop. A Windows service/scheduled-task installer is still pending.
+`telegram-loop` wraps the same poll-once core in a continuous polling loop with `--iterations`, `--idle-ms`, `--max-consecutive-errors`, and optional `--stop-file`. Use `--iterations 1` or another finite count for controlled tests and `--iterations 0` for an operator-run handoff loop.
 
 `discord-outbox-send-once` is the first Discord delivery adapter. It reads `DISCORD_BOT_TOKEN` from the environment or `secrets/channel-credentials.env`, sends pending `platform=discord` outbox messages through Discord's channel message REST endpoint, records delivery receipts, and logs a `discord.outbox-send-once` summary.
 
-`discord-event-run-once` normalizes one Discord Gateway `MESSAGE_CREATE` event into the shared channel pipeline. `discord-gateway-probe` and `discord-gateway-loop` provide the Node WebSocket receive wrapper for operator-run live handoff.
+`discord-event-run-once` normalizes one Discord Gateway `MESSAGE_CREATE` event into the shared channel pipeline. `discord-gateway-probe` and `discord-gateway-loop` provide the Node WebSocket receive wrapper for operator-run live handoff. The gateway loop accepts `--stop-file` through the CLI wrapper and closes the WebSocket cleanly when the file appears.
 
 `queue-enqueue` persists the agent-turn side of `channel-step`. It appends queued turns to `state/runtime-queue/pending.jsonl`, appends every queued/skipped attempt to `state/runtime-queue/receipts.jsonl`, and precomputes OpenClaw-compatible transcript and trajectory paths under `agents/<agent-id>/sessions/`. Command-only channel steps are recorded as skipped receipts and are not sent to the agent queue.
 
@@ -136,7 +143,7 @@ Telegram and Discord adapters should share the same channel command parser and i
 
 `runtime-run-once` is the first worker-facing pipeline. It calls `queue-prepare`, `codex-plan`, and `codex-run` for one queued or already prepared item, writes `state/runtime-queue/run-once-last.json`, appends `run-once-receipts.jsonl`, and writes a `kind=agent-reply` message to `state/channels/outbox.jsonl` when a fresh assistant reply is recorded. This is the core function a Telegram or Discord adapter can call after enqueueing a normal DM. If `codex-run` reports an already recorded completion, it skips the outbox write to avoid duplicate delivery.
 
-`runtime-loop` wraps `runtime-run-once` for operator handoff or a future Windows service wrapper. It drains queued runtime work until `--iterations` is reached, `--stop-when-idle` sees an idle queue, or `--max-consecutive-errors` is exceeded. `NoWork`, `NoPreparedExecution`, and already recorded completions are treated as idle for loop control so the worker does not repeatedly process the latest completed execution. It writes `state/runtime-queue/loop-last.json` and appends `runtime.loop-stopped` plus `runtime.loop-error` events to `state/logs/harness.jsonl`.
+`runtime-loop` wraps `runtime-run-once` for operator handoff or a Windows scheduled-task wrapper. It drains queued runtime work until `--iterations` is reached, `--stop-when-idle` sees an idle queue, `--stop-file` appears, or `--max-consecutive-errors` is exceeded. `NoWork`, `NoPreparedExecution`, and already recorded completions are treated as idle for loop control so the worker does not repeatedly process the latest completed execution. It writes `state/runtime-queue/loop-last.json` and appends `runtime.loop-stopped` plus `runtime.loop-error` events to `state/logs/harness.jsonl`.
 
 `codex-plan` reads the latest prepared execution or an explicit `--execution-dir`, writes `codex-runtime-plan.json` plus `codex-runtime-receipt.json`, and appends `codex-runtime-receipts.jsonl`. It plans a stdio `codex app-server` invocation, model/env requirements, and OpenClaw-compatible transcript/trajectory/Codex binding output paths. It still does not start Codex or make a model request.
 

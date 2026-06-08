@@ -23,8 +23,9 @@ use openclaw_harness_core::{
     RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions,
     RuntimeQueuePrepareReport, RuntimeRunOnceOptions, RuntimeRunOnceReport, RuntimeRunOnceStatus,
     SkillIndex, SkillSelectionQuery, SubagentPlan, SubagentPlanInput, TurnPlan, TurnPlanInput,
-    append_harness_log, apply_channel_command_step, assemble_prompt_bundle, build_channel_step,
-    build_dry_run_report, build_harness_skill_index, build_import_plan, build_runtime_skill_index,
+    WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport, append_harness_log,
+    apply_channel_command_step, assemble_prompt_bundle, build_channel_step, build_dry_run_report,
+    build_harness_skill_index, build_import_plan, build_runtime_skill_index,
     build_source_skill_index, build_turn_plan, check_activation_readiness, collect_harness_status,
     current_log_time_ms, enqueue_channel_step, execute_import, export_harness_registry_files,
     inventory, load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
@@ -34,7 +35,7 @@ use openclaw_harness_core::{
     record_codex_runtime_completion, run_channel_once, run_codex_runtime, run_runtime_queue_once,
     select_skills, sync_builtin_harness_skills, write_channel_step, write_deterministic_cron_plan,
     write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
-    write_subagent_plan, write_turn_plan,
+    write_subagent_plan, write_turn_plan, write_windows_supervisor_plan,
 };
 
 fn main() {
@@ -52,6 +53,7 @@ fn main() {
         "registry-export" => run_registry_export(&rest),
         "enable-check" => run_enable_check(&rest),
         "status" | "harness-status" => run_harness_status(&rest),
+        "supervisor-plan" => run_supervisor_plan(&rest),
         "harness-skills-sync" => run_harness_skills_sync(&rest),
         "skills" => run_skills(&rest),
         "turn-plan" => run_turn_plan(&rest),
@@ -327,6 +329,34 @@ fn run_harness_status(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_supervisor_plan(args: &[String]) -> Result<(), String> {
+    let args = supervisor_plan_args_from_args(args)?;
+    let report = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
+        harness_home: args.target_home,
+        openclaw_home: args.openclaw_home,
+        workspace: args.workspace,
+        harness_cli: args.harness_cli,
+        codex_executable: args.codex_exe,
+        node_executable: args.node_exe,
+        discord_gateway_script: args.gateway_script,
+        agent_id: args.agent_id,
+        output_dir: args.output_dir,
+        task_prefix: args.task_prefix,
+        include_runtime: args.include_runtime,
+        include_telegram: args.include_telegram,
+        include_discord: args.include_discord,
+        idle_ms: args.idle_ms,
+        max_consecutive_errors: args.max_consecutive_errors,
+        telegram_poll_timeout_seconds: args.telegram_poll_timeout_seconds,
+        telegram_max_updates: args.telegram_max_updates,
+        telegram_outbox_limit: args.telegram_outbox_limit,
+    })
+    .map_err(|err| err.to_string())?;
+
+    print_windows_supervisor_plan_report(&report);
+    Ok(())
+}
+
 fn run_harness_skills_sync(args: &[String]) -> Result<(), String> {
     let args = harness_skills_sync_args_from_args(args)?;
     let report = sync_builtin_harness_skills(BuiltinHarnessSkillSyncOptions {
@@ -587,6 +617,17 @@ fn run_telegram_loop(args: &[String]) -> Result<(), String> {
     let mut consecutive_errors = 0usize;
 
     loop {
+        if stop_file_requested(args.stop_file.as_deref()) {
+            append_loop_stop_log(
+                &args.poll.target_home,
+                "telegram",
+                "telegram.loop-stopped",
+                iterations,
+                "stop file requested",
+            )?;
+            println!("Telegram loop stop requested after {iterations} iteration(s)");
+            break;
+        }
         iterations += 1;
         match execute_telegram_poll_once(&args.poll, &token) {
             Ok(report) => {
@@ -1034,6 +1075,9 @@ fn discord_gateway_command(args: &DiscordGatewayArgs) -> Command {
     if let Some(codex_exe) = &args.codex_exe {
         command.arg("--codex-exe").arg(codex_exe);
     }
+    if let Some(stop_file) = &args.stop_file {
+        command.arg("--stop-file").arg(stop_file);
+    }
     if env::var_os("DISCORD_BOT_TOKEN").is_none()
         && let Some(token) = secret_env_value(&args.target_home, "DISCORD_BOT_TOKEN")
     {
@@ -1244,13 +1288,17 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
     let mut idle = 0usize;
     let mut errors = 0usize;
     let mut consecutive_errors = 0usize;
-    let mut last_status: Option<RuntimeRunOnceStatus>;
-    let mut last_queue_id: Option<String>;
-    let mut last_reason: Option<String>;
+    let mut last_status: Option<RuntimeRunOnceStatus> = None;
+    let mut last_queue_id: Option<String> = None;
+    let mut last_reason: Option<String> = None;
     let mut failed = false;
     let stop_reason;
 
     loop {
+        if stop_file_requested(args.stop_file.as_deref()) {
+            stop_reason = "stopped after stop file request".to_string();
+            break;
+        }
         iterations += 1;
         match run_runtime_queue_once(RuntimeRunOnceOptions {
             harness_home: args.target_home.clone(),
@@ -1647,6 +1695,27 @@ struct HarnessStatusArgs {
     json: bool,
 }
 
+struct SupervisorPlanArgs {
+    target_home: PathBuf,
+    openclaw_home: PathBuf,
+    workspace: Option<PathBuf>,
+    harness_cli: PathBuf,
+    codex_exe: Option<PathBuf>,
+    node_exe: PathBuf,
+    gateway_script: PathBuf,
+    agent_id: Option<String>,
+    output_dir: Option<PathBuf>,
+    task_prefix: String,
+    include_runtime: bool,
+    include_telegram: bool,
+    include_discord: bool,
+    idle_ms: u64,
+    max_consecutive_errors: usize,
+    telegram_poll_timeout_seconds: u64,
+    telegram_max_updates: usize,
+    telegram_outbox_limit: usize,
+}
+
 struct HarnessSkillsSyncArgs {
     target_home: PathBuf,
     force: bool,
@@ -1739,6 +1808,7 @@ struct TelegramLoopArgs {
     iterations: usize,
     idle_ms: u64,
     max_consecutive_errors: usize,
+    stop_file: Option<PathBuf>,
 }
 
 struct DiscordOutboxSendOnceArgs {
@@ -1785,6 +1855,7 @@ struct DiscordGatewayArgs {
     agent_id: Option<String>,
     codex_exe: Option<PathBuf>,
     max_messages: usize,
+    stop_file: Option<PathBuf>,
 }
 
 struct PluginSidecarProbeArgs {
@@ -1834,6 +1905,7 @@ struct RuntimeLoopArgs {
     idle_ms: u64,
     max_consecutive_errors: usize,
     stop_when_idle: bool,
+    stop_file: Option<PathBuf>,
 }
 
 struct RuntimeLoopSummary {
@@ -2161,6 +2233,169 @@ fn harness_status_args_from_args(args: &[String]) -> Result<HarnessStatusArgs, S
     }
 
     Ok(HarnessStatusArgs { target_home, json })
+}
+
+fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut openclaw_home = default_openclaw_home();
+    let mut workspace = None;
+    let mut harness_cli = default_harness_cli();
+    let mut codex_exe = None;
+    let mut node_exe = PathBuf::from("node");
+    let mut gateway_script = PathBuf::from("tools")
+        .join("openclaw-discord-gateway")
+        .join("index.mjs");
+    let mut agent_id = None;
+    let mut output_dir = None;
+    let mut task_prefix = "OpenClawHarness".to_string();
+    let mut include_runtime = true;
+    let mut include_telegram = true;
+    let mut include_discord = true;
+    let mut idle_ms = 1_000;
+    let mut max_consecutive_errors = 5;
+    let mut telegram_poll_timeout_seconds = 1;
+    let mut telegram_max_updates = 10;
+    let mut telegram_outbox_limit = 20;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--openclaw-home" => {
+                i += 1;
+                openclaw_home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--openclaw-home requires a path".to_string())?;
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--harness-cli" => {
+                i += 1;
+                harness_cli = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--harness-cli requires a path".to_string())?;
+            }
+            "--codex-exe" => {
+                i += 1;
+                codex_exe = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--codex-exe requires a path".to_string())?,
+                );
+            }
+            "--node-exe" => {
+                i += 1;
+                node_exe = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--node-exe requires a path".to_string())?;
+            }
+            "--gateway-script" => {
+                i += 1;
+                gateway_script = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--gateway-script requires a path".to_string())?;
+            }
+            "--agent" => {
+                i += 1;
+                agent_id = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--agent requires an id".to_string())?,
+                );
+            }
+            "--output" => {
+                i += 1;
+                output_dir = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--output requires a path".to_string())?,
+                );
+            }
+            "--task-prefix" => {
+                i += 1;
+                task_prefix = args
+                    .get(i)
+                    .cloned()
+                    .ok_or_else(|| "--task-prefix requires a name".to_string())?;
+            }
+            "--no-runtime" => include_runtime = false,
+            "--no-telegram" => include_telegram = false,
+            "--no-discord" => include_discord = false,
+            "--idle-ms" => {
+                i += 1;
+                idle_ms = args
+                    .get(i)
+                    .ok_or_else(|| "--idle-ms requires a positive integer".to_string())
+                    .and_then(|value| parse_u64(value, "--idle-ms"))?;
+            }
+            "--max-consecutive-errors" => {
+                i += 1;
+                max_consecutive_errors = args
+                    .get(i)
+                    .ok_or_else(|| {
+                        "--max-consecutive-errors requires a positive integer".to_string()
+                    })
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--poll-timeout-seconds" => {
+                i += 1;
+                telegram_poll_timeout_seconds = args
+                    .get(i)
+                    .ok_or_else(|| "--poll-timeout-seconds requires a positive integer".to_string())
+                    .and_then(|value| parse_u64(value, "--poll-timeout-seconds"))?;
+            }
+            "--max-updates" => {
+                i += 1;
+                telegram_max_updates = args
+                    .get(i)
+                    .ok_or_else(|| "--max-updates requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--outbox-limit" => {
+                i += 1;
+                telegram_outbox_limit = args
+                    .get(i)
+                    .ok_or_else(|| "--outbox-limit requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(SupervisorPlanArgs {
+        target_home,
+        openclaw_home,
+        workspace,
+        harness_cli,
+        codex_exe,
+        node_exe,
+        gateway_script,
+        agent_id,
+        output_dir,
+        task_prefix,
+        include_runtime,
+        include_telegram,
+        include_discord,
+        idle_ms,
+        max_consecutive_errors,
+        telegram_poll_timeout_seconds,
+        telegram_max_updates,
+        telegram_outbox_limit,
+    })
 }
 
 fn harness_skills_sync_args_from_args(args: &[String]) -> Result<HarnessSkillsSyncArgs, String> {
@@ -2811,6 +3046,7 @@ fn telegram_loop_args_from_args(args: &[String]) -> Result<TelegramLoopArgs, Str
     let mut iterations = 0;
     let mut idle_ms = 1_000;
     let mut max_consecutive_errors = 5;
+    let mut stop_file = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -2908,6 +3144,14 @@ fn telegram_loop_args_from_args(args: &[String]) -> Result<TelegramLoopArgs, Str
                     })
                     .and_then(|value| parse_limit(value))?;
             }
+            "--stop-file" => {
+                i += 1;
+                stop_file = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--stop-file requires a path".to_string())?,
+                );
+            }
             flag => return Err(format!("unknown argument: {flag}")),
         }
         i += 1;
@@ -2932,6 +3176,7 @@ fn telegram_loop_args_from_args(args: &[String]) -> Result<TelegramLoopArgs, Str
         iterations,
         idle_ms,
         max_consecutive_errors,
+        stop_file,
     })
 }
 
@@ -3093,6 +3338,7 @@ fn discord_gateway_args_from_args(args: &[String]) -> Result<DiscordGatewayArgs,
     let mut agent_id = None;
     let mut codex_exe = None;
     let mut max_messages = 0;
+    let mut stop_file = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -3160,6 +3406,14 @@ fn discord_gateway_args_from_args(args: &[String]) -> Result<DiscordGatewayArgs,
                     .ok_or_else(|| "--max-messages requires a non-negative integer".to_string())
                     .and_then(|value| parse_usize(value, "--max-messages"))?;
             }
+            "--stop-file" => {
+                i += 1;
+                stop_file = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--stop-file requires a path".to_string())?,
+                );
+            }
             flag => return Err(format!("unknown argument: {flag}")),
         }
         i += 1;
@@ -3178,6 +3432,7 @@ fn discord_gateway_args_from_args(args: &[String]) -> Result<DiscordGatewayArgs,
         agent_id,
         codex_exe,
         max_messages,
+        stop_file,
     })
 }
 
@@ -3412,6 +3667,7 @@ fn runtime_loop_args_from_args(args: &[String]) -> Result<RuntimeLoopArgs, Strin
     let mut idle_ms = 1_000u64;
     let mut max_consecutive_errors = 5usize;
     let mut stop_when_idle = false;
+    let mut stop_file = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -3477,6 +3733,14 @@ fn runtime_loop_args_from_args(args: &[String]) -> Result<RuntimeLoopArgs, Strin
             "--stop-when-idle" => {
                 stop_when_idle = true;
             }
+            "--stop-file" => {
+                i += 1;
+                stop_file = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--stop-file requires a path".to_string())?,
+                );
+            }
             flag => return Err(format!("unknown argument: {flag}")),
         }
         i += 1;
@@ -3492,6 +3756,7 @@ fn runtime_loop_args_from_args(args: &[String]) -> Result<RuntimeLoopArgs, Strin
         idle_ms,
         max_consecutive_errors,
         stop_when_idle,
+        stop_file,
     })
 }
 
@@ -4887,6 +5152,31 @@ fn current_time_ms() -> Result<i64, String> {
         .map_err(|_| "current epoch milliseconds exceed i64".to_string())
 }
 
+fn stop_file_requested(stop_file: Option<&Path>) -> bool {
+    stop_file.is_some_and(Path::exists)
+}
+
+fn append_loop_stop_log(
+    harness_home: &Path,
+    component: &str,
+    event: &str,
+    iterations: usize,
+    reason: &str,
+) -> Result<(), String> {
+    append_harness_log(
+        harness_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            HarnessLogLevel::Info,
+            component,
+            event,
+            format!("iterations={iterations} reason={reason}"),
+        ),
+    )
+    .map(|_| ())
+    .map_err(|err| err.to_string())
+}
+
 fn format_status(status: &ImportPhaseStatus) -> &'static str {
     match status {
         ImportPhaseStatus::Ready => "ready",
@@ -5133,6 +5423,39 @@ fn print_builtin_harness_skill_sync_report(report: &BuiltinHarnessSkillSyncRepor
                 receipt.path.display(),
                 receipt.reason
             );
+        }
+    }
+}
+
+fn print_windows_supervisor_plan_report(report: &WindowsSupervisorPlanReport) {
+    println!("OpenClaw Windows supervisor plan");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Output dir: {}", report.output_dir.display());
+    println!("Receipt: {}", report.receipt_file.display());
+    println!("Tasks: {}", report.tasks.len());
+    for task in &report.tasks {
+        println!(
+            "- {} component={} gracefulStop={} script={} stopFile={}",
+            task.name,
+            task.component,
+            yes_no(task.graceful_stop),
+            task.runner_script.display(),
+            task.stop_file.display()
+        );
+    }
+    println!("Scripts: {}", report.scripts.len());
+    for script in &report.scripts {
+        println!(
+            "- {}: {} ({})",
+            script.name,
+            script.path.display(),
+            script.purpose
+        );
+    }
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
         }
     }
 }
@@ -6246,6 +6569,7 @@ fn print_help() {
     println!(
         "  status          Summarize harness readiness, runtime, channels, memory, plugins, and logs"
     );
+    println!("  supervisor-plan Generate Windows scheduled-task scripts for harness loops");
     println!("  harness-skills-sync Sync bundled harness operation skills");
     println!("  skills          Build a skill-first index and optionally match a task");
     println!("  turn-plan       Plan routing, commands, prompts, and skills for one turn");
@@ -6287,6 +6611,7 @@ fn print_help() {
     println!("  --output <path>         Write report.json and summary.md");
     println!("  --include-sensitive     Copy/write sensitive import or credential values");
     println!("  --json                  Print machine-readable JSON for status");
+    println!("  --task-prefix <name>    Windows scheduled-task name prefix for supervisor-plan");
     println!("  --query <text>          Match skills for a task turn");
     println!("  --agent <id>            Agent hint for skill matching");
     println!("  --channel <name>        Channel hint for skill matching");
@@ -6306,6 +6631,9 @@ fn print_help() {
     println!("  --event-json <text>     Discord Gateway event JSON text");
     println!("  --gateway-script <path> Discord Gateway Node script path");
     println!("  --harness-cli <path>    Harness CLI used by gateway loop callbacks");
+    println!("  --no-runtime            Exclude runtime-loop from supervisor-plan");
+    println!("  --no-telegram           Exclude telegram-loop from supervisor-plan");
+    println!("  --no-discord            Exclude discord-gateway-loop from supervisor-plan");
     println!(
         "  --max-messages <n>      Stop Discord gateway loop after n messages; 0 means forever"
     );
@@ -6317,6 +6645,7 @@ fn print_help() {
     println!("  --idle-ms <n>           Loop sleep after each poll or runtime run");
     println!("  --max-consecutive-errors <n> Loop failure threshold");
     println!("  --stop-when-idle        Stop runtime-loop when the runtime queue is idle");
+    println!("  --stop-file <path>      Stop-file path for runtime, Telegram, or Discord loops");
     println!("  TELEGRAM_BOT_TOKEN      Env var or harness secret used by Telegram adapters");
     println!("  DISCORD_BOT_TOKEN       Env var or harness secret used by Discord adapters");
     println!("  --node-exe <path>       Node executable for plugin sidecar commands");

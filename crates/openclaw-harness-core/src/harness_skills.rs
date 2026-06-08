@@ -50,7 +50,8 @@ Use it when the user mentions:
 10. Use a Codex CLI binary that the harness can spawn. On Windows, the Codex Desktop MSIX resource path may be visible on PATH but fail with os error 5; prefer a standalone release or local npm install and pass it with --codex-exe.
 11. Use tools/openclaw-fake-codex-app-server for offline runtime smoke when the goal is to verify harness receipts and logs without a model request.
 12. Use runtime-loop for operator-run queue draining or service-wrapper handoff; use --stop-when-idle for smoke and --iterations 0 only under an intentional supervisor.
-13. Use status --json for operator health checks; it should show runtime openItems=0 and outbox pending=0 before live handoff.
+13. Use supervisor-plan to generate Windows Task Scheduler install/start/stop/uninstall scripts. It writes scripts and receipts only; it does not register tasks automatically.
+14. Use status --json for operator health checks; it should show runtime openItems=0 and outbox pending=0 before live handoff.
 
 ## Prompt And Tool Schema Policy
 
@@ -90,9 +91,9 @@ Commands should update channel state and receipts before enqueueing agent turns.
 - Use channel-delivery-record after Telegram/Discord send attempts to record delivered or failed receipts.
 - Use channel-credentials-export --include-sensitive during OpenClaw cutover to import Telegram/Discord bot tokens and known channel/user/guild IDs into secrets/channel-credentials.env with redacted receipts.
 - Use telegram-poll-once for Telegram Bot API smoke tests. It reads TELEGRAM_BOT_TOKEN from the environment or secrets/channel-credentials.env, stores offsets in state/channels/telegram-offset.json, runs channel-run-once for text updates, sends pending replies, records delivery receipts, and writes a telegram.poll-once operational log.
-- Use telegram-loop for operator-run Telegram handoff. It repeats the same poll-once path with --iterations, --idle-ms, and --max-consecutive-errors. Use finite iterations for tests and --iterations 0 only when the old gateway is not also consuming Telegram updates.
+- Use telegram-loop for operator-run Telegram handoff. It repeats the same poll-once path with --iterations, --idle-ms, --max-consecutive-errors, and optional --stop-file. Use finite iterations for tests and --iterations 0 only when the old gateway is not also consuming Telegram updates.
 - Use discord-outbox-send-once for Discord outbound smoke. It reads DISCORD_BOT_TOKEN from the environment or secrets/channel-credentials.env, sends pending platform=discord outbox messages through Discord REST, records delivery receipts, and writes a discord.outbox-send-once operational log.
-- Use discord-event-run-once for Discord inbound normalization smoke. It accepts a Discord Gateway MESSAGE_CREATE event from --event-file or --event-json, skips bot/empty/duplicate messages, calls channel-run-once for text, writes discord-event receipts, and logs discord.event-run-once. Use discord-gateway-probe before discord-gateway-loop for live WebSocket handoff.
+- Use discord-event-run-once for Discord inbound normalization smoke. It accepts a Discord Gateway MESSAGE_CREATE event from --event-file or --event-json, skips bot/empty/duplicate messages, calls channel-run-once for text, writes discord-event receipts, and logs discord.event-run-once. Use discord-gateway-probe before discord-gateway-loop for live WebSocket handoff. The gateway loop accepts --stop-file and closes the WebSocket when that file appears.
 - Failed receipts stay retryable; delivered receipts are skipped by future outbox plans.
 - Do not send the same already recorded Codex completion twice.
 
@@ -114,6 +115,7 @@ Before replacing the Docker OpenClaw gateway:
 12. Run plugin-sidecar-probe and plugin-sidecar-call for sidecar.status/plugins.list/tools.probe; set OPENCLAW_PLUGIN_SOURCE_ROOTS when imported manifests live outside the harness home. Confirm plugin-sidecar, plugin-sidecar-probe, and plugin-sidecar-bridge are pass in enable-check. This proves manifest catalog and JSON-RPC bridge readiness; plugin-specific tool executors still need dedicated adapters.
 13. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt. Use tools/openclaw-fake-codex-app-server/fake-codex-app-server.cmd for offline smoke; use the intended Codex CLI only for operator-run model smoke.
 14. Run runtime-loop --stop-when-idle for idle/drain smoke and confirm state/runtime-queue/loop-last.json plus runtime.loop-stopped log evidence.
+15. Run supervisor-plan with the intended harness CLI, Codex executable, channel loop selection, and task prefix. Confirm state/supervisor/windows-scheduled-tasks/supervisor-plan.json, absolute paths in generated scripts, no raw token/key/secret strings in scripts, and enable-check supervisor-plan pass.
 
 ## Codex Runtime Flow
 
@@ -125,8 +127,16 @@ For a normal queued channel turn, the current worker-facing path is runtime-run-
 For operator-run drain or service-wrapper handoff, use runtime-loop:
 
 - It repeats runtime-run-once with finite or infinite --iterations.
-- It treats no-work/no-prepared-execution and already recorded completions as idle, supports --stop-when-idle for smoke, and exits nonzero after --max-consecutive-errors for runtime/preflight/protocol failures.
+- It treats no-work/no-prepared-execution and already recorded completions as idle, supports --stop-when-idle and --stop-file for smoke/supervisor stop, and exits nonzero after --max-consecutive-errors for runtime/preflight/protocol failures.
 - It writes state/runtime-queue/loop-last.json and appends runtime.loop-stopped plus runtime.loop-error to state/logs/harness.jsonl.
+
+For Windows supervisor handoff, use supervisor-plan:
+
+- It writes runner scripts for runtime-loop, telegram-loop, and discord-gateway-loop under state/supervisor/windows-scheduled-tasks/scripts.
+- It writes install-scheduled-tasks.ps1, start-scheduled-tasks.ps1, stop-scheduled-tasks.ps1, uninstall-scheduled-tasks.ps1, and supervisor-plan.json.
+- It uses absolute paths because Task Scheduler does not run from the repo directory by default.
+- It uses stop files for graceful loop shutdown and never embeds raw bot tokens or API keys.
+- The operator must explicitly run the generated installer/start scripts after the old gateway is offline.
 
 For manual debugging of one prepared turn, the expanded path is:
 
@@ -150,6 +160,7 @@ Use status for operator-facing health checks before and after handoff:
 - status summarizes readiness, runtime queued/open/prepared/completed items, outbox pending/delivered/retryable counts, Telegram/Discord smoke evidence, memory backend presence, plugin sidecar receipts, and operational log coverage.
 - status --json is the monitor-friendly form for scheduled tasks or service wrappers.
 - runtime-loop writes loop-last.json for the most recent worker-loop stop reason, iteration count, idle count, and error count.
+- supervisor-plan readiness is checked through enable-check, not status-specific process liveness; installed task health still needs monitor integration.
 - Before live channel handoff, openItems should be 0 and outbox pending should be 0 unless the operator intentionally wants the adapter to deliver those pending messages.
 
 ## Skill Maintenance Loop

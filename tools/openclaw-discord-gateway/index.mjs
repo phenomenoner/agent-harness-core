@@ -20,6 +20,7 @@ function parseArgs(argv) {
     codexExe: null,
     gatewayUrl: DISCORD_GATEWAY_URL,
     maxMessages: 0,
+    stopFile: null,
     probe: false,
     writeReceipt: false,
   };
@@ -49,6 +50,9 @@ function parseArgs(argv) {
     } else if (flag === "--max-messages") {
       i += 1;
       args.maxMessages = Number.parseInt(requiredValue(argv, i, flag), 10);
+    } else if (flag === "--stop-file") {
+      i += 1;
+      args.stopFile = requiredValue(argv, i, flag);
     } else if (flag === "--probe") {
       args.probe = true;
     } else if (flag === "--write-receipt") {
@@ -144,12 +148,21 @@ async function runGateway(args) {
 
   let sequence = null;
   let heartbeatTimer = null;
+  let stopFileTimer = null;
   let handledMessages = 0;
   const ws = new WebSocket(args.gatewayUrl);
 
   await new Promise((resolve, reject) => {
+    const requestStopIfNeeded = () => {
+      if (args.stopFile && fs.existsSync(args.stopFile)) {
+        writeGatewayLog(args, "stop-file", { stopFile: args.stopFile });
+        ws.close(1000, "stop file requested");
+      }
+    };
     ws.addEventListener("open", () => {
       writeGatewayLog(args, "open", { gatewayUrl: args.gatewayUrl });
+      stopFileTimer = setInterval(requestStopIfNeeded, 1000);
+      requestStopIfNeeded();
     });
     ws.addEventListener("error", (event) => {
       reject(new Error(`Discord gateway WebSocket error: ${event.message || "unknown error"}`));
@@ -157,6 +170,9 @@ async function runGateway(args) {
     ws.addEventListener("close", (event) => {
       if (heartbeatTimer) {
         clearInterval(heartbeatTimer);
+      }
+      if (stopFileTimer) {
+        clearInterval(stopFileTimer);
       }
       writeGatewayLog(args, "close", { code: event.code, reason: event.reason });
       resolve();

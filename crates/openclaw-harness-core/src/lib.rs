@@ -24,6 +24,7 @@ pub mod runtime_worker;
 pub mod skills;
 pub mod status;
 pub mod subagents;
+pub mod supervisor;
 pub mod turns;
 
 pub use activation::{
@@ -139,6 +140,10 @@ pub use subagents::{
     SubagentLedger, SubagentLedgerSummary, SubagentPlan, SubagentPlanAction, SubagentPlanEntry,
     SubagentPlanFile, SubagentPlanInput, SubagentPlanSummary, SubagentRun, SubagentRunStatus,
     load_subagent_ledger, plan_subagents, write_subagent_plan,
+};
+pub use supervisor::{
+    WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport, WindowsSupervisorScript,
+    WindowsSupervisorTask, write_windows_supervisor_plan,
 };
 pub use turns::{
     TurnAgent, TurnDispatch, TurnModelPolicy, TurnPlan, TurnPlanFile, TurnPlanInput,

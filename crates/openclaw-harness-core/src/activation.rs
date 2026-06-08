@@ -99,6 +99,7 @@ pub fn check_activation_readiness(
     check_activation_plan_doc(&mut checks);
     check_harness_skills(&options.harness_home, &mut checks);
     check_runtime_queue(&options.harness_home, &mut checks);
+    check_supervisor_plan(&options.harness_home, &mut checks);
     check_channel_state(&options.harness_home, &mut checks);
     check_logging(&options.harness_home, &mut checks);
     check_memory_import(&options.harness_home, &mut checks);
@@ -566,6 +567,48 @@ fn check_codex_launch_probe(harness_home: &Path, checks: &mut Vec<ActivationRead
         Err(error) => checks.push(warn(
             "codex-runtime-launch-probe",
             format!("could not read {}: {error}", path.display()),
+        )),
+    }
+}
+
+fn check_supervisor_plan(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let path = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("windows-scheduled-tasks")
+        .join("supervisor-plan.json");
+    match read_json_value(&path) {
+        Ok(value) => {
+            let task_count = value
+                .get("tasks")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            if task_count > 0 {
+                checks.push(pass(
+                    "supervisor-plan",
+                    format!(
+                        "found {task_count} scheduled task plan(s) at {}",
+                        path.display()
+                    ),
+                ));
+            } else {
+                checks.push(warn(
+                    "supervisor-plan",
+                    format!("supervisor plan has no tasks at {}", path.display()),
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+            "supervisor-plan",
+            format!(
+                "not found yet: {}; run supervisor-plan before service handoff",
+                path.display()
+            ),
+        )),
+        Err(error) => checks.push(fail(
+            "supervisor-plan",
+            format!("could not read supervisor plan {}: {error}", path.display()),
         )),
     }
 }
@@ -1174,6 +1217,47 @@ mod tests {
             check.name == "runtime-loop"
                 && check.status == ActivationReadinessStatus::Fail
                 && check.detail.contains("errors=2")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readiness_reports_supervisor_plan() {
+        let root = temp_root("readiness_reports_supervisor_plan");
+        let harness_home = root.join(".openclaw-harness");
+        let state = harness_home.join("state");
+        let supervisor_dir = state.join("supervisor").join("windows-scheduled-tasks");
+        fs::create_dir_all(&supervisor_dir).unwrap();
+        fs::write(
+            state.join("harness-registry.json"),
+            r#"{
+              "schema": "openclaw-harness.target-registry.v1",
+              "agents": [
+                { "id": "main", "enabled": true }
+              ],
+              "providers": [],
+              "plugins": [],
+              "channels": { "telegram": false, "discord": false }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            supervisor_dir.join("supervisor-plan.json"),
+            r#"{
+              "schema": "openclaw-harness.windows-supervisor-plan.v1",
+              "tasks": [
+                { "name": "OpenClawHarness-runtime-loop" }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let report =
+            check_activation_readiness(ActivationReadinessOptions { harness_home }).unwrap();
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "supervisor-plan" && check.status == ActivationReadinessStatus::Pass
         }));
 
         let _ = fs::remove_dir_all(root);
