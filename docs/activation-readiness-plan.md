@@ -175,11 +175,12 @@ As of 2026-06-08 local verification:
 - Discord Gateway `MESSAGE_CREATE` event normalizer smoke passes for `/status`, including duplicate-message skip by Discord message id.
 - `channel-credentials-export --include-sensitive` imported Telegram/Discord bot tokens plus known allow-list/guild/channel/chat IDs from the local OpenClaw snapshot into `imports/activation-harness/secrets/channel-credentials.env`; readiness sees both token gates as pass.
 - `discord-gateway-probe` passes with the imported Discord token and Node 24 global WebSocket support.
+- `discord-outbox-send-once` passes with an empty pending outbox, writes `discord.outbox-send-once`, and does not send any message when `pending=0`.
 - The Codex Desktop MSIX `codex.exe` path is not spawnable from this harness environment and should not be used for service runtime.
 - Offline normal-turn smoke passes through `channel-run-once` with `tools/openclaw-fake-codex-app-server/fake-codex-app-server.cmd`, producing runtime-run-once, Codex run, Codex completion, transcript, outbox, delivery receipt, and operational log evidence without a model request or channel send.
 - Runtime loop idle/drain smoke passes with `runtime-loop --stop-when-idle` and writes `state/runtime-queue/loop-last.json` without a model request when no pending queue items remain.
 - `status` reports `queued=2 open=0 prepared=2 completed=2`, outbox `pending=0 delivered=4`, Qdrant edge primary memory present, plugin catalog ready with 2 manifest-derived tools, and operational log event coverage for offline runtime/delivery smoke.
-- `enable-check` currently reports `Ready: yes` with no hard failures. Remaining warnings are live operator smoke evidence for Telegram poll/offset, Discord outbound delivery, and optional LanceDB backup.
+- `enable-check` currently reports `Ready: yes` with no hard failures. Remaining warnings are live operator smoke evidence for Telegram poll/offset and optional LanceDB backup.
 
 ## Verification Commands
 
