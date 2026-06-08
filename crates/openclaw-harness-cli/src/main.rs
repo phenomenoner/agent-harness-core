@@ -4,6 +4,10 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -67,6 +71,7 @@ fn main() {
         "telegram-poll-once" => run_telegram_poll_once(&rest),
         "telegram-loop" => run_telegram_loop(&rest),
         "discord-outbox-send-once" => run_discord_outbox_send_once(&rest),
+        "discord-outbox-loop" => run_discord_outbox_loop(&rest),
         "discord-event-run-once" => run_discord_event_run_once(&rest),
         "discord-gateway-probe" => run_discord_gateway_probe(&rest),
         "discord-gateway-loop" => run_discord_gateway_loop(&rest),
@@ -563,6 +568,7 @@ fn run_channel_run_once(args: &[String]) -> Result<(), String> {
             harness_home: Some(args.target_home),
         },
         outbox_limit: args.outbox_limit,
+        run_runtime: true,
     })
     .map_err(|err| err.to_string())?;
 
@@ -605,7 +611,7 @@ fn run_channel_delivery_record(args: &[String]) -> Result<(), String> {
 
 fn run_telegram_probe(args: &[String]) -> Result<(), String> {
     let args = telegram_probe_args_from_args(args)?;
-    let report = match telegram_bot_token(&args.target_home) {
+    let report = match telegram_bot_token(&args.target_home, None) {
         Ok(token) => execute_telegram_probe(&args.target_home, &token)?,
         Err(reason) => write_telegram_probe_result(TelegramProbeReport {
             harness_home: args.target_home.clone(),
@@ -630,7 +636,7 @@ fn run_telegram_probe(args: &[String]) -> Result<(), String> {
 
 fn run_telegram_poll_once(args: &[String]) -> Result<(), String> {
     let args = telegram_poll_once_args_from_args(args)?;
-    let token = telegram_bot_token(&args.target_home)?;
+    let token = telegram_bot_token(&args.target_home, args.telegram_account.as_deref())?;
     let report = execute_telegram_poll_once(&args, &token)?;
     print_telegram_poll_once_report(&report);
     Ok(())
@@ -638,7 +644,10 @@ fn run_telegram_poll_once(args: &[String]) -> Result<(), String> {
 
 fn run_telegram_loop(args: &[String]) -> Result<(), String> {
     let args = telegram_loop_args_from_args(args)?;
-    let token = telegram_bot_token(&args.poll.target_home)?;
+    let token = telegram_bot_token(
+        &args.poll.target_home,
+        args.poll.telegram_account.as_deref(),
+    )?;
     let mut iterations = 0usize;
     let mut consecutive_errors = 0usize;
 
@@ -796,7 +805,7 @@ fn execute_telegram_poll_once(
     token: &str,
 ) -> Result<TelegramPollOnceReport, String> {
     let mut warnings = Vec::new();
-    let offset_file = telegram_offset_file(&args.target_home);
+    let offset_file = telegram_offset_file(&args.target_home, args.telegram_account.as_deref());
     let offset = read_telegram_offset(&offset_file, &mut warnings)?;
     let access_policy = channel_access_policy(&args.target_home)?;
     let updates = telegram_get_updates(token, offset, args.poll_timeout_seconds, args.max_updates)?;
@@ -852,13 +861,18 @@ fn execute_telegram_poll_once(
             write_telegram_offset(&offset_file, next_offset)?;
             continue;
         }
+        if let Err(error) = telegram_send_chat_action(token, &chat_id, "typing") {
+            warnings.push(format!(
+                "Telegram sendChatAction failed for update {update_id}: {error}"
+            ));
+        }
         run_channel_once(ChannelRunOnceOptions {
             source: args.source.clone(),
             harness_home: args.target_home.clone(),
             platform: "telegram".to_string(),
             channel_id: chat_id,
             user_id,
-            agent_id: args.agent_id.clone(),
+            agent_id: telegram_effective_agent_id(args),
             session_key: None,
             message: text.to_string(),
             skill_limit: args.skill_limit,
@@ -870,6 +884,7 @@ fn execute_telegram_poll_once(
                 ..PromptAssemblyOptions::default()
             },
             outbox_limit: args.outbox_limit,
+            run_runtime: false,
         })
         .map_err(|err| err.to_string())?;
         handled_messages += 1;
@@ -962,6 +977,76 @@ fn execute_telegram_poll_once(
 fn run_discord_outbox_send_once(args: &[String]) -> Result<(), String> {
     let args = discord_outbox_send_once_args_from_args(args)?;
     let token = discord_bot_token(&args.target_home)?;
+    let report = execute_discord_outbox_send_once(&args, &token)?;
+    print_discord_outbox_send_once_report(&report);
+    Ok(())
+}
+
+fn run_discord_outbox_loop(args: &[String]) -> Result<(), String> {
+    let args = discord_outbox_loop_args_from_args(args)?;
+    let token = discord_bot_token(&args.send.target_home)?;
+    let mut iterations = 0usize;
+    let mut consecutive_errors = 0usize;
+
+    loop {
+        if stop_file_requested(args.stop_file.as_deref()) {
+            append_loop_stop_log(
+                &args.send.target_home,
+                "discord",
+                "discord.outbox-loop-stopped",
+                iterations,
+                "stop file requested",
+            )?;
+            println!("Discord outbox loop stop requested after {iterations} iteration(s)");
+            break;
+        }
+        iterations += 1;
+        match execute_discord_outbox_send_once(&args.send, &token) {
+            Ok(report) => {
+                consecutive_errors = 0;
+                println!("Discord outbox loop iteration: {iterations}");
+                print_discord_outbox_send_once_report(&report);
+            }
+            Err(error) => {
+                consecutive_errors += 1;
+                eprintln!(
+                    "discord-outbox-loop iteration {iterations} failed ({consecutive_errors}/{}): {error}",
+                    args.max_consecutive_errors
+                );
+                let _ = append_harness_log(
+                    &args.send.target_home,
+                    &HarnessLogEvent::new(
+                        current_log_time_ms().unwrap_or(0),
+                        HarnessLogLevel::Warn,
+                        "discord",
+                        "discord.outbox-loop-error",
+                        format!(
+                            "iteration={iterations} consecutiveErrors={consecutive_errors} error={error}"
+                        ),
+                    ),
+                );
+                if consecutive_errors >= args.max_consecutive_errors {
+                    return Err(format!(
+                        "discord-outbox-loop exceeded {} consecutive errors; last error: {error}",
+                        args.max_consecutive_errors
+                    ));
+                }
+            }
+        }
+
+        if args.iterations > 0 && iterations >= args.iterations {
+            break;
+        }
+        thread::sleep(Duration::from_millis(args.idle_ms));
+    }
+
+    Ok(())
+}
+
+fn execute_discord_outbox_send_once(
+    args: &DiscordOutboxSendOnceArgs,
+    token: &str,
+) -> Result<DiscordOutboxSendOnceReport, String> {
     let delivery = plan_channel_outbox(ChannelOutboxPlanOptions {
         harness_home: args.target_home.clone(),
         platform: Some("discord".to_string()),
@@ -1035,8 +1120,7 @@ fn run_discord_outbox_send_once(args: &[String]) -> Result<(), String> {
         ),
     )
     .map_err(|err| err.to_string())?;
-    print_discord_outbox_send_once_report(&report);
-    Ok(())
+    Ok(report)
 }
 
 fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
@@ -1109,6 +1193,20 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
                     run: None,
                 }
             } else {
+                if let Ok(token) = discord_bot_token(&args.target_home)
+                    && let Err(error) = discord_send_typing(&token, &message.channel_id)
+                {
+                    let _ = append_harness_log(
+                        &args.target_home,
+                        &HarnessLogEvent::new(
+                            current_log_time_ms().unwrap_or(0),
+                            HarnessLogLevel::Warn,
+                            "discord",
+                            "discord.typing-failed",
+                            error,
+                        ),
+                    );
+                }
                 let run = run_channel_once(ChannelRunOnceOptions {
                     source: args.source.clone(),
                     harness_home: args.target_home.clone(),
@@ -1127,6 +1225,7 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
                         ..PromptAssemblyOptions::default()
                     },
                     outbox_limit: args.outbox_limit,
+                    run_runtime: false,
                 })
                 .map_err(|err| err.to_string())?;
                 DiscordEventRunOnceReport {
@@ -1417,6 +1516,7 @@ fn run_queue_prepare(args: &[String]) -> Result<(), String> {
 
 fn run_runtime_run_once(args: &[String]) -> Result<(), String> {
     let args = runtime_run_once_args_from_args(args)?;
+    let _typing = start_runtime_typing_heartbeat(&args.target_home, args.queue_id.as_deref());
     let report = run_runtime_queue_once(RuntimeRunOnceOptions {
         harness_home: args.target_home.clone(),
         queue_id: args.queue_id,
@@ -1454,6 +1554,7 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
             break;
         }
         iterations += 1;
+        let _typing = start_runtime_typing_heartbeat(&args.target_home, None);
         match run_runtime_queue_once(RuntimeRunOnceOptions {
             harness_home: args.target_home.clone(),
             queue_id: None,
@@ -1956,6 +2057,7 @@ struct TelegramPollOnceArgs {
     source: OpenClawSource,
     target_home: PathBuf,
     agent_id: Option<String>,
+    telegram_account: Option<String>,
     skill_limit: usize,
     codex_exe: Option<PathBuf>,
     timeout_ms: u64,
@@ -2002,6 +2104,14 @@ struct TelegramLoopArgs {
 struct DiscordOutboxSendOnceArgs {
     target_home: PathBuf,
     outbox_limit: usize,
+}
+
+struct DiscordOutboxLoopArgs {
+    send: DiscordOutboxSendOnceArgs,
+    iterations: usize,
+    idle_ms: u64,
+    max_consecutive_errors: usize,
+    stop_file: Option<PathBuf>,
 }
 
 struct DiscordEventRunOnceArgs {
@@ -3138,6 +3248,7 @@ fn telegram_poll_once_args_from_args(args: &[String]) -> Result<TelegramPollOnce
     let mut workspace = None;
     let mut target_home = default_harness_home();
     let mut agent_id = None;
+    let mut telegram_account = None;
     let mut skill_limit = 5;
     let mut codex_exe = None;
     let mut timeout_ms = 300_000;
@@ -3173,6 +3284,14 @@ fn telegram_poll_once_args_from_args(args: &[String]) -> Result<TelegramPollOnce
                     args.get(i)
                         .cloned()
                         .ok_or_else(|| "--agent requires an id".to_string())?,
+                );
+            }
+            "--telegram-account" => {
+                i += 1;
+                telegram_account = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--telegram-account requires an account id".to_string())?,
                 );
             }
             "--skill-limit" => {
@@ -3231,6 +3350,7 @@ fn telegram_poll_once_args_from_args(args: &[String]) -> Result<TelegramPollOnce
         source,
         target_home,
         agent_id,
+        telegram_account,
         skill_limit,
         codex_exe,
         timeout_ms,
@@ -3245,6 +3365,7 @@ fn telegram_loop_args_from_args(args: &[String]) -> Result<TelegramLoopArgs, Str
     let mut workspace = None;
     let mut target_home = default_harness_home();
     let mut agent_id = None;
+    let mut telegram_account = None;
     let mut skill_limit = 5;
     let mut codex_exe = None;
     let mut timeout_ms = 300_000;
@@ -3284,6 +3405,14 @@ fn telegram_loop_args_from_args(args: &[String]) -> Result<TelegramLoopArgs, Str
                     args.get(i)
                         .cloned()
                         .ok_or_else(|| "--agent requires an id".to_string())?,
+                );
+            }
+            "--telegram-account" => {
+                i += 1;
+                telegram_account = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--telegram-account requires an account id".to_string())?,
                 );
             }
             "--skill-limit" => {
@@ -3374,6 +3503,7 @@ fn telegram_loop_args_from_args(args: &[String]) -> Result<TelegramLoopArgs, Str
             source,
             target_home,
             agent_id,
+            telegram_account,
             skill_limit,
             codex_exe,
             timeout_ms,
@@ -3416,6 +3546,76 @@ fn discord_outbox_send_once_args_from_args(
     Ok(DiscordOutboxSendOnceArgs {
         target_home,
         outbox_limit,
+    })
+}
+
+fn discord_outbox_loop_args_from_args(args: &[String]) -> Result<DiscordOutboxLoopArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut outbox_limit = 20;
+    let mut iterations = 0usize;
+    let mut idle_ms = 1_000u64;
+    let mut max_consecutive_errors = 5usize;
+    let mut stop_file = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--outbox-limit" => {
+                i += 1;
+                outbox_limit = args
+                    .get(i)
+                    .ok_or_else(|| "--outbox-limit requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--iterations" => {
+                i += 1;
+                iterations = args
+                    .get(i)
+                    .ok_or_else(|| "--iterations requires a non-negative integer".to_string())
+                    .and_then(|value| parse_usize(value, "--iterations"))?;
+            }
+            "--idle-ms" => {
+                i += 1;
+                idle_ms = args
+                    .get(i)
+                    .ok_or_else(|| "--idle-ms requires a positive integer".to_string())
+                    .and_then(|value| parse_u64(value, "--idle-ms"))?;
+            }
+            "--max-consecutive-errors" => {
+                i += 1;
+                max_consecutive_errors = args
+                    .get(i)
+                    .ok_or_else(|| {
+                        "--max-consecutive-errors requires a positive integer".to_string()
+                    })
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--stop-file" => {
+                i += 1;
+                stop_file = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--stop-file requires a path".to_string())?,
+                );
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(DiscordOutboxLoopArgs {
+        send: DiscordOutboxSendOnceArgs {
+            target_home,
+            outbox_limit,
+        },
+        iterations,
+        idle_ms,
+        max_consecutive_errors,
+        stop_file,
     })
 }
 
@@ -5241,20 +5441,68 @@ fn discord_access_decision(
     ChannelAccessDecision::Allowed
 }
 
-fn telegram_bot_token(harness_home: &Path) -> Result<String, String> {
-    env::var("TELEGRAM_BOT_TOKEN")
+fn telegram_bot_token(harness_home: &Path, account_id: Option<&str>) -> Result<String, String> {
+    let account_id = account_id
+        .map(str::trim)
+        .filter(|account_id| !account_id.is_empty());
+    let env_name = account_id
+        .filter(|account_id| *account_id != "default")
+        .map(telegram_account_token_env_name)
+        .unwrap_or_else(|| "TELEGRAM_BOT_TOKEN".to_string());
+    env::var(&env_name)
         .ok()
-        .or_else(|| secret_env_value(harness_home, "TELEGRAM_BOT_TOKEN"))
+        .or_else(|| secret_env_value(harness_home, &env_name))
         .ok_or_else(|| {
-            "TELEGRAM_BOT_TOKEN is required for Telegram adapters; run channel-credentials-export or set the env var".to_string()
+            format!(
+                "{env_name} is required for this Telegram adapter; run channel-credentials-export or set the env var"
+            )
         })
 }
 
-fn telegram_offset_file(harness_home: &std::path::Path) -> PathBuf {
-    harness_home
-        .join("state")
-        .join("channels")
-        .join("telegram-offset.json")
+fn telegram_account_token_env_name(account_id: &str) -> String {
+    format!(
+        "OPENCLAW_TELEGRAM_ACCOUNT_{}_BOT_TOKEN",
+        sanitize_env_suffix(account_id)
+    )
+}
+
+fn sanitize_file_component(value: &str) -> String {
+    let mut output = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            output.push(ch.to_ascii_lowercase());
+        } else {
+            output.push('-');
+        }
+    }
+    output.trim_matches('-').to_string()
+}
+
+fn telegram_effective_agent_id(args: &TelegramPollOnceArgs) -> Option<String> {
+    args.agent_id.clone().or_else(|| {
+        args.telegram_account.as_ref().and_then(|account| {
+            let account = account.trim();
+            if account.is_empty() || account == "default" {
+                None
+            } else {
+                Some(account.to_string())
+            }
+        })
+    })
+}
+
+fn telegram_offset_file(harness_home: &std::path::Path, account_id: Option<&str>) -> PathBuf {
+    let file_name = account_id
+        .map(str::trim)
+        .filter(|account_id| !account_id.is_empty() && *account_id != "default")
+        .map(|account_id| {
+            format!(
+                "telegram-offset-{}.json",
+                sanitize_file_component(account_id)
+            )
+        })
+        .unwrap_or_else(|| "telegram-offset.json".to_string());
+    harness_home.join("state").join("channels").join(file_name)
 }
 
 fn telegram_probe_latest_file(harness_home: &std::path::Path) -> PathBuf {
@@ -5370,6 +5618,23 @@ fn telegram_send_message(token: &str, chat_id: &str, text: &str) -> Result<Optio
         .and_then(telegram_id_string))
 }
 
+fn telegram_send_chat_action(token: &str, chat_id: &str, action: &str) -> Result<(), String> {
+    let url = format!("https://api.telegram.org/bot{token}/sendChatAction");
+    let response = ureq::post(&url)
+        .send_json(serde_json::json!({
+            "chat_id": chat_id,
+            "action": action
+        }))
+        .map_err(telegram_http_error)?;
+    let value: serde_json::Value = response.into_json().map_err(|err| err.to_string())?;
+    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(format!(
+            "Telegram sendChatAction returned non-ok response: {value}"
+        ));
+    }
+    Ok(())
+}
+
 fn telegram_id_string(value: &serde_json::Value) -> Option<String> {
     value
         .as_i64()
@@ -5438,6 +5703,17 @@ fn discord_send_message(
         .map(ToString::to_string))
 }
 
+fn discord_send_typing(token: &str, channel_id: &str) -> Result<(), String> {
+    let url = format!("https://discord.com/api/v10/channels/{channel_id}/typing");
+    let token = normalize_discord_bot_token(token);
+    let auth = format!("Bot {token}");
+    ureq::post(&url)
+        .set("Authorization", &auth)
+        .call()
+        .map_err(discord_http_error)?;
+    Ok(())
+}
+
 fn discord_http_error(error: ureq::Error) -> String {
     match error {
         ureq::Error::Status(code, response) => {
@@ -5503,6 +5779,161 @@ fn current_time_ms() -> Result<i64, String> {
         .map_err(|error| format!("system time is before Unix epoch: {error}"))?;
     i64::try_from(duration.as_millis())
         .map_err(|_| "current epoch milliseconds exceed i64".to_string())
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeTypingContext {
+    agent_id: String,
+    platform: String,
+    channel_id: String,
+}
+
+struct TypingHeartbeat {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for TypingHeartbeat {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn start_runtime_typing_heartbeat(
+    harness_home: &Path,
+    queue_id: Option<&str>,
+) -> Option<TypingHeartbeat> {
+    let context = pending_runtime_typing_context(harness_home, queue_id)
+        .ok()
+        .flatten()?;
+    let sender = runtime_typing_sender(harness_home, &context)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let handle = thread::spawn(move || {
+        while !thread_stop.load(Ordering::SeqCst) {
+            sender();
+            for _ in 0..40 {
+                if thread_stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    });
+    Some(TypingHeartbeat {
+        stop,
+        handle: Some(handle),
+    })
+}
+
+fn runtime_typing_sender(
+    harness_home: &Path,
+    context: &RuntimeTypingContext,
+) -> Option<Box<dyn Fn() + Send + 'static>> {
+    match context.platform.as_str() {
+        "telegram" => {
+            let token = if context.agent_id == "main" || context.agent_id == "default" {
+                telegram_bot_token(harness_home, None).ok()
+            } else {
+                telegram_bot_token(harness_home, Some(&context.agent_id)).ok()
+            }?;
+            let chat_id = context.channel_id.clone();
+            Some(Box::new(move || {
+                let _ = telegram_send_chat_action(&token, &chat_id, "typing");
+            }))
+        }
+        "discord" => {
+            let token = discord_bot_token(harness_home).ok()?;
+            let channel_id = context.channel_id.clone();
+            Some(Box::new(move || {
+                let _ = discord_send_typing(&token, &channel_id);
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn pending_runtime_typing_context(
+    harness_home: &Path,
+    requested_queue_id: Option<&str>,
+) -> Result<Option<RuntimeTypingContext>, String> {
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let pending_file = queue_dir.join("pending.jsonl");
+    if !pending_file.is_file() {
+        return Ok(None);
+    }
+    let prepared_ids = prepared_runtime_queue_ids(&queue_dir.join("execution-receipts.jsonl"))?;
+    let text = fs::read_to_string(&pending_file)
+        .map_err(|err| format!("failed to read {}: {err}", pending_file.display()))?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let queue_id = json_string_field(&value, &["queueId", "queue_id"]);
+        if let Some(requested_queue_id) = requested_queue_id
+            && queue_id != Some(requested_queue_id)
+        {
+            continue;
+        }
+        if json_string_field(&value, &["status"]) != Some("queued") {
+            continue;
+        }
+        if queue_id.is_some_and(|queue_id| prepared_ids.contains(queue_id)) {
+            continue;
+        }
+        let Some(agent_id) = json_string_field(&value, &["agentId", "agent_id"]) else {
+            continue;
+        };
+        let Some(platform) = json_string_field(&value, &["platform"]) else {
+            continue;
+        };
+        let Some(channel_id) = json_string_field(&value, &["channelId", "channel_id"]) else {
+            continue;
+        };
+        return Ok(Some(RuntimeTypingContext {
+            agent_id: agent_id.to_string(),
+            platform: platform.to_string(),
+            channel_id: channel_id.to_string(),
+        }));
+    }
+    Ok(None)
+}
+
+fn prepared_runtime_queue_ids(path: &Path) -> Result<BTreeSet<String>, String> {
+    let mut ids = BTreeSet::new();
+    if !path.is_file() {
+        return Ok(ids);
+    }
+    let text = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if json_string_field(&value, &["status"]) == Some("prepared")
+            && let Some(queue_id) = json_string_field(&value, &["queueId", "queue_id"])
+        {
+            ids.insert(queue_id.to_string());
+        }
+    }
+    Ok(ids)
+}
+
+fn json_string_field<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {
+    names.iter().find_map(|name| value.get(*name)?.as_str())
 }
 
 fn stop_file_requested(stop_file: Option<&Path>) -> bool {
@@ -6966,6 +7397,7 @@ fn print_help() {
     println!("  telegram-poll-once Poll Telegram once, run DM pipeline, and deliver replies");
     println!("  telegram-loop     Run Telegram polling continuously until stopped");
     println!("  discord-outbox-send-once Send pending Discord outbox messages once");
+    println!("  discord-outbox-loop Send pending Discord outbox messages continuously");
     println!("  discord-event-run-once Normalize one Discord Gateway message event");
     println!("  discord-gateway-probe Probe Discord Gateway loop prerequisites");
     println!("  discord-gateway-loop Run Discord Gateway receive loop");
@@ -6998,6 +7430,7 @@ fn print_help() {
     println!("  --task-prefix <name>    Windows scheduled-task name prefix for supervisor-plan");
     println!("  --query <text>          Match skills for a task turn");
     println!("  --agent <id>            Agent hint for skill matching");
+    println!("  --telegram-account <id> Telegram account token/offset selector");
     println!("  --channel <name>        Channel hint for skill matching");
     println!("  --match-workspace <txt> Workspace hint for skill matching");
     println!("  --limit <n>             Maximum matched skills to print");
@@ -7031,6 +7464,7 @@ fn print_help() {
     println!("  --stop-when-idle        Stop runtime-loop when the runtime queue is idle");
     println!("  --stop-file <path>      Stop-file path for runtime, Telegram, or Discord loops");
     println!("  TELEGRAM_BOT_TOKEN      Env var or harness secret used by Telegram adapters");
+    println!("  OPENCLAW_TELEGRAM_ACCOUNT_<ID>_BOT_TOKEN Account-specific Telegram token");
     println!("  DISCORD_BOT_TOKEN       Env var or harness secret used by Discord adapters");
     println!("  --node-exe <path>       Node executable for plugin sidecar commands");
     println!("  --sidecar-script <path> Plugin sidecar script path");

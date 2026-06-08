@@ -28,6 +28,7 @@ pub struct ChannelRunOnceOptions {
     pub timeout_ms: u64,
     pub prompt_options: PromptAssemblyOptions,
     pub outbox_limit: usize,
+    pub run_runtime: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -68,7 +69,8 @@ pub fn run_channel_once(options: ChannelRunOnceOptions) -> io::Result<ChannelRun
         now_ms: options.now_ms,
     })?;
     let mut warnings = receive.warnings.clone();
-    let runtime = if receive.status == ChannelReceiveStatus::AgentTurnQueued {
+    let runtime = if receive.status == ChannelReceiveStatus::AgentTurnQueued && options.run_runtime
+    {
         let run = run_runtime_queue_once(RuntimeRunOnceOptions {
             harness_home: options.harness_home.clone(),
             queue_id: receive.queue_id.clone(),
@@ -174,6 +176,7 @@ mod tests {
             timeout_ms: 5_000,
             prompt_options: PromptAssemblyOptions::default(),
             outbox_limit: 10,
+            run_runtime: true,
         })
         .unwrap();
 
@@ -215,6 +218,7 @@ mod tests {
             timeout_ms: 5_000,
             prompt_options: PromptAssemblyOptions::default(),
             outbox_limit: 10,
+            run_runtime: true,
         })
         .unwrap();
 

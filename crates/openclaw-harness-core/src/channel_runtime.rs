@@ -74,6 +74,8 @@ pub enum ChannelCommandEffect {
 #[serde(rename_all = "camelCase")]
 pub struct ChannelStatusSnapshot {
     pub scope: Option<String>,
+    pub platform: String,
+    pub session_key: String,
     pub agents_total: usize,
     pub agents_enabled: usize,
     pub providers_total: usize,
@@ -81,11 +83,21 @@ pub struct ChannelStatusSnapshot {
     pub telegram_configured: bool,
     pub discord_configured: bool,
     pub current_agent_id: Option<String>,
+    pub agent_directory_exists: bool,
+    pub agent_sessions_index_exists: bool,
     pub current_provider: Option<String>,
     pub current_model: Option<String>,
+    pub model_override: Option<String>,
     pub prompt_files_present: usize,
     pub prompt_files_total: usize,
+    pub prompt_file_names: Vec<String>,
     pub selected_skills: usize,
+    pub selected_skill_ids: Vec<String>,
+    pub channel_state_loaded: bool,
+    pub active_session_key: Option<String>,
+    pub thinking_enabled: bool,
+    pub steering_notes: usize,
+    pub btw_notes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -335,39 +347,58 @@ fn status_reply_text(snapshot: &ChannelStatusSnapshot) -> String {
         .as_deref()
     {
         Some("agents") => format!(
-            "Agents: {}/{} enabled. Current agent: {}.",
+            "OpenClaw Agent Status\nAgents: {}/{} enabled\nCurrent: {}\nDirectory: {}\nSessions index: {}",
             snapshot.agents_enabled,
             snapshot.agents_total,
-            display_opt(&snapshot.current_agent_id)
+            display_opt(&snapshot.current_agent_id),
+            yes_no(snapshot.agent_directory_exists),
+            yes_no(snapshot.agent_sessions_index_exists)
         ),
         Some("channels") => format!(
-            "Channels: telegram={}, discord={}.",
+            "OpenClaw Channel Status\nPlatform: {}\nSession: {}\nTelegram: {}\nDiscord: {}",
+            snapshot.platform,
+            snapshot.session_key,
             yes_no(snapshot.telegram_configured),
             yes_no(snapshot.discord_configured)
         ),
         Some("model") => format!(
-            "Model: agent={}, provider={}, model={}.",
+            "OpenClaw Model Status\nAgent: {}\nProvider: {}\nModel: {}\nOverride: {}",
             display_opt(&snapshot.current_agent_id),
             display_opt(&snapshot.current_provider),
-            display_opt(&snapshot.current_model)
+            display_opt(&snapshot.current_model),
+            display_opt(&snapshot.model_override)
         ),
         Some("skills") => format!(
-            "Selected skills for this turn: {}.",
-            snapshot.selected_skills
+            "OpenClaw Skill Status\nSelected: {}\nMatches: {}",
+            snapshot.selected_skills,
+            display_list(&snapshot.selected_skill_ids)
         ),
         Some("cron") => {
             "Cron status is available through cron-plan and deterministic-cron-plan.".to_string()
         }
         _ => format!(
-            "Status: agents {}/{} enabled, providers={}, plugins={}, telegram={}, discord={}, model={}/{}.",
+            "OpenClaw Harness Status\nAgent: {} ({}/{})\nModel: provider={}, model={}, override={}\nChannels: telegram={}, discord={}, current={}\nSession: active={}, stateLoaded={}\nPrompt: files {}/{} ({})\nSkills: {} selected ({})\nState: thinking={}, steer={}, btw={}\nRegistry: providers={}, plugins={}",
+            display_opt(&snapshot.current_agent_id),
             snapshot.agents_enabled,
             snapshot.agents_total,
-            snapshot.providers_total,
-            snapshot.plugins_total,
+            display_opt(&snapshot.current_provider),
+            display_opt(&snapshot.current_model),
+            display_opt(&snapshot.model_override),
             yes_no(snapshot.telegram_configured),
             yes_no(snapshot.discord_configured),
-            display_opt(&snapshot.current_provider),
-            display_opt(&snapshot.current_model)
+            snapshot.platform,
+            display_opt(&snapshot.active_session_key),
+            yes_no(snapshot.channel_state_loaded),
+            snapshot.prompt_files_present,
+            snapshot.prompt_files_total,
+            display_list(&snapshot.prompt_file_names),
+            snapshot.selected_skills,
+            display_list(&snapshot.selected_skill_ids),
+            yes_no(snapshot.thinking_enabled),
+            snapshot.steering_notes,
+            snapshot.btw_notes,
+            snapshot.providers_total,
+            snapshot.plugins_total
         ),
     }
 }
@@ -379,6 +410,8 @@ fn status_snapshot(
 ) -> ChannelStatusSnapshot {
     ChannelStatusSnapshot {
         scope,
+        platform: turn.platform.clone(),
+        session_key: turn.session_key.clone(),
         agents_total: registry.agents.len(),
         agents_enabled: registry
             .agents
@@ -390,11 +423,53 @@ fn status_snapshot(
         telegram_configured: registry.channels.telegram,
         discord_configured: registry.channels.discord,
         current_agent_id: turn.agent.as_ref().map(|agent| agent.id.clone()),
+        agent_directory_exists: turn
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.directory_exists),
+        agent_sessions_index_exists: turn
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.sessions_index_exists),
         current_provider: turn.model_policy.provider.clone(),
         current_model: turn.model_policy.model.clone(),
+        model_override: turn
+            .channel_state
+            .as_ref()
+            .and_then(|state| state.model_override.clone()),
         prompt_files_present: prompt_files_present(turn),
         prompt_files_total: turn.prompt_files.len(),
+        prompt_file_names: turn
+            .prompt_files
+            .iter()
+            .filter(|file| file.exists)
+            .map(|file| file.name.clone())
+            .collect(),
         selected_skills: turn.selected_skills.len(),
+        selected_skill_ids: turn
+            .selected_skills
+            .iter()
+            .map(|skill| skill.skill_id.clone())
+            .collect(),
+        channel_state_loaded: turn.channel_state.is_some(),
+        active_session_key: turn
+            .channel_state
+            .as_ref()
+            .map(|state| state.active_session_key.clone()),
+        thinking_enabled: turn
+            .channel_state
+            .as_ref()
+            .is_some_and(|state| state.thinking_enabled),
+        steering_notes: turn
+            .channel_state
+            .as_ref()
+            .map(|state| state.steering_notes.len())
+            .unwrap_or(0),
+        btw_notes: turn
+            .channel_state
+            .as_ref()
+            .map(|state| state.btw_notes.len())
+            .unwrap_or(0),
     }
 }
 
@@ -419,6 +494,14 @@ fn prompt_files_present(turn: &TurnPlan) -> usize {
 
 fn display_opt(value: &Option<String>) -> &str {
     value.as_deref().unwrap_or("-")
+}
+
+fn display_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values.join(", ")
+    }
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -496,7 +579,7 @@ mod tests {
         assert_eq!(step.action, ChannelStepAction::ReplyOnly);
         assert!(step.agent_turn.is_none());
         assert_eq!(step.outbound_messages.len(), 1);
-        assert!(step.outbound_messages[0].text.contains("telegram=yes"));
+        assert!(step.outbound_messages[0].text.contains("Telegram: yes"));
         assert!(matches!(
             step.command_effect,
             Some(ChannelCommandEffect::ShowStatus { ref snapshot, .. })

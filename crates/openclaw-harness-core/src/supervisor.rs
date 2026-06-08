@@ -94,7 +94,7 @@ pub fn write_windows_supervisor_plan(
     let mut tasks = Vec::new();
     let mut warnings = Vec::new();
 
-    if codex_executable.is_none() && (options.include_runtime || options.include_telegram) {
+    if codex_executable.is_none() && options.include_runtime {
         warnings.push(
             "codex executable was not pinned; generated runtime commands will rely on PATH"
                 .to_string(),
@@ -180,6 +180,35 @@ pub fn write_windows_supervisor_plan(
     }
 
     if options.include_discord {
+        let component = "discord-outbox-loop";
+        let runner_script = scripts_dir.join(format!("{component}.ps1"));
+        let stop_file = stop_dir.join(format!("{component}.stop"));
+        let args = vec![
+            "discord-outbox-loop".to_string(),
+            "--harness-home".to_string(),
+            path_arg(&harness_home),
+            "--iterations".to_string(),
+            "0".to_string(),
+            "--idle-ms".to_string(),
+            options.idle_ms.to_string(),
+            "--max-consecutive-errors".to_string(),
+            options.max_consecutive_errors.to_string(),
+            "--outbox-limit".to_string(),
+            options.telegram_outbox_limit.to_string(),
+            "--stop-file".to_string(),
+            path_arg(&stop_file),
+        ];
+        write_runner_script(&runner_script, &harness_cli, &args, &log_dir, component)?;
+        push_task(
+            &mut scripts,
+            &mut tasks,
+            &options.task_prefix,
+            component,
+            runner_script,
+            stop_file,
+            true,
+        );
+
         let component = "discord-gateway-loop";
         let runner_script = scripts_dir.join(format!("{component}.ps1"));
         let stop_file = stop_dir.join(format!("{component}.stop"));
@@ -310,7 +339,7 @@ fn write_runner_script(
         "$ErrorActionPreference = 'Continue'\n\
          $LogDir = {}\n\
          New-Item -ItemType Directory -Force -Path $LogDir | Out-Null\n\
-         $LogFile = Join-Path $LogDir '{}-$(Get-Date -Format yyyyMMdd-HHmmss).log'\n\
+         $LogFile = Join-Path $LogDir (\"{}-$(Get-Date -Format yyyyMMdd-HHmmss).log\")\n\
          {} *>&1 | Tee-Object -FilePath $LogFile\n\
          exit $LASTEXITCODE\n",
         ps_quote_path(log_dir),
@@ -460,7 +489,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(report.tasks.len(), 3);
+        assert_eq!(report.tasks.len(), 4);
         assert!(report.receipt_file.is_file());
         assert!(
             report
@@ -472,6 +501,10 @@ mod tests {
             fs::read_to_string(output_dir.join("scripts").join("runtime-loop.ps1")).unwrap();
         assert!(runtime_script.contains("--stop-file"));
         assert!(runtime_script.contains("runtime-loop"));
+        let discord_outbox_script =
+            fs::read_to_string(output_dir.join("scripts").join("discord-outbox-loop.ps1")).unwrap();
+        assert!(discord_outbox_script.contains("discord-outbox-loop"));
+        assert!(discord_outbox_script.contains("$(Get-Date -Format yyyyMMdd-HHmmss)"));
         let stop_script =
             fs::read_to_string(output_dir.join("scripts").join("stop-scheduled-tasks.ps1"))
                 .unwrap();
