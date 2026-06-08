@@ -272,6 +272,55 @@ fn check_runtime_queue(harness_home: &Path, checks: &mut Vec<ActivationReadiness
             checks.push(warn(name, format!("not found yet: {}", path.display())));
         }
     }
+    check_codex_launch_probe(harness_home, checks);
+}
+
+fn check_codex_launch_probe(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let path = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("codex-runtime-launch-receipts.jsonl");
+    match latest_jsonl_value(&path) {
+        Ok(Some(value)) => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let reason = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason recorded");
+            if status == "started-and-stopped" {
+                checks.push(pass(
+                    "codex-runtime-launch-probe",
+                    format!("latest launch probe passed in {}", path.display()),
+                ));
+            } else {
+                checks.push(fail(
+                    "codex-runtime-launch-probe",
+                    format!(
+                        "latest launch probe status={status} at {}: {reason}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        Ok(None) => checks.push(warn(
+            "codex-runtime-launch-probe",
+            format!("no launch probe receipt lines found at {}", path.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+            "codex-runtime-launch-probe",
+            format!(
+                "not found yet: {}; run codex-launch-probe before runtime handoff",
+                path.display()
+            ),
+        )),
+        Err(error) => checks.push(warn(
+            "codex-runtime-launch-probe",
+            format!("could not read {}: {error}", path.display()),
+        )),
+    }
 }
 
 fn check_channel_state(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
@@ -557,6 +606,20 @@ fn codex_auth_candidates() -> Vec<PathBuf> {
         .collect()
 }
 
+fn latest_jsonl_value(path: &Path) -> io::Result<Option<Value>> {
+    let text = fs::read_to_string(path)?;
+    for line in text.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        return serde_json::from_str(line)
+            .map(Some)
+            .map_err(io::Error::other);
+    }
+    Ok(None)
+}
+
 fn summarize(checks: &[ActivationReadinessCheck]) -> ActivationReadinessSummary {
     let mut summary = ActivationReadinessSummary::default();
     for check in checks {
@@ -650,6 +713,44 @@ mod tests {
         }));
         assert!(report.checks.iter().any(|check| {
             check.name == "plugin-sidecar" && check.status == ActivationReadinessStatus::Fail
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readiness_fails_failed_codex_launch_probe_receipt() {
+        let root = temp_root("readiness_fails_failed_codex_launch_probe_receipt");
+        let harness_home = root.join(".openclaw-harness");
+        let state = harness_home.join("state");
+        let runtime_queue = state.join("runtime-queue");
+        fs::create_dir_all(&runtime_queue).unwrap();
+        fs::write(
+            state.join("harness-registry.json"),
+            r#"{
+              "schema": "openclaw-harness.target-registry.v1",
+              "agents": [
+                { "id": "main", "enabled": true }
+              ],
+              "providers": [],
+              "plugins": [],
+              "channels": { "telegram": false, "discord": false }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            runtime_queue.join("codex-runtime-launch-receipts.jsonl"),
+            r#"{"status":"spawn-failed","reason":"failed to spawn codex app-server process"}"#,
+        )
+        .unwrap();
+
+        let report =
+            check_activation_readiness(ActivationReadinessOptions { harness_home }).unwrap();
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "codex-runtime-launch-probe"
+                && check.status == ActivationReadinessStatus::Fail
+                && check.detail.contains("spawn-failed")
         }));
 
         let _ = fs::remove_dir_all(root);

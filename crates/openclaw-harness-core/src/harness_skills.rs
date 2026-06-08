@@ -47,6 +47,7 @@ Use it when the user mentions:
 7. Keep multi-agent readiness intact. Do not collapse imported agents into a single default agent.
 8. Treat credentials as best-effort imports. Codex OAuth is preferred for Codex models; API keys may be provider-specific and model-limited.
 9. Treat memory/qdrant-edge as the primary memory backend when present. LanceDB is backup/optional unless the active OpenClaw config points to it.
+10. Use a Codex CLI binary that the harness can spawn. On Windows, the Codex Desktop MSIX resource path may be visible on PATH but fail with os error 5; prefer a standalone release or local npm install and pass it with --codex-exe.
 
 ## Prompt And Tool Schema Policy
 
@@ -103,7 +104,8 @@ Before replacing the Docker OpenClaw gateway:
 7. Smoke-test a Telegram command message with telegram-poll-once when TELEGRAM_BOT_TOKEN is configured, or with channel-run-once when testing offline.
 8. Confirm enable-check reports telegram-offset, telegram-poll-log, and discord-send-log after channel adapter smoke tests.
 9. Confirm memory-qdrant-edge is present when current OpenClaw uses Qdrant edge as primary memory backend.
-10. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt.
+10. Confirm codex-runtime-launch-probe passes with the intended --codex-exe before any real runtime handoff.
+11. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt.
 
 ## Codex Runtime Flow
 
@@ -120,6 +122,8 @@ For manual debugging of one prepared turn, the expanded path is:
 4. codex-preflight to check executable, prompt files, output paths, and auth.
 5. codex-launch-probe if process startup needs verification without a model request.
 6. codex-run to send the prepared OpenClaw payload to Codex app-server, capture assistant deltas, and write transcript/trajectory/Codex binding outputs.
+
+Use --codex-exe for the standalone/local Codex CLI that passed launch probe. Do not rely on the Codex Desktop app resource path for a service runtime unless it has passed codex-launch-probe.
 
 codex-run writes raw app-server stdout/stderr logs under the execution directory and appends operational events to state/logs/harness.jsonl. If a completion receipt already exists, codex-run must skip the model request and return the recorded completion state.
 

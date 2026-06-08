@@ -294,16 +294,30 @@ fn provider_profile(id: &str, source: &str, value: &Value) -> ProviderProfile {
 
 fn collect_plugins(config: &Value) -> Vec<PluginProfile> {
     let mut plugins = BTreeMap::new();
+    if let Some(value) = config.pointer("/plugins/entries") {
+        collect_plugin_collection(value, "plugins.entries", &mut plugins);
+    } else if let Some(value) = config.pointer("/plugins") {
+        collect_plugin_collection(value, "plugins", &mut plugins);
+    }
+
+    if let Some(value) = config.pointer("/plugins/load") {
+        collect_plugin_load(value, &mut plugins);
+    }
+
     for (path, source) in [
-        ("/plugins", "plugins"),
-        ("/extensions", "extensions"),
+        ("/plugins/slots", "plugins.slots"),
         ("/pluginSlots", "pluginSlots"),
         ("/plugin_slots", "plugin_slots"),
     ] {
-        let Some(value) = config.pointer(path) else {
-            continue;
-        };
-        collect_plugin_collection(value, source, &mut plugins);
+        if let Some(value) = config.pointer(path) {
+            collect_plugin_slots(value, source, &mut plugins);
+        }
+    }
+
+    for (path, source) in [("/extensions", "extensions")] {
+        if let Some(value) = config.pointer(path) {
+            collect_plugin_collection(value, source, &mut plugins);
+        }
     }
     plugins.into_values().collect()
 }
@@ -320,11 +334,57 @@ fn collect_plugin_collection(
         }
     } else if let Some(array) = value.as_array() {
         for value in array {
-            if let Some(id) = string_field(value, &["id", "name", "package", "plugin"]) {
+            if let Some(id) = plugin_id(value).or_else(|| value.as_str()) {
                 plugins.insert(id.to_string(), plugin_profile(id, source, value));
             }
         }
     }
+}
+
+fn collect_plugin_load(value: &Value, plugins: &mut BTreeMap<String, PluginProfile>) {
+    let load_items = if let Some(paths) = value.get("paths") {
+        paths
+    } else {
+        value
+    };
+    if let Some(array) = load_items.as_array() {
+        for value in array {
+            if let Some(id) = plugin_id(value).or_else(|| value.as_str().and_then(path_plugin_id)) {
+                plugins
+                    .entry(id.to_string())
+                    .or_insert_with(|| plugin_profile(id, "plugins.load", value));
+            }
+        }
+    }
+}
+
+fn collect_plugin_slots(
+    value: &Value,
+    source: &str,
+    plugins: &mut BTreeMap<String, PluginProfile>,
+) {
+    if let Some(object) = value.as_object() {
+        for value in object.values() {
+            collect_plugin_slot_value(value, source, plugins);
+        }
+    } else if let Some(array) = value.as_array() {
+        for value in array {
+            collect_plugin_slot_value(value, source, plugins);
+        }
+    }
+}
+
+fn collect_plugin_slot_value(
+    value: &Value,
+    source: &str,
+    plugins: &mut BTreeMap<String, PluginProfile>,
+) {
+    let Some(id) = plugin_id(value).or_else(|| value.as_str()) else {
+        return;
+    };
+    plugins
+        .entry(id.to_string())
+        .or_insert_with(|| plugin_profile(id, source, value));
 }
 
 fn plugin_profile(id: &str, source: &str, value: &Value) -> PluginProfile {
@@ -336,6 +396,16 @@ fn plugin_profile(id: &str, source: &str, value: &Value) -> PluginProfile {
         memory_related: lower.contains("openclaw-mem") || lower.contains("mem-engine"),
         channel_related: lower.contains("telegram") || lower.contains("discord"),
     }
+}
+
+fn plugin_id(value: &Value) -> Option<&str> {
+    string_field(value, &["id", "name", "package", "plugin"])
+}
+
+fn path_plugin_id(path: &str) -> Option<&str> {
+    path.trim_matches(&['/', '\\'][..])
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
 }
 
 fn collect_channels(config: &Value, plugins: &[PluginProfile]) -> ChannelRegistry {
@@ -524,6 +594,62 @@ mod tests {
         assert!(registry.config_parse_error.is_some());
         assert_eq!(registry.agents.len(), 1);
         assert_eq!(registry.agents[0].id, "main");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registry_reads_openclaw_plugin_entries_without_container_keys() {
+        let root = temp_root("registry_reads_openclaw_plugin_entries_without_container_keys");
+        let home = root.join(".openclaw");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("openclaw.json"),
+            r#"{
+              "plugins": {
+                "allow": ["workspace"],
+                "bundledDiscovery": true,
+                "entries": {
+                  "openclaw-mem-engine": { "enabled": true },
+                  "telegram": { "enabled": true },
+                  "memory-lancedb": { "enabled": false }
+                },
+                "load": {
+                  "paths": ["/root/.openclaw/workspace/extensions/custom-tool"]
+                },
+                "slots": {
+                  "memory": "openclaw-mem-engine"
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let registry = load_agent_registry(&OpenClawSource::new(&home)).unwrap();
+        let plugin_ids: Vec<_> = registry
+            .plugins
+            .iter()
+            .map(|plugin| plugin.id.as_str())
+            .collect();
+
+        assert!(plugin_ids.contains(&"openclaw-mem-engine"));
+        assert!(plugin_ids.contains(&"telegram"));
+        assert!(plugin_ids.contains(&"memory-lancedb"));
+        assert!(plugin_ids.contains(&"custom-tool"));
+        assert!(!plugin_ids.contains(&"allow"));
+        assert!(!plugin_ids.contains(&"bundledDiscovery"));
+        assert!(!plugin_ids.contains(&"entries"));
+        assert!(!plugin_ids.contains(&"load"));
+        assert!(!plugin_ids.contains(&"slots"));
+
+        let memory_plugin = registry
+            .plugins
+            .iter()
+            .find(|plugin| plugin.id == "openclaw-mem-engine")
+            .unwrap();
+        assert_eq!(memory_plugin.source, "plugins.entries");
+        assert!(memory_plugin.memory_related);
+        assert!(registry.channels.telegram);
 
         let _ = fs::remove_dir_all(root);
     }

@@ -38,6 +38,7 @@ These must pass before cutover.
 4. Credential gate
    - Prefer Codex OAuth for Codex models.
    - Confirm Codex auth through local `CODEX_HOME`, `%USERPROFILE%\.codex\auth.json`, or `%USERPROFILE%\.codex\auth.toml`.
+   - Confirm the harness uses a spawnable Codex CLI binary. The Codex Desktop MSIX resource path may resolve on `PATH` but fail to spawn with Windows `os error 5`; use a standalone release or a local npm install such as `.tools/codex-cli/node_modules/.bin/codex.cmd`.
    - Confirm `TELEGRAM_BOT_TOKEN` when Telegram is enabled.
    - Confirm `DISCORD_BOT_TOKEN` when Discord is enabled.
    - Confirm `OPENROUTER_API_KEY` only when OpenRouter providers are active.
@@ -46,6 +47,8 @@ These must pass before cutover.
 5. Runtime gate
    - Run `channel-receive` for a normal DM.
    - Prefer `channel-run-once` for one-message end-to-end smoke.
+   - Run `queue-prepare`, `codex-plan`, `codex-preflight`, and `codex-launch-probe` before the first real model run.
+   - Confirm `enable-check` reports `codex-runtime-launch-probe` as pass.
    - Run `runtime-run-once` with the intended Codex executable.
    - Confirm `state/runtime-queue/run-once-last.json`.
    - Confirm `state/runtime-queue/run-once-receipts.jsonl`.
@@ -81,6 +84,7 @@ These should be run before stopping the Docker gateway.
    - Telegram DM ordinary message to `main`.
    - Discord DM ordinary message to `main`.
    - Confirm `channel-run-once` or `runtime-run-once` writes fresh agent replies and delivery receipts.
+   - Use `--codex-exe` with the standalone/local Codex CLI that passed `codex-launch-probe`, not the Codex Desktop MSIX resource path.
 
 3. Prompt continuity smoke
    - Send two ordinary messages in the same session.
@@ -147,6 +151,19 @@ These should be run before stopping the Docker gateway.
    - Backup/export command.
    - Explicit cutover command that records operator intent.
 
+## Current Activation Snapshot
+
+As of 2026-06-08 local verification:
+
+- Imported activation harness: `imports/activation-harness`.
+- Qdrant edge is present and passes as the primary memory backend.
+- LanceDB is absent from the filtered activation snapshot and is treated as backup/optional.
+- `openclaw-mem.sqlite` is present as a snapshot/audit source.
+- Offline `/status` channel smoke passes against the imported registry: 24 enabled agents, 2 providers, 13 plugins, Telegram and Discord enabled.
+- Runtime queue prepare, Codex plan, Codex preflight, and Codex launch probe pass when using workspace-local `@openai/codex` via `.tools/codex-cli/node_modules/.bin/codex.cmd`.
+- The Codex Desktop MSIX `codex.exe` path is not spawnable from this harness environment and should not be used for service runtime.
+- Remaining `enable-check` failures are `TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN`, and `plugin-sidecar`.
+
 ## Verification Commands
 
 ```powershell
@@ -154,10 +171,12 @@ cargo fmt --all
 cargo test --workspace --quiet
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p openclaw-harness-cli -- help
-cargo run -p openclaw-harness-cli -- enable-check --target-home C:\path\to\.openclaw-harness
-cargo run -p openclaw-harness-cli -- telegram-poll-once --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.exe --poll-timeout-seconds 1 --max-updates 10
-cargo run -p openclaw-harness-cli -- telegram-loop --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.exe --iterations 1 --idle-ms 1000
-cargo run -p openclaw-harness-cli -- discord-outbox-send-once --target-home C:\path\to\.openclaw-harness --outbox-limit 20
+cargo run -p openclaw-harness-cli -- enable-check --harness-home C:\path\to\.openclaw-harness
+cargo run -p openclaw-harness-cli -- channel-run-once --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw --platform telegram --channel-id smoke --user-id operator --message /status
+cargo run -p openclaw-harness-cli -- codex-launch-probe --harness-home C:\path\to\.openclaw-harness --execution-dir C:\path\to\prepared-execution --startup-probe-ms 750
+cargo run -p openclaw-harness-cli -- telegram-poll-once --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.cmd --poll-timeout-seconds 1 --max-updates 10
+cargo run -p openclaw-harness-cli -- telegram-loop --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.cmd --iterations 1 --idle-ms 1000
+cargo run -p openclaw-harness-cli -- discord-outbox-send-once --harness-home C:\path\to\.openclaw-harness --outbox-limit 20
 ```
 
 Use fake app-server tests for CI. Use real `codex app-server` only in operator-run smoke tests because it may make model requests.

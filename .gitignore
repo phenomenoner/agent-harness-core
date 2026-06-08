@@ -14,6 +14,7 @@ Thumbs.db
 state/
 data/
 secrets/
+.tools/
 
 # Imported OpenClaw state should be staged intentionally.
 imports/

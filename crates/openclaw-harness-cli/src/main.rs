@@ -1317,12 +1317,9 @@ fn dry_run_args_from_args(args: &[String]) -> Result<DryRunArgs, String> {
                         .ok_or_else(|| "--workspace requires a path".to_string())?,
                 );
             }
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--conflict" => {
                 i += 1;
@@ -1382,12 +1379,9 @@ fn execute_args_from_args(args: &[String]) -> Result<ExecuteArgs, String> {
                         .ok_or_else(|| "--workspace requires a path".to_string())?,
                 );
             }
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--conflict" => {
                 i += 1;
@@ -1439,12 +1433,9 @@ fn registry_export_args_from_args(args: &[String]) -> Result<RegistryExportArgs,
                         .ok_or_else(|| "--workspace requires a path".to_string())?,
                 );
             }
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--conflict" => {
                 i += 1;
@@ -1476,12 +1467,9 @@ fn enable_check_args_from_args(args: &[String]) -> Result<EnableCheckArgs, Strin
 
     while i < args.len() {
         match args[i].as_str() {
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             flag => return Err(format!("unknown argument: {flag}")),
         }
@@ -1498,12 +1486,9 @@ fn harness_skills_sync_args_from_args(args: &[String]) -> Result<HarnessSkillsSy
 
     while i < args.len() {
         match args[i].as_str() {
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--force" => force = true,
             flag => return Err(format!("unknown argument: {flag}")),
@@ -1771,12 +1756,9 @@ fn queue_enqueue_args_from_args(args: &[String]) -> Result<QueueEnqueueArgs, Str
 
     while i < args.len() {
         match args[i].as_str() {
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--now-ms" => {
                 i += 1;
@@ -1815,12 +1797,9 @@ fn channel_run_once_args_from_args(args: &[String]) -> Result<ChannelRunOnceArgs
 
     while i < args.len() {
         match args[i].as_str() {
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--now-ms" => {
                 i += 1;
@@ -1881,12 +1860,9 @@ fn channel_outbox_plan_args_from_args(args: &[String]) -> Result<ChannelOutboxPl
 
     while i < args.len() {
         match args[i].as_str() {
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--platform" => {
                 i += 1;
@@ -1932,12 +1908,9 @@ fn channel_delivery_record_args_from_args(
 
     while i < args.len() {
         match args[i].as_str() {
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--delivery-id" => {
                 i += 1;
@@ -2063,12 +2036,9 @@ fn telegram_poll_once_args_from_args(args: &[String]) -> Result<TelegramPollOnce
                         .ok_or_else(|| "--workspace requires a path".to_string())?,
                 );
             }
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--agent" => {
                 i += 1;
@@ -2176,12 +2146,9 @@ fn telegram_loop_args_from_args(args: &[String]) -> Result<TelegramLoopArgs, Str
                         .ok_or_else(|| "--workspace requires a path".to_string())?,
                 );
             }
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--agent" => {
                 i += 1;
@@ -2293,12 +2260,9 @@ fn discord_outbox_send_once_args_from_args(
 
     while i < args.len() {
         match args[i].as_str() {
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--outbox-limit" => {
                 i += 1;
@@ -2327,12 +2291,9 @@ fn queue_prepare_args_from_args(args: &[String]) -> Result<QueuePrepareArgs, Str
 
     while i < args.len() {
         match args[i].as_str() {
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--queue-id" => {
                 i += 1;
@@ -2382,12 +2343,9 @@ fn runtime_run_once_args_from_args(args: &[String]) -> Result<RuntimeRunOnceArgs
 
     while i < args.len() {
         match args[i].as_str() {
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--queue-id" => {
                 i += 1;
@@ -2451,12 +2409,9 @@ fn codex_plan_args_from_args(args: &[String]) -> Result<CodexPlanArgs, String> {
 
     while i < args.len() {
         match args[i].as_str() {
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--execution-dir" => {
                 i += 1;
@@ -2494,12 +2449,9 @@ fn codex_preflight_args_from_args(args: &[String]) -> Result<CodexPreflightArgs,
 
     while i < args.len() {
         match args[i].as_str() {
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--execution-dir" => {
                 i += 1;
@@ -2538,12 +2490,9 @@ fn codex_launch_probe_args_from_args(args: &[String]) -> Result<CodexLaunchProbe
 
     while i < args.len() {
         match args[i].as_str() {
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--execution-dir" => {
                 i += 1;
@@ -2590,12 +2539,9 @@ fn codex_run_args_from_args(args: &[String]) -> Result<CodexRunArgs, String> {
 
     while i < args.len() {
         match args[i].as_str() {
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--execution-dir" => {
                 i += 1;
@@ -2643,12 +2589,9 @@ fn codex_complete_args_from_args(args: &[String]) -> Result<CodexCompleteArgs, S
 
     while i < args.len() {
         match args[i].as_str() {
-            "--target-home" => {
+            flag if is_harness_home_arg(flag) => {
                 i += 1;
-                target_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+                target_home = parse_harness_home_path(args, i, flag)?;
             }
             "--execution-dir" => {
                 i += 1;
@@ -2910,6 +2853,16 @@ fn default_harness_home() -> PathBuf {
     }
 
     PathBuf::from(".openclaw-harness")
+}
+
+fn is_harness_home_arg(flag: &str) -> bool {
+    matches!(flag, "--target-home" | "--harness-home")
+}
+
+fn parse_harness_home_path(args: &[String], index: usize, flag: &str) -> Result<PathBuf, String> {
+    args.get(index)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{flag} requires a path"))
 }
 
 fn telegram_bot_token() -> Result<String, String> {
@@ -4285,8 +4238,8 @@ fn print_help() {
     println!("Options:");
     println!("  --openclaw-home <path>  Source .openclaw directory");
     println!("  --workspace <path>      Override workspace directory");
-    println!("  --target-home <path>    Destination harness home for import/export commands");
-    println!("  --harness-home <path>   Existing harness home for imported skill indexing");
+    println!("  --target-home <path>    Destination harness home; alias of --harness-home");
+    println!("  --harness-home <path>   Harness state root for runtime/channel commands");
     println!("  --force                 Overwrite user-modified builtin harness skills");
     println!("  --conflict <policy>     skip, overwrite, or rename");
     println!("  --output <path>         Write report.json and summary.md");

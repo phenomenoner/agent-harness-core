@@ -62,6 +62,7 @@ pub struct HarnessProvider {
 #[serde(rename_all = "camelCase")]
 pub struct HarnessPlugin {
     pub id: String,
+    pub source: String,
     pub enabled: Option<bool>,
     pub sidecar_required: bool,
     pub memory_related: bool,
@@ -231,11 +232,19 @@ fn harness_provider(provider: &ProviderProfile) -> HarnessProvider {
 fn harness_plugin(plugin: &PluginProfile) -> HarnessPlugin {
     HarnessPlugin {
         id: plugin.id.clone(),
+        source: plugin.source.clone(),
         enabled: plugin.enabled,
-        sidecar_required: true,
+        sidecar_required: plugin.enabled.unwrap_or(true) && !has_native_harness_adapter(plugin),
         memory_related: plugin.memory_related,
         channel_related: plugin.channel_related,
     }
+}
+
+fn has_native_harness_adapter(plugin: &PluginProfile) -> bool {
+    matches!(
+        plugin.id.to_ascii_lowercase().as_str(),
+        "codex" | "openai" | "openrouter" | "telegram" | "discord"
+    )
 }
 
 struct OutputTarget {
@@ -396,7 +405,44 @@ mod tests {
             harness.providers[0].credential_status,
             CredentialStatus::LocalAuthFilesDetected
         );
-        assert!(harness.plugins[0].sidecar_required);
+        assert_eq!(harness.plugins[0].source, "plugins");
+        assert!(!harness.plugins[0].sidecar_required);
+    }
+
+    #[test]
+    fn only_enabled_non_native_plugins_require_sidecar() {
+        let registry = AgentRegistry {
+            plugins: vec![
+                PluginProfile {
+                    id: "telegram".to_string(),
+                    enabled: Some(true),
+                    source: "plugins.entries".to_string(),
+                    memory_related: false,
+                    channel_related: true,
+                },
+                PluginProfile {
+                    id: "memory-lancedb".to_string(),
+                    enabled: Some(false),
+                    source: "plugins.entries".to_string(),
+                    memory_related: true,
+                    channel_related: false,
+                },
+                PluginProfile {
+                    id: "openclaw-mem-engine".to_string(),
+                    enabled: Some(true),
+                    source: "plugins.entries".to_string(),
+                    memory_related: true,
+                    channel_related: false,
+                },
+            ],
+            ..AgentRegistry::default()
+        };
+
+        let harness = build_harness_registry(&registry);
+
+        assert!(!harness.plugins[0].sidecar_required);
+        assert!(!harness.plugins[1].sidecar_required);
+        assert!(harness.plugins[2].sidecar_required);
     }
 
     #[test]
