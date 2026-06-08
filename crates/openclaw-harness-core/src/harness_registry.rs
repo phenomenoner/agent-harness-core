@@ -243,7 +243,7 @@ fn harness_plugin(plugin: &PluginProfile) -> HarnessPlugin {
 fn has_native_harness_adapter(plugin: &PluginProfile) -> bool {
     matches!(
         plugin.id.to_ascii_lowercase().as_str(),
-        "codex" | "openai" | "openrouter" | "telegram" | "discord"
+        "codex" | "openai" | "openrouter" | "telegram" | "discord" | "openclaw-context-budget"
     )
 }
 
@@ -428,6 +428,13 @@ mod tests {
                     channel_related: false,
                 },
                 PluginProfile {
+                    id: "openclaw-context-budget".to_string(),
+                    enabled: Some(true),
+                    source: "plugins.entries".to_string(),
+                    memory_related: false,
+                    channel_related: false,
+                },
+                PluginProfile {
                     id: "openclaw-mem-engine".to_string(),
                     enabled: Some(true),
                     source: "plugins.entries".to_string(),
@@ -442,7 +449,8 @@ mod tests {
 
         assert!(!harness.plugins[0].sidecar_required);
         assert!(!harness.plugins[1].sidecar_required);
-        assert!(harness.plugins[2].sidecar_required);
+        assert!(!harness.plugins[2].sidecar_required);
+        assert!(harness.plugins[3].sidecar_required);
     }
 
     #[test]

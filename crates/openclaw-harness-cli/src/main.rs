@@ -1065,7 +1065,7 @@ fn run_plugin_sidecar_call(args: &[String]) -> Result<(), String> {
         "jsonrpc": "2.0",
         "id": "openclaw-harness-cli",
         "method": args.method,
-        "params": {}
+        "params": args.params
     });
     let mut child = Command::new(&args.node_exe)
         .arg(&args.sidecar_script)
@@ -1632,6 +1632,7 @@ struct PluginSidecarCallArgs {
     node_exe: PathBuf,
     sidecar_script: PathBuf,
     method: String,
+    params: serde_json::Value,
 }
 
 struct DiscordOutboxSendOnceReport {
@@ -3013,6 +3014,7 @@ fn plugin_sidecar_call_args_from_args(args: &[String]) -> Result<PluginSidecarCa
         .join("openclaw-plugin-sidecar")
         .join("index.mjs");
     let mut method = "sidecar.status".to_string();
+    let mut params = serde_json::json!({});
     let mut i = 0;
 
     while i < args.len() {
@@ -3042,6 +3044,17 @@ fn plugin_sidecar_call_args_from_args(args: &[String]) -> Result<PluginSidecarCa
                     .cloned()
                     .ok_or_else(|| "--method requires a JSON-RPC method name".to_string())?;
             }
+            "--params-json" => {
+                i += 1;
+                let text = args
+                    .get(i)
+                    .ok_or_else(|| "--params-json requires a JSON object".to_string())?;
+                params = serde_json::from_str(text)
+                    .map_err(|err| format!("--params-json must be valid JSON: {err}"))?;
+                if !params.is_object() {
+                    return Err("--params-json must be a JSON object".to_string());
+                }
+            }
             flag => return Err(format!("unknown argument: {flag}")),
         }
         i += 1;
@@ -3052,6 +3065,7 @@ fn plugin_sidecar_call_args_from_args(args: &[String]) -> Result<PluginSidecarCa
         node_exe,
         sidecar_script,
         method,
+        params,
     })
 }
 
@@ -5790,6 +5804,7 @@ fn print_help() {
     println!("  --node-exe <path>       Node executable for plugin sidecar commands");
     println!("  --sidecar-script <path> Plugin sidecar script path");
     println!("  --method <name>         Plugin sidecar JSON-RPC method for plugin-sidecar-call");
+    println!("  --params-json <object>  JSON-RPC params object for plugin-sidecar-call");
     println!("  --queue-id <id>         Select one runtime queue item for queue-prepare");
     println!("  --execution-dir <path>  Prepared execution directory for codex-plan");
     println!("  --codex-exe <path>      Codex executable path for codex-plan/runtime-run-once");

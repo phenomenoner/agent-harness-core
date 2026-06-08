@@ -144,11 +144,11 @@ These should be run before stopping the Docker gateway.
 
 6. Plugin sidecar
    - Run `plugin-sidecar-probe` and confirm `enable-check` reports `plugin-sidecar-probe` as pass.
-   - Run `plugin-sidecar-call --method sidecar.status` and `plugin-sidecar-call --method plugins.list`; confirm `enable-check` reports `plugin-sidecar-bridge` as pass.
-   - Node sidecar process contract.
-   - Tool/hook/memory slot JSON-RPC bridge.
-   - Actual OpenClaw hook/tool execution remains a blocker until the bridge can invoke plugin-provided tools and memory hooks, not only list metadata.
-   - Health check surfaced in `enable-check`.
+   - Run `plugin-sidecar-call --method sidecar.status`, `plugin-sidecar-call --method plugins.list`, and `plugin-sidecar-call --method tools.probe`; confirm `enable-check` reports `plugin-sidecar`, `plugin-sidecar-probe`, and `plugin-sidecar-bridge` as pass.
+   - Done for activation catalog: the Node sidecar resolves imported plugin manifests, writes `state/plugin-sidecar/catalog.json`, writes execution receipts, and exposes manifest-derived tools over `tools.list`.
+   - `openclaw-context-budget` is handled as a native prompt-budget adapter by the harness instead of requiring Node plugin source.
+   - Still required for broader plugin parity: plugin-specific executor adapters for tool/hook/memory slot invocation beyond manifest catalog and bridge receipts.
+   - Health check is surfaced in `enable-check`.
 
 7. Operations
    - Windows service or scheduled task install path.
@@ -164,14 +164,14 @@ As of 2026-06-08 local verification:
 - Qdrant edge is present and passes as the primary memory backend.
 - LanceDB is absent from the filtered activation snapshot and is treated as backup/optional.
 - `openclaw-mem.sqlite` is present as a snapshot/audit source.
-- Offline `/status` channel smoke passes against the imported registry: 24 enabled agents, 2 providers, 13 plugins, Telegram and Discord enabled.
+- Offline `/status` channel smoke passes against the imported registry: 25 enabled agents, 2 providers, 13 plugins, Telegram and Discord enabled.
 - Runtime queue prepare, Codex plan, Codex preflight, and Codex launch probe pass when using workspace-local `@openai/codex` via `.tools/codex-cli/node_modules/.bin/codex.cmd`.
-- Plugin sidecar probe passes and sees 6 sidecar-required plugins. JSON-RPC bridge calls for `sidecar.status` and `plugins.list` pass; OpenClaw plugin hook/tool execution remains pending.
+- Plugin sidecar probe passes. `openclaw-context-budget` is classified as a native adapter, leaving 5 sidecar-required plugins. `tools.probe` resolves all sidecar-required plugin manifests from local source roots, writes `state/plugin-sidecar/catalog.json`, reports 2 manifest-derived tools, and makes `enable-check` pass `plugin-sidecar`.
 - Discord Gateway `MESSAGE_CREATE` event normalizer smoke passes for `/status`, including duplicate-message skip by Discord message id.
 - `channel-credentials-export --include-sensitive` imported Telegram/Discord bot tokens plus known allow-list/guild/channel/chat IDs from the local OpenClaw snapshot into `imports/activation-harness/secrets/channel-credentials.env`; readiness sees both token gates as pass.
 - `discord-gateway-probe` passes with the imported Discord token and Node 24 global WebSocket support.
 - The Codex Desktop MSIX `codex.exe` path is not spawnable from this harness environment and should not be used for service runtime.
-- Remaining `enable-check` hard failure is `plugin-sidecar`; Telegram and Discord token gates now pass from the harness secrets env file.
+- `enable-check` currently reports `Ready: yes` with no hard failures. Remaining warnings are operator smoke evidence for runtime-run-once, Telegram poll/offset, Discord outbound delivery, channel delivery receipts, and optional LanceDB backup.
 
 ## Verification Commands
 
@@ -187,6 +187,8 @@ cargo run -p openclaw-harness-cli -- codex-launch-probe --harness-home C:\path\t
 cargo run -p openclaw-harness-cli -- plugin-sidecar-probe --harness-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\.openclaw-harness --method sidecar.status
 cargo run -p openclaw-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\.openclaw-harness --method plugins.list
+$env:OPENCLAW_PLUGIN_SOURCE_ROOTS='C:\path\to\openclaw-src\extensions;C:\path\to\openclaw-mem-src\extensions'
+cargo run -p openclaw-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\.openclaw-harness --method tools.probe
 cargo run -p openclaw-harness-cli -- discord-event-run-once --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw --event-file C:\path\to\discord-message-create.json
 cargo run -p openclaw-harness-cli -- discord-gateway-probe --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw
 cargo run -p openclaw-harness-cli -- telegram-poll-once --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.cmd --poll-timeout-seconds 1 --max-updates 10
