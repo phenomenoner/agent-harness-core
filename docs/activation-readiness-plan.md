@@ -128,7 +128,7 @@ These should be run before stopping the Docker gateway.
 
 1. Real Telegram adapter
    - Done for non-consuming token/API readiness: `telegram-probe` calls Telegram Bot API `getMe`, writes `state/channels/telegram-probe.json`, appends `telegram-probe-receipts.jsonl`, and logs `telegram.probe` without consuming updates or sending messages.
-   - Done for smoke and operator-run handoff: `telegram-poll-once` receives Telegram text updates, enforces imported Telegram direct/group chat and user allow-lists before runtime dispatch, normalizes allowed messages into `channel-run-once`, delivers pending replies through Telegram Bot API `sendMessage`, records delivery receipts, stores update offsets, and writes a poll summary log. `telegram-loop` repeats the same path with idle sleep and a consecutive-error threshold.
+   - Done for smoke and operator-run handoff: `telegram-poll-once` receives Telegram text updates, enforces imported Telegram direct/group chat and user allow-lists before runtime dispatch, normalizes allowed messages into `channel-run-once`, delivers pending replies through Telegram Bot API `sendMessage`, records delivery receipts, stores update offset state after every successful poll, and writes a poll summary log. `telegram-loop` repeats the same path with idle sleep and a consecutive-error threshold.
    - Done for graceful operator stop: `telegram-loop --stop-file <path>` exits before the next poll when the stop file appears.
    - Health/status CLI summary is available through `status`.
    - Still required for formal Telegram activation: live Telegram DM smoke after the old gateway is offline, token source hardening, and production retry policy.
@@ -192,8 +192,9 @@ As of 2026-06-08 local verification:
 - The Codex Desktop MSIX `codex.exe` path is not spawnable from this harness environment and should not be used for service runtime.
 - Offline normal-turn smoke passes through `channel-run-once` with `tools/openclaw-fake-codex-app-server/fake-codex-app-server.cmd`, producing runtime-run-once, Codex run, Codex completion, transcript, outbox, delivery receipt, and operational log evidence without a model request or channel send.
 - Runtime loop idle/drain smoke passes with `runtime-loop --stop-when-idle` and writes `state/runtime-queue/loop-last.json` without a model request when no pending queue items remain.
-- `status` reports `queued=2 open=0 prepared=2 completed=2`, outbox `pending=0 delivered=4`, Qdrant edge primary memory present, plugin catalog ready with 2 manifest-derived tools, and operational log event coverage for offline runtime/delivery smoke.
-- `enable-check` currently reports `Ready: yes` with `passed=33 warnings=3 failed=0`; `telegram-access-policy`, `discord-access-policy`, `runtime-loop`, and `supervisor-plan` are pass. Remaining warnings are live operator smoke evidence for Telegram poll/offset and optional LanceDB backup.
+- `telegram-poll-once` has run successfully against the imported Telegram token and allow-lists. No pending updates were present, so `state/channels/telegram-offset.json` currently records `nextOffset=null`; this still proves the poll adapter can take over without consuming stale updates.
+- `status` reports `queued=2 open=0 prepared=2 completed=2`, outbox `pending=0 delivered=4`, Telegram offset/probe/poll-log present, Qdrant edge primary memory present, plugin catalog ready with 2 manifest-derived tools, and operational log event coverage for offline runtime/delivery smoke.
+- `enable-check` currently reports `Ready: yes` with `passed=35 warnings=1 failed=0`; `telegram-access-policy`, `discord-access-policy`, `telegram-probe`, `telegram-offset`, `telegram-poll-log`, `runtime-loop`, and `supervisor-plan` are pass. The remaining warning is optional LanceDB backup absence while Qdrant edge is primary.
 
 ## Verification Commands
 

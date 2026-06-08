@@ -875,6 +875,7 @@ fn execute_telegram_poll_once(
         handled_messages += 1;
         write_telegram_offset(&offset_file, next_offset)?;
     }
+    write_telegram_offset(&offset_file, next_offset)?;
 
     let delivery = plan_channel_outbox(ChannelOutboxPlanOptions {
         harness_home: args.target_home.clone(),
