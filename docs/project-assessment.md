@@ -186,6 +186,8 @@ Importer policy borrowed from Hermes:
 
 To shut down the Docker OpenClaw gateway and let the Rust Windows harness take over current work, the MVP needs more than import. It needs runtime parity for the active surfaces currently doing work.
 
+The operational cutover gates are tracked in [Activation Readiness Plan](activation-readiness-plan.md).
+
 Required for a real cutover:
 
 1. State export/import
@@ -298,6 +300,7 @@ Current implemented foundation:
 - `channel-step` builds the shared Telegram/Discord-style channel bridge contract for one inbound DM: command turns produce typed command effects plus outbound reply text, and ordinary messages produce an agent-turn dispatch envelope for the future runtime queue.
 - `channel-apply` persists command effects for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status` into per-channel state, command events, and command-apply receipts without invoking the model path.
 - `channel-receive` is the single-message ingress handler future Telegram/Discord adapters can call; it routes commands to channel state/outbox and ordinary messages to the runtime queue with receive receipts.
+- `channel-run-once` is the single-message adapter/smoke entrypoint: it runs `channel-receive`, invokes `runtime-run-once` when the message is an ordinary agent turn, and returns pending outbox delivery work.
 - `channel-outbox-plan` and `channel-delivery-record` provide the shared Telegram/Discord delivery retry ledger: pending outbox messages get stable delivery ids, delivered receipts are skipped, failed receipts remain retryable, and delivery events are written to the operational log.
 - `queue-enqueue` and `queue-prepare` read channel command state from the target harness home so active session keys, model overrides, and steering/think/btw notes survive into queued turns and prompt bundles.
 - `queue-prepare` uses prepared execution receipts as idempotence state: automatic selection skips already prepared queue ids, while explicit `--queue-id` requests return an `AlreadyPrepared` no-op receipt with the prior output paths.
@@ -361,7 +364,7 @@ Current implemented foundation:
 - Add Telegram channel.
 - Add Discord channel.
 - Implement channel session key compatibility.
-- Route real Telegram/Discord bot events into `channel-receive`, run ordinary messages through `runtime-run-once`, and deliver replies through the shared `channel-outbox-plan` / `channel-delivery-record` ledger.
+- Route real Telegram/Discord bot events into `channel-run-once` and deliver replies through the shared `channel-outbox-plan` / `channel-delivery-record` ledger.
 - Expose persisted command effects such as model switch, new session, steering notes, and stop requests through the real bot UX and status replies.
 - Implement approval UX for shell/tool requests.
 

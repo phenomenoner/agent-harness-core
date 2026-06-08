@@ -18,6 +18,7 @@ The project starts with a small, testable foundation:
 - A shared channel runtime bridge that maps one Telegram/Discord-style DM into either an immediate command reply or an agent-turn dispatch envelope.
 - A deterministic channel command state writer for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status` effects.
 - A channel receive handler that turns one DM into either command state/outbox records or a queued agent turn.
+- A channel run-once pipeline that handles one DM, runs the runtime when needed, and returns pending delivery work.
 - A channel outbox delivery planner/receipt ledger for Telegram/Discord delivery retry.
 - A durable runtime queue writer that appends channel agent turns to `state/runtime-queue/pending.jsonl` with receipts and planned transcript paths.
 - A runtime queue prepare worker that reads pending items, assembles prompt bundles, and writes execution receipts before the Codex adapter is connected.
@@ -31,7 +32,7 @@ The project starts with a small, testable foundation:
 - A native agent-turn cron parser and dry-run dispatch planner with cutover hold safety.
 - A deterministic cron parser and no-LLM dry-run planner for workspace cron runners.
 - A subagent ledger parser and dry-run planner for `/subagents/runs.json` cutover safety.
-- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `enable-check`, `harness-skills-sync`, `skills`, `turn-plan`, `channel-step`, `channel-apply`, `channel-receive`, `channel-outbox-plan`, `channel-delivery-record`, `queue-enqueue`, `queue-prepare`, `runtime-run-once`, `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
+- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `enable-check`, `harness-skills-sync`, `skills`, `turn-plan`, `channel-step`, `channel-apply`, `channel-receive`, `channel-run-once`, `channel-outbox-plan`, `channel-delivery-record`, `queue-enqueue`, `queue-prepare`, `runtime-run-once`, `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
 - Minimal external crates: `serde` and `serde_json` for stable report/config/session JSON handling.
 
 ## Quick Start
@@ -52,6 +53,7 @@ cargo run -p openclaw-harness-cli -- turn-plan --openclaw-home C:\path\to\.openc
 cargo run -p openclaw-harness-cli -- channel-step --openclaw-home C:\path\to\.openclaw --platform discord --channel-id dm-123 --user-id user-456 --agent main --message "/status channels" --output imports\channel
 cargo run -p openclaw-harness-cli -- channel-apply --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "/model openrouter/anthropic/claude-sonnet-4"
 cargo run -p openclaw-harness-cli -- channel-receive --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "continue with the selected model"
+cargo run -p openclaw-harness-cli -- channel-run-once --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "continue with the selected model" --codex-exe C:\path\to\codex.exe
 cargo run -p openclaw-harness-cli -- channel-outbox-plan --target-home C:\path\to\.openclaw-harness --platform telegram --limit 20
 cargo run -p openclaw-harness-cli -- turn-plan --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "continue with the selected model"
 cargo run -p openclaw-harness-cli -- queue-enqueue --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron"
@@ -106,6 +108,8 @@ Telegram and Discord adapters should share the same channel command parser and i
 
 `channel-receive` is the single-message ingress contract for future Telegram and Discord adapters. It builds the same channel step, applies command turns into channel state and `state/channels/outbox.jsonl`, or queues ordinary agent turns into `state/runtime-queue/pending.jsonl`. It writes `state/channels/receive-receipts.jsonl` for retry/audit and never calls a model directly.
 
+`channel-run-once` is the single-message smoke and future adapter entrypoint. It calls `channel-receive`, runs `runtime-run-once` for ordinary agent turns, then returns a `channel-outbox-plan` view for delivery. Command messages never enter the model path; ordinary messages may start `codex app-server` and make a model request.
+
 `channel-outbox-plan` reads `state/channels/outbox.jsonl`, filters by platform, excludes delivered messages, and returns retryable pending messages with stable delivery ids, attempt counts, and last delivery status. `channel-delivery-record` appends delivered/failed receipts to `state/channels/delivery-receipts.jsonl` and logs delivery events. Telegram and Discord adapters should use this shared ledger so command replies and agent replies follow the same retry/audit path.
 
 `queue-enqueue` persists the agent-turn side of `channel-step`. It appends queued turns to `state/runtime-queue/pending.jsonl`, appends every queued/skipped attempt to `state/runtime-queue/receipts.jsonl`, and precomputes OpenClaw-compatible transcript and trajectory paths under `agents/<agent-id>/sessions/`. Command-only channel steps are recorded as skipped receipts and are not sent to the agent queue.
@@ -135,5 +139,7 @@ Cron import has two separate lanes: OpenClaw native agent-turn cron under `.open
 `subagent-plan` reads `.openclaw/subagents/runs.json` and writes `subagent-plan.json`. Completed, failed, and canceled runs stay historical no-ops. Queued and running runs are held by default to avoid duplicate worker execution during gateway handoff; `--resume-subagents` only marks them as resume candidates in the dry-run plan and does not start a worker.
 
 This workspace disables Codex-side `openclaw-mem` gateway lookups through [AGENTS.md](AGENTS.md). The harness product requirement still includes importing existing OpenClaw memory files/databases and supporting memory adapters when enabled.
+
+The cutover checklist is tracked in [Activation Readiness Plan](docs/activation-readiness-plan.md).
 
 See [Project Assessment](docs/project-assessment.md).

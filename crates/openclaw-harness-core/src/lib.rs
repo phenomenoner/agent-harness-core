@@ -6,6 +6,7 @@ pub mod activation;
 pub mod channel_commands;
 pub mod channel_delivery;
 pub mod channel_ingress;
+pub mod channel_pipeline;
 pub mod channel_runtime;
 pub mod channel_state;
 pub mod codex_runtime;
@@ -39,6 +40,9 @@ pub use channel_delivery::{
 pub use channel_ingress::{
     ChannelReceiveOptions, ChannelReceiveReceipt, ChannelReceiveReport, ChannelReceiveStatus,
     receive_channel_message,
+};
+pub use channel_pipeline::{
+    ChannelRunOnceOptions, ChannelRunOnceReport, ChannelRunOnceStatus, run_channel_once,
 };
 pub use channel_runtime::{
     ChannelAgentTurnDispatch, ChannelCommandEffect, ChannelOutboundMessage,

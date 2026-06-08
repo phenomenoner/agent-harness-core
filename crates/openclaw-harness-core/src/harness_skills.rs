@@ -80,6 +80,7 @@ Commands should update channel state and receipts before enqueueing agent turns.
 ## Channel Delivery
 
 - Command replies and agent replies are both appended to state/channels/outbox.jsonl.
+- Use channel-run-once as the single-message adapter entrypoint before real Telegram/Discord loops exist.
 - Use channel-outbox-plan to list pending delivery work by platform.
 - Use channel-delivery-record after Telegram/Discord send attempts to record delivered or failed receipts.
 - Failed receipts stay retryable; delivered receipts are skipped by future outbox plans.

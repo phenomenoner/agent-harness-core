@@ -96,6 +96,8 @@ pub fn check_activation_readiness(
         check_providers(registry, &mut checks);
         check_plugins(registry, &mut checks);
     }
+    check_activation_plan_doc(&mut checks);
+    check_harness_skills(&options.harness_home, &mut checks);
     check_runtime_queue(&options.harness_home, &mut checks);
     check_channel_state(&options.harness_home, &mut checks);
     check_logging(&options.harness_home, &mut checks);
@@ -255,7 +257,9 @@ fn check_runtime_queue(harness_home: &Path, checks: &mut Vec<ActivationReadiness
     }
     for (name, file) in [
         ("prepared-executions", "execution-receipts.jsonl"),
+        ("runtime-run-once", "run-once-receipts.jsonl"),
         ("codex-runtime-plans", "codex-runtime-receipts.jsonl"),
+        ("codex-runtime-runs", "codex-runtime-run-receipts.jsonl"),
         (
             "codex-runtime-completions",
             "codex-runtime-completion-receipts.jsonl",
@@ -301,6 +305,59 @@ fn check_channel_state(harness_home: &Path, checks: &mut Vec<ActivationReadiness
             format!(
                 "no outbound channel messages queued at {}",
                 outbox.display()
+            ),
+        ));
+    }
+    let delivery_receipts = channels_dir.join("delivery-receipts.jsonl");
+    if delivery_receipts.is_file() {
+        checks.push(pass(
+            "channel-delivery",
+            format!("found {}", delivery_receipts.display()),
+        ));
+    } else {
+        checks.push(warn(
+            "channel-delivery",
+            format!(
+                "no channel delivery receipts yet at {}",
+                delivery_receipts.display()
+            ),
+        ));
+    }
+}
+
+fn check_activation_plan_doc(checks: &mut Vec<ActivationReadinessCheck>) {
+    let plan = PathBuf::from("docs").join("activation-readiness-plan.md");
+    if plan.is_file() {
+        checks.push(pass(
+            "activation-plan",
+            format!("activation plan exists at {}", plan.display()),
+        ));
+    } else {
+        checks.push(warn(
+            "activation-plan",
+            format!("activation plan doc not found at {}", plan.display()),
+        ));
+    }
+}
+
+fn check_harness_skills(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let manifest = harness_home
+        .join("skills")
+        .join(".openclaw-harness-builtins.json");
+    if manifest.is_file() {
+        checks.push(pass(
+            "harness-skills",
+            format!(
+                "builtin harness skill manifest found at {}",
+                manifest.display()
+            ),
+        ));
+    } else {
+        checks.push(warn(
+            "harness-skills",
+            format!(
+                "builtin harness skill manifest not found at {}; run harness-skills-sync",
+                manifest.display()
             ),
         ));
     }

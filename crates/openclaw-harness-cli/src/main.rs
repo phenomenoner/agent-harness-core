@@ -7,28 +7,28 @@ use openclaw_harness_core::{
     BuiltinHarnessSkillSyncOptions, BuiltinHarnessSkillSyncReport, ChannelCommandApplyOptions,
     ChannelCommandApplyReport, ChannelDeliveryReceipt, ChannelDeliveryRecordOptions,
     ChannelDeliveryStatus, ChannelOutboxPlanOptions, ChannelOutboxPlanReport,
-    ChannelReceiveOptions, ChannelReceiveReport, ChannelStep, CodexRuntimeCompletionOptions,
-    CodexRuntimeCompletionReport, CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReport,
-    CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimePreflightOptions,
-    CodexRuntimePreflightReport, CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy,
-    DeterministicCronPlan, DeterministicCronPlanInput, DryRunImportOptions, ExecuteImportOptions,
-    HarnessLogEvent, HarnessLogLevel, ImportPhaseStatus, ImportReport, NativeCronPlan,
-    NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions, PromptBundle,
-    RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions,
-    RuntimeQueuePrepareReport, RuntimeRunOnceOptions, RuntimeRunOnceReport, SkillIndex,
-    SkillSelectionQuery, SubagentPlan, SubagentPlanInput, TurnPlan, TurnPlanInput,
-    append_harness_log, apply_channel_command_step, assemble_prompt_bundle, build_channel_step,
-    build_dry_run_report, build_harness_skill_index, build_import_plan, build_runtime_skill_index,
-    build_source_skill_index, build_turn_plan, check_activation_readiness, current_log_time_ms,
-    enqueue_channel_step, execute_import, export_harness_registry_files, inventory,
-    load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
-    load_subagent_ledger, plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron,
-    plan_native_cron, plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
-    probe_codex_runtime_launch, receive_channel_message, record_channel_delivery,
-    record_codex_runtime_completion, run_codex_runtime, run_runtime_queue_once, select_skills,
-    sync_builtin_harness_skills, write_channel_step, write_deterministic_cron_plan,
-    write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
-    write_subagent_plan, write_turn_plan,
+    ChannelReceiveOptions, ChannelReceiveReport, ChannelRunOnceOptions, ChannelRunOnceReport,
+    ChannelStep, CodexRuntimeCompletionOptions, CodexRuntimeCompletionReport,
+    CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReport, CodexRuntimePlanOptions,
+    CodexRuntimePlanReport, CodexRuntimePreflightOptions, CodexRuntimePreflightReport,
+    CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy, DeterministicCronPlan,
+    DeterministicCronPlanInput, DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent,
+    HarnessLogLevel, ImportPhaseStatus, ImportReport, NativeCronPlan, NativeCronPlanInput,
+    OpenClawSource, PromptAssemblyOptions, PromptBundle, RuntimeQueueEnqueueOptions,
+    RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
+    RuntimeRunOnceOptions, RuntimeRunOnceReport, SkillIndex, SkillSelectionQuery, SubagentPlan,
+    SubagentPlanInput, TurnPlan, TurnPlanInput, append_harness_log, apply_channel_command_step,
+    assemble_prompt_bundle, build_channel_step, build_dry_run_report, build_harness_skill_index,
+    build_import_plan, build_runtime_skill_index, build_source_skill_index, build_turn_plan,
+    check_activation_readiness, current_log_time_ms, enqueue_channel_step, execute_import,
+    export_harness_registry_files, inventory, load_agent_registry, load_deterministic_cron_store,
+    load_native_cron_store, load_subagent_ledger, plan_channel_outbox, plan_codex_runtime,
+    plan_deterministic_cron, plan_native_cron, plan_subagents, preflight_codex_runtime,
+    prepare_runtime_queue_item, probe_codex_runtime_launch, receive_channel_message,
+    record_channel_delivery, record_codex_runtime_completion, run_channel_once, run_codex_runtime,
+    run_runtime_queue_once, select_skills, sync_builtin_harness_skills, write_channel_step,
+    write_deterministic_cron_plan, write_native_cron_plan, write_prompt_bundle, write_report_files,
+    write_skill_index, write_subagent_plan, write_turn_plan,
 };
 
 fn main() {
@@ -50,6 +50,7 @@ fn main() {
         "channel-step" => run_channel_step(&rest),
         "channel-apply" => run_channel_apply(&rest),
         "channel-receive" => run_channel_receive(&rest),
+        "channel-run-once" => run_channel_run_once(&rest),
         "channel-outbox-plan" => run_channel_outbox_plan(&rest),
         "channel-delivery-record" => run_channel_delivery_record(&rest),
         "queue-enqueue" => run_queue_enqueue(&rest),
@@ -445,6 +446,34 @@ fn run_channel_receive(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_channel_run_once(args: &[String]) -> Result<(), String> {
+    let args = channel_run_once_args_from_args(args)?;
+    let report = run_channel_once(ChannelRunOnceOptions {
+        source: args.turn.source,
+        harness_home: args.target_home.clone(),
+        platform: args.turn.platform,
+        channel_id: args.turn.channel_id,
+        user_id: args.turn.user_id,
+        agent_id: args.turn.agent_id,
+        session_key: args.turn.session_key,
+        message: args.turn.message,
+        skill_limit: args.turn.skill_limit,
+        now_ms: args.now_ms,
+        codex_executable: args.codex_exe,
+        timeout_ms: args.timeout_ms,
+        prompt_options: PromptAssemblyOptions {
+            max_prompt_file_bytes: args.turn.max_prompt_file_bytes,
+            max_skill_file_bytes: args.turn.max_skill_file_bytes,
+            harness_home: Some(args.target_home),
+        },
+        outbox_limit: args.outbox_limit,
+    })
+    .map_err(|err| err.to_string())?;
+
+    print_channel_run_once_report(&report);
+    Ok(())
+}
+
 fn run_channel_outbox_plan(args: &[String]) -> Result<(), String> {
     let args = channel_outbox_plan_args_from_args(args)?;
     let report = plan_channel_outbox(ChannelOutboxPlanOptions {
@@ -819,6 +848,15 @@ struct QueueEnqueueArgs {
     turn: TurnPlanArgs,
     target_home: PathBuf,
     now_ms: i64,
+}
+
+struct ChannelRunOnceArgs {
+    turn: TurnPlanArgs,
+    target_home: PathBuf,
+    now_ms: i64,
+    codex_exe: Option<PathBuf>,
+    timeout_ms: u64,
+    outbox_limit: usize,
 }
 
 struct ChannelOutboxPlanArgs {
@@ -1421,6 +1459,75 @@ fn queue_enqueue_args_from_args(args: &[String]) -> Result<QueueEnqueueArgs, Str
         turn,
         target_home,
         now_ms,
+    })
+}
+
+fn channel_run_once_args_from_args(args: &[String]) -> Result<ChannelRunOnceArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut now_ms = None;
+    let mut codex_exe = None;
+    let mut timeout_ms = 300_000;
+    let mut outbox_limit = 20;
+    let mut turn_args = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target-home" => {
+                i += 1;
+                target_home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+            }
+            "--now-ms" => {
+                i += 1;
+                now_ms = Some(
+                    args.get(i)
+                        .ok_or_else(|| "--now-ms requires epoch milliseconds".to_string())
+                        .and_then(|value| parse_i64(value, "--now-ms"))?,
+                );
+            }
+            "--codex-exe" => {
+                i += 1;
+                codex_exe = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--codex-exe requires a path".to_string())?,
+                );
+            }
+            "--timeout-ms" => {
+                i += 1;
+                timeout_ms = args
+                    .get(i)
+                    .ok_or_else(|| "--timeout-ms requires a positive integer".to_string())
+                    .and_then(|value| parse_u64(value, "--timeout-ms"))?;
+            }
+            "--outbox-limit" => {
+                i += 1;
+                outbox_limit = args
+                    .get(i)
+                    .ok_or_else(|| "--outbox-limit requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            _ => turn_args.push(args[i].clone()),
+        }
+        i += 1;
+    }
+
+    let turn = turn_plan_args_from_args(&turn_args)?;
+    let now_ms = match now_ms {
+        Some(now_ms) => now_ms,
+        None => current_time_ms()?,
+    };
+
+    Ok(ChannelRunOnceArgs {
+        turn,
+        target_home,
+        now_ms,
+        codex_exe,
+        timeout_ms,
+        outbox_limit,
     })
 }
 
@@ -2681,6 +2788,54 @@ fn print_channel_receive_report(report: &ChannelReceiveReport) {
     }
 }
 
+fn print_channel_run_once_report(report: &ChannelRunOnceReport) {
+    println!("OpenClaw channel run once");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Status: {:?}", report.status);
+    println!("Receive: {:?}", report.receive.status);
+    println!("Platform: {}", report.receive.platform);
+    println!("Channel: {}", report.receive.channel_id);
+    println!("User: {}", report.receive.user_id);
+    println!("Session key: {}", report.receive.session_key);
+    if let Some(queue_id) = &report.receive.queue_id {
+        println!("Queue id: {queue_id}");
+    }
+    if let Some(runtime) = &report.runtime {
+        println!("Runtime: {:?}", runtime.receipt.status);
+        println!("Runtime reason: {}", runtime.receipt.reason);
+        if let Some(execution_dir) = &runtime.receipt.execution_dir {
+            println!("Execution dir: {}", execution_dir.display());
+        }
+        if let Some(transcript_file) = &runtime.receipt.transcript_file {
+            println!("Transcript: {}", transcript_file.display());
+        }
+    }
+    println!(
+        "Outbox pending={} delivered={} failed_retryable={}",
+        report.outbox.summary.pending,
+        report.outbox.summary.delivered,
+        report.outbox.summary.failed_retryable
+    );
+    for pending in &report.outbox.pending {
+        println!(
+            "- {} {:?} platform={} channel={} user={} session={}",
+            pending.delivery_id,
+            pending.message.kind,
+            pending.message.platform,
+            pending.message.channel_id,
+            pending.message.user_id,
+            pending.message.session_key
+        );
+        println!("  {}", pending.message.text);
+    }
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
 fn print_channel_outbox_plan_report(report: &ChannelOutboxPlanReport) {
     println!("OpenClaw channel outbox plan");
     println!("Harness home: {}", report.harness_home.display());
@@ -3282,6 +3437,7 @@ fn print_help() {
     println!("  channel-step    Plan shared channel reply or agent dispatch for one DM");
     println!("  channel-apply   Persist channel command state and command receipts");
     println!("  channel-receive Handle one DM into command outbox or runtime queue");
+    println!("  channel-run-once Handle one DM, run runtime if needed, and plan delivery");
     println!("  channel-outbox-plan List pending Telegram/Discord delivery messages");
     println!("  channel-delivery-record Record delivery success or retryable failure");
     println!("  queue-enqueue   Persist one channel agent turn to the runtime queue");
@@ -3320,6 +3476,7 @@ fn print_help() {
     println!("  --status <value>        Delivery status: delivered or failed");
     println!("  --provider-message-id <id> Telegram/Discord message id after delivery");
     println!("  --error <text>          Delivery failure reason");
+    println!("  --outbox-limit <n>      Maximum pending outbox items for channel-run-once");
     println!("  --queue-id <id>         Select one runtime queue item for queue-prepare");
     println!("  --execution-dir <path>  Prepared execution directory for codex-plan");
     println!("  --codex-exe <path>      Codex executable path for codex-plan/runtime-run-once");
