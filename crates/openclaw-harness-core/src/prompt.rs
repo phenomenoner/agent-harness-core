@@ -1,15 +1,12 @@
-use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::{SKILL_FILE_NAME, TurnDispatch, TurnPlan};
 
 const PROMPT_BUNDLE_SCHEMA: &str = "openclaw-harness.prompt-bundle.v1";
-const PROMPT_INJECTION_LEDGER_SCHEMA: &str = "openclaw-harness.prompt-injection-ledger.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptAssemblyOptions {
@@ -85,50 +82,12 @@ pub struct PromptBundleFiles {
     pub markdown: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PromptInjectionLedger {
-    schema: String,
-    session_key: String,
-    agent_id: Option<String>,
-    prompt_files: BTreeMap<String, PromptInjectionLedgerEntry>,
-    skills: BTreeMap<String, PromptInjectionLedgerEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PromptInjectionLedgerEntry {
-    id: String,
-    title: String,
-    path: PathBuf,
-    fingerprint: String,
-    injected_at_ms: i64,
-}
-
 pub fn assemble_prompt_bundle(
     plan: &TurnPlan,
     options: PromptAssemblyOptions,
 ) -> io::Result<PromptBundle> {
     let mut sections = Vec::new();
     let mut warnings = plan.warnings.clone();
-    let mut ledger_state = if plan.dispatch == TurnDispatch::AgentTurn {
-        options
-            .harness_home
-            .as_ref()
-            .map(|harness_home| {
-                load_prompt_injection_ledger(
-                    harness_home,
-                    plan.agent.as_ref().map(|agent| agent.id.as_str()),
-                    &plan.session_key,
-                )
-            })
-            .transpose()?
-    } else {
-        None
-    };
-    let mut reused_prompt_files = Vec::new();
-    let mut reused_skills = Vec::new();
-    let mut ledger_dirty = false;
 
     sections.push(runtime_context_section(plan));
     if let Some(state) = &plan.channel_state {
@@ -141,17 +100,13 @@ pub fn assemble_prompt_bundle(
             plan.dispatch
         ));
     } else {
+        warnings.push(
+            "session context reuse is disabled until Codex backend thread resume is implemented; authoritative OpenClaw prompt files and skills are injected every agent turn".to_string(),
+        );
+        sections.push(openclaw_identity_section(plan));
+
         for prompt_file in &plan.prompt_files {
             if !prompt_file.exists {
-                continue;
-            }
-            let fingerprint = fingerprint_file(&prompt_file.path)?;
-            if let Some(state) = ledger_state.as_mut()
-                && let Some(entry) = state.ledger.prompt_files.get(&prompt_file.name)
-                && entry.fingerprint == fingerprint
-            {
-                state.summary.prompt_files_reused += 1;
-                reused_prompt_files.push(prompt_file.name.clone());
                 continue;
             }
             sections.push(read_limited_section(
@@ -160,19 +115,6 @@ pub fn assemble_prompt_bundle(
                 &prompt_file.path,
                 options.max_prompt_file_bytes,
             )?);
-            if let Some(state) = ledger_state.as_mut() {
-                state.ledger.prompt_files.insert(
-                    prompt_file.name.clone(),
-                    PromptInjectionLedgerEntry {
-                        id: prompt_file.name.clone(),
-                        title: prompt_file.name.clone(),
-                        path: prompt_file.path.clone(),
-                        fingerprint,
-                        injected_at_ms: current_time_ms()?,
-                    },
-                );
-                ledger_dirty = true;
-            }
         }
 
         for skill in &plan.selected_skills {
@@ -186,41 +128,12 @@ pub fn assemble_prompt_bundle(
                 ));
                 continue;
             }
-            let fingerprint = fingerprint_file(&skill_file)?;
-            if let Some(state) = ledger_state.as_mut()
-                && let Some(entry) = state.ledger.skills.get(&skill.skill_id)
-                && entry.fingerprint == fingerprint
-            {
-                state.summary.skills_reused += 1;
-                reused_skills.push(skill.skill_id.clone());
-                continue;
-            }
             sections.push(read_limited_section(
                 PromptSectionKind::Skill,
                 format!("{} ({})", skill.title, skill.skill_id),
                 &skill_file,
                 options.max_skill_file_bytes,
             )?);
-            if let Some(state) = ledger_state.as_mut() {
-                state.ledger.skills.insert(
-                    skill.skill_id.clone(),
-                    PromptInjectionLedgerEntry {
-                        id: skill.skill_id.clone(),
-                        title: skill.title.clone(),
-                        path: skill_file,
-                        fingerprint,
-                        injected_at_ms: current_time_ms()?,
-                    },
-                );
-                ledger_dirty = true;
-            }
-        }
-
-        if !reused_prompt_files.is_empty() || !reused_skills.is_empty() {
-            sections.push(session_continuity_section(
-                &reused_prompt_files,
-                &reused_skills,
-            ));
         }
 
         sections.push(PromptSection {
@@ -234,17 +147,7 @@ pub fn assemble_prompt_bundle(
         });
     }
 
-    if let Some(state) = &ledger_state
-        && ledger_dirty
-    {
-        write_prompt_injection_ledger(&state.path, &state.ledger)?;
-    }
-
-    let mut summary = summarize_sections(&sections);
-    if let Some(state) = ledger_state {
-        summary.prompt_files_reused = state.summary.prompt_files_reused;
-        summary.skills_reused = state.summary.skills_reused;
-    }
+    let summary = summarize_sections(&sections);
     Ok(PromptBundle {
         schema: PROMPT_BUNDLE_SCHEMA,
         dispatch: plan.dispatch,
@@ -301,6 +204,39 @@ fn runtime_context_section(plan: &TurnPlan) -> PromptSection {
     }
 }
 
+fn openclaw_identity_section(plan: &TurnPlan) -> PromptSection {
+    let agent_id = plan
+        .agent
+        .as_ref()
+        .map(|agent| agent.id.as_str())
+        .unwrap_or("unknown");
+    let content = format!(
+        "\
+You are executing an OpenClaw agent turn through a Codex backend runtime.
+
+User-facing identity contract:
+- The chat-facing agent identity is the imported OpenClaw agent `{agent_id}`.
+- Follow the SOUL.md, AGENTS.md, MEMORY.md, selected skills, and channel state included in this bundle as the authoritative agent context.
+- Do not introduce yourself as Codex, OpenAI, Codex CLI, or a generic programming assistant unless the user specifically asks about the backend/runtime implementation.
+- Do not mention harness development workspace rules, this prompt bundle, injection ledgers, or backend plumbing to the Telegram/Discord user unless asked for runtime diagnostics.
+- If a harness-development instruction conflicts with imported OpenClaw agent context for chat-facing behavior, keep the harness instruction for local safety but answer the channel user with the imported OpenClaw persona and operating rules.
+
+Backend continuity note:
+- This harness currently starts a fresh Codex app-server thread per runtime execution. Authoritative OpenClaw prompt files and skills are therefore repeated every agent turn until true Codex thread resume is implemented.
+",
+    );
+    let bytes = content.len();
+    PromptSection {
+        kind: PromptSectionKind::RuntimeContext,
+        title: "OpenClaw runtime identity contract".to_string(),
+        path: None,
+        bytes_original: bytes,
+        bytes_included: bytes,
+        truncated: false,
+        content,
+    }
+}
+
 fn channel_state_section(state: &crate::ChannelSessionState) -> PromptSection {
     let mut content = String::new();
     content.push_str(&format!(
@@ -331,43 +267,6 @@ fn channel_state_section(state: &crate::ChannelSessionState) -> PromptSection {
     PromptSection {
         kind: PromptSectionKind::ChannelState,
         title: "Channel command state".to_string(),
-        path: None,
-        bytes_original: bytes,
-        bytes_included: bytes,
-        truncated: false,
-        content,
-    }
-}
-
-fn session_continuity_section(prompt_files: &[String], skills: &[String]) -> PromptSection {
-    let mut content = String::new();
-    content.push_str("strategy: codex-session-continuity\n");
-    content.push_str("system_prompt_owner: codex-cli\n");
-    content.push_str("tool_schema_owner: codex-cli\n");
-    content.push_str(
-        "note: OpenClaw prompt files and skills listed here were already injected for this session with matching fingerprints. This bundle avoids repeating same-session context and expects the Codex backend session to retain prior context.\n",
-    );
-    content.push_str("reused_prompt_files:\n");
-    if prompt_files.is_empty() {
-        content.push_str("- -\n");
-    } else {
-        for name in prompt_files {
-            content.push_str(&format!("- {name}\n"));
-        }
-    }
-    content.push_str("reused_skills:\n");
-    if skills.is_empty() {
-        content.push_str("- -\n");
-    } else {
-        for skill in skills {
-            content.push_str(&format!("- {skill}\n"));
-        }
-    }
-
-    let bytes = content.len();
-    PromptSection {
-        kind: PromptSectionKind::SessionContinuity,
-        title: "Codex session continuity".to_string(),
         path: None,
         bytes_original: bytes,
         bytes_included: bytes,
@@ -500,106 +399,6 @@ fn render_prompt_markdown(bundle: &PromptBundle) -> String {
 
 fn escape_markdown_line(value: &str) -> String {
     value.replace('|', "\\|")
-}
-
-struct PromptInjectionLedgerState {
-    path: PathBuf,
-    ledger: PromptInjectionLedger,
-    summary: PromptBundleSummary,
-}
-
-fn load_prompt_injection_ledger(
-    harness_home: &Path,
-    agent_id: Option<&str>,
-    session_key: &str,
-) -> io::Result<PromptInjectionLedgerState> {
-    let path = prompt_injection_ledger_file(harness_home, agent_id, session_key);
-    let ledger = if path.is_file() {
-        let bytes = fs::read(&path)?;
-        serde_json::from_slice(&bytes).unwrap_or_else(|_| {
-            empty_prompt_injection_ledger(
-                agent_id.map(ToString::to_string),
-                session_key.to_string(),
-            )
-        })
-    } else {
-        empty_prompt_injection_ledger(agent_id.map(ToString::to_string), session_key.to_string())
-    };
-    Ok(PromptInjectionLedgerState {
-        path,
-        ledger,
-        summary: PromptBundleSummary::default(),
-    })
-}
-
-fn empty_prompt_injection_ledger(
-    agent_id: Option<String>,
-    session_key: String,
-) -> PromptInjectionLedger {
-    PromptInjectionLedger {
-        schema: PROMPT_INJECTION_LEDGER_SCHEMA.to_string(),
-        session_key,
-        agent_id,
-        prompt_files: BTreeMap::new(),
-        skills: BTreeMap::new(),
-    }
-}
-
-fn write_prompt_injection_ledger(path: &Path, ledger: &PromptInjectionLedger) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let text = serde_json::to_string_pretty(ledger).map_err(io::Error::other)?;
-    fs::write(path, text)
-}
-
-fn prompt_injection_ledger_file(
-    harness_home: &Path,
-    agent_id: Option<&str>,
-    session_key: &str,
-) -> PathBuf {
-    harness_home
-        .join("state")
-        .join("prompt-injection-ledgers")
-        .join(normalize_key_part(agent_id.unwrap_or("unassigned")))
-        .join(format!("{}.json", normalize_key_part(session_key)))
-}
-
-fn fingerprint_file(path: &Path) -> io::Result<String> {
-    let bytes = fs::read(path)?;
-    Ok(format!("fnv1a64:{:016x}:{}", fnv1a64(&bytes), bytes.len()))
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
-fn current_time_ms() -> io::Result<i64> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(io::Error::other)?;
-    Ok(duration.as_millis().try_into().unwrap_or(i64::MAX))
-}
-
-fn normalize_key_part(value: &str) -> String {
-    let mut normalized = String::new();
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-            normalized.push(ch.to_ascii_lowercase());
-        } else {
-            normalized.push('_');
-        }
-    }
-    if normalized.is_empty() {
-        "unknown".to_string()
-    } else {
-        normalized
-    }
 }
 
 #[cfg(test)]
@@ -777,8 +576,8 @@ mod tests {
     }
 
     #[test]
-    fn prompt_bundle_reuses_same_session_injections() {
-        let root = temp_root("prompt_bundle_reuses_same_session_injections");
+    fn prompt_bundle_reinjects_context_until_backend_thread_resume_exists() {
+        let root = temp_root("prompt_bundle_reinjects_context_until_backend_thread_resume_exists");
         let source = write_prompt_source(&root);
         let harness_home = root.join(".openclaw-harness");
         let registry = load_agent_registry(&source).unwrap();
@@ -817,14 +616,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(second.summary.prompt_files_included, 0);
-        assert_eq!(second.summary.skills_included, 0);
-        assert_eq!(second.summary.prompt_files_reused, 2);
-        assert_eq!(second.summary.skills_reused, 1);
-        assert_eq!(second.summary.session_continuity_sections_included, 1);
+        assert_eq!(second.summary.prompt_files_included, 2);
+        assert_eq!(second.summary.skills_included, 1);
+        assert_eq!(second.summary.prompt_files_reused, 0);
+        assert_eq!(second.summary.skills_reused, 0);
+        assert_eq!(second.summary.session_continuity_sections_included, 0);
         assert!(second.sections.iter().any(|section| {
-            section.kind == PromptSectionKind::SessionContinuity
-                && section.content.contains("codex-session-continuity")
+            section.kind == PromptSectionKind::RuntimeContext
+                && section.title == "OpenClaw runtime identity contract"
+                && section.content.contains("fresh Codex app-server thread")
         }));
 
         let _ = fs::remove_dir_all(root);
