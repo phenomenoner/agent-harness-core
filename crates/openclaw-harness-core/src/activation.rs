@@ -465,7 +465,61 @@ fn check_runtime_queue(harness_home: &Path, checks: &mut Vec<ActivationReadiness
             checks.push(warn(name, format!("not found yet: {}", path.display())));
         }
     }
+    check_runtime_loop(harness_home, checks);
     check_codex_launch_probe(harness_home, checks);
+}
+
+fn check_runtime_loop(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let path = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("loop-last.json");
+    match read_json_value(&path) {
+        Ok(value) => {
+            let errors = value.get("errors").and_then(Value::as_u64);
+            let stop_reason = value
+                .get("stopReason")
+                .and_then(Value::as_str)
+                .unwrap_or("no stop reason recorded");
+            match errors {
+                Some(0) => checks.push(pass(
+                    "runtime-loop",
+                    format!(
+                        "latest runtime loop stopped cleanly at {}: {stop_reason}",
+                        path.display()
+                    ),
+                )),
+                Some(errors) => checks.push(fail(
+                    "runtime-loop",
+                    format!(
+                        "latest runtime loop recorded errors={errors} at {}: {stop_reason}",
+                        path.display()
+                    ),
+                )),
+                None => checks.push(warn(
+                    "runtime-loop",
+                    format!(
+                        "runtime loop report has no errors field at {}",
+                        path.display()
+                    ),
+                )),
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+            "runtime-loop",
+            format!(
+                "not found yet: {}; run runtime-loop --stop-when-idle before runtime handoff",
+                path.display()
+            ),
+        )),
+        Err(error) => checks.push(fail(
+            "runtime-loop",
+            format!(
+                "could not read runtime loop report {}: {error}",
+                path.display()
+            ),
+        )),
+    }
 }
 
 fn check_codex_launch_probe(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
@@ -923,6 +977,11 @@ fn latest_jsonl_value(path: &Path) -> io::Result<Option<Value>> {
     Ok(None)
 }
 
+fn read_json_value(path: &Path) -> io::Result<Value> {
+    let text = fs::read_to_string(path)?;
+    serde_json::from_str(&text).map_err(io::Error::other)
+}
+
 fn summarize(checks: &[ActivationReadinessCheck]) -> ActivationReadinessSummary {
     let mut summary = ActivationReadinessSummary::default();
     for check in checks {
@@ -1054,6 +1113,67 @@ mod tests {
             check.name == "codex-runtime-launch-probe"
                 && check.status == ActivationReadinessStatus::Fail
                 && check.detail.contains("spawn-failed")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readiness_checks_runtime_loop_last_report() {
+        let root = temp_root("readiness_checks_runtime_loop_last_report");
+        let harness_home = root.join(".openclaw-harness");
+        let state = harness_home.join("state");
+        let runtime_queue = state.join("runtime-queue");
+        fs::create_dir_all(&runtime_queue).unwrap();
+        fs::write(
+            state.join("harness-registry.json"),
+            r#"{
+              "schema": "openclaw-harness.target-registry.v1",
+              "agents": [
+                { "id": "main", "enabled": true }
+              ],
+              "providers": [],
+              "plugins": [],
+              "channels": { "telegram": false, "discord": false }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            runtime_queue.join("loop-last.json"),
+            r#"{
+              "schema": "openclaw-harness.runtime-loop.v1",
+              "errors": 0,
+              "stopReason": "stopped after idle runtime result completed"
+            }"#,
+        )
+        .unwrap();
+
+        let clean_report = check_activation_readiness(ActivationReadinessOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+
+        assert!(clean_report.checks.iter().any(|check| {
+            check.name == "runtime-loop" && check.status == ActivationReadinessStatus::Pass
+        }));
+
+        fs::write(
+            runtime_queue.join("loop-last.json"),
+            r#"{
+              "schema": "openclaw-harness.runtime-loop.v1",
+              "errors": 2,
+              "stopReason": "stopped after 2 consecutive runtime errors"
+            }"#,
+        )
+        .unwrap();
+
+        let failed_report =
+            check_activation_readiness(ActivationReadinessOptions { harness_home }).unwrap();
+
+        assert!(failed_report.checks.iter().any(|check| {
+            check.name == "runtime-loop"
+                && check.status == ActivationReadinessStatus::Fail
+                && check.detail.contains("errors=2")
         }));
 
         let _ = fs::remove_dir_all(root);

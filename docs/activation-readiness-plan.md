@@ -55,6 +55,7 @@ These must pass before cutover.
    - Confirm `state/runtime-queue/run-once-receipts.jsonl`.
    - Run `runtime-loop --stop-when-idle --iterations 1` for idle/drain smoke, or `runtime-loop --iterations 0` only under an operator/supervisor after handoff.
    - Confirm `state/runtime-queue/loop-last.json`.
+   - Confirm `enable-check` reports `runtime-loop` as pass.
    - Confirm transcript and trajectory files under `agents/<agent-id>/sessions`.
    - Confirm raw Codex stdout/stderr logs under the execution directory.
 
@@ -180,7 +181,7 @@ As of 2026-06-08 local verification:
 - Offline normal-turn smoke passes through `channel-run-once` with `tools/openclaw-fake-codex-app-server/fake-codex-app-server.cmd`, producing runtime-run-once, Codex run, Codex completion, transcript, outbox, delivery receipt, and operational log evidence without a model request or channel send.
 - Runtime loop idle/drain smoke passes with `runtime-loop --stop-when-idle` and writes `state/runtime-queue/loop-last.json` without a model request when no pending queue items remain.
 - `status` reports `queued=2 open=0 prepared=2 completed=2`, outbox `pending=0 delivered=4`, Qdrant edge primary memory present, plugin catalog ready with 2 manifest-derived tools, and operational log event coverage for offline runtime/delivery smoke.
-- `enable-check` currently reports `Ready: yes` with no hard failures. Remaining warnings are live operator smoke evidence for Telegram poll/offset and optional LanceDB backup.
+- `enable-check` currently reports `Ready: yes` with `passed=29 warnings=3 failed=0`; `runtime-loop` is a pass. Remaining warnings are live operator smoke evidence for Telegram poll/offset and optional LanceDB backup.
 
 ## Verification Commands
 
