@@ -77,6 +77,14 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 
 Commands should update channel state and receipts before enqueueing agent turns.
 
+## Channel Delivery
+
+- Command replies and agent replies are both appended to state/channels/outbox.jsonl.
+- Use channel-outbox-plan to list pending delivery work by platform.
+- Use channel-delivery-record after Telegram/Discord send attempts to record delivered or failed receipts.
+- Failed receipts stay retryable; delivered receipts are skipped by future outbox plans.
+- Do not send the same already recorded Codex completion twice.
+
 ## Activation Checklist
 
 Before replacing the Docker OpenClaw gateway:

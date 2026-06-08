@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 pub mod activation;
 pub mod channel_commands;
+pub mod channel_delivery;
 pub mod channel_ingress;
 pub mod channel_runtime;
 pub mod channel_state;
@@ -29,6 +30,11 @@ pub use activation::{
 };
 pub use channel_commands::{
     ChannelCommand, ChannelCommandIntent, parse_channel_command, parse_channel_command_intent,
+};
+pub use channel_delivery::{
+    ChannelDeliveryPending, ChannelDeliveryReceipt, ChannelDeliveryRecordOptions,
+    ChannelDeliveryStatus, ChannelOutboxPlanOptions, ChannelOutboxPlanReport,
+    ChannelOutboxPlanSummary, plan_channel_outbox, record_channel_delivery,
 };
 pub use channel_ingress::{
     ChannelReceiveOptions, ChannelReceiveReceipt, ChannelReceiveReport, ChannelReceiveStatus,

@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{AgentRegistry, ChannelCommandIntent, TurnDispatch, TurnPlan};
 
@@ -100,7 +100,7 @@ pub struct ChannelAgentTurnDispatch {
     pub selected_skill_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelOutboundMessage {
     pub platform: String,
@@ -111,7 +111,7 @@ pub struct ChannelOutboundMessage {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChannelOutboundMessageKind {
     CommandReply,

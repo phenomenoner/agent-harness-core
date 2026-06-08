@@ -5,27 +5,30 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use openclaw_harness_core::{
     ActivationReadinessOptions, ActivationReadinessReport, AgentRegistry,
     BuiltinHarnessSkillSyncOptions, BuiltinHarnessSkillSyncReport, ChannelCommandApplyOptions,
-    ChannelCommandApplyReport, ChannelReceiveOptions, ChannelReceiveReport, ChannelStep,
-    CodexRuntimeCompletionOptions, CodexRuntimeCompletionReport, CodexRuntimeLaunchProbeOptions,
-    CodexRuntimeLaunchProbeReport, CodexRuntimePlanOptions, CodexRuntimePlanReport,
-    CodexRuntimePreflightOptions, CodexRuntimePreflightReport, CodexRuntimeRunOptions,
-    CodexRuntimeRunReport, ConflictPolicy, DeterministicCronPlan, DeterministicCronPlanInput,
-    DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel, ImportPhaseStatus,
-    ImportReport, NativeCronPlan, NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions,
-    PromptBundle, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
-    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeRunOnceOptions,
-    RuntimeRunOnceReport, SkillIndex, SkillSelectionQuery, SubagentPlan, SubagentPlanInput,
-    TurnPlan, TurnPlanInput, append_harness_log, apply_channel_command_step,
-    assemble_prompt_bundle, build_channel_step, build_dry_run_report, build_harness_skill_index,
-    build_import_plan, build_runtime_skill_index, build_source_skill_index, build_turn_plan,
-    check_activation_readiness, current_log_time_ms, enqueue_channel_step, execute_import,
-    export_harness_registry_files, inventory, load_agent_registry, load_deterministic_cron_store,
-    load_native_cron_store, load_subagent_ledger, plan_codex_runtime, plan_deterministic_cron,
+    ChannelCommandApplyReport, ChannelDeliveryReceipt, ChannelDeliveryRecordOptions,
+    ChannelDeliveryStatus, ChannelOutboxPlanOptions, ChannelOutboxPlanReport,
+    ChannelReceiveOptions, ChannelReceiveReport, ChannelStep, CodexRuntimeCompletionOptions,
+    CodexRuntimeCompletionReport, CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReport,
+    CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimePreflightOptions,
+    CodexRuntimePreflightReport, CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy,
+    DeterministicCronPlan, DeterministicCronPlanInput, DryRunImportOptions, ExecuteImportOptions,
+    HarnessLogEvent, HarnessLogLevel, ImportPhaseStatus, ImportReport, NativeCronPlan,
+    NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions, PromptBundle,
+    RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions,
+    RuntimeQueuePrepareReport, RuntimeRunOnceOptions, RuntimeRunOnceReport, SkillIndex,
+    SkillSelectionQuery, SubagentPlan, SubagentPlanInput, TurnPlan, TurnPlanInput,
+    append_harness_log, apply_channel_command_step, assemble_prompt_bundle, build_channel_step,
+    build_dry_run_report, build_harness_skill_index, build_import_plan, build_runtime_skill_index,
+    build_source_skill_index, build_turn_plan, check_activation_readiness, current_log_time_ms,
+    enqueue_channel_step, execute_import, export_harness_registry_files, inventory,
+    load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
+    load_subagent_ledger, plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron,
     plan_native_cron, plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
-    probe_codex_runtime_launch, receive_channel_message, record_codex_runtime_completion,
-    run_codex_runtime, run_runtime_queue_once, select_skills, sync_builtin_harness_skills,
-    write_channel_step, write_deterministic_cron_plan, write_native_cron_plan, write_prompt_bundle,
-    write_report_files, write_skill_index, write_subagent_plan, write_turn_plan,
+    probe_codex_runtime_launch, receive_channel_message, record_channel_delivery,
+    record_codex_runtime_completion, run_codex_runtime, run_runtime_queue_once, select_skills,
+    sync_builtin_harness_skills, write_channel_step, write_deterministic_cron_plan,
+    write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
+    write_subagent_plan, write_turn_plan,
 };
 
 fn main() {
@@ -47,6 +50,8 @@ fn main() {
         "channel-step" => run_channel_step(&rest),
         "channel-apply" => run_channel_apply(&rest),
         "channel-receive" => run_channel_receive(&rest),
+        "channel-outbox-plan" => run_channel_outbox_plan(&rest),
+        "channel-delivery-record" => run_channel_delivery_record(&rest),
         "queue-enqueue" => run_queue_enqueue(&rest),
         "queue-prepare" => run_queue_prepare(&rest),
         "runtime-run-once" => run_runtime_run_once(&rest),
@@ -440,6 +445,39 @@ fn run_channel_receive(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_channel_outbox_plan(args: &[String]) -> Result<(), String> {
+    let args = channel_outbox_plan_args_from_args(args)?;
+    let report = plan_channel_outbox(ChannelOutboxPlanOptions {
+        harness_home: args.target_home,
+        platform: args.platform,
+        limit: args.limit,
+    })
+    .map_err(|err| err.to_string())?;
+
+    print_channel_outbox_plan_report(&report);
+    Ok(())
+}
+
+fn run_channel_delivery_record(args: &[String]) -> Result<(), String> {
+    let args = channel_delivery_record_args_from_args(args)?;
+    let receipt = record_channel_delivery(ChannelDeliveryRecordOptions {
+        harness_home: args.target_home,
+        delivery_id: args.delivery_id,
+        status: args.status,
+        platform: args.platform,
+        channel_id: args.channel_id,
+        user_id: args.user_id,
+        session_key: args.session_key,
+        provider_message_id: args.provider_message_id,
+        error: args.error,
+        now_ms: args.now_ms,
+    })
+    .map_err(|err| err.to_string())?;
+
+    print_channel_delivery_receipt(&receipt);
+    Ok(())
+}
+
 fn run_queue_enqueue(args: &[String]) -> Result<(), String> {
     let args = queue_enqueue_args_from_args(args)?;
     let registry = load_agent_registry(&args.turn.source).map_err(|err| err.to_string())?;
@@ -780,6 +818,25 @@ struct TurnPlanArgs {
 struct QueueEnqueueArgs {
     turn: TurnPlanArgs,
     target_home: PathBuf,
+    now_ms: i64,
+}
+
+struct ChannelOutboxPlanArgs {
+    target_home: PathBuf,
+    platform: Option<String>,
+    limit: usize,
+}
+
+struct ChannelDeliveryRecordArgs {
+    target_home: PathBuf,
+    delivery_id: String,
+    status: ChannelDeliveryStatus,
+    platform: String,
+    channel_id: String,
+    user_id: String,
+    session_key: String,
+    provider_message_id: Option<String>,
+    error: Option<String>,
     now_ms: i64,
 }
 
@@ -1364,6 +1421,166 @@ fn queue_enqueue_args_from_args(args: &[String]) -> Result<QueueEnqueueArgs, Str
         turn,
         target_home,
         now_ms,
+    })
+}
+
+fn channel_outbox_plan_args_from_args(args: &[String]) -> Result<ChannelOutboxPlanArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut platform = None;
+    let mut limit = 20;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target-home" => {
+                i += 1;
+                target_home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+            }
+            "--platform" => {
+                i += 1;
+                platform = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--platform requires a name".to_string())?,
+                );
+            }
+            "--limit" => {
+                i += 1;
+                limit = args
+                    .get(i)
+                    .ok_or_else(|| "--limit requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(ChannelOutboxPlanArgs {
+        target_home,
+        platform,
+        limit,
+    })
+}
+
+fn channel_delivery_record_args_from_args(
+    args: &[String],
+) -> Result<ChannelDeliveryRecordArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut delivery_id = None;
+    let mut status = None;
+    let mut platform = None;
+    let mut channel_id = None;
+    let mut user_id = None;
+    let mut session_key = None;
+    let mut provider_message_id = None;
+    let mut error = None;
+    let mut now_ms = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target-home" => {
+                i += 1;
+                target_home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+            }
+            "--delivery-id" => {
+                i += 1;
+                delivery_id = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--delivery-id requires a value".to_string())?,
+                );
+            }
+            "--status" => {
+                i += 1;
+                status = Some(
+                    args.get(i)
+                        .ok_or_else(|| "--status requires delivered or failed".to_string())
+                        .and_then(|value| parse_delivery_status(value))?,
+                );
+            }
+            "--platform" => {
+                i += 1;
+                platform = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--platform requires a name".to_string())?,
+                );
+            }
+            "--channel-id" => {
+                i += 1;
+                channel_id = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--channel-id requires an id".to_string())?,
+                );
+            }
+            "--user-id" => {
+                i += 1;
+                user_id = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--user-id requires an id".to_string())?,
+                );
+            }
+            "--session-key" => {
+                i += 1;
+                session_key = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--session-key requires a value".to_string())?,
+                );
+            }
+            "--provider-message-id" => {
+                i += 1;
+                provider_message_id = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--provider-message-id requires a value".to_string())?,
+                );
+            }
+            "--error" => {
+                i += 1;
+                error = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--error requires text".to_string())?,
+                );
+            }
+            "--now-ms" => {
+                i += 1;
+                now_ms = Some(
+                    args.get(i)
+                        .ok_or_else(|| "--now-ms requires epoch milliseconds".to_string())
+                        .and_then(|value| parse_i64(value, "--now-ms"))?,
+                );
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(ChannelDeliveryRecordArgs {
+        target_home,
+        delivery_id: delivery_id.ok_or_else(|| "--delivery-id is required".to_string())?,
+        status: status.ok_or_else(|| "--status is required".to_string())?,
+        platform: platform.ok_or_else(|| "--platform is required".to_string())?,
+        channel_id: channel_id.ok_or_else(|| "--channel-id is required".to_string())?,
+        user_id: user_id.ok_or_else(|| "--user-id is required".to_string())?,
+        session_key: session_key.ok_or_else(|| "--session-key is required".to_string())?,
+        provider_message_id,
+        error,
+        now_ms: match now_ms {
+            Some(now_ms) => now_ms,
+            None => current_time_ms()?,
+        },
     })
 }
 
@@ -1972,6 +2189,16 @@ fn parse_conflict_policy(value: &str) -> Result<ConflictPolicy, String> {
     }
 }
 
+fn parse_delivery_status(value: &str) -> Result<ChannelDeliveryStatus, String> {
+    match value {
+        "delivered" => Ok(ChannelDeliveryStatus::Delivered),
+        "failed" => Ok(ChannelDeliveryStatus::Failed),
+        other => Err(format!(
+            "unknown delivery status: {other}; expected delivered or failed"
+        )),
+    }
+}
+
 fn parse_limit(value: &str) -> Result<usize, String> {
     value
         .parse::<usize>()
@@ -2452,6 +2679,63 @@ fn print_channel_receive_report(report: &ChannelReceiveReport) {
             println!("- {warning}");
         }
     }
+}
+
+fn print_channel_outbox_plan_report(report: &ChannelOutboxPlanReport) {
+    println!("OpenClaw channel outbox plan");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Outbox file: {}", report.outbox_file.display());
+    println!("Receipts file: {}", report.receipts_file.display());
+    println!(
+        "Summary: lines={} pending={} delivered={} failed_retryable={} skipped_platform={} invalid={}",
+        report.summary.total_outbox_lines,
+        report.summary.pending,
+        report.summary.delivered,
+        report.summary.failed_retryable,
+        report.summary.skipped_platform,
+        report.summary.invalid_lines
+    );
+    if !report.pending.is_empty() {
+        println!("Pending:");
+        for pending in &report.pending {
+            println!(
+                "- {} line={} attempts={} last={:?} kind={:?} platform={} channel={} user={} session={}",
+                pending.delivery_id,
+                pending.line_number,
+                pending.attempts,
+                pending.last_status,
+                pending.message.kind,
+                pending.message.platform,
+                pending.message.channel_id,
+                pending.message.user_id,
+                pending.message.session_key
+            );
+            println!("  {}", pending.message.text);
+        }
+    }
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
+fn print_channel_delivery_receipt(receipt: &ChannelDeliveryReceipt) {
+    println!("OpenClaw channel delivery receipt");
+    println!("Delivery id: {}", receipt.delivery_id);
+    println!("Status: {:?}", receipt.status);
+    println!("Platform: {}", receipt.platform);
+    println!("Channel: {}", receipt.channel_id);
+    println!("User: {}", receipt.user_id);
+    println!("Session: {}", receipt.session_key);
+    if let Some(provider_message_id) = &receipt.provider_message_id {
+        println!("Provider message id: {provider_message_id}");
+    }
+    if let Some(error) = &receipt.error {
+        println!("Error: {error}");
+    }
+    println!("At ms: {}", receipt.at_ms);
 }
 
 fn print_runtime_queue_enqueue_report(report: &RuntimeQueueEnqueueReport) {
@@ -2998,6 +3282,8 @@ fn print_help() {
     println!("  channel-step    Plan shared channel reply or agent dispatch for one DM");
     println!("  channel-apply   Persist channel command state and command receipts");
     println!("  channel-receive Handle one DM into command outbox or runtime queue");
+    println!("  channel-outbox-plan List pending Telegram/Discord delivery messages");
+    println!("  channel-delivery-record Record delivery success or retryable failure");
     println!("  queue-enqueue   Persist one channel agent turn to the runtime queue");
     println!("  queue-prepare   Prepare one queued runtime item for Codex execution");
     println!("  runtime-run-once Prepare, run, and outbox one queued runtime item");
@@ -3030,6 +3316,10 @@ fn print_help() {
     println!("  --channel-id <id>       Channel identity for session mapping");
     println!("  --user-id <id>          User identity for session mapping");
     println!("  --session-key <key>     Existing session key override");
+    println!("  --delivery-id <id>      Channel outbox delivery id");
+    println!("  --status <value>        Delivery status: delivered or failed");
+    println!("  --provider-message-id <id> Telegram/Discord message id after delivery");
+    println!("  --error <text>          Delivery failure reason");
     println!("  --queue-id <id>         Select one runtime queue item for queue-prepare");
     println!("  --execution-dir <path>  Prepared execution directory for codex-plan");
     println!("  --codex-exe <path>      Codex executable path for codex-plan/runtime-run-once");
