@@ -14,6 +14,7 @@ Thumbs.db
 state/
 data/
 secrets/
+**/secrets/channel-credentials.env
 .tools/
 
 # Imported OpenClaw state should be staged intentionally.

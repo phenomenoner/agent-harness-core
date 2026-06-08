@@ -92,7 +92,7 @@ pub fn check_activation_readiness(
 
     if let Some(registry) = &registry {
         check_agents(registry, &mut checks);
-        check_channels(registry, &mut checks);
+        check_channels(registry, &options.harness_home, &mut checks);
         check_providers(registry, &mut checks);
         check_plugins(registry, &options.harness_home, &mut checks);
     }
@@ -143,7 +143,11 @@ fn check_agents(registry: &Value, checks: &mut Vec<ActivationReadinessCheck>) {
     }
 }
 
-fn check_channels(registry: &Value, checks: &mut Vec<ActivationReadinessCheck>) {
+fn check_channels(
+    registry: &Value,
+    harness_home: &Path,
+    checks: &mut Vec<ActivationReadinessCheck>,
+) {
     let channels = registry.get("channels").unwrap_or(&Value::Null);
     let telegram = channels
         .get("telegram")
@@ -165,16 +169,18 @@ fn check_channels(registry: &Value, checks: &mut Vec<ActivationReadinessCheck>) 
         ));
     }
     if telegram {
-        check_env_token(
+        check_channel_token(
             checks,
+            harness_home,
             "telegram-token",
             "TELEGRAM_BOT_TOKEN",
             "Telegram channel is enabled",
         );
     }
     if discord {
-        check_env_token(
+        check_channel_token(
             checks,
+            harness_home,
             "discord-token",
             "DISCORD_BOT_TOKEN",
             "Discord channel is enabled",
@@ -506,6 +512,64 @@ fn check_channel_state(harness_home: &Path, checks: &mut Vec<ActivationReadiness
             ),
         ));
     }
+    check_discord_gateway_probe(harness_home, checks);
+}
+
+fn check_discord_gateway_probe(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let path = harness_home
+        .join("state")
+        .join("channels")
+        .join("discord-gateway-probe-receipts.jsonl");
+    match latest_jsonl_value(&path) {
+        Ok(Some(value)) => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let reason = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason recorded");
+            match status {
+                "ready" => checks.push(pass(
+                    "discord-gateway-probe",
+                    format!("Discord gateway probe ready at {}", path.display()),
+                )),
+                "token-missing" => checks.push(warn(
+                    "discord-gateway-probe",
+                    format!(
+                        "Discord gateway probe needs DISCORD_BOT_TOKEN at {}: {reason}",
+                        path.display()
+                    ),
+                )),
+                _ => checks.push(fail(
+                    "discord-gateway-probe",
+                    format!(
+                        "Discord gateway probe status={status} at {}: {reason}",
+                        path.display()
+                    ),
+                )),
+            }
+        }
+        Ok(None) => checks.push(warn(
+            "discord-gateway-probe",
+            format!(
+                "no Discord gateway probe receipt lines found at {}",
+                path.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+            "discord-gateway-probe",
+            format!(
+                "not found yet: {}; run discord-gateway-probe before Discord gateway handoff",
+                path.display()
+            ),
+        )),
+        Err(error) => checks.push(warn(
+            "discord-gateway-probe",
+            format!("could not read {}: {error}", path.display()),
+        )),
+    }
 }
 
 fn check_activation_plan_doc(checks: &mut Vec<ActivationReadinessCheck>) {
@@ -712,6 +776,51 @@ fn check_env_token(
     } else {
         checks.push(fail(name, format!("{env_name} is missing: {reason}")));
     }
+}
+
+fn check_channel_token(
+    checks: &mut Vec<ActivationReadinessCheck>,
+    harness_home: &Path,
+    name: &str,
+    env_name: &str,
+    reason: &str,
+) {
+    if env::var_os(env_name).is_some() {
+        checks.push(pass(name, format!("{env_name} is present")));
+    } else if harness_secret_env_has(harness_home, env_name) {
+        checks.push(pass(
+            name,
+            format!(
+                "{env_name} is present in {}",
+                harness_home
+                    .join("secrets")
+                    .join("channel-credentials.env")
+                    .display()
+            ),
+        ));
+    } else {
+        checks.push(fail(
+            name,
+            format!("{env_name} is missing from env and harness secrets: {reason}"),
+        ));
+    }
+}
+
+fn harness_secret_env_has(harness_home: &Path, env_name: &str) -> bool {
+    let path = harness_home.join("secrets").join("channel-credentials.env");
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return false;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return false;
+        };
+        key.trim() == env_name && !value.trim().is_empty()
+    })
 }
 
 fn codex_auth_candidates() -> Vec<PathBuf> {

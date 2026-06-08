@@ -85,10 +85,11 @@ Commands should update channel state and receipts before enqueueing agent turns.
 - Use channel-run-once as the single-message adapter entrypoint before real Telegram/Discord loops exist.
 - Use channel-outbox-plan to list pending delivery work by platform.
 - Use channel-delivery-record after Telegram/Discord send attempts to record delivered or failed receipts.
-- Use telegram-poll-once for Telegram Bot API smoke tests. It reads TELEGRAM_BOT_TOKEN from the environment, stores offsets in state/channels/telegram-offset.json, runs channel-run-once for text updates, sends pending replies, records delivery receipts, and writes a telegram.poll-once operational log.
+- Use channel-credentials-export --include-sensitive during OpenClaw cutover to import Telegram/Discord bot tokens and known channel/user/guild IDs into secrets/channel-credentials.env with redacted receipts.
+- Use telegram-poll-once for Telegram Bot API smoke tests. It reads TELEGRAM_BOT_TOKEN from the environment or secrets/channel-credentials.env, stores offsets in state/channels/telegram-offset.json, runs channel-run-once for text updates, sends pending replies, records delivery receipts, and writes a telegram.poll-once operational log.
 - Use telegram-loop for operator-run Telegram handoff. It repeats the same poll-once path with --iterations, --idle-ms, and --max-consecutive-errors. Use finite iterations for tests and --iterations 0 only when the old gateway is not also consuming Telegram updates.
-- Use discord-outbox-send-once for Discord outbound smoke. It reads DISCORD_BOT_TOKEN, sends pending platform=discord outbox messages through Discord REST, records delivery receipts, and writes a discord.outbox-send-once operational log. Discord gateway receive is still pending.
-- Use discord-event-run-once for Discord inbound normalization smoke. It accepts a Discord Gateway MESSAGE_CREATE event from --event-file or --event-json, skips bot/empty/duplicate messages, calls channel-run-once for text, writes discord-event receipts, and logs discord.event-run-once. Full Discord WebSocket gateway heartbeat/reconnect is still pending.
+- Use discord-outbox-send-once for Discord outbound smoke. It reads DISCORD_BOT_TOKEN from the environment or secrets/channel-credentials.env, sends pending platform=discord outbox messages through Discord REST, records delivery receipts, and writes a discord.outbox-send-once operational log.
+- Use discord-event-run-once for Discord inbound normalization smoke. It accepts a Discord Gateway MESSAGE_CREATE event from --event-file or --event-json, skips bot/empty/duplicate messages, calls channel-run-once for text, writes discord-event receipts, and logs discord.event-run-once. Use discord-gateway-probe before discord-gateway-loop for live WebSocket handoff.
 - Failed receipts stay retryable; delivered receipts are skipped by future outbox plans.
 - Do not send the same already recorded Codex completion twice.
 

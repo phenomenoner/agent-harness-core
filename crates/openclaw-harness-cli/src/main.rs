@@ -1,7 +1,8 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -45,6 +46,7 @@ fn main() {
         "import-plan" => run_import_plan(&rest),
         "import-dry-run" => run_import_dry_run(&rest),
         "import-execute" => run_import_execute(&rest),
+        "channel-credentials-export" => run_channel_credentials_export(&rest),
         "registry" => run_registry(&rest),
         "registry-export" => run_registry_export(&rest),
         "enable-check" => run_enable_check(&rest),
@@ -61,6 +63,8 @@ fn main() {
         "telegram-loop" => run_telegram_loop(&rest),
         "discord-outbox-send-once" => run_discord_outbox_send_once(&rest),
         "discord-event-run-once" => run_discord_event_run_once(&rest),
+        "discord-gateway-probe" => run_discord_gateway_probe(&rest),
+        "discord-gateway-loop" => run_discord_gateway_loop(&rest),
         "plugin-sidecar-probe" => run_plugin_sidecar_probe(&rest),
         "plugin-sidecar-call" => run_plugin_sidecar_call(&rest),
         "queue-enqueue" => run_queue_enqueue(&rest),
@@ -211,6 +215,33 @@ fn run_import_execute(args: &[String]) -> Result<(), String> {
         "Skipped sensitive files: {}",
         report.summary.skipped_sensitive_files
     );
+
+    Ok(())
+}
+
+fn run_channel_credentials_export(args: &[String]) -> Result<(), String> {
+    let args = channel_credentials_export_args_from_args(args)?;
+    let report = export_channel_credentials(&args)?;
+
+    println!("OpenClaw channel credentials export");
+    println!("Target env file: {}", report.env_file.display());
+    println!("Receipt file: {}", report.receipt_file.display());
+    println!(
+        "Sensitive values written: {}",
+        yes_no(args.include_sensitive)
+    );
+    println!("Entries: {}", report.entries.len());
+    for entry in report.entries {
+        println!(
+            "- {}: exported={} sensitive={} length={} source={} ({})",
+            entry.env_name,
+            yes_no(entry.exported),
+            yes_no(entry.sensitive),
+            entry.length,
+            entry.source_path,
+            entry.reason
+        );
+    }
 
     Ok(())
 }
@@ -525,7 +556,7 @@ fn run_channel_delivery_record(args: &[String]) -> Result<(), String> {
 
 fn run_telegram_poll_once(args: &[String]) -> Result<(), String> {
     let args = telegram_poll_once_args_from_args(args)?;
-    let token = telegram_bot_token()?;
+    let token = telegram_bot_token(&args.target_home)?;
     let report = execute_telegram_poll_once(&args, &token)?;
     print_telegram_poll_once_report(&report);
     Ok(())
@@ -533,7 +564,7 @@ fn run_telegram_poll_once(args: &[String]) -> Result<(), String> {
 
 fn run_telegram_loop(args: &[String]) -> Result<(), String> {
     let args = telegram_loop_args_from_args(args)?;
-    let token = telegram_bot_token()?;
+    let token = telegram_bot_token(&args.poll.target_home)?;
     let mut iterations = 0usize;
     let mut consecutive_errors = 0usize;
 
@@ -735,7 +766,7 @@ fn execute_telegram_poll_once(
 
 fn run_discord_outbox_send_once(args: &[String]) -> Result<(), String> {
     let args = discord_outbox_send_once_args_from_args(args)?;
-    let token = discord_bot_token()?;
+    let token = discord_bot_token(&args.target_home)?;
     let delivery = plan_channel_outbox(ChannelOutboxPlanOptions {
         harness_home: args.target_home.clone(),
         platform: Some("discord".to_string()),
@@ -917,6 +948,80 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
     .map_err(|err| err.to_string())?;
     print_discord_event_run_once_report(&report);
     Ok(())
+}
+
+fn run_discord_gateway_probe(args: &[String]) -> Result<(), String> {
+    let args = discord_gateway_args_from_args(args)?;
+    let output = discord_gateway_command(&args)
+        .arg("--probe")
+        .arg("--write-receipt")
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to spawn Discord gateway probe via {}: {err}",
+                args.node_exe.display()
+            )
+        })?;
+    println!("OpenClaw Discord gateway probe");
+    println!("Harness home: {}", args.target_home.display());
+    println!("Node executable: {}", args.node_exe.display());
+    println!("Gateway script: {}", args.gateway_script.display());
+    if !output.stdout.is_empty() {
+        println!("{}", String::from_utf8_lossy(&output.stdout).trim_end());
+    }
+    if !output.stderr.is_empty() {
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr).trim_end());
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "Discord gateway probe exited with {}",
+            output.status
+        ));
+    }
+    Ok(())
+}
+
+fn run_discord_gateway_loop(args: &[String]) -> Result<(), String> {
+    let args = discord_gateway_args_from_args(args)?;
+    let status = discord_gateway_command(&args).status().map_err(|err| {
+        format!(
+            "failed to spawn Discord gateway loop via {}: {err}",
+            args.node_exe.display()
+        )
+    })?;
+    if !status.success() {
+        return Err(format!("Discord gateway loop exited with {status}"));
+    }
+    Ok(())
+}
+
+fn discord_gateway_command(args: &DiscordGatewayArgs) -> Command {
+    let mut command = Command::new(&args.node_exe);
+    command
+        .arg(&args.gateway_script)
+        .arg("--harness-home")
+        .arg(&args.target_home)
+        .arg("--openclaw-home")
+        .arg(&args.source.home)
+        .arg("--harness-cli")
+        .arg(&args.harness_cli)
+        .arg("--max-messages")
+        .arg(args.max_messages.to_string());
+    if args.source.workspace != args.source.home.join("workspace") {
+        command.arg("--workspace").arg(&args.source.workspace);
+    }
+    if let Some(agent_id) = &args.agent_id {
+        command.arg("--agent").arg(agent_id);
+    }
+    if let Some(codex_exe) = &args.codex_exe {
+        command.arg("--codex-exe").arg(codex_exe);
+    }
+    if env::var_os("DISCORD_BOT_TOKEN").is_none()
+        && let Some(token) = secret_env_value(&args.target_home, "DISCORD_BOT_TOKEN")
+    {
+        command.env("DISCORD_BOT_TOKEN", normalize_discord_bot_token(&token));
+    }
+    command
 }
 
 fn run_plugin_sidecar_probe(args: &[String]) -> Result<(), String> {
@@ -1338,6 +1443,34 @@ struct ExecuteArgs {
     include_sensitive: bool,
 }
 
+struct ChannelCredentialsExportArgs {
+    source: OpenClawSource,
+    target_home: PathBuf,
+    include_sensitive: bool,
+}
+
+struct ChannelCredentialCandidate {
+    env_name: String,
+    value: String,
+    source_path: String,
+    sensitive: bool,
+}
+
+struct ChannelCredentialExportEntry {
+    env_name: String,
+    source_path: String,
+    length: usize,
+    sensitive: bool,
+    exported: bool,
+    reason: String,
+}
+
+struct ChannelCredentialExportReport {
+    env_file: PathBuf,
+    receipt_file: PathBuf,
+    entries: Vec<ChannelCredentialExportEntry>,
+}
+
 struct RegistryExportArgs {
     source: OpenClawSource,
     target_home: PathBuf,
@@ -1475,6 +1608,17 @@ struct DiscordEventRunOnceReport {
     channel_id: Option<String>,
     user_id: Option<String>,
     run: Option<ChannelRunOnceReport>,
+}
+
+struct DiscordGatewayArgs {
+    source: OpenClawSource,
+    target_home: PathBuf,
+    node_exe: PathBuf,
+    gateway_script: PathBuf,
+    harness_cli: PathBuf,
+    agent_id: Option<String>,
+    codex_exe: Option<PathBuf>,
+    max_messages: usize,
 }
 
 struct PluginSidecarProbeArgs {
@@ -1682,6 +1826,54 @@ fn execute_args_from_args(args: &[String]) -> Result<ExecuteArgs, String> {
         source,
         target_home,
         conflict_policy,
+        include_sensitive,
+    })
+}
+
+fn channel_credentials_export_args_from_args(
+    args: &[String],
+) -> Result<ChannelCredentialsExportArgs, String> {
+    let mut home = default_openclaw_home();
+    let mut workspace = None;
+    let mut target_home = default_harness_home();
+    let mut include_sensitive = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--openclaw-home" => {
+                i += 1;
+                home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--openclaw-home requires a path".to_string())?;
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--include-sensitive" => include_sensitive = true,
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let source = match workspace {
+        Some(workspace) => OpenClawSource::with_workspace(home, workspace),
+        None => OpenClawSource::new(home),
+    };
+
+    Ok(ChannelCredentialsExportArgs {
+        source,
+        target_home,
         include_sensitive,
     })
 }
@@ -2674,6 +2866,106 @@ fn discord_event_run_once_args_from_args(
     })
 }
 
+fn discord_gateway_args_from_args(args: &[String]) -> Result<DiscordGatewayArgs, String> {
+    let mut home = default_openclaw_home();
+    let mut workspace = None;
+    let mut target_home = default_harness_home();
+    let mut node_exe = PathBuf::from("node");
+    let mut gateway_script = PathBuf::from("tools")
+        .join("openclaw-discord-gateway")
+        .join("index.mjs");
+    let mut harness_cli = default_harness_cli();
+    let mut agent_id = None;
+    let mut codex_exe = None;
+    let mut max_messages = 0;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--openclaw-home" => {
+                i += 1;
+                home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--openclaw-home requires a path".to_string())?;
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--node-exe" => {
+                i += 1;
+                node_exe = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--node-exe requires a path".to_string())?;
+            }
+            "--gateway-script" => {
+                i += 1;
+                gateway_script = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--gateway-script requires a path".to_string())?;
+            }
+            "--harness-cli" => {
+                i += 1;
+                harness_cli = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--harness-cli requires a path".to_string())?;
+            }
+            "--agent" => {
+                i += 1;
+                agent_id = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--agent requires an id".to_string())?,
+                );
+            }
+            "--codex-exe" => {
+                i += 1;
+                codex_exe = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--codex-exe requires a path".to_string())?,
+                );
+            }
+            "--max-messages" => {
+                i += 1;
+                max_messages = args
+                    .get(i)
+                    .ok_or_else(|| "--max-messages requires a non-negative integer".to_string())
+                    .and_then(|value| parse_usize(value, "--max-messages"))?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let source = match workspace {
+        Some(workspace) => OpenClawSource::with_workspace(home, workspace),
+        None => OpenClawSource::new(home),
+    };
+    Ok(DiscordGatewayArgs {
+        source,
+        target_home,
+        node_exe,
+        gateway_script,
+        harness_cli,
+        agent_id,
+        codex_exe,
+        max_messages,
+    })
+}
+
 fn plugin_sidecar_probe_args_from_args(args: &[String]) -> Result<PluginSidecarProbeArgs, String> {
     let mut target_home = default_harness_home();
     let mut node_exe = PathBuf::from("node");
@@ -3336,6 +3628,15 @@ fn default_harness_home() -> PathBuf {
     PathBuf::from(".openclaw-harness")
 }
 
+fn default_harness_cli() -> PathBuf {
+    let exe = if cfg!(windows) {
+        "openclaw-harness.exe"
+    } else {
+        "openclaw-harness"
+    };
+    PathBuf::from("target").join("debug").join(exe)
+}
+
 fn is_harness_home_arg(flag: &str) -> bool {
     matches!(flag, "--target-home" | "--harness-home")
 }
@@ -3492,9 +3793,549 @@ fn write_discord_event_receipt(report: &DiscordEventRunOnceReport) -> Result<(),
         .map_err(|err| err.to_string())
 }
 
-fn telegram_bot_token() -> Result<String, String> {
+fn export_channel_credentials(
+    args: &ChannelCredentialsExportArgs,
+) -> Result<ChannelCredentialExportReport, String> {
+    let candidates = collect_channel_credentials(&args.source)?;
+    let env_file = channel_credentials_env_file(&args.target_home);
+    let receipt_file = channel_credentials_receipt_file(&args.target_home);
+    if let Some(parent) = receipt_file.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+
+    let mut env_values = read_secret_env_map(&env_file)?;
+    let mut entries = Vec::new();
+    for candidate in candidates {
+        let exported = args.include_sensitive && !candidate.value.trim().is_empty();
+        if exported {
+            env_values.insert(candidate.env_name.clone(), candidate.value.clone());
+        }
+        entries.push(ChannelCredentialExportEntry {
+            env_name: candidate.env_name,
+            source_path: candidate.source_path,
+            length: candidate.value.len(),
+            sensitive: candidate.sensitive,
+            exported,
+            reason: if exported {
+                "written to harness secrets env".to_string()
+            } else {
+                "redacted dry-run; pass --include-sensitive to write value".to_string()
+            },
+        });
+    }
+
+    if args.include_sensitive {
+        write_secret_env_file(&env_file, &env_values)?;
+    }
+    write_channel_credentials_receipt(
+        &receipt_file,
+        &args.source,
+        &args.target_home,
+        args.include_sensitive,
+        &entries,
+    )?;
+
+    Ok(ChannelCredentialExportReport {
+        env_file,
+        receipt_file,
+        entries,
+    })
+}
+
+fn collect_channel_credentials(
+    source: &OpenClawSource,
+) -> Result<Vec<ChannelCredentialCandidate>, String> {
+    let config_file = source.home.join("openclaw.json");
+    let text = fs::read_to_string(&config_file)
+        .map_err(|err| format!("failed to read {}: {err}", config_file.display()))?;
+    let config: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|err| format!("invalid JSON in {}: {err}", config_file.display()))?;
+    let mut candidates = Vec::new();
+
+    if let Some(telegram) = config
+        .get("channels")
+        .and_then(|channels| channels.get("telegram"))
+    {
+        collect_telegram_credentials(source, telegram, &mut candidates);
+    }
+    if let Some(discord) = config
+        .get("channels")
+        .and_then(|channels| channels.get("discord"))
+    {
+        collect_discord_credentials(discord, &mut candidates);
+    }
+
+    Ok(candidates)
+}
+
+fn collect_telegram_credentials(
+    source: &OpenClawSource,
+    telegram: &serde_json::Value,
+    candidates: &mut Vec<ChannelCredentialCandidate>,
+) {
+    let default_account = string_child(telegram, "defaultAccount")
+        .unwrap_or_else(|| "default".to_string())
+        .trim()
+        .to_string();
+    add_channel_credential(
+        candidates,
+        "OPENCLAW_TELEGRAM_DEFAULT_ACCOUNT",
+        default_account.clone(),
+        "channels.telegram.defaultAccount",
+        false,
+    );
+
+    let mut allowed_user_ids = BTreeSet::new();
+    let mut group_allowed_user_ids = BTreeSet::new();
+    let mut direct_chat_ids = BTreeSet::new();
+    let mut group_chat_ids = BTreeSet::new();
+    collect_string_array(telegram.get("allowFrom"), &mut allowed_user_ids);
+    collect_string_array(telegram.get("groupAllowFrom"), &mut group_allowed_user_ids);
+    collect_string_array(
+        telegram
+            .get("execApprovals")
+            .and_then(|exec| exec.get("approvers")),
+        &mut allowed_user_ids,
+    );
+
+    if let Some(accounts) = telegram
+        .get("accounts")
+        .and_then(serde_json::Value::as_object)
+    {
+        if let Some(account) = accounts
+            .get(&default_account)
+            .or_else(|| accounts.get("default"))
+        {
+            collect_telegram_account_token(
+                source,
+                &default_account,
+                account,
+                &default_account,
+                candidates,
+            );
+        }
+        for (account_id, account) in accounts {
+            collect_telegram_account_token(
+                source,
+                account_id,
+                account,
+                &default_account,
+                candidates,
+            );
+            collect_string_array(account.get("allowFrom"), &mut allowed_user_ids);
+            collect_string_array(account.get("groupAllowFrom"), &mut group_allowed_user_ids);
+            collect_object_keys(account.get("direct"), &mut direct_chat_ids);
+            collect_object_keys(account.get("groups"), &mut group_chat_ids);
+        }
+    }
+    if let Some(token) = string_child(telegram, "botToken") {
+        add_channel_credential(
+            candidates,
+            "TELEGRAM_BOT_TOKEN",
+            token,
+            "channels.telegram.botToken",
+            true,
+        );
+    }
+
+    add_joined_credential(
+        candidates,
+        "OPENCLAW_TELEGRAM_ALLOWED_USER_IDS",
+        &allowed_user_ids,
+        "channels.telegram.allowFrom + accounts.*.allowFrom",
+    );
+    add_joined_credential(
+        candidates,
+        "OPENCLAW_TELEGRAM_GROUP_ALLOWED_USER_IDS",
+        &group_allowed_user_ids,
+        "channels.telegram.groupAllowFrom + accounts.*.groupAllowFrom",
+    );
+    add_joined_credential(
+        candidates,
+        "OPENCLAW_TELEGRAM_DIRECT_CHAT_IDS",
+        &direct_chat_ids,
+        "channels.telegram.accounts.*.direct keys",
+    );
+    add_joined_credential(
+        candidates,
+        "OPENCLAW_TELEGRAM_GROUP_CHAT_IDS",
+        &group_chat_ids,
+        "channels.telegram.accounts.*.groups keys",
+    );
+}
+
+fn collect_telegram_account_token(
+    source: &OpenClawSource,
+    account_id: &str,
+    account: &serde_json::Value,
+    default_account: &str,
+    candidates: &mut Vec<ChannelCredentialCandidate>,
+) {
+    let env_name = if account_id == default_account || account_id == "default" {
+        "TELEGRAM_BOT_TOKEN".to_string()
+    } else {
+        format!(
+            "OPENCLAW_TELEGRAM_ACCOUNT_{}_BOT_TOKEN",
+            sanitize_env_suffix(account_id)
+        )
+    };
+    if let Some(token) = string_child(account, "botToken") {
+        add_channel_credential(
+            candidates,
+            env_name,
+            token,
+            format!("channels.telegram.accounts.{account_id}.botToken"),
+            true,
+        );
+        return;
+    }
+    if let Some(token_file) = string_child(account, "tokenFile")
+        && let Ok(Some(token)) = read_openclaw_token_file(source, &token_file)
+    {
+        add_channel_credential(
+            candidates,
+            env_name,
+            token,
+            format!("channels.telegram.accounts.{account_id}.tokenFile"),
+            true,
+        );
+    }
+}
+
+fn collect_discord_credentials(
+    discord: &serde_json::Value,
+    candidates: &mut Vec<ChannelCredentialCandidate>,
+) {
+    if let Some(token) = string_child(discord, "token") {
+        add_channel_credential(
+            candidates,
+            "DISCORD_BOT_TOKEN",
+            normalize_discord_bot_token(&token),
+            "channels.discord.token",
+            true,
+        );
+    }
+
+    let mut allowed_user_ids = BTreeSet::new();
+    let mut guild_ids = BTreeSet::new();
+    let mut channel_ids = BTreeSet::new();
+    collect_string_array(discord.get("allowFrom"), &mut allowed_user_ids);
+    collect_string_array(
+        discord
+            .get("execApprovals")
+            .and_then(|exec| exec.get("approvers")),
+        &mut allowed_user_ids,
+    );
+    if let Some(guilds) = discord.get("guilds").and_then(serde_json::Value::as_object) {
+        for (guild_id, guild) in guilds {
+            guild_ids.insert(guild_id.to_string());
+            collect_string_array(guild.get("users"), &mut allowed_user_ids);
+            if let Some(channels) = guild.get("channels").and_then(serde_json::Value::as_object) {
+                for channel_id in channels.keys() {
+                    channel_ids.insert(channel_id.to_string());
+                }
+            }
+        }
+    }
+    add_joined_credential(
+        candidates,
+        "OPENCLAW_DISCORD_ALLOWED_USER_IDS",
+        &allowed_user_ids,
+        "channels.discord.allowFrom + guilds.*.users",
+    );
+    add_joined_credential(
+        candidates,
+        "OPENCLAW_DISCORD_GUILD_IDS",
+        &guild_ids,
+        "channels.discord.guilds keys",
+    );
+    add_joined_credential(
+        candidates,
+        "OPENCLAW_DISCORD_CHANNEL_IDS",
+        &channel_ids,
+        "channels.discord.guilds.*.channels keys",
+    );
+}
+
+fn add_joined_credential(
+    candidates: &mut Vec<ChannelCredentialCandidate>,
+    env_name: &str,
+    values: &BTreeSet<String>,
+    source_path: &str,
+) {
+    if values.is_empty() {
+        return;
+    }
+    add_channel_credential(
+        candidates,
+        env_name,
+        values.iter().cloned().collect::<Vec<_>>().join(","),
+        source_path,
+        false,
+    );
+}
+
+fn add_channel_credential(
+    candidates: &mut Vec<ChannelCredentialCandidate>,
+    env_name: impl Into<String>,
+    value: impl Into<String>,
+    source_path: impl Into<String>,
+    sensitive: bool,
+) {
+    let env_name = env_name.into();
+    if candidates
+        .iter()
+        .any(|candidate| candidate.env_name == env_name)
+    {
+        return;
+    }
+    let value = value.into().trim().to_string();
+    if value.is_empty() {
+        return;
+    }
+    candidates.push(ChannelCredentialCandidate {
+        env_name,
+        value,
+        source_path: source_path.into(),
+        sensitive,
+    });
+}
+
+fn collect_string_array(value: Option<&serde_json::Value>, target: &mut BTreeSet<String>) {
+    let Some(array) = value.and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for item in array {
+        if let Some(value) = json_scalar_string(item) {
+            let value = value.trim();
+            if !value.is_empty() {
+                target.insert(value.to_string());
+            }
+        }
+    }
+}
+
+fn collect_object_keys(value: Option<&serde_json::Value>, target: &mut BTreeSet<String>) {
+    let Some(object) = value.and_then(serde_json::Value::as_object) else {
+        return;
+    };
+    target.extend(object.keys().cloned());
+}
+
+fn string_child(value: &serde_json::Value, key: &str) -> Option<String> {
+    value.get(key).and_then(json_scalar_string)
+}
+
+fn json_scalar_string(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .or_else(|| value.as_i64().map(|number| number.to_string()))
+        .or_else(|| value.as_u64().map(|number| number.to_string()))
+}
+
+fn read_openclaw_token_file(
+    source: &OpenClawSource,
+    token_file: &str,
+) -> Result<Option<String>, String> {
+    let path = resolve_openclaw_config_path(source, token_file);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
+    };
+    let token = text.trim().to_string();
+    if token.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(token))
+    }
+}
+
+fn resolve_openclaw_config_path(source: &OpenClawSource, raw: &str) -> PathBuf {
+    let raw = raw.trim();
+    for prefix in ["/root/.openclaw/", "/home/agent/.openclaw/"] {
+        if let Some(relative) = raw.strip_prefix(prefix) {
+            return join_unix_relative(&source.home, relative);
+        }
+    }
+    if matches!(raw, "/root/.openclaw" | "/home/agent/.openclaw") {
+        return source.home.clone();
+    }
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        source.home.join(path)
+    }
+}
+
+fn join_unix_relative(root: &Path, relative: &str) -> PathBuf {
+    let mut path = root.to_path_buf();
+    for component in relative.split('/') {
+        if !component.is_empty() {
+            path.push(component);
+        }
+    }
+    path
+}
+
+fn sanitize_env_suffix(value: &str) -> String {
+    let mut suffix = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            suffix.push(ch.to_ascii_uppercase());
+        } else {
+            suffix.push('_');
+        }
+    }
+    if suffix.is_empty() {
+        "ACCOUNT".to_string()
+    } else {
+        suffix
+    }
+}
+
+fn write_channel_credentials_receipt(
+    receipt_file: &Path,
+    source: &OpenClawSource,
+    target_home: &Path,
+    include_sensitive: bool,
+    entries: &[ChannelCredentialExportEntry],
+) -> Result<(), String> {
+    let entries: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "envName": entry.env_name,
+                "sourcePath": entry.source_path,
+                "length": entry.length,
+                "sensitive": entry.sensitive,
+                "exported": entry.exported,
+                "reason": entry.reason,
+            })
+        })
+        .collect();
+    let receipt = serde_json::json!({
+        "schema": "openclaw-harness.channel-credentials-export.v1",
+        "createdAtMs": current_time_ms()?,
+        "sourceHome": source.home,
+        "targetHome": target_home,
+        "includeSensitive": include_sensitive,
+        "entries": entries,
+    });
+    fs::write(
+        receipt_file,
+        serde_json::to_string_pretty(&receipt).map_err(|err| err.to_string())?,
+    )
+    .map_err(|err| err.to_string())
+}
+
+fn channel_credentials_env_file(harness_home: &Path) -> PathBuf {
+    harness_home.join("secrets").join("channel-credentials.env")
+}
+
+fn channel_credentials_receipt_file(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("secrets")
+        .join("channel-credentials-receipts.json")
+}
+
+fn read_secret_env_map(path: &Path) -> Result<BTreeMap<String, String>, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
+    };
+    let mut values = BTreeMap::new();
+    for line in text.lines() {
+        if let Some((key, value)) = parse_secret_env_line(line) {
+            values.insert(key, value);
+        }
+    }
+    Ok(values)
+}
+
+fn parse_secret_env_line(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let (key, value) = line.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some((key.to_string(), unquote_secret_env_value(value.trim())))
+}
+
+fn unquote_secret_env_value(value: &str) -> String {
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        let mut output = String::new();
+        let mut chars = value[1..value.len() - 1].chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                match chars.next() {
+                    Some('n') => output.push('\n'),
+                    Some('r') => output.push('\r'),
+                    Some('t') => output.push('\t'),
+                    Some(other) => output.push(other),
+                    None => output.push('\\'),
+                }
+            } else {
+                output.push(ch);
+            }
+        }
+        output
+    } else if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        value[1..value.len() - 1].to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn write_secret_env_file(path: &Path, values: &BTreeMap<String, String>) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let mut text = String::from(
+        "# Generated by openclaw-harness channel-credentials-export. Do not commit.\n",
+    );
+    for (key, value) in values {
+        text.push_str(key);
+        text.push('=');
+        text.push_str(&quote_secret_env_value(value));
+        text.push('\n');
+    }
+    fs::write(path, text).map_err(|err| err.to_string())
+}
+
+fn quote_secret_env_value(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n");
+    format!("\"{escaped}\"")
+}
+
+fn secret_env_value(harness_home: &Path, env_name: &str) -> Option<String> {
+    read_secret_env_map(&channel_credentials_env_file(harness_home))
+        .ok()
+        .and_then(|mut values| values.remove(env_name))
+}
+
+fn telegram_bot_token(harness_home: &Path) -> Result<String, String> {
     env::var("TELEGRAM_BOT_TOKEN")
-        .map_err(|_| "TELEGRAM_BOT_TOKEN is required for Telegram adapters".to_string())
+        .ok()
+        .or_else(|| secret_env_value(harness_home, "TELEGRAM_BOT_TOKEN"))
+        .ok_or_else(|| {
+            "TELEGRAM_BOT_TOKEN is required for Telegram adapters; run channel-credentials-export or set the env var".to_string()
+        })
 }
 
 fn telegram_offset_file(harness_home: &std::path::Path) -> PathBuf {
@@ -3608,9 +4449,26 @@ fn telegram_http_error(error: ureq::Error) -> String {
     }
 }
 
-fn discord_bot_token() -> Result<String, String> {
+fn discord_bot_token(harness_home: &Path) -> Result<String, String> {
     env::var("DISCORD_BOT_TOKEN")
-        .map_err(|_| "DISCORD_BOT_TOKEN is required for Discord adapters".to_string())
+        .ok()
+        .or_else(|| secret_env_value(harness_home, "DISCORD_BOT_TOKEN"))
+        .map(|token| normalize_discord_bot_token(&token))
+        .ok_or_else(|| {
+            "DISCORD_BOT_TOKEN is required for Discord adapters; run channel-credentials-export or set the env var".to_string()
+        })
+}
+
+fn normalize_discord_bot_token(token: &str) -> String {
+    let token = token.trim();
+    if token
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bot "))
+    {
+        token[4..].trim().to_string()
+    } else {
+        token.to_string()
+    }
 }
 
 fn discord_send_message(
@@ -3622,6 +4480,7 @@ fn discord_send_message(
         return Err("Discord message exceeds the 2000 character content limit".to_string());
     }
     let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
+    let token = normalize_discord_bot_token(token);
     let auth = format!("Bot {token}");
     let response = ureq::post(&url)
         .set("Authorization", &auth)
@@ -4854,6 +5713,9 @@ fn print_help() {
     println!("  import-plan     Print staged import readiness");
     println!("  import-dry-run  Build a read-only migration report");
     println!("  import-execute  Copy planned non-sensitive state and write receipts");
+    println!(
+        "  channel-credentials-export Export Telegram/Discord tokens and IDs to harness secrets"
+    );
     println!("  registry        Inspect parsed multi-agent registry state");
     println!("  registry-export Write target harness registry state");
     println!("  enable-check    Check formal activation readiness and log writability");
@@ -4870,6 +5732,8 @@ fn print_help() {
     println!("  telegram-loop     Run Telegram polling continuously until stopped");
     println!("  discord-outbox-send-once Send pending Discord outbox messages once");
     println!("  discord-event-run-once Normalize one Discord Gateway message event");
+    println!("  discord-gateway-probe Probe Discord Gateway loop prerequisites");
+    println!("  discord-gateway-loop Run Discord Gateway receive loop");
     println!("  plugin-sidecar-probe Probe the Node OpenClaw plugin sidecar contract");
     println!("  plugin-sidecar-call Call the plugin sidecar JSON-RPC bridge once");
     println!("  queue-enqueue   Persist one channel agent turn to the runtime queue");
@@ -4893,7 +5757,7 @@ fn print_help() {
     println!("  --force                 Overwrite user-modified builtin harness skills");
     println!("  --conflict <policy>     skip, overwrite, or rename");
     println!("  --output <path>         Write report.json and summary.md");
-    println!("  --include-sensitive     Copy raw sensitive files during import-execute");
+    println!("  --include-sensitive     Copy/write sensitive import or credential values");
     println!("  --query <text>          Match skills for a task turn");
     println!("  --agent <id>            Agent hint for skill matching");
     println!("  --channel <name>        Channel hint for skill matching");
@@ -4911,13 +5775,18 @@ fn print_help() {
     println!("  --outbox-limit <n>      Maximum pending outbox items for channel-run-once");
     println!("  --event-file <path>     Discord Gateway event JSON file");
     println!("  --event-json <text>     Discord Gateway event JSON text");
+    println!("  --gateway-script <path> Discord Gateway Node script path");
+    println!("  --harness-cli <path>    Harness CLI used by gateway loop callbacks");
+    println!(
+        "  --max-messages <n>      Stop Discord gateway loop after n messages; 0 means forever"
+    );
     println!("  --poll-timeout-seconds <n> Telegram long-poll timeout for telegram-poll-once");
     println!("  --max-updates <n>       Maximum Telegram updates for telegram-poll-once");
     println!("  --iterations <n>        Telegram loop iterations; 0 means forever");
     println!("  --idle-ms <n>           Telegram loop sleep after each poll");
     println!("  --max-consecutive-errors <n> Telegram loop failure threshold");
-    println!("  TELEGRAM_BOT_TOKEN      Environment variable used by Telegram adapters");
-    println!("  DISCORD_BOT_TOKEN       Environment variable used by Discord adapters");
+    println!("  TELEGRAM_BOT_TOKEN      Env var or harness secret used by Telegram adapters");
+    println!("  DISCORD_BOT_TOKEN       Env var or harness secret used by Discord adapters");
     println!("  --node-exe <path>       Node executable for plugin sidecar commands");
     println!("  --sidecar-script <path> Plugin sidecar script path");
     println!("  --method <name>         Plugin sidecar JSON-RPC method for plugin-sidecar-call");

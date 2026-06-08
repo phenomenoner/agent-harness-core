@@ -39,8 +39,9 @@ These must pass before cutover.
    - Prefer Codex OAuth for Codex models.
    - Confirm Codex auth through local `CODEX_HOME`, `%USERPROFILE%\.codex\auth.json`, or `%USERPROFILE%\.codex\auth.toml`.
    - Confirm the harness uses a spawnable Codex CLI binary. The Codex Desktop MSIX resource path may resolve on `PATH` but fail to spawn with Windows `os error 5`; use a standalone release or a local npm install such as `.tools/codex-cli/node_modules/.bin/codex.cmd`.
-   - Confirm `TELEGRAM_BOT_TOKEN` when Telegram is enabled.
-   - Confirm `DISCORD_BOT_TOKEN` when Discord is enabled.
+   - Run `channel-credentials-export --include-sensitive` when migrating from an existing OpenClaw home. It writes Telegram/Discord tokens and known channel/user/guild IDs into `secrets/channel-credentials.env` and redacted receipts into `secrets/channel-credentials-receipts.json`.
+   - Confirm `TELEGRAM_BOT_TOKEN` is present either in process env or `secrets/channel-credentials.env` when Telegram is enabled.
+   - Confirm `DISCORD_BOT_TOKEN` is present either in process env or `secrets/channel-credentials.env` when Discord is enabled.
    - Confirm `OPENROUTER_API_KEY` only when OpenRouter providers are active.
    - Do not rely on an imported OpenClaw embedding-only `OPENAI_API_KEY` for Codex agent turns.
 
@@ -60,9 +61,10 @@ These must pass before cutover.
    - Deliver the pending reply through the target adapter or manual test harness.
    - Run `channel-delivery-record --status delivered`.
    - Confirm future `channel-outbox-plan` skips delivered messages and retries failed messages.
-   - For Telegram smoke, set `TELEGRAM_BOT_TOKEN` and run `telegram-poll-once` against a controlled DM; confirm command replies and agent replies are delivered by the Bot API.
+   - For Telegram smoke, set or import `TELEGRAM_BOT_TOKEN` and run `telegram-poll-once` against a controlled DM; confirm command replies and agent replies are delivered by the Bot API.
    - For Telegram handoff rehearsal, run `telegram-loop --iterations 0` only after confirming the old Docker gateway is not also consuming Telegram updates.
-   - For Discord outbound smoke, set `DISCORD_BOT_TOKEN`, create a Discord outbox item with `channel-run-once --platform discord ...`, then run `discord-outbox-send-once`.
+   - For Discord outbound smoke, set or import `DISCORD_BOT_TOKEN`, create a Discord outbox item with `channel-run-once --platform discord ...`, then run `discord-outbox-send-once`.
+   - For Discord inbound handoff rehearsal, run `discord-gateway-probe`, then run `discord-gateway-loop` only after confirming the old Docker gateway is not also connected.
 
 7. Logging gate
    - Run `enable-check`.
@@ -166,8 +168,10 @@ As of 2026-06-08 local verification:
 - Runtime queue prepare, Codex plan, Codex preflight, and Codex launch probe pass when using workspace-local `@openai/codex` via `.tools/codex-cli/node_modules/.bin/codex.cmd`.
 - Plugin sidecar probe passes and sees 6 sidecar-required plugins. JSON-RPC bridge calls for `sidecar.status` and `plugins.list` pass; OpenClaw plugin hook/tool execution remains pending.
 - Discord Gateway `MESSAGE_CREATE` event normalizer smoke passes for `/status`, including duplicate-message skip by Discord message id.
+- `channel-credentials-export --include-sensitive` imported Telegram/Discord bot tokens plus known allow-list/guild/channel/chat IDs from the local OpenClaw snapshot into `imports/activation-harness/secrets/channel-credentials.env`; readiness sees both token gates as pass.
+- `discord-gateway-probe` passes with the imported Discord token and Node 24 global WebSocket support.
 - The Codex Desktop MSIX `codex.exe` path is not spawnable from this harness environment and should not be used for service runtime.
-- Remaining `enable-check` failures are `TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN`, and `plugin-sidecar`.
+- Remaining `enable-check` hard failure is `plugin-sidecar`; Telegram and Discord token gates now pass from the harness secrets env file.
 
 ## Verification Commands
 
@@ -176,6 +180,7 @@ cargo fmt --all
 cargo test --workspace --quiet
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p openclaw-harness-cli -- help
+cargo run -p openclaw-harness-cli -- channel-credentials-export --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --include-sensitive
 cargo run -p openclaw-harness-cli -- enable-check --harness-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- channel-run-once --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw --platform telegram --channel-id smoke --user-id operator --message /status
 cargo run -p openclaw-harness-cli -- codex-launch-probe --harness-home C:\path\to\.openclaw-harness --execution-dir C:\path\to\prepared-execution --startup-probe-ms 750
@@ -183,6 +188,7 @@ cargo run -p openclaw-harness-cli -- plugin-sidecar-probe --harness-home C:\path
 cargo run -p openclaw-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\.openclaw-harness --method sidecar.status
 cargo run -p openclaw-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\.openclaw-harness --method plugins.list
 cargo run -p openclaw-harness-cli -- discord-event-run-once --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw --event-file C:\path\to\discord-message-create.json
+cargo run -p openclaw-harness-cli -- discord-gateway-probe --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw
 cargo run -p openclaw-harness-cli -- telegram-poll-once --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.cmd --poll-timeout-seconds 1 --max-updates 10
 cargo run -p openclaw-harness-cli -- telegram-loop --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.cmd --iterations 1 --idle-ms 1000
 cargo run -p openclaw-harness-cli -- discord-outbox-send-once --harness-home C:\path\to\.openclaw-harness --outbox-limit 20
