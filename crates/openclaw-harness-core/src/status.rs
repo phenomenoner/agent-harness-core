@@ -259,6 +259,7 @@ fn log_status(harness_home: &Path) -> io::Result<HarnessOperationalLogStatus> {
         "discord.event-run-once",
         "channel.receive",
         "runtime.run-once.completed",
+        "runtime.loop-stopped",
         "codex.run.completed",
         "codex.complete.recorded",
         "channel.delivery.delivered",
@@ -489,7 +490,8 @@ mod tests {
                 .join("state")
                 .join("logs")
                 .join("harness.jsonl"),
-            r#"{"event":"channel.receive"}"#,
+            r#"{"event":"channel.receive"}
+{"event":"runtime.loop-stopped"}"#,
         )
         .unwrap();
 
@@ -508,6 +510,14 @@ mod tests {
         assert!(report.memory.qdrant_edge);
         assert_eq!(
             report.logs.event_present.get("channel.receive").copied(),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .logs
+                .event_present
+                .get("runtime.loop-stopped")
+                .copied(),
             Some(true)
         );
 

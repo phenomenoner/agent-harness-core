@@ -21,8 +21,8 @@ use openclaw_harness_core::{
     HarnessLogLevel, HarnessStatusOptions, HarnessStatusReport, ImportPhaseStatus, ImportReport,
     NativeCronPlan, NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions, PromptBundle,
     RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions,
-    RuntimeQueuePrepareReport, RuntimeRunOnceOptions, RuntimeRunOnceReport, SkillIndex,
-    SkillSelectionQuery, SubagentPlan, SubagentPlanInput, TurnPlan, TurnPlanInput,
+    RuntimeQueuePrepareReport, RuntimeRunOnceOptions, RuntimeRunOnceReport, RuntimeRunOnceStatus,
+    SkillIndex, SkillSelectionQuery, SubagentPlan, SubagentPlanInput, TurnPlan, TurnPlanInput,
     append_harness_log, apply_channel_command_step, assemble_prompt_bundle, build_channel_step,
     build_dry_run_report, build_harness_skill_index, build_import_plan, build_runtime_skill_index,
     build_source_skill_index, build_turn_plan, check_activation_readiness, collect_harness_status,
@@ -72,6 +72,7 @@ fn main() {
         "queue-enqueue" => run_queue_enqueue(&rest),
         "queue-prepare" => run_queue_prepare(&rest),
         "runtime-run-once" => run_runtime_run_once(&rest),
+        "runtime-loop" => run_runtime_loop(&rest),
         "codex-plan" => run_codex_plan(&rest),
         "codex-preflight" => run_codex_preflight(&rest),
         "codex-launch-probe" => run_codex_launch_probe(&rest),
@@ -1235,6 +1236,149 @@ fn run_runtime_run_once(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_runtime_loop(args: &[String]) -> Result<(), String> {
+    let args = runtime_loop_args_from_args(args)?;
+    let started_at_ms = current_log_time_ms().map_err(|err| err.to_string())?;
+    let mut iterations = 0usize;
+    let mut completed = 0usize;
+    let mut idle = 0usize;
+    let mut errors = 0usize;
+    let mut consecutive_errors = 0usize;
+    let mut last_status: Option<RuntimeRunOnceStatus>;
+    let mut last_queue_id: Option<String>;
+    let mut last_reason: Option<String>;
+    let mut failed = false;
+    let stop_reason;
+
+    loop {
+        iterations += 1;
+        match run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: args.target_home.clone(),
+            queue_id: None,
+            codex_executable: args.codex_exe.clone(),
+            timeout_ms: args.timeout_ms,
+            prompt_options: PromptAssemblyOptions {
+                max_prompt_file_bytes: args.max_prompt_file_bytes,
+                max_skill_file_bytes: args.max_skill_file_bytes,
+                harness_home: Some(args.target_home.clone()),
+            },
+        }) {
+            Ok(report) => {
+                let status = report.receipt.status;
+                last_status = Some(status);
+                last_queue_id = report.receipt.queue_id.clone();
+                last_reason = Some(report.receipt.reason.clone());
+                println!(
+                    "Runtime loop iteration {iterations}: {} ({})",
+                    runtime_run_once_status_label(status),
+                    report.receipt.reason
+                );
+
+                if runtime_run_once_report_is_idle(&report) {
+                    idle += 1;
+                    consecutive_errors = 0;
+                    if args.stop_when_idle {
+                        stop_reason = format!(
+                            "stopped after idle runtime result {}",
+                            runtime_run_once_status_label(status)
+                        );
+                        break;
+                    }
+                } else if status == RuntimeRunOnceStatus::Completed {
+                    completed += 1;
+                    consecutive_errors = 0;
+                } else {
+                    errors += 1;
+                    consecutive_errors += 1;
+                    append_runtime_loop_error_log(
+                        &args.target_home,
+                        iterations,
+                        consecutive_errors,
+                        args.max_consecutive_errors,
+                        &format!(
+                            "{}: {}",
+                            runtime_run_once_status_label(status),
+                            report.receipt.reason
+                        ),
+                    )?;
+                    if consecutive_errors >= args.max_consecutive_errors {
+                        failed = true;
+                        stop_reason = format!(
+                            "stopped after {} consecutive runtime errors",
+                            args.max_consecutive_errors
+                        );
+                        break;
+                    }
+                }
+            }
+            Err(error) => {
+                errors += 1;
+                consecutive_errors += 1;
+                let error = error.to_string();
+                eprintln!(
+                    "runtime-loop iteration {iterations} failed ({consecutive_errors}/{}): {error}",
+                    args.max_consecutive_errors
+                );
+                last_status = None;
+                last_queue_id = None;
+                last_reason = Some(error.clone());
+                append_runtime_loop_error_log(
+                    &args.target_home,
+                    iterations,
+                    consecutive_errors,
+                    args.max_consecutive_errors,
+                    &error,
+                )?;
+                if consecutive_errors >= args.max_consecutive_errors {
+                    failed = true;
+                    stop_reason = format!(
+                        "stopped after {} consecutive runtime errors",
+                        args.max_consecutive_errors
+                    );
+                    break;
+                }
+            }
+        }
+
+        if args.iterations > 0 && iterations >= args.iterations {
+            stop_reason = format!(
+                "stopped after configured iteration limit {}",
+                args.iterations
+            );
+            break;
+        }
+        thread::sleep(Duration::from_millis(args.idle_ms));
+    }
+
+    let summary = RuntimeLoopSummary {
+        target_home: args.target_home.clone(),
+        started_at_ms,
+        finished_at_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+        iterations,
+        completed,
+        idle,
+        errors,
+        consecutive_errors,
+        stop_reason,
+        last_status,
+        last_queue_id,
+        last_reason,
+        report_file: args
+            .target_home
+            .join("state")
+            .join("runtime-queue")
+            .join("loop-last.json"),
+    };
+    write_runtime_loop_summary(&summary)?;
+    append_runtime_loop_stopped_log(&summary, failed)?;
+    print_runtime_loop_summary(&summary);
+
+    if failed {
+        return Err(summary.stop_reason);
+    }
+    Ok(())
+}
+
 fn run_codex_plan(args: &[String]) -> Result<(), String> {
     let args = codex_plan_args_from_args(args)?;
     let report = plan_codex_runtime(CodexRuntimePlanOptions {
@@ -1678,6 +1822,34 @@ struct RuntimeRunOnceArgs {
     timeout_ms: u64,
     max_prompt_file_bytes: usize,
     max_skill_file_bytes: usize,
+}
+
+struct RuntimeLoopArgs {
+    target_home: PathBuf,
+    codex_exe: Option<PathBuf>,
+    timeout_ms: u64,
+    max_prompt_file_bytes: usize,
+    max_skill_file_bytes: usize,
+    iterations: usize,
+    idle_ms: u64,
+    max_consecutive_errors: usize,
+    stop_when_idle: bool,
+}
+
+struct RuntimeLoopSummary {
+    target_home: PathBuf,
+    started_at_ms: i64,
+    finished_at_ms: i64,
+    iterations: usize,
+    completed: usize,
+    idle: usize,
+    errors: usize,
+    consecutive_errors: usize,
+    stop_reason: String,
+    last_status: Option<RuntimeRunOnceStatus>,
+    last_queue_id: Option<String>,
+    last_reason: Option<String>,
+    report_file: PathBuf,
 }
 
 struct CodexPlanArgs {
@@ -3227,6 +3399,99 @@ fn runtime_run_once_args_from_args(args: &[String]) -> Result<RuntimeRunOnceArgs
         timeout_ms,
         max_prompt_file_bytes,
         max_skill_file_bytes,
+    })
+}
+
+fn runtime_loop_args_from_args(args: &[String]) -> Result<RuntimeLoopArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut codex_exe = None;
+    let mut timeout_ms = 300_000;
+    let mut max_prompt_file_bytes = PromptAssemblyOptions::default().max_prompt_file_bytes;
+    let mut max_skill_file_bytes = PromptAssemblyOptions::default().max_skill_file_bytes;
+    let mut iterations = 0usize;
+    let mut idle_ms = 1_000u64;
+    let mut max_consecutive_errors = 5usize;
+    let mut stop_when_idle = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--codex-exe" => {
+                i += 1;
+                codex_exe = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--codex-exe requires a path".to_string())?,
+                );
+            }
+            "--timeout-ms" => {
+                i += 1;
+                timeout_ms = args
+                    .get(i)
+                    .ok_or_else(|| "--timeout-ms requires a positive integer".to_string())
+                    .and_then(|value| parse_u64(value, "--timeout-ms"))?;
+            }
+            "--max-prompt-file-bytes" => {
+                i += 1;
+                max_prompt_file_bytes = args
+                    .get(i)
+                    .ok_or_else(|| {
+                        "--max-prompt-file-bytes requires a positive integer".to_string()
+                    })
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--max-skill-file-bytes" => {
+                i += 1;
+                max_skill_file_bytes = args
+                    .get(i)
+                    .ok_or_else(|| "--max-skill-file-bytes requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--iterations" => {
+                i += 1;
+                iterations = args
+                    .get(i)
+                    .ok_or_else(|| "--iterations requires a non-negative integer".to_string())
+                    .and_then(|value| parse_usize(value, "--iterations"))?;
+            }
+            "--idle-ms" => {
+                i += 1;
+                idle_ms = args
+                    .get(i)
+                    .ok_or_else(|| "--idle-ms requires a positive integer".to_string())
+                    .and_then(|value| parse_u64(value, "--idle-ms"))?;
+            }
+            "--max-consecutive-errors" => {
+                i += 1;
+                max_consecutive_errors = args
+                    .get(i)
+                    .ok_or_else(|| {
+                        "--max-consecutive-errors requires a positive integer".to_string()
+                    })
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--stop-when-idle" => {
+                stop_when_idle = true;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(RuntimeLoopArgs {
+        target_home,
+        codex_exe,
+        timeout_ms,
+        max_prompt_file_bytes,
+        max_skill_file_bytes,
+        iterations,
+        idle_ms,
+        max_consecutive_errors,
+        stop_when_idle,
     })
 }
 
@@ -5458,6 +5723,131 @@ fn print_runtime_run_once_report(report: &RuntimeRunOnceReport) {
     }
 }
 
+fn print_runtime_loop_summary(summary: &RuntimeLoopSummary) {
+    println!("OpenClaw runtime loop");
+    println!("Harness home: {}", summary.target_home.display());
+    println!("Report file: {}", summary.report_file.display());
+    println!("Iterations: {}", summary.iterations);
+    println!("Completed: {}", summary.completed);
+    println!("Idle: {}", summary.idle);
+    println!("Errors: {}", summary.errors);
+    println!("Consecutive errors: {}", summary.consecutive_errors);
+    println!("Stop reason: {}", summary.stop_reason);
+    if let Some(status) = summary.last_status {
+        println!("Last status: {}", runtime_run_once_status_label(status));
+    }
+    if let Some(queue_id) = &summary.last_queue_id {
+        println!("Last queue id: {queue_id}");
+    }
+    if let Some(reason) = &summary.last_reason {
+        println!("Last reason: {reason}");
+    }
+}
+
+fn write_runtime_loop_summary(summary: &RuntimeLoopSummary) -> Result<(), String> {
+    if let Some(parent) = summary.report_file.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let report = serde_json::json!({
+        "schema": "openclaw-harness.runtime-loop.v1",
+        "harnessHome": &summary.target_home,
+        "reportFile": &summary.report_file,
+        "startedAtMs": summary.started_at_ms,
+        "finishedAtMs": summary.finished_at_ms,
+        "iterations": summary.iterations,
+        "completed": summary.completed,
+        "idle": summary.idle,
+        "errors": summary.errors,
+        "consecutiveErrors": summary.consecutive_errors,
+        "stopReason": &summary.stop_reason,
+        "lastStatus": summary.last_status.map(runtime_run_once_status_label),
+        "lastQueueId": summary.last_queue_id.as_deref(),
+        "lastReason": summary.last_reason.as_deref(),
+    });
+    let bytes = serde_json::to_vec_pretty(&report).map_err(|err| err.to_string())?;
+    fs::write(&summary.report_file, bytes).map_err(|err| err.to_string())
+}
+
+fn append_runtime_loop_error_log(
+    harness_home: &Path,
+    iteration: usize,
+    consecutive_errors: usize,
+    max_consecutive_errors: usize,
+    error: &str,
+) -> Result<(), String> {
+    append_harness_log(
+        harness_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            HarnessLogLevel::Warn,
+            "runtime",
+            "runtime.loop-error",
+            format!(
+                "iteration={iteration} consecutiveErrors={consecutive_errors}/{max_consecutive_errors} error={error}"
+            ),
+        ),
+    )
+    .map(|_| ())
+    .map_err(|err| err.to_string())
+}
+
+fn append_runtime_loop_stopped_log(
+    summary: &RuntimeLoopSummary,
+    failed: bool,
+) -> Result<(), String> {
+    append_harness_log(
+        &summary.target_home,
+        &HarnessLogEvent::new(
+            summary.finished_at_ms,
+            if failed {
+                HarnessLogLevel::Error
+            } else if summary.errors > 0 {
+                HarnessLogLevel::Warn
+            } else {
+                HarnessLogLevel::Info
+            },
+            "runtime",
+            "runtime.loop-stopped",
+            format!(
+                "iterations={} completed={} idle={} errors={} stopReason={}",
+                summary.iterations,
+                summary.completed,
+                summary.idle,
+                summary.errors,
+                summary.stop_reason
+            ),
+        ),
+    )
+    .map(|_| ())
+    .map_err(|err| err.to_string())
+}
+
+fn runtime_run_once_status_is_idle(status: RuntimeRunOnceStatus) -> bool {
+    matches!(
+        status,
+        RuntimeRunOnceStatus::NoWork | RuntimeRunOnceStatus::NoPreparedExecution
+    )
+}
+
+fn runtime_run_once_report_is_idle(report: &RuntimeRunOnceReport) -> bool {
+    runtime_run_once_status_is_idle(report.receipt.status)
+        || (report.receipt.status == RuntimeRunOnceStatus::Completed
+            && report.receipt.reason.contains("already recorded"))
+}
+
+fn runtime_run_once_status_label(status: RuntimeRunOnceStatus) -> &'static str {
+    match status {
+        RuntimeRunOnceStatus::Completed => "completed",
+        RuntimeRunOnceStatus::NoWork => "no-work",
+        RuntimeRunOnceStatus::NoPreparedExecution => "no-prepared-execution",
+        RuntimeRunOnceStatus::NoRuntimePlan => "no-runtime-plan",
+        RuntimeRunOnceStatus::PreflightBlocked => "preflight-blocked",
+        RuntimeRunOnceStatus::SpawnFailed => "spawn-failed",
+        RuntimeRunOnceStatus::ProtocolError => "protocol-error",
+        RuntimeRunOnceStatus::Timeout => "timeout",
+    }
+}
+
 fn print_codex_runtime_plan_report(report: &CodexRuntimePlanReport) {
     println!("OpenClaw Codex runtime plan");
     println!("Harness home: {}", report.harness_home.display());
@@ -5876,6 +6266,7 @@ fn print_help() {
     println!("  queue-enqueue   Persist one channel agent turn to the runtime queue");
     println!("  queue-prepare   Prepare one queued runtime item for Codex execution");
     println!("  runtime-run-once Prepare, run, and outbox one queued runtime item");
+    println!("  runtime-loop    Drain runtime queue until stopped, idle, or error threshold");
     println!("  codex-plan      Plan Codex app-server invocation for prepared execution");
     println!("  codex-preflight Check a Codex runtime plan before process start");
     println!("  codex-launch-probe Start and stop Codex app-server without a model request");
@@ -5920,9 +6311,12 @@ fn print_help() {
     );
     println!("  --poll-timeout-seconds <n> Telegram long-poll timeout for telegram-poll-once");
     println!("  --max-updates <n>       Maximum Telegram updates for telegram-poll-once");
-    println!("  --iterations <n>        Telegram loop iterations; 0 means forever");
-    println!("  --idle-ms <n>           Telegram loop sleep after each poll");
-    println!("  --max-consecutive-errors <n> Telegram loop failure threshold");
+    println!(
+        "  --iterations <n>        Loop iterations for telegram-loop/runtime-loop; 0 means forever"
+    );
+    println!("  --idle-ms <n>           Loop sleep after each poll or runtime run");
+    println!("  --max-consecutive-errors <n> Loop failure threshold");
+    println!("  --stop-when-idle        Stop runtime-loop when the runtime queue is idle");
     println!("  TELEGRAM_BOT_TOKEN      Env var or harness secret used by Telegram adapters");
     println!("  DISCORD_BOT_TOKEN       Env var or harness secret used by Discord adapters");
     println!("  --node-exe <path>       Node executable for plugin sidecar commands");

@@ -49,7 +49,8 @@ Use it when the user mentions:
 9. Treat memory/qdrant-edge as the primary memory backend when present. LanceDB is backup/optional unless the active OpenClaw config points to it.
 10. Use a Codex CLI binary that the harness can spawn. On Windows, the Codex Desktop MSIX resource path may be visible on PATH but fail with os error 5; prefer a standalone release or local npm install and pass it with --codex-exe.
 11. Use tools/openclaw-fake-codex-app-server for offline runtime smoke when the goal is to verify harness receipts and logs without a model request.
-12. Use status --json for operator health checks; it should show runtime openItems=0 and outbox pending=0 before live handoff.
+12. Use runtime-loop for operator-run queue draining or service-wrapper handoff; use --stop-when-idle for smoke and --iterations 0 only under an intentional supervisor.
+13. Use status --json for operator health checks; it should show runtime openItems=0 and outbox pending=0 before live handoff.
 
 ## Prompt And Tool Schema Policy
 
@@ -112,6 +113,7 @@ Before replacing the Docker OpenClaw gateway:
 11. Confirm codex-runtime-launch-probe passes with the intended --codex-exe before any real runtime handoff.
 12. Run plugin-sidecar-probe and plugin-sidecar-call for sidecar.status/plugins.list/tools.probe; set OPENCLAW_PLUGIN_SOURCE_ROOTS when imported manifests live outside the harness home. Confirm plugin-sidecar, plugin-sidecar-probe, and plugin-sidecar-bridge are pass in enable-check. This proves manifest catalog and JSON-RPC bridge readiness; plugin-specific tool executors still need dedicated adapters.
 13. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt. Use tools/openclaw-fake-codex-app-server/fake-codex-app-server.cmd for offline smoke; use the intended Codex CLI only for operator-run model smoke.
+14. Run runtime-loop --stop-when-idle for idle/drain smoke and confirm state/runtime-queue/loop-last.json plus runtime.loop-stopped log evidence.
 
 ## Codex Runtime Flow
 
@@ -119,6 +121,12 @@ For a normal queued channel turn, the current worker-facing path is runtime-run-
 
 - It prepares one queue item, plans Codex, runs Codex app-server, records transcript/trajectory/Codex binding outputs, and writes an agent-reply message to state/channels/outbox.jsonl.
 - If the Codex completion receipt already exists, it skips the model request/outbox write to avoid duplicate delivery.
+
+For operator-run drain or service-wrapper handoff, use runtime-loop:
+
+- It repeats runtime-run-once with finite or infinite --iterations.
+- It treats no-work/no-prepared-execution and already recorded completions as idle, supports --stop-when-idle for smoke, and exits nonzero after --max-consecutive-errors for runtime/preflight/protocol failures.
+- It writes state/runtime-queue/loop-last.json and appends runtime.loop-stopped plus runtime.loop-error to state/logs/harness.jsonl.
 
 For manual debugging of one prepared turn, the expanded path is:
 
@@ -141,6 +149,7 @@ Use status for operator-facing health checks before and after handoff:
 
 - status summarizes readiness, runtime queued/open/prepared/completed items, outbox pending/delivered/retryable counts, Telegram/Discord smoke evidence, memory backend presence, plugin sidecar receipts, and operational log coverage.
 - status --json is the monitor-friendly form for scheduled tasks or service wrappers.
+- runtime-loop writes loop-last.json for the most recent worker-loop stop reason, iteration count, idle count, and error count.
 - Before live channel handoff, openItems should be 0 and outbox pending should be 0 unless the operator intentionally wants the adapter to deliver those pending messages.
 
 ## Skill Maintenance Loop

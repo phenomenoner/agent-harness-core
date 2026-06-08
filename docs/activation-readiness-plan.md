@@ -53,6 +53,8 @@ These must pass before cutover.
    - Run `runtime-run-once` with the intended Codex executable.
    - Confirm `state/runtime-queue/run-once-last.json`.
    - Confirm `state/runtime-queue/run-once-receipts.jsonl`.
+   - Run `runtime-loop --stop-when-idle --iterations 1` for idle/drain smoke, or `runtime-loop --iterations 0` only under an operator/supervisor after handoff.
+   - Confirm `state/runtime-queue/loop-last.json`.
    - Confirm transcript and trajectory files under `agents/<agent-id>/sessions`.
    - Confirm raw Codex stdout/stderr logs under the execution directory.
 
@@ -70,7 +72,7 @@ These must pass before cutover.
    - Run `enable-check`.
    - Run `status --json`.
    - Confirm `state/logs/harness.jsonl` is writable.
-   - Confirm logs include activation, Telegram poll-once or loop, Discord outbox send, channel receive, runtime run-once, Codex run, completion, and delivery events.
+   - Confirm logs include activation, Telegram poll-once or loop, Discord outbox send, channel receive, runtime run-once, runtime loop, Codex run, completion, and delivery events.
    - Confirm `enable-check` reports `telegram-offset`, `telegram-poll-log`, and `discord-send-log` as pass after adapter smoke tests.
    - Confirm `status` reports runtime `openItems=0` and outbox `pending=0` before live adapter handoff.
 
@@ -129,9 +131,8 @@ These should be run before stopping the Docker gateway.
    - Add gateway heartbeat/reconnect and live process health reporting beyond the CLI `status` summary.
 
 3. Worker loop
-   - Turn `runtime-run-once` into a supervised loop.
-   - Add stop/cancel handling for `/stop`.
-   - Add bounded retries and backoff.
+   - Done for CLI handoff/smoke: `runtime-loop` wraps `runtime-run-once`, drains queued work, treats already recorded completions as idle for loop control, supports finite or infinite `--iterations`, sleeps with `--idle-ms`, exits with `--stop-when-idle`, writes `state/runtime-queue/loop-last.json`, and logs `runtime.loop-stopped` plus `runtime.loop-error`.
+   - Still required for formal service activation: Windows service/scheduled-task wrapper, graceful shutdown, process supervisor health integration, stop/cancel handling for `/stop`, and richer retry/backoff policy.
 
 4. Scheduler execution
    - Native OpenClaw cron scheduler that can enqueue agent turns.
@@ -176,6 +177,7 @@ As of 2026-06-08 local verification:
 - `discord-gateway-probe` passes with the imported Discord token and Node 24 global WebSocket support.
 - The Codex Desktop MSIX `codex.exe` path is not spawnable from this harness environment and should not be used for service runtime.
 - Offline normal-turn smoke passes through `channel-run-once` with `tools/openclaw-fake-codex-app-server/fake-codex-app-server.cmd`, producing runtime-run-once, Codex run, Codex completion, transcript, outbox, delivery receipt, and operational log evidence without a model request or channel send.
+- Runtime loop idle/drain smoke passes with `runtime-loop --stop-when-idle` and writes `state/runtime-queue/loop-last.json` without a model request when no pending queue items remain.
 - `status` reports `queued=2 open=0 prepared=2 completed=2`, outbox `pending=0 delivered=4`, Qdrant edge primary memory present, plugin catalog ready with 2 manifest-derived tools, and operational log event coverage for offline runtime/delivery smoke.
 - `enable-check` currently reports `Ready: yes` with no hard failures. Remaining warnings are live operator smoke evidence for Telegram poll/offset, Discord outbound delivery, and optional LanceDB backup.
 
@@ -191,6 +193,7 @@ cargo run -p openclaw-harness-cli -- enable-check --harness-home C:\path\to\.ope
 cargo run -p openclaw-harness-cli -- status --harness-home C:\path\to\.openclaw-harness --json
 cargo run -p openclaw-harness-cli -- channel-run-once --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw --platform telegram --channel-id smoke --user-id operator --message /status
 cargo run -p openclaw-harness-cli -- channel-run-once --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw --platform telegram --channel-id offline-runtime-smoke --user-id operator --message "offline runtime smoke" --agent main --codex-exe tools\openclaw-fake-codex-app-server\fake-codex-app-server.cmd --timeout-ms 5000
+cargo run -p openclaw-harness-cli -- runtime-loop --harness-home C:\path\to\.openclaw-harness --codex-exe tools\openclaw-fake-codex-app-server\fake-codex-app-server.cmd --iterations 1 --idle-ms 1 --stop-when-idle
 cargo run -p openclaw-harness-cli -- codex-launch-probe --harness-home C:\path\to\.openclaw-harness --execution-dir C:\path\to\prepared-execution --startup-probe-ms 750
 cargo run -p openclaw-harness-cli -- plugin-sidecar-probe --harness-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\.openclaw-harness --method sidecar.status
