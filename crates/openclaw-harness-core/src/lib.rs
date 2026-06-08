@@ -2,6 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub mod activation;
 pub mod channel_commands;
 pub mod channel_ingress;
 pub mod channel_runtime;
@@ -11,6 +12,7 @@ pub mod cron;
 pub mod deterministic_cron;
 pub mod harness_registry;
 pub mod importer;
+pub mod logging;
 pub mod prompt;
 pub mod registry;
 pub mod runtime_queue;
@@ -19,6 +21,10 @@ pub mod skills;
 pub mod subagents;
 pub mod turns;
 
+pub use activation::{
+    ActivationReadinessCheck, ActivationReadinessOptions, ActivationReadinessReport,
+    ActivationReadinessStatus, ActivationReadinessSummary, check_activation_readiness,
+};
 pub use channel_commands::{
     ChannelCommand, ChannelCommandIntent, parse_channel_command, parse_channel_command_intent,
 };
@@ -72,6 +78,10 @@ pub use importer::{
     ImportItem, ImportItemKind, ImportItemStatus, ImportReport, ImportReportSummary,
     ImportSemantics, NativeCronSemantics, ReportFiles, SessionSemantics, build_dry_run_report,
     execute_import, write_report_files,
+};
+pub use logging::{
+    HarnessLogEvent, HarnessLogLevel, HarnessLogWrite, append_harness_log, current_log_time_ms,
+    harness_log_file, probe_harness_log_writable,
 };
 pub use prompt::{
     PromptAssemblyOptions, PromptBundle, PromptBundleFiles, PromptBundleSummary, PromptSection,

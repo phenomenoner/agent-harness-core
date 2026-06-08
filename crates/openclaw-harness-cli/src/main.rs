@@ -3,19 +3,21 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use openclaw_harness_core::{
-    AgentRegistry, ChannelCommandApplyOptions, ChannelCommandApplyReport, ChannelReceiveOptions,
+    ActivationReadinessOptions, ActivationReadinessReport, AgentRegistry,
+    ChannelCommandApplyOptions, ChannelCommandApplyReport, ChannelReceiveOptions,
     ChannelReceiveReport, ChannelStep, CodexRuntimeCompletionOptions, CodexRuntimeCompletionReport,
     CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReport, CodexRuntimePlanOptions,
     CodexRuntimePlanReport, CodexRuntimePreflightOptions, CodexRuntimePreflightReport,
     ConflictPolicy, DeterministicCronPlan, DeterministicCronPlanInput, DryRunImportOptions,
-    ExecuteImportOptions, ImportPhaseStatus, ImportReport, NativeCronPlan, NativeCronPlanInput,
-    OpenClawSource, PromptAssemblyOptions, PromptBundle, RuntimeQueueEnqueueOptions,
-    RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, SkillIndex,
-    SkillSelectionQuery, SubagentPlan, SubagentPlanInput, TurnPlan, TurnPlanInput,
-    apply_channel_command_step, assemble_prompt_bundle, build_channel_step, build_dry_run_report,
-    build_harness_skill_index, build_import_plan, build_source_skill_index, build_turn_plan,
-    enqueue_channel_step, execute_import, export_harness_registry_files, inventory,
-    load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
+    ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel, ImportPhaseStatus, ImportReport,
+    NativeCronPlan, NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions, PromptBundle,
+    RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions,
+    RuntimeQueuePrepareReport, SkillIndex, SkillSelectionQuery, SubagentPlan, SubagentPlanInput,
+    TurnPlan, TurnPlanInput, append_harness_log, apply_channel_command_step,
+    assemble_prompt_bundle, build_channel_step, build_dry_run_report, build_harness_skill_index,
+    build_import_plan, build_source_skill_index, build_turn_plan, check_activation_readiness,
+    current_log_time_ms, enqueue_channel_step, execute_import, export_harness_registry_files,
+    inventory, load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
     load_subagent_ledger, plan_codex_runtime, plan_deterministic_cron, plan_native_cron,
     plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
     probe_codex_runtime_launch, receive_channel_message, record_codex_runtime_completion,
@@ -36,6 +38,7 @@ fn main() {
         "import-execute" => run_import_execute(&rest),
         "registry" => run_registry(&rest),
         "registry-export" => run_registry_export(&rest),
+        "enable-check" => run_enable_check(&rest),
         "skills" => run_skills(&rest),
         "turn-plan" => run_turn_plan(&rest),
         "channel-step" => run_channel_step(&rest),
@@ -213,6 +216,38 @@ fn run_registry_export(args: &[String]) -> Result<(), String> {
         );
     }
 
+    Ok(())
+}
+
+fn run_enable_check(args: &[String]) -> Result<(), String> {
+    let args = enable_check_args_from_args(args)?;
+    let report = check_activation_readiness(ActivationReadinessOptions {
+        harness_home: args.target_home.clone(),
+    })
+    .map_err(|err| err.to_string())?;
+    append_harness_log(
+        &args.target_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            if report.ready {
+                HarnessLogLevel::Info
+            } else {
+                HarnessLogLevel::Warn
+            },
+            "activation",
+            "activation.enable-check",
+            format!(
+                "ready={} passed={} warnings={} failed={}",
+                yes_no(report.ready),
+                report.summary.passed,
+                report.summary.warnings,
+                report.summary.failed
+            ),
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+
+    print_activation_readiness_report(&report);
     Ok(())
 }
 
@@ -664,6 +699,10 @@ struct RegistryExportArgs {
     conflict_policy: ConflictPolicy,
 }
 
+struct EnableCheckArgs {
+    target_home: PathBuf,
+}
+
 struct SkillsArgs {
     source: OpenClawSource,
     harness_home: Option<PathBuf>,
@@ -928,6 +967,27 @@ fn registry_export_args_from_args(args: &[String]) -> Result<RegistryExportArgs,
         target_home,
         conflict_policy,
     })
+}
+
+fn enable_check_args_from_args(args: &[String]) -> Result<EnableCheckArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target-home" => {
+                i += 1;
+                target_home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(EnableCheckArgs { target_home })
 }
 
 fn skills_args_from_args(args: &[String]) -> Result<SkillsArgs, String> {
@@ -1953,6 +2013,25 @@ fn print_skill_index(index: &SkillIndex) {
     }
 }
 
+fn print_activation_readiness_report(report: &ActivationReadinessReport) {
+    println!("OpenClaw harness enable check");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Ready: {}", yes_no(report.ready));
+    println!(
+        "Checks: passed={} warnings={} failed={}",
+        report.summary.passed, report.summary.warnings, report.summary.failed
+    );
+    println!();
+    println!("Findings:");
+    for status_name in ["Fail", "Warn", "Pass"] {
+        for check in &report.checks {
+            if format!("{:?}", check.status) == status_name {
+                println!("- {:?} {}: {}", check.status, check.name, check.detail);
+            }
+        }
+    }
+}
+
 fn print_turn_plan(plan: &TurnPlan) {
     println!("OpenClaw turn plan");
     println!("Dispatch: {:?}", plan.dispatch);
@@ -2567,6 +2646,7 @@ fn print_help() {
     println!("  import-execute  Copy planned non-sensitive state and write receipts");
     println!("  registry        Inspect parsed multi-agent registry state");
     println!("  registry-export Write target harness registry state");
+    println!("  enable-check    Check formal activation readiness and log writability");
     println!("  skills          Build a skill-first index and optionally match a task");
     println!("  turn-plan       Plan routing, commands, prompts, and skills for one turn");
     println!("  channel-step    Plan shared channel reply or agent dispatch for one DM");

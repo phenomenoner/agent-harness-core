@@ -6,8 +6,9 @@ use serde::Serialize;
 
 use crate::{
     ChannelCommandApplyOptions, ChannelCommandApplyReport, ChannelOutboundMessage,
-    ChannelStepAction, OpenClawSource, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
-    SkillIndex, TurnPlanInput, apply_channel_command_step, build_channel_step, build_turn_plan,
+    ChannelStepAction, HarnessLogEvent, HarnessLogLevel, OpenClawSource,
+    RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, SkillIndex, TurnPlanInput,
+    append_harness_log, apply_channel_command_step, build_channel_step, build_turn_plan,
     enqueue_channel_step, load_agent_registry,
 };
 
@@ -164,6 +165,30 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
         reason,
     };
     append_json_line(&receipts_file, &receipt)?;
+    append_harness_log(
+        &options.harness_home,
+        &HarnessLogEvent::new(
+            options.now_ms,
+            match status {
+                ChannelReceiveStatus::CommandApplied | ChannelReceiveStatus::AgentTurnQueued => {
+                    HarnessLogLevel::Info
+                }
+                ChannelReceiveStatus::ErrorReplied => HarnessLogLevel::Warn,
+                ChannelReceiveStatus::Skipped => HarnessLogLevel::Debug,
+            },
+            "channel",
+            "channel.receive",
+            receipt.reason.clone(),
+        )
+        .queue_id(queue_id.clone())
+        .session_key(Some(step.session_key.clone()))
+        .agent_id(turn.agent.as_ref().map(|agent| agent.id.clone()))
+        .channel(
+            receipt.platform.clone(),
+            receipt.channel_id.clone(),
+            receipt.user_id.clone(),
+        ),
+    )?;
 
     Ok(ChannelReceiveReport {
         schema: CHANNEL_RECEIVE_SCHEMA,

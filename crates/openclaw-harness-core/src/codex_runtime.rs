@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::{HarnessLogEvent, HarnessLogLevel, append_harness_log, current_log_time_ms};
+
 const CODEX_RUNTIME_PLAN_SCHEMA: &str = "openclaw-harness.codex-runtime-plan.v1";
 const CODEX_RUNTIME_PREFLIGHT_SCHEMA: &str = "openclaw-harness.codex-runtime-preflight.v1";
 const CODEX_RUNTIME_LAUNCH_PROBE_SCHEMA: &str = "openclaw-harness.codex-runtime-launch-probe.v1";
@@ -716,6 +718,16 @@ pub fn record_codex_runtime_completion(
             reason: "no codex runtime plan found; run codex-plan first".to_string(),
         };
         append_json_line(&receipts_file, &receipt)?;
+        append_harness_log(
+            &options.harness_home,
+            &HarnessLogEvent::new(
+                current_log_time_ms()?,
+                HarnessLogLevel::Warn,
+                "codex-runtime",
+                "codex.complete.no-plan",
+                receipt.reason.clone(),
+            ),
+        )?;
         return Ok(CodexRuntimeCompletionReport {
             schema: CODEX_RUNTIME_COMPLETION_SCHEMA,
             harness_home: options.harness_home,
@@ -753,6 +765,20 @@ pub fn record_codex_runtime_completion(
                 reason: "codex runtime completion was already recorded".to_string(),
             };
             append_json_line(&receipts_file, &receipt)?;
+            append_harness_log(
+                &options.harness_home,
+                &HarnessLogEvent::new(
+                    current_log_time_ms()?,
+                    HarnessLogLevel::Info,
+                    "codex-runtime",
+                    "codex.complete.already-recorded",
+                    receipt.reason.clone(),
+                )
+                .queue_id(receipt.queue_id.clone())
+                .session_key(Some(plan.session_key.clone()))
+                .agent_id(plan.agent_id.clone())
+                .path(receipt.transcript_file.clone()),
+            )?;
             return Ok(CodexRuntimeCompletionReport {
                 schema: CODEX_RUNTIME_COMPLETION_SCHEMA,
                 harness_home: options.harness_home,
@@ -788,6 +814,20 @@ pub fn record_codex_runtime_completion(
         )?;
     }
     append_json_line(&receipts_file, &receipt)?;
+    append_harness_log(
+        &options.harness_home,
+        &HarnessLogEvent::new(
+            options.finished_at_ms,
+            HarnessLogLevel::Info,
+            "codex-runtime",
+            "codex.complete.recorded",
+            receipt.reason.clone(),
+        )
+        .queue_id(receipt.queue_id.clone())
+        .session_key(Some(plan.session_key.clone()))
+        .agent_id(plan.agent_id.clone())
+        .path(receipt.transcript_file.clone()),
+    )?;
 
     Ok(CodexRuntimeCompletionReport {
         schema: CODEX_RUNTIME_COMPLETION_SCHEMA,

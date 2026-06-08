@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    OpenClawSource, PromptAssemblyOptions, assemble_prompt_bundle, build_source_skill_index,
-    build_turn_plan, load_agent_registry, write_prompt_bundle,
+    HarnessLogEvent, HarnessLogLevel, OpenClawSource, PromptAssemblyOptions, append_harness_log,
+    assemble_prompt_bundle, build_source_skill_index, build_turn_plan, current_log_time_ms,
+    load_agent_registry, write_prompt_bundle,
 };
 
 const RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA: &str = "openclaw-harness.runtime-queue-prepare.v1";
@@ -105,6 +106,18 @@ pub fn prepare_runtime_queue_item(
             reason: "requested runtime queue item was already prepared".to_string(),
         };
         append_json_line(&execution_receipts_file, &receipt)?;
+        append_harness_log(
+            &options.harness_home,
+            &HarnessLogEvent::new(
+                current_log_time_ms()?,
+                HarnessLogLevel::Info,
+                "runtime-queue",
+                "queue.prepare.already-prepared",
+                receipt.reason.clone(),
+            )
+            .queue_id(receipt.queue_id.clone())
+            .path(receipt.execution_dir.clone()),
+        )?;
         return Ok(RuntimeQueuePrepareReport {
             schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
             harness_home: options.harness_home,
@@ -132,6 +145,17 @@ pub fn prepare_runtime_queue_item(
             reason: "no matching queued runtime item found".to_string(),
         };
         append_json_line(&execution_receipts_file, &receipt)?;
+        append_harness_log(
+            &options.harness_home,
+            &HarnessLogEvent::new(
+                current_log_time_ms()?,
+                HarnessLogLevel::Warn,
+                "runtime-queue",
+                "queue.prepare.no-pending",
+                receipt.reason.clone(),
+            )
+            .queue_id(receipt.queue_id.clone()),
+        )?;
         return Ok(RuntimeQueuePrepareReport {
             schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
             harness_home: options.harness_home,
@@ -203,6 +227,20 @@ pub fn prepare_runtime_queue_item(
     let receipt_json = serde_json::to_string_pretty(&receipt).map_err(io::Error::other)?;
     fs::write(&receipt_file, receipt_json)?;
     append_json_line(&execution_receipts_file, &receipt)?;
+    append_harness_log(
+        &options.harness_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms()?,
+            HarnessLogLevel::Info,
+            "runtime-queue",
+            "queue.prepare.prepared",
+            receipt.reason.clone(),
+        )
+        .queue_id(receipt.queue_id.clone())
+        .session_key(Some(item.session_key.clone()))
+        .agent_id(Some(item.agent_id.clone()))
+        .path(Some(item.execution_dir.clone())),
+    )?;
 
     Ok(RuntimeQueuePrepareReport {
         schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,

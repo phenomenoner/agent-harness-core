@@ -9,7 +9,9 @@ The project starts with a small, testable foundation:
 - A read-only importer dry-run report with Hermes-style conflict policy and receipts.
 - A read-only multi-agent registry parser for OpenClaw agents, providers, plugins, channels, and local agent state.
 - A target harness registry exporter that writes non-secret agent/provider/plugin/channel state with receipts.
+- An activation readiness checker that validates registry/channel/runtime/Codex/logging prerequisites before cutover.
 - A safe-copy import executor that copies planned non-sensitive state, skips raw secrets by default, backs up overwrite targets, and writes receipts.
+- A JSONL operational log at `state/logs/harness.jsonl` for activation checks, channel ingress, queue prepare, and Codex completion events.
 - A shared channel command parser and runtime-intent contract for OpenClaw-style DM commands.
 - A skill-first indexer and deterministic task matcher for imported or source OpenClaw skills.
 - A turn planner that maps one inbound channel message to command handling, agent/session/model routing, imported channel command state, prompt files, and selected skills.
@@ -26,7 +28,7 @@ The project starts with a small, testable foundation:
 - A native agent-turn cron parser and dry-run dispatch planner with cutover hold safety.
 - A deterministic cron parser and no-LLM dry-run planner for workspace cron runners.
 - A subagent ledger parser and dry-run planner for `/subagents/runs.json` cutover safety.
-- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `skills`, `turn-plan`, `channel-step`, `channel-apply`, `channel-receive`, `queue-enqueue`, `queue-prepare`, `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-complete`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
+- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `enable-check`, `skills`, `turn-plan`, `channel-step`, `channel-apply`, `channel-receive`, `queue-enqueue`, `queue-prepare`, `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-complete`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
 - Minimal external crates: `serde` and `serde_json` for stable report/config/session JSON handling.
 
 ## Quick Start
@@ -39,6 +41,7 @@ cargo run -p openclaw-harness-cli -- import-dry-run --openclaw-home C:\path\to\.
 cargo run -p openclaw-harness-cli -- import-execute --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --conflict skip
 cargo run -p openclaw-harness-cli -- registry --openclaw-home C:\path\to\.openclaw
 cargo run -p openclaw-harness-cli -- registry-export --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --conflict skip
+cargo run -p openclaw-harness-cli -- enable-check --target-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- skills --openclaw-home C:\path\to\.openclaw --query "repair memory cron" --agent mem-cron --limit 3
 cargo run -p openclaw-harness-cli -- skills --harness-home C:\path\to\.openclaw-harness --output imports\skills
 cargo run -p openclaw-harness-cli -- turn-plan --openclaw-home C:\path\to\.openclaw --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron"
@@ -77,6 +80,10 @@ The first importer command is intentionally read-only. `import-dry-run` produces
 The registry command is also read-only. It merges `openclaw.json` agent config with `/agents/<id>` directories and reports per-agent model/provider/workspace plus local session/auth/model state.
 
 `registry-export` writes the first target harness state files under `state/harness-registry.json` and `state/harness-registry-receipts.json`. It records credential presence as metadata only; it does not copy raw API keys, tokens, or login state.
+
+`enable-check` is the formal cutover readiness report. It checks the exported registry, enabled agents, Telegram/Discord token presence when those channels are enabled, provider credentials, plugin sidecar blockers, runtime queue receipts, channel outbox/state, Codex auth, memory-adapter status, and whether `state/logs/harness.jsonl` is writable. It appends an activation event to that log every time it runs.
+
+Runtime operations write an append-only JSONL operational log at `state/logs/harness.jsonl`. Current events include activation checks, `channel-receive`, `queue-prepare`, and `codex-complete`, with level, component, event name, message, queue id, session key, agent/channel ids, and relevant paths. This complements receipts and transcript/trajectory files and is the file to tail for monitoring/debugging once a long-running adapter is added.
 
 Telegram and Discord adapters should share the same channel command parser and intent mapper. Current parser coverage is `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`; `/model` maps to show-or-switch model intents, and `/status` maps to scoped or global status intents.
 
