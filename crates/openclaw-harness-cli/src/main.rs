@@ -4,26 +4,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use openclaw_harness_core::{
     ActivationReadinessOptions, ActivationReadinessReport, AgentRegistry,
-    ChannelCommandApplyOptions, ChannelCommandApplyReport, ChannelReceiveOptions,
-    ChannelReceiveReport, ChannelStep, CodexRuntimeCompletionOptions, CodexRuntimeCompletionReport,
-    CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReport, CodexRuntimePlanOptions,
-    CodexRuntimePlanReport, CodexRuntimePreflightOptions, CodexRuntimePreflightReport,
-    ConflictPolicy, DeterministicCronPlan, DeterministicCronPlanInput, DryRunImportOptions,
-    ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel, ImportPhaseStatus, ImportReport,
-    NativeCronPlan, NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions, PromptBundle,
+    BuiltinHarnessSkillSyncOptions, BuiltinHarnessSkillSyncReport, ChannelCommandApplyOptions,
+    ChannelCommandApplyReport, ChannelReceiveOptions, ChannelReceiveReport, ChannelStep,
+    CodexRuntimeCompletionOptions, CodexRuntimeCompletionReport, CodexRuntimeLaunchProbeOptions,
+    CodexRuntimeLaunchProbeReport, CodexRuntimePlanOptions, CodexRuntimePlanReport,
+    CodexRuntimePreflightOptions, CodexRuntimePreflightReport, ConflictPolicy,
+    DeterministicCronPlan, DeterministicCronPlanInput, DryRunImportOptions, ExecuteImportOptions,
+    HarnessLogEvent, HarnessLogLevel, ImportPhaseStatus, ImportReport, NativeCronPlan,
+    NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions, PromptBundle,
     RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions,
     RuntimeQueuePrepareReport, SkillIndex, SkillSelectionQuery, SubagentPlan, SubagentPlanInput,
     TurnPlan, TurnPlanInput, append_harness_log, apply_channel_command_step,
     assemble_prompt_bundle, build_channel_step, build_dry_run_report, build_harness_skill_index,
-    build_import_plan, build_source_skill_index, build_turn_plan, check_activation_readiness,
-    current_log_time_ms, enqueue_channel_step, execute_import, export_harness_registry_files,
-    inventory, load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
-    load_subagent_ledger, plan_codex_runtime, plan_deterministic_cron, plan_native_cron,
-    plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
+    build_import_plan, build_runtime_skill_index, build_source_skill_index, build_turn_plan,
+    check_activation_readiness, current_log_time_ms, enqueue_channel_step, execute_import,
+    export_harness_registry_files, inventory, load_agent_registry, load_deterministic_cron_store,
+    load_native_cron_store, load_subagent_ledger, plan_codex_runtime, plan_deterministic_cron,
+    plan_native_cron, plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
     probe_codex_runtime_launch, receive_channel_message, record_codex_runtime_completion,
-    select_skills, write_channel_step, write_deterministic_cron_plan, write_native_cron_plan,
-    write_prompt_bundle, write_report_files, write_skill_index, write_subagent_plan,
-    write_turn_plan,
+    select_skills, sync_builtin_harness_skills, write_channel_step, write_deterministic_cron_plan,
+    write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
+    write_subagent_plan, write_turn_plan,
 };
 
 fn main() {
@@ -39,6 +40,7 @@ fn main() {
         "registry" => run_registry(&rest),
         "registry-export" => run_registry_export(&rest),
         "enable-check" => run_enable_check(&rest),
+        "harness-skills-sync" => run_harness_skills_sync(&rest),
         "skills" => run_skills(&rest),
         "turn-plan" => run_turn_plan(&rest),
         "channel-step" => run_channel_step(&rest),
@@ -251,6 +253,18 @@ fn run_enable_check(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_harness_skills_sync(args: &[String]) -> Result<(), String> {
+    let args = harness_skills_sync_args_from_args(args)?;
+    let report = sync_builtin_harness_skills(BuiltinHarnessSkillSyncOptions {
+        harness_home: args.target_home,
+        force: args.force,
+    })
+    .map_err(|err| err.to_string())?;
+
+    print_builtin_harness_skill_sync_report(&report);
+    Ok(())
+}
+
 fn run_skills(args: &[String]) -> Result<(), String> {
     let args = skills_args_from_args(args)?;
     let index = match &args.harness_home {
@@ -298,7 +312,7 @@ fn run_turn_plan(args: &[String]) -> Result<(), String> {
     let args = turn_plan_args_from_args(args)?;
     let registry = load_agent_registry(&args.source).map_err(|err| err.to_string())?;
     let skill_index = match &args.harness_home {
-        Some(harness_home) => build_harness_skill_index(harness_home),
+        Some(harness_home) => build_runtime_skill_index(&args.source, harness_home),
         None => build_source_skill_index(&args.source),
     }
     .map_err(|err| err.to_string())?;
@@ -333,7 +347,7 @@ fn run_channel_step(args: &[String]) -> Result<(), String> {
     let args = turn_plan_args_from_args(args)?;
     let registry = load_agent_registry(&args.source).map_err(|err| err.to_string())?;
     let skill_index = match &args.harness_home {
-        Some(harness_home) => build_harness_skill_index(harness_home),
+        Some(harness_home) => build_runtime_skill_index(&args.source, harness_home),
         None => build_source_skill_index(&args.source),
     }
     .map_err(|err| err.to_string())?;
@@ -368,11 +382,8 @@ fn run_channel_step(args: &[String]) -> Result<(), String> {
 fn run_channel_apply(args: &[String]) -> Result<(), String> {
     let args = queue_enqueue_args_from_args(args)?;
     let registry = load_agent_registry(&args.turn.source).map_err(|err| err.to_string())?;
-    let skill_index = match &args.turn.harness_home {
-        Some(harness_home) => build_harness_skill_index(harness_home),
-        None => build_source_skill_index(&args.turn.source),
-    }
-    .map_err(|err| err.to_string())?;
+    let skill_index = build_runtime_skill_index(&args.turn.source, &args.target_home)
+        .map_err(|err| err.to_string())?;
     let plan = build_turn_plan(
         &args.turn.source,
         &registry,
@@ -405,11 +416,8 @@ fn run_channel_apply(args: &[String]) -> Result<(), String> {
 
 fn run_channel_receive(args: &[String]) -> Result<(), String> {
     let args = queue_enqueue_args_from_args(args)?;
-    let skill_index = match &args.turn.harness_home {
-        Some(harness_home) => build_harness_skill_index(harness_home),
-        None => build_source_skill_index(&args.turn.source),
-    }
-    .map_err(|err| err.to_string())?;
+    let skill_index = build_runtime_skill_index(&args.turn.source, &args.target_home)
+        .map_err(|err| err.to_string())?;
     let report = receive_channel_message(ChannelReceiveOptions {
         source: args.turn.source,
         harness_home: args.target_home,
@@ -432,11 +440,8 @@ fn run_channel_receive(args: &[String]) -> Result<(), String> {
 fn run_queue_enqueue(args: &[String]) -> Result<(), String> {
     let args = queue_enqueue_args_from_args(args)?;
     let registry = load_agent_registry(&args.turn.source).map_err(|err| err.to_string())?;
-    let skill_index = match &args.turn.harness_home {
-        Some(harness_home) => build_harness_skill_index(harness_home),
-        None => build_source_skill_index(&args.turn.source),
-    }
-    .map_err(|err| err.to_string())?;
+    let skill_index = build_runtime_skill_index(&args.turn.source, &args.target_home)
+        .map_err(|err| err.to_string())?;
     let plan = build_turn_plan(
         &args.turn.source,
         &registry,
@@ -470,11 +475,12 @@ fn run_queue_enqueue(args: &[String]) -> Result<(), String> {
 fn run_queue_prepare(args: &[String]) -> Result<(), String> {
     let args = queue_prepare_args_from_args(args)?;
     let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
-        harness_home: args.target_home,
+        harness_home: args.target_home.clone(),
         queue_id: args.queue_id,
         prompt_options: PromptAssemblyOptions {
             max_prompt_file_bytes: args.max_prompt_file_bytes,
             max_skill_file_bytes: args.max_skill_file_bytes,
+            harness_home: Some(args.target_home.clone()),
         },
     })
     .map_err(|err| err.to_string())?;
@@ -542,7 +548,7 @@ fn run_prompt_bundle(args: &[String]) -> Result<(), String> {
     let args = turn_plan_args_from_args(args)?;
     let registry = load_agent_registry(&args.source).map_err(|err| err.to_string())?;
     let skill_index = match &args.harness_home {
-        Some(harness_home) => build_harness_skill_index(harness_home),
+        Some(harness_home) => build_runtime_skill_index(&args.source, harness_home),
         None => build_source_skill_index(&args.source),
     }
     .map_err(|err| err.to_string())?;
@@ -567,6 +573,7 @@ fn run_prompt_bundle(args: &[String]) -> Result<(), String> {
         PromptAssemblyOptions {
             max_prompt_file_bytes: args.max_prompt_file_bytes,
             max_skill_file_bytes: args.max_skill_file_bytes,
+            harness_home: args.harness_home.clone(),
         },
     )
     .map_err(|err| err.to_string())?;
@@ -701,6 +708,11 @@ struct RegistryExportArgs {
 
 struct EnableCheckArgs {
     target_home: PathBuf,
+}
+
+struct HarnessSkillsSyncArgs {
+    target_home: PathBuf,
+    force: bool,
 }
 
 struct SkillsArgs {
@@ -988,6 +1000,29 @@ fn enable_check_args_from_args(args: &[String]) -> Result<EnableCheckArgs, Strin
     }
 
     Ok(EnableCheckArgs { target_home })
+}
+
+fn harness_skills_sync_args_from_args(args: &[String]) -> Result<HarnessSkillsSyncArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut force = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target-home" => {
+                i += 1;
+                target_home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+            }
+            "--force" => force = true,
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(HarnessSkillsSyncArgs { target_home, force })
 }
 
 fn skills_args_from_args(args: &[String]) -> Result<SkillsArgs, String> {
@@ -1992,6 +2027,10 @@ fn print_skill_index(index: &SkillIndex) {
         "Imported project .agents skills: {}",
         index.summary.imported_project_agent_skills
     );
+    println!(
+        "Harness builtin skills: {}",
+        index.summary.harness_builtin_skills
+    );
     println!("Skills with scripts: {}", index.summary.skills_with_scripts);
 
     if !index.skills.is_empty() {
@@ -2008,6 +2047,30 @@ fn print_skill_index(index: &SkillIndex) {
                 yes_no(skill.has_templates),
                 yes_no(skill.has_scripts),
                 yes_no(skill.has_assets),
+            );
+        }
+    }
+}
+
+fn print_builtin_harness_skill_sync_report(report: &BuiltinHarnessSkillSyncReport) {
+    println!("OpenClaw builtin harness skill sync");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Manifest: {}", report.manifest_file.display());
+    println!(
+        "Summary: written={} current={} skipped_user_modified={}",
+        report.summary.written,
+        report.summary.already_current,
+        report.summary.skipped_user_modified
+    );
+    if !report.receipts.is_empty() {
+        println!("Receipts:");
+        for receipt in &report.receipts {
+            println!(
+                "- {:?} {} {} ({})",
+                receipt.status,
+                receipt.skill_id,
+                receipt.path.display(),
+                receipt.reason
             );
         }
     }
@@ -2490,10 +2553,13 @@ fn print_prompt_bundle(bundle: &PromptBundle) {
         bundle.model.as_deref().unwrap_or("-")
     );
     println!(
-        "Sections: {} prompt_files={} skills={} user_messages={}",
+        "Sections: {} prompt_files={} reused_prompt_files={} skills={} reused_skills={} continuity={} user_messages={}",
         bundle.sections.len(),
         bundle.summary.prompt_files_included,
+        bundle.summary.prompt_files_reused,
         bundle.summary.skills_included,
+        bundle.summary.skills_reused,
+        bundle.summary.session_continuity_sections_included,
         bundle.summary.user_messages_included
     );
     println!("Bytes included: {}", bundle.summary.bytes_included);
@@ -2647,6 +2713,7 @@ fn print_help() {
     println!("  registry        Inspect parsed multi-agent registry state");
     println!("  registry-export Write target harness registry state");
     println!("  enable-check    Check formal activation readiness and log writability");
+    println!("  harness-skills-sync Sync bundled harness operation skills");
     println!("  skills          Build a skill-first index and optionally match a task");
     println!("  turn-plan       Plan routing, commands, prompts, and skills for one turn");
     println!("  channel-step    Plan shared channel reply or agent dispatch for one DM");
@@ -2668,6 +2735,7 @@ fn print_help() {
     println!("  --workspace <path>      Override workspace directory");
     println!("  --target-home <path>    Destination harness home for import/export commands");
     println!("  --harness-home <path>   Existing harness home for imported skill indexing");
+    println!("  --force                 Overwrite user-modified builtin harness skills");
     println!("  --conflict <policy>     skip, overwrite, or rename");
     println!("  --output <path>         Write report.json and summary.md");
     println!("  --include-sensitive     Copy raw sensitive files during import-execute");

@@ -1,17 +1,21 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{SKILL_FILE_NAME, TurnDispatch, TurnPlan};
 
 const PROMPT_BUNDLE_SCHEMA: &str = "openclaw-harness.prompt-bundle.v1";
+const PROMPT_INJECTION_LEDGER_SCHEMA: &str = "openclaw-harness.prompt-injection-ledger.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptAssemblyOptions {
     pub max_prompt_file_bytes: usize,
     pub max_skill_file_bytes: usize,
+    pub harness_home: Option<PathBuf>,
 }
 
 impl Default for PromptAssemblyOptions {
@@ -19,6 +23,7 @@ impl Default for PromptAssemblyOptions {
         Self {
             max_prompt_file_bytes: 64 * 1024,
             max_skill_file_bytes: 96 * 1024,
+            harness_home: None,
         }
     }
 }
@@ -41,8 +46,11 @@ pub struct PromptBundle {
 #[serde(rename_all = "camelCase")]
 pub struct PromptBundleSummary {
     pub prompt_files_included: usize,
+    pub prompt_files_reused: usize,
     pub channel_state_sections_included: usize,
     pub skills_included: usize,
+    pub skills_reused: usize,
+    pub session_continuity_sections_included: usize,
     pub user_messages_included: usize,
     pub bytes_included: usize,
     pub truncated_sections: usize,
@@ -65,6 +73,7 @@ pub struct PromptSection {
 pub enum PromptSectionKind {
     RuntimeContext,
     ChannelState,
+    SessionContinuity,
     PromptFile,
     Skill,
     UserMessage,
@@ -76,12 +85,50 @@ pub struct PromptBundleFiles {
     pub markdown: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptInjectionLedger {
+    schema: String,
+    session_key: String,
+    agent_id: Option<String>,
+    prompt_files: BTreeMap<String, PromptInjectionLedgerEntry>,
+    skills: BTreeMap<String, PromptInjectionLedgerEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptInjectionLedgerEntry {
+    id: String,
+    title: String,
+    path: PathBuf,
+    fingerprint: String,
+    injected_at_ms: i64,
+}
+
 pub fn assemble_prompt_bundle(
     plan: &TurnPlan,
     options: PromptAssemblyOptions,
 ) -> io::Result<PromptBundle> {
     let mut sections = Vec::new();
     let mut warnings = plan.warnings.clone();
+    let mut ledger_state = if plan.dispatch == TurnDispatch::AgentTurn {
+        options
+            .harness_home
+            .as_ref()
+            .map(|harness_home| {
+                load_prompt_injection_ledger(
+                    harness_home,
+                    plan.agent.as_ref().map(|agent| agent.id.as_str()),
+                    &plan.session_key,
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let mut reused_prompt_files = Vec::new();
+    let mut reused_skills = Vec::new();
+    let mut ledger_dirty = false;
 
     sections.push(runtime_context_section(plan));
     if let Some(state) = &plan.channel_state {
@@ -98,12 +145,34 @@ pub fn assemble_prompt_bundle(
             if !prompt_file.exists {
                 continue;
             }
+            let fingerprint = fingerprint_file(&prompt_file.path)?;
+            if let Some(state) = ledger_state.as_mut()
+                && let Some(entry) = state.ledger.prompt_files.get(&prompt_file.name)
+                && entry.fingerprint == fingerprint
+            {
+                state.summary.prompt_files_reused += 1;
+                reused_prompt_files.push(prompt_file.name.clone());
+                continue;
+            }
             sections.push(read_limited_section(
                 PromptSectionKind::PromptFile,
                 prompt_file.name.clone(),
                 &prompt_file.path,
                 options.max_prompt_file_bytes,
             )?);
+            if let Some(state) = ledger_state.as_mut() {
+                state.ledger.prompt_files.insert(
+                    prompt_file.name.clone(),
+                    PromptInjectionLedgerEntry {
+                        id: prompt_file.name.clone(),
+                        title: prompt_file.name.clone(),
+                        path: prompt_file.path.clone(),
+                        fingerprint,
+                        injected_at_ms: current_time_ms()?,
+                    },
+                );
+                ledger_dirty = true;
+            }
         }
 
         for skill in &plan.selected_skills {
@@ -117,12 +186,41 @@ pub fn assemble_prompt_bundle(
                 ));
                 continue;
             }
+            let fingerprint = fingerprint_file(&skill_file)?;
+            if let Some(state) = ledger_state.as_mut()
+                && let Some(entry) = state.ledger.skills.get(&skill.skill_id)
+                && entry.fingerprint == fingerprint
+            {
+                state.summary.skills_reused += 1;
+                reused_skills.push(skill.skill_id.clone());
+                continue;
+            }
             sections.push(read_limited_section(
                 PromptSectionKind::Skill,
                 format!("{} ({})", skill.title, skill.skill_id),
                 &skill_file,
                 options.max_skill_file_bytes,
             )?);
+            if let Some(state) = ledger_state.as_mut() {
+                state.ledger.skills.insert(
+                    skill.skill_id.clone(),
+                    PromptInjectionLedgerEntry {
+                        id: skill.skill_id.clone(),
+                        title: skill.title.clone(),
+                        path: skill_file,
+                        fingerprint,
+                        injected_at_ms: current_time_ms()?,
+                    },
+                );
+                ledger_dirty = true;
+            }
+        }
+
+        if !reused_prompt_files.is_empty() || !reused_skills.is_empty() {
+            sections.push(session_continuity_section(
+                &reused_prompt_files,
+                &reused_skills,
+            ));
         }
 
         sections.push(PromptSection {
@@ -136,7 +234,17 @@ pub fn assemble_prompt_bundle(
         });
     }
 
-    let summary = summarize_sections(&sections);
+    if let Some(state) = &ledger_state
+        && ledger_dirty
+    {
+        write_prompt_injection_ledger(&state.path, &state.ledger)?;
+    }
+
+    let mut summary = summarize_sections(&sections);
+    if let Some(state) = ledger_state {
+        summary.prompt_files_reused = state.summary.prompt_files_reused;
+        summary.skills_reused = state.summary.skills_reused;
+    }
     Ok(PromptBundle {
         schema: PROMPT_BUNDLE_SCHEMA,
         dispatch: plan.dispatch,
@@ -231,6 +339,43 @@ fn channel_state_section(state: &crate::ChannelSessionState) -> PromptSection {
     }
 }
 
+fn session_continuity_section(prompt_files: &[String], skills: &[String]) -> PromptSection {
+    let mut content = String::new();
+    content.push_str("strategy: codex-session-continuity\n");
+    content.push_str("system_prompt_owner: codex-cli\n");
+    content.push_str("tool_schema_owner: codex-cli\n");
+    content.push_str(
+        "note: OpenClaw prompt files and skills listed here were already injected for this session with matching fingerprints. This bundle avoids repeating same-session context and expects the Codex backend session to retain prior context.\n",
+    );
+    content.push_str("reused_prompt_files:\n");
+    if prompt_files.is_empty() {
+        content.push_str("- -\n");
+    } else {
+        for name in prompt_files {
+            content.push_str(&format!("- {name}\n"));
+        }
+    }
+    content.push_str("reused_skills:\n");
+    if skills.is_empty() {
+        content.push_str("- -\n");
+    } else {
+        for skill in skills {
+            content.push_str(&format!("- {skill}\n"));
+        }
+    }
+
+    let bytes = content.len();
+    PromptSection {
+        kind: PromptSectionKind::SessionContinuity,
+        title: "Codex session continuity".to_string(),
+        path: None,
+        bytes_original: bytes,
+        bytes_included: bytes,
+        truncated: false,
+        content,
+    }
+}
+
 fn push_notes(out: &mut String, label: &str, notes: &[crate::ChannelSessionNote]) {
     out.push_str(&format!("{label}_notes_recent:\n"));
     if notes.is_empty() {
@@ -270,6 +415,9 @@ fn summarize_sections(sections: &[PromptSection]) -> PromptBundleSummary {
         match section.kind {
             PromptSectionKind::RuntimeContext => {}
             PromptSectionKind::ChannelState => summary.channel_state_sections_included += 1,
+            PromptSectionKind::SessionContinuity => {
+                summary.session_continuity_sections_included += 1;
+            }
             PromptSectionKind::PromptFile => summary.prompt_files_included += 1,
             PromptSectionKind::Skill => summary.skills_included += 1,
             PromptSectionKind::UserMessage => summary.user_messages_included += 1,
@@ -301,10 +449,22 @@ fn render_prompt_markdown(bundle: &PromptBundle) -> String {
         bundle.summary.prompt_files_included
     ));
     out.push_str(&format!(
+        "- Reused prompt files: `{}`\n",
+        bundle.summary.prompt_files_reused
+    ));
+    out.push_str(&format!(
         "- Channel state sections: `{}`\n",
         bundle.summary.channel_state_sections_included
     ));
     out.push_str(&format!("- Skills: `{}`\n", bundle.summary.skills_included));
+    out.push_str(&format!(
+        "- Reused skills: `{}`\n",
+        bundle.summary.skills_reused
+    ));
+    out.push_str(&format!(
+        "- Session continuity sections: `{}`\n",
+        bundle.summary.session_continuity_sections_included
+    ));
     out.push_str(&format!(
         "- Truncated sections: `{}`\n\n",
         bundle.summary.truncated_sections
@@ -340,6 +500,106 @@ fn render_prompt_markdown(bundle: &PromptBundle) -> String {
 
 fn escape_markdown_line(value: &str) -> String {
     value.replace('|', "\\|")
+}
+
+struct PromptInjectionLedgerState {
+    path: PathBuf,
+    ledger: PromptInjectionLedger,
+    summary: PromptBundleSummary,
+}
+
+fn load_prompt_injection_ledger(
+    harness_home: &Path,
+    agent_id: Option<&str>,
+    session_key: &str,
+) -> io::Result<PromptInjectionLedgerState> {
+    let path = prompt_injection_ledger_file(harness_home, agent_id, session_key);
+    let ledger = if path.is_file() {
+        let bytes = fs::read(&path)?;
+        serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            empty_prompt_injection_ledger(
+                agent_id.map(ToString::to_string),
+                session_key.to_string(),
+            )
+        })
+    } else {
+        empty_prompt_injection_ledger(agent_id.map(ToString::to_string), session_key.to_string())
+    };
+    Ok(PromptInjectionLedgerState {
+        path,
+        ledger,
+        summary: PromptBundleSummary::default(),
+    })
+}
+
+fn empty_prompt_injection_ledger(
+    agent_id: Option<String>,
+    session_key: String,
+) -> PromptInjectionLedger {
+    PromptInjectionLedger {
+        schema: PROMPT_INJECTION_LEDGER_SCHEMA.to_string(),
+        session_key,
+        agent_id,
+        prompt_files: BTreeMap::new(),
+        skills: BTreeMap::new(),
+    }
+}
+
+fn write_prompt_injection_ledger(path: &Path, ledger: &PromptInjectionLedger) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string_pretty(ledger).map_err(io::Error::other)?;
+    fs::write(path, text)
+}
+
+fn prompt_injection_ledger_file(
+    harness_home: &Path,
+    agent_id: Option<&str>,
+    session_key: &str,
+) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("prompt-injection-ledgers")
+        .join(normalize_key_part(agent_id.unwrap_or("unassigned")))
+        .join(format!("{}.json", normalize_key_part(session_key)))
+}
+
+fn fingerprint_file(path: &Path) -> io::Result<String> {
+    let bytes = fs::read(path)?;
+    Ok(format!("fnv1a64:{:016x}:{}", fnv1a64(&bytes), bytes.len()))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn current_time_ms() -> io::Result<i64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?;
+    Ok(duration.as_millis().try_into().unwrap_or(i64::MAX))
+}
+
+fn normalize_key_part(value: &str) -> String {
+    let mut normalized = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            normalized.push(ch.to_ascii_lowercase());
+        } else {
+            normalized.push('_');
+        }
+    }
+    if normalized.is_empty() {
+        "unknown".to_string()
+    } else {
+        normalized
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +691,7 @@ mod tests {
             PromptAssemblyOptions {
                 max_prompt_file_bytes: 3,
                 max_skill_file_bytes: 4,
+                harness_home: None,
             },
         )
         .unwrap();
@@ -510,6 +771,60 @@ mod tests {
             section.kind == PromptSectionKind::ChannelState
                 && section.content.contains("keep migration notes explicit")
                 && section.content.contains("user prefers Codex OAuth")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prompt_bundle_reuses_same_session_injections() {
+        let root = temp_root("prompt_bundle_reuses_same_session_injections");
+        let source = write_prompt_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let input = TurnPlanInput {
+            harness_home: Some(harness_home.clone()),
+            platform: "telegram".to_string(),
+            channel_id: "dm".to_string(),
+            user_id: "user".to_string(),
+            text: "repair memory cron".to_string(),
+            requested_agent_id: Some("main".to_string()),
+            session_hint: Some("telegram:dm:user:main".to_string()),
+            skill_limit: 3,
+        };
+        let first_plan = build_turn_plan(&source, &registry, &skills, input.clone()).unwrap();
+        let first = assemble_prompt_bundle(
+            &first_plan,
+            PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(first.summary.prompt_files_included, 2);
+        assert_eq!(first.summary.skills_included, 1);
+        assert_eq!(first.summary.prompt_files_reused, 0);
+        assert_eq!(first.summary.skills_reused, 0);
+
+        let second_plan = build_turn_plan(&source, &registry, &skills, input).unwrap();
+        let second = assemble_prompt_bundle(
+            &second_plan,
+            PromptAssemblyOptions {
+                harness_home: Some(harness_home),
+                ..PromptAssemblyOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(second.summary.prompt_files_included, 0);
+        assert_eq!(second.summary.skills_included, 0);
+        assert_eq!(second.summary.prompt_files_reused, 2);
+        assert_eq!(second.summary.skills_reused, 1);
+        assert_eq!(second.summary.session_continuity_sections_included, 1);
+        assert!(second.sections.iter().any(|section| {
+            section.kind == PromptSectionKind::SessionContinuity
+                && section.content.contains("codex-session-continuity")
         }));
 
         let _ = fs::remove_dir_all(root);

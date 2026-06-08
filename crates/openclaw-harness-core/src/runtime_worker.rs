@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::{
     HarnessLogEvent, HarnessLogLevel, OpenClawSource, PromptAssemblyOptions, append_harness_log,
-    assemble_prompt_bundle, build_source_skill_index, build_turn_plan, current_log_time_ms,
+    assemble_prompt_bundle, build_runtime_skill_index, build_turn_plan, current_log_time_ms,
     load_agent_registry, write_prompt_bundle,
 };
 
@@ -169,7 +169,7 @@ pub fn prepare_runtime_queue_item(
 
     let source = OpenClawSource::with_workspace(&pending.source_home, &pending.source_workspace);
     let registry = load_agent_registry(&source)?;
-    let skill_index = build_source_skill_index(&source)?;
+    let skill_index = build_runtime_skill_index(&source, &options.harness_home)?;
     let plan = build_turn_plan(
         &source,
         &registry,
@@ -196,7 +196,13 @@ pub fn prepare_runtime_queue_item(
             pending.selected_skill_ids, actual_skill_ids
         ));
     }
-    let bundle = assemble_prompt_bundle(&plan, options.prompt_options)?;
+    let bundle = assemble_prompt_bundle(
+        &plan,
+        PromptAssemblyOptions {
+            harness_home: Some(options.harness_home.clone()),
+            ..options.prompt_options
+        },
+    )?;
 
     let execution_dir = queue_execution_dir(&options.harness_home, &pending.queue_id);
     fs::create_dir_all(&execution_dir)?;
@@ -431,8 +437,8 @@ fn normalize_key_part(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
-        RuntimeQueueEnqueueOptions, TurnPlanInput, build_channel_step, build_turn_plan,
-        enqueue_channel_step,
+        RuntimeQueueEnqueueOptions, TurnPlanInput, build_channel_step, build_source_skill_index,
+        build_turn_plan, enqueue_channel_step,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 

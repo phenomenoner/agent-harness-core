@@ -9,6 +9,7 @@ use crate::{OpenClawSource, SKILL_FILE_NAME};
 
 const SKILL_INDEX_SCHEMA: &str = "openclaw-harness.skill-index.v1";
 const IMPORTED_SKILL_NAMESPACE: &str = "openclaw-imports";
+pub const HARNESS_BUILTIN_SKILL_NAMESPACE: &str = "openclaw-harness-core";
 const MAX_KEYWORDS: usize = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -16,6 +17,7 @@ const MAX_KEYWORDS: usize = 80;
 pub enum SkillIndexOrigin {
     OpenClawSource,
     HarnessImport,
+    RuntimeMerged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -27,6 +29,7 @@ pub enum SkillSourceKind {
     ImportedWorkspace,
     ImportedManaged,
     ImportedProjectAgent,
+    HarnessBuiltin,
 }
 
 impl SkillSourceKind {
@@ -38,6 +41,7 @@ impl SkillSourceKind {
             SkillSourceKind::ImportedWorkspace => "imported-workspace",
             SkillSourceKind::ImportedManaged => "imported-managed",
             SkillSourceKind::ImportedProjectAgent => "imported-project-agent",
+            SkillSourceKind::HarnessBuiltin => "harness-builtin",
         }
     }
 }
@@ -64,6 +68,7 @@ pub struct SkillIndexSummary {
     pub imported_workspace_skills: usize,
     pub imported_managed_skills: usize,
     pub imported_project_agent_skills: usize,
+    pub harness_builtin_skills: usize,
     pub skills_with_references: usize,
     pub skills_with_templates: usize,
     pub skills_with_scripts: usize,
@@ -148,6 +153,9 @@ pub fn build_source_skill_index(source: &OpenClawSource) -> io::Result<SkillInde
 pub fn build_harness_skill_index(harness_home: impl AsRef<Path>) -> io::Result<SkillIndex> {
     let harness_home = harness_home.as_ref();
     let imported_root = harness_home.join("skills").join(IMPORTED_SKILL_NAMESPACE);
+    let builtin_root = harness_home
+        .join("skills")
+        .join(HARNESS_BUILTIN_SKILL_NAMESPACE);
     let mut skills = Vec::new();
     add_skill_root(
         &mut skills,
@@ -164,6 +172,7 @@ pub fn build_harness_skill_index(harness_home: impl AsRef<Path>) -> io::Result<S
         SkillSourceKind::ImportedProjectAgent,
         &imported_root.join("project-agents"),
     )?;
+    add_skill_root(&mut skills, SkillSourceKind::HarnessBuiltin, &builtin_root)?;
     skills.sort_by(|left, right| left.id.cmp(&right.id));
 
     Ok(SkillIndex {
@@ -171,6 +180,29 @@ pub fn build_harness_skill_index(harness_home: impl AsRef<Path>) -> io::Result<S
         origin: SkillIndexOrigin::HarnessImport,
         source_home: None,
         source_workspace: None,
+        harness_home: Some(harness_home.to_path_buf()),
+        summary: summarize_skills(&skills),
+        skills,
+    })
+}
+
+pub fn build_runtime_skill_index(
+    source: &OpenClawSource,
+    harness_home: impl AsRef<Path>,
+) -> io::Result<SkillIndex> {
+    let harness_home = harness_home.as_ref();
+    let mut source_index = build_source_skill_index(source)?;
+    let harness_index = build_harness_skill_index(harness_home)?;
+    source_index.skills.extend(harness_index.skills);
+    source_index
+        .skills
+        .sort_by(|left, right| left.id.cmp(&right.id));
+    let skills = source_index.skills;
+    Ok(SkillIndex {
+        schema: SKILL_INDEX_SCHEMA,
+        origin: SkillIndexOrigin::RuntimeMerged,
+        source_home: Some(source.home.clone()),
+        source_workspace: Some(source.workspace.clone()),
         harness_home: Some(harness_home.to_path_buf()),
         summary: summarize_skills(&skills),
         skills,
@@ -523,6 +555,7 @@ fn summarize_skills(skills: &[SkillRecord]) -> SkillIndexSummary {
             SkillSourceKind::ImportedWorkspace => summary.imported_workspace_skills += 1,
             SkillSourceKind::ImportedManaged => summary.imported_managed_skills += 1,
             SkillSourceKind::ImportedProjectAgent => summary.imported_project_agent_skills += 1,
+            SkillSourceKind::HarnessBuiltin => summary.harness_builtin_skills += 1,
         }
         if skill.has_references {
             summary.skills_with_references += 1;
@@ -639,6 +672,83 @@ mod tests {
         assert_eq!(index.summary.total_skills, 1);
         assert_eq!(index.summary.imported_project_agent_skills, 1);
         assert_eq!(index.skills[0].id, "imported-project-agent:handoff");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn harness_skill_index_discovers_builtin_namespace() {
+        let root = temp_root("harness_skill_index_discovers_builtin_namespace");
+        let harness_home = root.join("harness-home");
+        let builtin_skill = harness_home
+            .join("skills")
+            .join(HARNESS_BUILTIN_SKILL_NAMESPACE)
+            .join("openclaw-windows-harness");
+        fs::create_dir_all(&builtin_skill).unwrap();
+        fs::write(
+            builtin_skill.join(SKILL_FILE_NAME),
+            "# OpenClaw Windows Harness\n\nOperate the Rust harness.",
+        )
+        .unwrap();
+
+        let index = build_harness_skill_index(&harness_home).unwrap();
+
+        assert_eq!(index.summary.total_skills, 1);
+        assert_eq!(index.summary.harness_builtin_skills, 1);
+        assert_eq!(
+            index.skills[0].id,
+            "harness-builtin:openclaw-windows-harness"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_skill_index_merges_source_and_harness_skills() {
+        let root = temp_root("runtime_skill_index_merges_source_and_harness_skills");
+        let home = root.join(".openclaw");
+        let workspace = home.join("workspace");
+        let workspace_skill = workspace.join("skills").join("memory-cron");
+        let harness_home = root.join("harness-home");
+        let builtin_skill = harness_home
+            .join("skills")
+            .join(HARNESS_BUILTIN_SKILL_NAMESPACE)
+            .join("openclaw-windows-harness");
+        fs::create_dir_all(&workspace_skill).unwrap();
+        fs::create_dir_all(&builtin_skill).unwrap();
+        fs::write(
+            workspace_skill.join(SKILL_FILE_NAME),
+            "# Memory Cron\n\nRepair openclaw-mem jobs.",
+        )
+        .unwrap();
+        fs::write(
+            builtin_skill.join(SKILL_FILE_NAME),
+            "# OpenClaw Windows Harness\n\nOperate Telegram and Discord handoff.",
+        )
+        .unwrap();
+
+        let index = build_runtime_skill_index(
+            &OpenClawSource::with_workspace(&home, &workspace),
+            &harness_home,
+        )
+        .unwrap();
+
+        assert_eq!(index.origin, SkillIndexOrigin::RuntimeMerged);
+        assert_eq!(index.summary.total_skills, 2);
+        assert_eq!(index.summary.workspace_skills, 1);
+        assert_eq!(index.summary.harness_builtin_skills, 1);
+        assert!(
+            index
+                .skills
+                .iter()
+                .any(|skill| skill.id == "workspace:memory-cron")
+        );
+        assert!(
+            index
+                .skills
+                .iter()
+                .any(|skill| skill.id == "harness-builtin:openclaw-windows-harness")
+        );
 
         let _ = fs::remove_dir_all(root);
     }

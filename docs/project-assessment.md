@@ -219,6 +219,7 @@ Required for a real cutover:
 6. Skill-first task context
    - Load skill metadata before prompt assembly.
    - Select relevant skills by task, agent id, channel, platform, and required tools.
+   - Ship harness operation guidance as bundled skills and sync them into the harness home with a manifest that preserves user edits.
    - Allow agents to propose new skills or patch existing skills after repeated procedures.
    - Treat executable skill snippets as reviewed code paths, not free-form prompt text.
 
@@ -285,11 +286,12 @@ Current implemented foundation:
 - `registry-export` writes the target harness registry state to `state/harness-registry.json` plus `state/harness-registry-receipts.json`, with conflict policy support and no raw secret migration.
 - `enable-check` produces the formal cutover readiness report across registry, enabled agents, Telegram/Discord tokens, provider credentials, plugin sidecar blockers, runtime receipts, channel state/outbox, Codex auth, memory-adapter status, and operational-log writability.
 - `state/logs/harness.jsonl` is the append-only operational log for activation checks and runtime events such as channel ingress, queue prepare, and Codex completion; receipts/transcripts remain separate audit artifacts.
+- `harness-skills-sync` seeds bundled harness operation skills under `skills/openclaw-harness-core/*` and tracks them with `.openclaw-harness-builtins.json`; user-modified skills are skipped unless `--force` is explicit.
 - The dry-run planner currently covers config, prompt files, skill directories, agent directories, native cron store, deterministic cron stores, subagent store, memory store, plugin install record, and plugin-state directory.
 - `import-execute` safe-copies planned prompt files, skills, agent directories, sessions, cron stores, subagent ledgers, memory snapshots, and plugin records; it skips raw sensitive items by default, omits known auth/secret files inside copied directories unless `--include-sensitive` is set, backs up overwrite targets, and writes `state/import-execute-receipts.json`.
 - Runtime execution, SQLite-consistent backup, Docker volume export, credential vault migration, and plugin execution are still pending.
 - A shared channel command parser and runtime-intent mapper exists for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`; `/model` covers show/switch model, and `/status` covers global/scoped status requests.
-- `skills` builds a skill-first index from source OpenClaw skill directories or an imported harness home, preserves skill metadata/capability flags, writes `skill-index.json`, and can deterministically rank skills for a task turn using query, agent, channel, and workspace hints.
+- `skills` builds a skill-first index from source OpenClaw skill directories or an imported harness home, preserves skill metadata/capability flags, writes `skill-index.json`, and can deterministically rank skills for a task turn using query, agent, channel, and workspace hints. Runtime turn planning uses a merged index across source, imported, and bundled harness skills.
 - `turn-plan` builds a runtime-facing dry-run plan for one inbound message: command-vs-agent dispatch, OpenClaw agent routing, channel command state inheritance, session key mapping, provider/model policy, prompt file availability, and selected skills before any model/tool execution.
 - `channel-step` builds the shared Telegram/Discord-style channel bridge contract for one inbound DM: command turns produce typed command effects plus outbound reply text, and ordinary messages produce an agent-turn dispatch envelope for the future runtime queue.
 - `channel-apply` persists command effects for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status` into per-channel state, command events, and command-apply receipts without invoking the model path.
@@ -297,12 +299,12 @@ Current implemented foundation:
 - `queue-enqueue` and `queue-prepare` read channel command state from the target harness home so active session keys, model overrides, and steering/think/btw notes survive into queued turns and prompt bundles.
 - `queue-prepare` uses prepared execution receipts as idempotence state: automatic selection skips already prepared queue ids, while explicit `--queue-id` requests return an `AlreadyPrepared` no-op receipt with the prior output paths.
 - `queue-enqueue` persists channel agent-turn dispatches to `state/runtime-queue/pending.jsonl`, appends receipts to `state/runtime-queue/receipts.jsonl`, and precomputes OpenClaw-compatible transcript/trajectory paths for the future Codex runtime worker.
-- `queue-prepare` reads pending runtime queue items, rebuilds turn context from queued source/workspace/session metadata, writes `prompt-bundle.json` plus `prompt.md` under `state/runtime-queue/executions/<queue-id>/`, and records execution receipts without invoking a model.
+- `queue-prepare` reads pending runtime queue items, rebuilds turn context from queued source/workspace/session metadata, writes `prompt-bundle.json` plus `prompt.md` under `state/runtime-queue/executions/<queue-id>/`, updates `state/prompt-injection-ledgers/<agent>/<session>.json`, and records execution receipts without invoking a model.
 - `codex-plan` reads a prepared runtime execution, writes `codex-runtime-plan.json` and `codex-runtime-receipt.json`, records the stdio `codex app-server` invocation contract, and maps outputs to OpenClaw-compatible transcript/trajectory/Codex binding files without starting the process.
 - `codex-preflight` reads a runtime plan and writes `codex-runtime-preflight.json` plus `codex-runtime-preflight-receipts.jsonl`, checking executable resolution, prompt file presence, output directory containment/writability, and provider credentials before process start. OpenAI/Codex routes accept either `OPENAI_API_KEY` or local Codex OAuth auth state; OpenRouter routes still require `OPENROUTER_API_KEY`.
 - `codex-launch-probe` re-runs preflight, starts the planned app-server process only when local gates pass, sends no prompt or JSON-RPC request, terminates the process after a short probe window, and records stdout/stderr log paths plus launch receipts.
 - `codex-complete` records assistant output to the planned OpenClaw-compatible transcript, trajectory, and Codex binding files with idempotent completion receipts; this gives the future app-server JSON-RPC adapter a deterministic output sink.
-- `prompt-bundle` consumes an agent turn plan and writes `prompt-bundle.json` plus `prompt.md` containing runtime context, imported prompt file bodies, selected `SKILL.md` bodies, and the inbound message with byte caps.
+- `prompt-bundle` consumes an agent turn plan and writes `prompt-bundle.json` plus `prompt.md` containing runtime context, imported prompt file bodies, selected `SKILL.md` bodies, Codex session-continuity notes, and the inbound message with byte caps. The harness does not own Codex system prompt or tool schemas; those stay inside Codex CLI/app-server.
 - `cron-plan` parses OpenClaw native agent-turn cron jobs/state and produces a dry-run dispatch plan with cutover hold safety; it validates agent ids, extracts cron payload text when possible, classifies due `at` jobs, and registers cron expressions for future scheduler evaluation without firing anything.
 - `deterministic-cron-plan` parses workspace `tools/cron-runner` and `tools/backup-cron-runner` crontabs, resolves deterministic `jobs/*` scripts, classifies Windows shell compatibility and missing scripts, and preserves `llmAccessAllowed=false` throughout the dry-run plan.
 - `subagent-plan` parses `.openclaw/subagents/runs.json`, summarizes queued/running/completed/failed/canceled/unknown runs, holds queued/running work at cutover by default, and only marks them as resume candidates when `--resume-subagents` is explicitly set.
@@ -332,6 +334,8 @@ Current implemented foundation:
 - Import skill directories from workspace, OpenClaw home, and `.agents/skills`.
 - Build a skill metadata index and deterministic task matcher.
 - Add selected-skill full-body/reference loading for prompt assembly.
+- Keep bundled harness operation skills synced into the target harness home and selectable by runtime turns.
+- Use a prompt injection ledger so prompt files and skill bodies are injected once per unchanged session fingerprint.
 - Add skill conflict modes: skip, overwrite with backup, and rename.
 - Add skill lint/security checks for scripts, shell snippets, and platform constraints.
 - Add agent-managed skill create/patch/archive receipts.

@@ -11,6 +11,7 @@ pub mod codex_runtime;
 pub mod cron;
 pub mod deterministic_cron;
 pub mod harness_registry;
+pub mod harness_skills;
 pub mod importer;
 pub mod logging;
 pub mod prompt;
@@ -72,6 +73,11 @@ pub use harness_registry::{
     HarnessRegistryReceiptKind, HarnessRegistryReceiptStatus, build_harness_registry,
     export_harness_registry_files,
 };
+pub use harness_skills::{
+    BuiltinHarnessSkillSyncOptions, BuiltinHarnessSkillSyncReceipt, BuiltinHarnessSkillSyncReport,
+    BuiltinHarnessSkillSyncStatus, BuiltinHarnessSkillSyncSummary,
+    builtin_harness_skill_manifest_file, sync_builtin_harness_skills,
+};
 pub use importer::{
     ConfigSemantics, ConflictPolicy, DryRunImportOptions, ExecuteImportOptions, ImportAction,
     ImportExecuteReceipt, ImportExecuteReport, ImportExecuteStatus, ImportExecuteSummary,
@@ -101,9 +107,10 @@ pub use runtime_worker::{
     RuntimeQueuePrepareReport, RuntimeQueuePreparedItem, prepare_runtime_queue_item,
 };
 pub use skills::{
-    SkillIndex, SkillIndexFile, SkillIndexOrigin, SkillIndexSummary, SkillRecord, SkillSelection,
-    SkillSelectionQuery, SkillSourceKind, build_harness_skill_index, build_source_skill_index,
-    select_skills, write_skill_index,
+    HARNESS_BUILTIN_SKILL_NAMESPACE, SkillIndex, SkillIndexFile, SkillIndexOrigin,
+    SkillIndexSummary, SkillRecord, SkillSelection, SkillSelectionQuery, SkillSourceKind,
+    build_harness_skill_index, build_runtime_skill_index, build_source_skill_index, select_skills,
+    write_skill_index,
 };
 pub use subagents::{
     SubagentLedger, SubagentLedgerSummary, SubagentPlan, SubagentPlanAction, SubagentPlanEntry,
