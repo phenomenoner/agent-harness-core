@@ -38,13 +38,14 @@ Use it when the user mentions:
 
 ## Operating Lead
 
-1. Treat the harness as the orchestrator and Codex CLI as the model/tool runtime.
-2. Preserve OpenClaw state shape where possible: source workspace, prompt files, agent registry, sessions, memory files, cron state, plugin state, and receipts.
-3. Prefer dry-run, receipt, and append-only JSONL records before irreversible handoff.
-4. Keep deterministic cron off the LLM path. Agent-turn cron may enqueue runtime work.
-5. Keep Telegram and Discord session keys stable: platform, channel id, user id, and agent id determine continuity unless /new changes it.
-6. Keep multi-agent readiness intact. Do not collapse imported agents into a single default agent.
-7. Treat credentials as best-effort imports. Codex OAuth is preferred for Codex models; API keys may be provider-specific and model-limited.
+1. Treat this skill as the versioned harness runbook. Check it before relying on older docs or session memory.
+2. Treat the harness as the orchestrator and Codex CLI as the model/tool runtime.
+3. Preserve OpenClaw state shape where possible: source workspace, prompt files, agent registry, sessions, memory files, cron state, plugin state, and receipts.
+4. Prefer dry-run, receipt, and append-only JSONL records before irreversible handoff.
+5. Keep deterministic cron off the LLM path. Agent-turn cron may enqueue runtime work.
+6. Keep Telegram and Discord session keys stable: platform, channel id, user id, and agent id determine continuity unless /new changes it.
+7. Keep multi-agent readiness intact. Do not collapse imported agents into a single default agent.
+8. Treat credentials as best-effort imports. Codex OAuth is preferred for Codex models; API keys may be provider-specific and model-limited.
 
 ## Prompt And Tool Schema Policy
 
@@ -87,7 +88,20 @@ Before replacing the Docker OpenClaw gateway:
 5. Run activation readiness checks.
 6. Confirm logs are written to state/logs/harness.jsonl.
 7. Smoke-test a Telegram or Discord command message.
-8. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, and completion receipt.
+8. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt.
+
+## Codex Runtime Flow
+
+For one prepared turn, the current safe path is:
+
+1. channel-receive for an incoming Telegram/Discord-style message.
+2. queue-prepare to assemble prompt-bundle.json and prompt.md.
+3. codex-plan to write the app-server invocation contract.
+4. codex-preflight to check executable, prompt files, output paths, and auth.
+5. codex-launch-probe if process startup needs verification without a model request.
+6. codex-run to send the prepared OpenClaw payload to Codex app-server, capture assistant deltas, and write transcript/trajectory/Codex binding outputs.
+
+codex-run writes raw app-server stdout/stderr logs under the execution directory and appends operational events to state/logs/harness.jsonl. If a completion receipt already exists, codex-run must skip the model request and return the recorded completion state.
 
 ## Skill Maintenance Loop
 

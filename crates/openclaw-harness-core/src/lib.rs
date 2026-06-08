@@ -51,8 +51,10 @@ pub use codex_runtime::{
     CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimePreflightCheck,
     CodexRuntimePreflightCheckStatus, CodexRuntimePreflightOptions, CodexRuntimePreflightReceipt,
     CodexRuntimePreflightReport, CodexRuntimePreflightStatus, CodexRuntimeReceipt,
-    CodexRuntimeReceiptStatus, CodexTransportPlan, plan_codex_runtime, preflight_codex_runtime,
-    probe_codex_runtime_launch, record_codex_runtime_completion,
+    CodexRuntimeReceiptStatus, CodexRuntimeRunOptions, CodexRuntimeRunReceipt,
+    CodexRuntimeRunReport, CodexRuntimeRunStatus, CodexTransportPlan, plan_codex_runtime,
+    preflight_codex_runtime, probe_codex_runtime_launch, record_codex_runtime_completion,
+    run_codex_runtime,
 };
 pub use cron::{
     NativeCronJob, NativeCronJobState, NativeCronPlan, NativeCronPlanAction, NativeCronPlanEntry,

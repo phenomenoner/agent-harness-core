@@ -8,23 +8,24 @@ use openclaw_harness_core::{
     ChannelCommandApplyReport, ChannelReceiveOptions, ChannelReceiveReport, ChannelStep,
     CodexRuntimeCompletionOptions, CodexRuntimeCompletionReport, CodexRuntimeLaunchProbeOptions,
     CodexRuntimeLaunchProbeReport, CodexRuntimePlanOptions, CodexRuntimePlanReport,
-    CodexRuntimePreflightOptions, CodexRuntimePreflightReport, ConflictPolicy,
-    DeterministicCronPlan, DeterministicCronPlanInput, DryRunImportOptions, ExecuteImportOptions,
-    HarnessLogEvent, HarnessLogLevel, ImportPhaseStatus, ImportReport, NativeCronPlan,
-    NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions, PromptBundle,
-    RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions,
-    RuntimeQueuePrepareReport, SkillIndex, SkillSelectionQuery, SubagentPlan, SubagentPlanInput,
-    TurnPlan, TurnPlanInput, append_harness_log, apply_channel_command_step,
-    assemble_prompt_bundle, build_channel_step, build_dry_run_report, build_harness_skill_index,
-    build_import_plan, build_runtime_skill_index, build_source_skill_index, build_turn_plan,
-    check_activation_readiness, current_log_time_ms, enqueue_channel_step, execute_import,
-    export_harness_registry_files, inventory, load_agent_registry, load_deterministic_cron_store,
-    load_native_cron_store, load_subagent_ledger, plan_codex_runtime, plan_deterministic_cron,
-    plan_native_cron, plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
+    CodexRuntimePreflightOptions, CodexRuntimePreflightReport, CodexRuntimeRunOptions,
+    CodexRuntimeRunReport, ConflictPolicy, DeterministicCronPlan, DeterministicCronPlanInput,
+    DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel, ImportPhaseStatus,
+    ImportReport, NativeCronPlan, NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions,
+    PromptBundle, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
+    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, SkillIndex, SkillSelectionQuery,
+    SubagentPlan, SubagentPlanInput, TurnPlan, TurnPlanInput, append_harness_log,
+    apply_channel_command_step, assemble_prompt_bundle, build_channel_step, build_dry_run_report,
+    build_harness_skill_index, build_import_plan, build_runtime_skill_index,
+    build_source_skill_index, build_turn_plan, check_activation_readiness, current_log_time_ms,
+    enqueue_channel_step, execute_import, export_harness_registry_files, inventory,
+    load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
+    load_subagent_ledger, plan_codex_runtime, plan_deterministic_cron, plan_native_cron,
+    plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
     probe_codex_runtime_launch, receive_channel_message, record_codex_runtime_completion,
-    select_skills, sync_builtin_harness_skills, write_channel_step, write_deterministic_cron_plan,
-    write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
-    write_subagent_plan, write_turn_plan,
+    run_codex_runtime, select_skills, sync_builtin_harness_skills, write_channel_step,
+    write_deterministic_cron_plan, write_native_cron_plan, write_prompt_bundle, write_report_files,
+    write_skill_index, write_subagent_plan, write_turn_plan,
 };
 
 fn main() {
@@ -51,6 +52,7 @@ fn main() {
         "codex-plan" => run_codex_plan(&rest),
         "codex-preflight" => run_codex_preflight(&rest),
         "codex-launch-probe" => run_codex_launch_probe(&rest),
+        "codex-run" => run_codex_run(&rest),
         "codex-complete" => run_codex_complete(&rest),
         "prompt-bundle" => run_prompt_bundle(&rest),
         "cron-plan" => run_cron_plan(&rest),
@@ -529,6 +531,20 @@ fn run_codex_launch_probe(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_codex_run(args: &[String]) -> Result<(), String> {
+    let args = codex_run_args_from_args(args)?;
+    let report = run_codex_runtime(CodexRuntimeRunOptions {
+        harness_home: args.target_home,
+        execution_dir: args.execution_dir,
+        plan_file: args.plan_file,
+        timeout_ms: args.timeout_ms,
+    })
+    .map_err(|err| err.to_string())?;
+
+    print_codex_runtime_run_report(&report);
+    Ok(())
+}
+
 fn run_codex_complete(args: &[String]) -> Result<(), String> {
     let args = codex_complete_args_from_args(args)?;
     let report = record_codex_runtime_completion(CodexRuntimeCompletionOptions {
@@ -771,6 +787,13 @@ struct CodexLaunchProbeArgs {
     execution_dir: Option<PathBuf>,
     plan_file: Option<PathBuf>,
     startup_probe_ms: u64,
+}
+
+struct CodexRunArgs {
+    target_home: PathBuf,
+    execution_dir: Option<PathBuf>,
+    plan_file: Option<PathBuf>,
+    timeout_ms: u64,
 }
 
 struct CodexCompleteArgs {
@@ -1503,6 +1526,58 @@ fn codex_launch_probe_args_from_args(args: &[String]) -> Result<CodexLaunchProbe
         execution_dir,
         plan_file,
         startup_probe_ms,
+    })
+}
+
+fn codex_run_args_from_args(args: &[String]) -> Result<CodexRunArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut execution_dir = None;
+    let mut plan_file = None;
+    let mut timeout_ms = 300_000;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target-home" => {
+                i += 1;
+                target_home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+            }
+            "--execution-dir" => {
+                i += 1;
+                execution_dir = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--execution-dir requires a path".to_string())?,
+                );
+            }
+            "--plan-file" => {
+                i += 1;
+                plan_file = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--plan-file requires a path".to_string())?,
+                );
+            }
+            "--timeout-ms" => {
+                i += 1;
+                timeout_ms = args
+                    .get(i)
+                    .ok_or_else(|| "--timeout-ms requires a positive integer".to_string())
+                    .and_then(|value| parse_u64(value, "--timeout-ms"))?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(CodexRunArgs {
+        target_home,
+        execution_dir,
+        plan_file,
+        timeout_ms,
     })
 }
 
@@ -2510,6 +2585,52 @@ fn print_codex_runtime_launch_probe_report(report: &CodexRuntimeLaunchProbeRepor
     }
 }
 
+fn print_codex_runtime_run_report(report: &CodexRuntimeRunReport) {
+    println!("OpenClaw Codex runtime run");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Receipts file: {}", report.receipts_file.display());
+    println!("Receipt: {:?}", report.receipt.status);
+    println!("Reason: {}", report.receipt.reason);
+    println!("Elapsed ms: {}", report.receipt.elapsed_ms);
+    println!("Events: {}", report.receipt.event_count);
+    if let Some(execution_dir) = &report.execution_dir {
+        println!("Execution dir: {}", execution_dir.display());
+    }
+    if let Some(plan_file) = &report.plan_file {
+        println!("Plan file: {}", plan_file.display());
+    }
+    if let Some(run_file) = &report.run_file {
+        println!("Run report: {}", run_file.display());
+    }
+    if let Some(stdout_log) = &report.stdout_log {
+        println!("Stdout JSONL log: {}", stdout_log.display());
+    }
+    if let Some(stderr_log) = &report.stderr_log {
+        println!("Stderr log: {}", stderr_log.display());
+    }
+    if let Some(completion) = &report.completion {
+        println!("Completion receipt: {:?}", completion.receipt.status);
+        if let Some(completion_file) = &completion.completion_file {
+            println!("Completion file: {}", completion_file.display());
+        }
+        if let Some(transcript_file) = &completion.transcript_file {
+            println!("Transcript: {}", transcript_file.display());
+        }
+        if let Some(trajectory_file) = &completion.trajectory_file {
+            println!("Trajectory: {}", trajectory_file.display());
+        }
+        if let Some(codex_binding_file) = &completion.codex_binding_file {
+            println!("Codex binding: {}", codex_binding_file.display());
+        }
+    }
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
 fn print_codex_runtime_completion_report(report: &CodexRuntimeCompletionReport) {
     println!("OpenClaw Codex runtime completion");
     println!("Harness home: {}", report.harness_home.display());
@@ -2724,6 +2845,7 @@ fn print_help() {
     println!("  codex-plan      Plan Codex app-server invocation for prepared execution");
     println!("  codex-preflight Check a Codex runtime plan before process start");
     println!("  codex-launch-probe Start and stop Codex app-server without a model request");
+    println!("  codex-run       Run a prepared Codex app-server turn and record completion");
     println!("  codex-complete  Record assistant output to transcript and trajectory");
     println!("  prompt-bundle   Assemble prompt files, selected skills, and message");
     println!("  cron-plan       Dry-run OpenClaw native agent-turn cron dispatch");
@@ -2754,6 +2876,7 @@ fn print_help() {
     println!("  --codex-exe <path>      Codex executable path for codex-plan");
     println!("  --plan-file <path>      Codex runtime plan file for codex-preflight");
     println!("  --startup-probe-ms <n>  Milliseconds to keep app-server alive for launch probe");
+    println!("  --timeout-ms <n>        Milliseconds to wait for codex-run completion");
     println!("  --assistant-message <text> Assistant output for codex-complete");
     println!("  --skill-limit <n>       Maximum selected skills for turn-plan");
     println!("  --max-prompt-file-bytes <n> Cap each prompt file in prompt-bundle");

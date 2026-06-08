@@ -23,12 +23,13 @@ The project starts with a small, testable foundation:
 - A Codex runtime planner that turns a prepared queue execution into an inspectable `codex app-server` invocation plan and output-path contract.
 - A Codex runtime preflight checker that validates the plan, executable, prompt files, output directories, and required environment variables before process start.
 - A Codex runtime launch probe that starts the planned app-server process, sends no prompt or JSON-RPC request, then stops it and records process receipts/log paths.
+- A Codex runtime runner that drives one prepared `codex app-server` JSONL turn, records stdout/stderr logs, and writes OpenClaw-compatible completion outputs.
 - A Codex completion recorder that writes assistant output into OpenClaw-compatible transcript, trajectory, and Codex binding files.
 - A prompt bundle assembler that turns an agent turn plan into inspectable OpenClaw context payloads and uses a per-session injection ledger to avoid repeating prompt files/skill bodies.
 - A native agent-turn cron parser and dry-run dispatch planner with cutover hold safety.
 - A deterministic cron parser and no-LLM dry-run planner for workspace cron runners.
 - A subagent ledger parser and dry-run planner for `/subagents/runs.json` cutover safety.
-- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `enable-check`, `harness-skills-sync`, `skills`, `turn-plan`, `channel-step`, `channel-apply`, `channel-receive`, `queue-enqueue`, `queue-prepare`, `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-complete`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
+- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `enable-check`, `harness-skills-sync`, `skills`, `turn-plan`, `channel-step`, `channel-apply`, `channel-receive`, `queue-enqueue`, `queue-prepare`, `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
 - Minimal external crates: `serde` and `serde_json` for stable report/config/session JSON handling.
 
 ## Quick Start
@@ -55,6 +56,7 @@ cargo run -p openclaw-harness-cli -- queue-prepare --target-home C:\path\to\.ope
 cargo run -p openclaw-harness-cli -- codex-plan --target-home C:\path\to\.openclaw-harness --codex-exe C:\path\to\codex.exe
 cargo run -p openclaw-harness-cli -- codex-preflight --target-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- codex-launch-probe --target-home C:\path\to\.openclaw-harness --startup-probe-ms 750
+cargo run -p openclaw-harness-cli -- codex-run --target-home C:\path\to\.openclaw-harness --timeout-ms 300000
 cargo run -p openclaw-harness-cli -- codex-complete --target-home C:\path\to\.openclaw-harness --assistant-message "Smoke completion recorded."
 cargo run -p openclaw-harness-cli -- prompt-bundle --openclaw-home C:\path\to\.openclaw --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron" --output imports\prompt
 cargo run -p openclaw-harness-cli -- cron-plan --openclaw-home C:\path\to\.openclaw --output imports\cron
@@ -72,7 +74,7 @@ $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
 The recommended path is a Rust harness core that delegates native coding-agent execution to Codex app-server, keeps OpenClaw-compatible workspace/session/memory import semantics, and initially bridges OpenClaw plugins through a sidecar instead of reimplementing the full TypeScript plugin SDK.
 
-Skills are first-class runtime state, not documentation leftovers. The importer preserves OpenClaw workspace skills, managed OpenClaw skills, and project `.agents/skills`; `harness-skills-sync` also seeds bundled harness operation skills under `skills/openclaw-harness-core/*` with a manifest so user-modified copies are not overwritten unless `--force` is explicit. Runtime turn planning uses a merged skill index across source, imported, and bundled harness skills. Agent-created skill propose/patch/archive flows are still pending.
+Skills are first-class runtime state, not documentation leftovers. The importer preserves OpenClaw workspace skills, managed OpenClaw skills, and project `.agents/skills`; `harness-skills-sync` also seeds bundled harness operation skills under `skills/openclaw-harness-core/*` with a manifest so user-modified copies are not overwritten unless `--force` is explicit. The bundled harness operation skill is the versioned runbook for how agents should operate this harness, following the Hermes practice of keeping agent operating lead in skills that are updated with the harness instead of only in static docs. Runtime turn planning uses a merged skill index across source, imported, and bundled harness skills. Agent-created skill propose/patch/archive flows are still pending.
 
 Codex remains the owner of the model system prompt, built-in tool schemas, MCP tools, sandbox, approvals, and session continuity. The Rust harness only builds the OpenClaw turn payload: runtime context, channel command state, imported prompt files, matched skills, and the inbound user message. When a harness home is available, `prompt-bundle` and `queue-prepare` use `state/prompt-injection-ledgers/<agent>/<session>.json` so the same session only receives unchanged prompt files or skill bodies once; later turns receive a compact continuity note and rely on the Codex backend session to retain prior context.
 
@@ -88,7 +90,7 @@ The registry command is also read-only. It merges `openclaw.json` agent config w
 
 `enable-check` is the formal cutover readiness report. It checks the exported registry, enabled agents, Telegram/Discord token presence when those channels are enabled, provider credentials, plugin sidecar blockers, runtime queue receipts, channel outbox/state, Codex auth, memory-adapter status, and whether `state/logs/harness.jsonl` is writable. It appends an activation event to that log every time it runs.
 
-Runtime operations write an append-only JSONL operational log at `state/logs/harness.jsonl`. Current events include activation checks, `channel-receive`, `queue-prepare`, and `codex-complete`, with level, component, event name, message, queue id, session key, agent/channel ids, and relevant paths. This complements receipts and transcript/trajectory files and is the file to tail for monitoring/debugging once a long-running adapter is added.
+Runtime operations write an append-only JSONL operational log at `state/logs/harness.jsonl`. Current events include activation checks, `channel-receive`, `queue-prepare`, `codex-run`, and `codex-complete`, with level, component, event name, message, queue id, session key, agent/channel ids, and relevant paths. This complements receipts and transcript/trajectory files and is the file to tail for monitoring/debugging once a long-running adapter is added.
 
 Telegram and Discord adapters should share the same channel command parser and intent mapper. Current parser coverage is `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`; `/model` maps to show-or-switch model intents, and `/status` maps to scoped or global status intents.
 
@@ -109,6 +111,8 @@ Telegram and Discord adapters should share the same channel command parser and i
 `codex-preflight` reads the latest `codex-runtime-plan.json`, or an explicit `--execution-dir`/`--plan-file`, and writes `codex-runtime-preflight.json` plus `codex-runtime-preflight-receipts.jsonl`. It checks that the Codex executable can be resolved, prompt files exist, output parents stay under the harness home and are writable, and provider credentials are present. OpenAI/Codex routes accept either `OPENAI_API_KEY` or local Codex OAuth auth state; OpenRouter routes still require `OPENROUTER_API_KEY`. It still does not start Codex or make a model request.
 
 `codex-launch-probe` re-runs preflight, starts the planned app-server process only when preflight is ready, sends no JSON-RPC request and no prompt, waits for `--startup-probe-ms`, then terminates and waits for the child process. It writes `codex-runtime-launch-probe.json`, appends `codex-runtime-launch-receipts.jsonl`, and keeps stdout/stderr logs under the prepared execution directory. This proves process supervision before the worker starts real model-backed turns.
+
+`codex-run` re-runs preflight, skips the model request if a completion receipt already exists, otherwise starts `codex app-server`, sends `initialize`, `initialized`, `thread/start`, and `turn/start` over JSONL stdio, captures assistant message deltas, waits for `turn/completed`, and then calls the deterministic completion sink. It writes `codex-runtime-run.json`, appends `codex-runtime-run-receipts.jsonl`, and keeps raw app-server stdout/stderr logs under the prepared execution directory. The harness sends the assembled OpenClaw turn payload as user input; Codex remains responsible for its own system prompt, built-in tool schemas, MCP/tool inventory, approvals, and session continuity.
 
 `codex-complete` records an assistant message into the output contract from `codex-plan`. It reads `codex-runtime-plan.json`, copies the inbound user message from `prompt-bundle.json`, appends user/assistant entries to the planned transcript JSONL, appends trajectory events, writes the Codex binding mirror, writes `codex-runtime-completion-receipt.json`, and appends `codex-runtime-completion-receipts.jsonl`. This is the deterministic completion sink that the future JSON-RPC app-server adapter should call after it receives a real model response.
 

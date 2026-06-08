@@ -91,6 +91,7 @@ Hermes contributes two separate ideas, and the harness should keep them separate
 2. Skill-first runtime
    - This happens at the start of every agent turn, after channel command parsing and before prompt assembly.
    - The harness should match task-relevant skills by agent, channel, workspace, tools, and current user intent.
+   - Harness operation guidance should itself be shipped as versioned bundled skills, so agents can match the current harness runbook at the start of a turn and keep the operational lead aligned with harness updates.
    - During or after the turn, the harness should detect reusable procedures and propose or apply skill create/patch/archive operations with receipts.
    - Imported skills are only one source. Runtime-created and runtime-improved skills must become future turn context through the same index.
 
@@ -203,6 +204,7 @@ Required for a real cutover:
    - Start and supervise the custom Codex CLI/app-server.
    - Create/resume sessions per agent.
    - Feed prompt files, memory pack, channel envelope, and imported session context.
+   - Preserve Codex ownership of its system prompt, built-in tool schemas, MCP/tool inventory, approvals, and backend session continuity; the harness should pass OpenClaw context as turn input rather than mutating Codex internals.
    - Persist transcript, trajectory, and Codex binding mirror files in an OpenClaw-compatible layout.
 
 4. Provider routing
@@ -285,11 +287,11 @@ Current implemented foundation:
 - `registry` builds a read-only multi-agent registry from `openclaw.json` plus `/agents/<id>` directories, including provider/model/workspace metadata and local auth/session/model file presence.
 - `registry-export` writes the target harness registry state to `state/harness-registry.json` plus `state/harness-registry-receipts.json`, with conflict policy support and no raw secret migration.
 - `enable-check` produces the formal cutover readiness report across registry, enabled agents, Telegram/Discord tokens, provider credentials, plugin sidecar blockers, runtime receipts, channel state/outbox, Codex auth, memory-adapter status, and operational-log writability.
-- `state/logs/harness.jsonl` is the append-only operational log for activation checks and runtime events such as channel ingress, queue prepare, and Codex completion; receipts/transcripts remain separate audit artifacts.
-- `harness-skills-sync` seeds bundled harness operation skills under `skills/openclaw-harness-core/*` and tracks them with `.openclaw-harness-builtins.json`; user-modified skills are skipped unless `--force` is explicit.
+- `state/logs/harness.jsonl` is the append-only operational log for activation checks and runtime events such as channel ingress, queue prepare, `codex-run`, and Codex completion; receipts/transcripts remain separate audit artifacts.
+- `harness-skills-sync` seeds bundled harness operation skills under `skills/openclaw-harness-core/*` and tracks them with `.openclaw-harness-builtins.json`; user-modified skills are skipped unless `--force` is explicit. This is the Hermes-inspired versioned runbook path for harness operation lead.
 - The dry-run planner currently covers config, prompt files, skill directories, agent directories, native cron store, deterministic cron stores, subagent store, memory store, plugin install record, and plugin-state directory.
 - `import-execute` safe-copies planned prompt files, skills, agent directories, sessions, cron stores, subagent ledgers, memory snapshots, and plugin records; it skips raw sensitive items by default, omits known auth/secret files inside copied directories unless `--include-sensitive` is set, backs up overwrite targets, and writes `state/import-execute-receipts.json`.
-- Runtime execution, SQLite-consistent backup, Docker volume export, credential vault migration, and plugin execution are still pending.
+- Long-running runtime worker loops, SQLite-consistent backup, Docker volume export, credential vault migration, channel bot processes, scheduler execution, and plugin execution are still pending.
 - A shared channel command parser and runtime-intent mapper exists for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`; `/model` covers show/switch model, and `/status` covers global/scoped status requests.
 - `skills` builds a skill-first index from source OpenClaw skill directories or an imported harness home, preserves skill metadata/capability flags, writes `skill-index.json`, and can deterministically rank skills for a task turn using query, agent, channel, and workspace hints. Runtime turn planning uses a merged index across source, imported, and bundled harness skills.
 - `turn-plan` builds a runtime-facing dry-run plan for one inbound message: command-vs-agent dispatch, OpenClaw agent routing, channel command state inheritance, session key mapping, provider/model policy, prompt file availability, and selected skills before any model/tool execution.
@@ -303,6 +305,7 @@ Current implemented foundation:
 - `codex-plan` reads a prepared runtime execution, writes `codex-runtime-plan.json` and `codex-runtime-receipt.json`, records the stdio `codex app-server` invocation contract, and maps outputs to OpenClaw-compatible transcript/trajectory/Codex binding files without starting the process.
 - `codex-preflight` reads a runtime plan and writes `codex-runtime-preflight.json` plus `codex-runtime-preflight-receipts.jsonl`, checking executable resolution, prompt file presence, output directory containment/writability, and provider credentials before process start. OpenAI/Codex routes accept either `OPENAI_API_KEY` or local Codex OAuth auth state; OpenRouter routes still require `OPENROUTER_API_KEY`.
 - `codex-launch-probe` re-runs preflight, starts the planned app-server process only when local gates pass, sends no prompt or JSON-RPC request, terminates the process after a short probe window, and records stdout/stderr log paths plus launch receipts.
+- `codex-run` re-runs preflight, skips already completed executions, starts `codex app-server` over stdio JSONL, sends the prepared OpenClaw prompt payload as `turn/start` input, captures assistant deltas until `turn/completed`, writes raw stdout/stderr logs, and records the result through the OpenClaw-compatible transcript/trajectory/Codex binding completion sink. Tests use a fake app-server and do not call a real model.
 - `codex-complete` records assistant output to the planned OpenClaw-compatible transcript, trajectory, and Codex binding files with idempotent completion receipts; this gives the future app-server JSON-RPC adapter a deterministic output sink.
 - `prompt-bundle` consumes an agent turn plan and writes `prompt-bundle.json` plus `prompt.md` containing runtime context, imported prompt file bodies, selected `SKILL.md` bodies, Codex session-continuity notes, and the inbound message with byte caps. The harness does not own Codex system prompt or tool schemas; those stay inside Codex CLI/app-server.
 - `cron-plan` parses OpenClaw native agent-turn cron jobs/state and produces a dry-run dispatch plan with cutover hold safety; it validates agent ids, extracts cron payload text when possible, classifies due `at` jobs, and registers cron expressions for future scheduler evaluation without firing anything.
@@ -342,10 +345,10 @@ Current implemented foundation:
 
 ### Phase 2: Runtime MVP
 
-- Add Codex app-server client.
+- Harden the Codex app-server client against protocol/version drift and add real session resume binding once the exact tested Codex app-server version is pinned.
 - Add local direct-message CLI or HTTP channel for testing.
 - Use the imported multi-agent registry to route direct messages and cron payloads by `agentId`.
-- Extend the runtime worker from prepare/plan/preflight/launch-probe into Codex app-server execution: consume prepared prompt bundles, start/resume sessions, stream events, and persist transcript/trajectory/Codex binding receipts.
+- Extend the runtime worker from one-shot `codex-run` into a long-running worker loop: consume prepared prompt bundles, start/resume sessions, stream events, update delivery outboxes, and persist transcript/trajectory/Codex binding receipts.
 - Extend `cron-plan` into a real native scheduler after the Codex adapter and transcript writer exist.
 - Extend `deterministic-cron-plan` into a supervised Windows process runner with explicit WSL/Git Bash fallback policy and no model/tool-runtime access.
 - Extend `subagent-plan` into a worker queue with per-agent concurrency limits, cancellation, retry policy, and run receipts after the Codex runtime adapter exists.

@@ -1,19 +1,21 @@
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{HarnessLogEvent, HarnessLogLevel, append_harness_log, current_log_time_ms};
 
 const CODEX_RUNTIME_PLAN_SCHEMA: &str = "openclaw-harness.codex-runtime-plan.v1";
 const CODEX_RUNTIME_PREFLIGHT_SCHEMA: &str = "openclaw-harness.codex-runtime-preflight.v1";
 const CODEX_RUNTIME_LAUNCH_PROBE_SCHEMA: &str = "openclaw-harness.codex-runtime-launch-probe.v1";
+const CODEX_RUNTIME_RUN_SCHEMA: &str = "openclaw-harness.codex-runtime-run.v1";
 const CODEX_RUNTIME_COMPLETION_SCHEMA: &str = "openclaw-harness.codex-runtime-completion.v1";
 const CODEX_TRANSCRIPT_MESSAGE_SCHEMA: &str = "openclaw-harness.transcript-message.v1";
 const CODEX_TRAJECTORY_EVENT_SCHEMA: &str = "openclaw-harness.trajectory-event.v1";
@@ -39,6 +41,14 @@ pub struct CodexRuntimeLaunchProbeOptions {
     pub execution_dir: Option<PathBuf>,
     pub plan_file: Option<PathBuf>,
     pub startup_probe_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexRuntimeRunOptions {
+    pub harness_home: PathBuf,
+    pub execution_dir: Option<PathBuf>,
+    pub plan_file: Option<PathBuf>,
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +99,22 @@ pub struct CodexRuntimeLaunchProbeReport {
     pub receipts_file: PathBuf,
     pub receipt: CodexRuntimeLaunchProbeReceipt,
     pub process: Option<CodexRuntimeLaunchProcess>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRuntimeRunReport {
+    pub schema: &'static str,
+    pub harness_home: PathBuf,
+    pub execution_dir: Option<PathBuf>,
+    pub plan_file: Option<PathBuf>,
+    pub run_file: Option<PathBuf>,
+    pub receipts_file: PathBuf,
+    pub receipt: CodexRuntimeRunReceipt,
+    pub completion: Option<CodexRuntimeCompletionReport>,
+    pub stdout_log: Option<PathBuf>,
+    pub stderr_log: Option<PathBuf>,
     pub warnings: Vec<String>,
 }
 
@@ -247,6 +273,34 @@ pub struct CodexRuntimeLaunchProcess {
     pub terminated: bool,
     pub stdout_log: Option<PathBuf>,
     pub stderr_log: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRuntimeRunReceipt {
+    pub queue_id: Option<String>,
+    pub status: CodexRuntimeRunStatus,
+    pub execution_dir: Option<PathBuf>,
+    pub plan_file: Option<PathBuf>,
+    pub run_file: Option<PathBuf>,
+    pub completion_file: Option<PathBuf>,
+    pub transcript_file: Option<PathBuf>,
+    pub trajectory_file: Option<PathBuf>,
+    pub codex_binding_file: Option<PathBuf>,
+    pub reason: String,
+    pub elapsed_ms: u128,
+    pub event_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexRuntimeRunStatus {
+    Completed,
+    PreflightBlocked,
+    NoRuntimePlan,
+    SpawnFailed,
+    ProtocolError,
+    Timeout,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -690,6 +744,296 @@ pub fn probe_codex_runtime_launch(
     )
 }
 
+pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRuntimeRunReport> {
+    let queue_dir = options.harness_home.join("state").join("runtime-queue");
+    let receipts_file = queue_dir.join("codex-runtime-run-receipts.jsonl");
+    fs::create_dir_all(&queue_dir)?;
+
+    let preflight = preflight_codex_runtime(CodexRuntimePreflightOptions {
+        harness_home: options.harness_home.clone(),
+        execution_dir: options.execution_dir.clone(),
+        plan_file: options.plan_file.clone(),
+    })?;
+    let run_file = preflight
+        .execution_dir
+        .as_ref()
+        .map(|dir| dir.join("codex-runtime-run.json"));
+    let stdout_log = preflight
+        .execution_dir
+        .as_ref()
+        .map(|dir| dir.join("codex-runtime-run.stdout.jsonl"));
+    let stderr_log = preflight
+        .execution_dir
+        .as_ref()
+        .map(|dir| dir.join("codex-runtime-run.stderr.log"));
+    let mut warnings = preflight.warnings.clone();
+
+    match preflight.receipt.status {
+        CodexRuntimePreflightStatus::NoRuntimePlan => {
+            let receipt = CodexRuntimeRunReceipt {
+                queue_id: preflight.receipt.queue_id,
+                status: CodexRuntimeRunStatus::NoRuntimePlan,
+                execution_dir: preflight.execution_dir,
+                plan_file: preflight.plan_file,
+                run_file: run_file.clone(),
+                completion_file: None,
+                transcript_file: None,
+                trajectory_file: None,
+                codex_binding_file: None,
+                reason: "no codex runtime plan found; run codex-plan first".to_string(),
+                elapsed_ms: 0,
+                event_count: 0,
+            };
+            append_codex_run_log(
+                &options.harness_home,
+                HarnessLogLevel::Warn,
+                "codex.run.no-plan",
+                &receipt.reason,
+                None,
+                None,
+            )?;
+            return write_codex_runtime_run_report(
+                CodexRuntimeRunReport {
+                    schema: CODEX_RUNTIME_RUN_SCHEMA,
+                    harness_home: options.harness_home,
+                    execution_dir: receipt.execution_dir.clone(),
+                    plan_file: receipt.plan_file.clone(),
+                    run_file,
+                    receipts_file,
+                    receipt,
+                    completion: None,
+                    stdout_log,
+                    stderr_log,
+                    warnings,
+                },
+                true,
+            );
+        }
+        CodexRuntimePreflightStatus::Blocked => {
+            let receipt = CodexRuntimeRunReceipt {
+                queue_id: preflight.receipt.queue_id,
+                status: CodexRuntimeRunStatus::PreflightBlocked,
+                execution_dir: preflight.execution_dir,
+                plan_file: preflight.plan_file,
+                run_file: run_file.clone(),
+                completion_file: None,
+                transcript_file: None,
+                trajectory_file: None,
+                codex_binding_file: None,
+                reason: "codex runtime run blocked by preflight failures".to_string(),
+                elapsed_ms: 0,
+                event_count: 0,
+            };
+            append_codex_run_log(
+                &options.harness_home,
+                HarnessLogLevel::Warn,
+                "codex.run.preflight-blocked",
+                &receipt.reason,
+                None,
+                None,
+            )?;
+            return write_codex_runtime_run_report(
+                CodexRuntimeRunReport {
+                    schema: CODEX_RUNTIME_RUN_SCHEMA,
+                    harness_home: options.harness_home,
+                    execution_dir: receipt.execution_dir.clone(),
+                    plan_file: receipt.plan_file.clone(),
+                    run_file,
+                    receipts_file,
+                    receipt,
+                    completion: None,
+                    stdout_log,
+                    stderr_log,
+                    warnings,
+                },
+                true,
+            );
+        }
+        CodexRuntimePreflightStatus::Ready => {}
+    }
+
+    let Some(plan_file) = preflight.plan_file.clone() else {
+        warnings.push("preflight reported ready without a runtime plan file".to_string());
+        let receipt = CodexRuntimeRunReceipt {
+            queue_id: preflight.receipt.queue_id,
+            status: CodexRuntimeRunStatus::NoRuntimePlan,
+            execution_dir: preflight.execution_dir,
+            plan_file: None,
+            run_file: run_file.clone(),
+            completion_file: None,
+            transcript_file: None,
+            trajectory_file: None,
+            codex_binding_file: None,
+            reason: "preflight reported ready without a runtime plan file".to_string(),
+            elapsed_ms: 0,
+            event_count: 0,
+        };
+        append_codex_run_log(
+            &options.harness_home,
+            HarnessLogLevel::Warn,
+            "codex.run.no-plan",
+            &receipt.reason,
+            None,
+            None,
+        )?;
+        return write_codex_runtime_run_report(
+            CodexRuntimeRunReport {
+                schema: CODEX_RUNTIME_RUN_SCHEMA,
+                harness_home: options.harness_home,
+                execution_dir: receipt.execution_dir.clone(),
+                plan_file: None,
+                run_file,
+                receipts_file,
+                receipt,
+                completion: None,
+                stdout_log,
+                stderr_log,
+                warnings,
+            },
+            true,
+        );
+    };
+
+    let plan: CodexRuntimePlanFile = read_json_file_as(&plan_file)?;
+    let execution_dir = plan_file.parent().map(Path::to_path_buf);
+    if plan_completion_recorded(&plan)? {
+        let receipt = CodexRuntimeRunReceipt {
+            queue_id: plan.queue_id.clone(),
+            status: CodexRuntimeRunStatus::Completed,
+            execution_dir,
+            plan_file: Some(plan_file),
+            run_file: run_file.clone(),
+            completion_file: Some(
+                plan.invocation
+                    .working_directory
+                    .join("codex-runtime-completion-receipt.json"),
+            ),
+            transcript_file: Some(plan.outputs.transcript_file.clone()),
+            trajectory_file: Some(plan.outputs.trajectory_file.clone()),
+            codex_binding_file: Some(plan.outputs.codex_binding_file.clone()),
+            reason: "codex runtime completion was already recorded; model request skipped"
+                .to_string(),
+            elapsed_ms: 0,
+            event_count: 0,
+        };
+        append_codex_run_log(
+            &options.harness_home,
+            HarnessLogLevel::Info,
+            "codex.run.already-completed",
+            &receipt.reason,
+            Some(&plan),
+            receipt.transcript_file.clone(),
+        )?;
+        return write_codex_runtime_run_report(
+            CodexRuntimeRunReport {
+                schema: CODEX_RUNTIME_RUN_SCHEMA,
+                harness_home: options.harness_home,
+                execution_dir: receipt.execution_dir.clone(),
+                plan_file: receipt.plan_file.clone(),
+                run_file,
+                receipts_file,
+                receipt,
+                completion: None,
+                stdout_log,
+                stderr_log,
+                warnings,
+            },
+            true,
+        );
+    }
+
+    let started = Instant::now();
+    let run_result = drive_codex_app_server(&plan, options.timeout_ms)?;
+    let elapsed_ms = started.elapsed().as_millis();
+    let finished_at_ms = current_log_time_ms()?;
+    let status = run_result.status;
+    let reason = run_result.reason.clone();
+    warnings.extend(run_result.warnings);
+    let completion = if status == CodexRuntimeRunStatus::Completed {
+        let assistant_message = if run_result.assistant_message.trim().is_empty() {
+            warnings.push("Codex app-server completed without captured assistant text".to_string());
+            "(no assistant text captured from Codex app-server events)".to_string()
+        } else {
+            run_result.assistant_message
+        };
+        Some(record_codex_runtime_completion(
+            CodexRuntimeCompletionOptions {
+                harness_home: options.harness_home.clone(),
+                execution_dir: execution_dir.clone(),
+                plan_file: Some(plan_file.clone()),
+                assistant_message,
+                finished_at_ms,
+            },
+        )?)
+    } else {
+        None
+    };
+    let receipt = CodexRuntimeRunReceipt {
+        queue_id: plan.queue_id.clone(),
+        status,
+        execution_dir,
+        plan_file: Some(plan_file),
+        run_file: run_file.clone(),
+        completion_file: completion
+            .as_ref()
+            .and_then(|report| report.completion_file.clone()),
+        transcript_file: completion
+            .as_ref()
+            .and_then(|report| report.transcript_file.clone()),
+        trajectory_file: completion
+            .as_ref()
+            .and_then(|report| report.trajectory_file.clone()),
+        codex_binding_file: completion
+            .as_ref()
+            .and_then(|report| report.codex_binding_file.clone()),
+        reason,
+        elapsed_ms,
+        event_count: run_result.event_count,
+    };
+    let log_level = match receipt.status {
+        CodexRuntimeRunStatus::Completed => HarnessLogLevel::Info,
+        CodexRuntimeRunStatus::Timeout | CodexRuntimeRunStatus::ProtocolError => {
+            HarnessLogLevel::Error
+        }
+        CodexRuntimeRunStatus::SpawnFailed
+        | CodexRuntimeRunStatus::PreflightBlocked
+        | CodexRuntimeRunStatus::NoRuntimePlan => HarnessLogLevel::Warn,
+    };
+    let log_event = match receipt.status {
+        CodexRuntimeRunStatus::Completed => "codex.run.completed",
+        CodexRuntimeRunStatus::Timeout => "codex.run.timeout",
+        CodexRuntimeRunStatus::ProtocolError => "codex.run.protocol-error",
+        CodexRuntimeRunStatus::SpawnFailed => "codex.run.spawn-failed",
+        CodexRuntimeRunStatus::PreflightBlocked => "codex.run.preflight-blocked",
+        CodexRuntimeRunStatus::NoRuntimePlan => "codex.run.no-plan",
+    };
+    append_codex_run_log(
+        &options.harness_home,
+        log_level,
+        log_event,
+        &receipt.reason,
+        Some(&plan),
+        receipt.transcript_file.clone(),
+    )?;
+
+    write_codex_runtime_run_report(
+        CodexRuntimeRunReport {
+            schema: CODEX_RUNTIME_RUN_SCHEMA,
+            harness_home: options.harness_home,
+            execution_dir: receipt.execution_dir.clone(),
+            plan_file: receipt.plan_file.clone(),
+            run_file,
+            receipts_file,
+            completion,
+            stdout_log: run_result.stdout_log,
+            stderr_log: run_result.stderr_log,
+            receipt,
+            warnings,
+        },
+        true,
+    )
+}
+
 pub fn record_codex_runtime_completion(
     options: CodexRuntimeCompletionOptions,
 ) -> io::Result<CodexRuntimeCompletionReport> {
@@ -856,6 +1200,580 @@ fn write_launch_probe_report(
         append_json_line(&report.receipts_file, &report.receipt)?;
     }
     Ok(report)
+}
+
+fn write_codex_runtime_run_report(
+    report: CodexRuntimeRunReport,
+    append_receipt: bool,
+) -> io::Result<CodexRuntimeRunReport> {
+    if let Some(run_file) = &report.run_file {
+        let report_json = serde_json::to_string_pretty(&report).map_err(io::Error::other)?;
+        fs::write(run_file, report_json)?;
+    }
+    if append_receipt {
+        append_json_line(&report.receipts_file, &report.receipt)?;
+    }
+    Ok(report)
+}
+
+fn append_codex_run_log(
+    harness_home: &Path,
+    level: HarnessLogLevel,
+    event: &'static str,
+    message: &str,
+    plan: Option<&CodexRuntimePlanFile>,
+    path: Option<PathBuf>,
+) -> io::Result<()> {
+    let mut log = HarnessLogEvent::new(
+        current_log_time_ms()?,
+        level,
+        "codex-runtime",
+        event,
+        message.to_string(),
+    );
+    if let Some(plan) = plan {
+        log = log
+            .queue_id(plan.queue_id.clone())
+            .session_key(Some(plan.session_key.clone()))
+            .agent_id(plan.agent_id.clone());
+    }
+    if let Some(path) = path {
+        log = log.path(Some(path));
+    }
+    append_harness_log(harness_home, &log).map(|_| ())
+}
+
+fn plan_completion_recorded(plan: &CodexRuntimePlanFile) -> io::Result<bool> {
+    let completion_file = plan
+        .invocation
+        .working_directory
+        .join("codex-runtime-completion-receipt.json");
+    if !completion_file.is_file() {
+        return Ok(false);
+    }
+    let receipt: CodexRuntimeCompletionReceipt = read_json_file_as(&completion_file)?;
+    Ok(receipt.status == CodexRuntimeCompletionStatus::Recorded)
+}
+
+struct CodexAppServerRunResult {
+    status: CodexRuntimeRunStatus,
+    reason: String,
+    assistant_message: String,
+    event_count: usize,
+    stdout_log: Option<PathBuf>,
+    stderr_log: Option<PathBuf>,
+    warnings: Vec<String>,
+}
+
+fn drive_codex_app_server(
+    plan: &CodexRuntimePlanFile,
+    timeout_ms: u64,
+) -> io::Result<CodexAppServerRunResult> {
+    fs::create_dir_all(&plan.invocation.working_directory)?;
+    let stdout_log = plan
+        .invocation
+        .working_directory
+        .join("codex-runtime-run.stdout.jsonl");
+    let stderr_log = plan
+        .invocation
+        .working_directory
+        .join("codex-runtime-run.stderr.log");
+    let stderr = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_log)?;
+    let mut command = Command::new(&plan.invocation.executable);
+    command
+        .args(&plan.invocation.arguments)
+        .current_dir(&plan.invocation.working_directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr));
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return Ok(CodexAppServerRunResult {
+                status: CodexRuntimeRunStatus::SpawnFailed,
+                reason: format!("failed to spawn codex app-server process: {error}"),
+                assistant_message: String::new(),
+                event_count: 0,
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                warnings: Vec::new(),
+            });
+        }
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = terminate_child(&mut child);
+        return Ok(CodexAppServerRunResult {
+            status: CodexRuntimeRunStatus::ProtocolError,
+            reason: "codex app-server stdin pipe was unavailable".to_string(),
+            assistant_message: String::new(),
+            event_count: 0,
+            stdout_log: Some(stdout_log),
+            stderr_log: Some(stderr_log),
+            warnings: Vec::new(),
+        });
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = terminate_child(&mut child);
+        return Ok(CodexAppServerRunResult {
+            status: CodexRuntimeRunStatus::ProtocolError,
+            reason: "codex app-server stdout pipe was unavailable".to_string(),
+            assistant_message: String::new(),
+            event_count: 0,
+            stdout_log: Some(stdout_log),
+            stderr_log: Some(stderr_log),
+            warnings: Vec::new(),
+        });
+    };
+    let (line_rx, reader_handle) = spawn_stdout_reader(stdout, stdout_log.clone());
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut state = CodexProtocolState::default();
+
+    write_json_rpc(
+        &mut stdin,
+        &json!({
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "openclaw_harness",
+                    "title": "OpenClaw Rust Harness",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {
+                    "experimentalApi": true
+                }
+            }
+        }),
+    )?;
+    write_json_rpc(
+        &mut stdin,
+        &json!({
+            "method": "initialized",
+            "params": {}
+        }),
+    )?;
+    let mut thread_params = json!({});
+    if let Some(model) = &plan.model {
+        thread_params["model"] = json!(model);
+    }
+    write_json_rpc(
+        &mut stdin,
+        &json!({
+            "id": 1,
+            "method": "thread/start",
+            "params": thread_params
+        }),
+    )?;
+
+    let thread_id = match wait_for_thread_start(&line_rx, &mut child, &mut state, deadline)? {
+        ProtocolWait::ThreadStarted(thread_id) => thread_id,
+        ProtocolWait::TimedOut(reason) => {
+            let _ = terminate_child(&mut child);
+            let _ = reader_handle.join();
+            return Ok(CodexAppServerRunResult {
+                status: CodexRuntimeRunStatus::Timeout,
+                reason,
+                assistant_message: state.assistant_message,
+                event_count: state.event_count,
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                warnings: state.warnings,
+            });
+        }
+        ProtocolWait::Failed(reason) => {
+            let _ = terminate_child(&mut child);
+            let _ = reader_handle.join();
+            return Ok(CodexAppServerRunResult {
+                status: CodexRuntimeRunStatus::ProtocolError,
+                reason,
+                assistant_message: state.assistant_message,
+                event_count: state.event_count,
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                warnings: state.warnings,
+            });
+        }
+        ProtocolWait::TurnCompleted => {
+            let _ = terminate_child(&mut child);
+            let _ = reader_handle.join();
+            return Ok(CodexAppServerRunResult {
+                status: CodexRuntimeRunStatus::ProtocolError,
+                reason: "codex app-server reported turn completion before thread start".to_string(),
+                assistant_message: state.assistant_message,
+                event_count: state.event_count,
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                warnings: state.warnings,
+            });
+        }
+    };
+    let prompt_input = fs::read_to_string(&plan.invocation.prompt_input_file)?;
+    write_json_rpc(
+        &mut stdin,
+        &json!({
+            "id": 2,
+            "method": "turn/start",
+            "params": {
+                "threadId": thread_id,
+                "input": [
+                    {
+                        "type": "text",
+                        "text": prompt_input
+                    }
+                ]
+            }
+        }),
+    )?;
+
+    let status = match wait_for_turn_completed(&line_rx, &mut child, &mut state, deadline)? {
+        ProtocolWait::TurnCompleted => CodexRuntimeRunStatus::Completed,
+        ProtocolWait::TimedOut(reason) => {
+            let _ = terminate_child(&mut child);
+            let _ = reader_handle.join();
+            return Ok(CodexAppServerRunResult {
+                status: CodexRuntimeRunStatus::Timeout,
+                reason,
+                assistant_message: state.assistant_message,
+                event_count: state.event_count,
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                warnings: state.warnings,
+            });
+        }
+        ProtocolWait::Failed(reason) => {
+            let _ = terminate_child(&mut child);
+            let _ = reader_handle.join();
+            return Ok(CodexAppServerRunResult {
+                status: CodexRuntimeRunStatus::ProtocolError,
+                reason,
+                assistant_message: state.assistant_message,
+                event_count: state.event_count,
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                warnings: state.warnings,
+            });
+        }
+        ProtocolWait::ThreadStarted(_) => {
+            let _ = terminate_child(&mut child);
+            let _ = reader_handle.join();
+            return Ok(CodexAppServerRunResult {
+                status: CodexRuntimeRunStatus::ProtocolError,
+                reason: "codex app-server returned a second thread/start response during turn"
+                    .to_string(),
+                assistant_message: state.assistant_message,
+                event_count: state.event_count,
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                warnings: state.warnings,
+            });
+        }
+    };
+    let _ = terminate_child(&mut child);
+    let _ = reader_handle.join();
+    Ok(CodexAppServerRunResult {
+        status,
+        reason: "codex app-server turn completed and assistant output was captured".to_string(),
+        assistant_message: state.assistant_message,
+        event_count: state.event_count,
+        stdout_log: Some(stdout_log),
+        stderr_log: Some(stderr_log),
+        warnings: state.warnings,
+    })
+}
+
+#[derive(Default)]
+struct CodexProtocolState {
+    assistant_message: String,
+    event_count: usize,
+    warnings: Vec<String>,
+}
+
+enum ProtocolWait {
+    ThreadStarted(String),
+    TurnCompleted,
+    Failed(String),
+    TimedOut(String),
+}
+
+fn wait_for_thread_start(
+    line_rx: &mpsc::Receiver<Result<String, String>>,
+    child: &mut std::process::Child,
+    state: &mut CodexProtocolState,
+    deadline: Instant,
+) -> io::Result<ProtocolWait> {
+    loop {
+        match receive_protocol_event(line_rx, child, state, deadline)? {
+            ProtocolEvent::Json(value) => {
+                if let Some(error) = protocol_error(&value) {
+                    return Ok(ProtocolWait::Failed(error));
+                }
+                if json_id(&value) == Some(1) {
+                    return Ok(match extract_thread_id(&value) {
+                        Some(thread_id) => ProtocolWait::ThreadStarted(thread_id),
+                        None => ProtocolWait::Failed(
+                            "thread/start response did not include a thread id".to_string(),
+                        ),
+                    });
+                }
+                if is_turn_completed(&value) {
+                    return Ok(ProtocolWait::TurnCompleted);
+                }
+                collect_agent_delta(&value, state);
+            }
+            ProtocolEvent::TimedOut(reason) => return Ok(ProtocolWait::TimedOut(reason)),
+            ProtocolEvent::Failed(reason) => return Ok(ProtocolWait::Failed(reason)),
+        }
+    }
+}
+
+fn wait_for_turn_completed(
+    line_rx: &mpsc::Receiver<Result<String, String>>,
+    child: &mut std::process::Child,
+    state: &mut CodexProtocolState,
+    deadline: Instant,
+) -> io::Result<ProtocolWait> {
+    loop {
+        match receive_protocol_event(line_rx, child, state, deadline)? {
+            ProtocolEvent::Json(value) => {
+                if let Some(error) = protocol_error(&value) {
+                    return Ok(ProtocolWait::Failed(error));
+                }
+                collect_agent_delta(&value, state);
+                if is_turn_completed(&value) {
+                    return Ok(ProtocolWait::TurnCompleted);
+                }
+                if json_id(&value) == Some(1)
+                    && let Some(thread_id) = extract_thread_id(&value)
+                {
+                    return Ok(ProtocolWait::ThreadStarted(thread_id));
+                }
+            }
+            ProtocolEvent::TimedOut(reason) => return Ok(ProtocolWait::TimedOut(reason)),
+            ProtocolEvent::Failed(reason) => return Ok(ProtocolWait::Failed(reason)),
+        }
+    }
+}
+
+enum ProtocolEvent {
+    Json(Value),
+    TimedOut(String),
+    Failed(String),
+}
+
+fn receive_protocol_event(
+    line_rx: &mpsc::Receiver<Result<String, String>>,
+    child: &mut std::process::Child,
+    state: &mut CodexProtocolState,
+    deadline: Instant,
+) -> io::Result<ProtocolEvent> {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(ProtocolEvent::TimedOut(
+                "timed out waiting for Codex app-server JSONL event".to_string(),
+            ));
+        }
+        let timeout = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(250));
+        match line_rx.recv_timeout(timeout) {
+            Ok(Ok(line)) => {
+                state.event_count += 1;
+                return match serde_json::from_str::<Value>(&line) {
+                    Ok(value) => Ok(ProtocolEvent::Json(value)),
+                    Err(error) => Ok(ProtocolEvent::Failed(format!(
+                        "codex app-server stdout line was not valid JSON: {error}"
+                    ))),
+                };
+            }
+            Ok(Err(error)) => {
+                return Ok(ProtocolEvent::Failed(format!(
+                    "failed to read codex app-server stdout: {error}"
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(ProtocolEvent::Failed(format!(
+                        "codex app-server exited before completing protocol: {status}"
+                    )));
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return if let Some(status) = child.try_wait()? {
+                    Ok(ProtocolEvent::Failed(format!(
+                        "codex app-server stdout closed before completion: {status}"
+                    )))
+                } else {
+                    Ok(ProtocolEvent::Failed(
+                        "codex app-server stdout reader disconnected".to_string(),
+                    ))
+                };
+            }
+        }
+    }
+}
+
+fn spawn_stdout_reader<R: Read + Send + 'static>(
+    stdout: R,
+    stdout_log: PathBuf,
+) -> (
+    mpsc::Receiver<Result<String, String>>,
+    thread::JoinHandle<()>,
+) {
+    let (line_tx, line_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stdout_log);
+        let mut log = match log {
+            Ok(log) => log,
+            Err(error) => {
+                let _ = line_tx.send(Err(format!(
+                    "failed to open stdout log {}: {error}",
+                    stdout_log.display()
+                )));
+                return;
+            }
+        };
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    if let Err(error) = writeln!(log, "{line}") {
+                        let _ = line_tx.send(Err(format!(
+                            "failed to write stdout log {}: {error}",
+                            stdout_log.display()
+                        )));
+                        return;
+                    }
+                    if line_tx.send(Ok(line)).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = line_tx.send(Err(error.to_string()));
+                    return;
+                }
+            }
+        }
+    });
+    (line_rx, handle)
+}
+
+fn write_json_rpc(stdin: &mut impl Write, value: &Value) -> io::Result<()> {
+    serde_json::to_writer(&mut *stdin, value).map_err(io::Error::other)?;
+    writeln!(stdin)?;
+    stdin.flush()
+}
+
+fn terminate_child(child: &mut std::process::Child) -> io::Result<()> {
+    if child.try_wait()?.is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    Ok(())
+}
+
+fn json_id(value: &Value) -> Option<i64> {
+    value.get("id").and_then(Value::as_i64)
+}
+
+fn json_method(value: &Value) -> Option<&str> {
+    value.get("method").and_then(Value::as_str)
+}
+
+fn extract_thread_id(value: &Value) -> Option<String> {
+    for pointer in [
+        "/result/thread/id",
+        "/result/threadId",
+        "/result/id",
+        "/params/thread/id",
+        "/params/threadId",
+    ] {
+        if let Some(text) = value.pointer(pointer).and_then(Value::as_str) {
+            return Some(text.to_string());
+        }
+    }
+    None
+}
+
+fn collect_agent_delta(value: &Value, state: &mut CodexProtocolState) {
+    if let Some(delta) = extract_agent_delta(value) {
+        state.assistant_message.push_str(&delta);
+    }
+}
+
+fn extract_agent_delta(value: &Value) -> Option<String> {
+    let method = json_method(value)?;
+    let is_agent_delta = method.contains("agentMessage")
+        || method.contains("agent_message")
+        || method.contains("agent-message")
+        || method.contains("message/delta");
+    if !is_agent_delta {
+        return None;
+    }
+    for pointer in [
+        "/params/delta",
+        "/params/text",
+        "/params/message/delta",
+        "/params/message/text",
+        "/params/item/delta",
+        "/params/item/text",
+        "/params/item/content",
+    ] {
+        if let Some(candidate) = value.pointer(pointer)
+            && let Some(text) = string_or_nested_text(candidate)
+        {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn string_or_nested_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(items) => {
+            let mut out = String::new();
+            for item in items {
+                if let Some(text) = string_or_nested_text(item) {
+                    out.push_str(&text);
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        }
+        Value::Object(object) => {
+            for key in ["text", "content", "delta"] {
+                if let Some(value) = object.get(key)
+                    && let Some(text) = string_or_nested_text(value)
+                {
+                    return Some(text);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn is_turn_completed(value: &Value) -> bool {
+    matches!(json_method(value), Some("turn/completed"))
+}
+
+fn protocol_error(value: &Value) -> Option<String> {
+    let error = value.get("error")?;
+    if let Some(text) = error.as_str() {
+        return Some(text.to_string());
+    }
+    if let Some(message) = error.get("message").and_then(Value::as_str) {
+        return Some(message.to_string());
+    }
+    Some(error.to_string())
 }
 
 fn record_completion_outputs(
@@ -1872,6 +2790,76 @@ mod tests {
     }
 
     #[test]
+    fn run_codex_runtime_drives_fake_app_server_and_records_outputs() {
+        let root = temp_root("run_codex_runtime_drives_fake_app_server_and_records_outputs");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = fake_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 5_000,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert_eq!(report.receipt.event_count, 4);
+        assert!(report.run_file.unwrap().is_file());
+        assert!(report.stdout_log.as_ref().unwrap().is_file());
+        assert!(report.stderr_log.as_ref().unwrap().is_file());
+        let stdout = fs::read_to_string(report.stdout_log.unwrap()).unwrap();
+        assert!(stdout.contains("item/agentMessage/delta"));
+        let completion = report.completion.unwrap();
+        assert_eq!(
+            completion.receipt.status,
+            CodexRuntimeCompletionStatus::Recorded
+        );
+        let transcript_file = completion.transcript_file.clone().unwrap();
+        let transcript = fs::read_to_string(&transcript_file).unwrap();
+        assert!(transcript.contains("Fake assistant reply."));
+        assert!(completion.trajectory_file.unwrap().is_file());
+        assert!(completion.codex_binding_file.unwrap().is_file());
+        let harness_log = harness_home
+            .join("state")
+            .join("logs")
+            .join("harness.jsonl");
+        assert!(
+            fs::read_to_string(harness_log)
+                .unwrap()
+                .contains("codex.run.completed")
+        );
+
+        let second = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 5_000,
+        })
+        .unwrap();
+        assert_eq!(second.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert_eq!(second.receipt.event_count, 0);
+        assert!(second.receipt.reason.contains("already recorded"));
+        assert_eq!(
+            fs::read_to_string(transcript_file).unwrap().lines().count(),
+            2
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn record_codex_runtime_completion_writes_outputs_idempotently() {
         let root = temp_root("record_codex_runtime_completion_writes_outputs_idempotently");
         let source = write_codex_runtime_source(&root);
@@ -1998,6 +2986,82 @@ mod tests {
             PathBuf::from("sh"),
             vec!["-c".to_string(), "while true; do sleep 1; done".to_string()],
         )
+    }
+
+    #[cfg(windows)]
+    fn fake_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("fake-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try {
+        $msg = $line | ConvertFrom-Json
+    } catch {
+        continue
+    }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"delta":"Fake assistant reply."}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"turn":{"id":"turn-test","status":"completed"}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn fake_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("fake-app-server.sh");
+        fs::write(
+            &script,
+            r#"
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"Fake assistant reply."}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-test","status":"completed"}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        (PathBuf::from("sh"), vec![script.display().to_string()])
     }
 
     fn write_codex_runtime_source(root: &Path) -> crate::OpenClawSource {
