@@ -3,24 +3,25 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use openclaw_harness_core::{
-    AgentRegistry, ChannelCommandApplyOptions, ChannelCommandApplyReport, ChannelStep,
-    CodexRuntimeCompletionOptions, CodexRuntimeCompletionReport, CodexRuntimeLaunchProbeOptions,
-    CodexRuntimeLaunchProbeReport, CodexRuntimePlanOptions, CodexRuntimePlanReport,
-    CodexRuntimePreflightOptions, CodexRuntimePreflightReport, ConflictPolicy,
-    DeterministicCronPlan, DeterministicCronPlanInput, DryRunImportOptions, ExecuteImportOptions,
-    ImportPhaseStatus, ImportReport, NativeCronPlan, NativeCronPlanInput, OpenClawSource,
-    PromptAssemblyOptions, PromptBundle, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
-    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, SkillIndex, SkillSelectionQuery,
-    SubagentPlan, SubagentPlanInput, TurnPlan, TurnPlanInput, apply_channel_command_step,
-    assemble_prompt_bundle, build_channel_step, build_dry_run_report, build_harness_skill_index,
-    build_import_plan, build_source_skill_index, build_turn_plan, enqueue_channel_step,
-    execute_import, export_harness_registry_files, inventory, load_agent_registry,
-    load_deterministic_cron_store, load_native_cron_store, load_subagent_ledger,
-    plan_codex_runtime, plan_deterministic_cron, plan_native_cron, plan_subagents,
-    preflight_codex_runtime, prepare_runtime_queue_item, probe_codex_runtime_launch,
-    record_codex_runtime_completion, select_skills, write_channel_step,
-    write_deterministic_cron_plan, write_native_cron_plan, write_prompt_bundle, write_report_files,
-    write_skill_index, write_subagent_plan, write_turn_plan,
+    AgentRegistry, ChannelCommandApplyOptions, ChannelCommandApplyReport, ChannelReceiveOptions,
+    ChannelReceiveReport, ChannelStep, CodexRuntimeCompletionOptions, CodexRuntimeCompletionReport,
+    CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReport, CodexRuntimePlanOptions,
+    CodexRuntimePlanReport, CodexRuntimePreflightOptions, CodexRuntimePreflightReport,
+    ConflictPolicy, DeterministicCronPlan, DeterministicCronPlanInput, DryRunImportOptions,
+    ExecuteImportOptions, ImportPhaseStatus, ImportReport, NativeCronPlan, NativeCronPlanInput,
+    OpenClawSource, PromptAssemblyOptions, PromptBundle, RuntimeQueueEnqueueOptions,
+    RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, SkillIndex,
+    SkillSelectionQuery, SubagentPlan, SubagentPlanInput, TurnPlan, TurnPlanInput,
+    apply_channel_command_step, assemble_prompt_bundle, build_channel_step, build_dry_run_report,
+    build_harness_skill_index, build_import_plan, build_source_skill_index, build_turn_plan,
+    enqueue_channel_step, execute_import, export_harness_registry_files, inventory,
+    load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
+    load_subagent_ledger, plan_codex_runtime, plan_deterministic_cron, plan_native_cron,
+    plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
+    probe_codex_runtime_launch, receive_channel_message, record_codex_runtime_completion,
+    select_skills, write_channel_step, write_deterministic_cron_plan, write_native_cron_plan,
+    write_prompt_bundle, write_report_files, write_skill_index, write_subagent_plan,
+    write_turn_plan,
 };
 
 fn main() {
@@ -39,6 +40,7 @@ fn main() {
         "turn-plan" => run_turn_plan(&rest),
         "channel-step" => run_channel_step(&rest),
         "channel-apply" => run_channel_apply(&rest),
+        "channel-receive" => run_channel_receive(&rest),
         "queue-enqueue" => run_queue_enqueue(&rest),
         "queue-prepare" => run_queue_prepare(&rest),
         "codex-plan" => run_codex_plan(&rest),
@@ -363,6 +365,32 @@ fn run_channel_apply(args: &[String]) -> Result<(), String> {
     .map_err(|err| err.to_string())?;
 
     print_channel_command_apply_report(&report);
+    Ok(())
+}
+
+fn run_channel_receive(args: &[String]) -> Result<(), String> {
+    let args = queue_enqueue_args_from_args(args)?;
+    let skill_index = match &args.turn.harness_home {
+        Some(harness_home) => build_harness_skill_index(harness_home),
+        None => build_source_skill_index(&args.turn.source),
+    }
+    .map_err(|err| err.to_string())?;
+    let report = receive_channel_message(ChannelReceiveOptions {
+        source: args.turn.source,
+        harness_home: args.target_home,
+        skill_index,
+        platform: args.turn.platform,
+        channel_id: args.turn.channel_id,
+        user_id: args.turn.user_id,
+        agent_id: args.turn.agent_id,
+        session_key: args.turn.session_key,
+        message: args.turn.message,
+        skill_limit: args.turn.skill_limit,
+        now_ms: args.now_ms,
+    })
+    .map_err(|err| err.to_string())?;
+
+    print_channel_receive_report(&report);
     Ok(())
 }
 
@@ -2062,6 +2090,52 @@ fn print_channel_command_apply_report(report: &ChannelCommandApplyReport) {
     }
 }
 
+fn print_channel_receive_report(report: &ChannelReceiveReport) {
+    println!("OpenClaw channel receive");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Status: {:?}", report.status);
+    println!("Reason: {}", report.receipt.reason);
+    println!("Platform: {}", report.platform);
+    println!("Channel: {}", report.channel_id);
+    println!("User: {}", report.user_id);
+    println!("Session key: {}", report.session_key);
+    println!("Step action: {:?}", report.step_action);
+    if let Some(command_name) = &report.command_name {
+        println!("Command: {command_name}");
+    }
+    if let Some(queue_id) = &report.queue_id {
+        println!("Queue id: {queue_id}");
+    }
+    println!("Outbox file: {}", report.outbox_file.display());
+    println!("Receipts file: {}", report.receipts_file.display());
+    if !report.outbound_messages.is_empty() {
+        println!("Outbound messages:");
+        for message in &report.outbound_messages {
+            println!("- {:?}: {}", message.kind, message.text);
+        }
+    }
+    if let Some(apply) = &report.command_apply {
+        println!("Command state receipt: {:?}", apply.receipt.status);
+        println!("Command state file: {}", apply.state_file.display());
+    }
+    if let Some(queue) = &report.queue_enqueue {
+        println!("Queue receipt: {:?}", queue.receipt.status);
+        if let Some(item) = &queue.item {
+            println!(
+                "Model policy: provider={} model={}",
+                item.provider.as_deref().unwrap_or("-"),
+                item.model.as_deref().unwrap_or("-")
+            );
+        }
+    }
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
 fn print_runtime_queue_enqueue_report(report: &RuntimeQueueEnqueueReport) {
     println!("OpenClaw runtime queue enqueue");
     println!("Harness home: {}", report.harness_home.display());
@@ -2497,6 +2571,7 @@ fn print_help() {
     println!("  turn-plan       Plan routing, commands, prompts, and skills for one turn");
     println!("  channel-step    Plan shared channel reply or agent dispatch for one DM");
     println!("  channel-apply   Persist channel command state and command receipts");
+    println!("  channel-receive Handle one DM into command outbox or runtime queue");
     println!("  queue-enqueue   Persist one channel agent turn to the runtime queue");
     println!("  queue-prepare   Prepare one queued runtime item for Codex execution");
     println!("  codex-plan      Plan Codex app-server invocation for prepared execution");

@@ -3,6 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub mod channel_commands;
+pub mod channel_ingress;
 pub mod channel_runtime;
 pub mod channel_state;
 pub mod codex_runtime;
@@ -20,6 +21,10 @@ pub mod turns;
 
 pub use channel_commands::{
     ChannelCommand, ChannelCommandIntent, parse_channel_command, parse_channel_command_intent,
+};
+pub use channel_ingress::{
+    ChannelReceiveOptions, ChannelReceiveReceipt, ChannelReceiveReport, ChannelReceiveStatus,
+    receive_channel_message,
 };
 pub use channel_runtime::{
     ChannelAgentTurnDispatch, ChannelCommandEffect, ChannelOutboundMessage,
