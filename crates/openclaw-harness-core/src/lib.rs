@@ -57,17 +57,17 @@ pub use channel_state::{
     apply_channel_command_step, channel_session_state_file, read_channel_session_state,
 };
 pub use codex_runtime::{
-    CodexEnvRequirement, CodexInvocationPlan, CodexOutputPlan, CodexRuntimeCompletionOptions,
-    CodexRuntimeCompletionReceipt, CodexRuntimeCompletionReport, CodexRuntimeCompletionStatus,
-    CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReceipt, CodexRuntimeLaunchProbeReport,
-    CodexRuntimeLaunchProbeStatus, CodexRuntimeLaunchProcess, CodexRuntimePlan,
-    CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimePreflightCheck,
-    CodexRuntimePreflightCheckStatus, CodexRuntimePreflightOptions, CodexRuntimePreflightReceipt,
-    CodexRuntimePreflightReport, CodexRuntimePreflightStatus, CodexRuntimeReceipt,
-    CodexRuntimeReceiptStatus, CodexRuntimeRunOptions, CodexRuntimeRunReceipt,
-    CodexRuntimeRunReport, CodexRuntimeRunStatus, CodexTransportPlan, plan_codex_runtime,
-    preflight_codex_runtime, probe_codex_runtime_launch, record_codex_runtime_completion,
-    run_codex_runtime,
+    CodexApprovalPolicy, CodexApprovalPolicyInspection, CodexEnvRequirement, CodexInvocationPlan,
+    CodexOutputPlan, CodexRuntimeCompletionOptions, CodexRuntimeCompletionReceipt,
+    CodexRuntimeCompletionReport, CodexRuntimeCompletionStatus, CodexRuntimeLaunchProbeOptions,
+    CodexRuntimeLaunchProbeReceipt, CodexRuntimeLaunchProbeReport, CodexRuntimeLaunchProbeStatus,
+    CodexRuntimeLaunchProcess, CodexRuntimePlan, CodexRuntimePlanOptions, CodexRuntimePlanReport,
+    CodexRuntimePreflightCheck, CodexRuntimePreflightCheckStatus, CodexRuntimePreflightOptions,
+    CodexRuntimePreflightReceipt, CodexRuntimePreflightReport, CodexRuntimePreflightStatus,
+    CodexRuntimeReceipt, CodexRuntimeReceiptStatus, CodexRuntimeRunOptions, CodexRuntimeRunReceipt,
+    CodexRuntimeRunReport, CodexRuntimeRunStatus, CodexTransportPlan,
+    inspect_codex_approval_policy, plan_codex_runtime, preflight_codex_runtime,
+    probe_codex_runtime_launch, record_codex_runtime_completion, run_codex_runtime,
 };
 pub use cron::{
     NativeCronJob, NativeCronJobState, NativeCronPlan, NativeCronPlanAction, NativeCronPlanEntry,

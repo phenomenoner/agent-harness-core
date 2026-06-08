@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::probe_harness_log_writable;
+use crate::{
+    codex_runtime::{CodexApprovalPolicy, inspect_codex_approval_policy},
+    probe_harness_log_writable,
+};
 
 const ACTIVATION_READINESS_SCHEMA: &str = "openclaw-harness.activation-readiness.v1";
 
@@ -104,6 +107,8 @@ pub fn check_activation_readiness(
     check_logging(&options.harness_home, &mut checks);
     check_memory_import(&options.harness_home, &mut checks);
     check_codex_auth(&mut checks);
+    check_codex_config(&options.harness_home, &mut checks);
+    check_codex_approval_policy(&options.harness_home, &mut checks);
 
     let summary = summarize(&checks);
     Ok(ActivationReadinessReport {
@@ -1008,6 +1013,77 @@ fn check_codex_auth(checks: &mut Vec<ActivationReadinessCheck>) {
             "codex-auth",
             "neither OPENAI_API_KEY nor Codex OAuth auth state was found",
         ));
+    }
+}
+
+fn check_codex_config(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let codex_home = harness_home.join("codex-home");
+    let config = codex_home.join("config.toml");
+    if config.is_file() {
+        checks.push(pass(
+            "codex-config",
+            format!(
+                "harness-local Codex config is present at {}",
+                config.display()
+            ),
+        ));
+        return;
+    }
+
+    let has_harness_auth = [codex_home.join("auth.json"), codex_home.join("auth.toml")]
+        .iter()
+        .any(|path| path.is_file());
+    if has_harness_auth {
+        checks.push(warn(
+            "codex-config",
+            format!(
+                "harness-local Codex auth exists but config is missing at {}; codex-plan will create a minimal runtime config before app-server launch",
+                config.display()
+            ),
+        ));
+    } else {
+        checks.push(warn(
+            "codex-config",
+            format!(
+                "harness-local Codex config is not present at {}; using global Codex config/auth if available",
+                config.display()
+            ),
+        ));
+    }
+}
+
+fn check_codex_approval_policy(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let inspection = inspect_codex_approval_policy(harness_home);
+    if !inspection.warnings.is_empty() {
+        checks.push(warn(
+            "codex-approval-policy",
+            format!(
+                "{}; policy={} source={}",
+                inspection.warnings.join("; "),
+                inspection.policy.as_str(),
+                inspection.source
+            ),
+        ));
+        return;
+    }
+
+    match inspection.policy {
+        CodexApprovalPolicy::Accept => checks.push(pass(
+            "codex-approval-policy",
+            format!(
+                "Codex approval requests are auto-accepted for unattended channel runtime; source={}",
+                inspection.source
+            ),
+        )),
+        CodexApprovalPolicy::Deny => checks.push(warn(
+            "codex-approval-policy",
+            format!(
+                "Codex approval requests are cancelled; agent can chat but tool execution will be blocked until {}=accept or {} sets security.codexApprovalPolicy=\"accept\"; source={}",
+                super::codex_runtime::CODEX_APPROVAL_POLICY_ENV,
+                inspection.config_file.display(),
+                inspection.source
+            ),
+        )),
     }
 }
 

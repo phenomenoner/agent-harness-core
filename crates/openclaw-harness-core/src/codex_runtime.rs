@@ -26,6 +26,8 @@ the backend system prompt, tool schemas, MCP/tool inventory, sandbox, approvals,
 and thread continuity. The chat-facing agent identity and operating context come \
 from the OpenClaw prompt bundle passed as turn input. Do not treat the Rust harness \
 development repository as the chat user's agent identity.";
+const HARNESS_CONFIG_FILE_NAME: &str = "harness-config.json";
+pub(crate) const CODEX_APPROVAL_POLICY_ENV: &str = "OPENCLAW_HARNESS_CODEX_APPROVAL_POLICY";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRuntimePlanOptions {
@@ -167,12 +169,41 @@ pub struct CodexInvocationPlan {
     pub env_requirements: Vec<CodexEnvRequirement>,
     pub model_argument: Option<String>,
     pub thread_id: Option<String>,
+    #[serde(default)]
+    pub approval_policy: CodexApprovalPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CodexTransportPlan {
     StdioJsonRpcAppServer,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexApprovalPolicy {
+    #[default]
+    Deny,
+    Accept,
+}
+
+impl CodexApprovalPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Accept => "accept",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexApprovalPolicyInspection {
+    pub policy: CodexApprovalPolicy,
+    pub source: String,
+    pub configured: bool,
+    pub config_file: PathBuf,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -454,16 +485,25 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
     let executable = options
         .codex_executable
         .unwrap_or_else(|| PathBuf::from("codex"));
+    let approval_policy = resolve_codex_approval_policy(&options.harness_home, &mut warnings);
+    let codex_home = harness_codex_home(&options.harness_home);
+    ensure_harness_codex_config(
+        codex_home.as_deref(),
+        &working_directory,
+        &options.harness_home,
+        &mut warnings,
+    )?;
     let invocation = CodexInvocationPlan {
         executable,
         transport: CodexTransportPlan::StdioJsonRpcAppServer,
         arguments: vec!["app-server".to_string()],
         working_directory,
-        codex_home: harness_codex_home(&options.harness_home),
+        codex_home,
         prompt_input_file: prompt_markdown.clone(),
         env_requirements: env_requirements(provider.as_deref()),
         model_argument: model.clone(),
         thread_id,
+        approval_policy,
     };
     let outputs = CodexOutputPlan {
         transcript_file,
@@ -1405,53 +1445,58 @@ fn drive_codex_app_server(
         }),
     )?;
 
-    let thread_id =
-        match wait_for_thread_start(&line_rx, &mut child, &mut stdin, &mut state, deadline)? {
-            ProtocolWait::ThreadStarted(thread_id) => thread_id,
-            ProtocolWait::TimedOut(reason) => {
-                let _ = terminate_child(&mut child);
-                let _ = reader_handle.join();
-                return Ok(CodexAppServerRunResult {
-                    status: CodexRuntimeRunStatus::Timeout,
-                    reason,
-                    assistant_message: state.assistant_message,
-                    thread_id: None,
-                    event_count: state.event_count,
-                    stdout_log: Some(stdout_log),
-                    stderr_log: Some(stderr_log),
-                    warnings: state.warnings,
-                });
-            }
-            ProtocolWait::Failed(reason) => {
-                let _ = terminate_child(&mut child);
-                let _ = reader_handle.join();
-                return Ok(CodexAppServerRunResult {
-                    status: CodexRuntimeRunStatus::ProtocolError,
-                    reason,
-                    assistant_message: state.assistant_message,
-                    thread_id: None,
-                    event_count: state.event_count,
-                    stdout_log: Some(stdout_log),
-                    stderr_log: Some(stderr_log),
-                    warnings: state.warnings,
-                });
-            }
-            ProtocolWait::TurnCompleted => {
-                let _ = terminate_child(&mut child);
-                let _ = reader_handle.join();
-                return Ok(CodexAppServerRunResult {
-                    status: CodexRuntimeRunStatus::ProtocolError,
-                    reason: "codex app-server reported turn completion before thread start"
-                        .to_string(),
-                    assistant_message: state.assistant_message,
-                    thread_id: None,
-                    event_count: state.event_count,
-                    stdout_log: Some(stdout_log),
-                    stderr_log: Some(stderr_log),
-                    warnings: state.warnings,
-                });
-            }
-        };
+    let thread_id = match wait_for_thread_start(
+        &line_rx,
+        &mut child,
+        &mut stdin,
+        &mut state,
+        deadline,
+        plan.invocation.approval_policy,
+    )? {
+        ProtocolWait::ThreadStarted(thread_id) => thread_id,
+        ProtocolWait::TimedOut(reason) => {
+            let _ = terminate_child(&mut child);
+            let _ = reader_handle.join();
+            return Ok(CodexAppServerRunResult {
+                status: CodexRuntimeRunStatus::Timeout,
+                reason,
+                assistant_message: state.assistant_message_with_harness_notices(),
+                thread_id: None,
+                event_count: state.event_count,
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                warnings: state.warnings,
+            });
+        }
+        ProtocolWait::Failed(reason) => {
+            let _ = terminate_child(&mut child);
+            let _ = reader_handle.join();
+            return Ok(CodexAppServerRunResult {
+                status: CodexRuntimeRunStatus::ProtocolError,
+                reason,
+                assistant_message: state.assistant_message_with_harness_notices(),
+                thread_id: None,
+                event_count: state.event_count,
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                warnings: state.warnings,
+            });
+        }
+        ProtocolWait::TurnCompleted => {
+            let _ = terminate_child(&mut child);
+            let _ = reader_handle.join();
+            return Ok(CodexAppServerRunResult {
+                status: CodexRuntimeRunStatus::ProtocolError,
+                reason: "codex app-server reported turn completion before thread start".to_string(),
+                assistant_message: state.assistant_message_with_harness_notices(),
+                thread_id: None,
+                event_count: state.event_count,
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                warnings: state.warnings,
+            });
+        }
+    };
     let prompt_input = fs::read_to_string(&plan.invocation.prompt_input_file)?;
     write_json_rpc(
         &mut stdin,
@@ -1471,59 +1516,65 @@ fn drive_codex_app_server(
         }),
     )?;
 
-    let status =
-        match wait_for_turn_completed(&line_rx, &mut child, &mut stdin, &mut state, deadline)? {
-            ProtocolWait::TurnCompleted => CodexRuntimeRunStatus::Completed,
-            ProtocolWait::TimedOut(reason) => {
-                let _ = terminate_child(&mut child);
-                let _ = reader_handle.join();
-                return Ok(CodexAppServerRunResult {
-                    status: CodexRuntimeRunStatus::Timeout,
-                    reason,
-                    assistant_message: state.assistant_message,
-                    thread_id: Some(thread_id.clone()),
-                    event_count: state.event_count,
-                    stdout_log: Some(stdout_log),
-                    stderr_log: Some(stderr_log),
-                    warnings: state.warnings,
-                });
-            }
-            ProtocolWait::Failed(reason) => {
-                let _ = terminate_child(&mut child);
-                let _ = reader_handle.join();
-                return Ok(CodexAppServerRunResult {
-                    status: CodexRuntimeRunStatus::ProtocolError,
-                    reason,
-                    assistant_message: state.assistant_message,
-                    thread_id: Some(thread_id.clone()),
-                    event_count: state.event_count,
-                    stdout_log: Some(stdout_log),
-                    stderr_log: Some(stderr_log),
-                    warnings: state.warnings,
-                });
-            }
-            ProtocolWait::ThreadStarted(_) => {
-                let _ = terminate_child(&mut child);
-                let _ = reader_handle.join();
-                return Ok(CodexAppServerRunResult {
-                    status: CodexRuntimeRunStatus::ProtocolError,
-                    reason: "codex app-server returned a second thread/start response during turn"
-                        .to_string(),
-                    assistant_message: state.assistant_message,
-                    thread_id: Some(thread_id.clone()),
-                    event_count: state.event_count,
-                    stdout_log: Some(stdout_log),
-                    stderr_log: Some(stderr_log),
-                    warnings: state.warnings,
-                });
-            }
-        };
+    let status = match wait_for_turn_completed(
+        &line_rx,
+        &mut child,
+        &mut stdin,
+        &mut state,
+        deadline,
+        plan.invocation.approval_policy,
+    )? {
+        ProtocolWait::TurnCompleted => CodexRuntimeRunStatus::Completed,
+        ProtocolWait::TimedOut(reason) => {
+            let _ = terminate_child(&mut child);
+            let _ = reader_handle.join();
+            return Ok(CodexAppServerRunResult {
+                status: CodexRuntimeRunStatus::Timeout,
+                reason,
+                assistant_message: state.assistant_message_with_harness_notices(),
+                thread_id: Some(thread_id.clone()),
+                event_count: state.event_count,
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                warnings: state.warnings,
+            });
+        }
+        ProtocolWait::Failed(reason) => {
+            let _ = terminate_child(&mut child);
+            let _ = reader_handle.join();
+            return Ok(CodexAppServerRunResult {
+                status: CodexRuntimeRunStatus::ProtocolError,
+                reason,
+                assistant_message: state.assistant_message_with_harness_notices(),
+                thread_id: Some(thread_id.clone()),
+                event_count: state.event_count,
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                warnings: state.warnings,
+            });
+        }
+        ProtocolWait::ThreadStarted(_) => {
+            let _ = terminate_child(&mut child);
+            let _ = reader_handle.join();
+            return Ok(CodexAppServerRunResult {
+                status: CodexRuntimeRunStatus::ProtocolError,
+                reason: "codex app-server returned a second thread/start response during turn"
+                    .to_string(),
+                assistant_message: state.assistant_message_with_harness_notices(),
+                thread_id: Some(thread_id.clone()),
+                event_count: state.event_count,
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                warnings: state.warnings,
+            });
+        }
+    };
     let _ = terminate_child(&mut child);
     let _ = reader_handle.join();
     Ok(CodexAppServerRunResult {
         status,
         reason: "codex app-server turn completed and assistant output was captured".to_string(),
-        assistant_message: state.assistant_message,
+        assistant_message: state.assistant_message_with_harness_notices(),
         thread_id: Some(thread_id),
         event_count: state.event_count,
         stdout_log: Some(stdout_log),
@@ -1537,6 +1588,37 @@ struct CodexProtocolState {
     assistant_message: String,
     event_count: usize,
     warnings: Vec<String>,
+    denied_approval_requests: Vec<String>,
+}
+
+impl CodexProtocolState {
+    fn assistant_message_with_harness_notices(&self) -> String {
+        let mut message = self.assistant_message.clone();
+        if self.denied_approval_requests.is_empty() {
+            return message;
+        }
+
+        let mut notice = format!(
+            "[Harness safety] {} Codex approval request(s) were cancelled by codexApprovalPolicy=deny.",
+            self.denied_approval_requests.len()
+        );
+        if let Some(first) = self.denied_approval_requests.first() {
+            notice.push_str(" First cancelled request: ");
+            notice.push_str(first);
+            notice.push('.');
+        }
+        notice.push_str(
+            " Set OPENCLAW_HARNESS_CODEX_APPROVAL_POLICY=accept or security.codexApprovalPolicy=\"accept\" in harness-config.json to allow unattended tool execution.",
+        );
+
+        if message.trim().is_empty() {
+            notice
+        } else {
+            message.push_str("\n\n");
+            message.push_str(&notice);
+            message
+        }
+    }
 }
 
 enum ProtocolWait {
@@ -1552,6 +1634,7 @@ fn wait_for_thread_start(
     stdin: &mut impl Write,
     state: &mut CodexProtocolState,
     deadline: Instant,
+    approval_policy: CodexApprovalPolicy,
 ) -> io::Result<ProtocolWait> {
     loop {
         match receive_protocol_event(line_rx, child, state, deadline)? {
@@ -1559,7 +1642,7 @@ fn wait_for_thread_start(
                 if let Some(error) = protocol_error(&value) {
                     return Ok(ProtocolWait::Failed(error));
                 }
-                if answer_unattended_server_request(&value, stdin, state)? {
+                if answer_unattended_server_request(&value, stdin, state, approval_policy)? {
                     continue;
                 }
                 if json_id(&value) == Some(1) {
@@ -1587,6 +1670,7 @@ fn wait_for_turn_completed(
     stdin: &mut impl Write,
     state: &mut CodexProtocolState,
     deadline: Instant,
+    approval_policy: CodexApprovalPolicy,
 ) -> io::Result<ProtocolWait> {
     loop {
         match receive_protocol_event(line_rx, child, state, deadline)? {
@@ -1594,7 +1678,7 @@ fn wait_for_turn_completed(
                 if let Some(error) = protocol_error(&value) {
                     return Ok(ProtocolWait::Failed(error));
                 }
-                if answer_unattended_server_request(&value, stdin, state)? {
+                if answer_unattended_server_request(&value, stdin, state, approval_policy)? {
                     continue;
                 }
                 collect_agent_delta(&value, state);
@@ -1761,6 +1845,7 @@ fn answer_unattended_server_request(
     value: &Value,
     stdin: &mut impl Write,
     state: &mut CodexProtocolState,
+    approval_policy: CodexApprovalPolicy,
 ) -> io::Result<bool> {
     let Some(method) = json_method(value) else {
         return Ok(false);
@@ -1768,7 +1853,7 @@ fn answer_unattended_server_request(
     let Some(id) = value.get("id").cloned() else {
         return Ok(false);
     };
-    let Some(decision) = unattended_approval_decision(method) else {
+    let Some(decision) = unattended_approval_decision(method, approval_policy) else {
         return Ok(false);
     };
     write_json_rpc(
@@ -1780,20 +1865,66 @@ fn answer_unattended_server_request(
             }
         }),
     )?;
-    state
-        .warnings
-        .push(format!("auto-declined Codex app-server request {method}"));
+    match approval_policy {
+        CodexApprovalPolicy::Deny => {
+            let summary = approval_request_summary(value);
+            state.denied_approval_requests.push(summary);
+            state.warnings.push(format!(
+                "auto-cancelled Codex app-server request {method} by approval policy deny"
+            ));
+        }
+        CodexApprovalPolicy::Accept => {
+            state.warnings.push(format!(
+                "auto-accepted Codex app-server request {method} by approval policy accept"
+            ));
+        }
+    }
     Ok(true)
 }
 
-fn unattended_approval_decision(method: &str) -> Option<&'static str> {
-    match method {
-        "execCommandApproval" | "applyPatchApproval" => Some("denied"),
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-            Some("decline")
+fn unattended_approval_decision(
+    method: &str,
+    approval_policy: CodexApprovalPolicy,
+) -> Option<&'static str> {
+    match (method, approval_policy) {
+        ("execCommandApproval" | "applyPatchApproval", CodexApprovalPolicy::Deny) => Some("denied"),
+        ("execCommandApproval" | "applyPatchApproval", CodexApprovalPolicy::Accept) => {
+            Some("approved")
         }
+        (
+            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval",
+            CodexApprovalPolicy::Deny,
+        ) => Some("cancel"),
+        (
+            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval",
+            CodexApprovalPolicy::Accept,
+        ) => Some("accept"),
         _ => None,
     }
+}
+
+fn approval_request_summary(value: &Value) -> String {
+    let method = json_method(value).unwrap_or("unknown approval request");
+    let mut parts = vec![method.to_string()];
+    if let Some(cwd) = value.pointer("/params/cwd").and_then(Value::as_str) {
+        parts.push(format!("cwd={}", truncate_for_notice(cwd, 120)));
+    }
+    if let Some(reason) = value.pointer("/params/reason").and_then(Value::as_str) {
+        parts.push(format!("reason={}", truncate_for_notice(reason, 160)));
+    }
+    parts.join(", ")
+}
+
+fn truncate_for_notice(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if index >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn extract_thread_id(value: &Value) -> Option<String> {
@@ -2240,6 +2371,129 @@ fn env_requirements(provider: Option<&str>) -> Vec<CodexEnvRequirement> {
     }
 }
 
+pub fn inspect_codex_approval_policy(harness_home: &Path) -> CodexApprovalPolicyInspection {
+    let mut warnings = Vec::new();
+    let (policy, source, configured) =
+        resolve_codex_approval_policy_with_source(harness_home, &mut warnings);
+    CodexApprovalPolicyInspection {
+        policy,
+        source,
+        configured,
+        config_file: harness_home.join(HARNESS_CONFIG_FILE_NAME),
+        warnings,
+    }
+}
+
+fn resolve_codex_approval_policy(
+    harness_home: &Path,
+    warnings: &mut Vec<String>,
+) -> CodexApprovalPolicy {
+    let (policy, _, _) = resolve_codex_approval_policy_with_source(harness_home, warnings);
+    policy
+}
+
+fn resolve_codex_approval_policy_with_source(
+    harness_home: &Path,
+    warnings: &mut Vec<String>,
+) -> (CodexApprovalPolicy, String, bool) {
+    if let Ok(raw) = env::var(CODEX_APPROVAL_POLICY_ENV) {
+        return match parse_codex_approval_policy(&raw) {
+            Some(policy) => (policy, CODEX_APPROVAL_POLICY_ENV.to_string(), true),
+            None => {
+                warnings.push(format!(
+                    "invalid {CODEX_APPROVAL_POLICY_ENV}={raw:?}; defaulting Codex approval policy to deny"
+                ));
+                (
+                    CodexApprovalPolicy::Deny,
+                    CODEX_APPROVAL_POLICY_ENV.to_string(),
+                    true,
+                )
+            }
+        };
+    }
+
+    let config_file = harness_home.join(HARNESS_CONFIG_FILE_NAME);
+    let text = match fs::read_to_string(&config_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return (CodexApprovalPolicy::Deny, "default".to_string(), false);
+        }
+        Err(error) => {
+            warnings.push(format!(
+                "failed to read {}: {error}; defaulting Codex approval policy to deny",
+                config_file.display()
+            ));
+            return (
+                CodexApprovalPolicy::Deny,
+                config_file.display().to_string(),
+                false,
+            );
+        }
+    };
+    let value = match serde_json::from_str::<Value>(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            warnings.push(format!(
+                "failed to parse {} as JSON: {error}; defaulting Codex approval policy to deny",
+                config_file.display()
+            ));
+            return (
+                CodexApprovalPolicy::Deny,
+                config_file.display().to_string(),
+                false,
+            );
+        }
+    };
+    for pointer in [
+        "/security/codexApprovalPolicy",
+        "/security/codexApprovals",
+        "/codex/approvalPolicy",
+        "/codex/approvals",
+        "/runtime/codexApprovalPolicy",
+    ] {
+        if let Some(raw_value) = value.pointer(pointer) {
+            if let Some(policy) = codex_approval_policy_from_json(raw_value) {
+                return (policy, format!("{}:{pointer}", config_file.display()), true);
+            }
+            warnings.push(format!(
+                "invalid Codex approval policy at {}:{pointer}; defaulting to deny",
+                config_file.display()
+            ));
+            return (
+                CodexApprovalPolicy::Deny,
+                format!("{}:{pointer}", config_file.display()),
+                true,
+            );
+        }
+    }
+    (
+        CodexApprovalPolicy::Deny,
+        config_file.display().to_string(),
+        false,
+    )
+}
+
+fn codex_approval_policy_from_json(value: &Value) -> Option<CodexApprovalPolicy> {
+    match value {
+        Value::String(text) => parse_codex_approval_policy(text),
+        Value::Bool(true) => Some(CodexApprovalPolicy::Accept),
+        Value::Bool(false) => Some(CodexApprovalPolicy::Deny),
+        _ => None,
+    }
+}
+
+fn parse_codex_approval_policy(value: &str) -> Option<CodexApprovalPolicy> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "accept" | "allow" | "approve" | "approved" | "auto-accept" | "unattended-accept"
+        | "open" | "enabled" | "on" | "true" => Some(CodexApprovalPolicy::Accept),
+        "deny" | "decline" | "cancel" | "closed" | "disabled" | "off" | "false" => {
+            Some(CodexApprovalPolicy::Deny)
+        }
+        _ => None,
+    }
+}
+
 fn check_executable(executable: &Path) -> CodexRuntimePreflightCheck {
     match resolve_executable(executable) {
         Some(path) => pass_check(
@@ -2634,11 +2888,102 @@ fn completion_receipt_file(plan: &CodexRuntimePlanFile) -> PathBuf {
 }
 
 fn harness_codex_home(harness_home: &Path) -> Option<PathBuf> {
-    let codex_home = harness_home.join("codex-home");
+    let codex_home = absolute_for_config(harness_home).join("codex-home");
     [codex_home.join("auth.json"), codex_home.join("auth.toml")]
         .iter()
         .any(|path| path.is_file())
         .then_some(codex_home)
+}
+
+fn ensure_harness_codex_config(
+    codex_home: Option<&Path>,
+    working_directory: &Path,
+    harness_home: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    let Some(codex_home) = codex_home else {
+        return Ok(());
+    };
+    let config_file = codex_home.join("config.toml");
+    if config_file.is_file() {
+        let existing = fs::read_to_string(&config_file)?;
+        if existing.starts_with("# Generated by openclaw-harness.") {
+            let desired = harness_codex_config_toml(working_directory, harness_home);
+            if existing != desired {
+                fs::write(&config_file, desired)?;
+                warnings.push(format!(
+                    "updated generated harness-local Codex config at {}",
+                    config_file.display()
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    fs::create_dir_all(codex_home)?;
+    let config = harness_codex_config_toml(working_directory, harness_home);
+    fs::write(&config_file, config)?;
+    warnings.push(format!(
+        "created harness-local Codex config at {} with Windows elevated sandbox and trusted runtime workspace",
+        config_file.display()
+    ));
+    Ok(())
+}
+
+fn harness_codex_config_toml(working_directory: &Path, harness_home: &Path) -> String {
+    let mut project_roots = vec![
+        absolute_for_config(working_directory),
+        absolute_for_config(harness_home),
+    ];
+    project_roots.sort();
+    project_roots.dedup();
+
+    let mut config = String::from(
+        "# Generated by openclaw-harness. Contains no secrets.\n\
+         # Codex OAuth state stays in auth.json/auth.toml.\n\
+         \n\
+         [windows]\n\
+         sandbox = \"elevated\"\n\
+         \n\
+         [features]\n\
+         multi_agent = true\n\
+         memories = true\n",
+    );
+    for root in project_roots {
+        config.push_str("\n[projects.");
+        config.push_str(&toml_basic_string(&root.to_string_lossy()));
+        config.push_str("]\ntrust_level = \"trusted\"\n");
+    }
+    config
+}
+
+fn absolute_for_config(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
+fn toml_basic_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => {
+                out.push_str(&format!("\\u{:04X}", ch as u32));
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn apply_codex_home_env(command: &mut Command, plan: &CodexRuntimePlanFile) {
@@ -2717,6 +3062,7 @@ mod tests {
             plan.invocation.transport,
             CodexTransportPlan::StdioJsonRpcAppServer
         );
+        assert_eq!(plan.invocation.approval_policy, CodexApprovalPolicy::Deny);
         assert!(
             plan.invocation
                 .env_requirements
@@ -2732,6 +3078,39 @@ mod tests {
                 .codex_binding_file
                 .to_string_lossy()
                 .ends_with(".jsonl.codex-app-server.json")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plan_codex_runtime_reads_approval_policy_from_harness_config() {
+        let root = temp_root("plan_codex_runtime_reads_approval_policy_from_harness_config");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"security":{"codexApprovalPolicy":"accept"}}"#,
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+
+        let report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+
+        let plan = report.plan.unwrap();
+        assert_eq!(plan.invocation.approval_policy, CodexApprovalPolicy::Accept);
+
+        let plan_file = report.plan_file.unwrap();
+        let plan_json: Value = read_json_file(&plan_file).unwrap();
+        assert_eq!(
+            plan_json["invocation"]["approvalPolicy"],
+            serde_json::json!("accept")
         );
 
         let _ = fs::remove_dir_all(root);
@@ -2778,6 +3157,81 @@ mod tests {
 
         let plan = report.plan.unwrap();
         assert_eq!(plan.invocation.codex_home, Some(codex_home));
+        let config = fs::read_to_string(
+            plan.invocation
+                .codex_home
+                .as_ref()
+                .unwrap()
+                .join("config.toml"),
+        )
+        .unwrap();
+        assert!(config.contains("sandbox = \"elevated\""));
+        assert!(config.contains("multi_agent = true"));
+        assert!(config.contains("trust_level = \"trusted\""));
+        assert!(config.contains(&toml_basic_string(&source.workspace.to_string_lossy())));
+        assert!(config.contains(&toml_basic_string(&harness_home.to_string_lossy())));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plan_codex_runtime_preserves_existing_harness_codex_config() {
+        let root = temp_root("plan_codex_runtime_preserves_existing_harness_codex_config");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        let codex_home = harness_home.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        fs::write(codex_home.join("config.toml"), "# custom operator config\n").unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+
+        let report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(codex_home.join("config.toml")).unwrap(),
+            "# custom operator config\n"
+        );
+        assert!(report.warnings.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn harness_codex_config_uses_absolute_project_paths() {
+        let cwd = env::current_dir().unwrap();
+        let config =
+            harness_codex_config_toml(Path::new("relative-runtime"), Path::new("relative-harness"));
+
+        assert!(config.contains(&toml_basic_string(
+            &cwd.join("relative-runtime").to_string_lossy()
+        )));
+        assert!(config.contains(&toml_basic_string(
+            &cwd.join("relative-harness").to_string_lossy()
+        )));
+        assert!(!config.contains("[projects.\"relative-runtime\"]"));
+        assert!(!config.contains("[projects.\"relative-harness\"]"));
+    }
+
+    #[test]
+    fn harness_codex_home_uses_absolute_path_for_relative_harness_home() {
+        let root = PathBuf::from("target").join(format!(
+            "tmp-openclaw-harness-codex-home-{}",
+            current_log_time_ms().unwrap()
+        ));
+        let harness_home = root.join(".openclaw-harness");
+        let codex_home = harness_home.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+
+        let resolved = harness_codex_home(&harness_home).unwrap();
+
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with(harness_home.join("codex-home")));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3162,6 +3616,7 @@ mod tests {
             }),
             &mut out,
             &mut state,
+            CodexApprovalPolicy::Deny,
         )
         .unwrap();
 
@@ -3175,7 +3630,46 @@ mod tests {
         let response: Value =
             serde_json::from_slice(String::from_utf8(out).unwrap().trim().as_bytes()).unwrap();
         assert_eq!(response["id"], 7);
-        assert_eq!(response["result"]["decision"], "decline");
+        assert_eq!(response["result"]["decision"], "cancel");
+        assert_eq!(state.denied_approval_requests.len(), 1);
+        assert!(
+            state
+                .assistant_message_with_harness_notices()
+                .contains("codexApprovalPolicy=deny")
+        );
+    }
+
+    #[test]
+    fn answer_unattended_server_request_accepts_approval_requests_when_policy_allows() {
+        let mut state = CodexProtocolState::default();
+        let mut out = Vec::new();
+
+        let handled = answer_unattended_server_request(
+            &serde_json::json!({
+                "id": 8,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "cwd": "D:\\Warehouse\\Research\\OpenClaw_WSL"
+                }
+            }),
+            &mut out,
+            &mut state,
+            CodexApprovalPolicy::Accept,
+        )
+        .unwrap();
+
+        assert!(handled);
+        assert!(state.denied_approval_requests.is_empty());
+        assert!(
+            state
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("auto-accepted") })
+        );
+        let response: Value =
+            serde_json::from_slice(String::from_utf8(out).unwrap().trim().as_bytes()).unwrap();
+        assert_eq!(response["id"], 8);
+        assert_eq!(response["result"]["decision"], "accept");
     }
 
     #[test]
@@ -3191,6 +3685,7 @@ mod tests {
             }),
             &mut out,
             &mut state,
+            CodexApprovalPolicy::Deny,
         )
         .unwrap();
 
