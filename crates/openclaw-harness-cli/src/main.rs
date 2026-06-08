@@ -663,18 +663,52 @@ fn run_telegram_loop(args: &[String]) -> Result<(), String> {
                 iterations,
                 "stop file requested",
             )?;
+            write_loop_heartbeat(
+                &args.poll.target_home,
+                "telegram-loop",
+                "stopped",
+                iterations,
+                "stop file requested",
+            )?;
             println!("Telegram loop stop requested after {iterations} iteration(s)");
             break;
         }
         iterations += 1;
+        write_loop_heartbeat(
+            &args.poll.target_home,
+            "telegram-loop",
+            "running",
+            iterations,
+            "polling Telegram updates",
+        )?;
         match execute_telegram_poll_once(&args.poll, &token) {
             Ok(report) => {
                 consecutive_errors = 0;
+                write_loop_heartbeat(
+                    &args.poll.target_home,
+                    "telegram-loop",
+                    "ok",
+                    iterations,
+                    &format!(
+                        "updates={} handled={} delivered={} failed={}",
+                        report.update_count,
+                        report.handled_messages,
+                        report.delivered_messages,
+                        report.failed_deliveries
+                    ),
+                )?;
                 println!("Telegram loop iteration: {iterations}");
                 print_telegram_poll_once_report(&report);
             }
             Err(error) => {
                 consecutive_errors += 1;
+                write_loop_heartbeat(
+                    &args.poll.target_home,
+                    "telegram-loop",
+                    "error",
+                    iterations,
+                    &format!("consecutiveErrors={consecutive_errors} error={error}"),
+                )?;
                 eprintln!(
                     "telegram-loop iteration {iterations} failed ({consecutive_errors}/{}): {error}",
                     args.max_consecutive_errors
@@ -1001,18 +1035,49 @@ fn run_discord_outbox_loop(args: &[String]) -> Result<(), String> {
                 iterations,
                 "stop file requested",
             )?;
+            write_loop_heartbeat(
+                &args.send.target_home,
+                "discord-outbox-loop",
+                "stopped",
+                iterations,
+                "stop file requested",
+            )?;
             println!("Discord outbox loop stop requested after {iterations} iteration(s)");
             break;
         }
         iterations += 1;
+        write_loop_heartbeat(
+            &args.send.target_home,
+            "discord-outbox-loop",
+            "running",
+            iterations,
+            "checking Discord outbox",
+        )?;
         match execute_discord_outbox_send_once(&args.send, &token) {
             Ok(report) => {
                 consecutive_errors = 0;
+                write_loop_heartbeat(
+                    &args.send.target_home,
+                    "discord-outbox-loop",
+                    "ok",
+                    iterations,
+                    &format!(
+                        "pending={} delivered={} failed={}",
+                        report.pending_count, report.delivered_messages, report.failed_deliveries
+                    ),
+                )?;
                 println!("Discord outbox loop iteration: {iterations}");
                 print_discord_outbox_send_once_report(&report);
             }
             Err(error) => {
                 consecutive_errors += 1;
+                write_loop_heartbeat(
+                    &args.send.target_home,
+                    "discord-outbox-loop",
+                    "error",
+                    iterations,
+                    &format!("consecutiveErrors={consecutive_errors} error={error}"),
+                )?;
                 eprintln!(
                     "discord-outbox-loop iteration {iterations} failed ({consecutive_errors}/{}): {error}",
                     args.max_consecutive_errors
@@ -1325,13 +1390,34 @@ fn run_discord_gateway_loop(args: &[String]) -> Result<(), String> {
                 iterations,
                 "stop file requested",
             )?;
+            write_loop_heartbeat(
+                &args.target_home,
+                "discord-gateway-loop",
+                "stopped",
+                iterations,
+                "stop file requested",
+            )?;
             println!("Discord gateway loop stop requested after {iterations} iteration(s)");
             break;
         }
         iterations += 1;
+        write_loop_heartbeat(
+            &args.target_home,
+            "discord-gateway-loop",
+            "spawning",
+            iterations,
+            "starting Discord gateway subprocess",
+        )?;
         match discord_gateway_command(&args).status() {
             Ok(status) if status.success() => {
                 consecutive_errors = 0;
+                write_loop_heartbeat(
+                    &args.target_home,
+                    "discord-gateway-loop",
+                    "restarting",
+                    iterations,
+                    "gateway subprocess exited cleanly; restarting",
+                )?;
                 append_harness_log(
                     &args.target_home,
                     &HarnessLogEvent::new(
@@ -1347,6 +1433,13 @@ fn run_discord_gateway_loop(args: &[String]) -> Result<(), String> {
             Ok(status) => {
                 consecutive_errors += 1;
                 let error = format!("Discord gateway subprocess exited with {status}");
+                write_loop_heartbeat(
+                    &args.target_home,
+                    "discord-gateway-loop",
+                    "error",
+                    iterations,
+                    &format!("consecutiveErrors={consecutive_errors} error={error}"),
+                )?;
                 append_harness_log(
                     &args.target_home,
                     &HarnessLogEvent::new(
@@ -1375,6 +1468,13 @@ fn run_discord_gateway_loop(args: &[String]) -> Result<(), String> {
                     "failed to spawn Discord gateway loop via {}: {error}",
                     args.node_exe.display()
                 );
+                write_loop_heartbeat(
+                    &args.target_home,
+                    "discord-gateway-loop",
+                    "error",
+                    iterations,
+                    &format!("consecutiveErrors={consecutive_errors} error={error}"),
+                )?;
                 append_harness_log(
                     &args.target_home,
                     &HarnessLogEvent::new(
@@ -1651,9 +1751,23 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
     loop {
         if stop_file_requested(args.stop_file.as_deref()) {
             stop_reason = "stopped after stop file request".to_string();
+            write_loop_heartbeat(
+                &args.target_home,
+                "runtime-loop",
+                "stopped",
+                iterations,
+                "stop file requested",
+            )?;
             break;
         }
         iterations += 1;
+        write_loop_heartbeat(
+            &args.target_home,
+            "runtime-loop",
+            "running",
+            iterations,
+            "checking runtime queue",
+        )?;
         let _typing = start_runtime_typing_heartbeat(&args.target_home, None);
         match run_runtime_queue_once(RuntimeRunOnceOptions {
             harness_home: args.target_home.clone(),
@@ -1671,6 +1785,13 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
                 last_status = Some(status);
                 last_queue_id = report.receipt.queue_id.clone();
                 last_reason = Some(report.receipt.reason.clone());
+                write_loop_heartbeat(
+                    &args.target_home,
+                    "runtime-loop",
+                    runtime_run_once_status_label(status),
+                    iterations,
+                    &report.receipt.reason,
+                )?;
                 println!(
                     "Runtime loop iteration {iterations}: {} ({})",
                     runtime_run_once_status_label(status),
@@ -1718,6 +1839,13 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
                 errors += 1;
                 consecutive_errors += 1;
                 let error = error.to_string();
+                write_loop_heartbeat(
+                    &args.target_home,
+                    "runtime-loop",
+                    "error",
+                    iterations,
+                    &format!("consecutiveErrors={consecutive_errors} error={error}"),
+                )?;
                 eprintln!(
                     "runtime-loop iteration {iterations} failed ({consecutive_errors}/{}): {error}",
                     args.max_consecutive_errors
@@ -6125,6 +6253,35 @@ fn append_loop_stop_log(
     )
     .map(|_| ())
     .map_err(|err| err.to_string())
+}
+
+fn write_loop_heartbeat(
+    harness_home: &Path,
+    name: &str,
+    status: &str,
+    iteration: usize,
+    detail: &str,
+) -> Result<(), String> {
+    let dir = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("loop-heartbeats");
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let heartbeat = serde_json::json!({
+        "schema": "openclaw-harness.loop-heartbeat.v1",
+        "name": name,
+        "status": status,
+        "iteration": iteration,
+        "detail": detail,
+        "atMs": current_time_ms()?,
+        "processId": std::process::id(),
+    });
+    let file = dir.join(format!("{name}.json"));
+    fs::write(
+        &file,
+        serde_json::to_string_pretty(&heartbeat).map_err(|err| err.to_string())?,
+    )
+    .map_err(|err| format!("failed to write loop heartbeat {}: {err}", file.display()))
 }
 
 fn format_status(status: &ImportPhaseStatus) -> &'static str {

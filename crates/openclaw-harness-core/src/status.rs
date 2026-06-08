@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -28,6 +29,7 @@ pub struct HarnessStatusReport {
     pub readiness: ActivationReadinessReport,
     pub runtime: HarnessRuntimeStatus,
     pub channels: HarnessChannelStatus,
+    pub loops: HarnessLoopStatus,
     pub memory: HarnessMemoryStatus,
     pub plugins: HarnessPluginStatus,
     pub logs: HarnessOperationalLogStatus,
@@ -70,6 +72,27 @@ pub struct HarnessOutboxStatus {
     pub all: ChannelOutboxPlanSummary,
     pub telegram: ChannelOutboxPlanSummary,
     pub discord: ChannelOutboxPlanSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessLoopStatus {
+    pub heartbeat_dir: PathBuf,
+    pub heartbeats: Vec<HarnessLoopHeartbeatStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessLoopHeartbeatStatus {
+    pub name: String,
+    pub heartbeat_file: PathBuf,
+    pub present: bool,
+    pub status: Option<String>,
+    pub iteration: Option<i64>,
+    pub process_id: Option<i64>,
+    pub at_ms: Option<i64>,
+    pub age_ms: Option<i64>,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -125,6 +148,7 @@ pub fn collect_harness_status(options: HarnessStatusOptions) -> io::Result<Harne
     let channels = channel_status(&options.harness_home, &readiness, &mut warnings)?;
     let logs = log_status(&options.harness_home)?;
     let runtime = runtime_status(&options.harness_home)?;
+    let loops = loop_status(&options.harness_home)?;
     let memory = memory_status(&options.harness_home)?;
     let plugins = plugin_status(&options.harness_home)?;
 
@@ -135,10 +159,72 @@ pub fn collect_harness_status(options: HarnessStatusOptions) -> io::Result<Harne
         readiness,
         runtime,
         channels,
+        loops,
         memory,
         plugins,
         logs,
         warnings,
+    })
+}
+
+fn loop_status(harness_home: &Path) -> io::Result<HarnessLoopStatus> {
+    const LOOP_NAMES: &[&str] = &[
+        "runtime-loop",
+        "telegram-loop",
+        "discord-outbox-loop",
+        "discord-gateway-loop",
+    ];
+    let heartbeat_dir = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("loop-heartbeats");
+    let now_ms = epoch_ms().unwrap_or(0);
+    let mut heartbeats = Vec::new();
+    for name in LOOP_NAMES {
+        let heartbeat_file = heartbeat_dir.join(format!("{name}.json"));
+        let heartbeat = read_loop_heartbeat(name, &heartbeat_file, now_ms)?;
+        heartbeats.push(heartbeat);
+    }
+    Ok(HarnessLoopStatus {
+        heartbeat_dir,
+        heartbeats,
+    })
+}
+
+fn read_loop_heartbeat(
+    name: &str,
+    heartbeat_file: &Path,
+    now_ms: i64,
+) -> io::Result<HarnessLoopHeartbeatStatus> {
+    let text = match fs::read_to_string(heartbeat_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(HarnessLoopHeartbeatStatus {
+                name: name.to_string(),
+                heartbeat_file: heartbeat_file.to_path_buf(),
+                present: false,
+                status: None,
+                iteration: None,
+                process_id: None,
+                at_ms: None,
+                age_ms: None,
+                detail: None,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let value = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
+    let at_ms = i64_path(&value, &["atMs"]);
+    Ok(HarnessLoopHeartbeatStatus {
+        name: name.to_string(),
+        heartbeat_file: heartbeat_file.to_path_buf(),
+        present: true,
+        status: string_path(&value, &["status"]),
+        iteration: i64_path(&value, &["iteration"]),
+        process_id: i64_path(&value, &["processId"]),
+        at_ms,
+        age_ms: at_ms.map(|at_ms| now_ms.saturating_sub(at_ms)),
+        detail: string_path(&value, &["detail"]),
     })
 }
 
@@ -443,6 +529,21 @@ fn string_path(value: &Value, path: &[&str]) -> Option<String> {
     current.as_str().map(ToString::to_string)
 }
 
+fn i64_path(value: &Value, path: &[&str]) -> Option<i64> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_i64()
+}
+
+fn epoch_ms() -> io::Result<i64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?;
+    i64::try_from(duration.as_millis()).map_err(io::Error::other)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,6 +557,13 @@ mod tests {
         fs::create_dir_all(harness_home.join("state").join("channels")).unwrap();
         fs::create_dir_all(harness_home.join("state").join("logs")).unwrap();
         fs::create_dir_all(harness_home.join("state").join("plugin-sidecar")).unwrap();
+        fs::create_dir_all(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("loop-heartbeats"),
+        )
+        .unwrap();
         fs::create_dir_all(harness_home.join("memory").join("qdrant-edge")).unwrap();
         fs::write(
             harness_home.join("state").join("harness-registry.json"),
@@ -497,6 +605,15 @@ mod tests {
 {"event":"runtime.loop-stopped"}"#,
         )
         .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("loop-heartbeats")
+                .join("runtime-loop.json"),
+            r#"{"status":"no-work","iteration":7,"processId":42,"atMs":1000,"detail":"idle"}"#,
+        )
+        .unwrap();
 
         let report = collect_harness_status(HarnessStatusOptions {
             harness_home: harness_home.clone(),
@@ -511,6 +628,16 @@ mod tests {
         );
         assert_eq!(report.channels.outbox.all.pending, 1);
         assert!(report.memory.qdrant_edge);
+        let runtime_loop = report
+            .loops
+            .heartbeats
+            .iter()
+            .find(|heartbeat| heartbeat.name == "runtime-loop")
+            .unwrap();
+        assert!(runtime_loop.present);
+        assert_eq!(runtime_loop.status.as_deref(), Some("no-work"));
+        assert_eq!(runtime_loop.iteration, Some(7));
+        assert_eq!(runtime_loop.process_id, Some(42));
         assert_eq!(
             report.logs.event_present.get("channel.receive").copied(),
             Some(true)

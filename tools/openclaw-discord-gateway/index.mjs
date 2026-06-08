@@ -164,11 +164,13 @@ async function runGateway(args) {
     const requestStopIfNeeded = () => {
       if (args.stopFile && fs.existsSync(args.stopFile)) {
         writeGatewayLog(args, "stop-file", { stopFile: args.stopFile });
+        writeLoopHeartbeat(args, "stopped", "stop file requested");
         ws.close(1000, "stop file requested");
       }
     };
     ws.addEventListener("open", () => {
       writeGatewayLog(args, "open", { gatewayUrl: args.gatewayUrl });
+      writeLoopHeartbeat(args, "connected", "Discord gateway WebSocket opened");
       stopFileTimer = setInterval(requestStopIfNeeded, 1000);
       requestStopIfNeeded();
     });
@@ -183,6 +185,7 @@ async function runGateway(args) {
         clearInterval(stopFileTimer);
       }
       writeGatewayLog(args, "close", { code: event.code, reason: event.reason });
+      writeLoopHeartbeat(args, "closed", `Discord gateway WebSocket closed code=${event.code}`);
       resolve();
     });
     ws.addEventListener("message", async (event) => {
@@ -201,6 +204,7 @@ async function runGateway(args) {
       }
       if (payload.op === 11) {
         writeGatewayLog(args, "heartbeat-ack", { sequence });
+        writeLoopHeartbeat(args, "heartbeat", `Discord heartbeat ack sequence=${sequence}`);
         return;
       }
       if (payload.t === "MESSAGE_CREATE") {
@@ -213,6 +217,7 @@ async function runGateway(args) {
           contentLength: typeof payload.d?.content === "string" ? payload.d.content.length : null,
           status: result.status,
         });
+        writeLoopHeartbeat(args, "message-create", `message handled status=${result.status}`);
         if (args.maxMessages > 0 && handledMessages >= args.maxMessages) {
           ws.close(1000, "max messages handled");
         }
@@ -224,6 +229,7 @@ async function runGateway(args) {
             userId: payload.d?.user?.id,
             username: payload.d?.user?.username,
           });
+          writeLoopHeartbeat(args, "ready", `Discord gateway ready username=${payload.d?.user?.username ?? "-"}`);
         } else if (dispatchLogCount <= 20) {
           writeGatewayLog(args, "dispatch", { type: payload.t, sequence });
         }
@@ -310,6 +316,21 @@ function writeGatewayLog(args, event, payload) {
   fs.mkdirSync(dir, { recursive: true });
   const logFile = path.join(dir, "discord-gateway-events.jsonl");
   fs.appendFileSync(logFile, `${JSON.stringify({ event, ...payload })}\n`);
+}
+
+function writeLoopHeartbeat(args, status, detail) {
+  const dir = path.join(args.harnessHome, "state", "supervisor", "loop-heartbeats");
+  fs.mkdirSync(dir, { recursive: true });
+  const heartbeat = {
+    schema: "openclaw-harness.loop-heartbeat.v1",
+    name: "discord-gateway-loop",
+    status,
+    iteration: null,
+    detail,
+    atMs: Date.now(),
+    processId: process.pid,
+  };
+  fs.writeFileSync(path.join(dir, "discord-gateway-loop.json"), `${JSON.stringify(heartbeat, null, 2)}\n`);
 }
 
 async function main() {
