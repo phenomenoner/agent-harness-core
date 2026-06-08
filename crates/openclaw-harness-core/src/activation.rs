@@ -323,6 +323,21 @@ fn check_channel_state(harness_home: &Path, checks: &mut Vec<ActivationReadiness
             ),
         ));
     }
+    let telegram_offset = channels_dir.join("telegram-offset.json");
+    if telegram_offset.is_file() {
+        checks.push(pass(
+            "telegram-offset",
+            format!("found {}", telegram_offset.display()),
+        ));
+    } else {
+        checks.push(warn(
+            "telegram-offset",
+            format!(
+                "Telegram update offset not found at {}; run telegram-poll-once or telegram-loop before Telegram handoff",
+                telegram_offset.display()
+            ),
+        ));
+    }
 }
 
 fn check_activation_plan_doc(checks: &mut Vec<ActivationReadinessCheck>) {
@@ -375,6 +390,47 @@ fn check_logging(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>
         Err(error) => checks.push(fail(
             "operational-log",
             format!("harness operational log is not writable: {error}"),
+        )),
+    }
+    check_log_event(
+        harness_home,
+        checks,
+        "telegram-poll-log",
+        "telegram.poll-once",
+        "no Telegram poll summary found yet; run telegram-poll-once or telegram-loop",
+    );
+    check_log_event(
+        harness_home,
+        checks,
+        "discord-send-log",
+        "discord.outbox-send-once",
+        "no Discord outbound summary found yet; run discord-outbox-send-once",
+    );
+}
+
+fn check_log_event(
+    harness_home: &Path,
+    checks: &mut Vec<ActivationReadinessCheck>,
+    name: &str,
+    event: &str,
+    missing_detail: &str,
+) {
+    let log_file = harness_home
+        .join("state")
+        .join("logs")
+        .join("harness.jsonl");
+    match fs::read_to_string(&log_file) {
+        Ok(text) if text.contains(&format!(r#""event":"{event}""#)) => checks.push(pass(
+            name,
+            format!("found event {event} in {}", log_file.display()),
+        )),
+        Ok(_) => checks.push(warn(name, missing_detail)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            checks.push(warn(name, missing_detail));
+        }
+        Err(error) => checks.push(warn(
+            name,
+            format!("could not read {}: {error}", log_file.display()),
         )),
     }
 }

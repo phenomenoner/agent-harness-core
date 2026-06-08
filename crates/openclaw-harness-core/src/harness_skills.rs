@@ -100,7 +100,8 @@ Before replacing the Docker OpenClaw gateway:
 5. Run activation readiness checks.
 6. Confirm logs are written to state/logs/harness.jsonl.
 7. Smoke-test a Telegram command message with telegram-poll-once when TELEGRAM_BOT_TOKEN is configured, or with channel-run-once when testing offline.
-8. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt.
+8. Confirm enable-check reports telegram-offset, telegram-poll-log, and discord-send-log after channel adapter smoke tests.
+9. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt.
 
 ## Codex Runtime Flow
 

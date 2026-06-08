@@ -64,7 +64,8 @@ These must pass before cutover.
 7. Logging gate
    - Run `enable-check`.
    - Confirm `state/logs/harness.jsonl` is writable.
-   - Confirm logs include activation, Telegram poll-once, channel receive, runtime run-once, Codex run, completion, and delivery events.
+   - Confirm logs include activation, Telegram poll-once or loop, Discord outbox send, channel receive, runtime run-once, Codex run, completion, and delivery events.
+   - Confirm `enable-check` reports `telegram-offset`, `telegram-poll-log`, and `discord-send-log` as pass after adapter smoke tests.
 
 ## Smoke Gates
 
