@@ -798,6 +798,7 @@ fn execute_telegram_poll_once(
     let mut warnings = Vec::new();
     let offset_file = telegram_offset_file(&args.target_home);
     let offset = read_telegram_offset(&offset_file, &mut warnings)?;
+    let access_policy = channel_access_policy(&args.target_home)?;
     let updates = telegram_get_updates(token, offset, args.poll_timeout_seconds, args.max_updates)?;
     let mut handled_messages = 0;
     let mut skipped_updates = 0;
@@ -837,6 +838,20 @@ fn execute_telegram_poll_once(
             .and_then(|from| from.get("id"))
             .and_then(telegram_id_string)
             .unwrap_or_else(|| chat_id.clone());
+        let chat_type = message
+            .get("chat")
+            .and_then(|chat| chat.get("type"))
+            .and_then(serde_json::Value::as_str);
+        if let ChannelAccessDecision::Denied(reason) =
+            telegram_access_decision(&access_policy, &chat_id, &user_id, chat_type)
+        {
+            skipped_updates += 1;
+            warnings.push(format!(
+                "Telegram update {update_id} denied by imported channel allow-list: {reason}"
+            ));
+            write_telegram_offset(&offset_file, next_offset)?;
+            continue;
+        }
         run_channel_once(ChannelRunOnceOptions {
             source: args.source.clone(),
             harness_home: args.target_home.clone(),
@@ -1027,12 +1042,14 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
     let args = discord_event_run_once_args_from_args(args)?;
     let event = read_discord_event_json(&args)?;
     let parsed = parse_discord_gateway_message(&event)?;
+    let access_policy = channel_access_policy(&args.target_home)?;
     let report = match parsed {
         None => DiscordEventRunOnceReport {
             harness_home: args.target_home.clone(),
             status: "skipped".to_string(),
             reason: "event is not a Discord MESSAGE_CREATE payload".to_string(),
             message_id: None,
+            guild_id: None,
             channel_id: None,
             user_id: None,
             run: None,
@@ -1043,6 +1060,7 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
                 status: "skipped".to_string(),
                 reason: "message author is a bot".to_string(),
                 message_id: Some(message.message_id),
+                guild_id: message.guild_id,
                 channel_id: Some(message.channel_id),
                 user_id: Some(message.user_id),
                 run: None,
@@ -1056,19 +1074,7 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
                 status: "skipped".to_string(),
                 reason: "message content is empty".to_string(),
                 message_id: Some(message.message_id),
-                channel_id: Some(message.channel_id),
-                user_id: Some(message.user_id),
-                run: None,
-            };
-            write_discord_event_receipt(&report)?;
-            report
-        }
-        Some(message) if discord_event_seen(&args.target_home, &message.message_id)? => {
-            let report = DiscordEventRunOnceReport {
-                harness_home: args.target_home.clone(),
-                status: "duplicate".to_string(),
-                reason: "message id already has a Discord event receipt".to_string(),
-                message_id: Some(message.message_id),
+                guild_id: message.guild_id,
                 channel_id: Some(message.channel_id),
                 user_id: Some(message.user_id),
                 run: None,
@@ -1077,34 +1083,61 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
             report
         }
         Some(message) => {
-            let run = run_channel_once(ChannelRunOnceOptions {
-                source: args.source.clone(),
-                harness_home: args.target_home.clone(),
-                platform: "discord".to_string(),
-                channel_id: message.channel_id.clone(),
-                user_id: message.user_id.clone(),
-                agent_id: args.agent_id.clone(),
-                session_key: None,
-                message: message.content,
-                skill_limit: args.skill_limit,
-                now_ms: current_time_ms()?,
-                codex_executable: args.codex_exe.clone(),
-                timeout_ms: args.timeout_ms,
-                prompt_options: PromptAssemblyOptions {
-                    harness_home: Some(args.target_home.clone()),
-                    ..PromptAssemblyOptions::default()
-                },
-                outbox_limit: args.outbox_limit,
-            })
-            .map_err(|err| err.to_string())?;
-            let report = DiscordEventRunOnceReport {
-                harness_home: args.target_home.clone(),
-                status: "handled".to_string(),
-                reason: "Discord message normalized into channel-run-once".to_string(),
-                message_id: Some(message.message_id),
-                channel_id: Some(message.channel_id),
-                user_id: Some(message.user_id),
-                run: Some(run),
+            let report = if let ChannelAccessDecision::Denied(reason) =
+                discord_access_decision(&access_policy, &message)
+            {
+                DiscordEventRunOnceReport {
+                    harness_home: args.target_home.clone(),
+                    status: "denied".to_string(),
+                    reason,
+                    message_id: Some(message.message_id),
+                    guild_id: message.guild_id,
+                    channel_id: Some(message.channel_id),
+                    user_id: Some(message.user_id),
+                    run: None,
+                }
+            } else if discord_event_seen(&args.target_home, &message.message_id)? {
+                DiscordEventRunOnceReport {
+                    harness_home: args.target_home.clone(),
+                    status: "duplicate".to_string(),
+                    reason: "message id already has a Discord event receipt".to_string(),
+                    message_id: Some(message.message_id),
+                    guild_id: message.guild_id,
+                    channel_id: Some(message.channel_id),
+                    user_id: Some(message.user_id),
+                    run: None,
+                }
+            } else {
+                let run = run_channel_once(ChannelRunOnceOptions {
+                    source: args.source.clone(),
+                    harness_home: args.target_home.clone(),
+                    platform: "discord".to_string(),
+                    channel_id: message.channel_id.clone(),
+                    user_id: message.user_id.clone(),
+                    agent_id: args.agent_id.clone(),
+                    session_key: None,
+                    message: message.content.clone(),
+                    skill_limit: args.skill_limit,
+                    now_ms: current_time_ms()?,
+                    codex_executable: args.codex_exe.clone(),
+                    timeout_ms: args.timeout_ms,
+                    prompt_options: PromptAssemblyOptions {
+                        harness_home: Some(args.target_home.clone()),
+                        ..PromptAssemblyOptions::default()
+                    },
+                    outbox_limit: args.outbox_limit,
+                })
+                .map_err(|err| err.to_string())?;
+                DiscordEventRunOnceReport {
+                    harness_home: args.target_home.clone(),
+                    status: "handled".to_string(),
+                    reason: "Discord message normalized into channel-run-once".to_string(),
+                    message_id: Some(message.message_id),
+                    guild_id: message.guild_id,
+                    channel_id: Some(message.channel_id),
+                    user_id: Some(message.user_id),
+                    run: Some(run),
+                }
             };
             write_discord_event_receipt(&report)?;
             report
@@ -1940,6 +1973,23 @@ struct TelegramPollOnceReport {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ChannelAccessPolicy {
+    telegram_allowed_user_ids: BTreeSet<String>,
+    telegram_group_allowed_user_ids: BTreeSet<String>,
+    telegram_direct_chat_ids: BTreeSet<String>,
+    telegram_group_chat_ids: BTreeSet<String>,
+    discord_allowed_user_ids: BTreeSet<String>,
+    discord_channel_ids: BTreeSet<String>,
+    discord_guild_ids: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChannelAccessDecision {
+    Allowed,
+    Denied(String),
+}
+
 struct TelegramLoopArgs {
     poll: TelegramPollOnceArgs,
     iterations: usize,
@@ -1967,6 +2017,7 @@ struct DiscordEventRunOnceArgs {
 
 struct DiscordGatewayMessage {
     message_id: String,
+    guild_id: Option<String>,
     channel_id: String,
     user_id: String,
     content: String,
@@ -1978,6 +2029,7 @@ struct DiscordEventRunOnceReport {
     status: String,
     reason: String,
     message_id: Option<String>,
+    guild_id: Option<String>,
     channel_id: Option<String>,
     user_id: Option<String>,
     run: Option<ChannelRunOnceReport>,
@@ -4458,6 +4510,10 @@ fn parse_discord_gateway_message(
         .get("channel_id")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "Discord MESSAGE_CREATE payload missing channel_id".to_string())?;
+    let guild_id = payload
+        .get("guild_id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
     let content = payload
         .get("content")
         .and_then(serde_json::Value::as_str)
@@ -4476,6 +4532,7 @@ fn parse_discord_gateway_message(
 
     Ok(Some(DiscordGatewayMessage {
         message_id: message_id.to_string(),
+        guild_id,
         channel_id: channel_id.to_string(),
         user_id: user_id.to_string(),
         content: content.to_string(),
@@ -4522,6 +4579,7 @@ fn write_discord_event_receipt(report: &DiscordEventRunOnceReport) -> Result<(),
         "status": report.status,
         "reason": report.reason,
         "messageId": report.message_id,
+        "guildId": report.guild_id,
         "channelId": report.channel_id,
         "userId": report.user_id,
         "sessionKey": report.run.as_ref().map(|run| run.receive.session_key.clone()),
@@ -5068,6 +5126,118 @@ fn secret_env_value(harness_home: &Path, env_name: &str) -> Option<String> {
     read_secret_env_map(&channel_credentials_env_file(harness_home))
         .ok()
         .and_then(|mut values| values.remove(env_name))
+}
+
+fn channel_access_policy(harness_home: &Path) -> Result<ChannelAccessPolicy, String> {
+    let values = read_secret_env_map(&channel_credentials_env_file(harness_home))?;
+    Ok(ChannelAccessPolicy {
+        telegram_allowed_user_ids: channel_id_set(&values, "OPENCLAW_TELEGRAM_ALLOWED_USER_IDS"),
+        telegram_group_allowed_user_ids: channel_id_set(
+            &values,
+            "OPENCLAW_TELEGRAM_GROUP_ALLOWED_USER_IDS",
+        ),
+        telegram_direct_chat_ids: channel_id_set(&values, "OPENCLAW_TELEGRAM_DIRECT_CHAT_IDS"),
+        telegram_group_chat_ids: channel_id_set(&values, "OPENCLAW_TELEGRAM_GROUP_CHAT_IDS"),
+        discord_allowed_user_ids: channel_id_set(&values, "OPENCLAW_DISCORD_ALLOWED_USER_IDS"),
+        discord_channel_ids: channel_id_set(&values, "OPENCLAW_DISCORD_CHANNEL_IDS"),
+        discord_guild_ids: channel_id_set(&values, "OPENCLAW_DISCORD_GUILD_IDS"),
+    })
+}
+
+fn channel_id_set(values: &BTreeMap<String, String>, env_name: &str) -> BTreeSet<String> {
+    let raw = env::var(env_name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| values.get(env_name).cloned());
+    parse_channel_id_set(raw.as_deref())
+}
+
+fn parse_channel_id_set(raw: Option<&str>) -> BTreeSet<String> {
+    raw.unwrap_or_default()
+        .split(|ch: char| ch == ',' || ch == ';' || ch.is_ascii_whitespace())
+        .filter_map(|value| {
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+            (!value.is_empty()).then(|| value.to_string())
+        })
+        .collect()
+}
+
+fn telegram_access_decision(
+    policy: &ChannelAccessPolicy,
+    chat_id: &str,
+    user_id: &str,
+    chat_type: Option<&str>,
+) -> ChannelAccessDecision {
+    if telegram_is_group_context(policy, chat_id, chat_type) {
+        if !policy.telegram_group_chat_ids.is_empty()
+            && !policy.telegram_group_chat_ids.contains(chat_id)
+        {
+            return ChannelAccessDecision::Denied(
+                "Telegram group chat id is not in OPENCLAW_TELEGRAM_GROUP_CHAT_IDS".to_string(),
+            );
+        }
+        if !policy.telegram_group_allowed_user_ids.is_empty()
+            && !policy.telegram_group_allowed_user_ids.contains(user_id)
+        {
+            return ChannelAccessDecision::Denied(
+                "Telegram group user id is not in OPENCLAW_TELEGRAM_GROUP_ALLOWED_USER_IDS"
+                    .to_string(),
+            );
+        }
+    } else {
+        if !policy.telegram_direct_chat_ids.is_empty()
+            && !policy.telegram_direct_chat_ids.contains(chat_id)
+        {
+            return ChannelAccessDecision::Denied(
+                "Telegram direct chat id is not in OPENCLAW_TELEGRAM_DIRECT_CHAT_IDS".to_string(),
+            );
+        }
+        if !policy.telegram_allowed_user_ids.is_empty()
+            && !policy.telegram_allowed_user_ids.contains(user_id)
+        {
+            return ChannelAccessDecision::Denied(
+                "Telegram user id is not in OPENCLAW_TELEGRAM_ALLOWED_USER_IDS".to_string(),
+            );
+        }
+    }
+    ChannelAccessDecision::Allowed
+}
+
+fn telegram_is_group_context(
+    policy: &ChannelAccessPolicy,
+    chat_id: &str,
+    chat_type: Option<&str>,
+) -> bool {
+    matches!(chat_type, Some("group" | "supergroup" | "channel"))
+        || policy.telegram_group_chat_ids.contains(chat_id)
+}
+
+fn discord_access_decision(
+    policy: &ChannelAccessPolicy,
+    message: &DiscordGatewayMessage,
+) -> ChannelAccessDecision {
+    if let Some(guild_id) = message.guild_id.as_deref() {
+        if !policy.discord_guild_ids.is_empty() && !policy.discord_guild_ids.contains(guild_id) {
+            return ChannelAccessDecision::Denied(
+                "Discord guild id is not in OPENCLAW_DISCORD_GUILD_IDS".to_string(),
+            );
+        }
+        if !policy.discord_channel_ids.is_empty()
+            && !policy.discord_channel_ids.contains(&message.channel_id)
+        {
+            return ChannelAccessDecision::Denied(
+                "Discord channel id is not in OPENCLAW_DISCORD_CHANNEL_IDS".to_string(),
+            );
+        }
+    }
+    if !policy.discord_allowed_user_ids.is_empty()
+        && !policy.discord_allowed_user_ids.contains(&message.user_id)
+    {
+        return ChannelAccessDecision::Denied(
+            "Discord user id is not in OPENCLAW_DISCORD_ALLOWED_USER_IDS".to_string(),
+        );
+    }
+    ChannelAccessDecision::Allowed
 }
 
 fn telegram_bot_token(harness_home: &Path) -> Result<String, String> {
@@ -6097,6 +6267,7 @@ fn print_discord_event_run_once_report(report: &DiscordEventRunOnceReport) {
     println!("Status: {}", report.status);
     println!("Reason: {}", report.reason);
     println!("Message: {}", report.message_id.as_deref().unwrap_or("-"));
+    println!("Guild: {}", report.guild_id.as_deref().unwrap_or("-"));
     println!("Channel: {}", report.channel_id.as_deref().unwrap_or("-"));
     println!("User: {}", report.user_id.as_deref().unwrap_or("-"));
     if let Some(run) = &report.run {
@@ -6880,4 +7051,119 @@ fn print_help() {
     println!("  --resume-cron          Release native cron from cutover hold in dry-run");
     println!("  --allow-deterministic-run Release deterministic cron hold in dry-run");
     println!("  --resume-subagents    Mark queued/running subagents as resume candidates");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(values: &[&str]) -> BTreeSet<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn discord_message(
+        guild_id: Option<&str>,
+        channel_id: &str,
+        user_id: &str,
+    ) -> DiscordGatewayMessage {
+        DiscordGatewayMessage {
+            message_id: "message-1".to_string(),
+            guild_id: guild_id.map(ToString::to_string),
+            channel_id: channel_id.to_string(),
+            user_id: user_id.to_string(),
+            content: "hello".to_string(),
+            author_is_bot: false,
+        }
+    }
+
+    #[test]
+    fn parses_channel_id_sets_from_imported_env_format() {
+        let ids = parse_channel_id_set(Some(" 111,222; 333\n'444' \"555\" "));
+
+        assert_eq!(ids, set(&["111", "222", "333", "444", "555"]));
+    }
+
+    #[test]
+    fn telegram_direct_policy_requires_imported_chat_and_user_ids() {
+        let policy = ChannelAccessPolicy {
+            telegram_allowed_user_ids: set(&["user-1"]),
+            telegram_direct_chat_ids: set(&["chat-1"]),
+            ..ChannelAccessPolicy::default()
+        };
+
+        assert_eq!(
+            telegram_access_decision(&policy, "chat-1", "user-1", Some("private")),
+            ChannelAccessDecision::Allowed
+        );
+        assert!(matches!(
+            telegram_access_decision(&policy, "chat-2", "user-1", Some("private")),
+            ChannelAccessDecision::Denied(_)
+        ));
+        assert!(matches!(
+            telegram_access_decision(&policy, "chat-1", "user-2", Some("private")),
+            ChannelAccessDecision::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn telegram_group_policy_uses_group_allow_lists() {
+        let policy = ChannelAccessPolicy {
+            telegram_group_allowed_user_ids: set(&["user-1"]),
+            telegram_group_chat_ids: set(&["group-1"]),
+            ..ChannelAccessPolicy::default()
+        };
+
+        assert_eq!(
+            telegram_access_decision(&policy, "group-1", "user-1", Some("supergroup")),
+            ChannelAccessDecision::Allowed
+        );
+        assert!(matches!(
+            telegram_access_decision(&policy, "group-2", "user-1", Some("supergroup")),
+            ChannelAccessDecision::Denied(_)
+        ));
+        assert!(matches!(
+            telegram_access_decision(&policy, "group-1", "user-2", Some("group")),
+            ChannelAccessDecision::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn discord_policy_checks_guild_channel_and_user_but_allows_dms_by_user() {
+        let policy = ChannelAccessPolicy {
+            discord_allowed_user_ids: set(&["user-1"]),
+            discord_channel_ids: set(&["channel-1"]),
+            discord_guild_ids: set(&["guild-1"]),
+            ..ChannelAccessPolicy::default()
+        };
+
+        assert_eq!(
+            discord_access_decision(
+                &policy,
+                &discord_message(Some("guild-1"), "channel-1", "user-1")
+            ),
+            ChannelAccessDecision::Allowed
+        );
+        assert_eq!(
+            discord_access_decision(&policy, &discord_message(None, "dm-channel", "user-1")),
+            ChannelAccessDecision::Allowed
+        );
+        assert!(matches!(
+            discord_access_decision(
+                &policy,
+                &discord_message(Some("guild-2"), "channel-1", "user-1")
+            ),
+            ChannelAccessDecision::Denied(_)
+        ));
+        assert!(matches!(
+            discord_access_decision(
+                &policy,
+                &discord_message(Some("guild-1"), "channel-2", "user-1")
+            ),
+            ChannelAccessDecision::Denied(_)
+        ));
+        assert!(matches!(
+            discord_access_decision(&policy, &discord_message(None, "dm-channel", "user-2")),
+            ChannelAccessDecision::Denied(_)
+        ));
+    }
 }

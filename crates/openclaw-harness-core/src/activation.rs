@@ -177,6 +177,18 @@ fn check_channels(
             "TELEGRAM_BOT_TOKEN",
             "Telegram channel is enabled",
         );
+        check_channel_access_policy(
+            checks,
+            harness_home,
+            "telegram-access-policy",
+            "Telegram",
+            &[
+                "OPENCLAW_TELEGRAM_ALLOWED_USER_IDS",
+                "OPENCLAW_TELEGRAM_GROUP_ALLOWED_USER_IDS",
+                "OPENCLAW_TELEGRAM_DIRECT_CHAT_IDS",
+                "OPENCLAW_TELEGRAM_GROUP_CHAT_IDS",
+            ],
+        );
     }
     if discord {
         check_channel_token(
@@ -185,6 +197,17 @@ fn check_channels(
             "discord-token",
             "DISCORD_BOT_TOKEN",
             "Discord channel is enabled",
+        );
+        check_channel_access_policy(
+            checks,
+            harness_home,
+            "discord-access-policy",
+            "Discord",
+            &[
+                "OPENCLAW_DISCORD_ALLOWED_USER_IDS",
+                "OPENCLAW_DISCORD_CHANNEL_IDS",
+                "OPENCLAW_DISCORD_GUILD_IDS",
+            ],
         );
     }
 }
@@ -1029,6 +1052,37 @@ fn check_channel_token(
     }
 }
 
+fn check_channel_access_policy(
+    checks: &mut Vec<ActivationReadinessCheck>,
+    harness_home: &Path,
+    name: &str,
+    platform: &str,
+    env_names: &[&str],
+) {
+    let present = env_names
+        .iter()
+        .filter(|env_name| channel_config_has(harness_home, env_name))
+        .count();
+    if present == 0 {
+        checks.push(warn(
+            name,
+            format!(
+                "{platform} access allow-list is not configured; live adapters will accept any inbound chat/user permitted by the platform token"
+            ),
+        ));
+    } else {
+        checks.push(pass(
+            name,
+            format!("{platform} imported access allow-list has {present} configured id list(s)"),
+        ));
+    }
+}
+
+fn channel_config_has(harness_home: &Path, env_name: &str) -> bool {
+    env::var_os(env_name).is_some_and(|value| !value.is_empty())
+        || harness_secret_env_has(harness_home, env_name)
+}
+
 fn harness_secret_env_has(harness_home: &Path, env_name: &str) -> bool {
     let path = harness_home.join("secrets").join("channel-credentials.env");
     let Ok(text) = fs::read_to_string(path) else {
@@ -1176,6 +1230,54 @@ mod tests {
         }));
         assert!(report.checks.iter().any(|check| {
             check.name == "plugin-sidecar" && check.status == ActivationReadinessStatus::Fail
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readiness_reports_imported_channel_access_policy() {
+        let root = temp_root("readiness_reports_imported_channel_access_policy");
+        let harness_home = root.join(".openclaw-harness");
+        let state = harness_home.join("state");
+        let secrets = harness_home.join("secrets");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&secrets).unwrap();
+        fs::write(
+            state.join("harness-registry.json"),
+            r#"{
+              "schema": "openclaw-harness.target-registry.v1",
+              "agents": [
+                { "id": "main", "enabled": true }
+              ],
+              "providers": [],
+              "plugins": [],
+              "channels": { "telegram": true, "discord": true }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            secrets.join("channel-credentials.env"),
+            "\
+TELEGRAM_BOT_TOKEN=\"test-telegram-token\"
+DISCORD_BOT_TOKEN=\"test-discord-token\"
+OPENCLAW_TELEGRAM_ALLOWED_USER_IDS=\"user-1\"
+OPENCLAW_TELEGRAM_DIRECT_CHAT_IDS=\"chat-1\"
+OPENCLAW_DISCORD_ALLOWED_USER_IDS=\"discord-user-1\"
+OPENCLAW_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
+",
+        )
+        .unwrap();
+
+        let report =
+            check_activation_readiness(ActivationReadinessOptions { harness_home }).unwrap();
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "telegram-access-policy"
+                && check.status == ActivationReadinessStatus::Pass
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.name == "discord-access-policy" && check.status == ActivationReadinessStatus::Pass
         }));
 
         let _ = fs::remove_dir_all(root);

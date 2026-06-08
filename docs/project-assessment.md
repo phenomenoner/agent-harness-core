@@ -377,10 +377,10 @@ Current implemented foundation:
 
 ### Phase 3: Messaging Channels
 
-- Add Telegram channel. Current status: `telegram-probe` exists for non-consuming token/API checks, `telegram-poll-once` exists for smoke tests, `telegram-loop` exists for operator-run continuous polling, and `supervisor-plan` can generate the scheduled-task wrapper; live Telegram handoff and full health management are still pending.
-- Add Discord channel. Current status: outbound REST delivery exists through `discord-outbox-send-once`; inbound Gateway receive exists through the Node `discord-gateway-loop` wrapper, with live Discord DM handoff still pending.
+- Add Telegram channel. Current status: `telegram-probe` exists for non-consuming token/API checks, `telegram-poll-once` exists for smoke tests, `telegram-loop` exists for operator-run continuous polling, imported Telegram direct/group chat and user allow-lists are enforced before runtime dispatch, and `supervisor-plan` can generate the scheduled-task wrapper; live Telegram handoff and full health management are still pending.
+- Add Discord channel. Current status: outbound REST delivery exists through `discord-outbox-send-once`; inbound Gateway receive exists through the Node `discord-gateway-loop` wrapper, imported Discord user/channel/guild allow-lists are enforced before runtime dispatch, with live Discord DM handoff still pending.
 - Implement channel session key compatibility.
-- Route real Telegram/Discord bot events into `channel-run-once` and deliver replies through the shared `channel-outbox-plan` / `channel-delivery-record` ledger. Telegram probe/poll/loop coverage exists; Discord outbound and inbound gateway wrapper coverage exists; live DM handoff smoke is pending.
+- Route real Telegram/Discord bot events into `channel-run-once` and deliver replies through the shared `channel-outbox-plan` / `channel-delivery-record` ledger. Telegram probe/poll/loop coverage exists with imported allow-list enforcement; Discord outbound and inbound gateway wrapper coverage exists with imported allow-list enforcement; live DM handoff smoke is pending.
 - Expose persisted command effects such as model switch, new session, steering notes, and stop requests through the real bot UX and status replies.
 - Implement approval UX for shell/tool requests.
 

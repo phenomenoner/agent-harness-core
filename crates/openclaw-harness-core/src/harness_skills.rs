@@ -89,12 +89,12 @@ Commands should update channel state and receipts before enqueueing agent turns.
 - Use channel-run-once as the single-message adapter entrypoint before real Telegram/Discord loops exist.
 - Use channel-outbox-plan to list pending delivery work by platform.
 - Use channel-delivery-record after Telegram/Discord send attempts to record delivered or failed receipts.
-- Use channel-credentials-export --include-sensitive during OpenClaw cutover to import Telegram/Discord bot tokens and known channel/user/guild IDs into secrets/channel-credentials.env with redacted receipts.
+- Use channel-credentials-export --include-sensitive during OpenClaw cutover to import Telegram/Discord bot tokens and known channel/user/guild IDs into secrets/channel-credentials.env with redacted receipts. Telegram poll and Discord event adapters enforce those imported allow-lists before channel-run-once.
 - Use telegram-probe before live Telegram handoff to validate Bot API getMe without consuming updates or sending messages. It writes state/channels/telegram-probe.json, appends telegram-probe-receipts.jsonl, and logs telegram.probe.
-- Use telegram-poll-once for Telegram Bot API smoke tests. It reads TELEGRAM_BOT_TOKEN from the environment or secrets/channel-credentials.env, stores offsets in state/channels/telegram-offset.json, runs channel-run-once for text updates, sends pending replies, records delivery receipts, and writes a telegram.poll-once operational log.
+- Use telegram-poll-once for Telegram Bot API smoke tests. It reads TELEGRAM_BOT_TOKEN plus imported Telegram chat/user allow-lists from the environment or secrets/channel-credentials.env, stores offsets in state/channels/telegram-offset.json, denies non-allowed updates before runtime dispatch, runs channel-run-once for allowed text updates, sends pending replies, records delivery receipts, and writes a telegram.poll-once operational log.
 - Use telegram-loop for operator-run Telegram handoff. It repeats the same poll-once path with --iterations, --idle-ms, --max-consecutive-errors, and optional --stop-file. Use finite iterations for tests and --iterations 0 only when the old gateway is not also consuming Telegram updates.
 - Use discord-outbox-send-once for Discord outbound smoke. It reads DISCORD_BOT_TOKEN from the environment or secrets/channel-credentials.env, sends pending platform=discord outbox messages through Discord REST, records delivery receipts, and writes a discord.outbox-send-once operational log.
-- Use discord-event-run-once for Discord inbound normalization smoke. It accepts a Discord Gateway MESSAGE_CREATE event from --event-file or --event-json, skips bot/empty/duplicate messages, calls channel-run-once for text, writes discord-event receipts, and logs discord.event-run-once. Use discord-gateway-probe before discord-gateway-loop for live WebSocket handoff. The gateway loop accepts --stop-file and closes the WebSocket when that file appears.
+- Use discord-event-run-once for Discord inbound normalization smoke. It accepts a Discord Gateway MESSAGE_CREATE event from --event-file or --event-json, skips bot/empty/duplicate messages, enforces imported Discord user/channel/guild allow-lists, calls channel-run-once for allowed text, writes discord-event receipts, and logs discord.event-run-once. Use discord-gateway-probe before discord-gateway-loop for live WebSocket handoff. The gateway loop accepts --stop-file and closes the WebSocket when that file appears.
 - Failed receipts stay retryable; delivered receipts are skipped by future outbox plans.
 - Do not send the same already recorded Codex completion twice.
 
@@ -109,15 +109,16 @@ Before replacing the Docker OpenClaw gateway:
 5. Run activation readiness checks.
 6. Run status --json and confirm runtime openItems=0, channel outbox pending=0, and log evidence is present.
 7. Confirm logs are written to state/logs/harness.jsonl.
-8. Run telegram-probe when TELEGRAM_BOT_TOKEN is configured to prove Telegram token/API reachability without consuming updates.
-9. Smoke-test a Telegram command message with telegram-poll-once when the old gateway is offline, or with channel-run-once when testing offline.
-10. Confirm enable-check reports telegram-probe before live handoff, then telegram-offset, telegram-poll-log, and discord-send-log after channel adapter smoke tests.
-11. Confirm memory-qdrant-edge is present when current OpenClaw uses Qdrant edge as primary memory backend.
-12. Confirm codex-runtime-launch-probe passes with the intended --codex-exe before any real runtime handoff.
-13. Run plugin-sidecar-probe and plugin-sidecar-call for sidecar.status/plugins.list/tools.probe; set OPENCLAW_PLUGIN_SOURCE_ROOTS when imported manifests live outside the harness home. Confirm plugin-sidecar, plugin-sidecar-probe, and plugin-sidecar-bridge are pass in enable-check. This proves manifest catalog and JSON-RPC bridge readiness; plugin-specific tool executors still need dedicated adapters.
-14. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt. Use tools/openclaw-fake-codex-app-server/fake-codex-app-server.cmd for offline smoke; use the intended Codex CLI only for operator-run model smoke.
-15. Run runtime-loop --stop-when-idle for idle/drain smoke and confirm state/runtime-queue/loop-last.json plus runtime.loop-stopped log evidence.
-16. Run supervisor-plan with the intended harness CLI, Codex executable, channel loop selection, and task prefix. Confirm state/supervisor/windows-scheduled-tasks/supervisor-plan.json, absolute paths in generated scripts, no raw token/key/secret strings in scripts, and enable-check supervisor-plan pass.
+8. Confirm enable-check reports telegram-access-policy and discord-access-policy as pass when importing existing OpenClaw channel IDs.
+9. Run telegram-probe when TELEGRAM_BOT_TOKEN is configured to prove Telegram token/API reachability without consuming updates.
+10. Smoke-test a Telegram command message with telegram-poll-once when the old gateway is offline, or with channel-run-once when testing offline.
+11. Confirm enable-check reports telegram-probe before live handoff, then telegram-offset, telegram-poll-log, and discord-send-log after channel adapter smoke tests.
+12. Confirm memory-qdrant-edge is present when current OpenClaw uses Qdrant edge as primary memory backend.
+13. Confirm codex-runtime-launch-probe passes with the intended --codex-exe before any real runtime handoff.
+14. Run plugin-sidecar-probe and plugin-sidecar-call for sidecar.status/plugins.list/tools.probe; set OPENCLAW_PLUGIN_SOURCE_ROOTS when imported manifests live outside the harness home. Confirm plugin-sidecar, plugin-sidecar-probe, and plugin-sidecar-bridge are pass in enable-check. This proves manifest catalog and JSON-RPC bridge readiness; plugin-specific tool executors still need dedicated adapters.
+15. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt. Use tools/openclaw-fake-codex-app-server/fake-codex-app-server.cmd for offline smoke; use the intended Codex CLI only for operator-run model smoke.
+16. Run runtime-loop --stop-when-idle for idle/drain smoke and confirm state/runtime-queue/loop-last.json plus runtime.loop-stopped log evidence.
+17. Run supervisor-plan with the intended harness CLI, Codex executable, channel loop selection, and task prefix. Confirm state/supervisor/windows-scheduled-tasks/supervisor-plan.json, absolute paths in generated scripts, no raw token/key/secret strings in scripts, and enable-check supervisor-plan pass.
 
 ## Codex Runtime Flow
 

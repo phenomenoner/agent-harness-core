@@ -42,6 +42,7 @@ These must pass before cutover.
    - Run `channel-credentials-export --include-sensitive` when migrating from an existing OpenClaw home. It writes Telegram/Discord tokens and known channel/user/guild IDs into `secrets/channel-credentials.env` and redacted receipts into `secrets/channel-credentials-receipts.json`.
    - Confirm `TELEGRAM_BOT_TOKEN` is present either in process env or `secrets/channel-credentials.env` when Telegram is enabled.
    - Confirm `DISCORD_BOT_TOKEN` is present either in process env or `secrets/channel-credentials.env` when Discord is enabled.
+   - Confirm `enable-check` reports `telegram-access-policy` and `discord-access-policy` as pass when importing from an existing OpenClaw channel configuration. Missing access policies are warnings because fresh deployments may intentionally configure them later.
    - Run `telegram-probe` to validate Telegram Bot API `getMe` without consuming updates or sending messages.
    - Confirm `OPENROUTER_API_KEY` only when OpenRouter providers are active.
    - Do not rely on an imported OpenClaw embedding-only `OPENAI_API_KEY` for Codex agent turns.
@@ -69,10 +70,10 @@ These must pass before cutover.
    - Deliver the pending reply through the target adapter or manual test harness.
    - Run `channel-delivery-record --status delivered`.
    - Confirm future `channel-outbox-plan` skips delivered messages and retries failed messages.
-   - For Telegram smoke, set or import `TELEGRAM_BOT_TOKEN` and run `telegram-poll-once` against a controlled DM; confirm command replies and agent replies are delivered by the Bot API.
+   - For Telegram smoke, set or import `TELEGRAM_BOT_TOKEN` and the imported Telegram user/chat allow-lists, then run `telegram-poll-once` against a controlled DM; confirm denied updates are skipped and allowed command/agent replies are delivered by the Bot API.
    - For Telegram handoff rehearsal, run `telegram-loop --iterations 0` only after confirming the old Docker gateway is not also consuming Telegram updates.
    - For Discord outbound smoke, set or import `DISCORD_BOT_TOKEN`, create a Discord outbox item with `channel-run-once --platform discord ...`, then run `discord-outbox-send-once`.
-   - For Discord inbound handoff rehearsal, run `discord-gateway-probe`, then run `discord-gateway-loop` only after confirming the old Docker gateway is not also connected.
+   - For Discord inbound handoff rehearsal, import Discord user/channel/guild allow-lists, run `discord-gateway-probe`, then run `discord-gateway-loop` only after confirming the old Docker gateway is not also connected.
 
 7. Logging gate
    - Run `enable-check`.
@@ -127,14 +128,14 @@ These should be run before stopping the Docker gateway.
 
 1. Real Telegram adapter
    - Done for non-consuming token/API readiness: `telegram-probe` calls Telegram Bot API `getMe`, writes `state/channels/telegram-probe.json`, appends `telegram-probe-receipts.jsonl`, and logs `telegram.probe` without consuming updates or sending messages.
-   - Done for smoke and operator-run handoff: `telegram-poll-once` receives Telegram text updates, normalizes them into `channel-run-once`, delivers pending replies through Telegram Bot API `sendMessage`, records delivery receipts, stores update offsets, and writes a poll summary log. `telegram-loop` repeats the same path with idle sleep and a consecutive-error threshold.
+   - Done for smoke and operator-run handoff: `telegram-poll-once` receives Telegram text updates, enforces imported Telegram direct/group chat and user allow-lists before runtime dispatch, normalizes allowed messages into `channel-run-once`, delivers pending replies through Telegram Bot API `sendMessage`, records delivery receipts, stores update offsets, and writes a poll summary log. `telegram-loop` repeats the same path with idle sleep and a consecutive-error threshold.
    - Done for graceful operator stop: `telegram-loop --stop-file <path>` exits before the next poll when the stop file appears.
    - Health/status CLI summary is available through `status`.
    - Still required for formal Telegram activation: live Telegram DM smoke after the old gateway is offline, token source hardening, and production retry policy.
 
 2. Real Discord adapter
    - Done for outbound smoke: `discord-outbox-send-once` sends pending Discord outbox messages through Discord REST, records delivery receipts, and writes a delivery summary log.
-   - Done for inbound normalization smoke: `discord-event-run-once` accepts one Discord Gateway `MESSAGE_CREATE` event from `--event-file` or `--event-json`, dedupes by message id, normalizes text into `channel-run-once`, writes Discord event receipts, and logs `discord.event-run-once`.
+   - Done for inbound normalization smoke: `discord-event-run-once` accepts one Discord Gateway `MESSAGE_CREATE` event from `--event-file` or `--event-json`, enforces imported Discord user/channel/guild allow-lists, dedupes by message id, normalizes allowed text into `channel-run-once`, writes Discord event receipts, and logs `discord.event-run-once`.
    - Done for operator-run inbound loop: `discord-gateway-loop` receives Discord DM events through the Node WebSocket wrapper and feeds them into `discord-event-run-once` semantics; it accepts a stop file through the CLI wrapper and closes the WebSocket cleanly when requested.
    - Still required for formal Discord activation: live Discord DM smoke after the old gateway is offline.
    - Add gateway heartbeat/reconnect and live process health reporting beyond the CLI `status` summary.
@@ -183,8 +184,8 @@ As of 2026-06-08 local verification:
 - Runtime queue prepare, Codex plan, Codex preflight, and Codex launch probe pass when using workspace-local `@openai/codex` via `.tools/codex-cli/node_modules/.bin/codex.cmd`.
 - Plugin sidecar probe passes. `openclaw-context-budget` is classified as a native adapter, leaving 5 sidecar-required plugins. `tools.probe` resolves all sidecar-required plugin manifests from local source roots, writes `state/plugin-sidecar/catalog.json`, reports 2 manifest-derived tools, and makes `enable-check` pass `plugin-sidecar`.
 - Discord Gateway `MESSAGE_CREATE` event normalizer smoke passes for `/status`, including duplicate-message skip by Discord message id.
-- `channel-credentials-export --include-sensitive` imported Telegram/Discord bot tokens plus known allow-list/guild/channel/chat IDs from the local OpenClaw snapshot into `imports/activation-harness/secrets/channel-credentials.env`; readiness sees both token gates as pass.
-- `telegram-probe` is implemented as the non-consuming Telegram `getMe` readiness check; run it against `imports/activation-harness` before live `telegram-poll-once` handoff so token/API failures are separated from update consumption.
+- `channel-credentials-export --include-sensitive` imported Telegram/Discord bot tokens plus known allow-list/guild/channel/chat IDs from the local OpenClaw snapshot into `imports/activation-harness/secrets/channel-credentials.env`; readiness sees both token gates and both access-policy gates as pass.
+- `telegram-probe` is implemented and passes against `imports/activation-harness` as the non-consuming Telegram `getMe` readiness check, separating token/API failures from update consumption before live `telegram-poll-once` handoff.
 - `discord-gateway-probe` passes with the imported Discord token and Node 24 global WebSocket support.
 - `discord-outbox-send-once` passes with an empty pending outbox, writes `discord.outbox-send-once`, and does not send any message when `pending=0`.
 - `supervisor-plan` generated three Windows scheduled-task plans (`runtime-loop`, `telegram-loop`, `discord-gateway-loop`) plus install/start/stop/uninstall scripts under `imports/activation-harness/state/supervisor/windows-scheduled-tasks`; generated scripts use absolute paths, point at the local `imports/openclaw-core-snapshot` source because the mounted `D:\Warehouse\Research\OpenClaw_WSL\.openclaw` path is absent, and contain no raw token/key/secret strings.
@@ -192,7 +193,7 @@ As of 2026-06-08 local verification:
 - Offline normal-turn smoke passes through `channel-run-once` with `tools/openclaw-fake-codex-app-server/fake-codex-app-server.cmd`, producing runtime-run-once, Codex run, Codex completion, transcript, outbox, delivery receipt, and operational log evidence without a model request or channel send.
 - Runtime loop idle/drain smoke passes with `runtime-loop --stop-when-idle` and writes `state/runtime-queue/loop-last.json` without a model request when no pending queue items remain.
 - `status` reports `queued=2 open=0 prepared=2 completed=2`, outbox `pending=0 delivered=4`, Qdrant edge primary memory present, plugin catalog ready with 2 manifest-derived tools, and operational log event coverage for offline runtime/delivery smoke.
-- `enable-check` currently reports `Ready: yes` with `passed=30 warnings=3 failed=0`; `runtime-loop` and `supervisor-plan` are pass. Remaining warnings are live operator smoke evidence for Telegram poll/offset and optional LanceDB backup.
+- `enable-check` currently reports `Ready: yes` with `passed=33 warnings=3 failed=0`; `telegram-access-policy`, `discord-access-policy`, `runtime-loop`, and `supervisor-plan` are pass. Remaining warnings are live operator smoke evidence for Telegram poll/offset and optional LanceDB backup.
 
 ## Verification Commands
 
