@@ -97,6 +97,8 @@ pub fn prepare_runtime_queue_item(
 
     let mut warnings = Vec::new();
     let prepared_receipts = read_prepared_receipts(&execution_receipts_file, &mut warnings)?;
+    let terminal_run_ids =
+        read_terminal_run_once_ids(&queue_dir.join("run-once-receipts.jsonl"), &mut warnings)?;
     if let Some(requested_queue_id) = options.queue_id.as_deref()
         && let Some(prepared) = prepared_receipts.get(requested_queue_id)
     {
@@ -116,6 +118,43 @@ pub fn prepare_runtime_queue_item(
                 HarnessLogLevel::Info,
                 "runtime-queue",
                 "queue.prepare.already-prepared",
+                receipt.reason.clone(),
+            )
+            .queue_id(receipt.queue_id.clone())
+            .path(receipt.execution_dir.clone()),
+        )?;
+        return Ok(RuntimeQueuePrepareReport {
+            schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
+            harness_home: options.harness_home,
+            queue_file,
+            execution_receipts_file,
+            item: None,
+            receipt,
+            warnings,
+        });
+    }
+    if options.queue_id.is_none()
+        && let Some((queue_id, prepared)) = prepared_receipts
+            .iter()
+            .find(|(queue_id, _)| !terminal_run_ids.contains(*queue_id))
+    {
+        let receipt = RuntimeExecutionReceipt {
+            queue_id: Some(queue_id.clone()),
+            status: RuntimeExecutionReceiptStatus::AlreadyPrepared,
+            execution_dir: prepared.execution_dir.clone(),
+            prompt_bundle_json: prepared.prompt_bundle_json.clone(),
+            prompt_markdown: prepared.prompt_markdown.clone(),
+            reason: "resuming previously prepared runtime queue item without terminal run receipt"
+                .to_string(),
+        };
+        append_json_line(&execution_receipts_file, &receipt)?;
+        append_harness_log(
+            &options.harness_home,
+            &HarnessLogEvent::new(
+                current_log_time_ms()?,
+                HarnessLogLevel::Info,
+                "runtime-queue",
+                "queue.prepare.resume-prepared",
                 receipt.reason.clone(),
             )
             .queue_id(receipt.queue_id.clone())
@@ -358,6 +397,40 @@ fn read_prepared_receipts(
     Ok(receipts)
 }
 
+fn read_terminal_run_once_ids(
+    receipts_file: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<HashSet<String>> {
+    let mut ids = HashSet::new();
+    if !receipts_file.is_file() {
+        return Ok(ids);
+    }
+
+    let text = fs::read_to_string(receipts_file)?;
+    for (index, line) in text.lines().enumerate() {
+        let line_number = index + 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(error) => {
+                warnings.push(format!(
+                    "runtime run-once receipt line {line_number} is not valid JSON: {error}"
+                ));
+                continue;
+            }
+        };
+        if let Some(queue_id) = string_field(&value, &["queueId", "queue_id"])
+            && string_field(&value, &["status"]).is_some()
+        {
+            ids.insert(queue_id.to_string());
+        }
+    }
+    Ok(ids)
+}
+
 fn parse_pending_item(value: &Value) -> Option<PendingQueueItem> {
     let source = value.get("source")?;
     Some(PendingQueueItem {
@@ -446,6 +519,7 @@ mod tests {
         RuntimeQueueEnqueueOptions, TurnPlanInput, build_channel_step, build_source_skill_index,
         build_turn_plan, enqueue_channel_step,
     };
+    use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -540,18 +614,33 @@ mod tests {
         assert!(second.item.is_none());
         assert_eq!(
             second.receipt.status,
-            RuntimeExecutionReceiptStatus::NoPendingItem
+            RuntimeExecutionReceiptStatus::AlreadyPrepared
         );
-        assert!(
-            second
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("already has a prepared receipt"))
-        );
+        assert_eq!(second.receipt.queue_id.as_deref(), Some(queue_id.as_str()));
+
+        let run_once_receipts = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("run-once-receipts.jsonl");
+        let mut run_once_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&run_once_receipts)
+            .unwrap();
+        writeln!(
+            run_once_file,
+            "{}",
+            serde_json::json!({
+                "queueId": queue_id,
+                "status": "completed",
+                "reason": "test terminal receipt"
+            })
+        )
+        .unwrap();
 
         let explicit = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
-            harness_home,
-            queue_id: Some(queue_id),
+            harness_home: harness_home.clone(),
+            queue_id: second.receipt.queue_id.clone(),
             prompt_options: PromptAssemblyOptions::default(),
         })
         .unwrap();
@@ -562,6 +651,18 @@ mod tests {
         );
         assert!(explicit.receipt.execution_dir.is_some());
         assert!(explicit.receipt.prompt_bundle_json.is_some());
+
+        let after_terminal = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home,
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert!(after_terminal.item.is_none());
+        assert_eq!(
+            after_terminal.receipt.status,
+            RuntimeExecutionReceiptStatus::NoPendingItem
+        );
 
         let _ = fs::remove_dir_all(root);
     }

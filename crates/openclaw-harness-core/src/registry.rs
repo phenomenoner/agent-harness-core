@@ -150,12 +150,14 @@ fn collect_agent_defaults(config: &Value) -> AgentDefaults {
         return AgentDefaults::default();
     };
 
+    let (route_provider, route_model) = model_route(defaults);
     AgentDefaults {
         workspace: string_field(defaults, &["workspace", "workspacePath", "workspace_path"])
             .map(ToString::to_string),
         provider: string_field(defaults, &["provider", "providerId", "provider_id"])
-            .map(ToString::to_string),
-        model: model_id(defaults).map(ToString::to_string),
+            .map(ToString::to_string)
+            .or(route_provider),
+        model: route_model,
         timezone: string_field(defaults, &["timezone", "timeZone", "tz"]).map(ToString::to_string),
     }
 }
@@ -219,6 +221,7 @@ fn build_agent_profile(
     };
     let agent_home = directory.join("agent");
 
+    let (route_provider, route_model) = model_route(value);
     AgentProfile {
         id: id.to_string(),
         enabled: value.get("enabled").and_then(Value::as_bool),
@@ -227,10 +230,9 @@ fn build_agent_profile(
             .or_else(|| defaults.workspace.clone()),
         provider: string_field(value, &["provider", "providerId", "provider_id"])
             .map(ToString::to_string)
+            .or(route_provider)
             .or_else(|| defaults.provider.clone()),
-        model: model_id(value)
-            .map(ToString::to_string)
-            .or_else(|| defaults.model.clone()),
+        model: route_model.or_else(|| defaults.model.clone()),
         source,
         directory,
         directory_exists,
@@ -427,12 +429,31 @@ fn agent_id(value: &Value) -> Option<&str> {
         .or_else(|| string_field(value, &["id", "agentId", "agent_id", "name"]))
 }
 
-fn model_id(value: &Value) -> Option<&str> {
-    string_field(value, &["model", "modelId", "model_id"]).or_else(|| {
-        value
-            .get("model")
-            .and_then(|model| string_field(model, &["id", "name"]))
-    })
+fn model_route(value: &Value) -> (Option<String>, Option<String>) {
+    let route = string_field(value, &["model", "modelId", "model_id"])
+        .or_else(|| {
+            value
+                .get("model")
+                .and_then(|model| string_field(model, &["primary", "id", "name"]))
+        })
+        .or_else(|| string_field(value, &["primary"]));
+    match route {
+        Some(route) => split_provider_model_route(route),
+        None => (None, None),
+    }
+}
+
+fn split_provider_model_route(route: &str) -> (Option<String>, Option<String>) {
+    let trimmed = route.trim();
+    if trimmed.is_empty() {
+        return (None, None);
+    }
+    match trimmed.split_once('/') {
+        Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
+            (Some(provider.to_string()), Some(model.to_string()))
+        }
+        _ => (None, Some(trimmed.to_string())),
+    }
 }
 
 fn string_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -576,6 +597,51 @@ mod tests {
             .find(|plugin| plugin.id == "openclaw-mem-engine")
             .unwrap();
         assert!(memory_plugin.memory_related);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registry_parses_openclaw_primary_model_routes() {
+        let root = temp_root("registry_parses_openclaw_primary_model_routes");
+        let home = root.join(".openclaw");
+        fs::create_dir_all(home.join("agents").join("main").join("agent")).unwrap();
+        fs::create_dir_all(home.join("agents").join("xiaoxiaoli").join("agent")).unwrap();
+        fs::write(
+            home.join("openclaw.json"),
+            r#"{
+              "agents": {
+                "defaults": {
+                  "model": {
+                    "primary": "openai/gpt-5.5",
+                    "fallbacks": []
+                  }
+                },
+                "list": [
+                  { "id": "main", "enabled": true },
+                  {
+                    "id": "xiaoxiaoli",
+                    "enabled": true,
+                    "model": {
+                      "primary": "openrouter/openai/gpt-5.4-mini",
+                      "fallbacks": []
+                    }
+                  }
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let registry = load_agent_registry(&OpenClawSource::new(&home)).unwrap();
+        assert_eq!(registry.defaults.provider.as_deref(), Some("openai"));
+        assert_eq!(registry.defaults.model.as_deref(), Some("gpt-5.5"));
+        let main = agent(&registry, "main");
+        assert_eq!(main.provider.as_deref(), Some("openai"));
+        assert_eq!(main.model.as_deref(), Some("gpt-5.5"));
+        let xiaoxiaoli = agent(&registry, "xiaoxiaoli");
+        assert_eq!(xiaoxiaoli.provider.as_deref(), Some("openrouter"));
+        assert_eq!(xiaoxiaoli.model.as_deref(), Some("openai/gpt-5.4-mini"));
 
         let _ = fs::remove_dir_all(root);
     }

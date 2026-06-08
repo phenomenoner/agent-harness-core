@@ -1673,10 +1673,25 @@ fn write_json_rpc(stdin: &mut impl Write, value: &Value) -> io::Result<()> {
 
 fn terminate_child(child: &mut std::process::Child) -> io::Result<()> {
     if child.try_wait()?.is_none() {
-        let _ = child.kill();
+        terminate_child_process_tree(child);
     }
     let _ = child.wait();
     Ok(())
+}
+
+#[cfg(windows)]
+fn terminate_child_process_tree(child: &mut std::process::Child) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+}
+
+#[cfg(not(windows))]
+fn terminate_child_process_tree(child: &mut std::process::Child) {
+    let _ = child.kill();
 }
 
 fn json_id(value: &Value) -> Option<i64> {

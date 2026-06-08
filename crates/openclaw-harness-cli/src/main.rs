@@ -1295,14 +1295,105 @@ fn run_discord_gateway_probe(args: &[String]) -> Result<(), String> {
 
 fn run_discord_gateway_loop(args: &[String]) -> Result<(), String> {
     let args = discord_gateway_args_from_args(args)?;
-    let status = discord_gateway_command(&args).status().map_err(|err| {
-        format!(
-            "failed to spawn Discord gateway loop via {}: {err}",
-            args.node_exe.display()
-        )
-    })?;
-    if !status.success() {
-        return Err(format!("Discord gateway loop exited with {status}"));
+    if args.max_messages > 0 {
+        let status = discord_gateway_command(&args).status().map_err(|err| {
+            format!(
+                "failed to spawn Discord gateway loop via {}: {err}",
+                args.node_exe.display()
+            )
+        })?;
+        if !status.success() {
+            return Err(format!("Discord gateway loop exited with {status}"));
+        }
+        return Ok(());
+    }
+
+    let mut iterations = 0usize;
+    let mut consecutive_errors = 0usize;
+    let max_consecutive_errors = 5usize;
+    loop {
+        if stop_file_requested(args.stop_file.as_deref()) {
+            append_loop_stop_log(
+                &args.target_home,
+                "discord",
+                "discord.gateway-loop-stopped",
+                iterations,
+                "stop file requested",
+            )?;
+            println!("Discord gateway loop stop requested after {iterations} iteration(s)");
+            break;
+        }
+        iterations += 1;
+        match discord_gateway_command(&args).status() {
+            Ok(status) if status.success() => {
+                consecutive_errors = 0;
+                append_harness_log(
+                    &args.target_home,
+                    &HarnessLogEvent::new(
+                        current_log_time_ms().map_err(|err| err.to_string())?,
+                        HarnessLogLevel::Warn,
+                        "discord",
+                        "discord.gateway-loop-restart",
+                        format!("gateway subprocess exited cleanly on iteration {iterations}; restarting"),
+                    ),
+                )
+                .map_err(|err| err.to_string())?;
+            }
+            Ok(status) => {
+                consecutive_errors += 1;
+                let error = format!("Discord gateway subprocess exited with {status}");
+                append_harness_log(
+                    &args.target_home,
+                    &HarnessLogEvent::new(
+                        current_log_time_ms().map_err(|err| err.to_string())?,
+                        HarnessLogLevel::Warn,
+                        "discord",
+                        "discord.gateway-loop-error",
+                        format!(
+                            "iteration={iterations} consecutiveErrors={consecutive_errors} error={error}"
+                        ),
+                    ),
+                )
+                .map_err(|err| err.to_string())?;
+                eprintln!(
+                    "discord-gateway-loop iteration {iterations} failed ({consecutive_errors}/{max_consecutive_errors}): {error}"
+                );
+                if consecutive_errors >= max_consecutive_errors {
+                    return Err(format!(
+                        "discord-gateway-loop exceeded {max_consecutive_errors} consecutive errors; last error: {error}"
+                    ));
+                }
+            }
+            Err(error) => {
+                consecutive_errors += 1;
+                let error = format!(
+                    "failed to spawn Discord gateway loop via {}: {error}",
+                    args.node_exe.display()
+                );
+                append_harness_log(
+                    &args.target_home,
+                    &HarnessLogEvent::new(
+                        current_log_time_ms().map_err(|err| err.to_string())?,
+                        HarnessLogLevel::Warn,
+                        "discord",
+                        "discord.gateway-loop-error",
+                        format!(
+                            "iteration={iterations} consecutiveErrors={consecutive_errors} error={error}"
+                        ),
+                    ),
+                )
+                .map_err(|err| err.to_string())?;
+                eprintln!(
+                    "discord-gateway-loop iteration {iterations} failed ({consecutive_errors}/{max_consecutive_errors}): {error}"
+                );
+                if consecutive_errors >= max_consecutive_errors {
+                    return Err(format!(
+                        "discord-gateway-loop exceeded {max_consecutive_errors} consecutive errors; last error: {error}"
+                    ));
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(1_000));
     }
     Ok(())
 }
@@ -5865,7 +5956,7 @@ fn pending_runtime_typing_context(
     if !pending_file.is_file() {
         return Ok(None);
     }
-    let prepared_ids = prepared_runtime_queue_ids(&queue_dir.join("execution-receipts.jsonl"))?;
+    let terminal_ids = terminal_runtime_queue_ids(&queue_dir.join("run-once-receipts.jsonl"))?;
     let text = fs::read_to_string(&pending_file)
         .map_err(|err| format!("failed to read {}: {err}", pending_file.display()))?;
     for line in text.lines() {
@@ -5886,7 +5977,7 @@ fn pending_runtime_typing_context(
         if json_string_field(&value, &["status"]) != Some("queued") {
             continue;
         }
-        if queue_id.is_some_and(|queue_id| prepared_ids.contains(queue_id)) {
+        if queue_id.is_some_and(|queue_id| terminal_ids.contains(queue_id)) {
             continue;
         }
         let Some(agent_id) = json_string_field(&value, &["agentId", "agent_id"]) else {
@@ -5907,7 +5998,7 @@ fn pending_runtime_typing_context(
     Ok(None)
 }
 
-fn prepared_runtime_queue_ids(path: &Path) -> Result<BTreeSet<String>, String> {
+fn terminal_runtime_queue_ids(path: &Path) -> Result<BTreeSet<String>, String> {
     let mut ids = BTreeSet::new();
     if !path.is_file() {
         return Ok(ids);
@@ -5923,8 +6014,8 @@ fn prepared_runtime_queue_ids(path: &Path) -> Result<BTreeSet<String>, String> {
             Ok(value) => value,
             Err(_) => continue,
         };
-        if json_string_field(&value, &["status"]) == Some("prepared")
-            && let Some(queue_id) = json_string_field(&value, &["queueId", "queue_id"])
+        if let Some(queue_id) = json_string_field(&value, &["queueId", "queue_id"])
+            && json_string_field(&value, &["status"]).is_some()
         {
             ids.insert(queue_id.to_string());
         }

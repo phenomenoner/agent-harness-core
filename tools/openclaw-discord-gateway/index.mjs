@@ -8,7 +8,7 @@ import process from "node:process";
 const PROBE_SCHEMA = "openclaw-harness.discord-gateway-probe.v1";
 const RECEIPT_SCHEMA = "openclaw-harness.discord-gateway-probe-receipt.v1";
 const DISCORD_GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
-const DISCORD_INTENTS = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
+const DISCORD_INTENTS = (1 << 0) | (1 << 9) | (1 << 12);
 
 function parseArgs(argv) {
   const args = {
