@@ -58,6 +58,7 @@ These must pass before cutover.
    - Run `channel-delivery-record --status delivered`.
    - Confirm future `channel-outbox-plan` skips delivered messages and retries failed messages.
    - For Telegram smoke, set `TELEGRAM_BOT_TOKEN` and run `telegram-poll-once` against a controlled DM; confirm command replies and agent replies are delivered by the Bot API.
+   - For Telegram handoff rehearsal, run `telegram-loop --iterations 0` only after confirming the old Docker gateway is not also consuming Telegram updates.
 
 7. Logging gate
    - Run `enable-check`.
@@ -104,8 +105,8 @@ These should be run before stopping the Docker gateway.
 ## Remaining Development To Formal Activation
 
 1. Real Telegram adapter
-   - Done for one-shot smoke: `telegram-poll-once` receives Telegram text updates, normalizes them into `channel-run-once`, delivers pending replies through Telegram Bot API `sendMessage`, records delivery receipts, stores update offsets, and writes a poll summary log.
-   - Still required for formal activation: supervised long-running loop, backoff, health/status, graceful shutdown, token source hardening, and production retry policy.
+   - Done for smoke and operator-run handoff: `telegram-poll-once` receives Telegram text updates, normalizes them into `channel-run-once`, delivers pending replies through Telegram Bot API `sendMessage`, records delivery receipts, stores update offsets, and writes a poll summary log. `telegram-loop` repeats the same path with idle sleep and a consecutive-error threshold.
+   - Still required for formal service activation: Windows service or scheduled-task install path, health/status, graceful shutdown, token source hardening, and production retry policy.
 
 2. Real Discord adapter
    - Receive Discord DM events through a gateway adapter.
@@ -147,6 +148,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p openclaw-harness-cli -- help
 cargo run -p openclaw-harness-cli -- enable-check --target-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- telegram-poll-once --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.exe --poll-timeout-seconds 1 --max-updates 10
+cargo run -p openclaw-harness-cli -- telegram-loop --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.exe --iterations 1 --idle-ms 1000
 ```
 
 Use fake app-server tests for CI. Use real `codex app-server` only in operator-run smoke tests because it may make model requests.

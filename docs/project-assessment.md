@@ -59,7 +59,7 @@ The project should be split into small boundaries:
    - Model selection should remain provider/model based, with a separate runtime selection policy.
 
 4. Channel layer
-   - Telegram: use the current `telegram-poll-once` Bot API smoke adapter for activation tests; consider `teloxide` when promoting this into a long-running async bot service.
+   - Telegram: use the current `telegram-poll-once` Bot API smoke adapter for activation tests and `telegram-loop` for operator-run handoff; consider `teloxide` when promoting this into a full async bot service.
    - Discord: use `serenity`/`poise` for a faster bot implementation, or `twilight` when lower-level control matters.
    - Normalize all inbound messages into one internal `ChannelEnvelope`.
 
@@ -302,7 +302,7 @@ Current implemented foundation:
 - `channel-receive` is the single-message ingress handler future Telegram/Discord adapters can call; it routes commands to channel state/outbox and ordinary messages to the runtime queue with receive receipts.
 - `channel-run-once` is the single-message adapter/smoke entrypoint: it runs `channel-receive`, invokes `runtime-run-once` when the message is an ordinary agent turn, and returns pending outbox delivery work.
 - `channel-outbox-plan` and `channel-delivery-record` provide the shared Telegram/Discord delivery retry ledger: pending outbox messages get stable delivery ids, delivered receipts are skipped, failed receipts remain retryable, and delivery events are written to the operational log.
-- `telegram-poll-once` is the first real Telegram Bot API smoke adapter: it reads `TELEGRAM_BOT_TOKEN`, stores update offsets in `state/channels/telegram-offset.json`, normalizes text updates into `channel-run-once`, sends pending Telegram replies, records delivery receipts, and writes `telegram.poll-once` operational log summaries.
+- `telegram-poll-once` is the first real Telegram Bot API smoke adapter: it reads `TELEGRAM_BOT_TOKEN`, stores update offsets in `state/channels/telegram-offset.json`, normalizes text updates into `channel-run-once`, sends pending Telegram replies, records delivery receipts, and writes `telegram.poll-once` operational log summaries. `telegram-loop` repeats the same path with finite or infinite iterations for operator-run handoff.
 - `queue-enqueue` and `queue-prepare` read channel command state from the target harness home so active session keys, model overrides, and steering/think/btw notes survive into queued turns and prompt bundles.
 - `queue-prepare` uses prepared execution receipts as idempotence state: automatic selection skips already prepared queue ids, while explicit `--queue-id` requests return an `AlreadyPrepared` no-op receipt with the prior output paths.
 - `queue-enqueue` persists channel agent-turn dispatches to `state/runtime-queue/pending.jsonl`, appends receipts to `state/runtime-queue/receipts.jsonl`, and precomputes OpenClaw-compatible transcript/trajectory paths for the future Codex runtime worker.
@@ -362,10 +362,10 @@ Current implemented foundation:
 
 ### Phase 3: Messaging Channels
 
-- Add Telegram channel. Current status: one-shot `telegram-poll-once` adapter exists for smoke tests; long-running supervised Telegram service loop is still pending.
+- Add Telegram channel. Current status: `telegram-poll-once` exists for smoke tests and `telegram-loop` exists for operator-run continuous polling; Windows service packaging and full health management are still pending.
 - Add Discord channel.
 - Implement channel session key compatibility.
-- Route real Telegram/Discord bot events into `channel-run-once` and deliver replies through the shared `channel-outbox-plan` / `channel-delivery-record` ledger. Telegram one-shot coverage exists; Discord and long-running Telegram coverage are pending.
+- Route real Telegram/Discord bot events into `channel-run-once` and deliver replies through the shared `channel-outbox-plan` / `channel-delivery-record` ledger. Telegram poll and loop coverage exists; Discord coverage is pending.
 - Expose persisted command effects such as model switch, new session, steering notes, and stop requests through the real bot UX and status replies.
 - Implement approval UX for shell/tool requests.
 

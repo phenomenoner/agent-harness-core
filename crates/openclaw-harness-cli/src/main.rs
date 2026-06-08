@@ -1,7 +1,8 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use openclaw_harness_core::{
     ActivationReadinessOptions, ActivationReadinessReport, AgentRegistry,
@@ -55,6 +56,7 @@ fn main() {
         "channel-outbox-plan" => run_channel_outbox_plan(&rest),
         "channel-delivery-record" => run_channel_delivery_record(&rest),
         "telegram-poll-once" => run_telegram_poll_once(&rest),
+        "telegram-loop" => run_telegram_loop(&rest),
         "queue-enqueue" => run_queue_enqueue(&rest),
         "queue-prepare" => run_queue_prepare(&rest),
         "runtime-run-once" => run_runtime_run_once(&rest),
@@ -511,13 +513,70 @@ fn run_channel_delivery_record(args: &[String]) -> Result<(), String> {
 
 fn run_telegram_poll_once(args: &[String]) -> Result<(), String> {
     let args = telegram_poll_once_args_from_args(args)?;
-    let token = env::var("TELEGRAM_BOT_TOKEN")
-        .map_err(|_| "TELEGRAM_BOT_TOKEN is required for telegram-poll-once".to_string())?;
+    let token = telegram_bot_token()?;
+    let report = execute_telegram_poll_once(&args, &token)?;
+    print_telegram_poll_once_report(&report);
+    Ok(())
+}
+
+fn run_telegram_loop(args: &[String]) -> Result<(), String> {
+    let args = telegram_loop_args_from_args(args)?;
+    let token = telegram_bot_token()?;
+    let mut iterations = 0usize;
+    let mut consecutive_errors = 0usize;
+
+    loop {
+        iterations += 1;
+        match execute_telegram_poll_once(&args.poll, &token) {
+            Ok(report) => {
+                consecutive_errors = 0;
+                println!("Telegram loop iteration: {iterations}");
+                print_telegram_poll_once_report(&report);
+            }
+            Err(error) => {
+                consecutive_errors += 1;
+                eprintln!(
+                    "telegram-loop iteration {iterations} failed ({consecutive_errors}/{}): {error}",
+                    args.max_consecutive_errors
+                );
+                let _ = append_harness_log(
+                    &args.poll.target_home,
+                    &HarnessLogEvent::new(
+                        current_log_time_ms().unwrap_or(0),
+                        HarnessLogLevel::Warn,
+                        "telegram",
+                        "telegram.loop-error",
+                        format!(
+                            "iteration={iterations} consecutiveErrors={consecutive_errors} error={error}"
+                        ),
+                    ),
+                );
+                if consecutive_errors >= args.max_consecutive_errors {
+                    return Err(format!(
+                        "telegram-loop exceeded {} consecutive errors; last error: {error}",
+                        args.max_consecutive_errors
+                    ));
+                }
+            }
+        }
+
+        if args.iterations > 0 && iterations >= args.iterations {
+            break;
+        }
+        thread::sleep(Duration::from_millis(args.idle_ms));
+    }
+
+    Ok(())
+}
+
+fn execute_telegram_poll_once(
+    args: &TelegramPollOnceArgs,
+    token: &str,
+) -> Result<TelegramPollOnceReport, String> {
     let mut warnings = Vec::new();
     let offset_file = telegram_offset_file(&args.target_home);
     let offset = read_telegram_offset(&offset_file, &mut warnings)?;
-    let updates =
-        telegram_get_updates(&token, offset, args.poll_timeout_seconds, args.max_updates)?;
+    let updates = telegram_get_updates(token, offset, args.poll_timeout_seconds, args.max_updates)?;
     let mut handled_messages = 0;
     let mut skipped_updates = 0;
     let mut next_offset = offset;
@@ -590,7 +649,7 @@ fn run_telegram_poll_once(args: &[String]) -> Result<(), String> {
     let mut delivered_messages = 0;
     let mut failed_deliveries = 0;
     for pending in delivery.pending {
-        match telegram_send_message(&token, &pending.message.channel_id, &pending.message.text) {
+        match telegram_send_message(token, &pending.message.channel_id, &pending.message.text) {
             Ok(provider_message_id) => {
                 record_channel_delivery(ChannelDeliveryRecordOptions {
                     harness_home: args.target_home.clone(),
@@ -659,8 +718,7 @@ fn run_telegram_poll_once(args: &[String]) -> Result<(), String> {
         .path(Some(offset_file)),
     )
     .map_err(|err| err.to_string())?;
-    print_telegram_poll_once_report(&report);
-    Ok(())
+    Ok(report)
 }
 
 fn run_queue_enqueue(args: &[String]) -> Result<(), String> {
@@ -1054,6 +1112,13 @@ struct TelegramPollOnceReport {
     failed_deliveries: usize,
     next_offset: Option<i64>,
     warnings: Vec<String>,
+}
+
+struct TelegramLoopArgs {
+    poll: TelegramPollOnceArgs,
+    iterations: usize,
+    idle_ms: u64,
+    max_consecutive_errors: usize,
 }
 
 struct QueuePrepareArgs {
@@ -1979,6 +2044,147 @@ fn telegram_poll_once_args_from_args(args: &[String]) -> Result<TelegramPollOnce
     })
 }
 
+fn telegram_loop_args_from_args(args: &[String]) -> Result<TelegramLoopArgs, String> {
+    let mut home = default_openclaw_home();
+    let mut workspace = None;
+    let mut target_home = default_harness_home();
+    let mut agent_id = None;
+    let mut skill_limit = 5;
+    let mut codex_exe = None;
+    let mut timeout_ms = 300_000;
+    let mut poll_timeout_seconds = 1;
+    let mut max_updates = 10;
+    let mut outbox_limit = 20;
+    let mut iterations = 0;
+    let mut idle_ms = 1_000;
+    let mut max_consecutive_errors = 5;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--openclaw-home" => {
+                i += 1;
+                home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--openclaw-home requires a path".to_string())?;
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            "--target-home" => {
+                i += 1;
+                target_home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+            }
+            "--agent" => {
+                i += 1;
+                agent_id = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--agent requires an id".to_string())?,
+                );
+            }
+            "--skill-limit" => {
+                i += 1;
+                skill_limit = args
+                    .get(i)
+                    .ok_or_else(|| "--skill-limit requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--codex-exe" => {
+                i += 1;
+                codex_exe = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--codex-exe requires a path".to_string())?,
+                );
+            }
+            "--timeout-ms" => {
+                i += 1;
+                timeout_ms = args
+                    .get(i)
+                    .ok_or_else(|| "--timeout-ms requires a positive integer".to_string())
+                    .and_then(|value| parse_u64(value, "--timeout-ms"))?;
+            }
+            "--poll-timeout-seconds" => {
+                i += 1;
+                poll_timeout_seconds = args
+                    .get(i)
+                    .ok_or_else(|| "--poll-timeout-seconds requires a positive integer".to_string())
+                    .and_then(|value| parse_u64(value, "--poll-timeout-seconds"))?;
+            }
+            "--max-updates" => {
+                i += 1;
+                max_updates = args
+                    .get(i)
+                    .ok_or_else(|| "--max-updates requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--outbox-limit" => {
+                i += 1;
+                outbox_limit = args
+                    .get(i)
+                    .ok_or_else(|| "--outbox-limit requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--iterations" => {
+                i += 1;
+                iterations = args
+                    .get(i)
+                    .ok_or_else(|| "--iterations requires a non-negative integer".to_string())
+                    .and_then(|value| parse_usize(value, "--iterations"))?;
+            }
+            "--idle-ms" => {
+                i += 1;
+                idle_ms = args
+                    .get(i)
+                    .ok_or_else(|| "--idle-ms requires a positive integer".to_string())
+                    .and_then(|value| parse_u64(value, "--idle-ms"))?;
+            }
+            "--max-consecutive-errors" => {
+                i += 1;
+                max_consecutive_errors = args
+                    .get(i)
+                    .ok_or_else(|| {
+                        "--max-consecutive-errors requires a positive integer".to_string()
+                    })
+                    .and_then(|value| parse_limit(value))?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let source = match workspace {
+        Some(workspace) => OpenClawSource::with_workspace(home, workspace),
+        None => OpenClawSource::new(home),
+    };
+    Ok(TelegramLoopArgs {
+        poll: TelegramPollOnceArgs {
+            source,
+            target_home,
+            agent_id,
+            skill_limit,
+            codex_exe,
+            timeout_ms,
+            poll_timeout_seconds,
+            max_updates,
+            outbox_limit,
+        },
+        iterations,
+        idle_ms,
+        max_consecutive_errors,
+    })
+}
+
 fn queue_prepare_args_from_args(args: &[String]) -> Result<QueuePrepareArgs, String> {
     let mut target_home = default_harness_home();
     let mut queue_id = None;
@@ -2573,6 +2779,11 @@ fn default_harness_home() -> PathBuf {
     PathBuf::from(".openclaw-harness")
 }
 
+fn telegram_bot_token() -> Result<String, String> {
+    env::var("TELEGRAM_BOT_TOKEN")
+        .map_err(|_| "TELEGRAM_BOT_TOKEN is required for Telegram adapters".to_string())
+}
+
 fn telegram_offset_file(harness_home: &std::path::Path) -> PathBuf {
     harness_home
         .join("state")
@@ -2711,6 +2922,12 @@ fn parse_limit(value: &str) -> Result<usize, String> {
         .ok()
         .filter(|value| *value > 0)
         .ok_or_else(|| format!("invalid limit: {value}; expected a positive integer"))
+}
+
+fn parse_usize(value: &str, flag: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("{flag} requires a non-negative integer, got: {value}"))
 }
 
 fn parse_i64(value: &str, flag: &str) -> Result<i64, String> {
@@ -3862,6 +4079,7 @@ fn print_help() {
     println!("  channel-outbox-plan List pending Telegram/Discord delivery messages");
     println!("  channel-delivery-record Record delivery success or retryable failure");
     println!("  telegram-poll-once Poll Telegram once, run DM pipeline, and deliver replies");
+    println!("  telegram-loop     Run Telegram polling continuously until stopped");
     println!("  queue-enqueue   Persist one channel agent turn to the runtime queue");
     println!("  queue-prepare   Prepare one queued runtime item for Codex execution");
     println!("  runtime-run-once Prepare, run, and outbox one queued runtime item");
@@ -3901,7 +4119,10 @@ fn print_help() {
     println!("  --outbox-limit <n>      Maximum pending outbox items for channel-run-once");
     println!("  --poll-timeout-seconds <n> Telegram long-poll timeout for telegram-poll-once");
     println!("  --max-updates <n>       Maximum Telegram updates for telegram-poll-once");
-    println!("  TELEGRAM_BOT_TOKEN      Environment variable used by telegram-poll-once");
+    println!("  --iterations <n>        Telegram loop iterations; 0 means forever");
+    println!("  --idle-ms <n>           Telegram loop sleep after each poll");
+    println!("  --max-consecutive-errors <n> Telegram loop failure threshold");
+    println!("  TELEGRAM_BOT_TOKEN      Environment variable used by Telegram adapters");
     println!("  --queue-id <id>         Select one runtime queue item for queue-prepare");
     println!("  --execution-dir <path>  Prepared execution directory for codex-plan");
     println!("  --codex-exe <path>      Codex executable path for codex-plan/runtime-run-once");
