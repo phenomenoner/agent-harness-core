@@ -11,6 +11,7 @@ pub struct WindowsSupervisorPlanOptions {
     pub harness_home: PathBuf,
     pub openclaw_home: PathBuf,
     pub workspace: Option<PathBuf>,
+    pub runtime_workspace: Option<PathBuf>,
     pub harness_cli: PathBuf,
     pub codex_executable: Option<PathBuf>,
     pub node_executable: PathBuf,
@@ -65,6 +66,11 @@ pub fn write_windows_supervisor_plan(
     let openclaw_home = absolutize_path(&options.openclaw_home)?;
     let workspace = options
         .workspace
+        .as_deref()
+        .map(absolutize_path)
+        .transpose()?;
+    let runtime_workspace = options
+        .runtime_workspace
         .as_deref()
         .map(absolutize_path)
         .transpose()?;
@@ -161,6 +167,12 @@ pub fn write_windows_supervisor_plan(
         if let Some(workspace) = &workspace {
             args.extend(["--workspace".to_string(), path_arg(workspace)]);
         }
+        if let Some(runtime_workspace) = &runtime_workspace {
+            args.extend([
+                "--runtime-workspace".to_string(),
+                path_arg(runtime_workspace),
+            ]);
+        }
         if let Some(agent_id) = &options.agent_id {
             args.extend(["--agent".to_string(), agent_id.clone()]);
         }
@@ -231,6 +243,12 @@ pub fn write_windows_supervisor_plan(
         ];
         if let Some(workspace) = &workspace {
             args.extend(["--workspace".to_string(), path_arg(workspace)]);
+        }
+        if let Some(runtime_workspace) = &runtime_workspace {
+            args.extend([
+                "--runtime-workspace".to_string(),
+                path_arg(runtime_workspace),
+            ]);
         }
         if let Some(agent_id) = &options.agent_id {
             args.extend(["--agent".to_string(), agent_id.clone()]);
@@ -471,6 +489,7 @@ mod tests {
             harness_home: harness_home.clone(),
             openclaw_home: root.join(".openclaw"),
             workspace: Some(root.join("workspace")),
+            runtime_workspace: None,
             harness_cli: root.join("openclaw-harness.exe"),
             codex_executable: Some(root.join("codex.cmd")),
             node_executable: PathBuf::from("node"),

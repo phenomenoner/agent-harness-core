@@ -341,6 +341,7 @@ fn run_supervisor_plan(args: &[String]) -> Result<(), String> {
         harness_home: args.target_home,
         openclaw_home: args.openclaw_home,
         workspace: args.workspace,
+        runtime_workspace: args.runtime_workspace,
         harness_cli: args.harness_cli,
         codex_executable: args.codex_exe,
         node_executable: args.node_exe,
@@ -530,6 +531,7 @@ fn run_channel_receive(args: &[String]) -> Result<(), String> {
         .map_err(|err| err.to_string())?;
     let report = receive_channel_message(ChannelReceiveOptions {
         source: args.turn.source,
+        runtime_workspace: None,
         harness_home: args.target_home,
         skill_index,
         platform: args.turn.platform,
@@ -551,6 +553,7 @@ fn run_channel_run_once(args: &[String]) -> Result<(), String> {
     let args = channel_run_once_args_from_args(args)?;
     let report = run_channel_once(ChannelRunOnceOptions {
         source: args.turn.source,
+        runtime_workspace: args.runtime_workspace,
         harness_home: args.target_home.clone(),
         platform: args.turn.platform,
         channel_id: args.turn.channel_id,
@@ -868,6 +871,7 @@ fn execute_telegram_poll_once(
         }
         run_channel_once(ChannelRunOnceOptions {
             source: args.source.clone(),
+            runtime_workspace: args.runtime_workspace.clone(),
             harness_home: args.target_home.clone(),
             platform: "telegram".to_string(),
             channel_id: chat_id,
@@ -1209,6 +1213,7 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
                 }
                 let run = run_channel_once(ChannelRunOnceOptions {
                     source: args.source.clone(),
+                    runtime_workspace: args.runtime_workspace.clone(),
                     harness_home: args.target_home.clone(),
                     platform: "discord".to_string(),
                     channel_id: message.channel_id.clone(),
@@ -1413,6 +1418,9 @@ fn discord_gateway_command(args: &DiscordGatewayArgs) -> Command {
     if args.source.workspace != args.source.home.join("workspace") {
         command.arg("--workspace").arg(&args.source.workspace);
     }
+    if let Some(runtime_workspace) = &args.runtime_workspace {
+        command.arg("--runtime-workspace").arg(runtime_workspace);
+    }
     if let Some(agent_id) = &args.agent_id {
         command.arg("--agent").arg(agent_id);
     }
@@ -1579,6 +1587,7 @@ fn run_queue_enqueue(args: &[String]) -> Result<(), String> {
         &step,
         RuntimeQueueEnqueueOptions {
             harness_home: args.target_home,
+            runtime_workspace: None,
             now_ms: args.now_ms,
         },
     )
@@ -2046,6 +2055,7 @@ struct SupervisorPlanArgs {
     target_home: PathBuf,
     openclaw_home: PathBuf,
     workspace: Option<PathBuf>,
+    runtime_workspace: Option<PathBuf>,
     harness_cli: PathBuf,
     codex_exe: Option<PathBuf>,
     node_exe: PathBuf,
@@ -2102,6 +2112,7 @@ struct QueueEnqueueArgs {
 
 struct ChannelRunOnceArgs {
     turn: TurnPlanArgs,
+    runtime_workspace: Option<PathBuf>,
     target_home: PathBuf,
     now_ms: i64,
     codex_exe: Option<PathBuf>,
@@ -2147,6 +2158,7 @@ struct TelegramProbeReport {
 
 struct TelegramPollOnceArgs {
     source: OpenClawSource,
+    runtime_workspace: Option<PathBuf>,
     target_home: PathBuf,
     agent_id: Option<String>,
     telegram_account: Option<String>,
@@ -2208,6 +2220,7 @@ struct DiscordOutboxLoopArgs {
 
 struct DiscordEventRunOnceArgs {
     source: OpenClawSource,
+    runtime_workspace: Option<PathBuf>,
     target_home: PathBuf,
     agent_id: Option<String>,
     skill_limit: usize,
@@ -2240,6 +2253,7 @@ struct DiscordEventRunOnceReport {
 
 struct DiscordGatewayArgs {
     source: OpenClawSource,
+    runtime_workspace: Option<PathBuf>,
     target_home: PathBuf,
     node_exe: PathBuf,
     gateway_script: PathBuf,
@@ -2631,6 +2645,7 @@ fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs,
     let mut target_home = default_harness_home();
     let mut openclaw_home = default_openclaw_home();
     let mut workspace = None;
+    let mut runtime_workspace = None;
     let mut harness_cli = default_harness_cli();
     let mut codex_exe = None;
     let mut node_exe = PathBuf::from("node");
@@ -2665,6 +2680,14 @@ fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs,
                     args.get(i)
                         .map(PathBuf::from)
                         .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            "--runtime-workspace" => {
+                i += 1;
+                runtime_workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--runtime-workspace requires a path".to_string())?,
                 );
             }
             flag if is_harness_home_arg(flag) => {
@@ -2772,6 +2795,7 @@ fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs,
         target_home,
         openclaw_home,
         workspace,
+        runtime_workspace,
         harness_cli,
         codex_exe,
         node_exe,
@@ -3099,6 +3123,7 @@ fn queue_enqueue_args_from_args(args: &[String]) -> Result<QueueEnqueueArgs, Str
 
 fn channel_run_once_args_from_args(args: &[String]) -> Result<ChannelRunOnceArgs, String> {
     let mut target_home = default_harness_home();
+    let mut runtime_workspace = None;
     let mut now_ms = None;
     let mut codex_exe = None;
     let mut timeout_ms = 300_000;
@@ -3111,6 +3136,14 @@ fn channel_run_once_args_from_args(args: &[String]) -> Result<ChannelRunOnceArgs
             flag if is_harness_home_arg(flag) => {
                 i += 1;
                 target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--runtime-workspace" => {
+                i += 1;
+                runtime_workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--runtime-workspace requires a path".to_string())?,
+                );
             }
             "--now-ms" => {
                 i += 1;
@@ -3155,6 +3188,7 @@ fn channel_run_once_args_from_args(args: &[String]) -> Result<ChannelRunOnceArgs
 
     Ok(ChannelRunOnceArgs {
         turn,
+        runtime_workspace,
         target_home,
         now_ms,
         codex_exe,
@@ -3338,6 +3372,7 @@ fn telegram_probe_args_from_args(args: &[String]) -> Result<TelegramProbeArgs, S
 fn telegram_poll_once_args_from_args(args: &[String]) -> Result<TelegramPollOnceArgs, String> {
     let mut home = default_openclaw_home();
     let mut workspace = None;
+    let mut runtime_workspace = None;
     let mut target_home = default_harness_home();
     let mut agent_id = None;
     let mut telegram_account = None;
@@ -3364,6 +3399,14 @@ fn telegram_poll_once_args_from_args(args: &[String]) -> Result<TelegramPollOnce
                     args.get(i)
                         .map(PathBuf::from)
                         .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            "--runtime-workspace" => {
+                i += 1;
+                runtime_workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--runtime-workspace requires a path".to_string())?,
                 );
             }
             flag if is_harness_home_arg(flag) => {
@@ -3440,6 +3483,7 @@ fn telegram_poll_once_args_from_args(args: &[String]) -> Result<TelegramPollOnce
     };
     Ok(TelegramPollOnceArgs {
         source,
+        runtime_workspace,
         target_home,
         agent_id,
         telegram_account,
@@ -3455,6 +3499,7 @@ fn telegram_poll_once_args_from_args(args: &[String]) -> Result<TelegramPollOnce
 fn telegram_loop_args_from_args(args: &[String]) -> Result<TelegramLoopArgs, String> {
     let mut home = default_openclaw_home();
     let mut workspace = None;
+    let mut runtime_workspace = None;
     let mut target_home = default_harness_home();
     let mut agent_id = None;
     let mut telegram_account = None;
@@ -3485,6 +3530,14 @@ fn telegram_loop_args_from_args(args: &[String]) -> Result<TelegramLoopArgs, Str
                     args.get(i)
                         .map(PathBuf::from)
                         .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            "--runtime-workspace" => {
+                i += 1;
+                runtime_workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--runtime-workspace requires a path".to_string())?,
                 );
             }
             flag if is_harness_home_arg(flag) => {
@@ -3593,6 +3646,7 @@ fn telegram_loop_args_from_args(args: &[String]) -> Result<TelegramLoopArgs, Str
     Ok(TelegramLoopArgs {
         poll: TelegramPollOnceArgs {
             source,
+            runtime_workspace,
             target_home,
             agent_id,
             telegram_account,
@@ -3716,6 +3770,7 @@ fn discord_event_run_once_args_from_args(
 ) -> Result<DiscordEventRunOnceArgs, String> {
     let mut home = default_openclaw_home();
     let mut workspace = None;
+    let mut runtime_workspace = None;
     let mut target_home = default_harness_home();
     let mut agent_id = None;
     let mut skill_limit = 5;
@@ -3741,6 +3796,14 @@ fn discord_event_run_once_args_from_args(
                     args.get(i)
                         .map(PathBuf::from)
                         .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            "--runtime-workspace" => {
+                i += 1;
+                runtime_workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--runtime-workspace requires a path".to_string())?,
                 );
             }
             flag if is_harness_home_arg(flag) => {
@@ -3815,6 +3878,7 @@ fn discord_event_run_once_args_from_args(
     };
     Ok(DiscordEventRunOnceArgs {
         source,
+        runtime_workspace,
         target_home,
         agent_id,
         skill_limit,
@@ -3829,6 +3893,7 @@ fn discord_event_run_once_args_from_args(
 fn discord_gateway_args_from_args(args: &[String]) -> Result<DiscordGatewayArgs, String> {
     let mut home = default_openclaw_home();
     let mut workspace = None;
+    let mut runtime_workspace = None;
     let mut target_home = default_harness_home();
     let mut node_exe = PathBuf::from("node");
     let mut gateway_script = PathBuf::from("tools")
@@ -3856,6 +3921,14 @@ fn discord_gateway_args_from_args(args: &[String]) -> Result<DiscordGatewayArgs,
                     args.get(i)
                         .map(PathBuf::from)
                         .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            "--runtime-workspace" => {
+                i += 1;
+                runtime_workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--runtime-workspace requires a path".to_string())?,
                 );
             }
             flag if is_harness_home_arg(flag) => {
@@ -3925,6 +3998,7 @@ fn discord_gateway_args_from_args(args: &[String]) -> Result<DiscordGatewayArgs,
     };
     Ok(DiscordGatewayArgs {
         source,
+        runtime_workspace,
         target_home,
         node_exe,
         gateway_script,
@@ -6016,7 +6090,7 @@ fn terminal_runtime_queue_ids(path: &Path) -> Result<BTreeSet<String>, String> {
             Err(_) => continue,
         };
         if let Some(queue_id) = json_string_field(&value, &["queueId", "queue_id"])
-            && json_string_field(&value, &["status"]).is_some()
+            && json_string_field(&value, &["status"]) == Some("completed")
         {
             ids.insert(queue_id.to_string());
         }
@@ -7512,6 +7586,9 @@ fn print_help() {
     println!("Options:");
     println!("  --openclaw-home <path>  Source .openclaw directory");
     println!("  --workspace <path>      Override workspace directory");
+    println!(
+        "  --runtime-workspace <path> Codex cwd; prompt files still come from --workspace/source"
+    );
     println!("  --target-home <path>    Destination harness home; alias of --harness-home");
     println!("  --harness-home <path>   Harness state root for runtime/channel commands");
     println!("  --force                 Overwrite user-modified builtin harness skills");
@@ -7692,5 +7769,59 @@ mod tests {
             discord_access_decision(&policy, &discord_message(None, "dm-channel", "user-2")),
             ChannelAccessDecision::Denied(_)
         ));
+    }
+
+    #[test]
+    fn typing_context_ignores_retryable_runtime_receipts() {
+        let root = std::env::temp_dir().join(format!(
+            "openclaw-harness-cli-typing-{}",
+            current_time_ms().unwrap()
+        ));
+        let queue_dir = root.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        fs::write(
+            queue_dir.join("pending.jsonl"),
+            serde_json::json!({
+                "queueId": "queue-1",
+                "status": "queued",
+                "agentId": "main",
+                "platform": "telegram",
+                "channelId": "chat-1"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            queue_dir.join("run-once-receipts.jsonl"),
+            serde_json::json!({
+                "queueId": "queue-1",
+                "status": "timeout"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let context = pending_runtime_typing_context(&root, Some("queue-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.platform, "telegram");
+        assert_eq!(context.channel_id, "chat-1");
+
+        fs::write(
+            queue_dir.join("run-once-receipts.jsonl"),
+            serde_json::json!({
+                "queueId": "queue-1",
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            pending_runtime_typing_context(&root, Some("queue-1"))
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }

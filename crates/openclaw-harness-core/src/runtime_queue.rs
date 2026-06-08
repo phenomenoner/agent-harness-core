@@ -11,6 +11,7 @@ const RUNTIME_QUEUE_REPORT_SCHEMA: &str = "openclaw-harness.runtime-queue-enqueu
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeQueueEnqueueOptions {
     pub harness_home: PathBuf,
+    pub runtime_workspace: Option<PathBuf>,
     pub now_ms: i64,
 }
 
@@ -61,6 +62,8 @@ pub struct RuntimeQueueSource {
     pub kind: RuntimeQueueSourceKind,
     pub source_home: PathBuf,
     pub source_workspace: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_workspace: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -169,6 +172,7 @@ fn build_queue_item(
             kind: RuntimeQueueSourceKind::Channel,
             source_home: step.source_home.clone(),
             source_workspace: step.source_workspace.clone(),
+            runtime_workspace: options.runtime_workspace.clone(),
         },
         created_at_ms: options.now_ms,
         agent_id: agent_turn.agent_id.clone(),
@@ -272,6 +276,7 @@ mod tests {
             &step,
             RuntimeQueueEnqueueOptions {
                 harness_home: root.join(".openclaw-harness"),
+                runtime_workspace: None,
                 now_ms: 1234,
             },
         )
@@ -340,6 +345,7 @@ mod tests {
             &step,
             RuntimeQueueEnqueueOptions {
                 harness_home: root.join(".openclaw-harness"),
+                runtime_workspace: None,
                 now_ms: 1234,
             },
         )

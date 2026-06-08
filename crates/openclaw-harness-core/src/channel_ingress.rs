@@ -17,6 +17,7 @@ const CHANNEL_RECEIVE_SCHEMA: &str = "openclaw-harness.channel-receive.v1";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelReceiveOptions {
     pub source: OpenClawSource,
+    pub runtime_workspace: Option<PathBuf>,
     pub harness_home: PathBuf,
     pub skill_index: SkillIndex,
     pub platform: String,
@@ -127,6 +128,7 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
                     &step,
                     RuntimeQueueEnqueueOptions {
                         harness_home: options.harness_home.clone(),
+                        runtime_workspace: options.runtime_workspace.clone(),
                         now_ms: options.now_ms,
                     },
                 )?;
@@ -243,6 +245,7 @@ mod tests {
 
         let report = receive_channel_message(ChannelReceiveOptions {
             source: source.clone(),
+            runtime_workspace: None,
             harness_home: harness_home.clone(),
             skill_index: skills,
             platform: "telegram".to_string(),
@@ -276,6 +279,7 @@ mod tests {
         let skills = build_source_skill_index(&source).unwrap();
         receive_channel_message(ChannelReceiveOptions {
             source: source.clone(),
+            runtime_workspace: None,
             harness_home: harness_home.clone(),
             skill_index: skills.clone(),
             platform: "telegram".to_string(),
@@ -291,6 +295,7 @@ mod tests {
 
         let report = receive_channel_message(ChannelReceiveOptions {
             source,
+            runtime_workspace: None,
             harness_home,
             skill_index: skills,
             platform: "telegram".to_string(),

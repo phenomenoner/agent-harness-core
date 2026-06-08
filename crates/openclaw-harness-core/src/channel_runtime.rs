@@ -1,6 +1,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -256,7 +257,7 @@ fn command_effect(
     match intent {
         ChannelCommandIntent::StartNewSession { topic } => ChannelCommandEffect::StartNewSession {
             topic,
-            new_session_key: format!("{}:new", turn.session_key),
+            new_session_key: new_session_key(turn),
         },
         ChannelCommandIntent::SetThinkingMode { instruction } => {
             ChannelCommandEffect::SetThinkingMode { instruction }
@@ -283,6 +284,42 @@ fn command_effect(
             snapshot: status_snapshot(registry, turn, scope.clone()),
             scope,
         },
+    }
+}
+
+fn new_session_key(turn: &TurnPlan) -> String {
+    let agent_id = turn
+        .agent
+        .as_ref()
+        .map(|agent| agent.id.as_str())
+        .unwrap_or("unassigned");
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!(
+        "{}:{}:{}:{}:session-{}",
+        normalize_key_part(&turn.platform),
+        normalize_key_part(&turn.channel_id),
+        normalize_key_part(&turn.user_id),
+        normalize_key_part(agent_id),
+        millis
+    )
+}
+
+fn normalize_key_part(value: &str) -> String {
+    let mut normalized = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            normalized.push(ch.to_ascii_lowercase());
+        } else {
+            normalized.push('_');
+        }
+    }
+    if normalized.is_empty() {
+        "unknown".to_string()
+    } else {
+        normalized
     }
 }
 
@@ -627,6 +664,44 @@ mod tests {
             step.command_effect,
             Some(ChannelCommandEffect::SwitchModel { ref target, .. })
                 if target == "openrouter/anthropic/claude-sonnet-4"
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_step_new_session_uses_unique_base_session_key() {
+        let root = temp_root("channel_step_new_session_uses_unique_base_session_key");
+        let source = write_channel_source(&root);
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "/new weekly review".to_string(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: Some("telegram:dm:user:main:new".to_string()),
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        let step = build_channel_step(&registry, &turn);
+
+        assert!(matches!(
+            step.command_effect,
+            Some(ChannelCommandEffect::StartNewSession {
+                ref topic,
+                ref new_session_key,
+            }) if topic.as_deref() == Some("weekly review")
+                && new_session_key.starts_with("telegram:dm:user:main:session-")
+                && !new_session_key.contains(":new")
         ));
 
         let _ = fs::remove_dir_all(root);

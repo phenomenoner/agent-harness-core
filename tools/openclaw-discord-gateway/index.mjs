@@ -8,13 +8,14 @@ import process from "node:process";
 const PROBE_SCHEMA = "openclaw-harness.discord-gateway-probe.v1";
 const RECEIPT_SCHEMA = "openclaw-harness.discord-gateway-probe-receipt.v1";
 const DISCORD_GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
-const DISCORD_INTENTS = (1 << 0) | (1 << 9) | (1 << 12);
+const DEFAULT_DISCORD_INTENTS = (1 << 0) | (1 << 9) | (1 << 12);
 
 function parseArgs(argv) {
   const args = {
     harnessHome: process.env.OPENCLAW_HARNESS_HOME || ".openclaw-harness",
     openclawHome: process.env.OPENCLAW_HOME || ".openclaw",
     workspace: null,
+    runtimeWorkspace: null,
     harnessCli: process.env.OPENCLAW_HARNESS_CLI || defaultHarnessCli(),
     agent: null,
     codexExe: null,
@@ -35,6 +36,9 @@ function parseArgs(argv) {
     } else if (flag === "--workspace") {
       i += 1;
       args.workspace = requiredValue(argv, i, flag);
+    } else if (flag === "--runtime-workspace") {
+      i += 1;
+      args.runtimeWorkspace = requiredValue(argv, i, flag);
     } else if (flag === "--harness-cli") {
       i += 1;
       args.harnessCli = requiredValue(argv, i, flag);
@@ -98,8 +102,10 @@ function buildProbe(args) {
     harnessHome: args.harnessHome,
     openclawHome: args.openclawHome,
     workspace: args.workspace,
+    runtimeWorkspace: args.runtimeWorkspace,
     harnessCli: args.harnessCli,
     gatewayUrl: args.gatewayUrl,
+    intents: discordIntents(),
     node: process.version,
     webSocketPresent,
     tokenPresent,
@@ -150,6 +156,8 @@ async function runGateway(args) {
   let heartbeatTimer = null;
   let stopFileTimer = null;
   let handledMessages = 0;
+  let dispatchLogCount = 0;
+  const intents = discordIntents();
   const ws = new WebSocket(args.gatewayUrl);
 
   await new Promise((resolve, reject) => {
@@ -187,8 +195,8 @@ async function runGateway(args) {
         heartbeatTimer = setInterval(() => {
           ws.send(JSON.stringify({ op: 1, d: sequence }));
         }, interval);
-        ws.send(JSON.stringify({ op: 2, d: identifyPayload(token) }));
-        writeGatewayLog(args, "identify", { intents: DISCORD_INTENTS });
+        ws.send(JSON.stringify({ op: 2, d: identifyPayload(token, intents) }));
+        writeGatewayLog(args, "identify", { intents });
         return;
       }
       if (payload.op === 11) {
@@ -201,26 +209,48 @@ async function runGateway(args) {
         writeGatewayLog(args, "message-create", {
           messageId: payload.d?.id,
           channelId: payload.d?.channel_id,
+          guildId: payload.d?.guild_id ?? null,
+          contentLength: typeof payload.d?.content === "string" ? payload.d.content.length : null,
           status: result.status,
         });
         if (args.maxMessages > 0 && handledMessages >= args.maxMessages) {
           ws.close(1000, "max messages handled");
+        }
+      } else if (payload.t) {
+        dispatchLogCount += 1;
+        if (payload.t === "READY") {
+          writeGatewayLog(args, "ready", {
+            sessionId: payload.d?.session_id,
+            userId: payload.d?.user?.id,
+            username: payload.d?.user?.username,
+          });
+        } else if (dispatchLogCount <= 20) {
+          writeGatewayLog(args, "dispatch", { type: payload.t, sequence });
         }
       }
     });
   });
 }
 
-function identifyPayload(token) {
+function identifyPayload(token, intents) {
   return {
     token,
-    intents: DISCORD_INTENTS,
+    intents,
     properties: {
       os: process.platform,
       browser: "openclaw-harness",
       device: "openclaw-harness",
     },
   };
+}
+
+function discordIntents() {
+  const raw = process.env.DISCORD_GATEWAY_INTENTS || process.env.DISCORD_INTENTS;
+  if (!raw) {
+    return DEFAULT_DISCORD_INTENTS;
+  }
+  const value = Number.parseInt(raw, 10);
+  return Number.isFinite(value) ? value : DEFAULT_DISCORD_INTENTS;
 }
 
 function runHarnessForEvent(args, payload) {
@@ -236,6 +266,9 @@ function runHarnessForEvent(args, payload) {
   ];
   if (args.workspace) {
     cliArgs.push("--workspace", args.workspace);
+  }
+  if (args.runtimeWorkspace) {
+    cliArgs.push("--runtime-workspace", args.runtimeWorkspace);
   }
   if (args.agent) {
     cliArgs.push("--agent", args.agent);

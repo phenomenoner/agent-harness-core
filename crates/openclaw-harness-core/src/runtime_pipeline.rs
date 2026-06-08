@@ -453,6 +453,7 @@ mod tests {
         let skills = build_source_skill_index(&source).unwrap();
         let receive = receive_channel_message(ChannelReceiveOptions {
             source,
+            runtime_workspace: None,
             harness_home: harness_home.clone(),
             skill_index: skills,
             platform: "telegram".to_string(),
@@ -534,6 +535,7 @@ mod tests {
         let skills = build_source_skill_index(&source).unwrap();
         let receive = receive_channel_message(ChannelReceiveOptions {
             source,
+            runtime_workspace: None,
             harness_home: harness_home.clone(),
             skill_index: skills,
             platform: "telegram".to_string(),

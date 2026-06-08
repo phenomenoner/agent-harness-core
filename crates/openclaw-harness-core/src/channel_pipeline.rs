@@ -15,6 +15,7 @@ const CHANNEL_RUN_ONCE_SCHEMA: &str = "openclaw-harness.channel-run-once.v1";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelRunOnceOptions {
     pub source: OpenClawSource,
+    pub runtime_workspace: Option<PathBuf>,
     pub harness_home: PathBuf,
     pub platform: String,
     pub channel_id: String,
@@ -57,6 +58,7 @@ pub fn run_channel_once(options: ChannelRunOnceOptions) -> io::Result<ChannelRun
     let skill_index = build_runtime_skill_index(&options.source, &options.harness_home)?;
     let receive = receive_channel_message(ChannelReceiveOptions {
         source: options.source,
+        runtime_workspace: options.runtime_workspace,
         harness_home: options.harness_home.clone(),
         skill_index,
         platform: options.platform.clone(),
@@ -163,6 +165,7 @@ mod tests {
 
         let report = run_channel_once(ChannelRunOnceOptions {
             source,
+            runtime_workspace: None,
             harness_home,
             platform: "telegram".to_string(),
             channel_id: "dm-1".to_string(),
@@ -205,6 +208,7 @@ mod tests {
 
         let report = run_channel_once(ChannelRunOnceOptions {
             source,
+            runtime_workspace: None,
             harness_home: harness_home.clone(),
             platform: "telegram".to_string(),
             channel_id: "dm-2".to_string(),

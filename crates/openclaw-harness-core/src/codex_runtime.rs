@@ -162,6 +162,7 @@ pub struct CodexInvocationPlan {
     pub transport: CodexTransportPlan,
     pub arguments: Vec<String>,
     pub working_directory: PathBuf,
+    pub codex_home: Option<PathBuf>,
     pub prompt_input_file: PathBuf,
     pub env_requirements: Vec<CodexEnvRequirement>,
     pub model_argument: Option<String>,
@@ -439,7 +440,16 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
     let trajectory_file = trajectory_file(&transcript_file);
     let codex_binding_file = codex_binding_file(&transcript_file);
     let runtime_receipt_file = execution_dir.join("codex-runtime-receipt.json");
-    let working_directory = runtime_working_directory(&bundle, &execution_dir, &mut warnings);
+    let runtime_workspace = path_field(
+        &prepared_receipt,
+        &["runtimeWorkspace", "runtime_workspace"],
+    );
+    let working_directory = runtime_working_directory(
+        runtime_workspace.as_deref(),
+        &bundle,
+        &execution_dir,
+        &mut warnings,
+    );
     let thread_id = read_existing_codex_thread_id(&codex_binding_file, &mut warnings)?;
     let executable = options
         .codex_executable
@@ -449,6 +459,7 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
         transport: CodexTransportPlan::StdioJsonRpcAppServer,
         arguments: vec!["app-server".to_string()],
         working_directory,
+        codex_home: harness_codex_home(&options.harness_home),
         prompt_input_file: prompt_markdown.clone(),
         env_requirements: env_requirements(provider.as_deref()),
         model_argument: model.clone(),
@@ -1297,6 +1308,7 @@ fn drive_codex_app_server(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));
+    apply_codex_home_env(&mut command, plan);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -1393,51 +1405,53 @@ fn drive_codex_app_server(
         }),
     )?;
 
-    let thread_id = match wait_for_thread_start(&line_rx, &mut child, &mut state, deadline)? {
-        ProtocolWait::ThreadStarted(thread_id) => thread_id,
-        ProtocolWait::TimedOut(reason) => {
-            let _ = terminate_child(&mut child);
-            let _ = reader_handle.join();
-            return Ok(CodexAppServerRunResult {
-                status: CodexRuntimeRunStatus::Timeout,
-                reason,
-                assistant_message: state.assistant_message,
-                thread_id: None,
-                event_count: state.event_count,
-                stdout_log: Some(stdout_log),
-                stderr_log: Some(stderr_log),
-                warnings: state.warnings,
-            });
-        }
-        ProtocolWait::Failed(reason) => {
-            let _ = terminate_child(&mut child);
-            let _ = reader_handle.join();
-            return Ok(CodexAppServerRunResult {
-                status: CodexRuntimeRunStatus::ProtocolError,
-                reason,
-                assistant_message: state.assistant_message,
-                thread_id: None,
-                event_count: state.event_count,
-                stdout_log: Some(stdout_log),
-                stderr_log: Some(stderr_log),
-                warnings: state.warnings,
-            });
-        }
-        ProtocolWait::TurnCompleted => {
-            let _ = terminate_child(&mut child);
-            let _ = reader_handle.join();
-            return Ok(CodexAppServerRunResult {
-                status: CodexRuntimeRunStatus::ProtocolError,
-                reason: "codex app-server reported turn completion before thread start".to_string(),
-                assistant_message: state.assistant_message,
-                thread_id: None,
-                event_count: state.event_count,
-                stdout_log: Some(stdout_log),
-                stderr_log: Some(stderr_log),
-                warnings: state.warnings,
-            });
-        }
-    };
+    let thread_id =
+        match wait_for_thread_start(&line_rx, &mut child, &mut stdin, &mut state, deadline)? {
+            ProtocolWait::ThreadStarted(thread_id) => thread_id,
+            ProtocolWait::TimedOut(reason) => {
+                let _ = terminate_child(&mut child);
+                let _ = reader_handle.join();
+                return Ok(CodexAppServerRunResult {
+                    status: CodexRuntimeRunStatus::Timeout,
+                    reason,
+                    assistant_message: state.assistant_message,
+                    thread_id: None,
+                    event_count: state.event_count,
+                    stdout_log: Some(stdout_log),
+                    stderr_log: Some(stderr_log),
+                    warnings: state.warnings,
+                });
+            }
+            ProtocolWait::Failed(reason) => {
+                let _ = terminate_child(&mut child);
+                let _ = reader_handle.join();
+                return Ok(CodexAppServerRunResult {
+                    status: CodexRuntimeRunStatus::ProtocolError,
+                    reason,
+                    assistant_message: state.assistant_message,
+                    thread_id: None,
+                    event_count: state.event_count,
+                    stdout_log: Some(stdout_log),
+                    stderr_log: Some(stderr_log),
+                    warnings: state.warnings,
+                });
+            }
+            ProtocolWait::TurnCompleted => {
+                let _ = terminate_child(&mut child);
+                let _ = reader_handle.join();
+                return Ok(CodexAppServerRunResult {
+                    status: CodexRuntimeRunStatus::ProtocolError,
+                    reason: "codex app-server reported turn completion before thread start"
+                        .to_string(),
+                    assistant_message: state.assistant_message,
+                    thread_id: None,
+                    event_count: state.event_count,
+                    stdout_log: Some(stdout_log),
+                    stderr_log: Some(stderr_log),
+                    warnings: state.warnings,
+                });
+            }
+        };
     let prompt_input = fs::read_to_string(&plan.invocation.prompt_input_file)?;
     write_json_rpc(
         &mut stdin,
@@ -1457,52 +1471,53 @@ fn drive_codex_app_server(
         }),
     )?;
 
-    let status = match wait_for_turn_completed(&line_rx, &mut child, &mut state, deadline)? {
-        ProtocolWait::TurnCompleted => CodexRuntimeRunStatus::Completed,
-        ProtocolWait::TimedOut(reason) => {
-            let _ = terminate_child(&mut child);
-            let _ = reader_handle.join();
-            return Ok(CodexAppServerRunResult {
-                status: CodexRuntimeRunStatus::Timeout,
-                reason,
-                assistant_message: state.assistant_message,
-                thread_id: Some(thread_id.clone()),
-                event_count: state.event_count,
-                stdout_log: Some(stdout_log),
-                stderr_log: Some(stderr_log),
-                warnings: state.warnings,
-            });
-        }
-        ProtocolWait::Failed(reason) => {
-            let _ = terminate_child(&mut child);
-            let _ = reader_handle.join();
-            return Ok(CodexAppServerRunResult {
-                status: CodexRuntimeRunStatus::ProtocolError,
-                reason,
-                assistant_message: state.assistant_message,
-                thread_id: Some(thread_id.clone()),
-                event_count: state.event_count,
-                stdout_log: Some(stdout_log),
-                stderr_log: Some(stderr_log),
-                warnings: state.warnings,
-            });
-        }
-        ProtocolWait::ThreadStarted(_) => {
-            let _ = terminate_child(&mut child);
-            let _ = reader_handle.join();
-            return Ok(CodexAppServerRunResult {
-                status: CodexRuntimeRunStatus::ProtocolError,
-                reason: "codex app-server returned a second thread/start response during turn"
-                    .to_string(),
-                assistant_message: state.assistant_message,
-                thread_id: Some(thread_id.clone()),
-                event_count: state.event_count,
-                stdout_log: Some(stdout_log),
-                stderr_log: Some(stderr_log),
-                warnings: state.warnings,
-            });
-        }
-    };
+    let status =
+        match wait_for_turn_completed(&line_rx, &mut child, &mut stdin, &mut state, deadline)? {
+            ProtocolWait::TurnCompleted => CodexRuntimeRunStatus::Completed,
+            ProtocolWait::TimedOut(reason) => {
+                let _ = terminate_child(&mut child);
+                let _ = reader_handle.join();
+                return Ok(CodexAppServerRunResult {
+                    status: CodexRuntimeRunStatus::Timeout,
+                    reason,
+                    assistant_message: state.assistant_message,
+                    thread_id: Some(thread_id.clone()),
+                    event_count: state.event_count,
+                    stdout_log: Some(stdout_log),
+                    stderr_log: Some(stderr_log),
+                    warnings: state.warnings,
+                });
+            }
+            ProtocolWait::Failed(reason) => {
+                let _ = terminate_child(&mut child);
+                let _ = reader_handle.join();
+                return Ok(CodexAppServerRunResult {
+                    status: CodexRuntimeRunStatus::ProtocolError,
+                    reason,
+                    assistant_message: state.assistant_message,
+                    thread_id: Some(thread_id.clone()),
+                    event_count: state.event_count,
+                    stdout_log: Some(stdout_log),
+                    stderr_log: Some(stderr_log),
+                    warnings: state.warnings,
+                });
+            }
+            ProtocolWait::ThreadStarted(_) => {
+                let _ = terminate_child(&mut child);
+                let _ = reader_handle.join();
+                return Ok(CodexAppServerRunResult {
+                    status: CodexRuntimeRunStatus::ProtocolError,
+                    reason: "codex app-server returned a second thread/start response during turn"
+                        .to_string(),
+                    assistant_message: state.assistant_message,
+                    thread_id: Some(thread_id.clone()),
+                    event_count: state.event_count,
+                    stdout_log: Some(stdout_log),
+                    stderr_log: Some(stderr_log),
+                    warnings: state.warnings,
+                });
+            }
+        };
     let _ = terminate_child(&mut child);
     let _ = reader_handle.join();
     Ok(CodexAppServerRunResult {
@@ -1534,6 +1549,7 @@ enum ProtocolWait {
 fn wait_for_thread_start(
     line_rx: &mpsc::Receiver<Result<String, String>>,
     child: &mut std::process::Child,
+    stdin: &mut impl Write,
     state: &mut CodexProtocolState,
     deadline: Instant,
 ) -> io::Result<ProtocolWait> {
@@ -1542,6 +1558,9 @@ fn wait_for_thread_start(
             ProtocolEvent::Json(value) => {
                 if let Some(error) = protocol_error(&value) {
                     return Ok(ProtocolWait::Failed(error));
+                }
+                if answer_unattended_server_request(&value, stdin, state)? {
+                    continue;
                 }
                 if json_id(&value) == Some(1) {
                     return Ok(match extract_thread_id(&value) {
@@ -1565,6 +1584,7 @@ fn wait_for_thread_start(
 fn wait_for_turn_completed(
     line_rx: &mpsc::Receiver<Result<String, String>>,
     child: &mut std::process::Child,
+    stdin: &mut impl Write,
     state: &mut CodexProtocolState,
     deadline: Instant,
 ) -> io::Result<ProtocolWait> {
@@ -1573,6 +1593,9 @@ fn wait_for_turn_completed(
             ProtocolEvent::Json(value) => {
                 if let Some(error) = protocol_error(&value) {
                     return Ok(ProtocolWait::Failed(error));
+                }
+                if answer_unattended_server_request(&value, stdin, state)? {
+                    continue;
                 }
                 collect_agent_delta(&value, state);
                 if is_turn_completed(&value) {
@@ -1732,6 +1755,45 @@ fn json_id(value: &Value) -> Option<i64> {
 
 fn json_method(value: &Value) -> Option<&str> {
     value.get("method").and_then(Value::as_str)
+}
+
+fn answer_unattended_server_request(
+    value: &Value,
+    stdin: &mut impl Write,
+    state: &mut CodexProtocolState,
+) -> io::Result<bool> {
+    let Some(method) = json_method(value) else {
+        return Ok(false);
+    };
+    let Some(id) = value.get("id").cloned() else {
+        return Ok(false);
+    };
+    let Some(decision) = unattended_approval_decision(method) else {
+        return Ok(false);
+    };
+    write_json_rpc(
+        stdin,
+        &json!({
+            "id": id,
+            "result": {
+                "decision": decision
+            }
+        }),
+    )?;
+    state
+        .warnings
+        .push(format!("auto-declined Codex app-server request {method}"));
+    Ok(true)
+}
+
+fn unattended_approval_decision(method: &str) -> Option<&'static str> {
+    match method {
+        "execCommandApproval" | "applyPatchApproval" => Some("denied"),
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            Some("decline")
+        }
+        _ => None,
+    }
 }
 
 fn extract_thread_id(value: &Value) -> Option<String> {
@@ -1976,6 +2038,7 @@ fn spawn_launch_probe(
         .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    apply_codex_home_env(&mut command, plan);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -2495,10 +2558,20 @@ fn append_json_line(path: &Path, value: &impl Serialize) -> io::Result<()> {
 }
 
 fn runtime_working_directory(
+    runtime_workspace: Option<&Path>,
     bundle: &Value,
     execution_dir: &Path,
     warnings: &mut Vec<String>,
 ) -> PathBuf {
+    if let Some(runtime_workspace) = runtime_workspace {
+        if runtime_workspace.is_dir() {
+            return runtime_workspace.to_path_buf();
+        }
+        warnings.push(format!(
+            "runtime workspace does not exist; falling back to prompt source workspace: {}",
+            runtime_workspace.display()
+        ));
+    }
     if let Some(source_workspace) = path_field(bundle, &["sourceWorkspace", "source_workspace"]) {
         if source_workspace.is_dir() {
             return source_workspace;
@@ -2558,6 +2631,20 @@ fn runtime_execution_dir(plan: &CodexRuntimePlanFile) -> PathBuf {
 
 fn completion_receipt_file(plan: &CodexRuntimePlanFile) -> PathBuf {
     runtime_execution_dir(plan).join("codex-runtime-completion-receipt.json")
+}
+
+fn harness_codex_home(harness_home: &Path) -> Option<PathBuf> {
+    let codex_home = harness_home.join("codex-home");
+    [codex_home.join("auth.json"), codex_home.join("auth.toml")]
+        .iter()
+        .any(|path| path.is_file())
+        .then_some(codex_home)
+}
+
+fn apply_codex_home_env(command: &mut Command, plan: &CodexRuntimePlanFile) {
+    if let Some(codex_home) = &plan.invocation.codex_home {
+        command.env("CODEX_HOME", codex_home);
+    }
 }
 
 fn string_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -2668,6 +2755,62 @@ mod tests {
             CodexRuntimeReceiptStatus::NoPreparedExecution
         );
         assert!(report.receipts_file.is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plan_codex_runtime_uses_harness_codex_home_when_auth_is_present() {
+        let root = temp_root("plan_codex_runtime_uses_harness_codex_home_when_auth_is_present");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        let codex_home = harness_home.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+
+        let report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+
+        let plan = report.plan.unwrap();
+        assert_eq!(plan.invocation.codex_home, Some(codex_home));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plan_codex_runtime_uses_runtime_workspace_when_provided() {
+        let root = temp_root("plan_codex_runtime_uses_runtime_workspace_when_provided");
+        let source = write_codex_runtime_source(&root);
+        let runtime_workspace = root.join("mounted-workspace");
+        fs::create_dir_all(&runtime_workspace).unwrap();
+        let harness_home = root.join(".openclaw-harness");
+        enqueue_and_prepare_with_runtime_workspace(
+            &source,
+            &harness_home,
+            Some(runtime_workspace.clone()),
+        );
+
+        let report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+
+        let plan = report.plan.unwrap();
+        assert_eq!(plan.invocation.working_directory, runtime_workspace);
+        let bundle: Value =
+            serde_json::from_slice(&fs::read(plan.prompt_bundle_json).unwrap()).unwrap();
+        assert_eq!(
+            bundle["sourceWorkspace"],
+            source.workspace.to_string_lossy().to_string()
+        );
+        assert_eq!(bundle["summary"]["promptFilesIncluded"], 1);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3007,6 +3150,58 @@ mod tests {
     }
 
     #[test]
+    fn answer_unattended_server_request_declines_approval_requests() {
+        let mut state = CodexProtocolState::default();
+        let mut out = Vec::new();
+
+        let handled = answer_unattended_server_request(
+            &serde_json::json!({
+                "id": 7,
+                "method": "item/commandExecution/requestApproval",
+                "params": {}
+            }),
+            &mut out,
+            &mut state,
+        )
+        .unwrap();
+
+        assert!(handled);
+        assert!(
+            state
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("item/commandExecution/requestApproval") })
+        );
+        let response: Value =
+            serde_json::from_slice(String::from_utf8(out).unwrap().trim().as_bytes()).unwrap();
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["result"]["decision"], "decline");
+    }
+
+    #[test]
+    fn answer_unattended_server_request_declines_legacy_approval_requests() {
+        let mut state = CodexProtocolState::default();
+        let mut out = Vec::new();
+
+        let handled = answer_unattended_server_request(
+            &serde_json::json!({
+                "id": "approval-1",
+                "method": "execCommandApproval",
+                "params": {}
+            }),
+            &mut out,
+            &mut state,
+        )
+        .unwrap();
+
+        assert!(handled);
+        let response: Value =
+            serde_json::from_slice(String::from_utf8(out).unwrap().trim().as_bytes()).unwrap();
+        assert_eq!(response["id"], "approval-1");
+        assert_eq!(response["result"]["decision"], "denied");
+    }
+
+    #[test]
     fn record_codex_runtime_completion_writes_outputs_idempotently() {
         let root = temp_root("record_codex_runtime_completion_writes_outputs_idempotently");
         let source = write_codex_runtime_source(&root);
@@ -3086,6 +3281,14 @@ mod tests {
     }
 
     fn enqueue_and_prepare(source: &crate::OpenClawSource, harness_home: &Path) {
+        enqueue_and_prepare_with_runtime_workspace(source, harness_home, None);
+    }
+
+    fn enqueue_and_prepare_with_runtime_workspace(
+        source: &crate::OpenClawSource,
+        harness_home: &Path,
+        runtime_workspace: Option<PathBuf>,
+    ) {
         let registry = load_agent_registry(source).unwrap();
         let skills = build_source_skill_index(source).unwrap();
         let turn = build_turn_plan(
@@ -3109,6 +3312,7 @@ mod tests {
             &step,
             RuntimeQueueEnqueueOptions {
                 harness_home: harness_home.to_path_buf(),
+                runtime_workspace,
                 now_ms: 1234,
             },
         )

@@ -61,6 +61,8 @@ pub struct RuntimeExecutionReceipt {
     pub execution_dir: Option<PathBuf>,
     pub prompt_bundle_json: Option<PathBuf>,
     pub prompt_markdown: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_workspace: Option<PathBuf>,
     pub reason: String,
 }
 
@@ -82,6 +84,7 @@ struct PendingQueueItem {
     message_text: String,
     source_home: PathBuf,
     source_workspace: PathBuf,
+    runtime_workspace: Option<PathBuf>,
     planned_transcript_file: PathBuf,
     planned_trajectory_file: PathBuf,
     selected_skill_ids: Vec<String>,
@@ -108,6 +111,7 @@ pub fn prepare_runtime_queue_item(
             execution_dir: prepared.execution_dir.clone(),
             prompt_bundle_json: prepared.prompt_bundle_json.clone(),
             prompt_markdown: prepared.prompt_markdown.clone(),
+            runtime_workspace: prepared.runtime_workspace.clone(),
             reason: "requested runtime queue item was already prepared".to_string(),
         };
         append_json_line(&execution_receipts_file, &receipt)?;
@@ -144,6 +148,7 @@ pub fn prepare_runtime_queue_item(
             execution_dir: prepared.execution_dir.clone(),
             prompt_bundle_json: prepared.prompt_bundle_json.clone(),
             prompt_markdown: prepared.prompt_markdown.clone(),
+            runtime_workspace: prepared.runtime_workspace.clone(),
             reason: "resuming previously prepared runtime queue item without terminal run receipt"
                 .to_string(),
         };
@@ -184,6 +189,7 @@ pub fn prepare_runtime_queue_item(
             execution_dir: None,
             prompt_bundle_json: None,
             prompt_markdown: None,
+            runtime_workspace: None,
             reason: "no matching queued runtime item found".to_string(),
         };
         append_json_line(&execution_receipts_file, &receipt)?;
@@ -273,6 +279,7 @@ pub fn prepare_runtime_queue_item(
         execution_dir: Some(execution_dir),
         prompt_bundle_json: Some(prompt_files.json),
         prompt_markdown: Some(prompt_files.markdown),
+        runtime_workspace: pending.runtime_workspace,
         reason: "prompt bundle prepared; Codex runtime adapter not invoked yet".to_string(),
     };
     let receipt_json = serde_json::to_string_pretty(&receipt).map_err(io::Error::other)?;
@@ -423,7 +430,7 @@ fn read_terminal_run_once_ids(
             }
         };
         if let Some(queue_id) = string_field(&value, &["queueId", "queue_id"])
-            && string_field(&value, &["status"]).is_some()
+            && string_field(&value, &["status"]) == Some("completed")
         {
             ids.insert(queue_id.to_string());
         }
@@ -443,6 +450,7 @@ fn parse_pending_item(value: &Value) -> Option<PendingQueueItem> {
         message_text: string_field(value, &["messageText", "message_text"])?.to_string(),
         source_home: path_field(source, &["sourceHome", "source_home"])?,
         source_workspace: path_field(source, &["sourceWorkspace", "source_workspace"])?,
+        runtime_workspace: path_field(source, &["runtimeWorkspace", "runtime_workspace"]),
         planned_transcript_file: path_field(
             value,
             &["plannedTranscriptFile", "planned_transcript_file"],
@@ -632,6 +640,33 @@ mod tests {
             "{}",
             serde_json::json!({
                 "queueId": queue_id,
+                "status": "timeout",
+                "reason": "test retryable receipt"
+            })
+        )
+        .unwrap();
+
+        let after_timeout = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert!(after_timeout.item.is_none());
+        assert_eq!(
+            after_timeout.receipt.status,
+            RuntimeExecutionReceiptStatus::AlreadyPrepared
+        );
+        assert_eq!(
+            after_timeout.receipt.queue_id.as_deref(),
+            Some(queue_id.as_str())
+        );
+
+        writeln!(
+            run_once_file,
+            "{}",
+            serde_json::json!({
+                "queueId": queue_id,
                 "status": "completed",
                 "reason": "test terminal receipt"
             })
@@ -691,6 +726,7 @@ mod tests {
             &step,
             RuntimeQueueEnqueueOptions {
                 harness_home: harness_home.to_path_buf(),
+                runtime_workspace: None,
                 now_ms: 1234,
             },
         )
