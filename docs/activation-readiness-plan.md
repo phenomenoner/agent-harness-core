@@ -171,7 +171,8 @@ As of 2026-06-08 local verification:
 - `channel-credentials-export --include-sensitive` imported Telegram/Discord bot tokens plus known allow-list/guild/channel/chat IDs from the local OpenClaw snapshot into `imports/activation-harness/secrets/channel-credentials.env`; readiness sees both token gates as pass.
 - `discord-gateway-probe` passes with the imported Discord token and Node 24 global WebSocket support.
 - The Codex Desktop MSIX `codex.exe` path is not spawnable from this harness environment and should not be used for service runtime.
-- `enable-check` currently reports `Ready: yes` with no hard failures. Remaining warnings are operator smoke evidence for runtime-run-once, Telegram poll/offset, Discord outbound delivery, channel delivery receipts, and optional LanceDB backup.
+- Offline normal-turn smoke passes through `channel-run-once` with `tools/openclaw-fake-codex-app-server/fake-codex-app-server.cmd`, producing runtime-run-once, Codex run, Codex completion, transcript, outbox, delivery receipt, and operational log evidence without a model request or channel send.
+- `enable-check` currently reports `Ready: yes` with no hard failures. Remaining warnings are live operator smoke evidence for Telegram poll/offset, Discord outbound delivery, and optional LanceDB backup.
 
 ## Verification Commands
 
@@ -183,6 +184,7 @@ cargo run -p openclaw-harness-cli -- help
 cargo run -p openclaw-harness-cli -- channel-credentials-export --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --include-sensitive
 cargo run -p openclaw-harness-cli -- enable-check --harness-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- channel-run-once --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw --platform telegram --channel-id smoke --user-id operator --message /status
+cargo run -p openclaw-harness-cli -- channel-run-once --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw --platform telegram --channel-id offline-runtime-smoke --user-id operator --message "offline runtime smoke" --agent main --codex-exe tools\openclaw-fake-codex-app-server\fake-codex-app-server.cmd --timeout-ms 5000
 cargo run -p openclaw-harness-cli -- codex-launch-probe --harness-home C:\path\to\.openclaw-harness --execution-dir C:\path\to\prepared-execution --startup-probe-ms 750
 cargo run -p openclaw-harness-cli -- plugin-sidecar-probe --harness-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\.openclaw-harness --method sidecar.status
@@ -196,4 +198,4 @@ cargo run -p openclaw-harness-cli -- telegram-loop --openclaw-home C:\path\to\.o
 cargo run -p openclaw-harness-cli -- discord-outbox-send-once --harness-home C:\path\to\.openclaw-harness --outbox-limit 20
 ```
 
-Use fake app-server tests for CI. Use real `codex app-server` only in operator-run smoke tests because it may make model requests.
+Use `tools/openclaw-fake-codex-app-server` for offline CI and activation smoke. Use real `codex app-server` only in operator-run smoke tests because it may make model requests.

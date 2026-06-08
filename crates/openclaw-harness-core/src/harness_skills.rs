@@ -48,6 +48,7 @@ Use it when the user mentions:
 8. Treat credentials as best-effort imports. Codex OAuth is preferred for Codex models; API keys may be provider-specific and model-limited.
 9. Treat memory/qdrant-edge as the primary memory backend when present. LanceDB is backup/optional unless the active OpenClaw config points to it.
 10. Use a Codex CLI binary that the harness can spawn. On Windows, the Codex Desktop MSIX resource path may be visible on PATH but fail with os error 5; prefer a standalone release or local npm install and pass it with --codex-exe.
+11. Use tools/openclaw-fake-codex-app-server for offline runtime smoke when the goal is to verify harness receipts and logs without a model request.
 
 ## Prompt And Tool Schema Policy
 
@@ -108,7 +109,7 @@ Before replacing the Docker OpenClaw gateway:
 9. Confirm memory-qdrant-edge is present when current OpenClaw uses Qdrant edge as primary memory backend.
 10. Confirm codex-runtime-launch-probe passes with the intended --codex-exe before any real runtime handoff.
 11. Run plugin-sidecar-probe and plugin-sidecar-call for sidecar.status/plugins.list/tools.probe; set OPENCLAW_PLUGIN_SOURCE_ROOTS when imported manifests live outside the harness home. Confirm plugin-sidecar, plugin-sidecar-probe, and plugin-sidecar-bridge are pass in enable-check. This proves manifest catalog and JSON-RPC bridge readiness; plugin-specific tool executors still need dedicated adapters.
-12. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt.
+12. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt. Use tools/openclaw-fake-codex-app-server/fake-codex-app-server.cmd for offline smoke; use the intended Codex CLI only for operator-run model smoke.
 
 ## Codex Runtime Flow
 
@@ -129,6 +130,8 @@ For manual debugging of one prepared turn, the expanded path is:
 Use --codex-exe for the standalone/local Codex CLI that passed launch probe. Do not rely on the Codex Desktop app resource path for a service runtime unless it has passed codex-launch-probe.
 
 codex-run writes raw app-server stdout/stderr logs under the execution directory and appends operational events to state/logs/harness.jsonl. If a completion receipt already exists, codex-run must skip the model request and return the recorded completion state.
+
+For offline activation smoke, --codex-exe may point at tools/openclaw-fake-codex-app-server/fake-codex-app-server.cmd. That fixture only proves harness wiring, receipts, transcript/trajectory output, outbox creation, and logs; it is not a model or plugin execution test.
 
 ## Skill Maintenance Loop
 
