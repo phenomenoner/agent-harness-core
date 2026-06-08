@@ -11,7 +11,7 @@ use crate::{
     CodexRuntimeRunReport, CodexRuntimeRunStatus, HarnessLogEvent, HarnessLogLevel,
     PromptAssemblyOptions, RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions,
     RuntimeQueuePrepareReport, RuntimeQueuePreparedItem, append_harness_log, current_log_time_ms,
-    plan_codex_runtime, prepare_runtime_queue_item, run_codex_runtime,
+    plan_codex_runtime, prepare_runtime_queue_item, read_channel_session_state, run_codex_runtime,
 };
 
 const RUNTIME_RUN_ONCE_SCHEMA: &str = "openclaw-harness.runtime-run-once.v1";
@@ -196,17 +196,38 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             if let Some(transcript_file) = run.receipt.transcript_file.as_ref() {
                 match latest_assistant_message(transcript_file)? {
                     Some(text) => {
-                        let message = ChannelOutboundMessage {
-                            platform: context.platform,
-                            channel_id: context.channel_id,
-                            user_id: context.user_id,
-                            session_key: context.session_key,
-                            kind: ChannelOutboundMessageKind::AgentReply,
-                            text,
-                        };
-                        let file = append_outbound_message(&options.harness_home, &message)?;
-                        outbox_file = Some(file);
-                        outbound_message = Some(message);
+                        if channel_session_is_current(
+                            &options.harness_home,
+                            &context,
+                            &mut warnings,
+                        )? {
+                            let message = ChannelOutboundMessage {
+                                platform: context.platform,
+                                channel_id: context.channel_id,
+                                user_id: context.user_id,
+                                session_key: context.session_key,
+                                kind: ChannelOutboundMessageKind::AgentReply,
+                                text,
+                            };
+                            let file = append_outbound_message(&options.harness_home, &message)?;
+                            outbox_file = Some(file);
+                            outbound_message = Some(message);
+                        } else {
+                            let receipt = RuntimeRunOnceReceipt {
+                                queue_id: run.receipt.queue_id.clone(),
+                                status: map_run_once_status(run.receipt.status),
+                                execution_dir: run.receipt.execution_dir.clone(),
+                                transcript_file: run.receipt.transcript_file.clone(),
+                                outbox_file: None,
+                                reason: run.receipt.reason.clone(),
+                            };
+                            append_runtime_run_once_log(
+                                &options.harness_home,
+                                HarnessLogLevel::Warn,
+                                "runtime.run-once.stale-session-suppressed",
+                                &receipt,
+                            )?;
+                        }
                     }
                     None => warnings.push(format!(
                         "no assistant message found in transcript {}",
@@ -321,6 +342,31 @@ fn channel_context_from_prepared_item(item: &RuntimeQueuePreparedItem) -> QueueC
         user_id: item.user_id.clone(),
         session_key: item.session_key.clone(),
     }
+}
+
+fn channel_session_is_current(
+    harness_home: &Path,
+    context: &QueueChannelContext,
+    warnings: &mut Vec<String>,
+) -> io::Result<bool> {
+    let Some(state) = read_channel_session_state(
+        harness_home,
+        &context.platform,
+        &context.channel_id,
+        &context.user_id,
+    )?
+    else {
+        return Ok(true);
+    };
+    if state.active_session_key == context.session_key {
+        return Ok(true);
+    }
+
+    warnings.push(format!(
+        "assistant reply for stale session {} suppressed because active session is {}",
+        context.session_key, state.active_session_key
+    ));
+    Ok(false)
 }
 
 fn find_queue_channel_context(
@@ -522,6 +568,86 @@ mod tests {
         )
         .unwrap();
         assert!(log.contains("runtime.run-once.completed"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_runtime_queue_once_suppresses_stale_session_reply_after_new() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("run_runtime_queue_once_suppresses_stale_session_reply_after_new");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source: source.clone(),
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills.clone(),
+            platform: "telegram".to_string(),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "old in-flight request".to_string(),
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+
+        let new_session = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "/new".to_string(),
+            skill_limit: 3,
+            now_ms: 1235,
+        })
+        .unwrap();
+        assert_eq!(new_session.status, ChannelReceiveStatus::CommandApplied);
+
+        let fake_codex = fake_codex_executable(&root);
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            codex_executable: Some(fake_codex),
+            timeout_ms: 5_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert!(report.outbound_message.is_none());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("stale session"))
+        );
+        let outbox = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl"),
+        )
+        .unwrap();
+        assert!(outbox.contains("New session planned"));
+        assert!(!outbox.contains("Pipeline fake reply."));
 
         let _ = fs::remove_dir_all(root);
     }
