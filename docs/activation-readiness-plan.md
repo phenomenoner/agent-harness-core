@@ -119,8 +119,8 @@ These should be run before stopping the Docker gateway.
 
 2. Real Discord adapter
    - Done for outbound smoke: `discord-outbox-send-once` sends pending Discord outbox messages through Discord REST, records delivery receipts, and writes a delivery summary log.
-   - Still required for formal Discord activation: receive Discord DM events through a gateway adapter.
-   - Normalize inbound DMs into `channel-run-once`.
+   - Done for inbound normalization smoke: `discord-event-run-once` accepts one Discord Gateway `MESSAGE_CREATE` event from `--event-file` or `--event-json`, dedupes by message id, normalizes text into `channel-run-once`, writes Discord event receipts, and logs `discord.event-run-once`.
+   - Still required for formal Discord activation: WebSocket gateway loop that receives Discord DM events and feeds them into `discord-event-run-once` semantics.
    - Add gateway heartbeat/reconnect, dedupe, and health/status reporting.
 
 3. Worker loop
@@ -165,6 +165,7 @@ As of 2026-06-08 local verification:
 - Offline `/status` channel smoke passes against the imported registry: 24 enabled agents, 2 providers, 13 plugins, Telegram and Discord enabled.
 - Runtime queue prepare, Codex plan, Codex preflight, and Codex launch probe pass when using workspace-local `@openai/codex` via `.tools/codex-cli/node_modules/.bin/codex.cmd`.
 - Plugin sidecar probe passes and sees 6 sidecar-required plugins. JSON-RPC bridge calls for `sidecar.status` and `plugins.list` pass; OpenClaw plugin hook/tool execution remains pending.
+- Discord Gateway `MESSAGE_CREATE` event normalizer smoke passes for `/status`, including duplicate-message skip by Discord message id.
 - The Codex Desktop MSIX `codex.exe` path is not spawnable from this harness environment and should not be used for service runtime.
 - Remaining `enable-check` failures are `TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN`, and `plugin-sidecar`.
 
@@ -181,6 +182,7 @@ cargo run -p openclaw-harness-cli -- codex-launch-probe --harness-home C:\path\t
 cargo run -p openclaw-harness-cli -- plugin-sidecar-probe --harness-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\.openclaw-harness --method sidecar.status
 cargo run -p openclaw-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\.openclaw-harness --method plugins.list
+cargo run -p openclaw-harness-cli -- discord-event-run-once --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw --event-file C:\path\to\discord-message-create.json
 cargo run -p openclaw-harness-cli -- telegram-poll-once --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.cmd --poll-timeout-seconds 1 --max-updates 10
 cargo run -p openclaw-harness-cli -- telegram-loop --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.cmd --iterations 1 --idle-ms 1000
 cargo run -p openclaw-harness-cli -- discord-outbox-send-once --harness-home C:\path\to\.openclaw-harness --outbox-limit 20

@@ -60,6 +60,7 @@ fn main() {
         "telegram-poll-once" => run_telegram_poll_once(&rest),
         "telegram-loop" => run_telegram_loop(&rest),
         "discord-outbox-send-once" => run_discord_outbox_send_once(&rest),
+        "discord-event-run-once" => run_discord_event_run_once(&rest),
         "plugin-sidecar-probe" => run_plugin_sidecar_probe(&rest),
         "plugin-sidecar-call" => run_plugin_sidecar_call(&rest),
         "queue-enqueue" => run_queue_enqueue(&rest),
@@ -812,6 +813,112 @@ fn run_discord_outbox_send_once(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
+    let args = discord_event_run_once_args_from_args(args)?;
+    let event = read_discord_event_json(&args)?;
+    let parsed = parse_discord_gateway_message(&event)?;
+    let report = match parsed {
+        None => DiscordEventRunOnceReport {
+            harness_home: args.target_home.clone(),
+            status: "skipped".to_string(),
+            reason: "event is not a Discord MESSAGE_CREATE payload".to_string(),
+            message_id: None,
+            channel_id: None,
+            user_id: None,
+            run: None,
+        },
+        Some(message) if message.author_is_bot => {
+            let report = DiscordEventRunOnceReport {
+                harness_home: args.target_home.clone(),
+                status: "skipped".to_string(),
+                reason: "message author is a bot".to_string(),
+                message_id: Some(message.message_id),
+                channel_id: Some(message.channel_id),
+                user_id: Some(message.user_id),
+                run: None,
+            };
+            write_discord_event_receipt(&report)?;
+            report
+        }
+        Some(message) if message.content.trim().is_empty() => {
+            let report = DiscordEventRunOnceReport {
+                harness_home: args.target_home.clone(),
+                status: "skipped".to_string(),
+                reason: "message content is empty".to_string(),
+                message_id: Some(message.message_id),
+                channel_id: Some(message.channel_id),
+                user_id: Some(message.user_id),
+                run: None,
+            };
+            write_discord_event_receipt(&report)?;
+            report
+        }
+        Some(message) if discord_event_seen(&args.target_home, &message.message_id)? => {
+            let report = DiscordEventRunOnceReport {
+                harness_home: args.target_home.clone(),
+                status: "duplicate".to_string(),
+                reason: "message id already has a Discord event receipt".to_string(),
+                message_id: Some(message.message_id),
+                channel_id: Some(message.channel_id),
+                user_id: Some(message.user_id),
+                run: None,
+            };
+            write_discord_event_receipt(&report)?;
+            report
+        }
+        Some(message) => {
+            let run = run_channel_once(ChannelRunOnceOptions {
+                source: args.source.clone(),
+                harness_home: args.target_home.clone(),
+                platform: "discord".to_string(),
+                channel_id: message.channel_id.clone(),
+                user_id: message.user_id.clone(),
+                agent_id: args.agent_id.clone(),
+                session_key: None,
+                message: message.content,
+                skill_limit: args.skill_limit,
+                now_ms: current_time_ms()?,
+                codex_executable: args.codex_exe.clone(),
+                timeout_ms: args.timeout_ms,
+                prompt_options: PromptAssemblyOptions {
+                    harness_home: Some(args.target_home.clone()),
+                    ..PromptAssemblyOptions::default()
+                },
+                outbox_limit: args.outbox_limit,
+            })
+            .map_err(|err| err.to_string())?;
+            let report = DiscordEventRunOnceReport {
+                harness_home: args.target_home.clone(),
+                status: "handled".to_string(),
+                reason: "Discord message normalized into channel-run-once".to_string(),
+                message_id: Some(message.message_id),
+                channel_id: Some(message.channel_id),
+                user_id: Some(message.user_id),
+                run: Some(run),
+            };
+            write_discord_event_receipt(&report)?;
+            report
+        }
+    };
+    append_harness_log(
+        &args.target_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            if report.status == "handled" {
+                HarnessLogLevel::Info
+            } else {
+                HarnessLogLevel::Warn
+            },
+            "discord",
+            "discord.event-run-once",
+            format!("status={} reason={}", report.status, report.reason),
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    print_discord_event_run_once_report(&report);
+    Ok(())
+}
+
 fn run_plugin_sidecar_probe(args: &[String]) -> Result<(), String> {
     let args = plugin_sidecar_probe_args_from_args(args)?;
     let output = Command::new(&args.node_exe)
@@ -1338,6 +1445,36 @@ struct TelegramLoopArgs {
 struct DiscordOutboxSendOnceArgs {
     target_home: PathBuf,
     outbox_limit: usize,
+}
+
+struct DiscordEventRunOnceArgs {
+    source: OpenClawSource,
+    target_home: PathBuf,
+    agent_id: Option<String>,
+    skill_limit: usize,
+    codex_exe: Option<PathBuf>,
+    timeout_ms: u64,
+    outbox_limit: usize,
+    event_file: Option<PathBuf>,
+    event_json: Option<String>,
+}
+
+struct DiscordGatewayMessage {
+    message_id: String,
+    channel_id: String,
+    user_id: String,
+    content: String,
+    author_is_bot: bool,
+}
+
+struct DiscordEventRunOnceReport {
+    harness_home: PathBuf,
+    status: String,
+    reason: String,
+    message_id: Option<String>,
+    channel_id: Option<String>,
+    user_id: Option<String>,
+    run: Option<ChannelRunOnceReport>,
 }
 
 struct PluginSidecarProbeArgs {
@@ -2422,6 +2559,121 @@ fn discord_outbox_send_once_args_from_args(
     })
 }
 
+fn discord_event_run_once_args_from_args(
+    args: &[String],
+) -> Result<DiscordEventRunOnceArgs, String> {
+    let mut home = default_openclaw_home();
+    let mut workspace = None;
+    let mut target_home = default_harness_home();
+    let mut agent_id = None;
+    let mut skill_limit = 5;
+    let mut codex_exe = None;
+    let mut timeout_ms = 300_000;
+    let mut outbox_limit = 20;
+    let mut event_file = None;
+    let mut event_json = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--openclaw-home" => {
+                i += 1;
+                home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--openclaw-home requires a path".to_string())?;
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--agent" => {
+                i += 1;
+                agent_id = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--agent requires an id".to_string())?,
+                );
+            }
+            "--skill-limit" => {
+                i += 1;
+                skill_limit = args
+                    .get(i)
+                    .ok_or_else(|| "--skill-limit requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--codex-exe" => {
+                i += 1;
+                codex_exe = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--codex-exe requires a path".to_string())?,
+                );
+            }
+            "--timeout-ms" => {
+                i += 1;
+                timeout_ms = args
+                    .get(i)
+                    .ok_or_else(|| "--timeout-ms requires a positive integer".to_string())
+                    .and_then(|value| parse_u64(value, "--timeout-ms"))?;
+            }
+            "--outbox-limit" => {
+                i += 1;
+                outbox_limit = args
+                    .get(i)
+                    .ok_or_else(|| "--outbox-limit requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--event-file" => {
+                i += 1;
+                event_file = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--event-file requires a path".to_string())?,
+                );
+            }
+            "--event-json" => {
+                i += 1;
+                event_json = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--event-json requires JSON text".to_string())?,
+                );
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    if event_file.is_some() == event_json.is_some() {
+        return Err("provide exactly one of --event-file or --event-json".to_string());
+    }
+
+    let source = match workspace {
+        Some(workspace) => OpenClawSource::with_workspace(home, workspace),
+        None => OpenClawSource::new(home),
+    };
+    Ok(DiscordEventRunOnceArgs {
+        source,
+        target_home,
+        agent_id,
+        skill_limit,
+        codex_exe,
+        timeout_ms,
+        outbox_limit,
+        event_file,
+        event_json,
+    })
+}
+
 fn plugin_sidecar_probe_args_from_args(args: &[String]) -> Result<PluginSidecarProbeArgs, String> {
     let mut target_home = default_harness_home();
     let mut node_exe = PathBuf::from("node");
@@ -3133,6 +3385,109 @@ fn write_plugin_sidecar_bridge_receipt(
         .create(true)
         .append(true)
         .open(receipts_file)
+        .and_then(|mut file| writeln!(file, "{receipt}"))
+        .map_err(|err| err.to_string())
+}
+
+fn read_discord_event_json(args: &DiscordEventRunOnceArgs) -> Result<serde_json::Value, String> {
+    let text = match (&args.event_file, &args.event_json) {
+        (Some(path), None) => fs::read_to_string(path).map_err(|err| err.to_string())?,
+        (None, Some(text)) => text.clone(),
+        _ => return Err("provide exactly one of --event-file or --event-json".to_string()),
+    };
+    serde_json::from_str(&text).map_err(|err| format!("invalid Discord event JSON: {err}"))
+}
+
+fn parse_discord_gateway_message(
+    event: &serde_json::Value,
+) -> Result<Option<DiscordGatewayMessage>, String> {
+    if event
+        .get("t")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind != "MESSAGE_CREATE")
+    {
+        return Ok(None);
+    }
+    let payload = event.get("d").unwrap_or(event);
+    let Some(message_id) = payload.get("id").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    let channel_id = payload
+        .get("channel_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Discord MESSAGE_CREATE payload missing channel_id".to_string())?;
+    let content = payload
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let author = payload
+        .get("author")
+        .ok_or_else(|| "Discord MESSAGE_CREATE payload missing author".to_string())?;
+    let user_id = author
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Discord MESSAGE_CREATE author missing id".to_string())?;
+    let author_is_bot = author
+        .get("bot")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    Ok(Some(DiscordGatewayMessage {
+        message_id: message_id.to_string(),
+        channel_id: channel_id.to_string(),
+        user_id: user_id.to_string(),
+        content: content.to_string(),
+        author_is_bot,
+    }))
+}
+
+fn discord_event_receipts_file(harness_home: &std::path::Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("channels")
+        .join("discord-event-receipts.jsonl")
+}
+
+fn discord_event_seen(harness_home: &std::path::Path, message_id: &str) -> Result<bool, String> {
+    let path = discord_event_receipts_file(harness_home);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value
+            .get("messageId")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id == message_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn write_discord_event_receipt(report: &DiscordEventRunOnceReport) -> Result<(), String> {
+    let path = discord_event_receipts_file(&report.harness_home);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let receipt = serde_json::json!({
+        "schema": "openclaw-harness.discord-event-receipt.v1",
+        "status": report.status,
+        "reason": report.reason,
+        "messageId": report.message_id,
+        "channelId": report.channel_id,
+        "userId": report.user_id,
+        "sessionKey": report.run.as_ref().map(|run| run.receive.session_key.clone()),
+    });
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
         .and_then(|mut file| writeln!(file, "{receipt}"))
         .map_err(|err| err.to_string())
 }
@@ -3944,6 +4299,26 @@ fn print_discord_outbox_send_once_report(report: &DiscordOutboxSendOnceReport) {
     }
 }
 
+fn print_discord_event_run_once_report(report: &DiscordEventRunOnceReport) {
+    println!("OpenClaw Discord event run once");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Status: {}", report.status);
+    println!("Reason: {}", report.reason);
+    println!("Message: {}", report.message_id.as_deref().unwrap_or("-"));
+    println!("Channel: {}", report.channel_id.as_deref().unwrap_or("-"));
+    println!("User: {}", report.user_id.as_deref().unwrap_or("-"));
+    if let Some(run) = &report.run {
+        println!("Run status: {:?}", run.status);
+        println!("Session key: {}", run.receive.session_key);
+        println!(
+            "Outbox pending={} delivered={} failed_retryable={}",
+            run.outbox.summary.pending,
+            run.outbox.summary.delivered,
+            run.outbox.summary.failed_retryable
+        );
+    }
+}
+
 fn print_runtime_queue_enqueue_report(report: &RuntimeQueueEnqueueReport) {
     println!("OpenClaw runtime queue enqueue");
     println!("Harness home: {}", report.harness_home.display());
@@ -4494,6 +4869,7 @@ fn print_help() {
     println!("  telegram-poll-once Poll Telegram once, run DM pipeline, and deliver replies");
     println!("  telegram-loop     Run Telegram polling continuously until stopped");
     println!("  discord-outbox-send-once Send pending Discord outbox messages once");
+    println!("  discord-event-run-once Normalize one Discord Gateway message event");
     println!("  plugin-sidecar-probe Probe the Node OpenClaw plugin sidecar contract");
     println!("  plugin-sidecar-call Call the plugin sidecar JSON-RPC bridge once");
     println!("  queue-enqueue   Persist one channel agent turn to the runtime queue");
@@ -4533,6 +4909,8 @@ fn print_help() {
     println!("  --provider-message-id <id> Telegram/Discord message id after delivery");
     println!("  --error <text>          Delivery failure reason");
     println!("  --outbox-limit <n>      Maximum pending outbox items for channel-run-once");
+    println!("  --event-file <path>     Discord Gateway event JSON file");
+    println!("  --event-json <text>     Discord Gateway event JSON text");
     println!("  --poll-timeout-seconds <n> Telegram long-poll timeout for telegram-poll-once");
     println!("  --max-updates <n>       Maximum Telegram updates for telegram-poll-once");
     println!("  --iterations <n>        Telegram loop iterations; 0 means forever");

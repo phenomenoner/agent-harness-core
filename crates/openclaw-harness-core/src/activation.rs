@@ -574,6 +574,13 @@ fn check_logging(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>
         "discord.outbox-send-once",
         "no Discord outbound summary found yet; run discord-outbox-send-once",
     );
+    check_log_event(
+        harness_home,
+        checks,
+        "discord-event-log",
+        "discord.event-run-once",
+        "no Discord inbound event summary found yet; run discord-event-run-once",
+    );
 }
 
 fn check_log_event(
