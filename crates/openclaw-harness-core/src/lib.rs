@@ -22,6 +22,7 @@ pub mod runtime_pipeline;
 pub mod runtime_queue;
 pub mod runtime_worker;
 pub mod skills;
+pub mod status;
 pub mod subagents;
 pub mod turns;
 
@@ -128,6 +129,11 @@ pub use skills::{
     SkillIndexSummary, SkillRecord, SkillSelection, SkillSelectionQuery, SkillSourceKind,
     build_harness_skill_index, build_runtime_skill_index, build_source_skill_index, select_skills,
     write_skill_index,
+};
+pub use status::{
+    HarnessChannelStatus, HarnessJsonlStatus, HarnessMemoryStatus, HarnessOperationalLogStatus,
+    HarnessOutboxStatus, HarnessPluginStatus, HarnessRuntimeStatus, HarnessStatusOptions,
+    HarnessStatusReport, collect_harness_status,
 };
 pub use subagents::{
     SubagentLedger, SubagentLedgerSummary, SubagentPlan, SubagentPlanAction, SubagentPlanEntry,

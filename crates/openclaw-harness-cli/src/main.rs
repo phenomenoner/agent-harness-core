@@ -18,22 +18,23 @@ use openclaw_harness_core::{
     CodexRuntimePlanReport, CodexRuntimePreflightOptions, CodexRuntimePreflightReport,
     CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy, DeterministicCronPlan,
     DeterministicCronPlanInput, DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent,
-    HarnessLogLevel, ImportPhaseStatus, ImportReport, NativeCronPlan, NativeCronPlanInput,
-    OpenClawSource, PromptAssemblyOptions, PromptBundle, RuntimeQueueEnqueueOptions,
-    RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
-    RuntimeRunOnceOptions, RuntimeRunOnceReport, SkillIndex, SkillSelectionQuery, SubagentPlan,
-    SubagentPlanInput, TurnPlan, TurnPlanInput, append_harness_log, apply_channel_command_step,
-    assemble_prompt_bundle, build_channel_step, build_dry_run_report, build_harness_skill_index,
-    build_import_plan, build_runtime_skill_index, build_source_skill_index, build_turn_plan,
-    check_activation_readiness, current_log_time_ms, enqueue_channel_step, execute_import,
-    export_harness_registry_files, inventory, load_agent_registry, load_deterministic_cron_store,
-    load_native_cron_store, load_subagent_ledger, plan_channel_outbox, plan_codex_runtime,
-    plan_deterministic_cron, plan_native_cron, plan_subagents, preflight_codex_runtime,
-    prepare_runtime_queue_item, probe_codex_runtime_launch, receive_channel_message,
-    record_channel_delivery, record_codex_runtime_completion, run_channel_once, run_codex_runtime,
-    run_runtime_queue_once, select_skills, sync_builtin_harness_skills, write_channel_step,
-    write_deterministic_cron_plan, write_native_cron_plan, write_prompt_bundle, write_report_files,
-    write_skill_index, write_subagent_plan, write_turn_plan,
+    HarnessLogLevel, HarnessStatusOptions, HarnessStatusReport, ImportPhaseStatus, ImportReport,
+    NativeCronPlan, NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions, PromptBundle,
+    RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions,
+    RuntimeQueuePrepareReport, RuntimeRunOnceOptions, RuntimeRunOnceReport, SkillIndex,
+    SkillSelectionQuery, SubagentPlan, SubagentPlanInput, TurnPlan, TurnPlanInput,
+    append_harness_log, apply_channel_command_step, assemble_prompt_bundle, build_channel_step,
+    build_dry_run_report, build_harness_skill_index, build_import_plan, build_runtime_skill_index,
+    build_source_skill_index, build_turn_plan, check_activation_readiness, collect_harness_status,
+    current_log_time_ms, enqueue_channel_step, execute_import, export_harness_registry_files,
+    inventory, load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
+    load_subagent_ledger, plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron,
+    plan_native_cron, plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
+    probe_codex_runtime_launch, receive_channel_message, record_channel_delivery,
+    record_codex_runtime_completion, run_channel_once, run_codex_runtime, run_runtime_queue_once,
+    select_skills, sync_builtin_harness_skills, write_channel_step, write_deterministic_cron_plan,
+    write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
+    write_subagent_plan, write_turn_plan,
 };
 
 fn main() {
@@ -50,6 +51,7 @@ fn main() {
         "registry" => run_registry(&rest),
         "registry-export" => run_registry_export(&rest),
         "enable-check" => run_enable_check(&rest),
+        "status" | "harness-status" => run_harness_status(&rest),
         "harness-skills-sync" => run_harness_skills_sync(&rest),
         "skills" => run_skills(&rest),
         "turn-plan" => run_turn_plan(&rest),
@@ -306,6 +308,21 @@ fn run_enable_check(args: &[String]) -> Result<(), String> {
     .map_err(|err| err.to_string())?;
 
     print_activation_readiness_report(&report);
+    Ok(())
+}
+
+fn run_harness_status(args: &[String]) -> Result<(), String> {
+    let args = harness_status_args_from_args(args)?;
+    let report = collect_harness_status(HarnessStatusOptions {
+        harness_home: args.target_home,
+    })
+    .map_err(|err| err.to_string())?;
+    if args.json {
+        let json = serde_json::to_string_pretty(&report).map_err(|err| err.to_string())?;
+        println!("{json}");
+    } else {
+        print_harness_status_report(&report);
+    }
     Ok(())
 }
 
@@ -1481,6 +1498,11 @@ struct EnableCheckArgs {
     target_home: PathBuf,
 }
 
+struct HarnessStatusArgs {
+    target_home: PathBuf,
+    json: bool,
+}
+
 struct HarnessSkillsSyncArgs {
     target_home: PathBuf,
     force: bool,
@@ -1947,6 +1969,26 @@ fn enable_check_args_from_args(args: &[String]) -> Result<EnableCheckArgs, Strin
     }
 
     Ok(EnableCheckArgs { target_home })
+}
+
+fn harness_status_args_from_args(args: &[String]) -> Result<HarnessStatusArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut json = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--json" => json = true,
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(HarnessStatusArgs { target_home, json })
 }
 
 fn harness_skills_sync_args_from_args(args: &[String]) -> Result<HarnessSkillsSyncArgs, String> {
@@ -4849,6 +4891,84 @@ fn print_activation_readiness_report(report: &ActivationReadinessReport) {
     }
 }
 
+fn print_harness_status_report(report: &HarnessStatusReport) {
+    println!("OpenClaw harness status");
+    println!("Harness home: {}", report.harness_home.display());
+    println!(
+        "Ready: {} (passed={} warnings={} failed={})",
+        yes_no(report.ready),
+        report.readiness.summary.passed,
+        report.readiness.summary.warnings,
+        report.readiness.summary.failed
+    );
+    println!(
+        "Runtime: queued={} open={} prepared={} completed={} invalid={} runOnce={} codexRun={} completion={}",
+        report.runtime.queued_items,
+        report.runtime.open_items,
+        report.runtime.prepared_items,
+        report.runtime.completed_items,
+        report.runtime.pending_invalid_lines,
+        receipt_summary(&report.runtime.run_once_receipts),
+        receipt_summary(&report.runtime.codex_run_receipts),
+        receipt_summary(&report.runtime.codex_completion_receipts)
+    );
+    println!(
+        "Outbox: pending={} delivered={} retryable={} invalid={}",
+        report.channels.outbox.all.pending,
+        report.channels.outbox.all.delivered,
+        report.channels.outbox.all.failed_retryable,
+        report.channels.outbox.all.invalid_lines
+    );
+    println!(
+        "Channels: telegramOffset={} telegramPollLog={} discordSendLog={} discordEventLog={} discordGateway={}",
+        yes_no(report.channels.telegram_offset_present),
+        yes_no(report.channels.telegram_poll_log_present),
+        yes_no(report.channels.discord_send_log_present),
+        yes_no(report.channels.discord_event_log_present),
+        receipt_summary(&report.channels.discord_gateway_probe)
+    );
+    println!(
+        "Memory: qdrantEdge={} lancedb={} openclawMemSqlite={} files={}",
+        yes_no(report.memory.qdrant_edge),
+        yes_no(report.memory.lancedb),
+        yes_no(report.memory.openclaw_mem_sqlite),
+        report.memory.regular_files
+    );
+    println!(
+        "Plugins: catalog={} tools={} execution={} probe={} bridge={}",
+        yes_no(report.plugins.catalog_present),
+        report.plugins.catalog_tools,
+        receipt_summary(&report.plugins.sidecar_execution_receipts),
+        receipt_summary(&report.plugins.sidecar_probe_receipts),
+        receipt_summary(&report.plugins.sidecar_bridge_receipts)
+    );
+    println!(
+        "Logs: lines={} invalid={} latest={}",
+        report.logs.lines,
+        report.logs.invalid_lines,
+        report.logs.latest_event.as_deref().unwrap_or("-")
+    );
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
+fn receipt_summary(status: &openclaw_harness_core::HarnessJsonlStatus) -> String {
+    let latest = status
+        .latest_status
+        .as_deref()
+        .or(status.latest_method.as_deref())
+        .unwrap_or("-");
+    format!(
+        "{} lines latest={}",
+        if status.exists { status.lines } else { 0 },
+        latest
+    )
+}
+
 fn print_turn_plan(plan: &TurnPlan) {
     println!("OpenClaw turn plan");
     println!("Dispatch: {:?}", plan.dispatch);
@@ -5733,6 +5853,9 @@ fn print_help() {
     println!("  registry        Inspect parsed multi-agent registry state");
     println!("  registry-export Write target harness registry state");
     println!("  enable-check    Check formal activation readiness and log writability");
+    println!(
+        "  status          Summarize harness readiness, runtime, channels, memory, plugins, and logs"
+    );
     println!("  harness-skills-sync Sync bundled harness operation skills");
     println!("  skills          Build a skill-first index and optionally match a task");
     println!("  turn-plan       Plan routing, commands, prompts, and skills for one turn");
@@ -5772,6 +5895,7 @@ fn print_help() {
     println!("  --conflict <policy>     skip, overwrite, or rename");
     println!("  --output <path>         Write report.json and summary.md");
     println!("  --include-sensitive     Copy/write sensitive import or credential values");
+    println!("  --json                  Print machine-readable JSON for status");
     println!("  --query <text>          Match skills for a task turn");
     println!("  --agent <id>            Agent hint for skill matching");
     println!("  --channel <name>        Channel hint for skill matching");

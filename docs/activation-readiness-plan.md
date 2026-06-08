@@ -68,9 +68,11 @@ These must pass before cutover.
 
 7. Logging gate
    - Run `enable-check`.
+   - Run `status --json`.
    - Confirm `state/logs/harness.jsonl` is writable.
    - Confirm logs include activation, Telegram poll-once or loop, Discord outbox send, channel receive, runtime run-once, Codex run, completion, and delivery events.
    - Confirm `enable-check` reports `telegram-offset`, `telegram-poll-log`, and `discord-send-log` as pass after adapter smoke tests.
+   - Confirm `status` reports runtime `openItems=0` and outbox `pending=0` before live adapter handoff.
 
 ## Smoke Gates
 
@@ -117,13 +119,14 @@ These should be run before stopping the Docker gateway.
 
 1. Real Telegram adapter
    - Done for smoke and operator-run handoff: `telegram-poll-once` receives Telegram text updates, normalizes them into `channel-run-once`, delivers pending replies through Telegram Bot API `sendMessage`, records delivery receipts, stores update offsets, and writes a poll summary log. `telegram-loop` repeats the same path with idle sleep and a consecutive-error threshold.
-   - Still required for formal service activation: Windows service or scheduled-task install path, health/status, graceful shutdown, token source hardening, and production retry policy.
+   - Health/status CLI summary is available through `status`.
+   - Still required for formal service activation: Windows service or scheduled-task install path, graceful shutdown, token source hardening, and production retry policy.
 
 2. Real Discord adapter
    - Done for outbound smoke: `discord-outbox-send-once` sends pending Discord outbox messages through Discord REST, records delivery receipts, and writes a delivery summary log.
    - Done for inbound normalization smoke: `discord-event-run-once` accepts one Discord Gateway `MESSAGE_CREATE` event from `--event-file` or `--event-json`, dedupes by message id, normalizes text into `channel-run-once`, writes Discord event receipts, and logs `discord.event-run-once`.
    - Still required for formal Discord activation: WebSocket gateway loop that receives Discord DM events and feeds them into `discord-event-run-once` semantics.
-   - Add gateway heartbeat/reconnect, dedupe, and health/status reporting.
+   - Add gateway heartbeat/reconnect and live process health reporting beyond the CLI `status` summary.
 
 3. Worker loop
    - Turn `runtime-run-once` into a supervised loop.
@@ -152,7 +155,8 @@ These should be run before stopping the Docker gateway.
 
 7. Operations
    - Windows service or scheduled task install path.
-   - Health/status command for bot process.
+   - Done for CLI health/status: `status` summarizes readiness, runtime queue, channel outbox, memory, plugins, and logs; `--json` is monitor-friendly.
+   - Still required: process supervisor health endpoint or scheduled-task monitor integration.
    - Backup/export command.
    - Explicit cutover command that records operator intent.
 
@@ -172,6 +176,7 @@ As of 2026-06-08 local verification:
 - `discord-gateway-probe` passes with the imported Discord token and Node 24 global WebSocket support.
 - The Codex Desktop MSIX `codex.exe` path is not spawnable from this harness environment and should not be used for service runtime.
 - Offline normal-turn smoke passes through `channel-run-once` with `tools/openclaw-fake-codex-app-server/fake-codex-app-server.cmd`, producing runtime-run-once, Codex run, Codex completion, transcript, outbox, delivery receipt, and operational log evidence without a model request or channel send.
+- `status` reports `queued=2 open=0 prepared=2 completed=2`, outbox `pending=0 delivered=4`, Qdrant edge primary memory present, plugin catalog ready with 2 manifest-derived tools, and operational log event coverage for offline runtime/delivery smoke.
 - `enable-check` currently reports `Ready: yes` with no hard failures. Remaining warnings are live operator smoke evidence for Telegram poll/offset, Discord outbound delivery, and optional LanceDB backup.
 
 ## Verification Commands
@@ -183,6 +188,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p openclaw-harness-cli -- help
 cargo run -p openclaw-harness-cli -- channel-credentials-export --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --include-sensitive
 cargo run -p openclaw-harness-cli -- enable-check --harness-home C:\path\to\.openclaw-harness
+cargo run -p openclaw-harness-cli -- status --harness-home C:\path\to\.openclaw-harness --json
 cargo run -p openclaw-harness-cli -- channel-run-once --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw --platform telegram --channel-id smoke --user-id operator --message /status
 cargo run -p openclaw-harness-cli -- channel-run-once --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw --platform telegram --channel-id offline-runtime-smoke --user-id operator --message "offline runtime smoke" --agent main --codex-exe tools\openclaw-fake-codex-app-server\fake-codex-app-server.cmd --timeout-ms 5000
 cargo run -p openclaw-harness-cli -- codex-launch-probe --harness-home C:\path\to\.openclaw-harness --execution-dir C:\path\to\prepared-execution --startup-probe-ms 750
