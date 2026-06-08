@@ -83,6 +83,7 @@ Commands should update channel state and receipts before enqueueing agent turns.
 - Use channel-run-once as the single-message adapter entrypoint before real Telegram/Discord loops exist.
 - Use channel-outbox-plan to list pending delivery work by platform.
 - Use channel-delivery-record after Telegram/Discord send attempts to record delivered or failed receipts.
+- Use telegram-poll-once for Telegram Bot API smoke tests. It reads TELEGRAM_BOT_TOKEN from the environment, stores offsets in state/channels/telegram-offset.json, runs channel-run-once for text updates, sends pending replies, records delivery receipts, and writes a telegram.poll-once operational log.
 - Failed receipts stay retryable; delivered receipts are skipped by future outbox plans.
 - Do not send the same already recorded Codex completion twice.
 
@@ -96,7 +97,7 @@ Before replacing the Docker OpenClaw gateway:
 4. Sync builtin harness skills.
 5. Run activation readiness checks.
 6. Confirm logs are written to state/logs/harness.jsonl.
-7. Smoke-test a Telegram or Discord command message.
+7. Smoke-test a Telegram command message with telegram-poll-once when TELEGRAM_BOT_TOKEN is configured, or with channel-run-once when testing offline.
 8. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt.
 
 ## Codex Runtime Flow

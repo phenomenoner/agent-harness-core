@@ -57,11 +57,12 @@ These must pass before cutover.
    - Deliver the pending reply through the target adapter or manual test harness.
    - Run `channel-delivery-record --status delivered`.
    - Confirm future `channel-outbox-plan` skips delivered messages and retries failed messages.
+   - For Telegram smoke, set `TELEGRAM_BOT_TOKEN` and run `telegram-poll-once` against a controlled DM; confirm command replies and agent replies are delivered by the Bot API.
 
 7. Logging gate
    - Run `enable-check`.
    - Confirm `state/logs/harness.jsonl` is writable.
-   - Confirm logs include activation, channel receive, runtime run-once, Codex run, completion, and delivery events.
+   - Confirm logs include activation, Telegram poll-once, channel receive, runtime run-once, Codex run, completion, and delivery events.
 
 ## Smoke Gates
 
@@ -103,10 +104,8 @@ These should be run before stopping the Docker gateway.
 ## Remaining Development To Formal Activation
 
 1. Real Telegram adapter
-   - Receive Telegram updates.
-   - Normalize inbound DMs into `channel-run-once`.
-   - Deliver `channel-outbox-plan` messages through Telegram Bot API.
-   - Record delivery receipts.
+   - Done for one-shot smoke: `telegram-poll-once` receives Telegram text updates, normalizes them into `channel-run-once`, delivers pending replies through Telegram Bot API `sendMessage`, records delivery receipts, stores update offsets, and writes a poll summary log.
+   - Still required for formal activation: supervised long-running loop, backoff, health/status, graceful shutdown, token source hardening, and production retry policy.
 
 2. Real Discord adapter
    - Receive Discord DM events through a gateway adapter.
@@ -147,6 +146,7 @@ cargo test --workspace --quiet
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p openclaw-harness-cli -- help
 cargo run -p openclaw-harness-cli -- enable-check --target-home C:\path\to\.openclaw-harness
+cargo run -p openclaw-harness-cli -- telegram-poll-once --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.exe --poll-timeout-seconds 1 --max-updates 10
 ```
 
 Use fake app-server tests for CI. Use real `codex app-server` only in operator-run smoke tests because it may make model requests.

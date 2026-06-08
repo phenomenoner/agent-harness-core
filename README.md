@@ -20,6 +20,7 @@ The project starts with a small, testable foundation:
 - A channel receive handler that turns one DM into either command state/outbox records or a queued agent turn.
 - A channel run-once pipeline that handles one DM, runs the runtime when needed, and returns pending delivery work.
 - A channel outbox delivery planner/receipt ledger for Telegram/Discord delivery retry.
+- A Telegram Bot API poll-once adapter that receives updates, runs the shared channel pipeline, sends pending replies, records delivery receipts, and writes a poll summary log.
 - A durable runtime queue writer that appends channel agent turns to `state/runtime-queue/pending.jsonl` with receipts and planned transcript paths.
 - A runtime queue prepare worker that reads pending items, assembles prompt bundles, and writes execution receipts before the Codex adapter is connected.
 - A one-shot runtime pipeline that prepares, plans, runs Codex, records completion, and writes an agent reply to the shared channel outbox.
@@ -32,8 +33,8 @@ The project starts with a small, testable foundation:
 - A native agent-turn cron parser and dry-run dispatch planner with cutover hold safety.
 - A deterministic cron parser and no-LLM dry-run planner for workspace cron runners.
 - A subagent ledger parser and dry-run planner for `/subagents/runs.json` cutover safety.
-- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `enable-check`, `harness-skills-sync`, `skills`, `turn-plan`, `channel-step`, `channel-apply`, `channel-receive`, `channel-run-once`, `channel-outbox-plan`, `channel-delivery-record`, `queue-enqueue`, `queue-prepare`, `runtime-run-once`, `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
-- Minimal external crates: `serde` and `serde_json` for stable report/config/session JSON handling.
+- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `enable-check`, `harness-skills-sync`, `skills`, `turn-plan`, `channel-step`, `channel-apply`, `channel-receive`, `channel-run-once`, `channel-outbox-plan`, `channel-delivery-record`, `telegram-poll-once`, `queue-enqueue`, `queue-prepare`, `runtime-run-once`, `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
+- Minimal external crates for current scope: `serde`/`serde_json` for stable JSON reports and `ureq` for the first Telegram Bot API smoke adapter.
 
 ## Quick Start
 
@@ -55,6 +56,7 @@ cargo run -p openclaw-harness-cli -- channel-apply --openclaw-home C:\path\to\.o
 cargo run -p openclaw-harness-cli -- channel-receive --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "continue with the selected model"
 cargo run -p openclaw-harness-cli -- channel-run-once --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "continue with the selected model" --codex-exe C:\path\to\codex.exe
 cargo run -p openclaw-harness-cli -- channel-outbox-plan --target-home C:\path\to\.openclaw-harness --platform telegram --limit 20
+cargo run -p openclaw-harness-cli -- telegram-poll-once --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.exe --poll-timeout-seconds 1 --max-updates 10
 cargo run -p openclaw-harness-cli -- turn-plan --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "continue with the selected model"
 cargo run -p openclaw-harness-cli -- queue-enqueue --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron"
 cargo run -p openclaw-harness-cli -- queue-prepare --target-home C:\path\to\.openclaw-harness
@@ -96,7 +98,7 @@ The registry command is also read-only. It merges `openclaw.json` agent config w
 
 `enable-check` is the formal cutover readiness report. It checks the exported registry, enabled agents, Telegram/Discord token presence when those channels are enabled, provider credentials, plugin sidecar blockers, runtime queue receipts, channel outbox/state, Codex auth, memory-adapter status, and whether `state/logs/harness.jsonl` is writable. It appends an activation event to that log every time it runs.
 
-Runtime operations write an append-only JSONL operational log at `state/logs/harness.jsonl`. Current events include activation checks, `channel-receive`, `queue-prepare`, `codex-run`, and `codex-complete`, with level, component, event name, message, queue id, session key, agent/channel ids, and relevant paths. This complements receipts and transcript/trajectory files and is the file to tail for monitoring/debugging once a long-running adapter is added.
+Runtime operations write an append-only JSONL operational log at `state/logs/harness.jsonl`. Current events include activation checks, Telegram poll-once summaries, `channel-receive`, `queue-prepare`, `codex-run`, `codex-complete`, and channel delivery receipts, with level, component, event name, message, queue id, session key, agent/channel ids, and relevant paths. This complements receipts and transcript/trajectory files and is the file to tail for monitoring/debugging once a long-running adapter is added.
 
 Telegram and Discord adapters should share the same channel command parser and intent mapper. Current parser coverage is `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`; `/model` maps to show-or-switch model intents, and `/status` maps to scoped or global status intents.
 
@@ -111,6 +113,8 @@ Telegram and Discord adapters should share the same channel command parser and i
 `channel-run-once` is the single-message smoke and future adapter entrypoint. It calls `channel-receive`, runs `runtime-run-once` for ordinary agent turns, then returns a `channel-outbox-plan` view for delivery. Command messages never enter the model path; ordinary messages may start `codex app-server` and make a model request.
 
 `channel-outbox-plan` reads `state/channels/outbox.jsonl`, filters by platform, excludes delivered messages, and returns retryable pending messages with stable delivery ids, attempt counts, and last delivery status. `channel-delivery-record` appends delivered/failed receipts to `state/channels/delivery-receipts.jsonl` and logs delivery events. Telegram and Discord adapters should use this shared ledger so command replies and agent replies follow the same retry/audit path.
+
+`telegram-poll-once` is the first real Telegram Bot API smoke adapter. It reads `TELEGRAM_BOT_TOKEN` from the environment, stores the next update offset at `state/channels/telegram-offset.json`, normalizes text updates into `channel-run-once`, delivers pending Telegram outbox messages through `sendMessage`, records delivery receipts, and logs a `telegram.poll-once` summary. It is intentionally one-shot; a supervised long-running service loop is still a separate activation gate.
 
 `queue-enqueue` persists the agent-turn side of `channel-step`. It appends queued turns to `state/runtime-queue/pending.jsonl`, appends every queued/skipped attempt to `state/runtime-queue/receipts.jsonl`, and precomputes OpenClaw-compatible transcript and trajectory paths under `agents/<agent-id>/sessions/`. Command-only channel steps are recorded as skipped receipts and are not sent to the agent queue.
 
