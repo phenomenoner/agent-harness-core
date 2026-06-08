@@ -105,7 +105,7 @@ Before replacing the Docker OpenClaw gateway:
 8. Confirm enable-check reports telegram-offset, telegram-poll-log, and discord-send-log after channel adapter smoke tests.
 9. Confirm memory-qdrant-edge is present when current OpenClaw uses Qdrant edge as primary memory backend.
 10. Confirm codex-runtime-launch-probe passes with the intended --codex-exe before any real runtime handoff.
-11. Run plugin-sidecar-probe and confirm plugin-sidecar-probe is pass in enable-check. This proves sidecar process and metadata visibility only; hook/tool execution still needs its own bridge.
+11. Run plugin-sidecar-probe and plugin-sidecar-call for sidecar.status/plugins.list; confirm plugin-sidecar-probe and plugin-sidecar-bridge are pass in enable-check. This proves process startup and JSON-RPC metadata visibility only; hook/tool execution still needs its own bridge.
 12. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt.
 
 ## Codex Runtime Flow

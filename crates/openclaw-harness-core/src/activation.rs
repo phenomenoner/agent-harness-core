@@ -236,11 +236,70 @@ fn check_plugins(
             format!("{sidecar_required} imported plugin(s) require the Node sidecar, which is not enabled yet"),
         ));
         check_plugin_sidecar_probe(harness_home, checks);
+        check_plugin_sidecar_bridge(harness_home, checks);
     } else {
         checks.push(pass(
             "plugin-sidecar",
             "no sidecar-required plugins reported by registry",
         ));
+    }
+}
+
+fn check_plugin_sidecar_bridge(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let path = harness_home
+        .join("state")
+        .join("plugin-sidecar")
+        .join("bridge-receipts.jsonl");
+    match latest_jsonl_value(&path) {
+        Ok(Some(value)) => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let method = value
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let reason = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason recorded");
+            if status == "ok" {
+                checks.push(pass(
+                    "plugin-sidecar-bridge",
+                    format!(
+                        "latest sidecar JSON-RPC call method={method} passed at {}",
+                        path.display()
+                    ),
+                ));
+            } else {
+                checks.push(fail(
+                    "plugin-sidecar-bridge",
+                    format!(
+                        "latest sidecar JSON-RPC call method={method} status={status} at {}: {reason}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        Ok(None) => checks.push(warn(
+            "plugin-sidecar-bridge",
+            format!(
+                "no sidecar bridge receipt lines found at {}",
+                path.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+            "plugin-sidecar-bridge",
+            format!(
+                "not found yet: {}; run plugin-sidecar-call before plugin handoff",
+                path.display()
+            ),
+        )),
+        Err(error) => checks.push(warn(
+            "plugin-sidecar-bridge",
+            format!("could not read {}: {error}", path.display()),
+        )),
     }
 }
 
@@ -849,6 +908,44 @@ mod tests {
 
         assert!(report.checks.iter().any(|check| {
             check.name == "plugin-sidecar-probe" && check.status == ActivationReadinessStatus::Pass
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readiness_reports_plugin_sidecar_bridge_receipt() {
+        let root = temp_root("readiness_reports_plugin_sidecar_bridge_receipt");
+        let harness_home = root.join(".openclaw-harness");
+        let state = harness_home.join("state");
+        let sidecar = state.join("plugin-sidecar");
+        fs::create_dir_all(&sidecar).unwrap();
+        fs::write(
+            state.join("harness-registry.json"),
+            r#"{
+              "schema": "openclaw-harness.target-registry.v1",
+              "agents": [
+                { "id": "main", "enabled": true }
+              ],
+              "providers": [],
+              "plugins": [
+                { "id": "openclaw-mem-engine", "sidecarRequired": true }
+              ],
+              "channels": { "telegram": false, "discord": false }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            sidecar.join("bridge-receipts.jsonl"),
+            r#"{"status":"ok","method":"sidecar.status","reason":"plugin sidecar JSON-RPC call completed"}"#,
+        )
+        .unwrap();
+
+        let report =
+            check_activation_readiness(ActivationReadinessOptions { harness_home }).unwrap();
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "plugin-sidecar-bridge" && check.status == ActivationReadinessStatus::Pass
         }));
 
         let _ = fs::remove_dir_all(root);

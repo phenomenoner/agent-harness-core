@@ -1,7 +1,8 @@
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -60,6 +61,7 @@ fn main() {
         "telegram-loop" => run_telegram_loop(&rest),
         "discord-outbox-send-once" => run_discord_outbox_send_once(&rest),
         "plugin-sidecar-probe" => run_plugin_sidecar_probe(&rest),
+        "plugin-sidecar-call" => run_plugin_sidecar_call(&rest),
         "queue-enqueue" => run_queue_enqueue(&rest),
         "queue-prepare" => run_queue_prepare(&rest),
         "runtime-run-once" => run_runtime_run_once(&rest),
@@ -845,6 +847,94 @@ fn run_plugin_sidecar_probe(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_plugin_sidecar_call(args: &[String]) -> Result<(), String> {
+    let args = plugin_sidecar_call_args_from_args(args)?;
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "openclaw-harness-cli",
+        "method": args.method,
+        "params": {}
+    });
+    let mut child = Command::new(&args.node_exe)
+        .arg(&args.sidecar_script)
+        .arg("--harness-home")
+        .arg(&args.target_home)
+        .arg("--stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            format!(
+                "failed to spawn plugin sidecar via {}: {err}",
+                args.node_exe.display()
+            )
+        })?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "plugin sidecar stdin was not available".to_string())?;
+        stdin
+            .write_all(format!("{request}\n").as_bytes())
+            .map_err(|err| format!("failed to write JSON-RPC request: {err}"))?;
+    }
+    drop(child.stdin.take());
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("failed to wait for plugin sidecar response: {err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let response_line = stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    let response: serde_json::Value = if response_line.is_empty() {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "openclaw-harness-cli",
+            "error": {
+                "code": -32001,
+                "message": "sidecar returned no JSON-RPC response"
+            }
+        })
+    } else {
+        serde_json::from_str(response_line)
+            .map_err(|err| format!("invalid JSON-RPC response from plugin sidecar: {err}"))?
+    };
+    let status = if output.status.success() && response.get("error").is_none() {
+        "ok"
+    } else {
+        "failed"
+    };
+    write_plugin_sidecar_bridge_receipt(
+        &args.target_home,
+        &args.method,
+        status,
+        &response,
+        stderr.trim(),
+    )?;
+
+    println!("OpenClaw plugin sidecar call");
+    println!("Harness home: {}", args.target_home.display());
+    println!("Node executable: {}", args.node_exe.display());
+    println!("Sidecar script: {}", args.sidecar_script.display());
+    println!("Method: {}", args.method);
+    println!("Status: {status}");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response).map_err(|err| err.to_string())?
+    );
+    if !stderr.trim().is_empty() {
+        eprintln!("{}", stderr.trim());
+    }
+    if status != "ok" {
+        return Err("plugin sidecar JSON-RPC call failed".to_string());
+    }
+    Ok(())
+}
+
 fn run_queue_enqueue(args: &[String]) -> Result<(), String> {
     let args = queue_enqueue_args_from_args(args)?;
     let registry = load_agent_registry(&args.turn.source).map_err(|err| err.to_string())?;
@@ -1254,6 +1344,13 @@ struct PluginSidecarProbeArgs {
     target_home: PathBuf,
     node_exe: PathBuf,
     sidecar_script: PathBuf,
+}
+
+struct PluginSidecarCallArgs {
+    target_home: PathBuf,
+    node_exe: PathBuf,
+    sidecar_script: PathBuf,
+    method: String,
 }
 
 struct DiscordOutboxSendOnceReport {
@@ -2365,6 +2462,55 @@ fn plugin_sidecar_probe_args_from_args(args: &[String]) -> Result<PluginSidecarP
     })
 }
 
+fn plugin_sidecar_call_args_from_args(args: &[String]) -> Result<PluginSidecarCallArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut node_exe = PathBuf::from("node");
+    let mut sidecar_script = PathBuf::from("tools")
+        .join("openclaw-plugin-sidecar")
+        .join("index.mjs");
+    let mut method = "sidecar.status".to_string();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--node-exe" => {
+                i += 1;
+                node_exe = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--node-exe requires a path".to_string())?;
+            }
+            "--sidecar-script" => {
+                i += 1;
+                sidecar_script = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--sidecar-script requires a path".to_string())?;
+            }
+            "--method" => {
+                i += 1;
+                method = args
+                    .get(i)
+                    .cloned()
+                    .ok_or_else(|| "--method requires a JSON-RPC method name".to_string())?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(PluginSidecarCallArgs {
+        target_home,
+        node_exe,
+        sidecar_script,
+        method,
+    })
+}
+
 fn queue_prepare_args_from_args(args: &[String]) -> Result<QueuePrepareArgs, String> {
     let mut target_home = default_harness_home();
     let mut queue_id = None;
@@ -2946,6 +3092,49 @@ fn parse_harness_home_path(args: &[String], index: usize, flag: &str) -> Result<
     args.get(index)
         .map(PathBuf::from)
         .ok_or_else(|| format!("{flag} requires a path"))
+}
+
+fn write_plugin_sidecar_bridge_receipt(
+    harness_home: &std::path::Path,
+    method: &str,
+    status: &str,
+    response: &serde_json::Value,
+    stderr: &str,
+) -> Result<(), String> {
+    let dir = harness_home.join("state").join("plugin-sidecar");
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let receipts_file = dir.join("bridge-receipts.jsonl");
+    let response_file = dir.join("last-bridge-response.json");
+    fs::write(
+        &response_file,
+        serde_json::to_string_pretty(response).map_err(|err| err.to_string())?,
+    )
+    .map_err(|err| err.to_string())?;
+    let reason = response
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .or({
+            if stderr.is_empty() {
+                None
+            } else {
+                Some(stderr)
+            }
+        })
+        .unwrap_or("plugin sidecar JSON-RPC call completed");
+    let receipt = serde_json::json!({
+        "schema": "openclaw-harness.plugin-sidecar-bridge-receipt.v1",
+        "status": status,
+        "method": method,
+        "responseFile": response_file.display().to_string(),
+        "reason": reason,
+    });
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(receipts_file)
+        .and_then(|mut file| writeln!(file, "{receipt}"))
+        .map_err(|err| err.to_string())
 }
 
 fn telegram_bot_token() -> Result<String, String> {
@@ -4306,6 +4495,7 @@ fn print_help() {
     println!("  telegram-loop     Run Telegram polling continuously until stopped");
     println!("  discord-outbox-send-once Send pending Discord outbox messages once");
     println!("  plugin-sidecar-probe Probe the Node OpenClaw plugin sidecar contract");
+    println!("  plugin-sidecar-call Call the plugin sidecar JSON-RPC bridge once");
     println!("  queue-enqueue   Persist one channel agent turn to the runtime queue");
     println!("  queue-prepare   Prepare one queued runtime item for Codex execution");
     println!("  runtime-run-once Prepare, run, and outbox one queued runtime item");
@@ -4350,8 +4540,9 @@ fn print_help() {
     println!("  --max-consecutive-errors <n> Telegram loop failure threshold");
     println!("  TELEGRAM_BOT_TOKEN      Environment variable used by Telegram adapters");
     println!("  DISCORD_BOT_TOKEN       Environment variable used by Discord adapters");
-    println!("  --node-exe <path>       Node executable for plugin-sidecar-probe");
+    println!("  --node-exe <path>       Node executable for plugin sidecar commands");
     println!("  --sidecar-script <path> Plugin sidecar script path");
+    println!("  --method <name>         Plugin sidecar JSON-RPC method for plugin-sidecar-call");
     println!("  --queue-id <id>         Select one runtime queue item for queue-prepare");
     println!("  --execution-dir <path>  Prepared execution directory for codex-plan");
     println!("  --codex-exe <path>      Codex executable path for codex-plan/runtime-run-once");
