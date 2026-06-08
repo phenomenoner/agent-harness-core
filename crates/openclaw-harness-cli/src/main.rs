@@ -63,6 +63,7 @@ fn main() {
         "channel-run-once" => run_channel_run_once(&rest),
         "channel-outbox-plan" => run_channel_outbox_plan(&rest),
         "channel-delivery-record" => run_channel_delivery_record(&rest),
+        "telegram-probe" => run_telegram_probe(&rest),
         "telegram-poll-once" => run_telegram_poll_once(&rest),
         "telegram-loop" => run_telegram_loop(&rest),
         "discord-outbox-send-once" => run_discord_outbox_send_once(&rest),
@@ -602,6 +603,31 @@ fn run_channel_delivery_record(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_telegram_probe(args: &[String]) -> Result<(), String> {
+    let args = telegram_probe_args_from_args(args)?;
+    let report = match telegram_bot_token(&args.target_home) {
+        Ok(token) => execute_telegram_probe(&args.target_home, &token)?,
+        Err(reason) => write_telegram_probe_result(TelegramProbeReport {
+            harness_home: args.target_home.clone(),
+            receipt_file: telegram_probe_receipts_file(&args.target_home),
+            status: "token-missing".to_string(),
+            reason,
+            bot_id: None,
+            username: None,
+            can_join_groups: None,
+            can_read_all_group_messages: None,
+            supports_inline_queries: None,
+            at_ms: current_time_ms()?,
+        })?,
+    };
+    print_telegram_probe_report(&report);
+    if report.status == "ready" {
+        Ok(())
+    } else {
+        Err(report.reason)
+    }
+}
+
 fn run_telegram_poll_once(args: &[String]) -> Result<(), String> {
     let args = telegram_poll_once_args_from_args(args)?;
     let token = telegram_bot_token(&args.target_home)?;
@@ -669,6 +695,100 @@ fn run_telegram_loop(args: &[String]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn execute_telegram_probe(harness_home: &Path, token: &str) -> Result<TelegramProbeReport, String> {
+    let at_ms = current_time_ms()?;
+    let report = match telegram_get_me(token) {
+        Ok(bot) => TelegramProbeReport {
+            harness_home: harness_home.to_path_buf(),
+            receipt_file: telegram_probe_receipts_file(harness_home),
+            status: "ready".to_string(),
+            reason: "Telegram Bot API getMe succeeded without consuming updates".to_string(),
+            bot_id: bot
+                .get("id")
+                .and_then(telegram_id_string)
+                .filter(|id| !id.is_empty()),
+            username: bot
+                .get("username")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string),
+            can_join_groups: bot
+                .get("can_join_groups")
+                .and_then(serde_json::Value::as_bool),
+            can_read_all_group_messages: bot
+                .get("can_read_all_group_messages")
+                .and_then(serde_json::Value::as_bool),
+            supports_inline_queries: bot
+                .get("supports_inline_queries")
+                .and_then(serde_json::Value::as_bool),
+            at_ms,
+        },
+        Err(reason) => TelegramProbeReport {
+            harness_home: harness_home.to_path_buf(),
+            receipt_file: telegram_probe_receipts_file(harness_home),
+            status: "failed".to_string(),
+            reason,
+            bot_id: None,
+            username: None,
+            can_join_groups: None,
+            can_read_all_group_messages: None,
+            supports_inline_queries: None,
+            at_ms,
+        },
+    };
+    write_telegram_probe_result(report)
+}
+
+fn write_telegram_probe_result(report: TelegramProbeReport) -> Result<TelegramProbeReport, String> {
+    let latest_file = telegram_probe_latest_file(&report.harness_home);
+    if let Some(parent) = latest_file.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let receipt = serde_json::json!({
+        "schema": "openclaw-harness.telegram-probe-receipt.v1",
+        "status": report.status,
+        "reason": report.reason,
+        "botId": report.bot_id,
+        "username": report.username,
+        "canJoinGroups": report.can_join_groups,
+        "canReadAllGroupMessages": report.can_read_all_group_messages,
+        "supportsInlineQueries": report.supports_inline_queries,
+        "atMs": report.at_ms,
+    });
+    fs::write(
+        &latest_file,
+        serde_json::to_string_pretty(&receipt).map_err(|err| err.to_string())?,
+    )
+    .map_err(|err| err.to_string())?;
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&report.receipt_file)
+        .and_then(|mut file| writeln!(file, "{receipt}"))
+        .map_err(|err| err.to_string())?;
+    append_harness_log(
+        &report.harness_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            if report.status == "ready" {
+                HarnessLogLevel::Info
+            } else {
+                HarnessLogLevel::Warn
+            },
+            "telegram",
+            "telegram.probe",
+            format!(
+                "status={} botId={} username={} reason={}",
+                report.status,
+                report.bot_id.as_deref().unwrap_or("-"),
+                report.username.as_deref().unwrap_or("-"),
+                report.reason
+            ),
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(report)
 }
 
 fn execute_telegram_poll_once(
@@ -1779,6 +1899,23 @@ struct ChannelDeliveryRecordArgs {
     provider_message_id: Option<String>,
     error: Option<String>,
     now_ms: i64,
+}
+
+struct TelegramProbeArgs {
+    target_home: PathBuf,
+}
+
+struct TelegramProbeReport {
+    harness_home: PathBuf,
+    receipt_file: PathBuf,
+    status: String,
+    reason: String,
+    bot_id: Option<String>,
+    username: Option<String>,
+    can_join_groups: Option<bool>,
+    can_read_all_group_messages: Option<bool>,
+    supports_inline_queries: Option<bool>,
+    at_ms: i64,
 }
 
 struct TelegramPollOnceArgs {
@@ -2923,6 +3060,24 @@ fn channel_delivery_record_args_from_args(
             None => current_time_ms()?,
         },
     })
+}
+
+fn telegram_probe_args_from_args(args: &[String]) -> Result<TelegramProbeArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(TelegramProbeArgs { target_home })
 }
 
 fn telegram_poll_once_args_from_args(args: &[String]) -> Result<TelegramPollOnceArgs, String> {
@@ -4931,6 +5086,20 @@ fn telegram_offset_file(harness_home: &std::path::Path) -> PathBuf {
         .join("telegram-offset.json")
 }
 
+fn telegram_probe_latest_file(harness_home: &std::path::Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("channels")
+        .join("telegram-probe.json")
+}
+
+fn telegram_probe_receipts_file(harness_home: &std::path::Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("channels")
+        .join("telegram-probe-receipts.jsonl")
+}
+
 fn read_telegram_offset(
     path: &std::path::Path,
     warnings: &mut Vec<String>,
@@ -4963,6 +5132,19 @@ fn write_telegram_offset(path: &std::path::Path, next_offset: Option<i64>) -> Re
         .map_err(|err| err.to_string())?,
     )
     .map_err(|err| err.to_string())
+}
+
+fn telegram_get_me(token: &str) -> Result<serde_json::Value, String> {
+    let url = format!("https://api.telegram.org/bot{token}/getMe");
+    let response = ureq::get(&url).call().map_err(telegram_http_error)?;
+    let value: serde_json::Value = response.into_json().map_err(|err| err.to_string())?;
+    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(format!("Telegram getMe returned non-ok response: {value}"));
+    }
+    value
+        .get("result")
+        .cloned()
+        .ok_or_else(|| format!("Telegram getMe response was missing result: {value}"))
 }
 
 fn telegram_get_updates(
@@ -5187,6 +5369,14 @@ fn format_status(status: &ImportPhaseStatus) -> &'static str {
 
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
+}
+
+fn optional_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "-",
+    }
 }
 
 fn print_dry_run_summary(report: &ImportReport) {
@@ -5508,8 +5698,9 @@ fn print_harness_status_report(report: &HarnessStatusReport) {
         report.channels.outbox.all.invalid_lines
     );
     println!(
-        "Channels: telegramOffset={} telegramPollLog={} discordSendLog={} discordEventLog={} discordGateway={}",
+        "Channels: telegramOffset={} telegramProbe={} telegramPollLog={} discordSendLog={} discordEventLog={} discordGateway={}",
         yes_no(report.channels.telegram_offset_present),
+        receipt_summary(&report.channels.telegram_probe),
         yes_no(report.channels.telegram_poll_log_present),
         yes_no(report.channels.discord_send_log_present),
         yes_no(report.channels.discord_event_log_present),
@@ -5843,6 +6034,26 @@ fn print_channel_delivery_receipt(receipt: &ChannelDeliveryReceipt) {
         println!("Error: {error}");
     }
     println!("At ms: {}", receipt.at_ms);
+}
+
+fn print_telegram_probe_report(report: &TelegramProbeReport) {
+    println!("OpenClaw Telegram probe");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Status: {}", report.status);
+    println!("Reason: {}", report.reason);
+    println!("Receipt file: {}", report.receipt_file.display());
+    println!("Bot id: {}", report.bot_id.as_deref().unwrap_or("-"));
+    println!("Username: {}", report.username.as_deref().unwrap_or("-"));
+    println!("Can join groups: {}", optional_bool(report.can_join_groups));
+    println!(
+        "Can read all group messages: {}",
+        optional_bool(report.can_read_all_group_messages)
+    );
+    println!(
+        "Supports inline queries: {}",
+        optional_bool(report.supports_inline_queries)
+    );
+    println!("At ms: {}", report.at_ms);
 }
 
 fn print_telegram_poll_once_report(report: &TelegramPollOnceReport) {
@@ -6579,6 +6790,7 @@ fn print_help() {
     println!("  channel-run-once Handle one DM, run runtime if needed, and plan delivery");
     println!("  channel-outbox-plan List pending Telegram/Discord delivery messages");
     println!("  channel-delivery-record Record delivery success or retryable failure");
+    println!("  telegram-probe  Probe Telegram Bot API getMe without consuming updates");
     println!("  telegram-poll-once Poll Telegram once, run DM pipeline, and deliver replies");
     println!("  telegram-loop     Run Telegram polling continuously until stopped");
     println!("  discord-outbox-send-once Send pending Discord outbox messages once");

@@ -57,6 +57,7 @@ pub struct HarnessChannelStatus {
     pub outbox: HarnessOutboxStatus,
     pub telegram_offset_file: PathBuf,
     pub telegram_offset_present: bool,
+    pub telegram_probe: HarnessJsonlStatus,
     pub telegram_poll_log_present: bool,
     pub discord_send_log_present: bool,
     pub discord_event_log_present: bool,
@@ -209,6 +210,7 @@ fn channel_status(
         },
         telegram_offset_present: telegram_offset_file.is_file(),
         telegram_offset_file,
+        telegram_probe: jsonl_status(channel_dir.join("telegram-probe-receipts.jsonl"))?,
         telegram_poll_log_present: readiness_check_passed(readiness, "telegram-poll-log"),
         discord_send_log_present: readiness_check_passed(readiness, "discord-send-log"),
         discord_event_log_present: readiness_check_passed(readiness, "discord-event-log"),
@@ -254,6 +256,7 @@ fn plugin_status(harness_home: &Path) -> io::Result<HarnessPluginStatus> {
 fn log_status(harness_home: &Path) -> io::Result<HarnessOperationalLogStatus> {
     const EVENTS: &[&str] = &[
         "activation.enable-check",
+        "telegram.probe",
         "telegram.poll-once",
         "discord.outbox-send-once",
         "discord.event-run-once",

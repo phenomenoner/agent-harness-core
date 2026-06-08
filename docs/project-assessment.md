@@ -59,7 +59,7 @@ The project should be split into small boundaries:
    - Model selection should remain provider/model based, with a separate runtime selection policy.
 
 4. Channel layer
-   - Telegram: use the current `telegram-poll-once` Bot API smoke adapter for activation tests and `telegram-loop` for operator-run handoff; consider `teloxide` when promoting this into a full async bot service.
+   - Telegram: use `telegram-probe` for non-consuming Bot API token/readiness checks, the current `telegram-poll-once` Bot API smoke adapter for activation tests, and `telegram-loop` for operator-run handoff; consider `teloxide` when promoting this into a full async bot service.
    - Discord: use the current `discord-outbox-send-once` REST sender for outbound smoke; use `serenity`/`poise` for a faster full bot implementation, or `twilight` when lower-level gateway control matters.
    - Normalize all inbound messages into one internal `ChannelEnvelope`.
 
@@ -292,7 +292,7 @@ Current implemented foundation:
 - `import-dry-run` builds a structured migration report, supports `skip`, `overwrite`, and `rename` conflict policies, extracts non-secret semantic summaries from OpenClaw config/session/cron JSON, and can write `report.json` plus `summary.md`.
 - `registry` builds a read-only multi-agent registry from `openclaw.json` plus `/agents/<id>` directories, including provider/model/workspace metadata and local auth/session/model file presence.
 - `registry-export` writes the target harness registry state to `state/harness-registry.json` plus `state/harness-registry-receipts.json`, with conflict policy support and no raw secret migration.
-- `enable-check` produces the formal cutover readiness report across registry, enabled agents, Telegram/Discord tokens, provider credentials, plugin sidecar blockers, runtime receipts, latest runtime-loop report, channel state/outbox, Telegram offset state, Telegram/Discord adapter log evidence, Codex auth, memory-adapter status, and operational-log writability.
+- `enable-check` produces the formal cutover readiness report across registry, enabled agents, Telegram/Discord tokens, provider credentials, plugin sidecar blockers, runtime receipts, latest runtime-loop report, channel state/outbox, Telegram getMe probe evidence, Telegram offset state, Telegram/Discord adapter log evidence, Codex auth, memory-adapter status, and operational-log writability.
 - `enable-check` now treats `memory/qdrant-edge` as the primary memory backend, treats missing LanceDB as a warning when Qdrant edge is present, and fails a recorded Codex launch probe when the latest `codex-runtime-launch-receipts.jsonl` status is not `started-and-stopped`.
 - `status` provides the operator health summary for handoff and monitoring. It aggregates readiness, runtime queued/open/prepared/completed work, channel outbox delivery state, Telegram/Discord smoke evidence, memory backend presence, plugin sidecar receipts, and operational log event coverage, with `--json` for scheduled-task or monitor integration.
 - `state/logs/harness.jsonl` is the append-only operational log for activation checks and runtime events such as channel ingress, queue prepare, `runtime-run-once`, `runtime-loop`, `codex-run`, and Codex completion; receipts/transcripts remain separate audit artifacts.
@@ -303,6 +303,7 @@ Current implemented foundation:
 - Local activation smoke passes with a workspace-local official Codex CLI install at `.tools/codex-cli/node_modules/.bin/codex.cmd`; the Codex Desktop MSIX resource path resolves on `PATH` but is not spawnable by this harness environment.
 - `plugin-sidecar-probe` starts a dependency-free Node sidecar probe, reads the imported harness registry and plugin install manifest, and writes `state/plugin-sidecar/probe.json` plus JSONL receipts. `plugin-sidecar-call` verifies the JSON-RPC bridge with `sidecar.status`, `plugins.list`, `tools.list`, and `tools.probe`, writing bridge and execution receipts for `enable-check`. `tools.probe` resolves imported plugin manifests through `OPENCLAW_PLUGIN_SOURCE_ROOTS`, writes `state/plugin-sidecar/catalog.json`, and currently reports 5 sidecar-required plugins resolved plus 2 manifest-derived tools. Plugin-specific tool/hook executor adapters are still pending beyond the catalog bridge.
 - `channel-credentials-export` imports Telegram/Discord bot tokens plus known channel/user/guild IDs from an existing OpenClaw `openclaw.json` into `secrets/channel-credentials.env`, with redacted receipts in `secrets/channel-credentials-receipts.json`. The adapter and readiness paths now accept either process env vars or that harness secret env file.
+- `telegram-probe` validates the imported Telegram token through Bot API `getMe` without consuming updates or sending messages, writes `state/channels/telegram-probe.json`, appends `telegram-probe-receipts.jsonl`, logs `telegram.probe`, and is surfaced in `enable-check` plus `status`.
 - `tools/openclaw-fake-codex-app-server` is a dependency-free offline Codex app-server fixture for activation smoke. It speaks the minimal stdio JSONL protocol used by the harness tests, lets `channel-run-once` and `runtime-run-once` exercise prompt assembly, Codex run receipts, completion receipts, transcript/trajectory writes, outbox generation, and delivery receipts without a model request.
 - The CLI-level `runtime-loop` exists for queue draining and handoff smoke, and `supervisor-plan` provides the scheduled-task install/start/stop/uninstall path. SQLite-consistent backup, Docker volume export, Windows Credential Manager vault migration, live channel bot handoff, scheduler execution, process supervisor health integration, and plugin-specific executor adapters are still pending.
 - A shared channel command parser and runtime-intent mapper exists for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`; `/model` covers show/switch model, and `/status` covers global/scoped status requests.
@@ -376,10 +377,10 @@ Current implemented foundation:
 
 ### Phase 3: Messaging Channels
 
-- Add Telegram channel. Current status: `telegram-poll-once` exists for smoke tests, `telegram-loop` exists for operator-run continuous polling, and `supervisor-plan` can generate the scheduled-task wrapper; live Telegram handoff and full health management are still pending.
+- Add Telegram channel. Current status: `telegram-probe` exists for non-consuming token/API checks, `telegram-poll-once` exists for smoke tests, `telegram-loop` exists for operator-run continuous polling, and `supervisor-plan` can generate the scheduled-task wrapper; live Telegram handoff and full health management are still pending.
 - Add Discord channel. Current status: outbound REST delivery exists through `discord-outbox-send-once`; inbound Gateway receive exists through the Node `discord-gateway-loop` wrapper, with live Discord DM handoff still pending.
 - Implement channel session key compatibility.
-- Route real Telegram/Discord bot events into `channel-run-once` and deliver replies through the shared `channel-outbox-plan` / `channel-delivery-record` ledger. Telegram poll/loop coverage exists; Discord outbound coverage exists; Discord inbound gateway coverage is pending.
+- Route real Telegram/Discord bot events into `channel-run-once` and deliver replies through the shared `channel-outbox-plan` / `channel-delivery-record` ledger. Telegram probe/poll/loop coverage exists; Discord outbound and inbound gateway wrapper coverage exists; live DM handoff smoke is pending.
 - Expose persisted command effects such as model switch, new session, steering notes, and stop requests through the real bot UX and status replies.
 - Implement approval UX for shell/tool requests.
 

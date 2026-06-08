@@ -662,6 +662,7 @@ fn check_channel_state(harness_home: &Path, checks: &mut Vec<ActivationReadiness
             ),
         ));
     }
+    check_telegram_probe(harness_home, checks);
     let telegram_offset = channels_dir.join("telegram-offset.json");
     if telegram_offset.is_file() {
         checks.push(pass(
@@ -678,6 +679,63 @@ fn check_channel_state(harness_home: &Path, checks: &mut Vec<ActivationReadiness
         ));
     }
     check_discord_gateway_probe(harness_home, checks);
+}
+
+fn check_telegram_probe(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let path = harness_home
+        .join("state")
+        .join("channels")
+        .join("telegram-probe-receipts.jsonl");
+    match latest_jsonl_value(&path) {
+        Ok(Some(value)) => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let reason = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason recorded");
+            match status {
+                "ready" => checks.push(pass(
+                    "telegram-probe",
+                    format!("Telegram Bot API getMe probe ready at {}", path.display()),
+                )),
+                "token-missing" => checks.push(warn(
+                    "telegram-probe",
+                    format!(
+                        "Telegram probe needs TELEGRAM_BOT_TOKEN at {}: {reason}",
+                        path.display()
+                    ),
+                )),
+                _ => checks.push(fail(
+                    "telegram-probe",
+                    format!(
+                        "Telegram probe status={status} at {}: {reason}",
+                        path.display()
+                    ),
+                )),
+            }
+        }
+        Ok(None) => checks.push(warn(
+            "telegram-probe",
+            format!(
+                "no Telegram probe receipt lines found at {}",
+                path.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+            "telegram-probe",
+            format!(
+                "not found yet: {}; run telegram-probe before Telegram handoff",
+                path.display()
+            ),
+        )),
+        Err(error) => checks.push(warn(
+            "telegram-probe",
+            format!("could not read {}: {error}", path.display()),
+        )),
+    }
 }
 
 fn check_discord_gateway_probe(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
@@ -1258,6 +1316,42 @@ mod tests {
 
         assert!(report.checks.iter().any(|check| {
             check.name == "supervisor-plan" && check.status == ActivationReadinessStatus::Pass
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readiness_reports_telegram_probe() {
+        let root = temp_root("readiness_reports_telegram_probe");
+        let harness_home = root.join(".openclaw-harness");
+        let state = harness_home.join("state");
+        let channels = state.join("channels");
+        fs::create_dir_all(&channels).unwrap();
+        fs::write(
+            state.join("harness-registry.json"),
+            r#"{
+              "schema": "openclaw-harness.target-registry.v1",
+              "agents": [
+                { "id": "main", "enabled": true }
+              ],
+              "providers": [],
+              "plugins": [],
+              "channels": { "telegram": false, "discord": false }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            channels.join("telegram-probe-receipts.jsonl"),
+            r#"{"status":"ready","reason":"Telegram Bot API getMe succeeded without consuming updates"}"#,
+        )
+        .unwrap();
+
+        let report =
+            check_activation_readiness(ActivationReadinessOptions { harness_home }).unwrap();
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "telegram-probe" && check.status == ActivationReadinessStatus::Pass
         }));
 
         let _ = fs::remove_dir_all(root);

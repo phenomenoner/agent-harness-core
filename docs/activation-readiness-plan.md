@@ -42,6 +42,7 @@ These must pass before cutover.
    - Run `channel-credentials-export --include-sensitive` when migrating from an existing OpenClaw home. It writes Telegram/Discord tokens and known channel/user/guild IDs into `secrets/channel-credentials.env` and redacted receipts into `secrets/channel-credentials-receipts.json`.
    - Confirm `TELEGRAM_BOT_TOKEN` is present either in process env or `secrets/channel-credentials.env` when Telegram is enabled.
    - Confirm `DISCORD_BOT_TOKEN` is present either in process env or `secrets/channel-credentials.env` when Discord is enabled.
+   - Run `telegram-probe` to validate Telegram Bot API `getMe` without consuming updates or sending messages.
    - Confirm `OPENROUTER_API_KEY` only when OpenRouter providers are active.
    - Do not rely on an imported OpenClaw embedding-only `OPENAI_API_KEY` for Codex agent turns.
 
@@ -77,8 +78,8 @@ These must pass before cutover.
    - Run `enable-check`.
    - Run `status --json`.
    - Confirm `state/logs/harness.jsonl` is writable.
-   - Confirm logs include activation, Telegram poll-once or loop, Discord outbox send, channel receive, runtime run-once, runtime loop, Codex run, completion, and delivery events.
-   - Confirm `enable-check` reports `telegram-offset`, `telegram-poll-log`, and `discord-send-log` as pass after adapter smoke tests.
+   - Confirm logs include activation, Telegram probe, Telegram poll-once or loop, Discord outbox send, channel receive, runtime run-once, runtime loop, Codex run, completion, and delivery events.
+   - Confirm `enable-check` reports `telegram-probe` as pass after token/API smoke and reports `telegram-offset`, `telegram-poll-log`, and `discord-send-log` as pass after adapter smoke tests.
    - Confirm `status` reports runtime `openItems=0` and outbox `pending=0` before live adapter handoff.
 
 ## Smoke Gates
@@ -125,6 +126,7 @@ These should be run before stopping the Docker gateway.
 ## Remaining Development To Formal Activation
 
 1. Real Telegram adapter
+   - Done for non-consuming token/API readiness: `telegram-probe` calls Telegram Bot API `getMe`, writes `state/channels/telegram-probe.json`, appends `telegram-probe-receipts.jsonl`, and logs `telegram.probe` without consuming updates or sending messages.
    - Done for smoke and operator-run handoff: `telegram-poll-once` receives Telegram text updates, normalizes them into `channel-run-once`, delivers pending replies through Telegram Bot API `sendMessage`, records delivery receipts, stores update offsets, and writes a poll summary log. `telegram-loop` repeats the same path with idle sleep and a consecutive-error threshold.
    - Done for graceful operator stop: `telegram-loop --stop-file <path>` exits before the next poll when the stop file appears.
    - Health/status CLI summary is available through `status`.
@@ -182,6 +184,7 @@ As of 2026-06-08 local verification:
 - Plugin sidecar probe passes. `openclaw-context-budget` is classified as a native adapter, leaving 5 sidecar-required plugins. `tools.probe` resolves all sidecar-required plugin manifests from local source roots, writes `state/plugin-sidecar/catalog.json`, reports 2 manifest-derived tools, and makes `enable-check` pass `plugin-sidecar`.
 - Discord Gateway `MESSAGE_CREATE` event normalizer smoke passes for `/status`, including duplicate-message skip by Discord message id.
 - `channel-credentials-export --include-sensitive` imported Telegram/Discord bot tokens plus known allow-list/guild/channel/chat IDs from the local OpenClaw snapshot into `imports/activation-harness/secrets/channel-credentials.env`; readiness sees both token gates as pass.
+- `telegram-probe` is implemented as the non-consuming Telegram `getMe` readiness check; run it against `imports/activation-harness` before live `telegram-poll-once` handoff so token/API failures are separated from update consumption.
 - `discord-gateway-probe` passes with the imported Discord token and Node 24 global WebSocket support.
 - `discord-outbox-send-once` passes with an empty pending outbox, writes `discord.outbox-send-once`, and does not send any message when `pending=0`.
 - `supervisor-plan` generated three Windows scheduled-task plans (`runtime-loop`, `telegram-loop`, `discord-gateway-loop`) plus install/start/stop/uninstall scripts under `imports/activation-harness/state/supervisor/windows-scheduled-tasks`; generated scripts use absolute paths, point at the local `imports/openclaw-core-snapshot` source because the mounted `D:\Warehouse\Research\OpenClaw_WSL\.openclaw` path is absent, and contain no raw token/key/secret strings.
@@ -199,6 +202,7 @@ cargo test --workspace --quiet
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p openclaw-harness-cli -- help
 cargo run -p openclaw-harness-cli -- channel-credentials-export --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --include-sensitive
+cargo run -p openclaw-harness-cli -- telegram-probe --harness-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- enable-check --harness-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- status --harness-home C:\path\to\.openclaw-harness --json
 cargo run -p openclaw-harness-cli -- supervisor-plan --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw --workspace C:\path\to\workspace --harness-cli C:\path\to\openclaw-harness.exe --codex-exe C:\path\to\codex.cmd --agent main
