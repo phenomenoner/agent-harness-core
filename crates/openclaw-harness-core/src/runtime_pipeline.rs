@@ -90,16 +90,20 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         .as_ref()
         .map(channel_context_from_prepared_item);
 
-    if prepare.receipt.status == RuntimeExecutionReceiptStatus::NoPendingItem
-        && options.queue_id.is_some()
-    {
+    if prepare.receipt.status == RuntimeExecutionReceiptStatus::NoPendingItem {
+        let requested_queue = options.queue_id;
+        let requested_specific_queue = requested_queue.is_some();
         let receipt = RuntimeRunOnceReceipt {
-            queue_id: options.queue_id,
+            queue_id: requested_queue,
             status: RuntimeRunOnceStatus::NoWork,
             execution_dir: None,
             transcript_file: None,
             outbox_file: None,
-            reason: "requested queue item was not pending or prepared".to_string(),
+            reason: if requested_specific_queue {
+                "requested queue item was not pending or prepared".to_string()
+            } else {
+                "no pending or prepared runtime queue item is available".to_string()
+            },
         };
         append_runtime_run_once_log(
             &options.harness_home,
@@ -517,6 +521,80 @@ mod tests {
         )
         .unwrap();
         assert!(log.contains("runtime.run-once.completed"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_runtime_queue_once_stops_when_only_terminal_queue_items_remain() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("no_work_after_terminal");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "repair memory cron".to_string(),
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+        let fake_codex = fake_codex_executable(&root);
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let first = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            codex_executable: Some(fake_codex.clone()),
+            timeout_ms: 5_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(first.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert!(first.outbox_file.is_some());
+
+        let second = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            codex_executable: Some(fake_codex),
+            timeout_ms: 5_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(second.receipt.status, RuntimeRunOnceStatus::NoWork);
+        assert_eq!(
+            second.prepare.as_ref().unwrap().receipt.status,
+            RuntimeExecutionReceiptStatus::NoPendingItem
+        );
+        assert!(second.plan.is_none());
+        assert!(second.run.is_none());
+        assert!(second.outbound_message.is_none());
+        let outbox = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(outbox.lines().count(), 1);
 
         let _ = fs::remove_dir_all(root);
     }

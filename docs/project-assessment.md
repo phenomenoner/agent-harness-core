@@ -366,7 +366,7 @@ Current implemented foundation:
 
 ### Phase 2: Runtime MVP
 
-- Harden the Codex app-server client against protocol/version drift and add real session resume binding once the exact tested Codex app-server version is pinned.
+- Keep hardening the Codex app-server client against protocol/version drift; the current adapter stores returned `threadId` values in the OpenClaw-compatible binding file and uses `thread/resume` for later turns in the same OpenClaw session.
 - Add local direct-message CLI or HTTP channel for testing.
 - Use the imported multi-agent registry to route direct messages and cron payloads by `agentId`.
 - Promote the generated scheduled-task handoff from plan artifacts into an operator-run installed service path with monitor integration: consume queued prompt bundles continuously, start/resume sessions, stream events, update delivery outboxes, persist transcript/trajectory/Codex binding receipts, and expose process health.

@@ -1834,6 +1834,7 @@ fn run_codex_complete(args: &[String]) -> Result<(), String> {
         execution_dir: args.execution_dir,
         plan_file: args.plan_file,
         assistant_message: args.assistant_message,
+        thread_id: None,
         finished_at_ms: args.finished_at_ms,
     })
     .map_err(|err| err.to_string())?;

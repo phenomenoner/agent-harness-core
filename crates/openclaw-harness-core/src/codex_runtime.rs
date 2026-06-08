@@ -20,6 +20,12 @@ const CODEX_RUNTIME_COMPLETION_SCHEMA: &str = "openclaw-harness.codex-runtime-co
 const CODEX_TRANSCRIPT_MESSAGE_SCHEMA: &str = "openclaw-harness.transcript-message.v1";
 const CODEX_TRAJECTORY_EVENT_SCHEMA: &str = "openclaw-harness.trajectory-event.v1";
 const CODEX_BINDING_SCHEMA: &str = "openclaw-harness.codex-binding.v1";
+const CODEX_APP_SERVER_DEVELOPER_INSTRUCTIONS: &str = "\
+This Codex app-server thread backs an OpenClaw agent harness session. Codex owns \
+the backend system prompt, tool schemas, MCP/tool inventory, sandbox, approvals, \
+and thread continuity. The chat-facing agent identity and operating context come \
+from the OpenClaw prompt bundle passed as turn input. Do not treat the Rust harness \
+development repository as the chat user's agent identity.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRuntimePlanOptions {
@@ -57,6 +63,7 @@ pub struct CodexRuntimeCompletionOptions {
     pub execution_dir: Option<PathBuf>,
     pub plan_file: Option<PathBuf>,
     pub assistant_message: String,
+    pub thread_id: Option<String>,
     pub finished_at_ms: i64,
 }
 
@@ -158,6 +165,7 @@ pub struct CodexInvocationPlan {
     pub prompt_input_file: PathBuf,
     pub env_requirements: Vec<CodexEnvRequirement>,
     pub model_argument: Option<String>,
+    pub thread_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -373,6 +381,8 @@ struct CodexBindingRecord {
     agent_id: Option<String>,
     provider: Option<String>,
     model: Option<String>,
+    thread_id: Option<String>,
+    working_directory: PathBuf,
     prompt_bundle_json: PathBuf,
     prompt_markdown: PathBuf,
     transcript_file: PathBuf,
@@ -429,6 +439,8 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
     let trajectory_file = trajectory_file(&transcript_file);
     let codex_binding_file = codex_binding_file(&transcript_file);
     let runtime_receipt_file = execution_dir.join("codex-runtime-receipt.json");
+    let working_directory = runtime_working_directory(&bundle, &execution_dir, &mut warnings);
+    let thread_id = read_existing_codex_thread_id(&codex_binding_file, &mut warnings)?;
     let executable = options
         .codex_executable
         .unwrap_or_else(|| PathBuf::from("codex"));
@@ -436,10 +448,11 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
         executable,
         transport: CodexTransportPlan::StdioJsonRpcAppServer,
         arguments: vec!["app-server".to_string()],
-        working_directory: execution_dir.clone(),
+        working_directory,
         prompt_input_file: prompt_markdown.clone(),
         env_requirements: env_requirements(provider.as_deref()),
         model_argument: model.clone(),
+        thread_id,
     };
     let outputs = CodexOutputPlan {
         transcript_file,
@@ -962,6 +975,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 execution_dir: execution_dir.clone(),
                 plan_file: Some(plan_file.clone()),
                 assistant_message,
+                thread_id: run_result.thread_id.clone(),
                 finished_at_ms,
             },
         )?)
@@ -1244,10 +1258,7 @@ fn append_codex_run_log(
 }
 
 fn plan_completion_recorded(plan: &CodexRuntimePlanFile) -> io::Result<bool> {
-    let completion_file = plan
-        .invocation
-        .working_directory
-        .join("codex-runtime-completion-receipt.json");
+    let completion_file = completion_receipt_file(plan);
     if !completion_file.is_file() {
         return Ok(false);
     }
@@ -1259,6 +1270,7 @@ struct CodexAppServerRunResult {
     status: CodexRuntimeRunStatus,
     reason: String,
     assistant_message: String,
+    thread_id: Option<String>,
     event_count: usize,
     stdout_log: Option<PathBuf>,
     stderr_log: Option<PathBuf>,
@@ -1269,15 +1281,11 @@ fn drive_codex_app_server(
     plan: &CodexRuntimePlanFile,
     timeout_ms: u64,
 ) -> io::Result<CodexAppServerRunResult> {
+    let execution_dir = runtime_execution_dir(plan);
+    fs::create_dir_all(&execution_dir)?;
     fs::create_dir_all(&plan.invocation.working_directory)?;
-    let stdout_log = plan
-        .invocation
-        .working_directory
-        .join("codex-runtime-run.stdout.jsonl");
-    let stderr_log = plan
-        .invocation
-        .working_directory
-        .join("codex-runtime-run.stderr.log");
+    let stdout_log = execution_dir.join("codex-runtime-run.stdout.jsonl");
+    let stderr_log = execution_dir.join("codex-runtime-run.stderr.log");
     let stderr = OpenOptions::new()
         .create(true)
         .append(true)
@@ -1297,6 +1305,7 @@ fn drive_codex_app_server(
                 status: CodexRuntimeRunStatus::SpawnFailed,
                 reason: format!("failed to spawn codex app-server process: {error}"),
                 assistant_message: String::new(),
+                thread_id: None,
                 event_count: 0,
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
@@ -1310,6 +1319,7 @@ fn drive_codex_app_server(
             status: CodexRuntimeRunStatus::ProtocolError,
             reason: "codex app-server stdin pipe was unavailable".to_string(),
             assistant_message: String::new(),
+            thread_id: None,
             event_count: 0,
             stdout_log: Some(stdout_log),
             stderr_log: Some(stderr_log),
@@ -1322,6 +1332,7 @@ fn drive_codex_app_server(
             status: CodexRuntimeRunStatus::ProtocolError,
             reason: "codex app-server stdout pipe was unavailable".to_string(),
             assistant_message: String::new(),
+            thread_id: None,
             event_count: 0,
             stdout_log: Some(stdout_log),
             stderr_log: Some(stderr_log),
@@ -1360,11 +1371,24 @@ fn drive_codex_app_server(
     if let Some(model) = &plan.model {
         thread_params["model"] = json!(model);
     }
+    thread_params["cwd"] = json!(
+        plan.invocation
+            .working_directory
+            .to_string_lossy()
+            .to_string()
+    );
+    thread_params["developerInstructions"] = json!(CODEX_APP_SERVER_DEVELOPER_INSTRUCTIONS);
+    let thread_method = if let Some(thread_id) = &plan.invocation.thread_id {
+        thread_params["threadId"] = json!(thread_id);
+        "thread/resume"
+    } else {
+        "thread/start"
+    };
     write_json_rpc(
         &mut stdin,
         &json!({
             "id": 1,
-            "method": "thread/start",
+            "method": thread_method,
             "params": thread_params
         }),
     )?;
@@ -1378,6 +1402,7 @@ fn drive_codex_app_server(
                 status: CodexRuntimeRunStatus::Timeout,
                 reason,
                 assistant_message: state.assistant_message,
+                thread_id: None,
                 event_count: state.event_count,
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
@@ -1391,6 +1416,7 @@ fn drive_codex_app_server(
                 status: CodexRuntimeRunStatus::ProtocolError,
                 reason,
                 assistant_message: state.assistant_message,
+                thread_id: None,
                 event_count: state.event_count,
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
@@ -1404,6 +1430,7 @@ fn drive_codex_app_server(
                 status: CodexRuntimeRunStatus::ProtocolError,
                 reason: "codex app-server reported turn completion before thread start".to_string(),
                 assistant_message: state.assistant_message,
+                thread_id: None,
                 event_count: state.event_count,
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
@@ -1419,6 +1446,7 @@ fn drive_codex_app_server(
             "method": "turn/start",
             "params": {
                 "threadId": thread_id,
+                "cwd": plan.invocation.working_directory.to_string_lossy().to_string(),
                 "input": [
                     {
                         "type": "text",
@@ -1438,6 +1466,7 @@ fn drive_codex_app_server(
                 status: CodexRuntimeRunStatus::Timeout,
                 reason,
                 assistant_message: state.assistant_message,
+                thread_id: Some(thread_id.clone()),
                 event_count: state.event_count,
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
@@ -1451,6 +1480,7 @@ fn drive_codex_app_server(
                 status: CodexRuntimeRunStatus::ProtocolError,
                 reason,
                 assistant_message: state.assistant_message,
+                thread_id: Some(thread_id.clone()),
                 event_count: state.event_count,
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
@@ -1465,6 +1495,7 @@ fn drive_codex_app_server(
                 reason: "codex app-server returned a second thread/start response during turn"
                     .to_string(),
                 assistant_message: state.assistant_message,
+                thread_id: Some(thread_id.clone()),
                 event_count: state.event_count,
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
@@ -1478,6 +1509,7 @@ fn drive_codex_app_server(
         status,
         reason: "codex app-server turn completed and assistant output was captured".to_string(),
         assistant_message: state.assistant_message,
+        thread_id: Some(thread_id),
         event_count: state.event_count,
         stdout_log: Some(stdout_log),
         stderr_log: Some(stderr_log),
@@ -1861,10 +1893,7 @@ fn record_completion_outputs(
             detail: "assistant message recorded by codex completion sink".to_string(),
         },
     )?;
-    let completion_file = plan
-        .invocation
-        .working_directory
-        .join("codex-runtime-completion-receipt.json");
+    let completion_file = completion_receipt_file(plan);
     fs::write(
         &plan.outputs.codex_binding_file,
         serde_json::to_string_pretty(&CodexBindingRecord {
@@ -1874,6 +1903,8 @@ fn record_completion_outputs(
             agent_id: plan.agent_id.clone(),
             provider: plan.provider.clone(),
             model: plan.model.clone(),
+            thread_id: options.thread_id.clone(),
+            working_directory: plan.invocation.working_directory.clone(),
             prompt_bundle_json: plan.prompt_bundle_json.clone(),
             prompt_markdown: plan.prompt_markdown.clone(),
             transcript_file: plan.outputs.transcript_file.clone(),
@@ -1924,15 +1955,11 @@ fn spawn_launch_probe(
     plan: &CodexRuntimePlanFile,
     startup_probe_ms: u64,
 ) -> io::Result<LaunchProbeProcessResult> {
+    let execution_dir = runtime_execution_dir(plan);
+    fs::create_dir_all(&execution_dir)?;
     fs::create_dir_all(&plan.invocation.working_directory)?;
-    let stdout_log = plan
-        .invocation
-        .working_directory
-        .join("codex-runtime-launch.stdout.log");
-    let stderr_log = plan
-        .invocation
-        .working_directory
-        .join("codex-runtime-launch.stderr.log");
+    let stdout_log = execution_dir.join("codex-runtime-launch.stdout.log");
+    let stderr_log = execution_dir.join("codex-runtime-launch.stderr.log");
     let stdout = OpenOptions::new()
         .create(true)
         .append(true)
@@ -2467,6 +2494,72 @@ fn append_json_line(path: &Path, value: &impl Serialize) -> io::Result<()> {
     Ok(())
 }
 
+fn runtime_working_directory(
+    bundle: &Value,
+    execution_dir: &Path,
+    warnings: &mut Vec<String>,
+) -> PathBuf {
+    if let Some(source_workspace) = path_field(bundle, &["sourceWorkspace", "source_workspace"]) {
+        if source_workspace.is_dir() {
+            return source_workspace;
+        }
+        warnings.push(format!(
+            "prompt bundle source workspace does not exist; falling back to execution dir: {}",
+            source_workspace.display()
+        ));
+    } else {
+        warnings.push(
+            "prompt bundle did not include sourceWorkspace; falling back to execution dir"
+                .to_string(),
+        );
+    }
+    execution_dir.to_path_buf()
+}
+
+fn read_existing_codex_thread_id(
+    codex_binding_file: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<Option<String>> {
+    if !codex_binding_file.is_file() {
+        return Ok(None);
+    }
+    let value = match read_json_file(codex_binding_file) {
+        Ok(value) => value,
+        Err(error) => {
+            warnings.push(format!(
+                "could not read existing Codex binding for thread resume at {}: {}",
+                codex_binding_file.display(),
+                error
+            ));
+            return Ok(None);
+        }
+    };
+    Ok(
+        string_field(&value, &["threadId", "thread_id", "codexThreadId"])
+            .map(str::trim)
+            .filter(|thread_id| !thread_id.is_empty())
+            .map(ToString::to_string),
+    )
+}
+
+fn runtime_execution_dir(plan: &CodexRuntimePlanFile) -> PathBuf {
+    plan.outputs
+        .runtime_receipt_file
+        .parent()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            plan.invocation
+                .prompt_input_file
+                .parent()
+                .map(Path::to_path_buf)
+        })
+        .unwrap_or_else(|| plan.invocation.working_directory.clone())
+}
+
+fn completion_receipt_file(plan: &CodexRuntimePlanFile) -> PathBuf {
+    runtime_execution_dir(plan).join("codex-runtime-completion-receipt.json")
+}
+
 fn string_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
     for key in keys {
         if let Some(text) = value.get(*key).and_then(Value::as_str) {
@@ -2527,6 +2620,8 @@ mod tests {
         assert_eq!(plan.provider.as_deref(), Some("openai"));
         assert_eq!(plan.model.as_deref(), Some("gpt-5"));
         assert_eq!(plan.invocation.arguments, vec!["app-server"]);
+        assert_eq!(plan.invocation.working_directory, source.workspace);
+        assert_eq!(plan.invocation.thread_id, None);
         assert_eq!(
             plan.invocation.executable,
             PathBuf::from("custom-codex.exe")
@@ -2845,7 +2940,10 @@ mod tests {
         let transcript = fs::read_to_string(&transcript_file).unwrap();
         assert!(transcript.contains("Fake assistant reply."));
         assert!(completion.trajectory_file.unwrap().is_file());
-        assert!(completion.codex_binding_file.unwrap().is_file());
+        let binding_file = completion.codex_binding_file.unwrap();
+        assert!(binding_file.is_file());
+        let binding: Value = serde_json::from_slice(&fs::read(binding_file).unwrap()).unwrap();
+        assert_eq!(binding["threadId"], "thread-test");
         let harness_log = harness_home
             .join("state")
             .join("logs")
@@ -2875,6 +2973,40 @@ mod tests {
     }
 
     #[test]
+    fn run_codex_runtime_resumes_existing_thread_binding() {
+        let root = temp_root("run_codex_runtime_resumes_existing_thread_binding");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = fake_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+        replace_invocation_thread_id(plan_file, Some("thread-existing"));
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 5_000,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let transcript_file = report.completion.unwrap().transcript_file.unwrap();
+        let transcript = fs::read_to_string(transcript_file).unwrap();
+        assert!(transcript.contains("method=thread/resume"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn record_codex_runtime_completion_writes_outputs_idempotently() {
         let root = temp_root("record_codex_runtime_completion_writes_outputs_idempotently");
         let source = write_codex_runtime_source(&root);
@@ -2892,6 +3024,7 @@ mod tests {
             execution_dir: None,
             plan_file: None,
             assistant_message: "Recorded assistant reply.".to_string(),
+            thread_id: Some("thread-recorded".to_string()),
             finished_at_ms: 12345,
         })
         .unwrap();
@@ -2914,12 +3047,14 @@ mod tests {
         let binding: Value = serde_json::from_slice(&fs::read(binding_file).unwrap()).unwrap();
         assert_eq!(binding["schema"], CODEX_BINDING_SCHEMA);
         assert_eq!(binding["sessionKey"], "telegram:dm-42:user-7:main");
+        assert_eq!(binding["threadId"], "thread-recorded");
 
         let second = record_codex_runtime_completion(CodexRuntimeCompletionOptions {
-            harness_home,
+            harness_home: harness_home.clone(),
             execution_dir: None,
             plan_file: None,
             assistant_message: "Should not be duplicated.".to_string(),
+            thread_id: Some("ignored-thread".to_string()),
             finished_at_ms: 12346,
         })
         .unwrap();
@@ -2931,6 +3066,21 @@ mod tests {
             fs::read_to_string(transcript_file).unwrap().lines().count(),
             2
         );
+
+        enqueue_and_prepare(&source, &harness_home);
+        let resumed_plan = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap()
+        .plan
+        .unwrap();
+        assert_eq!(
+            resumed_plan.invocation.thread_id.as_deref(),
+            Some("thread-recorded")
+        );
+        assert_eq!(resumed_plan.invocation.working_directory, source.workspace);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2984,6 +3134,15 @@ mod tests {
         fs::write(plan_file, serde_json::to_string_pretty(&value).unwrap()).unwrap();
     }
 
+    fn replace_invocation_thread_id(plan_file: &Path, thread_id: Option<&str>) {
+        let mut value: Value = serde_json::from_slice(&fs::read(plan_file).unwrap()).unwrap();
+        value["invocation"]["threadId"] = match thread_id {
+            Some(thread_id) => serde_json::json!(thread_id),
+            None => Value::Null,
+        };
+        fs::write(plan_file, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    }
+
     #[cfg(windows)]
     fn long_running_probe_command() -> (PathBuf, Vec<String>) {
         let system_cmd = PathBuf::from(r"C:\Windows\System32\cmd.exe");
@@ -3010,6 +3169,7 @@ mod tests {
             &script,
             r#"
 while ($true) {
+    if ($null -eq $threadMethod) { $threadMethod = 'unknown' }
     $line = [Console]::In.ReadLine()
     if ($null -eq $line) { break }
     try {
@@ -3021,10 +3181,15 @@ while ($true) {
         [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/start') {
+        $threadMethod = 'thread/start'
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/resume') {
+        $threadMethod = 'thread/resume'
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
-        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"delta":"Fake assistant reply."}}')
+        [Console]::Out.WriteLine(('{"method":"item/agentMessage/delta","params":{"delta":"Fake assistant reply. method=' + $threadMethod + '"}}'))
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"turn":{"id":"turn-test","status":"completed"}}}')
         [Console]::Out.Flush()
         break
@@ -3064,10 +3229,15 @@ while IFS= read -r line; do
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
             ;;
         *'"method":"thread/start"'*)
+            thread_method='thread/start'
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"thread/resume"'*)
+            thread_method='thread/resume'
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
             ;;
         *'"method":"turn/start"'*)
-            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"Fake assistant reply."}}'
+            printf '%s\n' "{\"method\":\"item/agentMessage/delta\",\"params\":{\"delta\":\"Fake assistant reply. method=${thread_method:-unknown}\"}}"
             printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-test","status":"completed"}}}'
             exit 0
             ;;
