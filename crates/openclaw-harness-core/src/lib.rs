@@ -16,6 +16,7 @@ pub mod importer;
 pub mod logging;
 pub mod prompt;
 pub mod registry;
+pub mod runtime_pipeline;
 pub mod runtime_queue;
 pub mod runtime_worker;
 pub mod skills;
@@ -98,6 +99,10 @@ pub use prompt::{
 pub use registry::{
     AgentDefaults, AgentProfile, AgentProfileSource, AgentRegistry, ChannelRegistry, PluginProfile,
     ProviderProfile, load_agent_registry,
+};
+pub use runtime_pipeline::{
+    RuntimeRunOnceOptions, RuntimeRunOnceReceipt, RuntimeRunOnceReport, RuntimeRunOnceStatus,
+    run_runtime_queue_once,
 };
 pub use runtime_queue::{
     RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, RuntimeQueueItem,

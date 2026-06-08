@@ -20,6 +20,7 @@ The project starts with a small, testable foundation:
 - A channel receive handler that turns one DM into either command state/outbox records or a queued agent turn.
 - A durable runtime queue writer that appends channel agent turns to `state/runtime-queue/pending.jsonl` with receipts and planned transcript paths.
 - A runtime queue prepare worker that reads pending items, assembles prompt bundles, and writes execution receipts before the Codex adapter is connected.
+- A one-shot runtime pipeline that prepares, plans, runs Codex, records completion, and writes an agent reply to the shared channel outbox.
 - A Codex runtime planner that turns a prepared queue execution into an inspectable `codex app-server` invocation plan and output-path contract.
 - A Codex runtime preflight checker that validates the plan, executable, prompt files, output directories, and required environment variables before process start.
 - A Codex runtime launch probe that starts the planned app-server process, sends no prompt or JSON-RPC request, then stops it and records process receipts/log paths.
@@ -29,7 +30,7 @@ The project starts with a small, testable foundation:
 - A native agent-turn cron parser and dry-run dispatch planner with cutover hold safety.
 - A deterministic cron parser and no-LLM dry-run planner for workspace cron runners.
 - A subagent ledger parser and dry-run planner for `/subagents/runs.json` cutover safety.
-- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `enable-check`, `harness-skills-sync`, `skills`, `turn-plan`, `channel-step`, `channel-apply`, `channel-receive`, `queue-enqueue`, `queue-prepare`, `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
+- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `enable-check`, `harness-skills-sync`, `skills`, `turn-plan`, `channel-step`, `channel-apply`, `channel-receive`, `queue-enqueue`, `queue-prepare`, `runtime-run-once`, `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
 - Minimal external crates: `serde` and `serde_json` for stable report/config/session JSON handling.
 
 ## Quick Start
@@ -53,6 +54,7 @@ cargo run -p openclaw-harness-cli -- channel-receive --openclaw-home C:\path\to\
 cargo run -p openclaw-harness-cli -- turn-plan --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "continue with the selected model"
 cargo run -p openclaw-harness-cli -- queue-enqueue --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron"
 cargo run -p openclaw-harness-cli -- queue-prepare --target-home C:\path\to\.openclaw-harness
+cargo run -p openclaw-harness-cli -- runtime-run-once --target-home C:\path\to\.openclaw-harness --codex-exe C:\path\to\codex.exe --timeout-ms 300000
 cargo run -p openclaw-harness-cli -- codex-plan --target-home C:\path\to\.openclaw-harness --codex-exe C:\path\to\codex.exe
 cargo run -p openclaw-harness-cli -- codex-preflight --target-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- codex-launch-probe --target-home C:\path\to\.openclaw-harness --startup-probe-ms 750
@@ -105,6 +107,8 @@ Telegram and Discord adapters should share the same channel command parser and i
 `queue-enqueue` persists the agent-turn side of `channel-step`. It appends queued turns to `state/runtime-queue/pending.jsonl`, appends every queued/skipped attempt to `state/runtime-queue/receipts.jsonl`, and precomputes OpenClaw-compatible transcript and trajectory paths under `agents/<agent-id>/sessions/`. Command-only channel steps are recorded as skipped receipts and are not sent to the agent queue.
 
 `queue-prepare` reads one queued runtime item, rebuilds the turn context from its stored source/workspace/session metadata, assembles `prompt-bundle.json` plus `prompt.md` under `state/runtime-queue/executions/<queue-id>/`, and writes `execution-receipt.json` plus `execution-receipts.jsonl`. It uses the merged runtime skill index and the prompt injection ledger, so unchanged prompt files and skill bodies are not repeated in the same session. It treats existing `Prepared` receipts as idempotence state, skips already prepared queue ids during automatic selection, and returns `AlreadyPrepared` when an operator explicitly requests a prepared `--queue-id`. This is the handoff point for the future Codex app-server worker; it does not call a model yet.
+
+`runtime-run-once` is the first worker-facing pipeline. It calls `queue-prepare`, `codex-plan`, and `codex-run` for one queued or already prepared item, writes `state/runtime-queue/run-once-last.json`, appends `run-once-receipts.jsonl`, and writes a `kind=agent-reply` message to `state/channels/outbox.jsonl` when a fresh assistant reply is recorded. This is the core function a Telegram or Discord adapter can call after enqueueing a normal DM. If `codex-run` reports an already recorded completion, it skips the outbox write to avoid duplicate delivery.
 
 `codex-plan` reads the latest prepared execution or an explicit `--execution-dir`, writes `codex-runtime-plan.json` plus `codex-runtime-receipt.json`, and appends `codex-runtime-receipts.jsonl`. It plans a stdio `codex app-server` invocation, model/env requirements, and OpenClaw-compatible transcript/trajectory/Codex binding output paths. It still does not start Codex or make a model request.
 

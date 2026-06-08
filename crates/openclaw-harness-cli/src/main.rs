@@ -13,19 +13,19 @@ use openclaw_harness_core::{
     DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel, ImportPhaseStatus,
     ImportReport, NativeCronPlan, NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions,
     PromptBundle, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
-    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, SkillIndex, SkillSelectionQuery,
-    SubagentPlan, SubagentPlanInput, TurnPlan, TurnPlanInput, append_harness_log,
-    apply_channel_command_step, assemble_prompt_bundle, build_channel_step, build_dry_run_report,
-    build_harness_skill_index, build_import_plan, build_runtime_skill_index,
-    build_source_skill_index, build_turn_plan, check_activation_readiness, current_log_time_ms,
-    enqueue_channel_step, execute_import, export_harness_registry_files, inventory,
-    load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
-    load_subagent_ledger, plan_codex_runtime, plan_deterministic_cron, plan_native_cron,
-    plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
+    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeRunOnceOptions,
+    RuntimeRunOnceReport, SkillIndex, SkillSelectionQuery, SubagentPlan, SubagentPlanInput,
+    TurnPlan, TurnPlanInput, append_harness_log, apply_channel_command_step,
+    assemble_prompt_bundle, build_channel_step, build_dry_run_report, build_harness_skill_index,
+    build_import_plan, build_runtime_skill_index, build_source_skill_index, build_turn_plan,
+    check_activation_readiness, current_log_time_ms, enqueue_channel_step, execute_import,
+    export_harness_registry_files, inventory, load_agent_registry, load_deterministic_cron_store,
+    load_native_cron_store, load_subagent_ledger, plan_codex_runtime, plan_deterministic_cron,
+    plan_native_cron, plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
     probe_codex_runtime_launch, receive_channel_message, record_codex_runtime_completion,
-    run_codex_runtime, select_skills, sync_builtin_harness_skills, write_channel_step,
-    write_deterministic_cron_plan, write_native_cron_plan, write_prompt_bundle, write_report_files,
-    write_skill_index, write_subagent_plan, write_turn_plan,
+    run_codex_runtime, run_runtime_queue_once, select_skills, sync_builtin_harness_skills,
+    write_channel_step, write_deterministic_cron_plan, write_native_cron_plan, write_prompt_bundle,
+    write_report_files, write_skill_index, write_subagent_plan, write_turn_plan,
 };
 
 fn main() {
@@ -49,6 +49,7 @@ fn main() {
         "channel-receive" => run_channel_receive(&rest),
         "queue-enqueue" => run_queue_enqueue(&rest),
         "queue-prepare" => run_queue_prepare(&rest),
+        "runtime-run-once" => run_runtime_run_once(&rest),
         "codex-plan" => run_codex_plan(&rest),
         "codex-preflight" => run_codex_preflight(&rest),
         "codex-launch-probe" => run_codex_launch_probe(&rest),
@@ -491,6 +492,25 @@ fn run_queue_prepare(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_runtime_run_once(args: &[String]) -> Result<(), String> {
+    let args = runtime_run_once_args_from_args(args)?;
+    let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+        harness_home: args.target_home.clone(),
+        queue_id: args.queue_id,
+        codex_executable: args.codex_exe,
+        timeout_ms: args.timeout_ms,
+        prompt_options: PromptAssemblyOptions {
+            max_prompt_file_bytes: args.max_prompt_file_bytes,
+            max_skill_file_bytes: args.max_skill_file_bytes,
+            harness_home: Some(args.target_home),
+        },
+    })
+    .map_err(|err| err.to_string())?;
+
+    print_runtime_run_once_report(&report);
+    Ok(())
+}
+
 fn run_codex_plan(args: &[String]) -> Result<(), String> {
     let args = codex_plan_args_from_args(args)?;
     let report = plan_codex_runtime(CodexRuntimePlanOptions {
@@ -766,6 +786,15 @@ struct QueueEnqueueArgs {
 struct QueuePrepareArgs {
     target_home: PathBuf,
     queue_id: Option<String>,
+    max_prompt_file_bytes: usize,
+    max_skill_file_bytes: usize,
+}
+
+struct RuntimeRunOnceArgs {
+    target_home: PathBuf,
+    queue_id: Option<String>,
+    codex_exe: Option<PathBuf>,
+    timeout_ms: u64,
     max_prompt_file_bytes: usize,
     max_skill_file_bytes: usize,
 }
@@ -1386,6 +1415,78 @@ fn queue_prepare_args_from_args(args: &[String]) -> Result<QueuePrepareArgs, Str
     Ok(QueuePrepareArgs {
         target_home,
         queue_id,
+        max_prompt_file_bytes,
+        max_skill_file_bytes,
+    })
+}
+
+fn runtime_run_once_args_from_args(args: &[String]) -> Result<RuntimeRunOnceArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut queue_id = None;
+    let mut codex_exe = None;
+    let mut timeout_ms = 300_000;
+    let mut max_prompt_file_bytes = PromptAssemblyOptions::default().max_prompt_file_bytes;
+    let mut max_skill_file_bytes = PromptAssemblyOptions::default().max_skill_file_bytes;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target-home" => {
+                i += 1;
+                target_home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+            }
+            "--queue-id" => {
+                i += 1;
+                queue_id = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--queue-id requires a value".to_string())?,
+                );
+            }
+            "--codex-exe" => {
+                i += 1;
+                codex_exe = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--codex-exe requires a path".to_string())?,
+                );
+            }
+            "--timeout-ms" => {
+                i += 1;
+                timeout_ms = args
+                    .get(i)
+                    .ok_or_else(|| "--timeout-ms requires a positive integer".to_string())
+                    .and_then(|value| parse_u64(value, "--timeout-ms"))?;
+            }
+            "--max-prompt-file-bytes" => {
+                i += 1;
+                max_prompt_file_bytes = args
+                    .get(i)
+                    .ok_or_else(|| {
+                        "--max-prompt-file-bytes requires a positive integer".to_string()
+                    })
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--max-skill-file-bytes" => {
+                i += 1;
+                max_skill_file_bytes = args
+                    .get(i)
+                    .ok_or_else(|| "--max-skill-file-bytes requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(RuntimeRunOnceArgs {
+        target_home,
+        queue_id,
+        codex_exe,
+        timeout_ms,
         max_prompt_file_bytes,
         max_skill_file_bytes,
     })
@@ -2442,6 +2543,63 @@ fn print_runtime_queue_prepare_report(report: &RuntimeQueuePrepareReport) {
     }
 }
 
+fn print_runtime_run_once_report(report: &RuntimeRunOnceReport) {
+    println!("OpenClaw runtime run once");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Report file: {}", report.report_file.display());
+    println!("Receipts file: {}", report.receipts_file.display());
+    println!("Receipt: {:?}", report.receipt.status);
+    println!("Reason: {}", report.receipt.reason);
+    if let Some(queue_id) = &report.receipt.queue_id {
+        println!("Queue id: {queue_id}");
+    }
+    if let Some(execution_dir) = &report.receipt.execution_dir {
+        println!("Execution dir: {}", execution_dir.display());
+    }
+    if let Some(prepare) = &report.prepare {
+        println!("Prepare receipt: {:?}", prepare.receipt.status);
+    }
+    if let Some(plan) = &report.plan {
+        println!("Plan receipt: {:?}", plan.receipt.status);
+        if let Some(plan_file) = &plan.plan_file {
+            println!("Plan file: {}", plan_file.display());
+        }
+    }
+    if let Some(run) = &report.run {
+        println!("Run receipt: {:?}", run.receipt.status);
+        println!("Run reason: {}", run.receipt.reason);
+        if let Some(run_file) = &run.run_file {
+            println!("Run report: {}", run_file.display());
+        }
+        if let Some(stdout_log) = &run.stdout_log {
+            println!("Stdout JSONL log: {}", stdout_log.display());
+        }
+        if let Some(stderr_log) = &run.stderr_log {
+            println!("Stderr log: {}", stderr_log.display());
+        }
+    }
+    if let Some(outbox_file) = &report.outbox_file {
+        println!("Outbox file: {}", outbox_file.display());
+    }
+    if let Some(message) = &report.outbound_message {
+        println!(
+            "Outbound: {:?} platform={} channel={} user={} session={}",
+            message.kind,
+            message.platform,
+            message.channel_id,
+            message.user_id,
+            message.session_key
+        );
+        println!("Outbound text: {}", message.text);
+    }
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
 fn print_codex_runtime_plan_report(report: &CodexRuntimePlanReport) {
     println!("OpenClaw Codex runtime plan");
     println!("Harness home: {}", report.harness_home.display());
@@ -2842,6 +3000,7 @@ fn print_help() {
     println!("  channel-receive Handle one DM into command outbox or runtime queue");
     println!("  queue-enqueue   Persist one channel agent turn to the runtime queue");
     println!("  queue-prepare   Prepare one queued runtime item for Codex execution");
+    println!("  runtime-run-once Prepare, run, and outbox one queued runtime item");
     println!("  codex-plan      Plan Codex app-server invocation for prepared execution");
     println!("  codex-preflight Check a Codex runtime plan before process start");
     println!("  codex-launch-probe Start and stop Codex app-server without a model request");
@@ -2873,7 +3032,7 @@ fn print_help() {
     println!("  --session-key <key>     Existing session key override");
     println!("  --queue-id <id>         Select one runtime queue item for queue-prepare");
     println!("  --execution-dir <path>  Prepared execution directory for codex-plan");
-    println!("  --codex-exe <path>      Codex executable path for codex-plan");
+    println!("  --codex-exe <path>      Codex executable path for codex-plan/runtime-run-once");
     println!("  --plan-file <path>      Codex runtime plan file for codex-preflight");
     println!("  --startup-probe-ms <n>  Milliseconds to keep app-server alive for launch probe");
     println!("  --timeout-ms <n>        Milliseconds to wait for codex-run completion");

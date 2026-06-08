@@ -115,6 +115,7 @@ pub struct ChannelOutboundMessage {
 #[serde(rename_all = "kebab-case")]
 pub enum ChannelOutboundMessageKind {
     CommandReply,
+    AgentReply,
     ErrorReply,
 }
 

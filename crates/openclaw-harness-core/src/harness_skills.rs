@@ -92,7 +92,12 @@ Before replacing the Docker OpenClaw gateway:
 
 ## Codex Runtime Flow
 
-For one prepared turn, the current safe path is:
+For a normal queued channel turn, the current worker-facing path is runtime-run-once:
+
+- It prepares one queue item, plans Codex, runs Codex app-server, records transcript/trajectory/Codex binding outputs, and writes an agent-reply message to state/channels/outbox.jsonl.
+- If the Codex completion receipt already exists, it skips the model request/outbox write to avoid duplicate delivery.
+
+For manual debugging of one prepared turn, the expanded path is:
 
 1. channel-receive for an incoming Telegram/Discord-style message.
 2. queue-prepare to assemble prompt-bundle.json and prompt.md.
