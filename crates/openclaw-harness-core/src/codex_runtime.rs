@@ -12,6 +12,10 @@ use serde_json::Value;
 const CODEX_RUNTIME_PLAN_SCHEMA: &str = "openclaw-harness.codex-runtime-plan.v1";
 const CODEX_RUNTIME_PREFLIGHT_SCHEMA: &str = "openclaw-harness.codex-runtime-preflight.v1";
 const CODEX_RUNTIME_LAUNCH_PROBE_SCHEMA: &str = "openclaw-harness.codex-runtime-launch-probe.v1";
+const CODEX_RUNTIME_COMPLETION_SCHEMA: &str = "openclaw-harness.codex-runtime-completion.v1";
+const CODEX_TRANSCRIPT_MESSAGE_SCHEMA: &str = "openclaw-harness.transcript-message.v1";
+const CODEX_TRAJECTORY_EVENT_SCHEMA: &str = "openclaw-harness.trajectory-event.v1";
+const CODEX_BINDING_SCHEMA: &str = "openclaw-harness.codex-binding.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRuntimePlanOptions {
@@ -33,6 +37,15 @@ pub struct CodexRuntimeLaunchProbeOptions {
     pub execution_dir: Option<PathBuf>,
     pub plan_file: Option<PathBuf>,
     pub startup_probe_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexRuntimeCompletionOptions {
+    pub harness_home: PathBuf,
+    pub execution_dir: Option<PathBuf>,
+    pub plan_file: Option<PathBuf>,
+    pub assistant_message: String,
+    pub finished_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -74,6 +87,22 @@ pub struct CodexRuntimeLaunchProbeReport {
     pub receipts_file: PathBuf,
     pub receipt: CodexRuntimeLaunchProbeReceipt,
     pub process: Option<CodexRuntimeLaunchProcess>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRuntimeCompletionReport {
+    pub schema: &'static str,
+    pub harness_home: PathBuf,
+    pub execution_dir: Option<PathBuf>,
+    pub plan_file: Option<PathBuf>,
+    pub completion_file: Option<PathBuf>,
+    pub receipts_file: PathBuf,
+    pub receipt: CodexRuntimeCompletionReceipt,
+    pub transcript_file: Option<PathBuf>,
+    pub trajectory_file: Option<PathBuf>,
+    pub codex_binding_file: Option<PathBuf>,
     pub warnings: Vec<String>,
 }
 
@@ -170,6 +199,20 @@ pub struct CodexRuntimeLaunchProbeReceipt {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRuntimeCompletionReceipt {
+    pub queue_id: Option<String>,
+    pub status: CodexRuntimeCompletionStatus,
+    pub execution_dir: Option<PathBuf>,
+    pub plan_file: Option<PathBuf>,
+    pub completion_file: Option<PathBuf>,
+    pub transcript_file: Option<PathBuf>,
+    pub trajectory_file: Option<PathBuf>,
+    pub codex_binding_file: Option<PathBuf>,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CodexRuntimeLaunchProbeStatus {
@@ -179,6 +222,14 @@ pub enum CodexRuntimeLaunchProbeStatus {
     NoRuntimePlan,
     SpawnFailed,
     TerminationFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexRuntimeCompletionStatus {
+    Recorded,
+    AlreadyRecorded,
+    NoRuntimePlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -225,6 +276,53 @@ struct CodexRuntimePlanFile {
     pub prompt_markdown: PathBuf,
     pub invocation: CodexInvocationPlan,
     pub outputs: CodexOutputPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexTranscriptMessage {
+    schema: &'static str,
+    queue_id: Option<String>,
+    session_key: String,
+    agent_id: Option<String>,
+    role: &'static str,
+    content: String,
+    provider: Option<String>,
+    model: Option<String>,
+    source: &'static str,
+    at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexTrajectoryEvent {
+    schema: &'static str,
+    queue_id: Option<String>,
+    session_key: String,
+    agent_id: Option<String>,
+    event: &'static str,
+    role: Option<&'static str>,
+    provider: Option<String>,
+    model: Option<String>,
+    at_ms: i64,
+    detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexBindingRecord {
+    schema: &'static str,
+    queue_id: Option<String>,
+    session_key: String,
+    agent_id: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    prompt_bundle_json: PathBuf,
+    prompt_markdown: PathBuf,
+    transcript_file: PathBuf,
+    trajectory_file: PathBuf,
+    completion_file: PathBuf,
+    completed_at_ms: i64,
 }
 
 pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexRuntimePlanReport> {
@@ -590,6 +688,122 @@ pub fn probe_codex_runtime_launch(
     )
 }
 
+pub fn record_codex_runtime_completion(
+    options: CodexRuntimeCompletionOptions,
+) -> io::Result<CodexRuntimeCompletionReport> {
+    let queue_dir = options.harness_home.join("state").join("runtime-queue");
+    let receipts_file = queue_dir.join("codex-runtime-completion-receipts.jsonl");
+    fs::create_dir_all(&queue_dir)?;
+    let mut warnings = Vec::new();
+    let Some(plan_file) = resolve_preflight_plan_file(
+        &CodexRuntimePreflightOptions {
+            harness_home: options.harness_home.clone(),
+            execution_dir: options.execution_dir.clone(),
+            plan_file: options.plan_file.clone(),
+        },
+        &mut warnings,
+    )?
+    else {
+        let receipt = CodexRuntimeCompletionReceipt {
+            queue_id: None,
+            status: CodexRuntimeCompletionStatus::NoRuntimePlan,
+            execution_dir: options.execution_dir,
+            plan_file: options.plan_file,
+            completion_file: None,
+            transcript_file: None,
+            trajectory_file: None,
+            codex_binding_file: None,
+            reason: "no codex runtime plan found; run codex-plan first".to_string(),
+        };
+        append_json_line(&receipts_file, &receipt)?;
+        return Ok(CodexRuntimeCompletionReport {
+            schema: CODEX_RUNTIME_COMPLETION_SCHEMA,
+            harness_home: options.harness_home,
+            execution_dir: receipt.execution_dir.clone(),
+            plan_file: receipt.plan_file.clone(),
+            completion_file: None,
+            receipts_file,
+            receipt,
+            transcript_file: None,
+            trajectory_file: None,
+            codex_binding_file: None,
+            warnings,
+        });
+    };
+
+    let plan: CodexRuntimePlanFile = read_json_file_as(&plan_file)?;
+    let execution_dir = plan_file.parent().map(Path::to_path_buf);
+    let completion_file = execution_dir
+        .as_ref()
+        .map(|dir| dir.join("codex-runtime-completion-receipt.json"));
+    if let Some(existing_file) = &completion_file
+        && existing_file.is_file()
+    {
+        let existing: CodexRuntimeCompletionReceipt = read_json_file_as(existing_file)?;
+        if existing.status == CodexRuntimeCompletionStatus::Recorded {
+            let receipt = CodexRuntimeCompletionReceipt {
+                queue_id: existing.queue_id.clone(),
+                status: CodexRuntimeCompletionStatus::AlreadyRecorded,
+                execution_dir: existing.execution_dir.clone(),
+                plan_file: Some(plan_file),
+                completion_file: Some(existing_file.clone()),
+                transcript_file: existing.transcript_file.clone(),
+                trajectory_file: existing.trajectory_file.clone(),
+                codex_binding_file: existing.codex_binding_file.clone(),
+                reason: "codex runtime completion was already recorded".to_string(),
+            };
+            append_json_line(&receipts_file, &receipt)?;
+            return Ok(CodexRuntimeCompletionReport {
+                schema: CODEX_RUNTIME_COMPLETION_SCHEMA,
+                harness_home: options.harness_home,
+                execution_dir: receipt.execution_dir.clone(),
+                plan_file: receipt.plan_file.clone(),
+                completion_file: receipt.completion_file.clone(),
+                receipts_file,
+                transcript_file: receipt.transcript_file.clone(),
+                trajectory_file: receipt.trajectory_file.clone(),
+                codex_binding_file: receipt.codex_binding_file.clone(),
+                receipt,
+                warnings,
+            });
+        }
+    }
+
+    record_completion_outputs(&plan, &options)?;
+    let receipt = CodexRuntimeCompletionReceipt {
+        queue_id: plan.queue_id.clone(),
+        status: CodexRuntimeCompletionStatus::Recorded,
+        execution_dir: execution_dir.clone(),
+        plan_file: Some(plan_file),
+        completion_file: completion_file.clone(),
+        transcript_file: Some(plan.outputs.transcript_file.clone()),
+        trajectory_file: Some(plan.outputs.trajectory_file.clone()),
+        codex_binding_file: Some(plan.outputs.codex_binding_file.clone()),
+        reason: "codex runtime completion recorded to transcript and trajectory".to_string(),
+    };
+    if let Some(completion_file) = &completion_file {
+        fs::write(
+            completion_file,
+            serde_json::to_string_pretty(&receipt).map_err(io::Error::other)?,
+        )?;
+    }
+    append_json_line(&receipts_file, &receipt)?;
+
+    Ok(CodexRuntimeCompletionReport {
+        schema: CODEX_RUNTIME_COMPLETION_SCHEMA,
+        harness_home: options.harness_home,
+        execution_dir,
+        plan_file: receipt.plan_file.clone(),
+        completion_file,
+        receipts_file,
+        transcript_file: receipt.transcript_file.clone(),
+        trajectory_file: receipt.trajectory_file.clone(),
+        codex_binding_file: receipt.codex_binding_file.clone(),
+        receipt,
+        warnings,
+    })
+}
+
 fn write_launch_probe_report(
     report: CodexRuntimeLaunchProbeReport,
     append_receipt: bool,
@@ -602,6 +816,122 @@ fn write_launch_probe_report(
         append_json_line(&report.receipts_file, &report.receipt)?;
     }
     Ok(report)
+}
+
+fn record_completion_outputs(
+    plan: &CodexRuntimePlanFile,
+    options: &CodexRuntimeCompletionOptions,
+) -> io::Result<()> {
+    fs::create_dir_all(parent_dir(&plan.outputs.transcript_file)?)?;
+    fs::create_dir_all(parent_dir(&plan.outputs.trajectory_file)?)?;
+    fs::create_dir_all(parent_dir(&plan.outputs.codex_binding_file)?)?;
+
+    if let Some(user_message) = prompt_bundle_user_message(&plan.prompt_bundle_json)? {
+        append_json_line(
+            &plan.outputs.transcript_file,
+            &CodexTranscriptMessage {
+                schema: CODEX_TRANSCRIPT_MESSAGE_SCHEMA,
+                queue_id: plan.queue_id.clone(),
+                session_key: plan.session_key.clone(),
+                agent_id: plan.agent_id.clone(),
+                role: "user",
+                content: user_message,
+                provider: plan.provider.clone(),
+                model: plan.model.clone(),
+                source: "prompt-bundle",
+                at_ms: options.finished_at_ms,
+            },
+        )?;
+        append_json_line(
+            &plan.outputs.trajectory_file,
+            &CodexTrajectoryEvent {
+                schema: CODEX_TRAJECTORY_EVENT_SCHEMA,
+                queue_id: plan.queue_id.clone(),
+                session_key: plan.session_key.clone(),
+                agent_id: plan.agent_id.clone(),
+                event: "user-message-recorded",
+                role: Some("user"),
+                provider: plan.provider.clone(),
+                model: plan.model.clone(),
+                at_ms: options.finished_at_ms,
+                detail: "inbound message copied from prompt bundle".to_string(),
+            },
+        )?;
+    }
+    append_json_line(
+        &plan.outputs.transcript_file,
+        &CodexTranscriptMessage {
+            schema: CODEX_TRANSCRIPT_MESSAGE_SCHEMA,
+            queue_id: plan.queue_id.clone(),
+            session_key: plan.session_key.clone(),
+            agent_id: plan.agent_id.clone(),
+            role: "assistant",
+            content: options.assistant_message.clone(),
+            provider: plan.provider.clone(),
+            model: plan.model.clone(),
+            source: "codex-runtime-completion",
+            at_ms: options.finished_at_ms,
+        },
+    )?;
+    append_json_line(
+        &plan.outputs.trajectory_file,
+        &CodexTrajectoryEvent {
+            schema: CODEX_TRAJECTORY_EVENT_SCHEMA,
+            queue_id: plan.queue_id.clone(),
+            session_key: plan.session_key.clone(),
+            agent_id: plan.agent_id.clone(),
+            event: "assistant-message-recorded",
+            role: Some("assistant"),
+            provider: plan.provider.clone(),
+            model: plan.model.clone(),
+            at_ms: options.finished_at_ms,
+            detail: "assistant message recorded by codex completion sink".to_string(),
+        },
+    )?;
+    let completion_file = plan
+        .invocation
+        .working_directory
+        .join("codex-runtime-completion-receipt.json");
+    fs::write(
+        &plan.outputs.codex_binding_file,
+        serde_json::to_string_pretty(&CodexBindingRecord {
+            schema: CODEX_BINDING_SCHEMA,
+            queue_id: plan.queue_id.clone(),
+            session_key: plan.session_key.clone(),
+            agent_id: plan.agent_id.clone(),
+            provider: plan.provider.clone(),
+            model: plan.model.clone(),
+            prompt_bundle_json: plan.prompt_bundle_json.clone(),
+            prompt_markdown: plan.prompt_markdown.clone(),
+            transcript_file: plan.outputs.transcript_file.clone(),
+            trajectory_file: plan.outputs.trajectory_file.clone(),
+            completion_file,
+            completed_at_ms: options.finished_at_ms,
+        })
+        .map_err(io::Error::other)?,
+    )?;
+    Ok(())
+}
+
+fn parent_dir(path: &Path) -> io::Result<&Path> {
+    path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path has no parent: {}", path.display()),
+        )
+    })
+}
+
+fn prompt_bundle_user_message(prompt_bundle_json: &Path) -> io::Result<Option<String>> {
+    let value = read_json_file(prompt_bundle_json)?;
+    let Some(sections) = value.get("sections").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    Ok(sections.iter().find_map(|section| {
+        (string_field(section, &["kind"]) == Some("user-message"))
+            .then(|| string_field(section, &["content"]).map(ToString::to_string))
+            .flatten()
+    }))
 }
 
 struct LaunchProbeProcessResult {
@@ -1155,6 +1485,9 @@ fn read_json_file_as<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T>
 }
 
 fn append_json_line(path: &Path, value: &impl Serialize) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     let line = serde_json::to_string(value).map_err(io::Error::other)?;
     writeln!(file, "{line}")?;
@@ -1494,6 +1827,67 @@ mod tests {
         );
         assert!(report.process.is_none());
         assert!(report.receipts_file.is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn record_codex_runtime_completion_writes_outputs_idempotently() {
+        let root = temp_root("record_codex_runtime_completion_writes_outputs_idempotently");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+
+        let report = record_codex_runtime_completion(CodexRuntimeCompletionOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            assistant_message: "Recorded assistant reply.".to_string(),
+            finished_at_ms: 12345,
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.receipt.status,
+            CodexRuntimeCompletionStatus::Recorded
+        );
+        let transcript_file = report.transcript_file.clone().unwrap();
+        let trajectory_file = report.trajectory_file.clone().unwrap();
+        let binding_file = report.codex_binding_file.clone().unwrap();
+        assert!(transcript_file.is_file());
+        assert!(trajectory_file.is_file());
+        assert!(binding_file.is_file());
+        let transcript = fs::read_to_string(&transcript_file).unwrap();
+        assert_eq!(transcript.lines().count(), 2);
+        assert!(transcript.contains("\"role\":\"user\""));
+        assert!(transcript.contains("\"role\":\"assistant\""));
+        assert!(transcript.contains("Recorded assistant reply."));
+        let binding: Value = serde_json::from_slice(&fs::read(binding_file).unwrap()).unwrap();
+        assert_eq!(binding["schema"], CODEX_BINDING_SCHEMA);
+        assert_eq!(binding["sessionKey"], "telegram:dm-42:user-7:main");
+
+        let second = record_codex_runtime_completion(CodexRuntimeCompletionOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            assistant_message: "Should not be duplicated.".to_string(),
+            finished_at_ms: 12346,
+        })
+        .unwrap();
+        assert_eq!(
+            second.receipt.status,
+            CodexRuntimeCompletionStatus::AlreadyRecorded
+        );
+        assert_eq!(
+            fs::read_to_string(transcript_file).unwrap().lines().count(),
+            2
+        );
 
         let _ = fs::remove_dir_all(root);
     }
