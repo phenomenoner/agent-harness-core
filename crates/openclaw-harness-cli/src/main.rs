@@ -121,6 +121,12 @@ fn run_doctor(args: &[String]) -> Result<(), String> {
     println!("Deterministic cron logs: {}", inv.deterministic_cron_logs);
     println!("Subagent state files: {}", inv.subagent_state_files);
     println!("Memory files: {}", inv.memory_files);
+    println!("Memory qdrant-edge: {}", yes_no(inv.memory_qdrant_edge));
+    println!("Memory LanceDB: {}", yes_no(inv.memory_lancedb));
+    println!(
+        "Memory openclaw-mem.sqlite: {}",
+        yes_no(inv.memory_openclaw_mem_sqlite)
+    );
     println!(
         "Plugin install record: {}",
         yes_no(inv.plugin_install_record)

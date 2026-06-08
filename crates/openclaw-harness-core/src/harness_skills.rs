@@ -46,6 +46,7 @@ Use it when the user mentions:
 6. Keep Telegram and Discord session keys stable: platform, channel id, user id, and agent id determine continuity unless /new changes it.
 7. Keep multi-agent readiness intact. Do not collapse imported agents into a single default agent.
 8. Treat credentials as best-effort imports. Codex OAuth is preferred for Codex models; API keys may be provider-specific and model-limited.
+9. Treat memory/qdrant-edge as the primary memory backend when present. LanceDB is backup/optional unless the active OpenClaw config points to it.
 
 ## Prompt And Tool Schema Policy
 
@@ -101,7 +102,8 @@ Before replacing the Docker OpenClaw gateway:
 6. Confirm logs are written to state/logs/harness.jsonl.
 7. Smoke-test a Telegram command message with telegram-poll-once when TELEGRAM_BOT_TOKEN is configured, or with channel-run-once when testing offline.
 8. Confirm enable-check reports telegram-offset, telegram-poll-log, and discord-send-log after channel adapter smoke tests.
-9. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt.
+9. Confirm memory-qdrant-edge is present when current OpenClaw uses Qdrant edge as primary memory backend.
+10. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt.
 
 ## Codex Runtime Flow
 

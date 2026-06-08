@@ -151,6 +151,8 @@ Cron import has two separate lanes: OpenClaw native agent-turn cron under `.open
 
 This workspace disables Codex-side `openclaw-mem` gateway lookups through [AGENTS.md](AGENTS.md). The harness product requirement still includes importing existing OpenClaw memory files/databases and supporting memory adapters when enabled.
 
+Memory import treats `memory/qdrant-edge` as the primary backend when present. `openclaw-mem.sqlite`, memory JSONL files, and Markdown memory are still imported as snapshot/audit sources; LanceDB is treated as backup/optional unless the active source config points to it.
+
 The cutover checklist is tracked in [Activation Readiness Plan](docs/activation-readiness-plan.md).
 
 See [Project Assessment](docs/project-assessment.md).

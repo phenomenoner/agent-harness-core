@@ -438,10 +438,10 @@ fn check_log_event(
 fn check_memory_import(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
     let memory_dir = harness_home.join("memory");
     if memory_dir.is_dir() {
-        checks.push(warn(
+        checks.push(pass(
             "memory-adapter",
             format!(
-                "memory files are imported at {}, but native memory query adapter is not enabled yet",
+                "memory files are imported at {}; native memory query adapter is still pending",
                 memory_dir.display()
             ),
         ));
@@ -449,6 +449,64 @@ fn check_memory_import(harness_home: &Path, checks: &mut Vec<ActivationReadiness
         checks.push(warn(
             "memory-adapter",
             "no imported memory directory detected; memory recall will be unavailable",
+        ));
+        return;
+    }
+
+    let qdrant_edge = memory_dir.join("qdrant-edge");
+    if qdrant_edge.is_dir() {
+        checks.push(pass(
+            "memory-qdrant-edge",
+            format!(
+                "primary Qdrant edge memory backend found at {}",
+                qdrant_edge.display()
+            ),
+        ));
+    } else {
+        checks.push(warn(
+            "memory-qdrant-edge",
+            format!(
+                "primary Qdrant edge memory backend not found at {}; memory recall may fall back to SQLite/LanceDB or be unavailable",
+                qdrant_edge.display()
+            ),
+        ));
+    }
+
+    let sqlite = memory_dir.join("openclaw-mem.sqlite");
+    if sqlite.is_file() {
+        checks.push(pass(
+            "memory-openclaw-mem-sqlite",
+            format!(
+                "OpenClaw memory SQLite snapshot found at {}",
+                sqlite.display()
+            ),
+        ));
+    } else {
+        checks.push(warn(
+            "memory-openclaw-mem-sqlite",
+            format!(
+                "OpenClaw memory SQLite snapshot not found at {}",
+                sqlite.display()
+            ),
+        ));
+    }
+
+    let lancedb = memory_dir.join("lancedb");
+    if lancedb.is_dir() {
+        checks.push(pass(
+            "memory-lancedb",
+            format!(
+                "LanceDB backup memory backend found at {}",
+                lancedb.display()
+            ),
+        ));
+    } else {
+        checks.push(warn(
+            "memory-lancedb",
+            format!(
+                "LanceDB backup backend not found at {}; acceptable when Qdrant edge is primary",
+                lancedb.display()
+            ),
         ));
     }
 }

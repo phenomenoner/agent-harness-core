@@ -71,7 +71,8 @@ The project should be split into small boundaries:
 6. Memory integration
    - Treat `openclaw-mem` as a first-class external service and data source.
    - Use gateway/pack/search contracts instead of direct SQLite mutation where possible.
-   - Preserve raw Markdown memory, JSONL observation logs, SQLite DBs, LanceDB/Qdrant/Postgres side data, and receipts.
+   - Preserve raw Markdown memory, JSONL observation logs, SQLite DBs, Qdrant edge data, LanceDB backup data, graph/vector sidecars, and receipts.
+   - Treat `memory/qdrant-edge` as the primary vector backend when present. LanceDB is backup/optional and should not block initial activation when Qdrant edge and SQLite snapshots are present.
 
 7. Skill-first runtime
    - Treat skills as procedural memory that the harness can discover, rank, view, create, patch, and reference per task.
@@ -169,7 +170,8 @@ Importer policy borrowed from Hermes:
    - Keep subagent execution behind a queue with per-agent concurrency limits, cancellation, retries, and receipt files.
 
 9. Memory import
-   - Preserve `.openclaw/memory/*.md`, `openclaw-mem.sqlite`, `openclaw-mem-observations.jsonl`, `openclaw-mem-episodes.jsonl`, mem-engine DBs, LanceDB data, and graph/vector sidecars.
+   - Preserve `.openclaw/memory/*.md`, `openclaw-mem.sqlite`, `openclaw-mem-observations.jsonl`, `openclaw-mem-episodes.jsonl`, mem-engine DBs, `qdrant-edge`, LanceDB backup data, and graph/vector sidecars.
+   - Import `qdrant-edge` before LanceDB because the current OpenClaw memory backend uses Qdrant edge as primary and LanceDB as backup.
    - SQLite files should be copied from a stopped gateway or through a backup API to avoid WAL loss.
 
 10. Plugin import
@@ -243,6 +245,8 @@ Required for a real cutover:
 
 9. Memory
    - Import raw memory files and DB snapshots without requiring a running gateway.
+   - Prioritize Qdrant edge as the primary memory database backend when `memory/qdrant-edge` exists.
+   - Treat LanceDB as backup/optional during first handoff unless the active OpenClaw config explicitly points to LanceDB.
    - Optional `openclaw-mem` gateway adapter for pack/search/propose when an operator enables it.
    - Restore mem-engine lookup/writeback jobs.
    - Treat imported memory as evidence, not executable instruction.

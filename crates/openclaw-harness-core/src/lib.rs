@@ -194,6 +194,9 @@ pub struct OpenClawInventory {
     pub deterministic_cron_logs: usize,
     pub subagent_state_files: usize,
     pub memory_files: usize,
+    pub memory_qdrant_edge: bool,
+    pub memory_lancedb: bool,
+    pub memory_openclaw_mem_sqlite: bool,
     pub plugin_install_record: bool,
     pub plugin_state_db: bool,
 }
@@ -219,6 +222,9 @@ impl OpenClawInventory {
             && self.deterministic_cron_logs == 0
             && self.subagent_state_files == 0
             && self.memory_files == 0
+            && !self.memory_qdrant_edge
+            && !self.memory_lancedb
+            && !self.memory_openclaw_mem_sqlite
             && !self.plugin_install_record
             && !self.plugin_state_db
     }
@@ -292,7 +298,11 @@ pub fn inventory(source: OpenClawSource) -> io::Result<OpenClawInventory> {
             .join("logs"),
     )?;
     let subagent_state_files = count_regular_files(&source.home.join("subagents"))?;
-    let memory_files = count_regular_files(&source.home.join("memory"))?;
+    let memory_root = source.home.join("memory");
+    let memory_files = count_regular_files(&memory_root)?;
+    let memory_qdrant_edge = memory_root.join("qdrant-edge").is_dir();
+    let memory_lancedb = memory_root.join("lancedb").is_dir();
+    let memory_openclaw_mem_sqlite = memory_root.join("openclaw-mem.sqlite").is_file();
     let plugin_install_record = source.home.join("plugins").join("installs.json").is_file();
     let plugin_state_db = source
         .home
@@ -321,6 +331,9 @@ pub fn inventory(source: OpenClawSource) -> io::Result<OpenClawInventory> {
         deterministic_cron_logs,
         subagent_state_files,
         memory_files,
+        memory_qdrant_edge,
+        memory_lancedb,
+        memory_openclaw_mem_sqlite,
         plugin_install_record,
         plugin_state_db,
     })
@@ -458,8 +471,11 @@ pub fn build_import_plan(inv: &OpenClawInventory) -> ImportPlan {
             ImportPhaseStatus::Ready
         },
         notes: vec![format!(
-            "{} memory files found; SQLite sources require stopped gateway or backup API",
-            inv.memory_files
+            "{} memory files found; qdrant-edge={}, lancedb={}, openclaw-mem.sqlite={}; qdrant-edge is the primary backend when present, LanceDB is backup/optional, and SQLite sources require stopped gateway or backup API",
+            inv.memory_files,
+            inv.memory_qdrant_edge,
+            inv.memory_lancedb,
+            inv.memory_openclaw_mem_sqlite
         )],
     });
 
@@ -626,6 +642,8 @@ mod tests {
         fs::create_dir_all(&deterministic_jobs).unwrap();
         fs::create_dir_all(&deterministic_logs).unwrap();
         fs::create_dir_all(home.join("memory")).unwrap();
+        fs::create_dir_all(home.join("memory").join("qdrant-edge")).unwrap();
+        fs::create_dir_all(home.join("memory").join("lancedb")).unwrap();
         fs::create_dir_all(home.join("plugins")).unwrap();
         fs::create_dir_all(home.join("plugin-state")).unwrap();
         fs::create_dir_all(home.join("subagents")).unwrap();
@@ -665,6 +683,7 @@ mod tests {
         fs::write(deterministic_logs.join("supercronic.log"), "").unwrap();
         fs::write(home.join("subagents").join("runs.json"), "{\"runs\":[]}").unwrap();
         fs::write(home.join("memory").join("2026-06-08.md"), "# Memory").unwrap();
+        fs::write(home.join("memory").join("openclaw-mem.sqlite"), "").unwrap();
         fs::write(home.join("plugins").join("installs.json"), "{}").unwrap();
         fs::write(home.join("plugin-state").join("state.sqlite"), "").unwrap();
 
@@ -688,7 +707,10 @@ mod tests {
         assert_eq!(inv.deterministic_cron_job_scripts, 1);
         assert_eq!(inv.deterministic_cron_logs, 1);
         assert_eq!(inv.subagent_state_files, 1);
-        assert_eq!(inv.memory_files, 1);
+        assert_eq!(inv.memory_files, 2);
+        assert!(inv.memory_qdrant_edge);
+        assert!(inv.memory_lancedb);
+        assert!(inv.memory_openclaw_mem_sqlite);
         assert!(inv.plugin_install_record);
         assert!(inv.plugin_state_db);
 
@@ -718,6 +740,9 @@ mod tests {
             deterministic_cron_logs: 3,
             subagent_state_files: 1,
             memory_files: 3,
+            memory_qdrant_edge: true,
+            memory_lancedb: true,
+            memory_openclaw_mem_sqlite: true,
             plugin_install_record: true,
             plugin_state_db: true,
         };

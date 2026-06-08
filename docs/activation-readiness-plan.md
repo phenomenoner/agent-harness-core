@@ -102,6 +102,9 @@ These should be run before stopping the Docker gateway.
 6. Historical state smoke
    - Confirm imported session indexes and transcript files are present.
    - Confirm memory files/databases are imported or explicitly documented as unavailable.
+   - Confirm `memory/qdrant-edge` is present when Qdrant edge is the active OpenClaw memory backend.
+   - Confirm `openclaw-mem.sqlite` and memory JSONL files are present as snapshot/audit sources.
+   - Treat LanceDB as backup/optional unless the active config points to LanceDB.
    - Confirm subagent ledgers are held by default.
 
 ## Remaining Development To Formal Activation
@@ -128,6 +131,8 @@ These should be run before stopping the Docker gateway.
 
 5. Memory adapter
    - Imported memory file/database inventory check.
+   - Qdrant edge import/read adapter first, because current OpenClaw uses Qdrant edge as the primary backend.
+   - LanceDB import/read support as backup/fallback, not as the first activation blocker.
    - Optional openclaw-mem gateway adapter when explicitly enabled.
    - Memory pack/search/propose integration into prompt assembly.
 
