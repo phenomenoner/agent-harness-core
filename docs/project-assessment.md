@@ -60,7 +60,7 @@ The project should be split into small boundaries:
 
 4. Channel layer
    - Telegram: use the current `telegram-poll-once` Bot API smoke adapter for activation tests and `telegram-loop` for operator-run handoff; consider `teloxide` when promoting this into a full async bot service.
-   - Discord: use `serenity`/`poise` for a faster bot implementation, or `twilight` when lower-level control matters.
+   - Discord: use the current `discord-outbox-send-once` REST sender for outbound smoke; use `serenity`/`poise` for a faster full bot implementation, or `twilight` when lower-level gateway control matters.
    - Normalize all inbound messages into one internal `ChannelEnvelope`.
 
 5. Plugin compatibility sidecar
@@ -303,6 +303,7 @@ Current implemented foundation:
 - `channel-run-once` is the single-message adapter/smoke entrypoint: it runs `channel-receive`, invokes `runtime-run-once` when the message is an ordinary agent turn, and returns pending outbox delivery work.
 - `channel-outbox-plan` and `channel-delivery-record` provide the shared Telegram/Discord delivery retry ledger: pending outbox messages get stable delivery ids, delivered receipts are skipped, failed receipts remain retryable, and delivery events are written to the operational log.
 - `telegram-poll-once` is the first real Telegram Bot API smoke adapter: it reads `TELEGRAM_BOT_TOKEN`, stores update offsets in `state/channels/telegram-offset.json`, normalizes text updates into `channel-run-once`, sends pending Telegram replies, records delivery receipts, and writes `telegram.poll-once` operational log summaries. `telegram-loop` repeats the same path with finite or infinite iterations for operator-run handoff.
+- `discord-outbox-send-once` is the first Discord delivery adapter: it reads `DISCORD_BOT_TOKEN`, sends pending Discord outbox messages through Discord REST, records delivery receipts, and writes `discord.outbox-send-once` operational log summaries. Discord gateway receive is still pending.
 - `queue-enqueue` and `queue-prepare` read channel command state from the target harness home so active session keys, model overrides, and steering/think/btw notes survive into queued turns and prompt bundles.
 - `queue-prepare` uses prepared execution receipts as idempotence state: automatic selection skips already prepared queue ids, while explicit `--queue-id` requests return an `AlreadyPrepared` no-op receipt with the prior output paths.
 - `queue-enqueue` persists channel agent-turn dispatches to `state/runtime-queue/pending.jsonl`, appends receipts to `state/runtime-queue/receipts.jsonl`, and precomputes OpenClaw-compatible transcript/trajectory paths for the future Codex runtime worker.
@@ -363,9 +364,9 @@ Current implemented foundation:
 ### Phase 3: Messaging Channels
 
 - Add Telegram channel. Current status: `telegram-poll-once` exists for smoke tests and `telegram-loop` exists for operator-run continuous polling; Windows service packaging and full health management are still pending.
-- Add Discord channel.
+- Add Discord channel. Current status: outbound REST delivery exists through `discord-outbox-send-once`; gateway receive is pending.
 - Implement channel session key compatibility.
-- Route real Telegram/Discord bot events into `channel-run-once` and deliver replies through the shared `channel-outbox-plan` / `channel-delivery-record` ledger. Telegram poll and loop coverage exists; Discord coverage is pending.
+- Route real Telegram/Discord bot events into `channel-run-once` and deliver replies through the shared `channel-outbox-plan` / `channel-delivery-record` ledger. Telegram poll/loop coverage exists; Discord outbound coverage exists; Discord inbound gateway coverage is pending.
 - Expose persisted command effects such as model switch, new session, steering notes, and stop requests through the real bot UX and status replies.
 - Implement approval UX for shell/tool requests.
 
@@ -391,7 +392,7 @@ Current implemented foundation:
 The project began as a Rust workspace with no external dependencies. Now that import reports and OpenClaw JSON parsing are in scope, `serde` and `serde_json` are part of the foundation. Additional crates should still be introduced only when the module that needs them is implemented:
 
 - `serde` and `serde_json` for report/config/session parsing and serialization.
-- `ureq` for the current one-shot Telegram Bot API smoke adapter.
+- `ureq` for the current Telegram/Discord REST smoke adapters.
 - `tokio` for async runtime.
 - `tracing` for logs.
 - `clap` for CLI.

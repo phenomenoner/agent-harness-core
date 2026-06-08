@@ -59,6 +59,7 @@ These must pass before cutover.
    - Confirm future `channel-outbox-plan` skips delivered messages and retries failed messages.
    - For Telegram smoke, set `TELEGRAM_BOT_TOKEN` and run `telegram-poll-once` against a controlled DM; confirm command replies and agent replies are delivered by the Bot API.
    - For Telegram handoff rehearsal, run `telegram-loop --iterations 0` only after confirming the old Docker gateway is not also consuming Telegram updates.
+   - For Discord outbound smoke, set `DISCORD_BOT_TOKEN`, create a Discord outbox item with `channel-run-once --platform discord ...`, then run `discord-outbox-send-once`.
 
 7. Logging gate
    - Run `enable-check`.
@@ -109,9 +110,10 @@ These should be run before stopping the Docker gateway.
    - Still required for formal service activation: Windows service or scheduled-task install path, health/status, graceful shutdown, token source hardening, and production retry policy.
 
 2. Real Discord adapter
-   - Receive Discord DM events through a gateway adapter.
+   - Done for outbound smoke: `discord-outbox-send-once` sends pending Discord outbox messages through Discord REST, records delivery receipts, and writes a delivery summary log.
+   - Still required for formal Discord activation: receive Discord DM events through a gateway adapter.
    - Normalize inbound DMs into `channel-run-once`.
-   - Deliver outbox messages and record receipts.
+   - Add gateway heartbeat/reconnect, dedupe, and health/status reporting.
 
 3. Worker loop
    - Turn `runtime-run-once` into a supervised loop.
@@ -149,6 +151,7 @@ cargo run -p openclaw-harness-cli -- help
 cargo run -p openclaw-harness-cli -- enable-check --target-home C:\path\to\.openclaw-harness
 cargo run -p openclaw-harness-cli -- telegram-poll-once --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.exe --poll-timeout-seconds 1 --max-updates 10
 cargo run -p openclaw-harness-cli -- telegram-loop --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.exe --iterations 1 --idle-ms 1000
+cargo run -p openclaw-harness-cli -- discord-outbox-send-once --target-home C:\path\to\.openclaw-harness --outbox-limit 20
 ```
 
 Use fake app-server tests for CI. Use real `codex app-server` only in operator-run smoke tests because it may make model requests.

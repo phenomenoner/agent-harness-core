@@ -85,6 +85,7 @@ Commands should update channel state and receipts before enqueueing agent turns.
 - Use channel-delivery-record after Telegram/Discord send attempts to record delivered or failed receipts.
 - Use telegram-poll-once for Telegram Bot API smoke tests. It reads TELEGRAM_BOT_TOKEN from the environment, stores offsets in state/channels/telegram-offset.json, runs channel-run-once for text updates, sends pending replies, records delivery receipts, and writes a telegram.poll-once operational log.
 - Use telegram-loop for operator-run Telegram handoff. It repeats the same poll-once path with --iterations, --idle-ms, and --max-consecutive-errors. Use finite iterations for tests and --iterations 0 only when the old gateway is not also consuming Telegram updates.
+- Use discord-outbox-send-once for Discord outbound smoke. It reads DISCORD_BOT_TOKEN, sends pending platform=discord outbox messages through Discord REST, records delivery receipts, and writes a discord.outbox-send-once operational log. Discord gateway receive is still pending.
 - Failed receipts stay retryable; delivered receipts are skipped by future outbox plans.
 - Do not send the same already recorded Codex completion twice.
 

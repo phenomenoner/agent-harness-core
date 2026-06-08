@@ -57,6 +57,7 @@ fn main() {
         "channel-delivery-record" => run_channel_delivery_record(&rest),
         "telegram-poll-once" => run_telegram_poll_once(&rest),
         "telegram-loop" => run_telegram_loop(&rest),
+        "discord-outbox-send-once" => run_discord_outbox_send_once(&rest),
         "queue-enqueue" => run_queue_enqueue(&rest),
         "queue-prepare" => run_queue_prepare(&rest),
         "runtime-run-once" => run_runtime_run_once(&rest),
@@ -721,6 +722,86 @@ fn execute_telegram_poll_once(
     Ok(report)
 }
 
+fn run_discord_outbox_send_once(args: &[String]) -> Result<(), String> {
+    let args = discord_outbox_send_once_args_from_args(args)?;
+    let token = discord_bot_token()?;
+    let delivery = plan_channel_outbox(ChannelOutboxPlanOptions {
+        harness_home: args.target_home.clone(),
+        platform: Some("discord".to_string()),
+        limit: args.outbox_limit,
+    })
+    .map_err(|err| err.to_string())?;
+    let mut warnings = delivery.warnings.clone();
+    let pending_count = delivery.pending.len();
+    let mut delivered_messages = 0;
+    let mut failed_deliveries = 0;
+
+    for pending in delivery.pending {
+        match discord_send_message(&token, &pending.message.channel_id, &pending.message.text) {
+            Ok(provider_message_id) => {
+                record_channel_delivery(ChannelDeliveryRecordOptions {
+                    harness_home: args.target_home.clone(),
+                    delivery_id: pending.delivery_id,
+                    status: ChannelDeliveryStatus::Delivered,
+                    platform: pending.message.platform,
+                    channel_id: pending.message.channel_id,
+                    user_id: pending.message.user_id,
+                    session_key: pending.message.session_key,
+                    provider_message_id,
+                    error: None,
+                    now_ms: current_time_ms()?,
+                })
+                .map_err(|err| err.to_string())?;
+                delivered_messages += 1;
+            }
+            Err(error) => {
+                record_channel_delivery(ChannelDeliveryRecordOptions {
+                    harness_home: args.target_home.clone(),
+                    delivery_id: pending.delivery_id,
+                    status: ChannelDeliveryStatus::Failed,
+                    platform: pending.message.platform,
+                    channel_id: pending.message.channel_id,
+                    user_id: pending.message.user_id,
+                    session_key: pending.message.session_key,
+                    provider_message_id: None,
+                    error: Some(error.clone()),
+                    now_ms: current_time_ms()?,
+                })
+                .map_err(|err| err.to_string())?;
+                warnings.push(error);
+                failed_deliveries += 1;
+            }
+        }
+    }
+
+    let report = DiscordOutboxSendOnceReport {
+        pending_count,
+        delivered_messages,
+        failed_deliveries,
+        warnings,
+    };
+    append_harness_log(
+        &args.target_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            if report.failed_deliveries == 0 {
+                HarnessLogLevel::Info
+            } else {
+                HarnessLogLevel::Warn
+            },
+            "discord",
+            "discord.outbox-send-once",
+            format!(
+                "pending={} delivered={} failed={}",
+                report.pending_count, report.delivered_messages, report.failed_deliveries
+            ),
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    print_discord_outbox_send_once_report(&report);
+    Ok(())
+}
+
 fn run_queue_enqueue(args: &[String]) -> Result<(), String> {
     let args = queue_enqueue_args_from_args(args)?;
     let registry = load_agent_registry(&args.turn.source).map_err(|err| err.to_string())?;
@@ -1119,6 +1200,18 @@ struct TelegramLoopArgs {
     iterations: usize,
     idle_ms: u64,
     max_consecutive_errors: usize,
+}
+
+struct DiscordOutboxSendOnceArgs {
+    target_home: PathBuf,
+    outbox_limit: usize,
+}
+
+struct DiscordOutboxSendOnceReport {
+    pending_count: usize,
+    delivered_messages: usize,
+    failed_deliveries: usize,
+    warnings: Vec<String>,
 }
 
 struct QueuePrepareArgs {
@@ -2185,6 +2278,40 @@ fn telegram_loop_args_from_args(args: &[String]) -> Result<TelegramLoopArgs, Str
     })
 }
 
+fn discord_outbox_send_once_args_from_args(
+    args: &[String],
+) -> Result<DiscordOutboxSendOnceArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut outbox_limit = 20;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target-home" => {
+                i += 1;
+                target_home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--target-home requires a path".to_string())?;
+            }
+            "--outbox-limit" => {
+                i += 1;
+                outbox_limit = args
+                    .get(i)
+                    .ok_or_else(|| "--outbox-limit requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(DiscordOutboxSendOnceArgs {
+        target_home,
+        outbox_limit,
+    })
+}
+
 fn queue_prepare_args_from_args(args: &[String]) -> Result<QueuePrepareArgs, String> {
     let mut target_home = default_harness_home();
     let mut queue_id = None;
@@ -2895,6 +3022,48 @@ fn telegram_http_error(error: ureq::Error) -> String {
     }
 }
 
+fn discord_bot_token() -> Result<String, String> {
+    env::var("DISCORD_BOT_TOKEN")
+        .map_err(|_| "DISCORD_BOT_TOKEN is required for Discord adapters".to_string())
+}
+
+fn discord_send_message(
+    token: &str,
+    channel_id: &str,
+    text: &str,
+) -> Result<Option<String>, String> {
+    if text.chars().count() > 2_000 {
+        return Err("Discord message exceeds the 2000 character content limit".to_string());
+    }
+    let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
+    let auth = format!("Bot {token}");
+    let response = ureq::post(&url)
+        .set("Authorization", &auth)
+        .set("Content-Type", "application/json")
+        .send_json(serde_json::json!({
+            "content": text,
+            "allowed_mentions": {
+                "parse": []
+            }
+        }))
+        .map_err(discord_http_error)?;
+    let value: serde_json::Value = response.into_json().map_err(|err| err.to_string())?;
+    Ok(value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string))
+}
+
+fn discord_http_error(error: ureq::Error) -> String {
+    match error {
+        ureq::Error::Status(code, response) => {
+            let body = response.into_string().unwrap_or_default();
+            format!("Discord HTTP status {code}: {body}")
+        }
+        ureq::Error::Transport(_) => "Discord transport error".to_string(),
+    }
+}
+
 fn parse_conflict_policy(value: &str) -> Result<ConflictPolicy, String> {
     match value {
         "skip" => Ok(ConflictPolicy::Skip),
@@ -3531,6 +3700,19 @@ fn print_telegram_poll_once_report(report: &TelegramPollOnceReport) {
     }
 }
 
+fn print_discord_outbox_send_once_report(report: &DiscordOutboxSendOnceReport) {
+    println!("OpenClaw Discord outbox send once");
+    println!("Pending messages: {}", report.pending_count);
+    println!("Delivered messages: {}", report.delivered_messages);
+    println!("Failed deliveries: {}", report.failed_deliveries);
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
 fn print_runtime_queue_enqueue_report(report: &RuntimeQueueEnqueueReport) {
     println!("OpenClaw runtime queue enqueue");
     println!("Harness home: {}", report.harness_home.display());
@@ -4080,6 +4262,7 @@ fn print_help() {
     println!("  channel-delivery-record Record delivery success or retryable failure");
     println!("  telegram-poll-once Poll Telegram once, run DM pipeline, and deliver replies");
     println!("  telegram-loop     Run Telegram polling continuously until stopped");
+    println!("  discord-outbox-send-once Send pending Discord outbox messages once");
     println!("  queue-enqueue   Persist one channel agent turn to the runtime queue");
     println!("  queue-prepare   Prepare one queued runtime item for Codex execution");
     println!("  runtime-run-once Prepare, run, and outbox one queued runtime item");
@@ -4123,6 +4306,7 @@ fn print_help() {
     println!("  --idle-ms <n>           Telegram loop sleep after each poll");
     println!("  --max-consecutive-errors <n> Telegram loop failure threshold");
     println!("  TELEGRAM_BOT_TOKEN      Environment variable used by Telegram adapters");
+    println!("  DISCORD_BOT_TOKEN       Environment variable used by Discord adapters");
     println!("  --queue-id <id>         Select one runtime queue item for queue-prepare");
     println!("  --execution-dir <path>  Prepared execution directory for codex-plan");
     println!("  --codex-exe <path>      Codex executable path for codex-plan/runtime-run-once");

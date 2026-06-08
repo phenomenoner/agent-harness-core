@@ -21,6 +21,7 @@ The project starts with a small, testable foundation:
 - A channel run-once pipeline that handles one DM, runs the runtime when needed, and returns pending delivery work.
 - A channel outbox delivery planner/receipt ledger for Telegram/Discord delivery retry.
 - Telegram Bot API adapters: `telegram-poll-once` for controlled smoke tests and `telegram-loop` for continuous polling with bounded consecutive-error handling.
+- A Discord REST outbox sender that delivers pending Discord replies, records delivery receipts, and logs delivery summaries.
 - A durable runtime queue writer that appends channel agent turns to `state/runtime-queue/pending.jsonl` with receipts and planned transcript paths.
 - A runtime queue prepare worker that reads pending items, assembles prompt bundles, and writes execution receipts before the Codex adapter is connected.
 - A one-shot runtime pipeline that prepares, plans, runs Codex, records completion, and writes an agent reply to the shared channel outbox.
@@ -33,8 +34,8 @@ The project starts with a small, testable foundation:
 - A native agent-turn cron parser and dry-run dispatch planner with cutover hold safety.
 - A deterministic cron parser and no-LLM dry-run planner for workspace cron runners.
 - A subagent ledger parser and dry-run planner for `/subagents/runs.json` cutover safety.
-- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `enable-check`, `harness-skills-sync`, `skills`, `turn-plan`, `channel-step`, `channel-apply`, `channel-receive`, `channel-run-once`, `channel-outbox-plan`, `channel-delivery-record`, `telegram-poll-once`, `telegram-loop`, `queue-enqueue`, `queue-prepare`, `runtime-run-once`, `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
-- Minimal external crates for current scope: `serde`/`serde_json` for stable JSON reports and `ureq` for the first Telegram Bot API smoke adapter.
+- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `enable-check`, `harness-skills-sync`, `skills`, `turn-plan`, `channel-step`, `channel-apply`, `channel-receive`, `channel-run-once`, `channel-outbox-plan`, `channel-delivery-record`, `telegram-poll-once`, `telegram-loop`, `discord-outbox-send-once`, `queue-enqueue`, `queue-prepare`, `runtime-run-once`, `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle`, `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` commands.
+- Minimal external crates for current scope: `serde`/`serde_json` for stable JSON reports and `ureq` for the first Telegram/Discord REST smoke adapters.
 
 ## Quick Start
 
@@ -58,6 +59,7 @@ cargo run -p openclaw-harness-cli -- channel-run-once --openclaw-home C:\path\to
 cargo run -p openclaw-harness-cli -- channel-outbox-plan --target-home C:\path\to\.openclaw-harness --platform telegram --limit 20
 cargo run -p openclaw-harness-cli -- telegram-poll-once --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.exe --poll-timeout-seconds 1 --max-updates 10
 cargo run -p openclaw-harness-cli -- telegram-loop --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.exe --iterations 0 --idle-ms 1000 --max-consecutive-errors 5
+cargo run -p openclaw-harness-cli -- discord-outbox-send-once --target-home C:\path\to\.openclaw-harness --outbox-limit 20
 cargo run -p openclaw-harness-cli -- turn-plan --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "continue with the selected model"
 cargo run -p openclaw-harness-cli -- queue-enqueue --openclaw-home C:\path\to\.openclaw --target-home C:\path\to\.openclaw-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron"
 cargo run -p openclaw-harness-cli -- queue-prepare --target-home C:\path\to\.openclaw-harness
@@ -118,6 +120,8 @@ Telegram and Discord adapters should share the same channel command parser and i
 `telegram-poll-once` is the first real Telegram Bot API smoke adapter. It reads `TELEGRAM_BOT_TOKEN` from the environment, stores the next update offset at `state/channels/telegram-offset.json`, normalizes text updates into `channel-run-once`, delivers pending Telegram outbox messages through `sendMessage`, records delivery receipts, and logs a `telegram.poll-once` summary.
 
 `telegram-loop` wraps the same poll-once core in a continuous polling loop with `--iterations`, `--idle-ms`, and `--max-consecutive-errors`. Use `--iterations 1` or another finite count for controlled tests and `--iterations 0` for an operator-run handoff loop. A Windows service/scheduled-task installer is still pending.
+
+`discord-outbox-send-once` is the first Discord delivery adapter. It reads `DISCORD_BOT_TOKEN`, sends pending `platform=discord` outbox messages through Discord's channel message REST endpoint, records delivery receipts, and logs a `discord.outbox-send-once` summary. Discord gateway receive is still pending; until then, use `channel-run-once --platform discord ...` or imported channel state to create test outbox messages.
 
 `queue-enqueue` persists the agent-turn side of `channel-step`. It appends queued turns to `state/runtime-queue/pending.jsonl`, appends every queued/skipped attempt to `state/runtime-queue/receipts.jsonl`, and precomputes OpenClaw-compatible transcript and trajectory paths under `agents/<agent-id>/sessions/`. Command-only channel steps are recorded as skipped receipts and are not sent to the agent queue.
 
