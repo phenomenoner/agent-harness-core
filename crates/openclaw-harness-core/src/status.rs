@@ -191,6 +191,7 @@ pub fn collect_harness_status(options: HarnessStatusOptions) -> io::Result<Harne
 fn loop_status(harness_home: &Path) -> io::Result<HarnessLoopStatus> {
     const LOOP_NAMES: &[&str] = &[
         "runtime-loop",
+        "progress-delivery-loop",
         "telegram-loop",
         "discord-outbox-loop",
         "discord-gateway-loop",

@@ -6,13 +6,15 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
-    ChannelOutboundMessage, ChannelOutboundMessageKind, CodexRuntimePlanOptions,
+    AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
+    ChannelOutboundMessage, ChannelOutboundMessageKind, CodexRuntimePlan, CodexRuntimePlanOptions,
     CodexRuntimePlanReport, CodexRuntimeReceiptStatus, CodexRuntimeRunOptions,
     CodexRuntimeRunReport, CodexRuntimeRunStatus, HarnessLogEvent, HarnessLogLevel,
     MemoryLifecycleTurnOptions, PromptAssemblyOptions, RuntimeExecutionReceiptStatus,
     RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeQueuePreparedItem,
-    append_harness_log, current_log_time_ms, plan_codex_runtime, prepare_runtime_queue_item,
-    read_channel_session_state, record_memory_lifecycle_turn, run_codex_runtime,
+    append_agent_progress_event, append_harness_log, current_log_time_ms, plan_codex_runtime,
+    prepare_runtime_queue_item, read_channel_session_state, record_memory_lifecycle_turn,
+    run_codex_runtime,
 };
 
 const RUNTIME_RUN_ONCE_SCHEMA: &str = "openclaw-harness.runtime-run-once.v1";
@@ -177,13 +179,36 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             find_queue_channel_context(&options.harness_home, queue_id, &mut warnings)?;
     }
 
+    let progress_context =
+        progress_context_from(&prepare, plan.plan.as_ref(), channel_context.as_ref());
+    if let Some(context) = &progress_context {
+        append_runtime_progress_started(
+            &options.harness_home,
+            context,
+            prepare.item.as_ref(),
+            plan.plan.as_ref(),
+            &mut warnings,
+        );
+    }
+
     let run = run_codex_runtime(CodexRuntimeRunOptions {
         harness_home: options.harness_home.clone(),
         execution_dir: plan.execution_dir.clone(),
         plan_file: plan.plan_file.clone(),
         timeout_ms: options.timeout_ms,
+        progress_context: progress_context.clone(),
     })?;
     warnings.extend(run.warnings.clone());
+    if let Some(context) = &progress_context {
+        append_runtime_progress_finished(
+            &options.harness_home,
+            context,
+            run.receipt.status,
+            &run.receipt.reason,
+            run.receipt.elapsed_ms,
+            &mut warnings,
+        );
+    }
 
     let mut outbox_file = None;
     let mut outbound_message = None;
@@ -339,6 +364,159 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         },
         true,
     )
+}
+
+fn progress_context_from(
+    prepare: &RuntimeQueuePrepareReport,
+    plan: Option<&CodexRuntimePlan>,
+    channel_context: Option<&QueueChannelContext>,
+) -> Option<AgentProgressContext> {
+    let channel_context = channel_context?;
+    let queue_id = prepare
+        .receipt
+        .queue_id
+        .clone()
+        .or_else(|| plan.and_then(|plan| plan.queue_id.clone()))?;
+    let agent_id = prepare
+        .item
+        .as_ref()
+        .map(|item| item.agent_id.clone())
+        .or_else(|| plan.and_then(|plan| plan.agent_id.clone()));
+    Some(AgentProgressContext {
+        queue_id,
+        agent_id,
+        session_key: channel_context.session_key.clone(),
+        platform: channel_context.platform.clone(),
+        channel_id: channel_context.channel_id.clone(),
+        user_id: channel_context.user_id.clone(),
+    })
+}
+
+fn append_runtime_progress_started(
+    harness_home: &Path,
+    context: &AgentProgressContext,
+    prepared: Option<&RuntimeQueuePreparedItem>,
+    plan: Option<&CodexRuntimePlan>,
+    warnings: &mut Vec<String>,
+) {
+    let Ok(at_ms) = current_log_time_ms() else {
+        warnings.push("progress event timestamp could not be read".to_string());
+        return;
+    };
+    append_progress_nonfatal(
+        harness_home,
+        AgentProgressEvent::new(
+            context,
+            AgentProgressKind::Todo,
+            "todo",
+            "planning 1 task(s)",
+            AgentProgressStatus::Completed,
+            at_ms,
+        )
+        .source("runtime-pipeline"),
+        warnings,
+    );
+    if let Some(prepared) = prepared {
+        if prepared.selected_skill_ids.is_empty() {
+            append_progress_nonfatal(
+                harness_home,
+                AgentProgressEvent::new(
+                    context,
+                    AgentProgressKind::SkillView,
+                    "skill_view",
+                    "no matched skills",
+                    AgentProgressStatus::Completed,
+                    at_ms,
+                )
+                .source("runtime-pipeline"),
+                warnings,
+            );
+        } else {
+            for skill_id in &prepared.selected_skill_ids {
+                append_progress_nonfatal(
+                    harness_home,
+                    AgentProgressEvent::new(
+                        context,
+                        AgentProgressKind::SkillView,
+                        "skill_view",
+                        skill_id,
+                        AgentProgressStatus::Completed,
+                        at_ms,
+                    )
+                    .source("runtime-pipeline"),
+                    warnings,
+                );
+            }
+        }
+    }
+    if let Some(plan) = plan {
+        let mut command = plan.invocation.executable.display().to_string();
+        if !plan.invocation.arguments.is_empty() {
+            command.push(' ');
+            command.push_str(&plan.invocation.arguments.join(" "));
+        }
+        append_progress_nonfatal(
+            harness_home,
+            AgentProgressEvent::new(
+                context,
+                AgentProgressKind::Terminal,
+                "terminal",
+                command,
+                AgentProgressStatus::Started,
+                at_ms,
+            )
+            .source("runtime-pipeline"),
+            warnings,
+        );
+    }
+}
+
+fn append_runtime_progress_finished(
+    harness_home: &Path,
+    context: &AgentProgressContext,
+    status: CodexRuntimeRunStatus,
+    reason: &str,
+    elapsed_ms: u128,
+    warnings: &mut Vec<String>,
+) {
+    let Ok(at_ms) = current_log_time_ms() else {
+        warnings.push("progress event timestamp could not be read".to_string());
+        return;
+    };
+    let progress_status = if status == CodexRuntimeRunStatus::Completed {
+        AgentProgressStatus::Completed
+    } else {
+        AgentProgressStatus::Failed
+    };
+    let preview = if status == CodexRuntimeRunStatus::Completed {
+        "done".to_string()
+    } else {
+        reason.to_string()
+    };
+    append_progress_nonfatal(
+        harness_home,
+        AgentProgressEvent::new(
+            context,
+            AgentProgressKind::Runtime,
+            "run",
+            preview,
+            progress_status,
+            at_ms,
+        )
+        .elapsed_ms(elapsed_ms)
+        .source("runtime-pipeline"),
+        warnings,
+    );
+}
+
+fn append_progress_nonfatal(
+    harness_home: &Path,
+    event: AgentProgressEvent,
+    warnings: &mut Vec<String>,
+) {
+    if let Err(error) = append_agent_progress_event(harness_home, &event) {
+        warnings.push(format!("progress event write failed: {error}"));
+    }
 }
 
 fn map_run_once_status(status: CodexRuntimeRunStatus) -> RuntimeRunOnceStatus {

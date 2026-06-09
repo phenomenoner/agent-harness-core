@@ -20,6 +20,7 @@ pub struct WindowsSupervisorPlanOptions {
     pub output_dir: Option<PathBuf>,
     pub task_prefix: String,
     pub include_runtime: bool,
+    pub include_progress: bool,
     pub include_telegram: bool,
     pub include_discord: bool,
     pub idle_ms: u64,
@@ -127,6 +128,35 @@ pub fn write_windows_supervisor_plan(
         if let Some(codex) = &codex_executable {
             args.extend(["--codex-exe".to_string(), path_arg(codex)]);
         }
+        write_runner_script(&runner_script, &harness_cli, &args, &log_dir, component)?;
+        push_task(
+            &mut scripts,
+            &mut tasks,
+            &options.task_prefix,
+            component,
+            runner_script,
+            stop_file,
+            true,
+        );
+    }
+
+    if options.include_progress {
+        let component = "progress-delivery-loop";
+        let runner_script = scripts_dir.join(format!("{component}.ps1"));
+        let stop_file = stop_dir.join(format!("{component}.stop"));
+        let args = vec![
+            "progress-delivery-loop".to_string(),
+            "--harness-home".to_string(),
+            path_arg(&harness_home),
+            "--iterations".to_string(),
+            "0".to_string(),
+            "--idle-ms".to_string(),
+            options.idle_ms.to_string(),
+            "--max-consecutive-errors".to_string(),
+            options.max_consecutive_errors.to_string(),
+            "--stop-file".to_string(),
+            path_arg(&stop_file),
+        ];
         write_runner_script(&runner_script, &harness_cli, &args, &log_dir, component)?;
         push_task(
             &mut scripts,
@@ -498,6 +528,7 @@ mod tests {
             output_dir: Some(output_dir.clone()),
             task_prefix: "OpenClawHarness".to_string(),
             include_runtime: true,
+            include_progress: true,
             include_telegram: true,
             include_discord: true,
             idle_ms: 1000,
@@ -508,7 +539,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(report.tasks.len(), 4);
+        assert_eq!(report.tasks.len(), 5);
         assert!(report.receipt_file.is_file());
         assert!(
             report
@@ -520,6 +551,13 @@ mod tests {
             fs::read_to_string(output_dir.join("scripts").join("runtime-loop.ps1")).unwrap();
         assert!(runtime_script.contains("--stop-file"));
         assert!(runtime_script.contains("runtime-loop"));
+        let progress_script = fs::read_to_string(
+            output_dir
+                .join("scripts")
+                .join("progress-delivery-loop.ps1"),
+        )
+        .unwrap();
+        assert!(progress_script.contains("progress-delivery-loop"));
         let discord_outbox_script =
             fs::read_to_string(output_dir.join("scripts").join("discord-outbox-loop.ps1")).unwrap();
         assert!(discord_outbox_script.contains("discord-outbox-loop"));

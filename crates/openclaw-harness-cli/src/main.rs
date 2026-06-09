@@ -12,7 +12,9 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use openclaw_harness_core::{
-    ActivationReadinessOptions, ActivationReadinessReport, AgentRegistry,
+    ActivationReadinessOptions, ActivationReadinessReport, AgentProgressDeliveryAction,
+    AgentProgressDeliveryPending, AgentProgressDeliveryPlanOptions,
+    AgentProgressDeliveryRecordOptions, AgentProgressDeliveryStatus, AgentRegistry,
     BuiltinHarnessSkillSyncOptions, BuiltinHarnessSkillSyncReport, ChannelCommand,
     ChannelCommandApplyOptions, ChannelCommandApplyReport, ChannelDeliveryReceipt,
     ChannelDeliveryRecordOptions, ChannelDeliveryStatus, ChannelOutboxPlanOptions,
@@ -37,15 +39,16 @@ use openclaw_harness_core::{
     check_activation_readiness, collect_harness_status, current_log_time_ms, enqueue_channel_step,
     execute_import, export_harness_registry_files, export_memory_credentials, inventory,
     load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
-    load_subagent_ledger, parse_channel_command, plan_channel_outbox, plan_codex_runtime,
-    plan_deterministic_cron, plan_native_cron, plan_subagents, preflight_codex_runtime,
-    prepare_runtime_queue_item, probe_codex_runtime_launch, receive_channel_message,
-    record_channel_delivery, record_codex_runtime_completion, run_channel_once, run_codex_runtime,
-    run_memory_canvas_worker, run_runtime_queue_once, search_imported_memory,
-    search_imported_vector_memory, select_skills, sync_builtin_harness_skills, write_channel_step,
-    write_deterministic_cron_plan, write_memory_search_receipt, write_memory_vector_recall_receipt,
-    write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
-    write_subagent_plan, write_turn_plan, write_windows_supervisor_plan,
+    load_subagent_ledger, parse_channel_command, plan_agent_progress_delivery, plan_channel_outbox,
+    plan_codex_runtime, plan_deterministic_cron, plan_native_cron, plan_subagents,
+    preflight_codex_runtime, prepare_runtime_queue_item, probe_codex_runtime_launch,
+    receive_channel_message, record_agent_progress_delivery, record_channel_delivery,
+    record_codex_runtime_completion, run_channel_once, run_codex_runtime, run_memory_canvas_worker,
+    run_runtime_queue_once, search_imported_memory, search_imported_vector_memory, select_skills,
+    sync_builtin_harness_skills, write_channel_step, write_deterministic_cron_plan,
+    write_memory_search_receipt, write_memory_vector_recall_receipt, write_native_cron_plan,
+    write_prompt_bundle, write_report_files, write_skill_index, write_subagent_plan,
+    write_turn_plan, write_windows_supervisor_plan,
 };
 
 fn main() {
@@ -77,6 +80,8 @@ fn main() {
         "channel-run-once" => run_channel_run_once(&rest),
         "channel-outbox-plan" => run_channel_outbox_plan(&rest),
         "channel-delivery-record" => run_channel_delivery_record(&rest),
+        "progress-delivery-once" => run_progress_delivery_once(&rest),
+        "progress-delivery-loop" => run_progress_delivery_loop(&rest),
         "telegram-probe" => run_telegram_probe(&rest),
         "telegram-poll-once" => run_telegram_poll_once(&rest),
         "telegram-loop" => run_telegram_loop(&rest),
@@ -528,6 +533,7 @@ fn run_supervisor_plan(args: &[String]) -> Result<(), String> {
         output_dir: args.output_dir,
         task_prefix: args.task_prefix,
         include_runtime: args.include_runtime,
+        include_progress: args.include_progress,
         include_telegram: args.include_telegram,
         include_discord: args.include_discord,
         idle_ms: args.idle_ms,
@@ -793,6 +799,375 @@ fn run_channel_delivery_record(args: &[String]) -> Result<(), String> {
 
     print_channel_delivery_receipt(&receipt);
     Ok(())
+}
+
+fn run_progress_delivery_once(args: &[String]) -> Result<(), String> {
+    let args = progress_delivery_once_args_from_args(args)?;
+    let report = execute_progress_delivery_once(&args)?;
+    print_progress_delivery_once_report(&report);
+    Ok(())
+}
+
+fn run_progress_delivery_loop(args: &[String]) -> Result<(), String> {
+    let args = progress_delivery_loop_args_from_args(args)?;
+    let mut iterations = 0usize;
+    let mut consecutive_errors = 0usize;
+
+    loop {
+        if stop_file_requested(args.stop_file.as_deref()) {
+            append_loop_stop_log(
+                &args.send.target_home,
+                "progress",
+                "progress.delivery-loop-stopped",
+                iterations,
+                "stop file requested",
+            )?;
+            write_loop_heartbeat(
+                &args.send.target_home,
+                "progress-delivery-loop",
+                "stopped",
+                iterations,
+                "stop file requested",
+            )?;
+            println!("Progress delivery loop stop requested after {iterations} iteration(s)");
+            break;
+        }
+        iterations += 1;
+        write_loop_heartbeat(
+            &args.send.target_home,
+            "progress-delivery-loop",
+            "running",
+            iterations,
+            "checking progress events",
+        )?;
+        match execute_progress_delivery_once(&args.send) {
+            Ok(report) => {
+                consecutive_errors = 0;
+                write_loop_heartbeat(
+                    &args.send.target_home,
+                    "progress-delivery-loop",
+                    "ok",
+                    iterations,
+                    &format!(
+                        "pending={} sent={} edited={} failed={}",
+                        report.pending_count,
+                        report.sent_messages,
+                        report.edited_messages,
+                        report.failed_deliveries
+                    ),
+                )?;
+                println!("Progress delivery loop iteration: {iterations}");
+                print_progress_delivery_once_report(&report);
+            }
+            Err(error) => {
+                consecutive_errors += 1;
+                write_loop_heartbeat(
+                    &args.send.target_home,
+                    "progress-delivery-loop",
+                    "error",
+                    iterations,
+                    &format!("consecutiveErrors={consecutive_errors} error={error}"),
+                )?;
+                eprintln!(
+                    "progress-delivery-loop iteration {iterations} failed ({consecutive_errors}/{}): {error}",
+                    args.max_consecutive_errors
+                );
+                append_harness_log(
+                    &args.send.target_home,
+                    &HarnessLogEvent::new(
+                        current_log_time_ms().map_err(|err| err.to_string())?,
+                        HarnessLogLevel::Warn,
+                        "progress",
+                        "progress.delivery-loop-error",
+                        format!(
+                            "iteration={iterations} consecutiveErrors={consecutive_errors}/{} error={error}",
+                            args.max_consecutive_errors
+                        ),
+                    ),
+                )
+                .map_err(|err| err.to_string())?;
+                if consecutive_errors >= args.max_consecutive_errors {
+                    return Err(format!(
+                        "progress-delivery-loop exceeded {} consecutive errors; last error: {error}",
+                        args.max_consecutive_errors
+                    ));
+                }
+            }
+        }
+
+        if args.iterations > 0 && iterations >= args.iterations {
+            break;
+        }
+        thread::sleep(Duration::from_millis(args.idle_ms));
+    }
+    Ok(())
+}
+
+fn execute_progress_delivery_once(
+    args: &ProgressDeliveryOnceArgs,
+) -> Result<ProgressDeliveryOnceReport, String> {
+    let plan = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+        harness_home: args.target_home.clone(),
+        platform: args.platform.clone(),
+        now_ms: current_time_ms()?,
+        min_update_interval_ms: args.min_update_interval_ms,
+        max_events_per_panel: args.max_events_per_panel,
+        max_preview_chars: args.max_preview_chars,
+    })
+    .map_err(|err| err.to_string())?;
+    let mut warnings = plan.warnings.clone();
+    let policy = channel_access_policy(&args.target_home)?;
+    let pending_count = plan.pending.len();
+    let mut sent_messages = 0usize;
+    let mut edited_messages = 0usize;
+    let mut skipped_denied = 0usize;
+    let mut failed_deliveries = 0usize;
+
+    for pending in plan.pending {
+        if let Err(reason) = progress_delivery_allowed(&policy, &pending) {
+            record_progress_delivery(
+                args,
+                &pending,
+                pending.action,
+                AgentProgressDeliveryStatus::SkippedDenied,
+                pending.provider_message_id.clone(),
+                Some(reason.clone()),
+            )?;
+            warnings.push(format!(
+                "progress delivery for {} denied by channel access policy: {}",
+                pending.queue_id, reason
+            ));
+            skipped_denied += 1;
+            continue;
+        }
+
+        match deliver_progress_pending(args, &pending) {
+            Ok((actual_action, provider_message_id)) => {
+                record_progress_delivery(
+                    args,
+                    &pending,
+                    actual_action,
+                    AgentProgressDeliveryStatus::Delivered,
+                    provider_message_id,
+                    None,
+                )?;
+                match actual_action {
+                    AgentProgressDeliveryAction::Send => sent_messages += 1,
+                    AgentProgressDeliveryAction::Edit => edited_messages += 1,
+                }
+            }
+            Err(error) => {
+                record_progress_delivery(
+                    args,
+                    &pending,
+                    pending.action,
+                    AgentProgressDeliveryStatus::Failed,
+                    pending.provider_message_id.clone(),
+                    Some(error.clone()),
+                )?;
+                warnings.push(error);
+                failed_deliveries += 1;
+            }
+        }
+    }
+
+    let report = ProgressDeliveryOnceReport {
+        pending_count,
+        sent_messages,
+        edited_messages,
+        skipped_denied,
+        failed_deliveries,
+        warnings,
+    };
+    append_harness_log(
+        &args.target_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            if report.failed_deliveries == 0 {
+                HarnessLogLevel::Info
+            } else {
+                HarnessLogLevel::Warn
+            },
+            "progress",
+            "progress.delivery-once",
+            format!(
+                "pending={} sent={} edited={} denied={} failed={}",
+                report.pending_count,
+                report.sent_messages,
+                report.edited_messages,
+                report.skipped_denied,
+                report.failed_deliveries
+            ),
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(report)
+}
+
+fn deliver_progress_pending(
+    args: &ProgressDeliveryOnceArgs,
+    pending: &AgentProgressDeliveryPending,
+) -> Result<(AgentProgressDeliveryAction, Option<String>), String> {
+    match pending.platform.as_str() {
+        "telegram" => {
+            let token = telegram_bot_token(&args.target_home, args.telegram_account.as_deref())?;
+            match pending.action {
+                AgentProgressDeliveryAction::Send => {
+                    telegram_send_message(&token, &pending.channel_id, &pending.text)
+                        .map(|id| (AgentProgressDeliveryAction::Send, id))
+                }
+                AgentProgressDeliveryAction::Edit => {
+                    let Some(message_id) = pending.provider_message_id.as_deref() else {
+                        return telegram_send_message(&token, &pending.channel_id, &pending.text)
+                            .map(|id| (AgentProgressDeliveryAction::Send, id));
+                    };
+                    telegram_edit_message_text(
+                        &token,
+                        &pending.channel_id,
+                        message_id,
+                        &pending.text,
+                    )
+                    .map(|id| (AgentProgressDeliveryAction::Edit, id.or(Some(message_id.to_string()))))
+                    .or_else(|edit_error| {
+                        telegram_send_message(&token, &pending.channel_id, &pending.text).map(
+                            |id| {
+                                (
+                                    AgentProgressDeliveryAction::Send,
+                                    id.or(Some(message_id.to_string())),
+                                )
+                            },
+                        ).map_err(|send_error| {
+                            format!(
+                                "Telegram progress edit failed ({edit_error}); replacement send failed ({send_error})"
+                            )
+                        })
+                    })
+                }
+            }
+        }
+        "discord" => {
+            let token = discord_bot_token(&args.target_home)?;
+            match pending.action {
+                AgentProgressDeliveryAction::Send => {
+                    discord_send_message(&token, &pending.channel_id, &pending.text)
+                        .map(|id| (AgentProgressDeliveryAction::Send, id))
+                }
+                AgentProgressDeliveryAction::Edit => {
+                    let Some(message_id) = pending.provider_message_id.as_deref() else {
+                        return discord_send_message(&token, &pending.channel_id, &pending.text)
+                            .map(|id| (AgentProgressDeliveryAction::Send, id));
+                    };
+                    discord_edit_message(&token, &pending.channel_id, message_id, &pending.text)
+                        .map(|id| {
+                            (
+                                AgentProgressDeliveryAction::Edit,
+                                id.or(Some(message_id.to_string())),
+                            )
+                        })
+                        .or_else(|edit_error| {
+                            discord_send_message(&token, &pending.channel_id, &pending.text)
+                                .map(|id| (AgentProgressDeliveryAction::Send, id))
+                                .map_err(|send_error| {
+                                    format!(
+                                        "Discord progress edit failed ({edit_error}); replacement send failed ({send_error})"
+                                    )
+                                })
+                        })
+                }
+            }
+        }
+        other => Err(format!(
+            "progress delivery does not support platform `{other}`"
+        )),
+    }
+}
+
+fn record_progress_delivery(
+    args: &ProgressDeliveryOnceArgs,
+    pending: &AgentProgressDeliveryPending,
+    action: AgentProgressDeliveryAction,
+    status: AgentProgressDeliveryStatus,
+    provider_message_id: Option<String>,
+    error: Option<String>,
+) -> Result<(), String> {
+    record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+        harness_home: args.target_home.clone(),
+        queue_id: pending.queue_id.clone(),
+        platform: pending.platform.clone(),
+        channel_id: pending.channel_id.clone(),
+        user_id: pending.user_id.clone(),
+        session_key: pending.session_key.clone(),
+        action,
+        status,
+        provider_message_id,
+        event_line: pending.event_line,
+        text_hash: pending.text_hash.clone(),
+        terminal: pending.terminal,
+        error,
+        now_ms: current_time_ms()?,
+    })
+    .map(|_| ())
+    .map_err(|err| err.to_string())
+}
+
+fn progress_delivery_allowed(
+    policy: &ChannelAccessPolicy,
+    pending: &AgentProgressDeliveryPending,
+) -> Result<(), String> {
+    match pending.platform.as_str() {
+        "telegram" => {
+            if policy.telegram_group_chat_ids.contains(&pending.channel_id) {
+                if telegram_user_is_admin(policy, &pending.user_id)
+                    || policy
+                        .telegram_group_admin_user_ids
+                        .contains(&pending.user_id)
+                    || policy
+                        .telegram_group_allowed_user_ids
+                        .contains(&pending.user_id)
+                    || policy.telegram_group_open
+                    || (policy.telegram_group_allowed_user_ids.is_empty()
+                        && policy.telegram_group_admin_user_ids.is_empty()
+                        && !policy.telegram_group_chat_ids.is_empty())
+                {
+                    return Ok(());
+                }
+                return Err(
+                    "Telegram group progress target is not authorized for this user id".to_string(),
+                );
+            }
+            if telegram_user_is_admin(policy, &pending.user_id) {
+                Ok(())
+            } else {
+                Err("Telegram DM progress target user id is not an admin/allowed user".to_string())
+            }
+        }
+        "discord" => {
+            if policy.discord_channel_ids.contains(&pending.channel_id) {
+                if discord_user_is_admin(policy, &pending.user_id)
+                    || policy
+                        .discord_group_allowed_user_ids
+                        .contains(&pending.user_id)
+                    || policy.discord_group_open
+                    || (policy.discord_group_allowed_user_ids.is_empty()
+                        && !policy.discord_channel_ids.is_empty())
+                {
+                    return Ok(());
+                }
+                return Err(
+                    "Discord channel progress target is not authorized for this user id"
+                        .to_string(),
+                );
+            }
+            if discord_user_is_admin(policy, &pending.user_id) {
+                Ok(())
+            } else {
+                Err("Discord DM progress target user id is not an admin/allowed user".to_string())
+            }
+        }
+        other => Err(format!(
+            "progress delivery does not know access policy for platform `{other}`"
+        )),
+    }
 }
 
 fn run_telegram_probe(args: &[String]) -> Result<(), String> {
@@ -2612,6 +2987,7 @@ fn run_codex_run(args: &[String]) -> Result<(), String> {
         execution_dir: args.execution_dir,
         plan_file: args.plan_file,
         timeout_ms: args.timeout_ms,
+        progress_context: None,
     })
     .map_err(|err| err.to_string())?;
 
@@ -2877,6 +3253,7 @@ struct SupervisorPlanArgs {
     output_dir: Option<PathBuf>,
     task_prefix: String,
     include_runtime: bool,
+    include_progress: bool,
     include_telegram: bool,
     include_discord: bool,
     idle_ms: u64,
@@ -2950,6 +3327,35 @@ struct ChannelDeliveryRecordArgs {
     provider_message_id: Option<String>,
     error: Option<String>,
     now_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ProgressDeliveryOnceArgs {
+    target_home: PathBuf,
+    platform: Option<String>,
+    telegram_account: Option<String>,
+    min_update_interval_ms: i64,
+    max_events_per_panel: usize,
+    max_preview_chars: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ProgressDeliveryLoopArgs {
+    send: ProgressDeliveryOnceArgs,
+    iterations: usize,
+    idle_ms: u64,
+    max_consecutive_errors: usize,
+    stop_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct ProgressDeliveryOnceReport {
+    pending_count: usize,
+    sent_messages: usize,
+    edited_messages: usize,
+    skipped_denied: usize,
+    failed_deliveries: usize,
+    warnings: Vec<String>,
 }
 
 struct TelegramProbeArgs {
@@ -3730,6 +4136,7 @@ fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs,
     let mut output_dir = None;
     let mut task_prefix = "OpenClawHarness".to_string();
     let mut include_runtime = true;
+    let mut include_progress = true;
     let mut include_telegram = true;
     let mut include_discord = true;
     let mut idle_ms = 1_000;
@@ -3821,6 +4228,7 @@ fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs,
                     .ok_or_else(|| "--task-prefix requires a name".to_string())?;
             }
             "--no-runtime" => include_runtime = false,
+            "--no-progress" => include_progress = false,
             "--no-telegram" => include_telegram = false,
             "--no-discord" => include_discord = false,
             "--idle-ms" => {
@@ -3878,6 +4286,7 @@ fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs,
         output_dir,
         task_prefix,
         include_runtime,
+        include_progress,
         include_telegram,
         include_discord,
         idle_ms,
@@ -4423,6 +4832,160 @@ fn channel_delivery_record_args_from_args(
             None => current_time_ms()?,
         },
     })
+}
+
+fn progress_delivery_once_args_from_args(
+    args: &[String],
+) -> Result<ProgressDeliveryOnceArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut platform = None;
+    let mut telegram_account = None;
+    let mut min_update_interval_ms = 2_500_i64;
+    let mut max_events_per_panel = 8usize;
+    let mut max_preview_chars = 120usize;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--platform" => {
+                i += 1;
+                platform = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--platform requires telegram or discord".to_string())?,
+                );
+            }
+            "--telegram-account" => {
+                i += 1;
+                telegram_account = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--telegram-account requires an account id".to_string())?,
+                );
+            }
+            "--min-update-interval-ms" => {
+                i += 1;
+                min_update_interval_ms = args
+                    .get(i)
+                    .ok_or_else(|| {
+                        "--min-update-interval-ms requires a non-negative integer".to_string()
+                    })
+                    .and_then(|value| parse_i64(value, "--min-update-interval-ms"))?;
+                if min_update_interval_ms < 0 {
+                    return Err("--min-update-interval-ms must be non-negative".to_string());
+                }
+            }
+            "--max-events" => {
+                i += 1;
+                max_events_per_panel = args
+                    .get(i)
+                    .ok_or_else(|| "--max-events requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--max-preview-chars" => {
+                i += 1;
+                max_preview_chars = args
+                    .get(i)
+                    .ok_or_else(|| "--max-preview-chars requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(ProgressDeliveryOnceArgs {
+        target_home,
+        platform,
+        telegram_account,
+        min_update_interval_ms,
+        max_events_per_panel,
+        max_preview_chars,
+    })
+}
+
+fn progress_delivery_loop_args_from_args(
+    args: &[String],
+) -> Result<ProgressDeliveryLoopArgs, String> {
+    let mut send_args = Vec::new();
+    let mut iterations = 0usize;
+    let mut idle_ms = 1_000_u64;
+    let mut max_consecutive_errors = 5usize;
+    let mut stop_file = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--iterations" => {
+                i += 1;
+                iterations = args
+                    .get(i)
+                    .ok_or_else(|| "--iterations requires a non-negative integer".to_string())
+                    .and_then(|value| parse_usize(value, "--iterations"))?;
+            }
+            "--idle-ms" => {
+                i += 1;
+                idle_ms = args
+                    .get(i)
+                    .ok_or_else(|| "--idle-ms requires a positive integer".to_string())
+                    .and_then(|value| parse_u64(value, "--idle-ms"))?;
+            }
+            "--max-consecutive-errors" => {
+                i += 1;
+                max_consecutive_errors = args
+                    .get(i)
+                    .ok_or_else(|| {
+                        "--max-consecutive-errors requires a positive integer".to_string()
+                    })
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--stop-file" => {
+                i += 1;
+                stop_file = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--stop-file requires a path".to_string())?,
+                );
+            }
+            flag => {
+                send_args.push(flag.to_string());
+                if option_takes_value(flag) {
+                    i += 1;
+                    send_args.push(
+                        args.get(i)
+                            .cloned()
+                            .ok_or_else(|| format!("{flag} requires a value"))?,
+                    );
+                }
+            }
+        }
+        i += 1;
+    }
+
+    Ok(ProgressDeliveryLoopArgs {
+        send: progress_delivery_once_args_from_args(&send_args)?,
+        iterations,
+        idle_ms,
+        max_consecutive_errors,
+        stop_file,
+    })
+}
+
+fn option_takes_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--target-home"
+            | "--harness-home"
+            | "--platform"
+            | "--telegram-account"
+            | "--min-update-interval-ms"
+            | "--max-events"
+            | "--max-preview-chars"
+    )
 }
 
 fn telegram_probe_args_from_args(args: &[String]) -> Result<TelegramProbeArgs, String> {
@@ -7457,6 +8020,39 @@ fn telegram_send_message(token: &str, chat_id: &str, text: &str) -> Result<Optio
         .and_then(telegram_id_string))
 }
 
+fn telegram_edit_message_text(
+    token: &str,
+    chat_id: &str,
+    message_id: &str,
+    text: &str,
+) -> Result<Option<String>, String> {
+    let url = format!("https://api.telegram.org/bot{token}/editMessageText");
+    let agent = channel_http_short_agent();
+    let message_id_value = message_id
+        .parse::<i64>()
+        .map(serde_json::Value::from)
+        .unwrap_or_else(|_| serde_json::Value::String(message_id.to_string()));
+    let response = agent
+        .post(&url)
+        .send_json(serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id_value,
+            "text": text,
+            "disable_web_page_preview": true
+        }))
+        .map_err(telegram_http_error)?;
+    let value: serde_json::Value = response.into_json().map_err(|err| err.to_string())?;
+    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(format!(
+            "Telegram editMessageText returned non-ok response: {value}"
+        ));
+    }
+    Ok(value
+        .get("result")
+        .and_then(|result| result.get("message_id"))
+        .and_then(telegram_id_string))
+}
+
 fn telegram_send_chat_action(token: &str, chat_id: &str, action: &str) -> Result<(), String> {
     let url = format!("https://api.telegram.org/bot{token}/sendChatAction");
     let agent = channel_http_short_agent();
@@ -7588,6 +8184,37 @@ fn discord_send_message(
     let agent = channel_http_short_agent();
     let response = agent
         .post(&url)
+        .set("Authorization", &auth)
+        .set("Content-Type", "application/json")
+        .send_json(serde_json::json!({
+            "content": text,
+            "allowed_mentions": {
+                "parse": []
+            }
+        }))
+        .map_err(discord_http_error)?;
+    let value: serde_json::Value = response.into_json().map_err(|err| err.to_string())?;
+    Ok(value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string))
+}
+
+fn discord_edit_message(
+    token: &str,
+    channel_id: &str,
+    message_id: &str,
+    text: &str,
+) -> Result<Option<String>, String> {
+    if text.chars().count() > DISCORD_MESSAGE_CONTENT_LIMIT {
+        return Err("Discord message exceeds the 2000 character content limit".to_string());
+    }
+    let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}");
+    let token = normalize_discord_bot_token(token);
+    let auth = format!("Bot {token}");
+    let agent = channel_http_short_agent();
+    let response = agent
+        .patch(&url)
         .set("Authorization", &auth)
         .set("Content-Type", "application/json")
         .send_json(serde_json::json!({
@@ -8815,6 +9442,21 @@ fn print_channel_delivery_receipt(receipt: &ChannelDeliveryReceipt) {
     println!("At ms: {}", receipt.at_ms);
 }
 
+fn print_progress_delivery_once_report(report: &ProgressDeliveryOnceReport) {
+    println!("OpenClaw progress delivery once");
+    println!("Pending panels: {}", report.pending_count);
+    println!("Sent panels: {}", report.sent_messages);
+    println!("Edited panels: {}", report.edited_messages);
+    println!("Denied panels: {}", report.skipped_denied);
+    println!("Failed deliveries: {}", report.failed_deliveries);
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
 fn print_telegram_probe_report(report: &TelegramProbeReport) {
     println!("OpenClaw Telegram probe");
     println!("Harness home: {}", report.harness_home.display());
@@ -9632,6 +10274,8 @@ fn print_help() {
     println!("  channel-run-once Handle one DM, run runtime if needed, and plan delivery");
     println!("  channel-outbox-plan List pending Telegram/Discord delivery messages");
     println!("  channel-delivery-record Record delivery success or retryable failure");
+    println!("  progress-delivery-once Send/edit compact runtime progress panels once");
+    println!("  progress-delivery-loop Send/edit compact runtime progress panels continuously");
     println!("  telegram-probe  Probe Telegram Bot API getMe without consuming updates");
     println!("  telegram-poll-once Poll Telegram once, run DM pipeline, and deliver replies");
     println!("  telegram-loop     Run Telegram polling continuously until stopped");
@@ -9690,11 +10334,15 @@ fn print_help() {
     println!("  --provider-message-id <id> Telegram/Discord message id after delivery");
     println!("  --error <text>          Delivery failure reason");
     println!("  --outbox-limit <n>      Maximum pending outbox items for channel-run-once");
+    println!("  --min-update-interval-ms <n> Minimum progress panel edit interval");
+    println!("  --max-events <n>        Maximum action lines shown in a progress panel");
+    println!("  --max-preview-chars <n> Maximum preview characters per progress action");
     println!("  --event-file <path>     Discord Gateway event JSON file");
     println!("  --event-json <text>     Discord Gateway event JSON text");
     println!("  --gateway-script <path> Discord Gateway Node script path");
     println!("  --harness-cli <path>    Harness CLI used by gateway loop callbacks");
     println!("  --no-runtime            Exclude runtime-loop from supervisor-plan");
+    println!("  --no-progress           Exclude progress-delivery-loop from supervisor-plan");
     println!("  --no-telegram           Exclude telegram-loop from supervisor-plan");
     println!("  --no-discord            Exclude discord-gateway-loop from supervisor-plan");
     println!(
@@ -9741,6 +10389,28 @@ mod tests {
 
     fn set(values: &[&str]) -> BTreeSet<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn progress_pending(
+        platform: &str,
+        channel_id: &str,
+        user_id: &str,
+    ) -> AgentProgressDeliveryPending {
+        AgentProgressDeliveryPending {
+            queue_id: "queue-1".to_string(),
+            platform: platform.to_string(),
+            channel_id: channel_id.to_string(),
+            user_id: user_id.to_string(),
+            session_key: "session-1".to_string(),
+            action: AgentProgressDeliveryAction::Send,
+            provider_message_id: None,
+            event_line: 1,
+            terminal: false,
+            text: "progress".to_string(),
+            text_hash: "hash".to_string(),
+            started_at_ms: 1,
+            latest_at_ms: 1,
+        }
     }
 
     fn cli_temp_root(name: &str) -> PathBuf {
@@ -9822,6 +10492,24 @@ mod tests {
             telegram_access_decision(&policy, "group-1", "user-2", Some("group")),
             ChannelAccessDecision::Denied(_)
         ));
+    }
+
+    #[test]
+    fn progress_delivery_uses_same_telegram_group_admin_acl_as_ingress() {
+        let policy = ChannelAccessPolicy {
+            telegram_group_admin_user_ids: set(&["admin-1"]),
+            telegram_group_chat_ids: set(&["group-1"]),
+            ..ChannelAccessPolicy::default()
+        };
+
+        assert!(
+            progress_delivery_allowed(&policy, &progress_pending("telegram", "group-1", "admin-1"))
+                .is_ok()
+        );
+        assert!(
+            progress_delivery_allowed(&policy, &progress_pending("telegram", "group-1", "user-2"))
+                .is_err()
+        );
     }
 
     #[test]

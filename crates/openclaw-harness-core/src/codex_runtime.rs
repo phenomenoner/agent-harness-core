@@ -10,7 +10,11 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{HarnessLogEvent, HarnessLogLevel, append_harness_log, current_log_time_ms};
+use crate::{
+    AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
+    HarnessLogEvent, HarnessLogLevel, append_agent_progress_event, append_harness_log,
+    current_log_time_ms,
+};
 
 const CODEX_RUNTIME_PLAN_SCHEMA: &str = "openclaw-harness.codex-runtime-plan.v1";
 const CODEX_RUNTIME_PREFLIGHT_SCHEMA: &str = "openclaw-harness.codex-runtime-preflight.v1";
@@ -61,6 +65,7 @@ pub struct CodexRuntimeRunOptions {
     pub execution_dir: Option<PathBuf>,
     pub plan_file: Option<PathBuf>,
     pub timeout_ms: u64,
+    pub progress_context: Option<AgentProgressContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1029,7 +1034,12 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
     }
 
     let started = Instant::now();
-    let run_result = drive_codex_app_server(&plan, options.timeout_ms)?;
+    let run_result = drive_codex_app_server(
+        &options.harness_home,
+        &plan,
+        options.timeout_ms,
+        options.progress_context,
+    )?;
     let elapsed_ms = started.elapsed().as_millis();
     let finished_at_ms = current_log_time_ms()?;
     let status = run_result.status;
@@ -1401,8 +1411,10 @@ fn codex_app_server_approval_policy(policy: CodexApprovalPolicy) -> &'static str
 }
 
 fn drive_codex_app_server(
+    harness_home: &Path,
     plan: &CodexRuntimePlanFile,
     timeout_ms: u64,
+    progress_context: Option<AgentProgressContext>,
 ) -> io::Result<CodexAppServerRunResult> {
     let execution_dir = runtime_execution_dir(plan);
     fs::create_dir_all(&execution_dir)?;
@@ -1466,6 +1478,8 @@ fn drive_codex_app_server(
     let (line_rx, reader_handle) = spawn_stdout_reader(stdout, stdout_log.clone());
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut state = CodexProtocolState::default();
+    let mut progress =
+        progress_context.map(|context| CodexProgressEmitter::new(harness_home, context));
 
     write_json_rpc(
         &mut stdin,
@@ -1527,6 +1541,7 @@ fn drive_codex_app_server(
         &mut child,
         &mut stdin,
         &mut state,
+        &mut progress,
         deadline,
         plan.invocation.approval_policy,
     )? {
@@ -1609,6 +1624,7 @@ fn drive_codex_app_server(
         &mut child,
         &mut stdin,
         &mut state,
+        &mut progress,
         deadline,
         plan.invocation.approval_policy,
     )? {
@@ -1677,6 +1693,7 @@ struct CodexProtocolState {
     event_count: usize,
     warnings: Vec<String>,
     denied_approval_requests: Vec<String>,
+    assistant_stream_announced: bool,
 }
 
 impl CodexProtocolState {
@@ -1709,6 +1726,202 @@ impl CodexProtocolState {
     }
 }
 
+struct CodexProgressEmitter {
+    harness_home: PathBuf,
+    context: AgentProgressContext,
+}
+
+impl CodexProgressEmitter {
+    fn new(harness_home: &Path, context: AgentProgressContext) -> Self {
+        Self {
+            harness_home: harness_home.to_path_buf(),
+            context,
+        }
+    }
+
+    fn append(&self, event: AgentProgressEvent) -> io::Result<()> {
+        append_agent_progress_event(&self.harness_home, &event).map(|_| ())
+    }
+}
+
+fn emit_codex_progress(
+    progress: &mut Option<CodexProgressEmitter>,
+    value: &Value,
+    state: &mut CodexProtocolState,
+) {
+    let Some(emitter) = progress.as_ref() else {
+        return;
+    };
+    let Ok(at_ms) = current_log_time_ms() else {
+        state
+            .warnings
+            .push("progress event timestamp could not be read".to_string());
+        return;
+    };
+    let Some(event) = codex_progress_event_from_json(&emitter.context, value, state, at_ms) else {
+        return;
+    };
+    if let Err(error) = emitter.append(event) {
+        state
+            .warnings
+            .push(format!("progress event write failed: {error}"));
+    }
+}
+
+fn codex_progress_event_from_json(
+    context: &AgentProgressContext,
+    value: &Value,
+    state: &mut CodexProtocolState,
+    at_ms: i64,
+) -> Option<AgentProgressEvent> {
+    if !state.assistant_stream_announced
+        && let Some(delta) = extract_agent_delta(value)
+    {
+        state.assistant_stream_announced = true;
+        return Some(
+            AgentProgressEvent::new(
+                context,
+                AgentProgressKind::AssistantStream,
+                "assistant_stream",
+                if delta.trim().is_empty() {
+                    "receiving stream response".to_string()
+                } else {
+                    delta
+                },
+                AgentProgressStatus::Progress,
+                at_ms,
+            )
+            .source("codex-runtime"),
+        );
+    }
+
+    let method = json_method(value)?;
+    let method_lower = method.to_ascii_lowercase();
+    if method_lower.contains("agentmessage")
+        || method_lower.contains("agent_message")
+        || method_lower.contains("agent-message")
+        || method_lower.contains("message/delta")
+        || method_lower == "turn/completed"
+    {
+        return None;
+    }
+    let (kind, label) = codex_progress_kind_and_label(method, &method_lower)?;
+    let preview = codex_progress_preview(value, method);
+    Some(
+        AgentProgressEvent::new(
+            context,
+            kind,
+            label,
+            preview,
+            AgentProgressStatus::Started,
+            at_ms,
+        )
+        .source("codex-runtime"),
+    )
+}
+
+fn codex_progress_kind_and_label(
+    method: &str,
+    method_lower: &str,
+) -> Option<(AgentProgressKind, &'static str)> {
+    if method_lower.contains("commandexecution")
+        || method_lower.contains("exec_command")
+        || method_lower.contains("execcommand")
+        || method_lower.contains("terminal")
+        || method_lower.contains("shell")
+    {
+        return Some((AgentProgressKind::Terminal, "terminal"));
+    }
+    if method_lower.contains("execute_code")
+        || method_lower.contains("python")
+        || method_lower.contains("code_interpreter")
+    {
+        return Some((AgentProgressKind::ExecuteCode, "execute_code"));
+    }
+    if method_lower.contains("search")
+        || method_lower.contains("grep")
+        || method_lower.contains("glob")
+        || method_lower.contains("rg")
+    {
+        return Some((AgentProgressKind::SearchFiles, "search_files"));
+    }
+    if (method_lower.contains("file") && method_lower.contains("read"))
+        || method_lower.contains("read_file")
+        || method_lower.contains("view_file")
+    {
+        return Some((AgentProgressKind::ReadFile, "read_file"));
+    }
+    if method_lower.contains("skill") {
+        return Some((AgentProgressKind::SkillView, "skill_view"));
+    }
+    if method_lower.contains("todo") || method_lower.contains("plan_update") {
+        return Some((AgentProgressKind::Todo, "todo"));
+    }
+    if method_lower.contains("tool")
+        || method_lower.contains("mcp")
+        || method_lower.contains("function")
+        || method.starts_with("item/")
+    {
+        return Some((AgentProgressKind::ToolCall, "tool_call"));
+    }
+    None
+}
+
+fn codex_progress_preview(value: &Value, method: &str) -> String {
+    for pointer in [
+        "/params/command",
+        "/params/cmd",
+        "/params/argv",
+        "/params/args",
+        "/params/arguments",
+        "/params/input",
+        "/params/query",
+        "/params/pattern",
+        "/params/path",
+        "/params/file",
+        "/params/name",
+        "/params/toolName",
+        "/params/tool/name",
+        "/params/item/name",
+        "/params/item/path",
+        "/params/item/query",
+        "/params/item/command",
+    ] {
+        if let Some(text) = progress_value_text(value.pointer(pointer)) {
+            return text;
+        }
+    }
+    if let Some(params) = value.get("params")
+        && let Some(text) = progress_value_text(Some(params))
+    {
+        return text;
+    }
+    method.to_string()
+}
+
+fn progress_value_text(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Array(values) => {
+            if values.is_empty() {
+                None
+            } else {
+                Some(
+                    values
+                        .iter()
+                        .filter_map(|value| progress_value_text(Some(value)))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            }
+        }
+        Value::Object(_) => serde_json::to_string(value?).ok(),
+        Value::Null => None,
+    }
+}
+
 enum ProtocolWait {
     ThreadStarted(String),
     TurnCompleted,
@@ -1721,6 +1934,7 @@ fn wait_for_thread_start(
     child: &mut std::process::Child,
     stdin: &mut impl Write,
     state: &mut CodexProtocolState,
+    progress: &mut Option<CodexProgressEmitter>,
     deadline: Instant,
     approval_policy: CodexApprovalPolicy,
 ) -> io::Result<ProtocolWait> {
@@ -1730,6 +1944,7 @@ fn wait_for_thread_start(
                 if let Some(error) = protocol_error(&value) {
                     return Ok(ProtocolWait::Failed(error));
                 }
+                emit_codex_progress(progress, &value, state);
                 if answer_unattended_server_request(&value, stdin, state, approval_policy)? {
                     continue;
                 }
@@ -1757,6 +1972,7 @@ fn wait_for_turn_completed(
     child: &mut std::process::Child,
     stdin: &mut impl Write,
     state: &mut CodexProtocolState,
+    progress: &mut Option<CodexProgressEmitter>,
     deadline: Instant,
     approval_policy: CodexApprovalPolicy,
 ) -> io::Result<ProtocolWait> {
@@ -1766,6 +1982,7 @@ fn wait_for_turn_completed(
                 if let Some(error) = protocol_error(&value) {
                     return Ok(ProtocolWait::Failed(error));
                 }
+                emit_codex_progress(progress, &value, state);
                 if answer_unattended_server_request(&value, stdin, state, approval_policy)? {
                     continue;
                 }
@@ -4028,6 +4245,7 @@ mod tests {
             execution_dir: None,
             plan_file: None,
             timeout_ms: 5_000,
+            progress_context: None,
         })
         .unwrap();
 
@@ -4066,6 +4284,7 @@ mod tests {
             execution_dir: None,
             plan_file: None,
             timeout_ms: 5_000,
+            progress_context: None,
         })
         .unwrap();
         assert_eq!(second.receipt.status, CodexRuntimeRunStatus::Completed);
@@ -4102,6 +4321,7 @@ mod tests {
             execution_dir: None,
             plan_file: None,
             timeout_ms: 5_000,
+            progress_context: None,
         })
         .unwrap();
 

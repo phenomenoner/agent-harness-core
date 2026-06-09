@@ -27,13 +27,13 @@ Primary source snapshot:
 
 ## Current Baseline
 
-Latest local status after the 2026-06-09 round2 refinement pass:
+Latest local status after the 2026-06-09 progress streaming implementation:
 
 - Readiness: `ready=true`, `passed=53`, `warnings=1`, `failed=0`.
 - Runtime: `queued=53`, `open=0`, `prepared=53`, `completed=53`.
 - Outbox: `pending=0`, `delivered=95`, `retryable=0`, `invalid=0`.
 - Channels: Telegram and Discord are enabled; Telegram probe ready; Discord gateway probe ready; Discord real inbound evidence is present; Discord reply-context receipt file is now tracked by status and will appear after the next handled Discord reply event.
-- Loops: runtime, Telegram, Discord outbox, and Discord gateway loops are live. Expected process shape is 4 `openclaw-harness.exe` loops plus 1 Discord Gateway `node.exe` child.
+- Loops: runtime, progress delivery, Telegram, Discord outbox, and Discord gateway loops are the expected live set. Expected process shape is 5 `openclaw-harness.exe` loops plus 1 Discord Gateway `node.exe` child.
 - Memory: Qdrant edge snapshot present, `openclaw-mem.sqlite` present, active recall via `sqlite-vector`, `qdrantParity=snapshot-preserved; native-recall-not-active`, embedding secret migrated, vector recall ready, prompt context ready, lifecycle receipts present, capture candidates=3, compact canvas written.
 - Plugins: sidecar catalog present, 2 manifest-derived tools visible, sidecar bridge OK.
 
@@ -60,6 +60,7 @@ Important core modules:
 - `turns.rs`: turn planning, model policy, thinking policy, agent routing, skill selection.
 - `prompt.rs`: prompt bundle assembly, memory context injection, prompt injection ledger.
 - `codex_runtime.rs`: Codex app-server planning/preflight/run/completion.
+- `progress.rs`: compact runtime action/status event schema, panel rendering, delivery cursor state, and progress delivery receipts.
 - `runtime_queue.rs`, `runtime_worker.rs`, `runtime_pipeline.rs`: queue, preparation, runtime loop.
 - `memory.rs`: imported memory search, vector recall, credentials export, lifecycle, canvas worker.
 - `status.rs`: `status` report aggregation.
@@ -83,8 +84,10 @@ Channel normal message flow:
 5. `runtime-loop` calls `runtime-run-once`.
 6. `queue-prepare` builds a turn plan and prompt bundle.
 7. `codex-plan` and `codex-run` start Codex app-server.
-8. `codex-complete` records transcript, trajectory, Codex binding, memory lifecycle evidence, and outbox reply.
-9. Telegram/Discord outbox delivery loops send and record delivery receipts.
+8. Runtime/Codex writes compact action/status events to `state/runtime-queue/progress-events.jsonl`.
+9. `progress-delivery-loop` sends or edits a compact Telegram/Discord progress panel for authorized targets.
+10. `codex-complete` records transcript, trajectory, Codex binding, memory lifecycle evidence, and outbox reply.
+11. Telegram/Discord outbox delivery loops send and record delivery receipts.
    Discord delivery splits messages over Discord's 2000-character content limit into multiple sends before recording the original delivery id as delivered.
 
 Prompt strategy:
@@ -196,6 +199,8 @@ Implemented:
 - Harness JSONL operational log.
 - Loop heartbeats.
 - Stop files.
+- Compact progress event ledger plus Telegram/Discord progress panels.
+- `progress-delivery-loop` generated with the supervised loop bundle.
 - Windows scheduled-task script generation.
 
 Current operational caveat:
@@ -211,6 +216,7 @@ Useful commands:
 .\target\debug\openclaw-harness.exe status --harness-home .\imports\activation-harness
 .\target\debug\openclaw-harness.exe enable-check --harness-home .\imports\activation-harness
 .\target\debug\openclaw-harness.exe channel-outbox-plan --harness-home .\imports\activation-harness --limit 20
+.\target\debug\openclaw-harness.exe progress-delivery-once --harness-home .\imports\activation-harness
 ```
 
 Stop loops:
@@ -222,7 +228,7 @@ Stop loops:
 Start loops manually when tasks are not registered:
 
 ```powershell
-$scripts = @('runtime-loop.ps1','telegram-loop.ps1','discord-outbox-loop.ps1','discord-gateway-loop.ps1')
+$scripts = @('runtime-loop.ps1','progress-delivery-loop.ps1','telegram-loop.ps1','discord-outbox-loop.ps1','discord-gateway-loop.ps1')
 $dir = Resolve-Path .\imports\activation-harness\state\supervisor\windows-scheduled-tasks\scripts
 foreach ($script in $scripts) {
   Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $dir $script)) -WindowStyle Hidden
@@ -242,8 +248,8 @@ cargo build -p openclaw-harness-cli
 
 Current passing results:
 
-- Core tests: 132 passed.
-- CLI tests: 12 passed.
+- Core tests: 135 passed.
+- CLI tests: 15 passed.
 
 Important test notes:
 
@@ -263,7 +269,7 @@ Important test notes:
    - Narrow operator-safe channel history read command/tool.
    - Native attachment delivery for Discord/TG outgoing messages.
    - Attachment download/inspection policy when explicitly allowed.
-   - Richer progress lifecycle beyond typing indicators.
+   - Provider-native typing/cancel signals where the platform supports them.
 3. Close memory parity:
    - Qdrant-native recall adapter.
    - LanceDB fallback.
