@@ -8,10 +8,12 @@ use serde_json::Value;
 
 use crate::{
     codex_runtime::{CodexApprovalPolicy, inspect_codex_approval_policy},
+    logging::current_log_time_ms,
     probe_harness_log_writable,
 };
 
 const ACTIVATION_READINESS_SCHEMA: &str = "openclaw-harness.activation-readiness.v1";
+const LOOP_HEARTBEAT_STALE_MS: i64 = 120_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationReadinessOptions {
@@ -639,6 +641,100 @@ fn check_supervisor_plan(harness_home: &Path, checks: &mut Vec<ActivationReadine
             format!("could not read supervisor plan {}: {error}", path.display()),
         )),
     }
+    check_loop_heartbeats(harness_home, checks);
+}
+
+fn check_loop_heartbeats(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    for name in [
+        "runtime-loop",
+        "telegram-loop",
+        "discord-outbox-loop",
+        "discord-gateway-loop",
+    ] {
+        check_loop_heartbeat(harness_home, checks, name);
+    }
+}
+
+fn check_loop_heartbeat(
+    harness_home: &Path,
+    checks: &mut Vec<ActivationReadinessCheck>,
+    name: &str,
+) {
+    let path = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("loop-heartbeats")
+        .join(format!("{name}.json"));
+    match read_json_value(&path) {
+        Ok(value) => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let detail = value
+                .get("detail")
+                .and_then(Value::as_str)
+                .unwrap_or("no detail recorded");
+            let age_ms = value
+                .get("atMs")
+                .and_then(Value::as_i64)
+                .and_then(|at_ms| current_log_time_ms().ok().map(|now_ms| now_ms - at_ms));
+            let age_detail = age_ms
+                .map(|age_ms| format!("ageMs={age_ms}"))
+                .unwrap_or_else(|| "ageMs=-".to_string());
+            let check_name = format!("{name}-heartbeat");
+            if matches!(
+                status,
+                "running" | "ok" | "no-work" | "ready" | "heartbeat" | "connected"
+            ) {
+                if age_ms.is_some_and(|age_ms| age_ms > LOOP_HEARTBEAT_STALE_MS) {
+                    checks.push(warn(
+                        check_name,
+                        format!(
+                            "{name} heartbeat is stale at {}: status={status}, {age_detail}, detail={detail}",
+                            path.display()
+                        ),
+                    ));
+                } else {
+                    checks.push(pass(
+                        check_name,
+                        format!(
+                            "{name} heartbeat is live at {}: status={status}, {age_detail}, detail={detail}",
+                            path.display()
+                        ),
+                    ));
+                }
+            } else if status == "stopped"
+                || status.contains("error")
+                || status.contains("fail")
+                || status == "closed"
+            {
+                checks.push(fail(
+                    check_name,
+                    format!(
+                        "{name} heartbeat is not live at {}: status={status}, {age_detail}, detail={detail}",
+                        path.display()
+                    ),
+                ));
+            } else {
+                checks.push(warn(
+                    check_name,
+                    format!(
+                        "{name} heartbeat has unrecognized status at {}: status={status}, {age_detail}, detail={detail}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+            format!("{name}-heartbeat"),
+            format!("no live {name} heartbeat found yet at {}", path.display()),
+        )),
+        Err(error) => checks.push(warn(
+            format!("{name}-heartbeat"),
+            format!("could not read {}: {error}", path.display()),
+        )),
+    }
 }
 
 fn check_channel_state(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
@@ -958,6 +1054,7 @@ fn check_logging(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>
         "discord.event-run-once",
         "no Discord inbound event summary found yet; run discord-event-run-once",
     );
+    check_discord_real_inbound(harness_home, checks);
 }
 
 fn check_log_event(
@@ -983,6 +1080,40 @@ fn check_log_event(
         Err(error) => checks.push(warn(
             name,
             format!("could not read {}: {error}", log_file.display()),
+        )),
+    }
+}
+
+fn check_discord_real_inbound(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let path = harness_home
+        .join("state")
+        .join("channels")
+        .join("discord-gateway-events.jsonl");
+    match fs::read_to_string(&path) {
+        Ok(text) if text.contains(r#""event":"message-create""#) => checks.push(pass(
+            "discord-real-inbound",
+            format!(
+                "Discord Gateway has received a real MESSAGE_CREATE event at {}",
+                path.display()
+            ),
+        )),
+        Ok(_) => checks.push(warn(
+            "discord-real-inbound",
+            format!(
+                "Discord Gateway is connected but no real MESSAGE_CREATE event is recorded at {}; ask an allowed Discord user to DM the bot",
+                path.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+            "discord-real-inbound",
+            format!(
+                "Discord gateway event log is not present at {}; start discord-gateway-loop and DM the bot",
+                path.display()
+            ),
+        )),
+        Err(error) => checks.push(warn(
+            "discord-real-inbound",
+            format!("could not read {}: {error}", path.display()),
         )),
     }
 }
@@ -1562,6 +1693,71 @@ OPENCLAW_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
     }
 
     #[test]
+    fn readiness_reports_live_loop_heartbeats() {
+        let root = temp_root("readiness_reports_live_loop_heartbeats");
+        let harness_home = root.join(".openclaw-harness");
+        let state = harness_home.join("state");
+        let supervisor_dir = state.join("supervisor").join("windows-scheduled-tasks");
+        let heartbeat_dir = state.join("supervisor").join("loop-heartbeats");
+        fs::create_dir_all(&supervisor_dir).unwrap();
+        fs::create_dir_all(&heartbeat_dir).unwrap();
+        fs::write(
+            state.join("harness-registry.json"),
+            r#"{
+              "schema": "openclaw-harness.target-registry.v1",
+              "agents": [
+                { "id": "main", "enabled": true }
+              ],
+              "providers": [],
+              "plugins": [],
+              "channels": { "telegram": false, "discord": false }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            supervisor_dir.join("supervisor-plan.json"),
+            r#"{
+              "schema": "openclaw-harness.windows-supervisor-plan.v1",
+              "tasks": [
+                { "name": "OpenClawHarness-runtime-loop" }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let now_ms = current_log_time_ms().unwrap();
+        fs::write(
+            heartbeat_dir.join("runtime-loop.json"),
+            format!(
+                r#"{{"status":"no-work","iteration":7,"processId":42,"atMs":{now_ms},"detail":"idle"}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            heartbeat_dir.join("telegram-loop.json"),
+            format!(
+                r#"{{"status":"stopped","iteration":8,"processId":43,"atMs":{now_ms},"detail":"stop file requested"}}"#
+            ),
+        )
+        .unwrap();
+
+        let report =
+            check_activation_readiness(ActivationReadinessOptions { harness_home }).unwrap();
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "runtime-loop-heartbeat"
+                && check.status == ActivationReadinessStatus::Pass
+                && check.detail.contains("status=no-work")
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.name == "telegram-loop-heartbeat"
+                && check.status == ActivationReadinessStatus::Fail
+                && check.detail.contains("status=stopped")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn readiness_reports_telegram_probe() {
         let root = temp_root("readiness_reports_telegram_probe");
         let harness_home = root.join(".openclaw-harness");
@@ -1592,6 +1788,42 @@ OPENCLAW_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
 
         assert!(report.checks.iter().any(|check| {
             check.name == "telegram-probe" && check.status == ActivationReadinessStatus::Pass
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readiness_reports_discord_real_inbound_message_create() {
+        let root = temp_root("readiness_reports_discord_real_inbound_message_create");
+        let harness_home = root.join(".openclaw-harness");
+        let state = harness_home.join("state");
+        let channels = state.join("channels");
+        fs::create_dir_all(&channels).unwrap();
+        fs::write(
+            state.join("harness-registry.json"),
+            r#"{
+              "schema": "openclaw-harness.target-registry.v1",
+              "agents": [
+                { "id": "main", "enabled": true }
+              ],
+              "providers": [],
+              "plugins": [],
+              "channels": { "telegram": false, "discord": false }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            channels.join("discord-gateway-events.jsonl"),
+            r#"{"event":"message-create","messageId":"m1","channelId":"c1","guildId":null,"contentLength":5,"status":0}"#,
+        )
+        .unwrap();
+
+        let report =
+            check_activation_readiness(ActivationReadinessOptions { harness_home }).unwrap();
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "discord-real-inbound" && check.status == ActivationReadinessStatus::Pass
         }));
 
         let _ = fs::remove_dir_all(root);
