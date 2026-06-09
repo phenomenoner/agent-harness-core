@@ -5,7 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentRegistry, ChannelCommandIntent, TurnDispatch, TurnPlan};
+use crate::{
+    AgentRegistry, ChannelCommandIntent, TurnDispatch, TurnPlan, inspect_codex_approval_policy,
+    inspect_codex_sandbox,
+};
 
 const CHANNEL_STEP_SCHEMA: &str = "openclaw-harness.channel-step.v1";
 
@@ -89,6 +92,8 @@ pub struct ChannelStatusSnapshot {
     pub current_provider: Option<String>,
     pub current_model: Option<String>,
     pub model_override: Option<String>,
+    pub codex_approval_policy: Option<String>,
+    pub codex_sandbox: Option<String>,
     pub prompt_files_present: usize,
     pub prompt_files_total: usize,
     pub prompt_file_names: Vec<String>,
@@ -405,6 +410,11 @@ fn status_reply_text(snapshot: &ChannelStatusSnapshot) -> String {
             display_opt(&snapshot.current_model),
             display_opt(&snapshot.model_override)
         ),
+        Some("security") => format!(
+            "OpenClaw Security Status\nApprovals: {}\nSandbox: {}",
+            display_opt(&snapshot.codex_approval_policy),
+            display_opt(&snapshot.codex_sandbox)
+        ),
         Some("skills") => format!(
             "OpenClaw Skill Status\nSelected: {}\nMatches: {}",
             snapshot.selected_skills,
@@ -414,13 +424,15 @@ fn status_reply_text(snapshot: &ChannelStatusSnapshot) -> String {
             "Cron status is available through cron-plan and deterministic-cron-plan.".to_string()
         }
         _ => format!(
-            "OpenClaw Harness Status\nAgent: {} ({}/{})\nModel: provider={}, model={}, override={}\nChannels: telegram={}, discord={}, current={}\nSession: active={}, stateLoaded={}\nPrompt: files {}/{} ({})\nSkills: {} selected ({})\nState: thinking={}, steer={}, btw={}\nRegistry: providers={}, plugins={}",
+            "OpenClaw Harness Status\nAgent: {} ({}/{})\nModel: provider={}, model={}, override={}\nSecurity: approvals={}, sandbox={}\nChannels: telegram={}, discord={}, current={}\nSession: active={}, stateLoaded={}\nPrompt: files {}/{} ({})\nSkills: {} selected ({})\nState: thinking={}, steer={}, btw={}\nRegistry: providers={}, plugins={}",
             display_opt(&snapshot.current_agent_id),
             snapshot.agents_enabled,
             snapshot.agents_total,
             display_opt(&snapshot.current_provider),
             display_opt(&snapshot.current_model),
             display_opt(&snapshot.model_override),
+            display_opt(&snapshot.codex_approval_policy),
+            display_opt(&snapshot.codex_sandbox),
             yes_no(snapshot.telegram_configured),
             yes_no(snapshot.discord_configured),
             snapshot.platform,
@@ -445,6 +457,16 @@ fn status_snapshot(
     turn: &TurnPlan,
     scope: Option<String>,
 ) -> ChannelStatusSnapshot {
+    let codex_approval_policy = turn.harness_home.as_ref().map(|harness_home| {
+        inspect_codex_approval_policy(harness_home)
+            .policy
+            .as_str()
+            .to_string()
+    });
+    let codex_sandbox = turn
+        .harness_home
+        .as_ref()
+        .map(|harness_home| inspect_codex_sandbox(harness_home).sandbox);
     ChannelStatusSnapshot {
         scope,
         platform: turn.platform.clone(),
@@ -474,6 +496,8 @@ fn status_snapshot(
             .channel_state
             .as_ref()
             .and_then(|state| state.model_override.clone()),
+        codex_approval_policy,
+        codex_sandbox,
         prompt_files_present: prompt_files_present(turn),
         prompt_files_total: turn.prompt_files.len(),
         prompt_file_names: turn
@@ -623,6 +647,52 @@ mod tests {
                 if snapshot.scope.as_deref() == Some("channels")
                     && snapshot.discord_configured
                     && snapshot.telegram_configured
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_step_replies_to_security_status_command() {
+        let root = temp_root("channel_step_replies_to_security_status_command");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"security":{"codexApprovalPolicy":"accept","codexSandbox":"elevated"}}"#,
+        )
+        .unwrap();
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "/status security".to_string(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        let step = build_channel_step(&registry, &turn);
+
+        assert_eq!(step.action, ChannelStepAction::ReplyOnly);
+        assert!(step.outbound_messages[0].text.contains("Approvals: accept"));
+        assert!(step.outbound_messages[0].text.contains("Sandbox: elevated"));
+        assert!(matches!(
+            step.command_effect,
+            Some(ChannelCommandEffect::ShowStatus { ref snapshot, .. })
+                if snapshot.scope.as_deref() == Some("security")
+                    && snapshot.codex_approval_policy.as_deref() == Some("accept")
+                    && snapshot.codex_sandbox.as_deref() == Some("elevated")
         ));
 
         let _ = fs::remove_dir_all(root);

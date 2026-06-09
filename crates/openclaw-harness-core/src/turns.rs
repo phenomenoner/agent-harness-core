@@ -28,6 +28,7 @@ pub struct TurnPlanInput {
 #[serde(rename_all = "camelCase")]
 pub struct TurnPlan {
     pub schema: &'static str,
+    pub harness_home: Option<PathBuf>,
     pub source_home: PathBuf,
     pub source_workspace: PathBuf,
     pub platform: String,
@@ -157,6 +158,7 @@ pub fn build_turn_plan(
     };
     Ok(TurnPlan {
         schema: TURN_PLAN_SCHEMA,
+        harness_home: input.harness_home,
         source_home: source.home.clone(),
         source_workspace: source.workspace.clone(),
         platform: input.platform,

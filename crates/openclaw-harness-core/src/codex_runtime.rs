@@ -28,6 +28,8 @@ from the OpenClaw prompt bundle passed as turn input. Do not treat the Rust harn
 development repository as the chat user's agent identity.";
 const HARNESS_CONFIG_FILE_NAME: &str = "harness-config.json";
 pub(crate) const CODEX_APPROVAL_POLICY_ENV: &str = "OPENCLAW_HARNESS_CODEX_APPROVAL_POLICY";
+pub(crate) const CODEX_SANDBOX_ENV: &str = "OPENCLAW_HARNESS_CODEX_SANDBOX";
+const DEFAULT_CODEX_SANDBOX: &str = "elevated";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRuntimePlanOptions {
@@ -200,6 +202,16 @@ impl CodexApprovalPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct CodexApprovalPolicyInspection {
     pub policy: CodexApprovalPolicy,
+    pub source: String,
+    pub configured: bool,
+    pub config_file: PathBuf,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSandboxInspection {
+    pub sandbox: String,
     pub source: String,
     pub configured: bool,
     pub config_file: PathBuf,
@@ -2494,6 +2506,144 @@ fn parse_codex_approval_policy(value: &str) -> Option<CodexApprovalPolicy> {
     }
 }
 
+pub fn inspect_codex_sandbox(harness_home: &Path) -> CodexSandboxInspection {
+    let mut warnings = Vec::new();
+    let (sandbox, source, configured) =
+        resolve_codex_sandbox_with_source(harness_home, &mut warnings);
+    CodexSandboxInspection {
+        sandbox,
+        source,
+        configured,
+        config_file: harness_home.join(HARNESS_CONFIG_FILE_NAME),
+        warnings,
+    }
+}
+
+fn resolve_codex_sandbox(harness_home: &Path, warnings: &mut Vec<String>) -> String {
+    let (sandbox, _, _) = resolve_codex_sandbox_with_source(harness_home, warnings);
+    sandbox
+}
+
+fn resolve_codex_sandbox_with_source(
+    harness_home: &Path,
+    warnings: &mut Vec<String>,
+) -> (String, String, bool) {
+    if let Ok(raw) = env::var(CODEX_SANDBOX_ENV) {
+        return match parse_codex_sandbox(&raw) {
+            Some(sandbox) => (sandbox, CODEX_SANDBOX_ENV.to_string(), true),
+            None => {
+                warnings.push(format!(
+                    "invalid {CODEX_SANDBOX_ENV}={raw:?}; defaulting Codex sandbox to {DEFAULT_CODEX_SANDBOX}"
+                ));
+                (
+                    DEFAULT_CODEX_SANDBOX.to_string(),
+                    CODEX_SANDBOX_ENV.to_string(),
+                    true,
+                )
+            }
+        };
+    }
+
+    let config_file = harness_home.join(HARNESS_CONFIG_FILE_NAME);
+    let text = match fs::read_to_string(&config_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return (
+                DEFAULT_CODEX_SANDBOX.to_string(),
+                "default".to_string(),
+                false,
+            );
+        }
+        Err(error) => {
+            warnings.push(format!(
+                "failed to read {}: {error}; defaulting Codex sandbox to {DEFAULT_CODEX_SANDBOX}",
+                config_file.display()
+            ));
+            return (
+                DEFAULT_CODEX_SANDBOX.to_string(),
+                config_file.display().to_string(),
+                false,
+            );
+        }
+    };
+    let value = match serde_json::from_str::<Value>(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            warnings.push(format!(
+                "failed to parse {} as JSON: {error}; defaulting Codex sandbox to {DEFAULT_CODEX_SANDBOX}",
+                config_file.display()
+            ));
+            return (
+                DEFAULT_CODEX_SANDBOX.to_string(),
+                config_file.display().to_string(),
+                false,
+            );
+        }
+    };
+    for pointer in [
+        "/security/codexSandbox",
+        "/security/codexSandboxMode",
+        "/codex/sandbox",
+        "/codex/sandboxMode",
+        "/runtime/codexSandbox",
+    ] {
+        if let Some(raw_value) = value.pointer(pointer) {
+            if let Some(sandbox) = codex_sandbox_from_json(raw_value) {
+                return (
+                    sandbox,
+                    format!("{}:{pointer}", config_file.display()),
+                    true,
+                );
+            }
+            warnings.push(format!(
+                "invalid Codex sandbox at {}:{pointer}; defaulting to {DEFAULT_CODEX_SANDBOX}",
+                config_file.display()
+            ));
+            return (
+                DEFAULT_CODEX_SANDBOX.to_string(),
+                format!("{}:{pointer}", config_file.display()),
+                true,
+            );
+        }
+    }
+    (
+        DEFAULT_CODEX_SANDBOX.to_string(),
+        config_file.display().to_string(),
+        false,
+    )
+}
+
+fn codex_sandbox_from_json(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => parse_codex_sandbox(text),
+        Value::Bool(true) => Some(DEFAULT_CODEX_SANDBOX.to_string()),
+        Value::Bool(false) => Some("danger-full-access".to_string()),
+        _ => None,
+    }
+}
+
+fn parse_codex_sandbox(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+    let sandbox = match normalized.as_str() {
+        "" => return None,
+        "default" | "windows-elevated" => DEFAULT_CODEX_SANDBOX,
+        "readonly" => "read-only",
+        "workspace" | "workspace-write" => "workspace-write",
+        "full-access" | "full" | "none" | "off" | "disabled" | "false" => "danger-full-access",
+        "elevated" | "read-only" | "danger-full-access" => normalized.as_str(),
+        other if is_safe_codex_sandbox_value(other) => other,
+        _ => return None,
+    };
+    Some(sandbox.to_string())
+}
+
+fn is_safe_codex_sandbox_value(value: &str) -> bool {
+    value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
 fn check_executable(executable: &Path) -> CodexRuntimePreflightCheck {
     match resolve_executable(executable) {
         Some(path) => pass_check(
@@ -2904,11 +3054,12 @@ fn ensure_harness_codex_config(
     let Some(codex_home) = codex_home else {
         return Ok(());
     };
+    let sandbox = resolve_codex_sandbox(harness_home, warnings);
     let config_file = codex_home.join("config.toml");
     if config_file.is_file() {
         let existing = fs::read_to_string(&config_file)?;
         if existing.starts_with("# Generated by openclaw-harness.") {
-            let desired = harness_codex_config_toml(working_directory, harness_home);
+            let desired = harness_codex_config_toml(working_directory, harness_home, &sandbox);
             if existing != desired {
                 fs::write(&config_file, desired)?;
                 warnings.push(format!(
@@ -2921,16 +3072,20 @@ fn ensure_harness_codex_config(
     }
 
     fs::create_dir_all(codex_home)?;
-    let config = harness_codex_config_toml(working_directory, harness_home);
+    let config = harness_codex_config_toml(working_directory, harness_home, &sandbox);
     fs::write(&config_file, config)?;
     warnings.push(format!(
-        "created harness-local Codex config at {} with Windows elevated sandbox and trusted runtime workspace",
-        config_file.display()
+        "created harness-local Codex config at {} with Windows sandbox={sandbox:?} and trusted runtime workspace",
+        config_file.display(),
     ));
     Ok(())
 }
 
-fn harness_codex_config_toml(working_directory: &Path, harness_home: &Path) -> String {
+fn harness_codex_config_toml(
+    working_directory: &Path,
+    harness_home: &Path,
+    sandbox: &str,
+) -> String {
     let mut project_roots = vec![
         absolute_for_config(working_directory),
         absolute_for_config(harness_home),
@@ -2938,16 +3093,17 @@ fn harness_codex_config_toml(working_directory: &Path, harness_home: &Path) -> S
     project_roots.sort();
     project_roots.dedup();
 
-    let mut config = String::from(
+    let mut config = format!(
         "# Generated by openclaw-harness. Contains no secrets.\n\
          # Codex OAuth state stays in auth.json/auth.toml.\n\
          \n\
          [windows]\n\
-         sandbox = \"elevated\"\n\
+         sandbox = {}\n\
          \n\
          [features]\n\
          multi_agent = true\n\
          memories = true\n",
+        toml_basic_string(sandbox)
     );
     for root in project_roots {
         config.push_str("\n[projects.");
@@ -3175,6 +3331,42 @@ mod tests {
     }
 
     #[test]
+    fn plan_codex_runtime_reads_sandbox_from_harness_config() {
+        let root = temp_root("plan_codex_runtime_reads_sandbox_from_harness_config");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        let codex_home = harness_home.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"security":{"codexSandbox":"read-only"}}"#,
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+
+        let report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+
+        let plan = report.plan.unwrap();
+        let config = fs::read_to_string(
+            plan.invocation
+                .codex_home
+                .as_ref()
+                .unwrap()
+                .join("config.toml"),
+        )
+        .unwrap();
+        assert!(config.contains("sandbox = \"read-only\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn plan_codex_runtime_preserves_existing_harness_codex_config() {
         let root = temp_root("plan_codex_runtime_preserves_existing_harness_codex_config");
         let source = write_codex_runtime_source(&root);
@@ -3204,8 +3396,11 @@ mod tests {
     #[test]
     fn harness_codex_config_uses_absolute_project_paths() {
         let cwd = env::current_dir().unwrap();
-        let config =
-            harness_codex_config_toml(Path::new("relative-runtime"), Path::new("relative-harness"));
+        let config = harness_codex_config_toml(
+            Path::new("relative-runtime"),
+            Path::new("relative-harness"),
+            DEFAULT_CODEX_SANDBOX,
+        );
 
         assert!(config.contains(&toml_basic_string(
             &cwd.join("relative-runtime").to_string_lossy()

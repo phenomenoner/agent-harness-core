@@ -52,6 +52,7 @@ Use it when the user mentions:
 12. Use runtime-loop for operator-run queue draining or service-wrapper handoff; use --stop-when-idle for smoke and --iterations 0 only under an intentional supervisor.
 13. Use supervisor-plan to generate Windows Task Scheduler install/start/stop/uninstall scripts. It writes scripts and receipts only; it does not register tasks automatically.
 14. Use status --json for operator health checks; it should show runtime openItems=0 and outbox pending=0 before live handoff.
+15. Treat harness-config.json security.codexApprovalPolicy and security.codexSandbox as operator-controlled runtime safety settings. Use codexApprovalPolicy="accept" only for an intentionally unattended trusted channel runtime.
 
 ## Prompt And Tool Schema Policy
 
@@ -62,6 +63,8 @@ The harness does not own the Codex system prompt or Codex tool schema. Codex CLI
 - tool schemas
 - sandbox and approval policy
 - session continuity
+
+The harness-local Codex config is generated under codex-home/config.toml when harness-local Codex OAuth auth is present. Generated config uses security.codexSandbox from harness-config.json or OPENCLAW_HARNESS_CODEX_SANDBOX, defaulting to Windows sandbox "elevated". Approval requests are controlled separately by security.codexApprovalPolicy or OPENCLAW_HARNESS_CODEX_APPROVAL_POLICY.
 
 The harness may assemble a turn payload containing OpenClaw prompt files, channel state, matched skills, and the user message. Same-session payload assembly must use the prompt injection ledger:
 
@@ -114,11 +117,13 @@ Before replacing the Docker OpenClaw gateway:
 10. Smoke-test a Telegram command message with telegram-poll-once when the old gateway is offline, or with channel-run-once when testing offline.
 11. Confirm enable-check reports telegram-probe before live handoff, then telegram-offset, telegram-poll-log, and discord-send-log after channel adapter smoke tests.
 12. Confirm memory-qdrant-edge is present when current OpenClaw uses Qdrant edge as primary memory backend.
-13. Confirm codex-runtime-launch-probe passes with the intended --codex-exe before any real runtime handoff.
-14. Run plugin-sidecar-probe and plugin-sidecar-call for sidecar.status/plugins.list/tools.probe; set OPENCLAW_PLUGIN_SOURCE_ROOTS when imported manifests live outside the harness home. Confirm plugin-sidecar, plugin-sidecar-probe, and plugin-sidecar-bridge are pass in enable-check. This proves manifest catalog and JSON-RPC bridge readiness; plugin-specific tool executors still need dedicated adapters.
-15. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt. Use tools/openclaw-fake-codex-app-server/fake-codex-app-server.cmd for offline smoke; use the intended Codex CLI only for operator-run model smoke.
-16. Run runtime-loop --stop-when-idle for idle/drain smoke and confirm state/runtime-queue/loop-last.json plus runtime.loop-stopped log evidence.
-17. Run supervisor-plan with the intended harness CLI, Codex executable, channel loop selection, and task prefix. Confirm state/supervisor/windows-scheduled-tasks/supervisor-plan.json, absolute paths in generated scripts, no raw token/key/secret strings in scripts, and enable-check supervisor-plan pass.
+13. Run memory-search --harness-home <harness> --query <known term> to prove imported markdown/text memory files are readable. This is a read-only recall probe and does not replace the Qdrant edge vector adapter.
+14. Confirm /status security, enable-check codex-approval-policy, and enable-check codex-sandbox show the intended unattended safety posture.
+15. Confirm codex-runtime-launch-probe passes with the intended --codex-exe before any real runtime handoff.
+16. Run plugin-sidecar-probe and plugin-sidecar-call for sidecar.status/plugins.list/tools.probe; set OPENCLAW_PLUGIN_SOURCE_ROOTS when imported manifests live outside the harness home. Confirm plugin-sidecar, plugin-sidecar-probe, and plugin-sidecar-bridge are pass in enable-check. This proves manifest catalog and JSON-RPC bridge readiness; plugin-specific tool executors still need dedicated adapters.
+17. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt. Use tools/openclaw-fake-codex-app-server/fake-codex-app-server.cmd for offline smoke; use the intended Codex CLI only for operator-run model smoke.
+18. Run runtime-loop --stop-when-idle for idle/drain smoke and confirm state/runtime-queue/loop-last.json plus runtime.loop-stopped log evidence.
+19. Run supervisor-plan with the intended harness CLI, Codex executable, channel loop selection, and task prefix. Confirm state/supervisor/windows-scheduled-tasks/supervisor-plan.json, absolute paths in generated scripts, no raw token/key/secret strings in scripts, and enable-check supervisor-plan pass.
 
 ## Codex Runtime Flow
 
@@ -161,6 +166,7 @@ For offline activation smoke, --codex-exe may point at tools/openclaw-fake-codex
 Use status for operator-facing health checks before and after handoff:
 
 - status summarizes readiness, runtime queued/open/prepared/completed items, outbox pending/delivered/retryable counts, Telegram/Discord smoke evidence, memory backend presence, plugin sidecar receipts, and operational log coverage.
+- status includes memory-search receipts when the imported markdown/text memory probe has been run.
 - status --json is the monitor-friendly form for scheduled tasks or service wrappers.
 - runtime-loop writes loop-last.json for the most recent worker-loop stop reason, iteration count, idle count, and error count.
 - supervisor-plan readiness is checked through enable-check, not status-specific process liveness; installed task health still needs monitor integration.

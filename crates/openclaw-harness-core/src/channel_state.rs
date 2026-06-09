@@ -521,6 +521,8 @@ mod tests {
                 current_provider: Some("openai".to_string()),
                 current_model: Some("gpt-5".to_string()),
                 model_override: None,
+                codex_approval_policy: None,
+                codex_sandbox: None,
                 prompt_files_present: 1,
                 prompt_files_total: 1,
                 prompt_file_names: vec!["AGENTS.md".to_string()],

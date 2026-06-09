@@ -23,23 +23,25 @@ use openclaw_harness_core::{
     CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy, DeterministicCronPlan,
     DeterministicCronPlanInput, DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent,
     HarnessLogLevel, HarnessStatusOptions, HarnessStatusReport, ImportPhaseStatus, ImportReport,
-    NativeCronPlan, NativeCronPlanInput, OpenClawSource, PromptAssemblyOptions, PromptBundle,
-    RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions,
-    RuntimeQueuePrepareReport, RuntimeRunOnceOptions, RuntimeRunOnceReport, RuntimeRunOnceStatus,
-    SkillIndex, SkillSelectionQuery, SubagentPlan, SubagentPlanInput, TurnPlan, TurnPlanInput,
-    WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport, append_harness_log,
-    apply_channel_command_step, assemble_prompt_bundle, build_channel_step, build_dry_run_report,
-    build_harness_skill_index, build_import_plan, build_runtime_skill_index,
-    build_source_skill_index, build_turn_plan, check_activation_readiness, collect_harness_status,
-    current_log_time_ms, enqueue_channel_step, execute_import, export_harness_registry_files,
-    inventory, load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
-    load_subagent_ledger, plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron,
-    plan_native_cron, plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
+    MemorySearchOptions, MemorySearchReport, NativeCronPlan, NativeCronPlanInput, OpenClawSource,
+    PromptAssemblyOptions, PromptBundle, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
+    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeRunOnceOptions,
+    RuntimeRunOnceReport, RuntimeRunOnceStatus, SkillIndex, SkillSelectionQuery, SubagentPlan,
+    SubagentPlanInput, TurnPlan, TurnPlanInput, WindowsSupervisorPlanOptions,
+    WindowsSupervisorPlanReport, append_harness_log, apply_channel_command_step,
+    assemble_prompt_bundle, build_channel_step, build_dry_run_report, build_harness_skill_index,
+    build_import_plan, build_runtime_skill_index, build_source_skill_index, build_turn_plan,
+    check_activation_readiness, collect_harness_status, current_log_time_ms, enqueue_channel_step,
+    execute_import, export_harness_registry_files, inventory, load_agent_registry,
+    load_deterministic_cron_store, load_native_cron_store, load_subagent_ledger,
+    plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron, plan_native_cron,
+    plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
     probe_codex_runtime_launch, receive_channel_message, record_channel_delivery,
     record_codex_runtime_completion, run_channel_once, run_codex_runtime, run_runtime_queue_once,
-    select_skills, sync_builtin_harness_skills, write_channel_step, write_deterministic_cron_plan,
-    write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
-    write_subagent_plan, write_turn_plan, write_windows_supervisor_plan,
+    search_imported_memory, select_skills, sync_builtin_harness_skills, write_channel_step,
+    write_deterministic_cron_plan, write_memory_search_receipt, write_native_cron_plan,
+    write_prompt_bundle, write_report_files, write_skill_index, write_subagent_plan,
+    write_turn_plan, write_windows_supervisor_plan,
 };
 
 fn main() {
@@ -57,6 +59,7 @@ fn main() {
         "registry-export" => run_registry_export(&rest),
         "enable-check" => run_enable_check(&rest),
         "status" | "harness-status" => run_harness_status(&rest),
+        "memory-search" => run_memory_search(&rest),
         "supervisor-plan" => run_supervisor_plan(&rest),
         "harness-skills-sync" => run_harness_skills_sync(&rest),
         "skills" => run_skills(&rest),
@@ -334,6 +337,51 @@ fn run_harness_status(args: &[String]) -> Result<(), String> {
         print_harness_status_report(&report);
     }
     Ok(())
+}
+
+fn run_memory_search(args: &[String]) -> Result<(), String> {
+    let args = memory_search_args_from_args(args)?;
+    let report = search_imported_memory(MemorySearchOptions {
+        harness_home: args.target_home.clone(),
+        query: args.query,
+        limit: args.limit,
+        max_file_bytes: args.max_file_bytes,
+    })
+    .map_err(|err| err.to_string())?;
+    if args.write_receipt {
+        write_memory_search_receipt(&report).map_err(|err| err.to_string())?;
+    }
+    append_harness_log(
+        &args.target_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            if report.status.as_str() == "ready" {
+                HarnessLogLevel::Info
+            } else {
+                HarnessLogLevel::Warn
+            },
+            "memory",
+            "memory.search",
+            format!(
+                "status={} hits={} searchedFiles={} skippedFiles={}",
+                report.status.as_str(),
+                report.hits.len(),
+                report.searched_files,
+                report.skipped_files
+            ),
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    if args.json {
+        print_memory_search_report_json(&report)?;
+    } else {
+        print_memory_search_report(&report);
+    }
+    if report.status.as_str() == "ready" {
+        Ok(())
+    } else {
+        Err(report.reason)
+    }
 }
 
 fn run_supervisor_plan(args: &[String]) -> Result<(), String> {
@@ -2265,6 +2313,15 @@ struct HarnessStatusArgs {
     json: bool,
 }
 
+struct MemorySearchArgs {
+    target_home: PathBuf,
+    query: String,
+    limit: usize,
+    max_file_bytes: u64,
+    json: bool,
+    write_receipt: bool,
+}
+
 struct SupervisorPlanArgs {
     target_home: PathBuf,
     openclaw_home: PathBuf,
@@ -2871,6 +2928,65 @@ fn harness_status_args_from_args(args: &[String]) -> Result<HarnessStatusArgs, S
     }
 
     Ok(HarnessStatusArgs { target_home, json })
+}
+
+fn memory_search_args_from_args(args: &[String]) -> Result<MemorySearchArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut query = None;
+    let mut limit = 8usize;
+    let mut max_file_bytes = 1_000_000u64;
+    let mut json = false;
+    let mut write_receipt = true;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--query" | "-q" => {
+                i += 1;
+                query = Some(
+                    args.get(i)
+                        .ok_or_else(|| "--query requires text".to_string())?
+                        .clone(),
+                );
+            }
+            "--limit" => {
+                i += 1;
+                limit = args
+                    .get(i)
+                    .ok_or_else(|| "--limit requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--max-file-bytes" => {
+                i += 1;
+                max_file_bytes = args
+                    .get(i)
+                    .ok_or_else(|| "--max-file-bytes requires a positive integer".to_string())
+                    .and_then(|value| parse_u64(value, "--max-file-bytes"))?;
+            }
+            "--json" => json = true,
+            "--no-receipt" => write_receipt = false,
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let query = query.ok_or_else(|| "--query is required".to_string())?;
+    if query.trim().is_empty() {
+        return Err("--query must not be empty".to_string());
+    }
+
+    Ok(MemorySearchArgs {
+        target_home,
+        query,
+        limit,
+        max_file_bytes,
+        json,
+        write_receipt,
+    })
 }
 
 fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs, String> {
@@ -6848,11 +6964,12 @@ fn print_harness_status_report(report: &HarnessStatusReport) {
         receipt_summary(&report.channels.discord_gateway_probe)
     );
     println!(
-        "Memory: qdrantEdge={} lancedb={} openclawMemSqlite={} files={}",
+        "Memory: qdrantEdge={} lancedb={} openclawMemSqlite={} files={} search={}",
         yes_no(report.memory.qdrant_edge),
         yes_no(report.memory.lancedb),
         yes_no(report.memory.openclaw_mem_sqlite),
-        report.memory.regular_files
+        report.memory.regular_files,
+        receipt_summary(&report.memory.search_receipts)
     );
     println!(
         "Plugins: catalog={} tools={} execution={} probe={} bridge={}",
@@ -6868,6 +6985,65 @@ fn print_harness_status_report(report: &HarnessStatusReport) {
         report.logs.invalid_lines,
         report.logs.latest_event.as_deref().unwrap_or("-")
     );
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
+fn print_memory_search_report_json(report: &MemorySearchReport) -> Result<(), String> {
+    let value = serde_json::json!({
+        "schema": report.schema,
+        "harnessHome": report.harness_home,
+        "memoryDir": report.memory_dir,
+        "status": report.status.as_str(),
+        "reason": report.reason,
+        "query": report.query,
+        "searchedFiles": report.searched_files,
+        "skippedFiles": report.skipped_files,
+        "hits": report.hits.iter().map(|hit| {
+            serde_json::json!({
+                "path": hit.path,
+                "line": hit.line,
+                "score": hit.score,
+                "snippet": hit.snippet,
+            })
+        }).collect::<Vec<_>>(),
+        "warnings": report.warnings,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?
+    );
+    Ok(())
+}
+
+fn print_memory_search_report(report: &MemorySearchReport) {
+    println!("OpenClaw imported memory search");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Memory dir: {}", report.memory_dir.display());
+    println!("Status: {}", report.status.as_str());
+    println!("Reason: {}", report.reason);
+    println!(
+        "Files: searched={} skipped={} hits={}",
+        report.searched_files,
+        report.skipped_files,
+        report.hits.len()
+    );
+    if !report.hits.is_empty() {
+        println!("Hits:");
+        for hit in &report.hits {
+            println!(
+                "- {}:{} score={} {}",
+                hit.path.display(),
+                hit.line,
+                hit.score,
+                hit.snippet
+            );
+        }
+    }
     if !report.warnings.is_empty() {
         println!("Warnings:");
         for warning in &report.warnings {
@@ -7942,6 +8118,7 @@ fn print_help() {
     println!(
         "  status          Summarize harness readiness, runtime, channels, memory, plugins, and logs"
     );
+    println!("  memory-search   Search imported markdown/text memory files read-only");
     println!("  supervisor-plan Generate Windows scheduled-task scripts for harness loops");
     println!("  harness-skills-sync Sync bundled harness operation skills");
     println!("  skills          Build a skill-first index and optionally match a task");
@@ -7991,12 +8168,14 @@ fn print_help() {
     println!("  --include-sensitive     Copy/write sensitive import or credential values");
     println!("  --json                  Print machine-readable JSON for status");
     println!("  --task-prefix <name>    Windows scheduled-task name prefix for supervisor-plan");
-    println!("  --query <text>          Match skills for a task turn");
+    println!("  --query <text>          Match skills or search imported memory");
     println!("  --agent <id>            Agent hint for skill matching");
     println!("  --telegram-account <id> Telegram account token/offset selector");
     println!("  --channel <name>        Channel hint for skill matching");
     println!("  --match-workspace <txt> Workspace hint for skill matching");
     println!("  --limit <n>             Maximum matched skills to print");
+    println!("  --max-file-bytes <n>    Maximum imported memory file size for memory-search");
+    println!("  --no-receipt            Do not write memory-search probe receipts");
     println!("  --message <text>        Incoming channel message for turn-plan");
     println!("  --platform <name>       local, telegram, discord, or cron");
     println!("  --channel-id <id>       Channel identity for session mapping");

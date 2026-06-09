@@ -104,6 +104,7 @@ pub struct HarnessMemoryStatus {
     pub lancedb: bool,
     pub openclaw_mem_sqlite: bool,
     pub regular_files: usize,
+    pub search_receipts: HarnessJsonlStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -314,6 +315,12 @@ fn memory_status(harness_home: &Path) -> io::Result<HarnessMemoryStatus> {
         lancedb: memory_dir.join("lancedb").is_dir(),
         openclaw_mem_sqlite: memory_dir.join("openclaw-mem.sqlite").is_file(),
         regular_files: count_regular_files(&memory_dir)?,
+        search_receipts: jsonl_status(
+            harness_home
+                .join("state")
+                .join("memory")
+                .join("search-receipts.jsonl"),
+        )?,
         memory_dir,
     })
 }

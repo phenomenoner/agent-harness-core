@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
-    codex_runtime::{CodexApprovalPolicy, inspect_codex_approval_policy},
+    codex_runtime::{CodexApprovalPolicy, inspect_codex_approval_policy, inspect_codex_sandbox},
     logging::current_log_time_ms,
     probe_harness_log_writable,
 };
@@ -111,6 +111,7 @@ pub fn check_activation_readiness(
     check_codex_auth(&mut checks);
     check_codex_config(&options.harness_home, &mut checks);
     check_codex_approval_policy(&options.harness_home, &mut checks);
+    check_codex_sandbox(&options.harness_home, &mut checks);
 
     let summary = summarize(&checks);
     Ok(ActivationReadinessReport {
@@ -1122,19 +1123,17 @@ fn check_memory_import(harness_home: &Path, checks: &mut Vec<ActivationReadiness
     let memory_dir = harness_home.join("memory");
     if memory_dir.is_dir() {
         checks.push(pass(
-            "memory-adapter",
-            format!(
-                "memory files are imported at {}; native memory query adapter is still pending",
-                memory_dir.display()
-            ),
+            "memory-files",
+            format!("memory files are imported at {}", memory_dir.display()),
         ));
     } else {
         checks.push(warn(
-            "memory-adapter",
+            "memory-files",
             "no imported memory directory detected; memory recall will be unavailable",
         ));
         return;
     }
+    check_memory_search_probe(harness_home, checks);
 
     let qdrant_edge = memory_dir.join("qdrant-edge");
     if qdrant_edge.is_dir() {
@@ -1191,6 +1190,68 @@ fn check_memory_import(harness_home: &Path, checks: &mut Vec<ActivationReadiness
                 lancedb.display()
             ),
         ));
+    }
+}
+
+fn check_memory_search_probe(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let path = harness_home
+        .join("state")
+        .join("memory")
+        .join("search-receipts.jsonl");
+    match latest_jsonl_value(&path) {
+        Ok(Some(value)) => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let reason = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason recorded");
+            let hit_count = value.get("hitCount").and_then(Value::as_u64).unwrap_or(0);
+            let searched_files = value
+                .get("searchedFiles")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            match status {
+                "ready" if hit_count > 0 => checks.push(pass(
+                    "memory-search",
+                    format!(
+                        "read-only imported memory search probe returned {hit_count} hit(s) across {searched_files} searched file(s) at {}",
+                        path.display()
+                    ),
+                )),
+                "ready" => checks.push(warn(
+                    "memory-search",
+                    format!(
+                        "read-only imported memory search ran but returned no hits across {searched_files} searched file(s) at {}",
+                        path.display()
+                    ),
+                )),
+                _ => checks.push(fail(
+                    "memory-search",
+                    format!("memory search probe status={status} at {}: {reason}", path.display()),
+                )),
+            }
+        }
+        Ok(None) => checks.push(warn(
+            "memory-search",
+            format!(
+                "no memory search probe receipt lines found at {}",
+                path.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+            "memory-search",
+            format!(
+                "not found yet: {}; run memory-search --query <text> before claiming memory recall",
+                path.display()
+            ),
+        )),
+        Err(error) => checks.push(warn(
+            "memory-search",
+            format!("could not read {}: {error}", path.display()),
+        )),
     }
 }
 
@@ -1278,6 +1339,30 @@ fn check_codex_approval_policy(harness_home: &Path, checks: &mut Vec<ActivationR
             ),
         )),
     }
+}
+
+fn check_codex_sandbox(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let inspection = inspect_codex_sandbox(harness_home);
+    if !inspection.warnings.is_empty() {
+        checks.push(warn(
+            "codex-sandbox",
+            format!(
+                "{}; sandbox={} source={}",
+                inspection.warnings.join("; "),
+                inspection.sandbox,
+                inspection.source
+            ),
+        ));
+        return;
+    }
+
+    checks.push(pass(
+        "codex-sandbox",
+        format!(
+            "Codex Windows sandbox is {}; source={}",
+            inspection.sandbox, inspection.source
+        ),
+    ));
 }
 
 fn check_env_token(

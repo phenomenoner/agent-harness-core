@@ -16,6 +16,7 @@ pub mod harness_registry;
 pub mod harness_skills;
 pub mod importer;
 pub mod logging;
+pub mod memory;
 pub mod prompt;
 pub mod registry;
 pub mod runtime_pipeline;
@@ -65,9 +66,10 @@ pub use codex_runtime::{
     CodexRuntimePreflightCheck, CodexRuntimePreflightCheckStatus, CodexRuntimePreflightOptions,
     CodexRuntimePreflightReceipt, CodexRuntimePreflightReport, CodexRuntimePreflightStatus,
     CodexRuntimeReceipt, CodexRuntimeReceiptStatus, CodexRuntimeRunOptions, CodexRuntimeRunReceipt,
-    CodexRuntimeRunReport, CodexRuntimeRunStatus, CodexTransportPlan,
-    inspect_codex_approval_policy, plan_codex_runtime, preflight_codex_runtime,
-    probe_codex_runtime_launch, record_codex_runtime_completion, run_codex_runtime,
+    CodexRuntimeRunReport, CodexRuntimeRunStatus, CodexSandboxInspection, CodexTransportPlan,
+    inspect_codex_approval_policy, inspect_codex_sandbox, plan_codex_runtime,
+    preflight_codex_runtime, probe_codex_runtime_launch, record_codex_runtime_completion,
+    run_codex_runtime,
 };
 pub use cron::{
     NativeCronJob, NativeCronJobState, NativeCronPlan, NativeCronPlanAction, NativeCronPlanEntry,
@@ -103,6 +105,11 @@ pub use importer::{
 pub use logging::{
     HarnessLogEvent, HarnessLogLevel, HarnessLogWrite, append_harness_log, current_log_time_ms,
     harness_log_file, probe_harness_log_writable,
+};
+pub use memory::{
+    MemorySearchHit, MemorySearchOptions, MemorySearchReport, MemorySearchStatus,
+    memory_search_latest_file, memory_search_receipts_file, search_imported_memory,
+    write_memory_search_receipt,
 };
 pub use prompt::{
     PromptAssemblyOptions, PromptBundle, PromptBundleFiles, PromptBundleSummary, PromptSection,
