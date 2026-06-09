@@ -128,14 +128,14 @@ pub use memory::{
     write_memory_search_receipt, write_memory_vector_recall_receipt,
 };
 pub use progress::{
-    AgentProgressContext, AgentProgressDeliveryAction, AgentProgressDeliveryPending,
-    AgentProgressDeliveryPlanOptions, AgentProgressDeliveryPlanReport,
-    AgentProgressDeliveryPlanSummary, AgentProgressDeliveryReceipt,
-    AgentProgressDeliveryRecordOptions, AgentProgressDeliveryStatus, AgentProgressEvent,
-    AgentProgressKind, AgentProgressStatus, agent_progress_delivery_receipts_file,
-    agent_progress_delivery_state_file, agent_progress_events_file, append_agent_progress_event,
-    plan_agent_progress_delivery, record_agent_progress_delivery, render_agent_progress_panel,
-    sanitize_progress_preview,
+    AgentProgressContext, AgentProgressDeliveryAction, AgentProgressDeliveryMessageKind,
+    AgentProgressDeliveryPending, AgentProgressDeliveryPlanOptions,
+    AgentProgressDeliveryPlanReport, AgentProgressDeliveryPlanSummary,
+    AgentProgressDeliveryReceipt, AgentProgressDeliveryRecordOptions, AgentProgressDeliveryStatus,
+    AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
+    agent_progress_delivery_receipts_file, agent_progress_delivery_state_file,
+    agent_progress_events_file, append_agent_progress_event, plan_agent_progress_delivery,
+    record_agent_progress_delivery, render_agent_progress_panel, sanitize_progress_preview,
 };
 pub use prompt::{
     PromptAssemblyOptions, PromptBundle, PromptBundleFiles, PromptBundleSummary, PromptSection,

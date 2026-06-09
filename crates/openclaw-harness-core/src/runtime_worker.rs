@@ -216,7 +216,15 @@ pub fn prepare_runtime_queue_item(
         });
     };
 
-    let source = OpenClawSource::with_workspace(&pending.source_home, &pending.source_workspace);
+    let prompt_workspace = prompt_source_workspace(&pending.source_home, &pending.source_workspace);
+    if !paths_equivalent(&prompt_workspace, &pending.source_workspace) {
+        warnings.push(format!(
+            "using imported prompt workspace {} instead of queued source workspace {}",
+            prompt_workspace.display(),
+            pending.source_workspace.display()
+        ));
+    }
+    let source = OpenClawSource::with_workspace(&pending.source_home, &prompt_workspace);
     let registry = load_agent_registry(&source)?;
     let skill_index = build_runtime_skill_index(&source, &options.harness_home)?;
     let plan = build_turn_plan(
@@ -311,6 +319,25 @@ pub fn prepare_runtime_queue_item(
         receipt,
         warnings,
     })
+}
+
+fn prompt_source_workspace(source_home: &Path, queued_source_workspace: &Path) -> PathBuf {
+    let imported_workspace = source_home.join("workspace");
+    if imported_workspace.is_dir() {
+        imported_workspace
+    } else {
+        queued_source_workspace.to_path_buf()
+    }
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn read_pending_item(
@@ -572,6 +599,76 @@ mod tests {
         let receipt_json: Value =
             serde_json::from_slice(&fs::read(item.receipt_file).unwrap()).unwrap();
         assert_eq!(receipt_json["status"], "prepared");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_runtime_queue_item_uses_imported_prompt_workspace_when_runtime_workspace_drifts() {
+        let root = temp_root(
+            "prepare_runtime_queue_item_uses_imported_prompt_workspace_when_runtime_workspace_drifts",
+        );
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        let drift_workspace = root.join("runtime-workspace");
+        fs::create_dir_all(&drift_workspace).unwrap();
+
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                text: "repair memory cron".to_string(),
+                inbound_context: None,
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let mut step = build_channel_step(&registry, &turn);
+        step.source_workspace = drift_workspace.clone();
+        enqueue_channel_step(
+            &step,
+            RuntimeQueueEnqueueOptions {
+                harness_home: harness_home.clone(),
+                runtime_workspace: Some(drift_workspace.clone()),
+                now_ms: 1234,
+            },
+        )
+        .unwrap();
+
+        let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("using imported prompt workspace"))
+        );
+        assert_eq!(
+            report.receipt.runtime_workspace.as_deref(),
+            Some(drift_workspace.as_path())
+        );
+        let item = report.item.unwrap();
+        let bundle_json: Value =
+            serde_json::from_slice(&fs::read(item.prompt_bundle_json).unwrap()).unwrap();
+        assert_eq!(
+            bundle_json["sourceWorkspace"].as_str(),
+            Some(source.workspace.to_string_lossy().as_ref())
+        );
+        assert_eq!(bundle_json["summary"]["promptFilesIncluded"], 1);
 
         let _ = fs::remove_dir_all(root);
     }

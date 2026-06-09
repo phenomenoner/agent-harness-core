@@ -1806,7 +1806,7 @@ fn codex_progress_event_from_json(
         return None;
     }
     let (kind, label) = codex_progress_kind_and_label(method, &method_lower)?;
-    let preview = codex_progress_preview(value, method);
+    let preview = codex_progress_preview(value, kind)?;
     Some(
         AgentProgressEvent::new(
             context,
@@ -1867,59 +1867,165 @@ fn codex_progress_kind_and_label(
     None
 }
 
-fn codex_progress_preview(value: &Value, method: &str) -> String {
+fn codex_progress_preview(value: &Value, kind: AgentProgressKind) -> Option<String> {
+    let pointers: &[&str] = match kind {
+        AgentProgressKind::Terminal | AgentProgressKind::ExecuteCode => &[
+            "/params/command",
+            "/params/cmd",
+            "/params/argv",
+            "/params/args",
+            "/params/arguments",
+            "/params/item/command",
+            "/params/item/cmd",
+            "/params/item/argv",
+            "/params/item/args",
+            "/params/item/arguments",
+        ],
+        AgentProgressKind::SearchFiles => &[
+            "/params/query",
+            "/params/pattern",
+            "/params/path",
+            "/params/file",
+            "/params/input",
+            "/params/item/query",
+            "/params/item/pattern",
+            "/params/item/path",
+            "/params/item/file",
+        ],
+        AgentProgressKind::ReadFile => &[
+            "/params/path",
+            "/params/file",
+            "/params/name",
+            "/params/input",
+            "/params/item/path",
+            "/params/item/file",
+            "/params/item/name",
+        ],
+        AgentProgressKind::SkillView => &[
+            "/params/name",
+            "/params/skill",
+            "/params/skillName",
+            "/params/input",
+            "/params/item/name",
+            "/params/item/skill",
+            "/params/item/skillName",
+        ],
+        AgentProgressKind::Todo => &[
+            "/params/title",
+            "/params/todo",
+            "/params/text",
+            "/params/input",
+            "/params/item/title",
+            "/params/item/todo",
+            "/params/item/text",
+        ],
+        AgentProgressKind::ToolCall => &[
+            "/params/toolName",
+            "/params/name",
+            "/params/tool/name",
+            "/params/function/name",
+            "/params/command",
+            "/params/cmd",
+            "/params/arguments",
+            "/params/input",
+            "/params/item/toolName",
+            "/params/item/name",
+            "/params/item/tool/name",
+            "/params/item/function/name",
+            "/params/item/command",
+            "/params/item/path",
+            "/params/item/query",
+        ],
+        AgentProgressKind::AssistantStream
+        | AgentProgressKind::Delivery
+        | AgentProgressKind::MemoryRecall
+        | AgentProgressKind::Runtime => &["/params/text", "/params/input", "/params/name"],
+    };
     for pointer in [
-        "/params/command",
-        "/params/cmd",
-        "/params/argv",
-        "/params/args",
-        "/params/arguments",
-        "/params/input",
-        "/params/query",
-        "/params/pattern",
-        "/params/path",
-        "/params/file",
-        "/params/name",
-        "/params/toolName",
-        "/params/tool/name",
-        "/params/item/name",
-        "/params/item/path",
-        "/params/item/query",
-        "/params/item/command",
-    ] {
+        "/params/display",
+        "/params/preview",
+        "/params/summary",
+        "/params/item/display",
+        "/params/item/preview",
+        "/params/item/summary",
+    ]
+    .iter()
+    .chain(pointers.iter())
+    {
         if let Some(text) = progress_value_text(value.pointer(pointer)) {
-            return text;
+            return Some(text);
         }
     }
-    if let Some(params) = value.get("params")
-        && let Some(text) = progress_value_text(Some(params))
-    {
-        return text;
-    }
-    method.to_string()
+    None
 }
 
 fn progress_value_text(value: Option<&Value>) -> Option<String> {
     match value? {
-        Value::String(text) => Some(text.clone()),
+        Value::String(text) => clean_progress_text(text),
         Value::Number(number) => Some(number.to_string()),
         Value::Bool(value) => Some(value.to_string()),
         Value::Array(values) => {
             if values.is_empty() {
                 None
             } else {
-                Some(
-                    values
-                        .iter()
-                        .filter_map(|value| progress_value_text(Some(value)))
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                )
+                let parts = values
+                    .iter()
+                    .filter_map(|value| progress_value_text(Some(value)))
+                    .collect::<Vec<_>>();
+                (!parts.is_empty()).then(|| parts.join(" "))
             }
         }
-        Value::Object(_) => serde_json::to_string(value?).ok(),
+        Value::Object(map) => [
+            "command",
+            "cmd",
+            "argv",
+            "args",
+            "arguments",
+            "path",
+            "file",
+            "query",
+            "pattern",
+            "name",
+            "toolName",
+            "title",
+            "text",
+        ]
+        .iter()
+        .find_map(|key| {
+            map.get(*key)
+                .and_then(|value| progress_value_text(Some(value)))
+        }),
         Value::Null => None,
     }
+}
+
+fn clean_progress_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || looks_like_progress_event_payload(trimmed) {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn looks_like_progress_event_payload(text: &str) -> bool {
+    let looks_structured =
+        text.starts_with('{') || text.starts_with("[{") || text.starts_with("{'");
+    looks_structured
+        && [
+            "\"delta\"",
+            "'delta'",
+            "\"item\"",
+            "'item'",
+            "\"itemId\"",
+            "'itemId'",
+            "\"threadId\"",
+            "'threadId'",
+            "\"turnId\"",
+            "'turnId'",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
 }
 
 enum ProtocolWait {
@@ -3708,6 +3814,79 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn codex_progress_skips_terminal_delta_event_wrappers() {
+        let context = progress_context();
+        let mut state = progress_protocol_state();
+        let event = codex_progress_event_from_json(
+            &context,
+            &json!({
+                "method": "commandExecution/delta",
+                "params": {
+                    "delta": "\r\n",
+                    "itemId": "call-1",
+                    "threadId": "thread-1",
+                    "turnId": "turn-1"
+                }
+            }),
+            &mut state,
+            1234,
+        );
+
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn codex_progress_extracts_compact_terminal_command_preview() {
+        let context = progress_context();
+        let mut state = progress_protocol_state();
+        let event = codex_progress_event_from_json(
+            &context,
+            &json!({
+                "method": "exec_command/start",
+                "params": {
+                    "command": "pwsh.exe -Command Get-Item -LiteralPath README.md",
+                    "itemId": "call-1",
+                    "threadId": "thread-1",
+                    "turnId": "turn-1"
+                }
+            }),
+            &mut state,
+            1234,
+        )
+        .unwrap();
+
+        assert_eq!(event.kind, AgentProgressKind::Terminal);
+        assert_eq!(
+            event.preview,
+            "pwsh.exe -Command Get-Item -LiteralPath README.md"
+        );
+        assert!(!event.preview.contains("threadId"));
+    }
+
+    #[test]
+    fn codex_progress_skips_item_message_wrappers_without_tool_preview() {
+        let context = progress_context();
+        let mut state = progress_protocol_state();
+        let event = codex_progress_event_from_json(
+            &context,
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": "msg-1",
+                        "phase": "commentary",
+                        "text": "working update"
+                    }
+                }
+            }),
+            &mut state,
+            1234,
+        );
+
+        assert!(event.is_none());
+    }
+
+    #[test]
     fn plan_codex_runtime_writes_plan_and_receipts() {
         let root = temp_root("plan_codex_runtime_writes_plan_and_receipts");
         let source = write_codex_runtime_source(&root);
@@ -3759,6 +3938,27 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn progress_context() -> AgentProgressContext {
+        AgentProgressContext {
+            queue_id: "queue-1".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: "telegram:dm:user:main".to_string(),
+            platform: "telegram".to_string(),
+            channel_id: "dm".to_string(),
+            user_id: "user".to_string(),
+        }
+    }
+
+    fn progress_protocol_state() -> CodexProtocolState {
+        CodexProtocolState {
+            assistant_message: String::new(),
+            event_count: 0,
+            warnings: Vec::new(),
+            denied_approval_requests: Vec::new(),
+            assistant_stream_announced: false,
+        }
     }
 
     #[test]

@@ -1097,6 +1097,7 @@ fn record_progress_delivery(
         channel_id: pending.channel_id.clone(),
         user_id: pending.user_id.clone(),
         session_key: pending.session_key.clone(),
+        message_kind: pending.message_kind,
         action,
         status,
         provider_message_id,
@@ -1510,7 +1511,8 @@ fn execute_telegram_poll_once(
     let mut delivered_messages = 0;
     let mut failed_deliveries = 0;
     for pending in delivery.pending {
-        match telegram_send_message(token, &pending.message.channel_id, &pending.message.text) {
+        let text = format_channel_reply_text(&pending.message.text);
+        match telegram_send_message(token, &pending.message.channel_id, &text) {
             Ok(provider_message_id) => {
                 record_channel_delivery(ChannelDeliveryRecordOptions {
                     harness_home: args.target_home.clone(),
@@ -2132,11 +2134,8 @@ fn execute_discord_outbox_send_once(
     let mut failed_deliveries = 0;
 
     for pending in delivery.pending {
-        match discord_send_message_chunks(
-            &token,
-            &pending.message.channel_id,
-            &pending.message.text,
-        ) {
+        let text = format_channel_reply_text(&pending.message.text);
+        match discord_send_message_chunks(&token, &pending.message.channel_id, &text) {
             Ok(provider_message_id) => {
                 record_channel_delivery(ChannelDeliveryRecordOptions {
                     harness_home: args.target_home.clone(),
@@ -8020,6 +8019,19 @@ fn telegram_send_message(token: &str, chat_id: &str, text: &str) -> Result<Optio
         .and_then(telegram_id_string))
 }
 
+fn format_channel_reply_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("◆ OpenClaw")
+        || trimmed.starts_with("⏳ ")
+        || trimmed.starts_with("✅ ")
+        || trimmed.starts_with("⚠️ ")
+    {
+        return trimmed.to_string();
+    }
+    format!("◆ OpenClaw\n\n{trimmed}")
+}
+
 fn telegram_edit_message_text(
     token: &str,
     chat_id: &str,
@@ -10402,6 +10414,7 @@ mod tests {
             channel_id: channel_id.to_string(),
             user_id: user_id.to_string(),
             session_key: "session-1".to_string(),
+            message_kind: openclaw_harness_core::AgentProgressDeliveryMessageKind::Body,
             action: AgentProgressDeliveryAction::Send,
             provider_message_id: None,
             event_line: 1,
@@ -10448,6 +10461,15 @@ mod tests {
         let ids = parse_channel_id_set(Some(" 111,222; 333\n'444' \"555\" "));
 
         assert_eq!(ids, set(&["111", "222", "333", "444", "555"]));
+    }
+
+    #[test]
+    fn formats_channel_reply_with_short_plain_header() {
+        assert_eq!(format_channel_reply_text("  done\n"), "◆ OpenClaw\n\ndone");
+        assert_eq!(
+            format_channel_reply_text("⏳ Working — <1 min — running tools"),
+            "⏳ Working — <1 min — running tools"
+        );
     }
 
     #[test]

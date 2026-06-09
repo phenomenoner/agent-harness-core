@@ -128,6 +128,7 @@ pub struct AgentProgressDeliveryPending {
     pub channel_id: String,
     pub user_id: String,
     pub session_key: String,
+    pub message_kind: AgentProgressDeliveryMessageKind,
     pub action: AgentProgressDeliveryAction,
     pub provider_message_id: Option<String>,
     pub event_line: usize,
@@ -136,6 +137,13 @@ pub struct AgentProgressDeliveryPending {
     pub text_hash: String,
     pub started_at_ms: i64,
     pub latest_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentProgressDeliveryMessageKind {
+    Body,
+    Status,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +161,7 @@ pub struct AgentProgressDeliveryRecordOptions {
     pub channel_id: String,
     pub user_id: String,
     pub session_key: String,
+    pub message_kind: AgentProgressDeliveryMessageKind,
     pub action: AgentProgressDeliveryAction,
     pub status: AgentProgressDeliveryStatus,
     pub provider_message_id: Option<String>,
@@ -173,6 +182,7 @@ pub struct AgentProgressDeliveryReceipt {
     pub channel_id: String,
     pub user_id: String,
     pub session_key: String,
+    pub message_kind: AgentProgressDeliveryMessageKind,
     pub action: AgentProgressDeliveryAction,
     pub status: AgentProgressDeliveryStatus,
     pub provider_message_id: Option<String>,
@@ -214,11 +224,134 @@ struct AgentProgressDeliveryCursor {
     channel_id: String,
     user_id: String,
     session_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body_provider_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status_provider_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    body_last_event_line: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    status_last_event_line: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    body_last_text_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    status_last_text_hash: String,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    body_last_sent_at_ms: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    status_last_sent_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     provider_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
     last_event_line: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     last_text_hash: String,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
     last_sent_at_ms: i64,
+    #[serde(default)]
     terminal: bool,
+}
+
+impl AgentProgressDeliveryCursor {
+    fn new(platform: String, channel_id: String, user_id: String, session_key: String) -> Self {
+        Self {
+            platform,
+            channel_id,
+            user_id,
+            session_key,
+            body_provider_message_id: None,
+            status_provider_message_id: None,
+            body_last_event_line: 0,
+            status_last_event_line: 0,
+            body_last_text_hash: String::new(),
+            status_last_text_hash: String::new(),
+            body_last_sent_at_ms: 0,
+            status_last_sent_at_ms: 0,
+            provider_message_id: None,
+            last_event_line: 0,
+            last_text_hash: String::new(),
+            last_sent_at_ms: 0,
+            terminal: false,
+        }
+    }
+
+    fn provider_message_id_for(
+        &self,
+        message_kind: AgentProgressDeliveryMessageKind,
+    ) -> Option<&String> {
+        match message_kind {
+            AgentProgressDeliveryMessageKind::Body => self
+                .body_provider_message_id
+                .as_ref()
+                .or(self.provider_message_id.as_ref()),
+            AgentProgressDeliveryMessageKind::Status => self.status_provider_message_id.as_ref(),
+        }
+    }
+
+    fn last_event_line_for(&self, message_kind: AgentProgressDeliveryMessageKind) -> usize {
+        match message_kind {
+            AgentProgressDeliveryMessageKind::Body => {
+                if self.body_last_event_line == 0 {
+                    self.last_event_line
+                } else {
+                    self.body_last_event_line
+                }
+            }
+            AgentProgressDeliveryMessageKind::Status => self.status_last_event_line,
+        }
+    }
+
+    fn last_text_hash_for(&self, message_kind: AgentProgressDeliveryMessageKind) -> &str {
+        match message_kind {
+            AgentProgressDeliveryMessageKind::Body => {
+                if self.body_last_text_hash.is_empty() {
+                    &self.last_text_hash
+                } else {
+                    &self.body_last_text_hash
+                }
+            }
+            AgentProgressDeliveryMessageKind::Status => &self.status_last_text_hash,
+        }
+    }
+
+    fn last_sent_at_ms_for(&self, message_kind: AgentProgressDeliveryMessageKind) -> i64 {
+        match message_kind {
+            AgentProgressDeliveryMessageKind::Body => {
+                if self.body_last_sent_at_ms == 0 {
+                    self.last_sent_at_ms
+                } else {
+                    self.body_last_sent_at_ms
+                }
+            }
+            AgentProgressDeliveryMessageKind::Status => self.status_last_sent_at_ms,
+        }
+    }
+
+    fn record_lane(
+        &mut self,
+        message_kind: AgentProgressDeliveryMessageKind,
+        provider_message_id: Option<String>,
+        event_line: usize,
+        text_hash: String,
+        sent_at_ms: i64,
+        terminal: bool,
+    ) {
+        match message_kind {
+            AgentProgressDeliveryMessageKind::Body => {
+                self.body_provider_message_id = provider_message_id;
+                self.body_last_event_line = event_line;
+                self.body_last_text_hash = text_hash;
+                self.body_last_sent_at_ms = sent_at_ms;
+            }
+            AgentProgressDeliveryMessageKind::Status => {
+                self.status_provider_message_id = provider_message_id;
+                self.status_last_event_line = event_line;
+                self.status_last_text_hash = text_hash;
+                self.status_last_sent_at_ms = sent_at_ms;
+            }
+        }
+        self.terminal = terminal;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -342,58 +475,78 @@ pub fn plan_agent_progress_delivery(
             continue;
         };
         let terminal = is_terminal_event(&latest.event);
-        let text = render_agent_progress_panel(
-            queue_events
-                .iter()
-                .map(|stored| &stored.event)
-                .collect::<Vec<_>>()
-                .as_slice(),
-            options.now_ms,
-            options.max_events_per_panel,
-            options.max_preview_chars,
-        );
-        let text_hash = fnv1a_64_hex(&text);
+        let event_refs = queue_events
+            .iter()
+            .map(|stored| &stored.event)
+            .collect::<Vec<_>>();
         let cursor = state.queues.get(&queue_id);
-        if cursor.is_some_and(|cursor| {
-            cursor.last_event_line >= latest.line_number
-                && cursor.last_text_hash == text_hash
-                && cursor.terminal == terminal
-        }) {
-            summary.delivered_current += 1;
-            continue;
+        let lanes = [
+            (
+                AgentProgressDeliveryMessageKind::Body,
+                render_agent_progress_actions(
+                    event_refs.as_slice(),
+                    options.max_events_per_panel,
+                    options.max_preview_chars,
+                ),
+            ),
+            (
+                AgentProgressDeliveryMessageKind::Status,
+                render_agent_progress_status(
+                    event_refs.as_slice(),
+                    options.now_ms,
+                    options.max_preview_chars,
+                ),
+            ),
+        ];
+
+        for (message_kind, text) in lanes {
+            if text.trim().is_empty() {
+                continue;
+            }
+            let text_hash = fnv1a_64_hex(&text);
+            let provider_message_id =
+                cursor.and_then(|cursor| cursor.provider_message_id_for(message_kind).cloned());
+            if cursor.is_some_and(|cursor| {
+                cursor.last_event_line_for(message_kind) >= latest.line_number
+                    && cursor.last_text_hash_for(message_kind) == text_hash
+                    && cursor.terminal == terminal
+            }) {
+                summary.delivered_current += 1;
+                continue;
+            }
+            if let Some(cursor) = cursor
+                && provider_message_id.is_some()
+                && !terminal
+                && options
+                    .now_ms
+                    .saturating_sub(cursor.last_sent_at_ms_for(message_kind))
+                    < options.min_update_interval_ms
+            {
+                summary.rate_limited += 1;
+                continue;
+            }
+            let action = if provider_message_id.is_some() {
+                AgentProgressDeliveryAction::Edit
+            } else {
+                AgentProgressDeliveryAction::Send
+            };
+            pending.push(AgentProgressDeliveryPending {
+                queue_id: queue_id.clone(),
+                platform: latest.event.platform.clone(),
+                channel_id: latest.event.channel_id.clone(),
+                user_id: latest.event.user_id.clone(),
+                session_key: latest.event.session_key.clone(),
+                message_kind,
+                action,
+                provider_message_id,
+                event_line: latest.line_number,
+                terminal,
+                text,
+                text_hash,
+                started_at_ms: first.event.at_ms,
+                latest_at_ms: latest.event.at_ms,
+            });
         }
-        if let Some(cursor) = cursor
-            && cursor.provider_message_id.is_some()
-            && !terminal
-            && options.now_ms.saturating_sub(cursor.last_sent_at_ms)
-                < options.min_update_interval_ms
-        {
-            summary.rate_limited += 1;
-            continue;
-        }
-        let action = if cursor
-            .and_then(|cursor| cursor.provider_message_id.as_ref())
-            .is_some()
-        {
-            AgentProgressDeliveryAction::Edit
-        } else {
-            AgentProgressDeliveryAction::Send
-        };
-        pending.push(AgentProgressDeliveryPending {
-            queue_id,
-            platform: latest.event.platform.clone(),
-            channel_id: latest.event.channel_id.clone(),
-            user_id: latest.event.user_id.clone(),
-            session_key: latest.event.session_key.clone(),
-            action,
-            provider_message_id: cursor.and_then(|cursor| cursor.provider_message_id.clone()),
-            event_line: latest.line_number,
-            terminal,
-            text,
-            text_hash,
-            started_at_ms: first.event.at_ms,
-            latest_at_ms: latest.event.at_ms,
-        });
     }
     summary.pending = pending.len();
 
@@ -424,6 +577,7 @@ pub fn record_agent_progress_delivery(
         channel_id: options.channel_id,
         user_id: options.user_id,
         session_key: options.session_key,
+        message_kind: options.message_kind,
         action: options.action,
         status: options.status,
         provider_message_id: options.provider_message_id,
@@ -434,19 +588,28 @@ pub fn record_agent_progress_delivery(
     };
 
     if receipt.status == AgentProgressDeliveryStatus::Delivered {
-        state.queues.insert(
-            receipt.queue_id.clone(),
-            AgentProgressDeliveryCursor {
-                platform: receipt.platform.clone(),
-                channel_id: receipt.channel_id.clone(),
-                user_id: receipt.user_id.clone(),
-                session_key: receipt.session_key.clone(),
-                provider_message_id: receipt.provider_message_id.clone(),
-                last_event_line: receipt.event_line,
-                last_text_hash: receipt.text_hash.clone(),
-                last_sent_at_ms: receipt.at_ms,
-                terminal: receipt.terminal,
-            },
+        let cursor = state
+            .queues
+            .entry(receipt.queue_id.clone())
+            .or_insert_with(|| {
+                AgentProgressDeliveryCursor::new(
+                    receipt.platform.clone(),
+                    receipt.channel_id.clone(),
+                    receipt.user_id.clone(),
+                    receipt.session_key.clone(),
+                )
+            });
+        cursor.platform = receipt.platform.clone();
+        cursor.channel_id = receipt.channel_id.clone();
+        cursor.user_id = receipt.user_id.clone();
+        cursor.session_key = receipt.session_key.clone();
+        cursor.record_lane(
+            receipt.message_kind,
+            receipt.provider_message_id.clone(),
+            receipt.event_line,
+            receipt.text_hash.clone(),
+            receipt.at_ms,
+            receipt.terminal,
         );
         write_delivery_state(&state_file, &state)?;
     }
@@ -460,12 +623,20 @@ pub fn render_agent_progress_panel(
     max_events: usize,
     max_preview_chars: usize,
 ) -> String {
-    if events.is_empty() {
-        return "⏳ Working — <1 min — starting".to_string();
+    let actions = render_agent_progress_actions(events, max_events, max_preview_chars);
+    let status = render_agent_progress_status(events, now_ms, max_preview_chars);
+    if actions.trim().is_empty() {
+        status
+    } else {
+        format!("{actions}\n\n{status}")
     }
-    let first_at_ms = events.first().map(|event| event.at_ms).unwrap_or(now_ms);
-    let latest = events.last().copied().unwrap_or(events[0]);
-    let terminal = is_terminal_event(latest);
+}
+
+fn render_agent_progress_actions(
+    events: &[&AgentProgressEvent],
+    max_events: usize,
+    max_preview_chars: usize,
+) -> String {
     let mut actions = Vec::<RenderedAction>::new();
     let start = events.len().saturating_sub(max_events.max(1));
     for event in events.iter().skip(start) {
@@ -492,31 +663,35 @@ pub fn render_agent_progress_panel(
             out.push_str(&format!(" (x{})", action.count));
         }
     }
-    if !out.is_empty() {
-        out.push_str("\n\n");
+    out
+}
+
+fn render_agent_progress_status(
+    events: &[&AgentProgressEvent],
+    now_ms: i64,
+    max_preview_chars: usize,
+) -> String {
+    if events.is_empty() {
+        return "⏳ Working — <1 min — starting".to_string();
     }
+    let first_at_ms = events.first().map(|event| event.at_ms).unwrap_or(now_ms);
+    let latest = events.last().copied().unwrap_or(events[0]);
+    let terminal = is_terminal_event(latest);
     let elapsed = format_elapsed(now_ms.saturating_sub(first_at_ms));
     if terminal {
         match latest.status {
             AgentProgressStatus::Failed => {
-                out.push_str(&format!(
+                format!(
                     "⚠️ Failed — {} — {}",
                     elapsed,
                     quote_safe_preview(&latest.preview, max_preview_chars)
-                ));
+                )
             }
-            _ => {
-                out.push_str(&format!("✅ Done — {elapsed}"));
-            }
+            _ => format!("✅ Done — {elapsed}"),
         }
     } else {
-        out.push_str(&format!(
-            "⏳ Working — {} — {}",
-            elapsed,
-            status_phrase(latest)
-        ));
+        format!("⏳ Working — {} — {}", elapsed, status_phrase(latest))
     }
-    out
 }
 
 pub fn sanitize_progress_preview(value: &str, max_chars: usize) -> String {
@@ -706,6 +881,14 @@ fn fnv1a_64_hex(value: &str) -> String {
     format!("{hash:016x}")
 }
 
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
+}
+
 fn agent_progress_event_schema() -> String {
     AGENT_PROGRESS_EVENT_SCHEMA.to_string()
 }
@@ -722,7 +905,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn render_panel_keeps_status_line_at_bottom() {
+    fn renders_actions_and_status_as_separate_messages() {
         let context = context();
         let events = vec![
             AgentProgressEvent::new(
@@ -751,11 +934,15 @@ mod tests {
             ),
         ];
         let refs = events.iter().collect::<Vec<_>>();
+        let actions = render_agent_progress_actions(&refs, 8, 120);
+        let status = render_agent_progress_status(&refs, 9 * 60_000 + 1000, 120);
         let panel = render_agent_progress_panel(&refs, 9 * 60_000 + 1000, 8, 120);
 
-        assert!(panel.contains("📚 skill_view: \"codebase-inspection\""));
-        assert!(panel.contains("💻 terminal: \"cargo test -p openclaw-harness-core\""));
-        assert!(panel.ends_with("⏳ Working — 9 min — receiving stream response"));
+        assert!(actions.contains("📚 skill_view: \"codebase-inspection\""));
+        assert!(actions.contains("💻 terminal: \"cargo test -p openclaw-harness-core\""));
+        assert!(!actions.contains("⏳ Working"));
+        assert_eq!(status, "⏳ Working — 9 min — receiving stream response");
+        assert_eq!(panel, format!("{actions}\n\n{status}"));
     }
 
     #[test]
@@ -783,27 +970,38 @@ mod tests {
             ..AgentProgressDeliveryPlanOptions::default()
         })
         .unwrap();
-        assert_eq!(plan.pending.len(), 1);
+        assert_eq!(plan.pending.len(), 2);
+        assert_eq!(
+            plan.pending[0].message_kind,
+            AgentProgressDeliveryMessageKind::Body
+        );
+        assert_eq!(
+            plan.pending[1].message_kind,
+            AgentProgressDeliveryMessageKind::Status
+        );
         assert_eq!(plan.pending[0].action, AgentProgressDeliveryAction::Send);
+        assert_eq!(plan.pending[1].action, AgentProgressDeliveryAction::Send);
 
-        let pending = plan.pending[0].clone();
-        record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
-            harness_home: harness_home.clone(),
-            queue_id: pending.queue_id,
-            platform: pending.platform,
-            channel_id: pending.channel_id,
-            user_id: pending.user_id,
-            session_key: pending.session_key,
-            action: pending.action,
-            status: AgentProgressDeliveryStatus::Delivered,
-            provider_message_id: Some("provider-1".to_string()),
-            event_line: pending.event_line,
-            text_hash: pending.text_hash,
-            terminal: pending.terminal,
-            error: None,
-            now_ms: 2000,
-        })
-        .unwrap();
+        for (index, pending) in plan.pending.iter().cloned().enumerate() {
+            record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+                harness_home: harness_home.clone(),
+                queue_id: pending.queue_id,
+                platform: pending.platform,
+                channel_id: pending.channel_id,
+                user_id: pending.user_id,
+                session_key: pending.session_key,
+                message_kind: pending.message_kind,
+                action: pending.action,
+                status: AgentProgressDeliveryStatus::Delivered,
+                provider_message_id: Some(format!("provider-{}", index + 1)),
+                event_line: pending.event_line,
+                text_hash: pending.text_hash,
+                terminal: pending.terminal,
+                error: None,
+                now_ms: 2000,
+            })
+            .unwrap();
+        }
 
         append_agent_progress_event(
             &harness_home,
@@ -826,7 +1024,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(rate_limited.pending.len(), 0);
-        assert_eq!(rate_limited.summary.rate_limited, 1);
+        assert_eq!(rate_limited.summary.rate_limited, 2);
 
         let edit = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
             harness_home,
@@ -836,11 +1034,16 @@ mod tests {
             ..AgentProgressDeliveryPlanOptions::default()
         })
         .unwrap();
-        assert_eq!(edit.pending.len(), 1);
+        assert_eq!(edit.pending.len(), 2);
         assert_eq!(edit.pending[0].action, AgentProgressDeliveryAction::Edit);
+        assert_eq!(edit.pending[1].action, AgentProgressDeliveryAction::Edit);
         assert_eq!(
             edit.pending[0].provider_message_id.as_deref(),
             Some("provider-1")
+        );
+        assert_eq!(
+            edit.pending[1].provider_message_id.as_deref(),
+            Some("provider-2")
         );
 
         let _ = fs::remove_dir_all(root);

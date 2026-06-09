@@ -1,6 +1,6 @@
 # Agent Harness Development Handoff
 
-Date: 2026-06-09
+Date: 2026-06-10
 
 This handoff is for a developer or a new Codex session continuing implementation of the Rust Windows Agent Harness. It summarizes the project context, current architecture, verified state, important files, and next development priorities.
 
@@ -85,7 +85,7 @@ Channel normal message flow:
 6. `queue-prepare` builds a turn plan and prompt bundle.
 7. `codex-plan` and `codex-run` start Codex app-server.
 8. Runtime/Codex writes compact action/status events to `state/runtime-queue/progress-events.jsonl`.
-9. `progress-delivery-loop` sends or edits a compact Telegram/Discord progress panel for authorized targets.
+9. `progress-delivery-loop` sends or edits separate compact Telegram/Discord action and status messages for authorized targets.
 10. `codex-complete` records transcript, trajectory, Codex binding, memory lifecycle evidence, and outbox reply.
 11. Telegram/Discord outbox delivery loops send and record delivery receipts.
    Discord delivery splits messages over Discord's 2000-character content limit into multiple sends before recording the original delivery id as delivered.
@@ -99,6 +99,7 @@ Prompt strategy:
 - Telegram reply/media metadata and Discord reply/attachment metadata are inserted before the user message as a bounded untrusted `InboundContext` section.
 - Reply targets include preview, source, length, truncation metadata, and up to 4000 characters of referenced text when the platform payload exposes text.
 - Raw Telegram file IDs and Discord attachment URLs are deliberately not injected into the prompt bundle.
+- `queue-prepare` resolves prompt files, skills, and registry state from the imported OpenClaw source home `workspace` when present; a separate runtime workspace is only used as Codex cwd and must not make prompt files disappear after `/new` or other session changes.
 - Codex's app-server/session continuity is relied on for backend continuity where possible.
 
 Reply-context audit:
@@ -199,9 +200,15 @@ Implemented:
 - Harness JSONL operational log.
 - Loop heartbeats.
 - Stop files.
-- Compact progress event ledger plus Telegram/Discord progress panels.
+- Compact progress event ledger plus Telegram/Discord action/status progress messages.
 - `progress-delivery-loop` generated with the supervised loop bundle.
 - Windows scheduled-task script generation.
+
+Progress UI notes:
+
+- Codex tool/action previews come from explicit command/path/query/name fields. Raw JSON wrappers and output-only deltas are skipped to keep messages Hermes-style compact.
+- Progress delivery maintains separate body/status cursors in `state/channels/progress-delivery-state.json`; older single-message state can be taken over by the body lane.
+- Normal Telegram/Discord outbox replies add a short plain-text `◆ OpenClaw` header. Progress messages do not add that header.
 
 Current operational caveat:
 
