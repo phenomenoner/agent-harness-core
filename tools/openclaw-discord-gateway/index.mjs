@@ -8,6 +8,7 @@ import process from "node:process";
 const PROBE_SCHEMA = "openclaw-harness.discord-gateway-probe.v1";
 const RECEIPT_SCHEMA = "openclaw-harness.discord-gateway-probe-receipt.v1";
 const DISCORD_GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
+const DISCORD_API_BASE = "https://discord.com/api/v10";
 const DEFAULT_DISCORD_INTENTS = (1 << 0) | (1 << 9) | (1 << 12);
 
 function parseArgs(argv) {
@@ -221,6 +222,25 @@ async function runGateway(args) {
         if (args.maxMessages > 0 && handledMessages >= args.maxMessages) {
           ws.close(1000, "max messages handled");
         }
+      } else if (payload.t === "INTERACTION_CREATE") {
+        const result = await handleInteractionCreate(args, payload);
+        handledMessages += result.routed ? 1 : 0;
+        writeGatewayLog(args, "interaction-create", {
+          interactionId: payload.d?.id,
+          interactionType: payload.d?.type ?? null,
+          name: payload.d?.data?.name ?? null,
+          channelId: payload.d?.channel_id ?? null,
+          guildId: payload.d?.guild_id ?? null,
+          userId: interactionUserId(payload.d),
+          ackStatus: result.ackStatus,
+          routed: result.routed,
+          status: result.status,
+          reason: result.reason,
+        });
+        writeLoopHeartbeat(args, "interaction-create", `interaction handled status=${result.status}`);
+        if (args.maxMessages > 0 && handledMessages >= args.maxMessages) {
+          ws.close(1000, "max messages handled");
+        }
       } else if (payload.t) {
         dispatchLogCount += 1;
         if (payload.t === "READY") {
@@ -248,6 +268,110 @@ function identifyPayload(token, intents) {
       device: "openclaw-harness",
     },
   };
+}
+
+async function handleInteractionCreate(args, payload) {
+  const interaction = payload.d ?? {};
+  const content = interactionToMessageText(interaction);
+  const userId = interactionUserId(interaction);
+  const channelId = interaction.channel_id;
+  if (!content || !userId || !channelId) {
+    const ackStatus = await acknowledgeInteraction(
+      interaction,
+      "This Discord interaction type is not supported by the OpenClaw harness yet.",
+    );
+    return {
+      ackStatus,
+      routed: false,
+      status: 0,
+      reason: "unsupported or incomplete interaction payload",
+    };
+  }
+
+  const ackStatus = await acknowledgeInteraction(
+    interaction,
+    "Routing this through OpenClaw. Reply will appear in this channel.",
+  );
+  const syntheticPayload = {
+    t: "MESSAGE_CREATE",
+    s: payload.s,
+    d: {
+      id: `interaction-${interaction.id}`,
+      channel_id: channelId,
+      guild_id: interaction.guild_id ?? null,
+      content,
+      author: {
+        id: userId,
+        bot: false,
+        username:
+          interaction.user?.username ??
+          interaction.member?.user?.username ??
+          "discord-interaction-user",
+      },
+    },
+  };
+  const result = runHarnessForEvent(args, syntheticPayload);
+  return {
+    ackStatus,
+    routed: true,
+    status: result.status,
+    reason: "Discord interaction normalized into channel-run-once",
+  };
+}
+
+async function acknowledgeInteraction(interaction, content) {
+  if (!interaction?.id || !interaction?.token || typeof fetch !== "function") {
+    return "skipped";
+  }
+  try {
+    const response = await fetch(
+      `${DISCORD_API_BASE}/interactions/${interaction.id}/${interaction.token}/callback`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          type: 4,
+          data: { content },
+        }),
+      },
+    );
+    return response.ok ? "sent" : `failed-${response.status}`;
+  } catch {
+    return "failed-network";
+  }
+}
+
+function interactionUserId(interaction) {
+  return interaction?.user?.id ?? interaction?.member?.user?.id ?? null;
+}
+
+function interactionToMessageText(interaction) {
+  if (interaction?.type !== 2 || !interaction?.data?.name) {
+    return null;
+  }
+  const args = interactionOptionsToText(interaction.data.options ?? []);
+  return args ? `/${interaction.data.name} ${args}` : `/${interaction.data.name}`;
+}
+
+function interactionOptionsToText(options) {
+  const parts = [];
+  for (const option of options) {
+    if (Array.isArray(option.options)) {
+      const nested = interactionOptionsToText(option.options);
+      if (nested) {
+        parts.push(option.name, nested);
+      } else if (option.name) {
+        parts.push(option.name);
+      }
+      continue;
+    }
+    if (option.value !== undefined && option.value !== null) {
+      parts.push(String(option.value));
+    } else if (option.name) {
+      parts.push(option.name);
+    }
+  }
+  return parts.join(" ").trim();
 }
 
 function discordIntents() {
