@@ -677,7 +677,12 @@ fn render_agent_progress_status(
     let first_at_ms = events.first().map(|event| event.at_ms).unwrap_or(now_ms);
     let latest = events.last().copied().unwrap_or(events[0]);
     let terminal = is_terminal_event(latest);
-    let elapsed = format_elapsed(now_ms.saturating_sub(first_at_ms));
+    let elapsed = format_elapsed(progress_status_elapsed_ms(
+        first_at_ms,
+        latest,
+        now_ms,
+        terminal,
+    ));
     if terminal {
         match latest.status {
             AgentProgressStatus::Failed => {
@@ -815,6 +820,22 @@ fn is_terminal_event(event: &AgentProgressEvent) -> bool {
         )
 }
 
+fn progress_status_elapsed_ms(
+    first_at_ms: i64,
+    latest: &AgentProgressEvent,
+    now_ms: i64,
+    terminal: bool,
+) -> i64 {
+    if terminal {
+        latest
+            .elapsed_ms
+            .and_then(|elapsed| i64::try_from(elapsed).ok())
+            .unwrap_or_else(|| latest.at_ms.saturating_sub(first_at_ms))
+    } else {
+        now_ms.saturating_sub(first_at_ms)
+    }
+}
+
 fn progress_icon(kind: AgentProgressKind) -> &'static str {
     match kind {
         AgentProgressKind::Runtime => "⚙️",
@@ -943,6 +964,39 @@ mod tests {
         assert!(!actions.contains("⏳ Working"));
         assert_eq!(status, "⏳ Working — 9 min — receiving stream response");
         assert_eq!(panel, format!("{actions}\n\n{status}"));
+    }
+
+    #[test]
+    fn terminal_status_uses_completion_elapsed_instead_of_wall_clock_age() {
+        let context = context();
+        let events = vec![
+            AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Todo,
+                "todo",
+                "planning 1 task(s)",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+            AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Runtime,
+                "run",
+                "completed",
+                AgentProgressStatus::Completed,
+                61_000,
+            ),
+        ];
+        let refs = events.iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            render_agent_progress_status(&refs, 44 * 60_000 + 1000, 120),
+            "✅ Done — 1 min"
+        );
+        assert_eq!(
+            render_agent_progress_status(&refs, 45 * 60_000 + 1000, 120),
+            "✅ Done — 1 min"
+        );
     }
 
     #[test]
