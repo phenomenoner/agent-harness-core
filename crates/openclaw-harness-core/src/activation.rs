@@ -707,6 +707,7 @@ fn check_channel_state(harness_home: &Path, checks: &mut Vec<ActivationReadiness
         ));
     }
     check_discord_gateway_probe(harness_home, checks);
+    check_discord_dm_probe(harness_home, checks);
 }
 
 fn check_telegram_probe(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
@@ -818,6 +819,67 @@ fn check_discord_gateway_probe(harness_home: &Path, checks: &mut Vec<ActivationR
         )),
         Err(error) => checks.push(warn(
             "discord-gateway-probe",
+            format!("could not read {}: {error}", path.display()),
+        )),
+    }
+}
+
+fn check_discord_dm_probe(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let path = harness_home
+        .join("state")
+        .join("channels")
+        .join("discord-dm-probe-receipts.jsonl");
+    match latest_jsonl_value(&path) {
+        Ok(Some(value)) => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let reason = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason recorded");
+            let channel_id = value
+                .get("channelId")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let provider_message_id = value
+                .get("providerMessageId")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            match status {
+                "ready" => checks.push(pass(
+                    "discord-dm-probe",
+                    format!(
+                        "Discord DM probe ready at {}; channelId={channel_id}, providerMessageId={provider_message_id}",
+                        path.display()
+                    ),
+                )),
+                _ => checks.push(fail(
+                    "discord-dm-probe",
+                    format!(
+                        "Discord DM probe status={status} at {}: {reason}",
+                        path.display()
+                    ),
+                )),
+            }
+        }
+        Ok(None) => checks.push(warn(
+            "discord-dm-probe",
+            format!(
+                "no Discord DM probe receipt lines found at {}",
+                path.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+            "discord-dm-probe",
+            format!(
+                "not found yet: {}; run discord-dm-probe --user-id <id> before Discord DM handoff",
+                path.display()
+            ),
+        )),
+        Err(error) => checks.push(warn(
+            "discord-dm-probe",
             format!("could not read {}: {error}", path.display()),
         )),
     }

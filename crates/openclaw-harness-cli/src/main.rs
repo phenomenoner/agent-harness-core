@@ -72,6 +72,7 @@ fn main() {
         "telegram-loop" => run_telegram_loop(&rest),
         "discord-outbox-send-once" => run_discord_outbox_send_once(&rest),
         "discord-outbox-loop" => run_discord_outbox_loop(&rest),
+        "discord-dm-probe" => run_discord_dm_probe(&rest),
         "discord-event-run-once" => run_discord_event_run_once(&rest),
         "discord-gateway-probe" => run_discord_gateway_probe(&rest),
         "discord-gateway-loop" => run_discord_gateway_loop(&rest),
@@ -1110,6 +1111,91 @@ fn run_discord_outbox_loop(args: &[String]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn run_discord_dm_probe(args: &[String]) -> Result<(), String> {
+    let args = discord_dm_probe_args_from_args(args)?;
+    let token = discord_bot_token(&args.target_home)?;
+    let report = execute_discord_dm_probe(&args, &token);
+    write_discord_dm_probe_report(&report)?;
+    append_harness_log(
+        &args.target_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            if report.status == "ready" {
+                HarnessLogLevel::Info
+            } else {
+                HarnessLogLevel::Warn
+            },
+            "discord",
+            "discord.dm-probe",
+            report.reason.clone(),
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    print_discord_dm_probe_report(&report);
+    if report.status == "ready" {
+        Ok(())
+    } else {
+        Err(report.reason)
+    }
+}
+
+fn execute_discord_dm_probe(args: &DiscordDmProbeArgs, token: &str) -> DiscordDmProbeReport {
+    let mut warnings = Vec::new();
+    let channel_id = match discord_create_dm_channel(token, &args.user_id) {
+        Ok(channel_id) => channel_id,
+        Err(error) => {
+            return DiscordDmProbeReport {
+                harness_home: args.target_home.clone(),
+                status: "failed".to_string(),
+                reason: format!("failed to create Discord DM channel: {error}"),
+                user_id: args.user_id.clone(),
+                channel_id: None,
+                provider_message_id: None,
+                sent_message: false,
+                warnings,
+            };
+        }
+    };
+
+    let provider_message_id = if args.send_message {
+        match discord_send_message(token, &channel_id, &args.message) {
+            Ok(provider_message_id) => provider_message_id,
+            Err(error) => {
+                return DiscordDmProbeReport {
+                    harness_home: args.target_home.clone(),
+                    status: "failed".to_string(),
+                    reason: format!(
+                        "created Discord DM channel but failed to send probe message: {error}"
+                    ),
+                    user_id: args.user_id.clone(),
+                    channel_id: Some(channel_id),
+                    provider_message_id: None,
+                    sent_message: false,
+                    warnings,
+                };
+            }
+        }
+    } else {
+        warnings.push("probe message send skipped by --no-send".to_string());
+        None
+    };
+
+    DiscordDmProbeReport {
+        harness_home: args.target_home.clone(),
+        status: "ready".to_string(),
+        reason: if args.send_message {
+            "Discord DM channel was created and probe message was sent".to_string()
+        } else {
+            "Discord DM channel was created; probe message send skipped".to_string()
+        },
+        user_id: args.user_id.clone(),
+        channel_id: Some(channel_id),
+        provider_message_id,
+        sent_message: args.send_message,
+        warnings,
+    }
 }
 
 fn execute_discord_outbox_send_once(
@@ -2346,6 +2432,13 @@ struct DiscordOutboxLoopArgs {
     stop_file: Option<PathBuf>,
 }
 
+struct DiscordDmProbeArgs {
+    target_home: PathBuf,
+    user_id: String,
+    send_message: bool,
+    message: String,
+}
+
 struct DiscordEventRunOnceArgs {
     source: OpenClawSource,
     runtime_workspace: Option<PathBuf>,
@@ -2410,6 +2503,17 @@ struct DiscordOutboxSendOnceReport {
     pending_count: usize,
     delivered_messages: usize,
     failed_deliveries: usize,
+    warnings: Vec<String>,
+}
+
+struct DiscordDmProbeReport {
+    harness_home: PathBuf,
+    status: String,
+    reason: String,
+    user_id: String,
+    channel_id: Option<String>,
+    provider_message_id: Option<String>,
+    sent_message: bool,
     warnings: Vec<String>,
 }
 
@@ -3893,6 +3997,56 @@ fn discord_outbox_loop_args_from_args(args: &[String]) -> Result<DiscordOutboxLo
     })
 }
 
+fn discord_dm_probe_args_from_args(args: &[String]) -> Result<DiscordDmProbeArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut user_id = None;
+    let mut send_message = true;
+    let mut message = "OpenClaw harness Discord DM probe.".to_string();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--user-id" => {
+                i += 1;
+                user_id = Some(
+                    args.get(i)
+                        .ok_or_else(|| "--user-id requires a Discord user id".to_string())?
+                        .clone(),
+                );
+            }
+            "--message" => {
+                i += 1;
+                message = args
+                    .get(i)
+                    .ok_or_else(|| "--message requires text".to_string())?
+                    .clone();
+            }
+            "--no-send" => send_message = false,
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let user_id = user_id.ok_or_else(|| "--user-id is required".to_string())?;
+    if user_id.trim().is_empty() {
+        return Err("--user-id must not be empty".to_string());
+    }
+    if message.chars().count() > 2_000 {
+        return Err("--message exceeds Discord's 2000 character content limit".to_string());
+    }
+
+    Ok(DiscordDmProbeArgs {
+        target_home,
+        user_id,
+        send_message,
+        message,
+    })
+}
+
 fn discord_event_run_once_args_from_args(
     args: &[String],
 ) -> Result<DiscordEventRunOnceArgs, String> {
@@ -5087,6 +5241,50 @@ fn write_discord_event_receipt(report: &DiscordEventRunOnceReport) -> Result<(),
         .map_err(|err| err.to_string())
 }
 
+fn discord_dm_probe_report_file(harness_home: &std::path::Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("channels")
+        .join("discord-dm-probe.json")
+}
+
+fn discord_dm_probe_receipts_file(harness_home: &std::path::Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("channels")
+        .join("discord-dm-probe-receipts.jsonl")
+}
+
+fn write_discord_dm_probe_report(report: &DiscordDmProbeReport) -> Result<(), String> {
+    let report_file = discord_dm_probe_report_file(&report.harness_home);
+    let receipts_file = discord_dm_probe_receipts_file(&report.harness_home);
+    if let Some(parent) = report_file.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let receipt = serde_json::json!({
+        "schema": "openclaw-harness.discord-dm-probe-receipt.v1",
+        "status": report.status,
+        "reason": report.reason,
+        "userId": report.user_id,
+        "channelId": report.channel_id,
+        "providerMessageId": report.provider_message_id,
+        "sentMessage": report.sent_message,
+        "warnings": report.warnings,
+        "atMs": current_log_time_ms().map_err(|err| err.to_string())?,
+    });
+    fs::write(
+        &report_file,
+        serde_json::to_string_pretty(&receipt).map_err(|err| err.to_string())?,
+    )
+    .map_err(|err| err.to_string())?;
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(receipts_file)
+        .and_then(|mut file| writeln!(file, "{receipt}"))
+        .map_err(|err| err.to_string())
+}
+
 fn export_channel_credentials(
     args: &ChannelCredentialsExportArgs,
 ) -> Result<ChannelCredentialExportReport, String> {
@@ -5995,6 +6193,24 @@ fn discord_send_message(
         .get("id")
         .and_then(serde_json::Value::as_str)
         .map(ToString::to_string))
+}
+
+fn discord_create_dm_channel(token: &str, user_id: &str) -> Result<String, String> {
+    let token = normalize_discord_bot_token(token);
+    let auth = format!("Bot {token}");
+    let response = ureq::post("https://discord.com/api/v10/users/@me/channels")
+        .set("Authorization", &auth)
+        .set("Content-Type", "application/json")
+        .send_json(serde_json::json!({
+            "recipient_id": user_id
+        }))
+        .map_err(discord_http_error)?;
+    let value: serde_json::Value = response.into_json().map_err(|err| err.to_string())?;
+    value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| "Discord create DM response did not include channel id".to_string())
 }
 
 fn discord_send_typing(token: &str, channel_id: &str) -> Result<(), String> {
@@ -7016,6 +7232,26 @@ fn print_discord_outbox_send_once_report(report: &DiscordOutboxSendOnceReport) {
     }
 }
 
+fn print_discord_dm_probe_report(report: &DiscordDmProbeReport) {
+    println!("OpenClaw Discord DM probe");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Status: {}", report.status);
+    println!("Reason: {}", report.reason);
+    println!("User: {}", report.user_id);
+    println!("Channel: {}", report.channel_id.as_deref().unwrap_or("-"));
+    println!(
+        "Provider message: {}",
+        report.provider_message_id.as_deref().unwrap_or("-")
+    );
+    println!("Sent message: {}", yes_no(report.sent_message));
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
 fn print_discord_event_run_once_report(report: &DiscordEventRunOnceReport) {
     println!("OpenClaw Discord event run once");
     println!("Harness home: {}", report.harness_home.display());
@@ -7721,6 +7957,7 @@ fn print_help() {
     println!("  telegram-loop     Run Telegram polling continuously until stopped");
     println!("  discord-outbox-send-once Send pending Discord outbox messages once");
     println!("  discord-outbox-loop Send pending Discord outbox messages continuously");
+    println!("  discord-dm-probe Create a Discord DM channel and optionally send a probe");
     println!("  discord-event-run-once Normalize one Discord Gateway message event");
     println!("  discord-gateway-probe Probe Discord Gateway loop prerequisites");
     println!("  discord-gateway-loop Run Discord Gateway receive loop");
