@@ -26,6 +26,7 @@ pub struct ChannelReceiveOptions {
     pub agent_id: Option<String>,
     pub session_key: Option<String>,
     pub message: String,
+    pub inbound_context: Option<String>,
     pub skill_limit: usize,
     pub now_ms: i64,
 }
@@ -91,6 +92,7 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
             channel_id: options.channel_id.clone(),
             user_id: options.user_id.clone(),
             text: options.message,
+            inbound_context: options.inbound_context,
             requested_agent_id: options.agent_id,
             session_hint: options.session_key,
             skill_limit: options.skill_limit,
@@ -254,6 +256,7 @@ mod tests {
             agent_id: Some("main".to_string()),
             session_key: None,
             message: "/model openrouter/anthropic/claude-sonnet-4".to_string(),
+            inbound_context: None,
             skill_limit: 3,
             now_ms: 1000,
         })
@@ -288,6 +291,7 @@ mod tests {
             agent_id: Some("main".to_string()),
             session_key: None,
             message: "/model openrouter/anthropic/claude-sonnet-4".to_string(),
+            inbound_context: None,
             skill_limit: 3,
             now_ms: 1000,
         })
@@ -304,6 +308,7 @@ mod tests {
             agent_id: Some("main".to_string()),
             session_key: None,
             message: "continue".to_string(),
+            inbound_context: None,
             skill_limit: 3,
             now_ms: 1001,
         })

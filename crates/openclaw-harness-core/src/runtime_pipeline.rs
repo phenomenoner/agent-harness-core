@@ -9,9 +9,10 @@ use crate::{
     ChannelOutboundMessage, ChannelOutboundMessageKind, CodexRuntimePlanOptions,
     CodexRuntimePlanReport, CodexRuntimeReceiptStatus, CodexRuntimeRunOptions,
     CodexRuntimeRunReport, CodexRuntimeRunStatus, HarnessLogEvent, HarnessLogLevel,
-    PromptAssemblyOptions, RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions,
-    RuntimeQueuePrepareReport, RuntimeQueuePreparedItem, append_harness_log, current_log_time_ms,
-    plan_codex_runtime, prepare_runtime_queue_item, read_channel_session_state, run_codex_runtime,
+    MemoryLifecycleTurnOptions, PromptAssemblyOptions, RuntimeExecutionReceiptStatus,
+    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeQueuePreparedItem,
+    append_harness_log, current_log_time_ms, plan_codex_runtime, prepare_runtime_queue_item,
+    read_channel_session_state, record_memory_lifecycle_turn, run_codex_runtime,
 };
 
 const RUNTIME_RUN_ONCE_SCHEMA: &str = "openclaw-harness.runtime-run-once.v1";
@@ -201,6 +202,20 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                             &context,
                             &mut warnings,
                         )? {
+                            if let Some(codex_plan) = plan.plan.as_ref() {
+                                match record_memory_lifecycle_turn(MemoryLifecycleTurnOptions {
+                                    harness_home: options.harness_home.clone(),
+                                    prompt_bundle_json: codex_plan.prompt_bundle_json.clone(),
+                                    assistant_text: text.clone(),
+                                    success: true,
+                                    now_ms: current_log_time_ms()?,
+                                }) {
+                                    Ok(memory) => warnings.extend(memory.warnings),
+                                    Err(error) => warnings.push(format!(
+                                        "memory lifecycle recording failed: {error}"
+                                    )),
+                                }
+                            }
                             let message = ChannelOutboundMessage {
                                 platform: context.platform,
                                 channel_id: context.channel_id,
@@ -241,6 +256,41 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                     .to_string(),
             );
         }
+    } else if let Some(context) = channel_context {
+        let status = map_run_once_status(run.receipt.status);
+        if channel_session_is_current(&options.harness_home, &context, &mut warnings)? {
+            let message = ChannelOutboundMessage {
+                platform: context.platform,
+                channel_id: context.channel_id,
+                user_id: context.user_id,
+                session_key: context.session_key,
+                kind: ChannelOutboundMessageKind::ErrorReply,
+                text: runtime_failure_reply_text(status, &run.receipt.reason),
+            };
+            let file = append_outbound_message(&options.harness_home, &message)?;
+            outbox_file = Some(file);
+            outbound_message = Some(message);
+        } else {
+            let receipt = RuntimeRunOnceReceipt {
+                queue_id: run.receipt.queue_id.clone(),
+                status,
+                execution_dir: run.receipt.execution_dir.clone(),
+                transcript_file: run.receipt.transcript_file.clone(),
+                outbox_file: None,
+                reason: run.receipt.reason.clone(),
+            };
+            append_runtime_run_once_log(
+                &options.harness_home,
+                HarnessLogLevel::Warn,
+                "runtime.run-once.failure-stale-session-suppressed",
+                &receipt,
+            )?;
+        }
+    } else {
+        warnings.push(
+            "queue channel context was unavailable; runtime failure was not written to outbox"
+                .to_string(),
+        );
     }
 
     let receipt = RuntimeRunOnceReceipt {
@@ -300,6 +350,26 @@ fn map_run_once_status(status: CodexRuntimeRunStatus) -> RuntimeRunOnceStatus {
         CodexRuntimeRunStatus::ProtocolError => RuntimeRunOnceStatus::ProtocolError,
         CodexRuntimeRunStatus::Timeout => RuntimeRunOnceStatus::Timeout,
     }
+}
+
+fn runtime_failure_reply_text(status: RuntimeRunOnceStatus, reason: &str) -> String {
+    format!(
+        "Agent harness runtime error: {:?}\nReason: {}\n\nUse /status security to check approvals and sandbox policy.",
+        status,
+        truncate_for_channel(reason, 360)
+    )
+}
+
+fn truncate_for_channel(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut truncated = value
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn write_runtime_run_once_report(
@@ -508,6 +578,7 @@ mod tests {
             agent_id: Some("main".to_string()),
             session_key: None,
             message: "repair memory cron".to_string(),
+            inbound_context: None,
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -568,6 +639,77 @@ mod tests {
         )
         .unwrap();
         assert!(log.contains("runtime.run-once.completed"));
+        let lifecycle = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("memory")
+                .join("lifecycle-receipts.jsonl"),
+        )
+        .unwrap();
+        assert!(lifecycle.contains(r#""status":"recorded""#));
+        assert!(lifecycle.contains(r#""episodesAppended":2"#));
+        let episodes =
+            fs::read_to_string(harness_home.join("memory").join("episodes.jsonl")).unwrap();
+        assert_eq!(episodes.lines().count(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_runtime_queue_once_records_runtime_failure_error_outbox() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("run_runtime_queue_once_records_runtime_failure_error_outbox");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "run a blocked command".to_string(),
+            inbound_context: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+        let fake_codex = fake_failing_codex_executable(&root);
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            codex_executable: Some(fake_codex),
+            timeout_ms: 5_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::ProtocolError);
+        assert_eq!(
+            report.run.as_ref().unwrap().receipt.status,
+            CodexRuntimeRunStatus::ProtocolError
+        );
+        let outbound = report.outbound_message.unwrap();
+        assert_eq!(outbound.kind, ChannelOutboundMessageKind::ErrorReply);
+        assert_eq!(outbound.platform, "telegram");
+        assert!(outbound.text.contains("Agent harness runtime error"));
+        assert!(outbound.text.contains("synthetic app-server refusal"));
+        let outbox = fs::read_to_string(report.outbox_file.unwrap()).unwrap();
+        assert!(outbox.contains("\"kind\":\"error-reply\""));
+        assert!(outbox.contains("synthetic app-server refusal"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -590,6 +732,7 @@ mod tests {
             agent_id: Some("main".to_string()),
             session_key: None,
             message: "old in-flight request".to_string(),
+            inbound_context: None,
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -607,6 +750,7 @@ mod tests {
             agent_id: Some("main".to_string()),
             session_key: None,
             message: "/new".to_string(),
+            inbound_context: None,
             skill_limit: 3,
             now_ms: 1235,
         })
@@ -670,6 +814,7 @@ mod tests {
             agent_id: Some("main".to_string()),
             session_key: None,
             message: "repair memory cron".to_string(),
+            inbound_context: None,
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -795,6 +940,44 @@ while ($true) {
         cmd
     }
 
+    #[cfg(windows)]
+    fn fake_failing_codex_executable(root: &Path) -> PathBuf {
+        let script = root.join("fake-failing-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try {
+        $msg = $line | ConvertFrom-Json
+    } catch {
+        continue
+    }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"error":{"message":"synthetic app-server refusal"}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let cmd = root.join("fake-failing-codex.cmd");
+        fs::write(
+            &cmd,
+            format!(
+                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        cmd
+    }
+
     #[cfg(not(windows))]
     fn fake_codex_executable(root: &Path) -> PathBuf {
         let script = root.join("fake-codex");
@@ -812,6 +995,36 @@ while IFS= read -r line; do
         *'"method":"turn/start"'*)
             printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"Pipeline fake reply."}}'
             printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-pipeline","status":"completed"}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+        script
+    }
+
+    #[cfg(not(windows))]
+    fn fake_failing_codex_executable(root: &Path) -> PathBuf {
+        let script = root.join("fake-failing-codex");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"error":{"message":"synthetic app-server refusal"}}'
             exit 0
             ;;
     esac
@@ -851,12 +1064,30 @@ done
                   { "id": "main", "model": "gpt-5", "enabled": true }
                 ]
               },
-              "models": {
-                "providers": {
-                  "openai": { "apiKey": "${OPENAI_API_KEY}" }
+                "models": {
+                  "providers": {
+                    "openai": { "apiKey": "${OPENAI_API_KEY}" }
+                  }
+                },
+                "plugins": {
+                  "entries": {
+                    "openclaw-mem": {
+                      "config": {
+                        "episodes": {
+                          "enabled": true,
+                          "outputPath": "memory/episodes.jsonl"
+                        }
+                      }
+                    },
+                    "openclaw-mem-engine": {
+                      "config": {
+                        "autoCapture": { "enabled": true },
+                        "symbolicCanvas": { "autoBuild": { "enabled": false } }
+                      }
+                    }
+                  }
                 }
-              }
-            }"#,
+              }"#,
         )
         .unwrap();
         fs::write(

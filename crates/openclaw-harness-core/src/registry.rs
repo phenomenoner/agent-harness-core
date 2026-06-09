@@ -66,6 +66,7 @@ pub struct ProviderProfile {
     pub source: String,
     pub has_base_url: bool,
     pub has_api_key_reference: bool,
+    pub models: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -260,6 +261,11 @@ fn collect_providers(config: &Value) -> Vec<ProviderProfile> {
         };
         collect_provider_collection(value, source, &mut providers);
     }
+    collect_route_model_sources(config, &mut providers);
+    for provider in providers.values_mut() {
+        provider.models.sort();
+        provider.models.dedup();
+    }
     providers.into_values().collect()
 }
 
@@ -271,12 +277,12 @@ fn collect_provider_collection(
     if let Some(object) = value.as_object() {
         for (key, value) in object {
             let id = string_field(value, &["id", "name"]).unwrap_or(key);
-            providers.insert(id.to_string(), provider_profile(id, source, value));
+            merge_provider_profile(providers, provider_profile(id, source, value));
         }
     } else if let Some(array) = value.as_array() {
         for value in array {
             if let Some(id) = string_field(value, &["id", "name"]) {
-                providers.insert(id.to_string(), provider_profile(id, source, value));
+                merge_provider_profile(providers, provider_profile(id, source, value));
             }
         }
     }
@@ -291,6 +297,150 @@ fn provider_profile(id: &str, source: &str, value: &Value) -> ProviderProfile {
             value,
             &["apiKey", "api_key", "key", "env", "envVar", "env_var"],
         ),
+        models: collect_provider_models(value),
+    }
+}
+
+fn merge_provider_profile(
+    providers: &mut BTreeMap<String, ProviderProfile>,
+    profile: ProviderProfile,
+) {
+    let entry = providers
+        .entry(profile.id.clone())
+        .or_insert_with(|| ProviderProfile {
+            id: profile.id.clone(),
+            source: profile.source.clone(),
+            has_base_url: false,
+            has_api_key_reference: false,
+            models: Vec::new(),
+        });
+    entry.source = profile.source;
+    entry.has_base_url |= profile.has_base_url;
+    entry.has_api_key_reference |= profile.has_api_key_reference;
+    merge_model_ids(&mut entry.models, profile.models);
+}
+
+fn collect_provider_models(value: &Value) -> Vec<String> {
+    let mut models = Vec::new();
+    for key in ["models", "modelIds", "model_ids"] {
+        let Some(value) = value.get(key) else {
+            continue;
+        };
+        collect_model_id_values(value, &mut models);
+    }
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn collect_model_id_values(value: &Value, models: &mut Vec<String>) {
+    if let Some(array) = value.as_array() {
+        for value in array {
+            if let Some(model) = value
+                .as_str()
+                .or_else(|| string_field(value, &["id", "name", "model", "modelId", "model_id"]))
+            {
+                push_model_id(models, model);
+            }
+        }
+    } else if let Some(object) = value.as_object() {
+        for (key, value) in object {
+            let model =
+                string_field(value, &["id", "name", "model", "modelId", "model_id"]).unwrap_or(key);
+            push_model_id(models, model);
+        }
+    }
+}
+
+fn collect_route_model_sources(config: &Value, providers: &mut BTreeMap<String, ProviderProfile>) {
+    for (path, source) in [
+        ("/agents/defaults/models", "agents.defaults.models"),
+        ("/agent/defaults/models", "agent.defaults.models"),
+        ("/defaults/models", "defaults.models"),
+        ("/models/list", "models.list"),
+        ("/models/items", "models.items"),
+    ] {
+        if let Some(value) = config.pointer(path) {
+            collect_route_model_collection(value, source, providers);
+        }
+    }
+
+    for path in ["/agents/list", "/agents/items", "/agent/list"] {
+        if let Some(value) = config.pointer(path).and_then(Value::as_array) {
+            for agent in value {
+                if let Some(models) = agent.get("models") {
+                    collect_route_model_collection(models, "agent.models", providers);
+                }
+            }
+        }
+    }
+
+    if let Some(agents) = config.get("agents").and_then(Value::as_object) {
+        for (key, agent) in agents {
+            if matches!(key.as_str(), "defaults" | "list" | "items") {
+                continue;
+            }
+            if let Some(models) = agent.get("models") {
+                collect_route_model_collection(models, "agent.models", providers);
+            }
+        }
+    }
+}
+
+fn collect_route_model_collection(
+    value: &Value,
+    source: &str,
+    providers: &mut BTreeMap<String, ProviderProfile>,
+) {
+    if let Some(object) = value.as_object() {
+        for (key, value) in object {
+            let route = value
+                .as_str()
+                .or_else(|| string_field(value, &["id", "name", "model", "modelId", "model_id"]))
+                .unwrap_or(key);
+            add_route_model(providers, source, route);
+        }
+    } else if let Some(array) = value.as_array() {
+        for value in array {
+            if let Some(route) = value
+                .as_str()
+                .or_else(|| string_field(value, &["id", "name", "model", "modelId", "model_id"]))
+            {
+                add_route_model(providers, source, route);
+            }
+        }
+    }
+}
+
+fn add_route_model(providers: &mut BTreeMap<String, ProviderProfile>, source: &str, route: &str) {
+    let route = route.trim().trim_matches('"');
+    let (Some(provider), Some(model)) = split_provider_model_route(route) else {
+        return;
+    };
+    let entry = providers
+        .entry(provider.clone())
+        .or_insert_with(|| ProviderProfile {
+            id: provider,
+            source: source.to_string(),
+            has_base_url: false,
+            has_api_key_reference: false,
+            models: Vec::new(),
+        });
+    push_model_id(&mut entry.models, &model);
+}
+
+fn merge_model_ids(target: &mut Vec<String>, source: Vec<String>) {
+    for model in source {
+        push_model_id(target, &model);
+    }
+    target.sort();
+    target.dedup();
+}
+
+fn push_model_id(models: &mut Vec<String>, model: &str) {
+    let model = model.trim().trim_matches('"');
+    if !model.is_empty() && !models.iter().any(|candidate| candidate == model) {
+        models.push(model.to_string());
     }
 }
 
@@ -532,9 +682,12 @@ mod tests {
                   { "id": "cron-lite", "provider": "openrouter", "model": { "id": "claude-sonnet-4" } }
                 ]
               },
-              "models": {
-                "providers": {
-                  "openai": { "apiKey": "${OPENAI_API_KEY}" },
+                  "models": {
+                    "providers": {
+                  "openai": {
+                    "apiKey": "${OPENAI_API_KEY}",
+                    "models": [{ "id": "gpt-5" }]
+                  },
                   "openrouter": { "baseURL": "https://openrouter.ai/api/v1", "apiKey": "${OPENROUTER_API_KEY}" }
                 }
               },
@@ -590,6 +743,12 @@ mod tests {
             .unwrap();
         assert!(openrouter.has_base_url);
         assert!(openrouter.has_api_key_reference);
+        let openai = registry
+            .providers
+            .iter()
+            .find(|provider| provider.id == "openai")
+            .unwrap();
+        assert_eq!(openai.models, vec!["gpt-5"]);
 
         let memory_plugin = registry
             .plugins
@@ -615,6 +774,11 @@ mod tests {
                   "model": {
                     "primary": "openai/gpt-5.5",
                     "fallbacks": []
+                  },
+                  "models": {
+                    "openai/gpt-5.5": {},
+                    "openrouter/openai/gpt-5.4-mini": {},
+                    "\"openrouter/qwen/qwen3.6-plus\"": {}
                   }
                 },
                 "list": [
@@ -642,6 +806,15 @@ mod tests {
         let xiaoxiaoli = agent(&registry, "xiaoxiaoli");
         assert_eq!(xiaoxiaoli.provider.as_deref(), Some("openrouter"));
         assert_eq!(xiaoxiaoli.model.as_deref(), Some("openai/gpt-5.4-mini"));
+        let openrouter = registry
+            .providers
+            .iter()
+            .find(|provider| provider.id == "openrouter")
+            .unwrap();
+        assert_eq!(
+            openrouter.models,
+            vec!["openai/gpt-5.4-mini", "qwen/qwen3.6-plus"]
+        );
 
         let _ = fs::remove_dir_all(root);
     }

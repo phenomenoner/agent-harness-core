@@ -29,7 +29,9 @@ development repository as the chat user's agent identity.";
 const HARNESS_CONFIG_FILE_NAME: &str = "harness-config.json";
 pub(crate) const CODEX_APPROVAL_POLICY_ENV: &str = "OPENCLAW_HARNESS_CODEX_APPROVAL_POLICY";
 pub(crate) const CODEX_SANDBOX_ENV: &str = "OPENCLAW_HARNESS_CODEX_SANDBOX";
+pub(crate) const CODEX_SANDBOX_POLICY_ENV: &str = "OPENCLAW_HARNESS_CODEX_SANDBOX_POLICY";
 const DEFAULT_CODEX_SANDBOX: &str = "elevated";
+const DEFAULT_CODEX_SANDBOX_POLICY: &str = "workspaceWrite";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRuntimePlanOptions {
@@ -171,6 +173,10 @@ pub struct CodexInvocationPlan {
     pub env_requirements: Vec<CodexEnvRequirement>,
     pub model_argument: Option<String>,
     pub thread_id: Option<String>,
+    #[serde(default)]
+    pub app_server_approval_policy: String,
+    #[serde(default)]
+    pub app_server_sandbox: String,
     #[serde(default)]
     pub approval_policy: CodexApprovalPolicy,
 }
@@ -498,6 +504,8 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
         .codex_executable
         .unwrap_or_else(|| PathBuf::from("codex"));
     let approval_policy = resolve_codex_approval_policy(&options.harness_home, &mut warnings);
+    let app_server_approval_policy = codex_app_server_approval_policy(approval_policy).to_string();
+    let app_server_sandbox = resolve_codex_sandbox_policy(&options.harness_home, &mut warnings);
     let codex_home = harness_codex_home(&options.harness_home);
     ensure_harness_codex_config(
         codex_home.as_deref(),
@@ -515,6 +523,8 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
         env_requirements: env_requirements(provider.as_deref()),
         model_argument: model.clone(),
         thread_id,
+        app_server_approval_policy,
+        app_server_sandbox,
         approval_policy,
     };
     let outputs = CodexOutputPlan {
@@ -1340,6 +1350,56 @@ struct CodexAppServerRunResult {
     warnings: Vec<String>,
 }
 
+fn app_server_approval_policy_for_plan(plan: &CodexRuntimePlanFile) -> String {
+    let configured = plan.invocation.app_server_approval_policy.trim();
+    if configured.is_empty() {
+        codex_app_server_approval_policy(plan.invocation.approval_policy).to_string()
+    } else {
+        configured.to_string()
+    }
+}
+
+fn app_server_sandbox_for_plan(plan: &CodexRuntimePlanFile) -> String {
+    let configured = plan.invocation.app_server_sandbox.trim();
+    if configured.is_empty() {
+        DEFAULT_CODEX_SANDBOX_POLICY.to_string()
+    } else {
+        configured.to_string()
+    }
+}
+
+fn app_server_sandbox_mode_value(sandbox: &str) -> &'static str {
+    match normalize_codex_sandbox_policy(sandbox).as_str() {
+        "dangerfullaccess" => "danger-full-access",
+        "readonly" => "read-only",
+        _ => "workspace-write",
+    }
+}
+
+fn app_server_sandbox_policy_value(sandbox: &str, runtime_workspace_root: &str) -> Value {
+    match normalize_codex_sandbox_policy(sandbox).as_str() {
+        "dangerfullaccess" => json!({
+            "type": "dangerFullAccess"
+        }),
+        "readonly" => json!({
+            "type": "readOnly",
+            "networkAccess": false
+        }),
+        _ => json!({
+            "type": "workspaceWrite",
+            "writableRoots": [runtime_workspace_root],
+            "networkAccess": false
+        }),
+    }
+}
+
+fn codex_app_server_approval_policy(policy: CodexApprovalPolicy) -> &'static str {
+    match policy {
+        CodexApprovalPolicy::Accept => "never",
+        CodexApprovalPolicy::Deny => "on-request",
+    }
+}
+
 fn drive_codex_app_server(
     plan: &CodexRuntimePlanFile,
     timeout_ms: u64,
@@ -1432,15 +1492,20 @@ fn drive_codex_app_server(
         }),
     )?;
     let mut thread_params = json!({});
+    let app_server_approval_policy = app_server_approval_policy_for_plan(plan);
+    let app_server_sandbox = app_server_sandbox_for_plan(plan);
+    let runtime_workspace_root = plan
+        .invocation
+        .working_directory
+        .to_string_lossy()
+        .to_string();
     if let Some(model) = &plan.model {
         thread_params["model"] = json!(model);
     }
-    thread_params["cwd"] = json!(
-        plan.invocation
-            .working_directory
-            .to_string_lossy()
-            .to_string()
-    );
+    thread_params["cwd"] = json!(runtime_workspace_root.clone());
+    thread_params["approvalPolicy"] = json!(app_server_approval_policy.clone());
+    thread_params["sandbox"] = json!(app_server_sandbox_mode_value(&app_server_sandbox));
+    thread_params["runtimeWorkspaceRoots"] = json!([runtime_workspace_root.clone()]);
     thread_params["developerInstructions"] = json!(CODEX_APP_SERVER_DEVELOPER_INSTRUCTIONS);
     let thread_method = if let Some(thread_id) = &plan.invocation.thread_id {
         thread_params["threadId"] = json!(thread_id);
@@ -1510,21 +1575,32 @@ fn drive_codex_app_server(
         }
     };
     let prompt_input = fs::read_to_string(&plan.invocation.prompt_input_file)?;
+    let turn_sandbox_policy =
+        app_server_sandbox_policy_value(&app_server_sandbox, &runtime_workspace_root);
+    let turn_params = json!({
+        "threadId": thread_id.clone(),
+        "cwd": runtime_workspace_root,
+        "approvalPolicy": app_server_approval_policy,
+        "sandboxPolicy": turn_sandbox_policy,
+        "runtimeWorkspaceRoots": [
+            plan.invocation
+                .working_directory
+                .to_string_lossy()
+                .to_string()
+        ],
+        "input": [
+            {
+                "type": "text",
+                "text": prompt_input
+            }
+        ]
+    });
     write_json_rpc(
         &mut stdin,
         &json!({
             "id": 2,
             "method": "turn/start",
-            "params": {
-                "threadId": thread_id,
-                "cwd": plan.invocation.working_directory.to_string_lossy().to_string(),
-                "input": [
-                    {
-                        "type": "text",
-                        "text": prompt_input
-                    }
-                ]
-            }
+            "params": turn_params
         }),
     )?;
 
@@ -1865,16 +1941,14 @@ fn answer_unattended_server_request(
     let Some(id) = value.get("id").cloned() else {
         return Ok(false);
     };
-    let Some(decision) = unattended_approval_decision(method, approval_policy) else {
+    let Some(result) = unattended_approval_result(value, approval_policy) else {
         return Ok(false);
     };
     write_json_rpc(
         stdin,
         &json!({
             "id": id,
-            "result": {
-                "decision": decision
-            }
+            "result": result
         }),
     )?;
     match approval_policy {
@@ -1894,25 +1968,111 @@ fn answer_unattended_server_request(
     Ok(true)
 }
 
+fn unattended_approval_result(
+    value: &Value,
+    approval_policy: CodexApprovalPolicy,
+) -> Option<Value> {
+    let method = json_method(value)?;
+    if method == "item/permissions/requestApproval" {
+        return Some(unattended_permissions_result(value, approval_policy));
+    }
+    unattended_approval_decision(value, method, approval_policy)
+        .map(|decision| json!({ "decision": decision }))
+}
+
+fn unattended_permissions_result(value: &Value, approval_policy: CodexApprovalPolicy) -> Value {
+    match approval_policy {
+        CodexApprovalPolicy::Accept => {
+            let permissions = value
+                .pointer("/params/permissions")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            json!({
+                "scope": "session",
+                "permissions": permissions
+            })
+        }
+        CodexApprovalPolicy::Deny => json!({
+            "scope": "turn",
+            "permissions": {}
+        }),
+    }
+}
+
 fn unattended_approval_decision(
+    value: &Value,
     method: &str,
     approval_policy: CodexApprovalPolicy,
-) -> Option<&'static str> {
+) -> Option<Value> {
     match (method, approval_policy) {
-        ("execCommandApproval" | "applyPatchApproval", CodexApprovalPolicy::Deny) => Some("denied"),
+        ("execCommandApproval" | "applyPatchApproval", CodexApprovalPolicy::Deny) => {
+            Some(json!("denied"))
+        }
         ("execCommandApproval" | "applyPatchApproval", CodexApprovalPolicy::Accept) => {
-            Some("approved")
+            Some(json!("approved"))
         }
         (
             "item/commandExecution/requestApproval" | "item/fileChange/requestApproval",
             CodexApprovalPolicy::Deny,
-        ) => Some("cancel"),
-        (
-            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval",
-            CodexApprovalPolicy::Accept,
-        ) => Some("accept"),
+        ) => Some(deny_decision(value)),
+        ("item/commandExecution/requestApproval", CodexApprovalPolicy::Accept) => {
+            Some(accept_command_decision(value))
+        }
+        ("item/fileChange/requestApproval", CodexApprovalPolicy::Accept) => {
+            Some(accept_file_change_decision(value))
+        }
         _ => None,
     }
+}
+
+fn deny_decision(value: &Value) -> Value {
+    if available_decision_string(value, "decline") && !available_decision_string(value, "cancel") {
+        json!("decline")
+    } else {
+        json!("cancel")
+    }
+}
+
+fn accept_command_decision(value: &Value) -> Value {
+    if let Some(decision) = available_decision_object(value, "acceptWithExecpolicyAmendment") {
+        return decision;
+    }
+    if available_decision_string(value, "acceptForSession") {
+        return json!("acceptForSession");
+    }
+    json!("accept")
+}
+
+fn accept_file_change_decision(value: &Value) -> Value {
+    if available_decision_string(value, "acceptForSession") {
+        json!("acceptForSession")
+    } else {
+        json!("accept")
+    }
+}
+
+fn available_decision_string(value: &Value, expected: &str) -> bool {
+    value
+        .pointer("/params/availableDecisions")
+        .and_then(Value::as_array)
+        .is_some_and(|decisions| {
+            decisions
+                .iter()
+                .any(|decision| decision.as_str() == Some(expected))
+        })
+}
+
+fn available_decision_object(value: &Value, expected_key: &str) -> Option<Value> {
+    value
+        .pointer("/params/availableDecisions")
+        .and_then(Value::as_array)
+        .and_then(|decisions| {
+            decisions.iter().find_map(|decision| {
+                decision
+                    .as_object()
+                    .and_then(|object| object.contains_key(expected_key).then(|| decision.clone()))
+            })
+        })
 }
 
 fn approval_request_summary(value: &Value) -> String {
@@ -2524,6 +2684,24 @@ fn resolve_codex_sandbox(harness_home: &Path, warnings: &mut Vec<String>) -> Str
     sandbox
 }
 
+pub fn inspect_codex_sandbox_policy(harness_home: &Path) -> CodexSandboxInspection {
+    let mut warnings = Vec::new();
+    let (sandbox, source, configured) =
+        resolve_codex_sandbox_policy_with_source(harness_home, &mut warnings);
+    CodexSandboxInspection {
+        sandbox,
+        source,
+        configured,
+        config_file: harness_home.join(HARNESS_CONFIG_FILE_NAME),
+        warnings,
+    }
+}
+
+fn resolve_codex_sandbox_policy(harness_home: &Path, warnings: &mut Vec<String>) -> String {
+    let (sandbox, _, _) = resolve_codex_sandbox_policy_with_source(harness_home, warnings);
+    sandbox
+}
+
 fn resolve_codex_sandbox_with_source(
     harness_home: &Path,
     warnings: &mut Vec<String>,
@@ -2642,6 +2820,131 @@ fn is_safe_codex_sandbox_value(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn resolve_codex_sandbox_policy_with_source(
+    harness_home: &Path,
+    warnings: &mut Vec<String>,
+) -> (String, String, bool) {
+    if let Ok(raw) = env::var(CODEX_SANDBOX_POLICY_ENV) {
+        return match parse_codex_sandbox_policy(&raw) {
+            Some(sandbox) => (sandbox, CODEX_SANDBOX_POLICY_ENV.to_string(), true),
+            None => {
+                warnings.push(format!(
+                    "invalid {CODEX_SANDBOX_POLICY_ENV}={raw:?}; defaulting Codex app-server sandbox policy to {DEFAULT_CODEX_SANDBOX_POLICY}"
+                ));
+                (
+                    DEFAULT_CODEX_SANDBOX_POLICY.to_string(),
+                    CODEX_SANDBOX_POLICY_ENV.to_string(),
+                    true,
+                )
+            }
+        };
+    }
+
+    let config_file = harness_home.join(HARNESS_CONFIG_FILE_NAME);
+    let text = match fs::read_to_string(&config_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return (
+                DEFAULT_CODEX_SANDBOX_POLICY.to_string(),
+                "default".to_string(),
+                false,
+            );
+        }
+        Err(error) => {
+            warnings.push(format!(
+                "failed to read {}: {error}; defaulting Codex app-server sandbox policy to {DEFAULT_CODEX_SANDBOX_POLICY}",
+                config_file.display()
+            ));
+            return (
+                DEFAULT_CODEX_SANDBOX_POLICY.to_string(),
+                config_file.display().to_string(),
+                false,
+            );
+        }
+    };
+    let value = match serde_json::from_str::<Value>(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            warnings.push(format!(
+                "failed to parse {} as JSON: {error}; defaulting Codex app-server sandbox policy to {DEFAULT_CODEX_SANDBOX_POLICY}",
+                config_file.display()
+            ));
+            return (
+                DEFAULT_CODEX_SANDBOX_POLICY.to_string(),
+                config_file.display().to_string(),
+                false,
+            );
+        }
+    };
+    for pointer in [
+        "/security/codexSandboxPolicy",
+        "/security/codexFilesystemSandbox",
+        "/codex/sandboxPolicy",
+        "/codex/filesystemSandbox",
+        "/runtime/codexSandboxPolicy",
+    ] {
+        if let Some(raw_value) = value.pointer(pointer) {
+            if let Some(sandbox) = codex_sandbox_policy_from_json(raw_value) {
+                return (
+                    sandbox,
+                    format!("{}:{pointer}", config_file.display()),
+                    true,
+                );
+            }
+            warnings.push(format!(
+                "invalid Codex app-server sandbox policy at {}:{pointer}; defaulting to {DEFAULT_CODEX_SANDBOX_POLICY}",
+                config_file.display()
+            ));
+            return (
+                DEFAULT_CODEX_SANDBOX_POLICY.to_string(),
+                format!("{}:{pointer}", config_file.display()),
+                true,
+            );
+        }
+    }
+    (
+        DEFAULT_CODEX_SANDBOX_POLICY.to_string(),
+        config_file.display().to_string(),
+        false,
+    )
+}
+
+fn codex_sandbox_policy_from_json(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => parse_codex_sandbox_policy(text),
+        Value::Bool(true) => Some(DEFAULT_CODEX_SANDBOX_POLICY.to_string()),
+        Value::Bool(false) => Some("dangerFullAccess".to_string()),
+        _ => None,
+    }
+}
+
+fn parse_codex_sandbox_policy(value: &str) -> Option<String> {
+    let normalized = value
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-")
+        .replace(' ', "-");
+    let sandbox = match normalized.as_str() {
+        "" => return None,
+        "default" | "workspace" | "workspace-write" | "workspacewrite" => "workspaceWrite",
+        "readonly" | "read-only" | "read" => "readOnly",
+        "dangerfullaccess" | "danger-full-access" | "full-access" | "full" | "none" | "off"
+        | "disabled" | "false" => "dangerFullAccess",
+        other if is_safe_codex_sandbox_value(other) => other,
+        _ => return None,
+    };
+    Some(sandbox.to_string())
+}
+
+fn normalize_codex_sandbox_policy(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "")
+        .replace('_', "")
+        .replace(' ', "")
 }
 
 fn check_executable(executable: &Path) -> CodexRuntimePreflightCheck {
@@ -3219,6 +3522,8 @@ mod tests {
             CodexTransportPlan::StdioJsonRpcAppServer
         );
         assert_eq!(plan.invocation.approval_policy, CodexApprovalPolicy::Deny);
+        assert_eq!(plan.invocation.app_server_approval_policy, "on-request");
+        assert_eq!(plan.invocation.app_server_sandbox, "workspaceWrite");
         assert!(
             plan.invocation
                 .env_requirements
@@ -3247,7 +3552,7 @@ mod tests {
         fs::create_dir_all(&harness_home).unwrap();
         fs::write(
             harness_home.join(HARNESS_CONFIG_FILE_NAME),
-            r#"{"security":{"codexApprovalPolicy":"accept"}}"#,
+            r#"{"security":{"codexApprovalPolicy":"accept","codexSandboxPolicy":"dangerFullAccess"}}"#,
         )
         .unwrap();
         enqueue_and_prepare(&source, &harness_home);
@@ -3261,12 +3566,22 @@ mod tests {
 
         let plan = report.plan.unwrap();
         assert_eq!(plan.invocation.approval_policy, CodexApprovalPolicy::Accept);
+        assert_eq!(plan.invocation.app_server_approval_policy, "never");
+        assert_eq!(plan.invocation.app_server_sandbox, "dangerFullAccess");
 
         let plan_file = report.plan_file.unwrap();
         let plan_json: Value = read_json_file(&plan_file).unwrap();
         assert_eq!(
             plan_json["invocation"]["approvalPolicy"],
             serde_json::json!("accept")
+        );
+        assert_eq!(
+            plan_json["invocation"]["appServerApprovalPolicy"],
+            serde_json::json!("never")
+        );
+        assert_eq!(
+            plan_json["invocation"]["appServerSandbox"],
+            serde_json::json!("dangerFullAccess")
         );
 
         let _ = fs::remove_dir_all(root);
@@ -3868,6 +4183,67 @@ mod tests {
     }
 
     #[test]
+    fn answer_unattended_server_request_accepts_execpolicy_amendment_decisions() {
+        let mut state = CodexProtocolState::default();
+        let mut out = Vec::new();
+
+        let handled = answer_unattended_server_request(
+            &serde_json::json!({
+                "id": 9,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "availableDecisions": [
+                        "accept",
+                        {
+                            "acceptWithExecpolicyAmendment": {
+                                "execpolicy_amendment": [
+                                    {
+                                        "match": { "program": "git" },
+                                        "decision": "allow"
+                                    }
+                                ]
+                            }
+                        },
+                        "cancel"
+                    ]
+                }
+            }),
+            &mut out,
+            &mut state,
+            CodexApprovalPolicy::Accept,
+        )
+        .unwrap();
+
+        assert!(handled);
+        let response: Value =
+            serde_json::from_slice(String::from_utf8(out).unwrap().trim().as_bytes()).unwrap();
+        assert_eq!(response["id"], 9);
+        assert!(response["result"]["decision"]["acceptWithExecpolicyAmendment"].is_object());
+    }
+
+    #[test]
+    fn app_server_sandbox_payloads_match_installed_schema() {
+        assert_eq!(
+            app_server_sandbox_mode_value("dangerFullAccess"),
+            "danger-full-access"
+        );
+        assert_eq!(
+            app_server_sandbox_policy_value("danger-full-access", "D:\\Workspace"),
+            serde_json::json!({
+                "type": "dangerFullAccess"
+            })
+        );
+        assert_eq!(
+            app_server_sandbox_policy_value("workspaceWrite", "D:\\Workspace"),
+            serde_json::json!({
+                "type": "workspaceWrite",
+                "writableRoots": ["D:\\Workspace"],
+                "networkAccess": false
+            })
+        );
+    }
+
+    #[test]
     fn answer_unattended_server_request_declines_legacy_approval_requests() {
         let mut state = CodexProtocolState::default();
         let mut out = Vec::new();
@@ -3991,6 +4367,7 @@ mod tests {
                 channel_id: "dm-42".to_string(),
                 user_id: "user-7".to_string(),
                 text: "repair memory cron".to_string(),
+                inbound_context: None,
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,

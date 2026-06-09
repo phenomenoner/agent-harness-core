@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -9,6 +10,7 @@ use crate::{ChannelCommandEffect, ChannelOutboundMessage, ChannelStep};
 const CHANNEL_COMMAND_APPLY_SCHEMA: &str = "openclaw-harness.channel-command-apply.v1";
 const CHANNEL_STATE_SCHEMA: &str = "openclaw-harness.channel-session-state.v1";
 const CHANNEL_COMMAND_EVENT_SCHEMA: &str = "openclaw-harness.channel-command-event.v1";
+const AGENT_OVERRIDES_SCHEMA: &str = "agent-harness.agent-overrides.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelCommandApplyOptions {
@@ -77,11 +79,19 @@ pub struct ChannelSessionState {
     pub model_override: Option<String>,
     pub model_override_provider: Option<String>,
     pub model_override_model: Option<String>,
+    #[serde(default)]
     pub thinking_enabled: bool,
+    #[serde(default)]
+    pub thinking_level: Option<String>,
+    #[serde(default)]
     pub thinking_instruction: Option<String>,
+    #[serde(default)]
     pub stop_requested: bool,
+    #[serde(default)]
     pub stop_reason: Option<String>,
+    #[serde(default)]
     pub steering_notes: Vec<ChannelSessionNote>,
+    #[serde(default)]
     pub btw_notes: Vec<ChannelSessionNote>,
     pub last_command: Option<String>,
     pub updated_at_ms: i64,
@@ -92,6 +102,33 @@ pub struct ChannelSessionState {
 pub struct ChannelSessionNote {
     pub at_ms: i64,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentOverride {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub thinking_level: Option<String>,
+    pub updated_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentOverridesStore {
+    #[serde(default = "agent_overrides_schema")]
+    pub schema: String,
+    #[serde(default)]
+    pub agents: BTreeMap<String, AgentOverride>,
+}
+
+impl Default for AgentOverridesStore {
+    fn default() -> Self {
+        Self {
+            schema: agent_overrides_schema(),
+            agents: BTreeMap::new(),
+        }
+    }
 }
 
 pub fn apply_channel_command_step(
@@ -138,7 +175,13 @@ pub fn apply_channel_command_step(
     };
 
     let mut state = read_channel_state(&state_file)?.unwrap_or_else(|| new_state(step));
-    apply_effect(&mut state, &effect, options.now_ms, &mut warnings);
+    apply_effect(
+        &mut state,
+        &effect,
+        &options.harness_home,
+        options.now_ms,
+        &mut warnings,
+    )?;
     let event = ChannelCommandEvent {
         schema: CHANNEL_COMMAND_EVENT_SCHEMA,
         at_ms: options.now_ms,
@@ -203,6 +246,22 @@ pub fn channel_session_state_file(
     channel_session_state_dir(harness_home, platform, channel_id, user_id).join("state.json")
 }
 
+pub fn agent_overrides_file(harness_home: impl AsRef<Path>) -> PathBuf {
+    harness_home
+        .as_ref()
+        .join("state")
+        .join("agents")
+        .join("overrides.json")
+}
+
+pub fn read_agent_override(
+    harness_home: impl AsRef<Path>,
+    agent_id: &str,
+) -> io::Result<Option<AgentOverride>> {
+    let store = read_agent_overrides_store(harness_home)?;
+    Ok(store.agents.get(agent_id).cloned())
+}
+
 fn read_channel_state(path: &Path) -> io::Result<Option<ChannelSessionState>> {
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -228,6 +287,7 @@ fn new_state(step: &ChannelStep) -> ChannelSessionState {
         model_override_provider: None,
         model_override_model: None,
         thinking_enabled: false,
+        thinking_level: None,
         thinking_instruction: None,
         stop_requested: false,
         stop_reason: None,
@@ -241,9 +301,10 @@ fn new_state(step: &ChannelStep) -> ChannelSessionState {
 fn apply_effect(
     state: &mut ChannelSessionState,
     effect: &ChannelCommandEffect,
+    harness_home: &Path,
     now_ms: i64,
     warnings: &mut Vec<String>,
-) {
+) -> io::Result<()> {
     state.last_command = Some(command_name(effect).to_string());
     state.updated_at_ms = now_ms;
 
@@ -255,15 +316,39 @@ fn apply_effect(
             state.active_session_key = new_session_key.clone();
             state.session_topic = topic.clone();
             state.thinking_enabled = false;
+            state.thinking_level = None;
             state.thinking_instruction = None;
             state.stop_requested = false;
             state.stop_reason = None;
             state.steering_notes.clear();
             state.btw_notes.clear();
         }
-        ChannelCommandEffect::SetThinkingMode { instruction } => {
-            state.thinking_enabled = true;
-            state.thinking_instruction = instruction.clone();
+        ChannelCommandEffect::ShowThinking {
+            agent_id,
+            provider,
+            model,
+            ..
+        } => {
+            update_model_context(state, agent_id, provider, model);
+        }
+        ChannelCommandEffect::SwitchThinking {
+            agent_id,
+            level,
+            global,
+            provider,
+            model,
+            valid,
+            ..
+        } => {
+            update_model_context(state, agent_id, provider, model);
+            if *valid {
+                state.thinking_enabled = true;
+                state.thinking_level = Some(level.clone());
+                state.thinking_instruction = None;
+                if *global {
+                    write_agent_override_thinking(harness_home, agent_id, level, now_ms, warnings)?;
+                }
+            }
         }
         ChannelCommandEffect::StopCurrentRun { reason } => {
             state.stop_requested = true;
@@ -283,22 +368,43 @@ fn apply_effect(
         }
         ChannelCommandEffect::ShowModel {
             agent_id,
-            provider,
-            model,
+            current_provider,
+            current_model,
+            ..
         } => {
-            update_model_context(state, agent_id, provider, model);
+            update_model_context(state, agent_id, current_provider, current_model);
+        }
+        ChannelCommandEffect::ListProviderModels {
+            agent_id,
+            current_provider,
+            current_model,
+            ..
+        } => {
+            update_model_context(state, agent_id, current_provider, current_model);
         }
         ChannelCommandEffect::SwitchModel {
             agent_id,
-            target,
+            provider,
+            model,
+            global,
             current_provider,
             current_model,
+            ..
         } => {
             update_model_context(state, agent_id, current_provider, current_model);
-            state.model_override = Some(target.clone());
-            let (provider, model) = split_model_target(target);
-            state.model_override_provider = provider;
-            state.model_override_model = model;
+            state.model_override = Some(format!("{provider}/{model}"));
+            state.model_override_provider = Some(provider.clone());
+            state.model_override_model = Some(model.clone());
+            if *global {
+                write_agent_override_model(
+                    harness_home,
+                    agent_id,
+                    provider,
+                    model,
+                    now_ms,
+                    warnings,
+                )?;
+            }
         }
         ChannelCommandEffect::ShowStatus { snapshot, .. } => {
             update_model_context(
@@ -313,6 +419,7 @@ fn apply_effect(
     if state.model_override.is_some() && state.model_override_model.is_none() {
         warnings.push("model override target did not include a usable model name".to_string());
     }
+    Ok(())
 }
 
 fn update_model_context(
@@ -335,28 +442,78 @@ fn update_model_context(
 fn command_name(effect: &ChannelCommandEffect) -> &'static str {
     match effect {
         ChannelCommandEffect::StartNewSession { .. } => "new",
-        ChannelCommandEffect::SetThinkingMode { .. } => "think",
+        ChannelCommandEffect::ShowThinking { .. } => "think",
+        ChannelCommandEffect::SwitchThinking { .. } => "think",
         ChannelCommandEffect::StopCurrentRun { .. } => "stop",
         ChannelCommandEffect::AddSteering { .. } => "steer",
         ChannelCommandEffect::AddBtwNote { .. } => "btw",
         ChannelCommandEffect::ShowModel { .. } => "model",
+        ChannelCommandEffect::ListProviderModels { .. } => "model",
         ChannelCommandEffect::SwitchModel { .. } => "model",
         ChannelCommandEffect::ShowStatus { .. } => "status",
     }
 }
 
-fn split_model_target(target: &str) -> (Option<String>, Option<String>) {
-    let trimmed = target.trim();
-    if trimmed.is_empty() {
-        return (None, None);
+fn read_agent_overrides_store(harness_home: impl AsRef<Path>) -> io::Result<AgentOverridesStore> {
+    let path = agent_overrides_file(harness_home);
+    match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(AgentOverridesStore::default()),
+        Err(error) => Err(error),
     }
-    match trimmed.split_once('/') {
-        Some((provider, model)) if !provider.trim().is_empty() && !model.trim().is_empty() => (
-            Some(provider.trim().to_string()),
-            Some(model.trim().to_string()),
-        ),
-        _ => (None, Some(trimmed.to_string())),
+}
+
+fn write_agent_overrides_store(harness_home: &Path, store: &AgentOverridesStore) -> io::Result<()> {
+    let path = agent_overrides_file(harness_home);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
+    fs::write(
+        path,
+        serde_json::to_string_pretty(store).map_err(io::Error::other)?,
+    )
+}
+
+fn write_agent_override_model(
+    harness_home: &Path,
+    agent_id: &Option<String>,
+    provider: &str,
+    model: &str,
+    now_ms: i64,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    let Some(agent_id) = agent_id else {
+        warnings.push("model --global was requested but no current agent was selected".to_string());
+        return Ok(());
+    };
+    let mut store = read_agent_overrides_store(harness_home)?;
+    let override_entry = store.agents.entry(agent_id.clone()).or_default();
+    override_entry.provider = Some(provider.to_string());
+    override_entry.model = Some(model.to_string());
+    override_entry.updated_at_ms = Some(now_ms);
+    write_agent_overrides_store(harness_home, &store)
+}
+
+fn write_agent_override_thinking(
+    harness_home: &Path,
+    agent_id: &Option<String>,
+    level: &str,
+    now_ms: i64,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    let Some(agent_id) = agent_id else {
+        warnings.push("think --global was requested but no current agent was selected".to_string());
+        return Ok(());
+    };
+    let mut store = read_agent_overrides_store(harness_home)?;
+    let override_entry = store.agents.entry(agent_id.clone()).or_default();
+    override_entry.thinking_level = Some(level.to_string());
+    override_entry.updated_at_ms = Some(now_ms);
+    write_agent_overrides_store(harness_home, &store)
+}
+
+fn agent_overrides_schema() -> String {
+    AGENT_OVERRIDES_SCHEMA.to_string()
 }
 
 fn channel_session_state_dir(
@@ -468,9 +625,13 @@ mod tests {
         let harness_home = root.join(".openclaw-harness");
         let step = command_step(ChannelCommandEffect::SwitchModel {
             agent_id: Some("main".to_string()),
-            target: "openrouter/anthropic/claude-sonnet-4".to_string(),
+            provider: "openrouter".to_string(),
+            model: "anthropic/claude-sonnet-4".to_string(),
+            global: false,
             current_provider: Some("openai".to_string()),
             current_model: Some("gpt-5".to_string()),
+            provider_known: true,
+            model_known: true,
         });
 
         let report = apply_channel_command_step(
@@ -500,6 +661,68 @@ mod tests {
     }
 
     #[test]
+    fn applies_per_agent_global_model_and_thinking_overrides() {
+        let root = temp_root("applies_per_agent_global_model_and_thinking_overrides");
+        let harness_home = root.join(".openclaw-harness");
+        let model_step = command_step(ChannelCommandEffect::SwitchModel {
+            agent_id: Some("main".to_string()),
+            provider: "openrouter".to_string(),
+            model: "anthropic/claude-sonnet-4".to_string(),
+            global: true,
+            current_provider: Some("openai".to_string()),
+            current_model: Some("gpt-5".to_string()),
+            provider_known: true,
+            model_known: true,
+        });
+        apply_channel_command_step(
+            &model_step,
+            ChannelCommandApplyOptions {
+                harness_home: harness_home.clone(),
+                now_ms: 2000,
+            },
+        )
+        .unwrap();
+
+        let think_step = command_step(ChannelCommandEffect::SwitchThinking {
+            agent_id: Some("main".to_string()),
+            provider: Some("openrouter".to_string()),
+            model: Some("anthropic/claude-sonnet-4".to_string()),
+            thinking_enabled: false,
+            current_level: Some("medium".to_string()),
+            level: "high".to_string(),
+            global: true,
+            valid: true,
+            available_levels: vec![
+                "minimal".to_string(),
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+            ],
+        });
+        let report = apply_channel_command_step(
+            &think_step,
+            ChannelCommandApplyOptions {
+                harness_home: harness_home.clone(),
+                now_ms: 2001,
+            },
+        )
+        .unwrap();
+
+        let state = report.state.unwrap();
+        assert!(state.thinking_enabled);
+        assert_eq!(state.thinking_level.as_deref(), Some("high"));
+        let override_entry = read_agent_override(&harness_home, "main").unwrap().unwrap();
+        assert_eq!(override_entry.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            override_entry.model.as_deref(),
+            Some("anthropic/claude-sonnet-4")
+        );
+        assert_eq!(override_entry.thinking_level.as_deref(), Some("high"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn skips_non_command_steps() {
         let root = temp_root("skips_non_command_steps");
         let harness_home = root.join(".openclaw-harness");
@@ -523,6 +746,7 @@ mod tests {
                 model_override: None,
                 codex_approval_policy: None,
                 codex_sandbox: None,
+                codex_sandbox_policy: None,
                 prompt_files_present: 1,
                 prompt_files_total: 1,
                 prompt_file_names: vec!["AGENTS.md".to_string()],
@@ -531,6 +755,7 @@ mod tests {
                 channel_state_loaded: false,
                 active_session_key: None,
                 thinking_enabled: false,
+                thinking_level: Some("medium".to_string()),
                 steering_notes: 0,
                 btw_notes: 0,
             },
@@ -571,6 +796,7 @@ mod tests {
             channel_id: "dm".to_string(),
             user_id: "user".to_string(),
             message_text: "/test".to_string(),
+            inbound_context: None,
             session_key: session_key.to_string(),
             action: ChannelStepAction::ReplyOnly,
             command_effect: Some(effect),

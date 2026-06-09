@@ -12,7 +12,7 @@ The target state is:
 - Rust harness can receive Telegram/Discord DM input.
 - Slash commands work consistently across Telegram/Discord.
 - Ordinary DM input can route to the right imported agent/session, run Codex through app-server, write transcript/trajectory/Codex binding files, and deliver the assistant reply.
-- Imported memory, cron, subagent, plugin, and historical session state remains available for the next implementation lanes, even when not all adapters are active yet.
+- Imported memory, cron, subagent, plugin, and historical session state remains available; memory now has text recall, SQLite vector recall, lifecycle capture, and symbolic canvas receipts, with deeper Qdrant-native/plugin parity tracked separately.
 
 ## Hard Gates
 
@@ -44,6 +44,7 @@ These must pass before cutover.
    - Confirm `DISCORD_BOT_TOKEN` is present either in process env or `secrets/channel-credentials.env` when Discord is enabled.
    - Confirm `enable-check` reports `telegram-access-policy` and `discord-access-policy` as pass when importing from an existing OpenClaw channel configuration. Missing access policies are warnings because fresh deployments may intentionally configure them later.
    - Run `telegram-probe` to validate Telegram Bot API `getMe` without consuming updates or sending messages.
+   - Run `memory-credentials-export --include-sensitive` when migrating imported memory search. It writes `OPENCLAW_HARNESS_MEMORY_EMBEDDING_API_KEY`, model, and base URL into `secrets/memory-credentials.env`; receipts disclose env names, source paths, and lengths only.
    - Confirm `OPENROUTER_API_KEY` only when OpenRouter providers are active.
    - Do not rely on an imported OpenClaw embedding-only `OPENAI_API_KEY` for Codex agent turns.
 
@@ -121,6 +122,8 @@ These should be run before stopping the Docker gateway.
    - Confirm memory files/databases are imported or explicitly documented as unavailable.
    - Confirm `memory/qdrant-edge` is present when Qdrant edge is the active OpenClaw memory backend.
    - Confirm `openclaw-mem.sqlite` and memory JSONL files are present as snapshot/audit sources.
+   - Run `memory-vector-search --query "<known memory>"` and confirm `state/memory/vector-recall-receipts.jsonl` reports `ready` with hits.
+   - Run `memory-canvas-run` and confirm `state/memory/canvas-receipts.jsonl` reports `written` or an explicit `skipped` reason.
    - Treat LanceDB as backup/optional unless the active config points to LanceDB.
    - Confirm subagent ledgers are held by default.
 
@@ -151,11 +154,13 @@ These should be run before stopping the Docker gateway.
    - Cutover watermark to avoid catch-up storms.
 
 5. Memory adapter
-   - Imported memory file/database inventory check.
-   - Qdrant edge import/read adapter first, because current OpenClaw uses Qdrant edge as the primary backend.
-   - LanceDB import/read support as backup/fallback, not as the first activation blocker.
-   - Optional openclaw-mem gateway adapter when explicitly enabled.
-   - Memory pack/search/propose integration into prompt assembly.
+   - Done for inventory: imported memory files, Qdrant edge snapshot, LanceDB backup presence, and `openclaw-mem.sqlite` are surfaced in `status` and `enable-check`.
+   - Done for text fallback: `memory-search` scans imported markdown/text/JSONL memory files read-only and writes redacted receipts.
+   - Done for embedding secrets: `memory-credentials-export` migrates imported embedding key/model/base URL into harness memory secrets without logging raw values.
+   - Done for readable vector recall: `memory-vector-search` embeds the query and searches imported SQLite embedding tables for observations, docs chunks, and episodic events; prompt assembly uses this before text fallback when configured.
+   - Done for minimal canvas: lifecycle capture writes conservative auto-capture candidates and `memory-canvas-run` builds compact JSON/Markdown symbolic canvas receipts.
+   - Qdrant edge is still treated as the preserved primary snapshot. The Rust adapter detects and reports it but does not raw-read Qdrant segment files; Qdrant-native recall should use a sidecar/service or a supported snapshot API.
+   - Still required for full parity: LanceDB read fallback, direct Qdrant-native adapter, routeAuto/autoRecall policy matching, direct propose/store semantics, and imported Node plugin hook parity when explicitly enabled.
 
 6. Plugin sidecar
    - Run `plugin-sidecar-probe` and confirm `enable-check` reports `plugin-sidecar-probe` as pass.
@@ -195,6 +200,32 @@ As of 2026-06-08 local verification:
 - `telegram-poll-once` has run successfully against the imported Telegram token and allow-lists. No pending updates were present, so `state/channels/telegram-offset.json` currently records `nextOffset=null`; this still proves the poll adapter can take over without consuming stale updates.
 - `status` reports `queued=2 open=0 prepared=2 completed=2`, outbox `pending=0 delivered=4`, Telegram offset/probe/poll-log present, Qdrant edge primary memory present, plugin catalog ready with 2 manifest-derived tools, and operational log event coverage for offline runtime/delivery smoke.
 - `enable-check` currently reports `Ready: yes` with `passed=35 warnings=1 failed=0`; `telegram-access-policy`, `discord-access-policy`, `telegram-probe`, `telegram-offset`, `telegram-poll-log`, `runtime-loop`, and `supervisor-plan` are pass. The remaining warning is optional LanceDB backup absence while Qdrant edge is primary.
+
+As of 2026-06-09 live activation follow-up:
+
+- `status --harness-home imports/activation-harness` reports `Ready: yes` with `passed=51 warnings=3 failed=0` after restarting the runtime, Telegram, Discord outbox, and Discord gateway loops.
+- Outbox is clean for handoff: `pending=0 delivered=41 retryable=0 invalid=0`. The remaining local smoke replies were marked delivered with `providerMessageId=local-smoke` because they were local CLI-only command replies, not Telegram/Discord sends.
+- Telegram loop stale polling was traced to unbounded ureq HTTP calls. Telegram `getMe`, `getUpdates`, `sendMessage`, and `sendChatAction` now use bounded connect/read/write timeouts; Discord REST helper calls use the same bounded short HTTP agent.
+- Live loop heartbeats are present for `runtime-loop`, `telegram-loop`, `discord-outbox-loop`, and `discord-gateway-loop`. Current samples: runtime `status=no-work`, Telegram `status=running` while polling updates, Discord outbox `status=ok`, and Discord gateway heartbeat ack present.
+- `/status` channel replies use `Agent Harness Status`, and `/model` plus `/think` report the current session setting before listing or changing options.
+- `/model <provider>/<model> --global` and `/think <level> --global` are per-agent defaults. They are persisted under `state/agents/overrides.json` for the current agent only and do not affect other imported agents.
+- Discord DM HTTP poll fallback is initialized and records cursors under `state/channels/discord-dm-poll-cursors.json`. A real allowed-user Discord DM still needs to be sent to clear the `discord-real-inbound` warning.
+- `openclaw-mem` and `openclaw-mem-engine` plugin manifests are resolved from `D:\Warehouse\Research\OpenClaw_WSL\openclaw-mem-gateway\openclaw-mem-src\extensions`, but their manifest files declare no direct `tools` or `hooks`; the behavior is registered at runtime through the OpenClaw plugin API.
+- Original `openclaw-mem-engine` lifecycle behavior uses `before_prompt_build` with fallback `before_agent_start` for auto recall or routeAuto prompt mutation, and `agent_end` for autoCapture. `openclaw-mem` uses tool-result and `agent_end` capture paths for observations and episodes.
+- Imported mem-engine config uses Qdrant edge retrieval, `text-embedding-3-small`, `autoRecall.enabled=false` with `routeAuto.enabled=true`, `autoCapture.enabled=true`, episodes enabled, and symbolic canvas auto build enabled.
+- The imported embedding key is present in `imports/openclaw-core-snapshot/openclaw.json` under `plugins.entries["openclaw-mem-engine"].config.embedding.apiKey`. `memory-credentials-export --include-sensitive` migrates it into harness memory secrets under `OPENCLAW_HARNESS_MEMORY_EMBEDDING_API_KEY`, separate from Codex/OpenAI agent-turn auth. A minimal OpenAI embeddings smoke test with that imported key succeeded against `text-embedding-3-small` and returned a 1536-dimensional vector.
+- Rust memory support now includes an in-harness lifecycle adapter at the two OpenClaw-equivalent boundaries:
+  - pre-turn prompt assembly tries imported SQLite vector recall first when memory embedding secrets are present, then falls back to imported text recall; it injects one bounded `MemoryContext` section before the user message and writes `state/memory/prompt-context-receipts.jsonl`.
+  - post-turn successful runtime completion records episode spool lines and conservative auto-capture candidates according to imported `openclaw-mem` / `openclaw-mem-engine` config; it writes `state/memory/lifecycle-receipts.jsonl`.
+  - symbolic canvas worker writes `state/memory/canvas/symbolic-canvas.json`, `state/memory/canvas/symbolic-canvas.md`, and `state/memory/canvas-receipts.jsonl`.
+  - `/status` and readiness now surface `search`, `vectorRecall`, `promptContext`, `lifecycle`, `canvas`, and `embeddingSecrets` receipt summaries.
+- Activation memory smoke passed:
+  - `memory-credentials-export --include-sensitive` wrote `secrets/memory-credentials.env` and a redacted receipt.
+  - `memory-vector-search --query "Qdrant edge memory backend and symbolic canvas"` returned 5 hits via SQLite vector recall using `text-embedding-3-small`, 1536-dimensional embeddings.
+  - `prompt-bundle` smoke wrote a prompt-context receipt with 5 memory hits.
+  - `memory-canvas-run` wrote compact canvas JSON/Markdown from 40 imported episodes.
+- Current memory warnings are expected: `memory-lifecycle` remains a warning until the next successful live agent turn writes a post-turn lifecycle receipt; LanceDB is absent and optional because Qdrant edge is primary.
+- Still required for full openclaw-mem parity: direct Qdrant edge service/sidecar recall, LanceDB fallback, routeAuto/autoRecall policy matching, direct openclaw-mem propose/store semantics, and imported Node plugin hook parity.
 
 ## Verification Commands
 

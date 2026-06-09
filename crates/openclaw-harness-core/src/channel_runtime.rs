@@ -6,8 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentRegistry, ChannelCommandIntent, TurnDispatch, TurnPlan, inspect_codex_approval_policy,
-    inspect_codex_sandbox,
+    AgentRegistry, ChannelCommandIntent, DEFAULT_THINKING_LEVEL, THINKING_LEVELS, TurnDispatch,
+    TurnPlan, XHIGH_THINKING_LEVEL, inspect_codex_approval_policy, inspect_codex_sandbox,
+    inspect_codex_sandbox_policy, normalize_thinking_level,
 };
 
 const CHANNEL_STEP_SCHEMA: &str = "openclaw-harness.channel-step.v1";
@@ -22,6 +23,8 @@ pub struct ChannelStep {
     pub channel_id: String,
     pub user_id: String,
     pub message_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbound_context: Option<String>,
     pub session_key: String,
     pub action: ChannelStepAction,
     pub command_effect: Option<ChannelCommandEffect>,
@@ -45,9 +48,6 @@ pub enum ChannelCommandEffect {
         topic: Option<String>,
         new_session_key: String,
     },
-    SetThinkingMode {
-        instruction: Option<String>,
-    },
     StopCurrentRun {
         reason: Option<String>,
     },
@@ -57,16 +57,48 @@ pub enum ChannelCommandEffect {
     AddBtwNote {
         note: String,
     },
-    ShowModel {
+    ShowThinking {
         agent_id: Option<String>,
         provider: Option<String>,
         model: Option<String>,
+        thinking_enabled: bool,
+        current_level: Option<String>,
+        available_levels: Vec<String>,
+    },
+    SwitchThinking {
+        agent_id: Option<String>,
+        provider: Option<String>,
+        model: Option<String>,
+        thinking_enabled: bool,
+        current_level: Option<String>,
+        level: String,
+        global: bool,
+        valid: bool,
+        available_levels: Vec<String>,
+    },
+    ShowModel {
+        agent_id: Option<String>,
+        current_provider: Option<String>,
+        current_model: Option<String>,
+        providers: Vec<String>,
+    },
+    ListProviderModels {
+        agent_id: Option<String>,
+        current_provider: Option<String>,
+        current_model: Option<String>,
+        provider: String,
+        provider_known: bool,
+        models: Vec<String>,
     },
     SwitchModel {
         agent_id: Option<String>,
-        target: String,
+        provider: String,
+        model: String,
+        global: bool,
         current_provider: Option<String>,
         current_model: Option<String>,
+        provider_known: bool,
+        model_known: bool,
     },
     ShowStatus {
         scope: Option<String>,
@@ -94,6 +126,7 @@ pub struct ChannelStatusSnapshot {
     pub model_override: Option<String>,
     pub codex_approval_policy: Option<String>,
     pub codex_sandbox: Option<String>,
+    pub codex_sandbox_policy: Option<String>,
     pub prompt_files_present: usize,
     pub prompt_files_total: usize,
     pub prompt_file_names: Vec<String>,
@@ -102,6 +135,7 @@ pub struct ChannelStatusSnapshot {
     pub channel_state_loaded: bool,
     pub active_session_key: Option<String>,
     pub thinking_enabled: bool,
+    pub thinking_level: Option<String>,
     pub steering_notes: usize,
     pub btw_notes: usize,
 }
@@ -154,7 +188,7 @@ pub fn build_channel_step(registry: &AgentRegistry, turn: &TurnPlan) -> ChannelS
         TurnDispatch::NoAgentAvailable => error_step(
             turn,
             warnings,
-            "No OpenClaw agent is available for this channel message.",
+            "No harness agent is available for this channel message.",
         ),
     }
 }
@@ -187,6 +221,7 @@ fn build_command_step(
         channel_id: turn.channel_id.clone(),
         user_id: turn.user_id.clone(),
         message_text: turn.message_text.clone(),
+        inbound_context: turn.inbound_context.clone(),
         session_key: turn.session_key.clone(),
         action: ChannelStepAction::ReplyOnly,
         command_effect: Some(effect),
@@ -222,6 +257,7 @@ fn build_agent_step(turn: &TurnPlan, warnings: Vec<String>) -> ChannelStep {
         channel_id: turn.channel_id.clone(),
         user_id: turn.user_id.clone(),
         message_text: turn.message_text.clone(),
+        inbound_context: turn.inbound_context.clone(),
         session_key: turn.session_key.clone(),
         action: ChannelStepAction::EnqueueAgentTurn,
         command_effect: None,
@@ -240,6 +276,7 @@ fn error_step(turn: &TurnPlan, warnings: Vec<String>, text: &str) -> ChannelStep
         channel_id: turn.channel_id.clone(),
         user_id: turn.user_id.clone(),
         message_text: turn.message_text.clone(),
+        inbound_context: turn.inbound_context.clone(),
         session_key: turn.session_key.clone(),
         action: ChannelStepAction::NoAgentAvailable,
         command_effect: None,
@@ -264,8 +301,8 @@ fn command_effect(
             topic,
             new_session_key: new_session_key(turn),
         },
-        ChannelCommandIntent::SetThinkingMode { instruction } => {
-            ChannelCommandEffect::SetThinkingMode { instruction }
+        ChannelCommandIntent::Think { level, global } => {
+            thinking_command_effect(turn, level, global)
         }
         ChannelCommandIntent::StopCurrentRun { reason } => {
             ChannelCommandEffect::StopCurrentRun { reason }
@@ -274,20 +311,111 @@ fn command_effect(
             ChannelCommandEffect::AddSteering { instruction }
         }
         ChannelCommandIntent::AddBtwNote { note } => ChannelCommandEffect::AddBtwNote { note },
-        ChannelCommandIntent::ShowModel => ChannelCommandEffect::ShowModel {
-            agent_id: turn.agent.as_ref().map(|agent| agent.id.clone()),
-            provider: turn.model_policy.provider.clone(),
-            model: turn.model_policy.model.clone(),
-        },
-        ChannelCommandIntent::SwitchModel { target } => ChannelCommandEffect::SwitchModel {
-            agent_id: turn.agent.as_ref().map(|agent| agent.id.clone()),
-            target,
-            current_provider: turn.model_policy.provider.clone(),
-            current_model: turn.model_policy.model.clone(),
-        },
+        ChannelCommandIntent::Model { target, global } => {
+            model_command_effect(registry, turn, target, global)
+        }
         ChannelCommandIntent::ShowStatus { scope } => ChannelCommandEffect::ShowStatus {
             snapshot: status_snapshot(registry, turn, scope.clone()),
             scope,
+        },
+    }
+}
+
+fn thinking_command_effect(
+    turn: &TurnPlan,
+    level: Option<String>,
+    global: bool,
+) -> ChannelCommandEffect {
+    let available_levels = available_thinking_levels(turn);
+    let agent_id = turn.agent.as_ref().map(|agent| agent.id.clone());
+    let provider = turn.model_policy.provider.clone();
+    let model = turn.model_policy.model.clone();
+    let thinking_enabled = turn.thinking_policy.enabled;
+    let current_level = current_thinking_level(turn);
+    match level {
+        Some(level) => {
+            let normalized = normalize_thinking_level(&level)
+                .unwrap_or_else(|| level.trim().to_ascii_lowercase());
+            let valid = available_levels
+                .iter()
+                .any(|candidate| candidate == &normalized);
+            ChannelCommandEffect::SwitchThinking {
+                agent_id,
+                provider,
+                model,
+                thinking_enabled,
+                current_level,
+                level: normalized,
+                global,
+                valid,
+                available_levels,
+            }
+        }
+        None => ChannelCommandEffect::ShowThinking {
+            agent_id,
+            provider,
+            model,
+            thinking_enabled,
+            current_level,
+            available_levels,
+        },
+    }
+}
+
+fn model_command_effect(
+    registry: &AgentRegistry,
+    turn: &TurnPlan,
+    target: Option<String>,
+    global: bool,
+) -> ChannelCommandEffect {
+    let agent_id = turn.agent.as_ref().map(|agent| agent.id.clone());
+    let current_provider = turn.model_policy.provider.clone();
+    let current_model = turn.model_policy.model.clone();
+    match target {
+        Some(target) => match split_provider_model_target(&target) {
+            Some((provider, model)) => {
+                let provider_known = provider_profile(registry, &provider).is_some();
+                let model_known = provider_profile(registry, &provider)
+                    .map(|profile| {
+                        profile.models.is_empty()
+                            || profile.models.iter().any(|candidate| candidate == &model)
+                    })
+                    .unwrap_or(false);
+                ChannelCommandEffect::SwitchModel {
+                    agent_id,
+                    provider,
+                    model,
+                    global,
+                    current_provider,
+                    current_model,
+                    provider_known,
+                    model_known,
+                }
+            }
+            None => {
+                let provider = target.trim().to_string();
+                let profile = provider_profile(registry, &provider);
+                ChannelCommandEffect::ListProviderModels {
+                    agent_id,
+                    current_provider,
+                    current_model,
+                    provider,
+                    provider_known: profile.is_some(),
+                    models: profile
+                        .map(|profile| profile.models.clone())
+                        .unwrap_or_default(),
+                }
+            }
+        },
+        None => ChannelCommandEffect::ShowModel {
+            agent_id,
+            current_provider,
+            current_model,
+            providers: registry
+                .providers
+                .iter()
+                .map(|provider| provider.id.clone())
+                .collect(),
         },
     }
 }
@@ -341,10 +469,60 @@ fn command_reply_text(effect: &ChannelCommandEffect) -> String {
                 .map(|topic| format!(" ({topic})"))
                 .unwrap_or_default()
         ),
-        ChannelCommandEffect::SetThinkingMode { instruction } => instruction
-            .as_ref()
-            .map(|instruction| format!("Thinking mode updated for this session: {instruction}"))
-            .unwrap_or_else(|| "Thinking mode updated for this session.".to_string()),
+        ChannelCommandEffect::ShowThinking {
+            provider,
+            model,
+            thinking_enabled,
+            current_level,
+            available_levels,
+            ..
+        } => format!(
+            "Current session thinking level: {} (enabled={})\nAvailable thinking levels for {}: {}",
+            display_thinking_level(current_level),
+            yes_no(*thinking_enabled),
+            display_model_route(provider, model),
+            display_list(available_levels)
+        ),
+        ChannelCommandEffect::SwitchThinking {
+            agent_id,
+            provider,
+            model,
+            thinking_enabled,
+            current_level,
+            level,
+            global,
+            valid,
+            available_levels,
+        } => {
+            let mut text = format!(
+                "Current session thinking level: {} (enabled={})\n",
+                display_thinking_level(current_level),
+                yes_no(*thinking_enabled)
+            );
+            if *valid {
+                if *global {
+                    text.push_str(&format!(
+                        "Thinking level updated for this session and agent `{}` default: {}\n",
+                        display_opt(agent_id),
+                        level
+                    ));
+                } else {
+                    text.push_str(&format!(
+                        "Thinking level updated for this session: {}\n",
+                        level
+                    ));
+                }
+                text.push_str(&format!("Model: {}", display_model_route(provider, model)));
+            } else {
+                text.push_str(&format!(
+                    "Unsupported thinking level for {}: {}\nAvailable thinking levels: {}",
+                    display_model_route(provider, model),
+                    level,
+                    display_list(available_levels)
+                ));
+            }
+            text
+        }
         ChannelCommandEffect::StopCurrentRun { reason } => reason
             .as_ref()
             .map(|reason| format!("Stop requested for the current run: {reason}"))
@@ -357,25 +535,59 @@ fn command_reply_text(effect: &ChannelCommandEffect) -> String {
         }
         ChannelCommandEffect::ShowModel {
             agent_id,
-            provider,
-            model,
+            current_provider,
+            current_model,
+            providers,
         } => format!(
-            "Current model for agent {}: provider={}, model={}",
+            "Current session model: {}\nAgent: {}\nAvailable providers: {}",
+            display_model_route(current_provider, current_model),
             display_opt(agent_id),
-            display_opt(provider),
-            display_opt(model)
+            display_list(providers)
+        ),
+        ChannelCommandEffect::ListProviderModels {
+            agent_id,
+            current_provider,
+            current_model,
+            provider,
+            provider_known,
+            models,
+        } => format!(
+            "Current session model: {}\nAgent: {}\n{}",
+            display_model_route(current_provider, current_model),
+            display_opt(agent_id),
+            if *provider_known {
+                format!(
+                    "Models for provider `{}`: {}",
+                    provider,
+                    display_list(models)
+                )
+            } else {
+                format!(
+                    "Provider `{}` is not registered. Available models: -",
+                    provider
+                )
+            }
         ),
         ChannelCommandEffect::SwitchModel {
             agent_id,
-            target,
+            provider,
+            model,
+            global,
             current_provider,
             current_model,
+            provider_known,
+            model_known,
         } => format!(
-            "Model switch planned for agent {}: {} (current provider={}, model={})",
-            display_opt(agent_id),
-            target,
-            display_opt(current_provider),
-            display_opt(current_model)
+            "Current session model: {}\nModel updated for {}: {}\nRegistry: provider={}, model={}",
+            display_model_route(current_provider, current_model),
+            if *global {
+                format!("this session and agent `{}` default", display_opt(agent_id))
+            } else {
+                "this session".to_string()
+            },
+            display_model_route(&Some(provider.clone()), &Some(model.clone())),
+            yes_no(*provider_known),
+            yes_no(*model_known)
         ),
         ChannelCommandEffect::ShowStatus { snapshot, .. } => status_reply_text(snapshot),
     }
@@ -389,7 +601,7 @@ fn status_reply_text(snapshot: &ChannelStatusSnapshot) -> String {
         .as_deref()
     {
         Some("agents") => format!(
-            "OpenClaw Agent Status\nAgents: {}/{} enabled\nCurrent: {}\nDirectory: {}\nSessions index: {}",
+            "Agent Harness Agent Status\nAgents: {}/{} enabled\nCurrent: {}\nDirectory: {}\nSessions index: {}",
             snapshot.agents_enabled,
             snapshot.agents_total,
             display_opt(&snapshot.current_agent_id),
@@ -397,26 +609,29 @@ fn status_reply_text(snapshot: &ChannelStatusSnapshot) -> String {
             yes_no(snapshot.agent_sessions_index_exists)
         ),
         Some("channels") => format!(
-            "OpenClaw Channel Status\nPlatform: {}\nSession: {}\nTelegram: {}\nDiscord: {}",
+            "Agent Harness Channel Status\nPlatform: {}\nSession: {}\nTelegram: {}\nDiscord: {}",
             snapshot.platform,
             snapshot.session_key,
             yes_no(snapshot.telegram_configured),
             yes_no(snapshot.discord_configured)
         ),
         Some("model") => format!(
-            "OpenClaw Model Status\nAgent: {}\nProvider: {}\nModel: {}\nOverride: {}",
+            "Agent Harness Model Status\nAgent: {}\nProvider: {}\nModel: {}\nOverride: {}\nThinking: {}, level={}",
             display_opt(&snapshot.current_agent_id),
             display_opt(&snapshot.current_provider),
             display_opt(&snapshot.current_model),
-            display_opt(&snapshot.model_override)
+            display_opt(&snapshot.model_override),
+            yes_no(snapshot.thinking_enabled),
+            display_thinking_level(&snapshot.thinking_level)
         ),
         Some("security") => format!(
-            "OpenClaw Security Status\nApprovals: {}\nSandbox: {}",
+            "Agent Harness Security Status\nApprovals: {}\nWindows sandbox: {}\nFilesystem sandbox: {}",
             display_opt(&snapshot.codex_approval_policy),
-            display_opt(&snapshot.codex_sandbox)
+            display_opt(&snapshot.codex_sandbox),
+            display_opt(&snapshot.codex_sandbox_policy)
         ),
         Some("skills") => format!(
-            "OpenClaw Skill Status\nSelected: {}\nMatches: {}",
+            "Agent Harness Skill Status\nSelected: {}\nMatches: {}",
             snapshot.selected_skills,
             display_list(&snapshot.selected_skill_ids)
         ),
@@ -424,15 +639,18 @@ fn status_reply_text(snapshot: &ChannelStatusSnapshot) -> String {
             "Cron status is available through cron-plan and deterministic-cron-plan.".to_string()
         }
         _ => format!(
-            "OpenClaw Harness Status\nAgent: {} ({}/{})\nModel: provider={}, model={}, override={}\nSecurity: approvals={}, sandbox={}\nChannels: telegram={}, discord={}, current={}\nSession: active={}, stateLoaded={}\nPrompt: files {}/{} ({})\nSkills: {} selected ({})\nState: thinking={}, steer={}, btw={}\nRegistry: providers={}, plugins={}",
+            "Agent Harness Status\nAgent: {} ({}/{})\nModel: provider={}, model={}, override={}\nThinking: enabled={}, level={}\nSecurity: approvals={}, windowsSandbox={}, filesystemSandbox={}\nChannels: telegram={}, discord={}, current={}\nSession: active={}, stateLoaded={}\nPrompt: files {}/{} ({})\nSkills: {} selected ({})\nState: steer={}, btw={}\nRegistry: providers={}, plugins={}",
             display_opt(&snapshot.current_agent_id),
             snapshot.agents_enabled,
             snapshot.agents_total,
             display_opt(&snapshot.current_provider),
             display_opt(&snapshot.current_model),
             display_opt(&snapshot.model_override),
+            yes_no(snapshot.thinking_enabled),
+            display_thinking_level(&snapshot.thinking_level),
             display_opt(&snapshot.codex_approval_policy),
             display_opt(&snapshot.codex_sandbox),
+            display_opt(&snapshot.codex_sandbox_policy),
             yes_no(snapshot.telegram_configured),
             yes_no(snapshot.discord_configured),
             snapshot.platform,
@@ -443,7 +661,6 @@ fn status_reply_text(snapshot: &ChannelStatusSnapshot) -> String {
             display_list(&snapshot.prompt_file_names),
             snapshot.selected_skills,
             display_list(&snapshot.selected_skill_ids),
-            yes_no(snapshot.thinking_enabled),
             snapshot.steering_notes,
             snapshot.btw_notes,
             snapshot.providers_total,
@@ -467,6 +684,10 @@ fn status_snapshot(
         .harness_home
         .as_ref()
         .map(|harness_home| inspect_codex_sandbox(harness_home).sandbox);
+    let codex_sandbox_policy = turn
+        .harness_home
+        .as_ref()
+        .map(|harness_home| inspect_codex_sandbox_policy(harness_home).sandbox);
     ChannelStatusSnapshot {
         scope,
         platform: turn.platform.clone(),
@@ -498,6 +719,7 @@ fn status_snapshot(
             .and_then(|state| state.model_override.clone()),
         codex_approval_policy,
         codex_sandbox,
+        codex_sandbox_policy,
         prompt_files_present: prompt_files_present(turn),
         prompt_files_total: turn.prompt_files.len(),
         prompt_file_names: turn
@@ -517,10 +739,8 @@ fn status_snapshot(
             .channel_state
             .as_ref()
             .map(|state| state.active_session_key.clone()),
-        thinking_enabled: turn
-            .channel_state
-            .as_ref()
-            .is_some_and(|state| state.thinking_enabled),
+        thinking_enabled: turn.thinking_policy.enabled,
+        thinking_level: turn.thinking_policy.level.clone(),
         steering_notes: turn
             .channel_state
             .as_ref()
@@ -557,6 +777,19 @@ fn display_opt(value: &Option<String>) -> &str {
     value.as_deref().unwrap_or("-")
 }
 
+fn display_model_route(provider: &Option<String>, model: &Option<String>) -> String {
+    match (provider.as_deref(), model.as_deref()) {
+        (Some(provider), Some(model)) => format!("{provider}/{model}"),
+        (None, Some(model)) => model.to_string(),
+        (Some(provider), None) => format!("{provider}/-"),
+        (None, None) => "-".to_string(),
+    }
+}
+
+fn display_thinking_level(level: &Option<String>) -> &str {
+    level.as_deref().unwrap_or(DEFAULT_THINKING_LEVEL)
+}
+
 fn display_list(values: &[String]) -> String {
     if values.is_empty() {
         "-".to_string()
@@ -567,6 +800,66 @@ fn display_list(values: &[String]) -> String {
 
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
+}
+
+fn provider_profile<'a>(
+    registry: &'a AgentRegistry,
+    provider: &str,
+) -> Option<&'a crate::ProviderProfile> {
+    registry
+        .providers
+        .iter()
+        .find(|profile| profile.id.eq_ignore_ascii_case(provider))
+}
+
+fn split_provider_model_target(target: &str) -> Option<(String, String)> {
+    let trimmed = target.trim().trim_matches('"');
+    let (provider, model) = trimmed.split_once('/')?;
+    let provider = provider.trim();
+    let model = model.trim();
+    if provider.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some((provider.to_string(), model.to_string()))
+}
+
+fn available_thinking_levels(turn: &TurnPlan) -> Vec<String> {
+    let mut levels = THINKING_LEVELS
+        .iter()
+        .map(|level| (*level).to_string())
+        .collect::<Vec<_>>();
+    if supports_xhigh_thinking(turn) && !levels.iter().any(|level| level == XHIGH_THINKING_LEVEL) {
+        levels.push(XHIGH_THINKING_LEVEL.to_string());
+    }
+    levels
+}
+
+fn supports_xhigh_thinking(turn: &TurnPlan) -> bool {
+    let model = turn
+        .model_policy
+        .model
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !(model.starts_with("gpt-5") || model.contains("codex")) {
+        return false;
+    }
+    turn.model_policy
+        .provider
+        .as_deref()
+        .map(|provider| {
+            provider.eq_ignore_ascii_case("openai")
+                || provider.eq_ignore_ascii_case("codex")
+                || (provider.eq_ignore_ascii_case("openrouter") && model.contains("openai/"))
+        })
+        .unwrap_or(true)
+}
+
+fn current_thinking_level(turn: &TurnPlan) -> Option<String> {
+    turn.thinking_policy
+        .level
+        .clone()
+        .or_else(|| Some(DEFAULT_THINKING_LEVEL.to_string()))
 }
 
 #[cfg(test)]
@@ -591,6 +884,7 @@ mod tests {
                 channel_id: "dm-42".to_string(),
                 user_id: "user-7".to_string(),
                 text: "repair memory cron".to_string(),
+                inbound_context: None,
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -628,6 +922,7 @@ mod tests {
                 channel_id: "dm#42".to_string(),
                 user_id: "user#7".to_string(),
                 text: "/status channels".to_string(),
+                inbound_context: None,
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -660,7 +955,7 @@ mod tests {
         fs::create_dir_all(&harness_home).unwrap();
         fs::write(
             harness_home.join("harness-config.json"),
-            r#"{"security":{"codexApprovalPolicy":"accept","codexSandbox":"elevated"}}"#,
+            r#"{"security":{"codexApprovalPolicy":"accept","codexSandbox":"elevated","codexSandboxPolicy":"dangerFullAccess"}}"#,
         )
         .unwrap();
         let registry = load_agent_registry(&source).unwrap();
@@ -675,6 +970,7 @@ mod tests {
                 channel_id: "dm".to_string(),
                 user_id: "user".to_string(),
                 text: "/status security".to_string(),
+                inbound_context: None,
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -686,13 +982,23 @@ mod tests {
 
         assert_eq!(step.action, ChannelStepAction::ReplyOnly);
         assert!(step.outbound_messages[0].text.contains("Approvals: accept"));
-        assert!(step.outbound_messages[0].text.contains("Sandbox: elevated"));
+        assert!(
+            step.outbound_messages[0]
+                .text
+                .contains("Windows sandbox: elevated")
+        );
+        assert!(
+            step.outbound_messages[0]
+                .text
+                .contains("Filesystem sandbox: dangerFullAccess")
+        );
         assert!(matches!(
             step.command_effect,
             Some(ChannelCommandEffect::ShowStatus { ref snapshot, .. })
                 if snapshot.scope.as_deref() == Some("security")
                     && snapshot.codex_approval_policy.as_deref() == Some("accept")
                     && snapshot.codex_sandbox.as_deref() == Some("elevated")
+                    && snapshot.codex_sandbox_policy.as_deref() == Some("dangerFullAccess")
         ));
 
         let _ = fs::remove_dir_all(root);
@@ -714,6 +1020,7 @@ mod tests {
                 channel_id: "dm".to_string(),
                 user_id: "user".to_string(),
                 text: "/model openrouter/anthropic/claude-sonnet-4".to_string(),
+                inbound_context: None,
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -727,13 +1034,192 @@ mod tests {
         assert!(
             step.outbound_messages[0]
                 .text
-                .contains("Model switch planned")
+                .contains("Model updated for this session")
         );
         assert!(step.warnings.is_empty());
         assert!(matches!(
             step.command_effect,
-            Some(ChannelCommandEffect::SwitchModel { ref target, .. })
-                if target == "openrouter/anthropic/claude-sonnet-4"
+            Some(ChannelCommandEffect::SwitchModel {
+                ref provider,
+                ref model,
+                global,
+                ..
+            }) if provider == "openrouter"
+                && model == "anthropic/claude-sonnet-4"
+                && !global
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_step_lists_model_providers_and_provider_models() {
+        let root = temp_root("channel_step_lists_model_providers_and_provider_models");
+        let source = write_channel_source(&root);
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let show_turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "/model".to_string(),
+                inbound_context: None,
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let show_step = build_channel_step(&registry, &show_turn);
+        assert!(
+            show_step.outbound_messages[0]
+                .text
+                .starts_with("Current session model: openai/gpt-5")
+        );
+        assert!(
+            show_step.outbound_messages[0]
+                .text
+                .contains("Available providers: openai, openrouter")
+        );
+
+        let list_turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "/model openrouter".to_string(),
+                inbound_context: None,
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let list_step = build_channel_step(&registry, &list_turn);
+        assert!(
+            list_step.outbound_messages[0]
+                .text
+                .contains("Models for provider `openrouter`: anthropic/claude-sonnet-4")
+        );
+        assert!(matches!(
+            list_step.command_effect,
+            Some(ChannelCommandEffect::ListProviderModels {
+                ref provider,
+                provider_known,
+                ..
+            }) if provider == "openrouter" && provider_known
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_step_reports_and_switches_thinking_level() {
+        let root = temp_root("channel_step_reports_and_switches_thinking_level");
+        let source = write_channel_source(&root);
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let show_turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "/think".to_string(),
+                inbound_context: None,
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let show_step = build_channel_step(&registry, &show_turn);
+        assert!(
+            show_step.outbound_messages[0]
+                .text
+                .starts_with("Current session thinking level: medium")
+        );
+        assert!(
+            show_step.outbound_messages[0]
+                .text
+                .contains("minimal, low, medium, high")
+        );
+
+        let switch_turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "/think high --global".to_string(),
+                inbound_context: None,
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let switch_step = build_channel_step(&registry, &switch_turn);
+        assert!(
+            switch_step.outbound_messages[0]
+                .text
+                .contains("agent `main` default: high")
+        );
+        assert!(matches!(
+            switch_step.command_effect,
+            Some(ChannelCommandEffect::SwitchThinking {
+                ref level,
+                global,
+                valid,
+                ..
+            }) if level == "high" && global && valid
+        ));
+
+        let xhigh_turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "/ think 超高".to_string(),
+                inbound_context: None,
+                requested_agent_id: Some("main55".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let xhigh_step = build_channel_step(&registry, &xhigh_turn);
+        assert!(
+            xhigh_step.outbound_messages[0]
+                .text
+                .contains("session: xhigh")
+        );
+        assert!(matches!(
+            xhigh_step.command_effect,
+            Some(ChannelCommandEffect::SwitchThinking {
+                ref level,
+                valid,
+                ..
+            }) if level == "xhigh" && valid
         ));
 
         let _ = fs::remove_dir_all(root);
@@ -755,6 +1241,7 @@ mod tests {
                 channel_id: "dm".to_string(),
                 user_id: "user".to_string(),
                 text: "/new weekly review".to_string(),
+                inbound_context: None,
                 requested_agent_id: Some("main".to_string()),
                 session_hint: Some("telegram:dm:user:main:new".to_string()),
                 skill_limit: 3,
@@ -793,6 +1280,7 @@ mod tests {
                 channel_id: "dm".to_string(),
                 user_id: "user".to_string(),
                 text: "/model".to_string(),
+                inbound_context: None,
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -831,14 +1319,33 @@ mod tests {
             home.join("openclaw.json"),
             r#"{
               "agents": {
-                "defaults": { "provider": "openai", "model": "codex" },
+                "defaults": {
+                  "provider": "openai",
+                  "model": "codex",
+                  "models": {
+                    "openai/gpt-5": {},
+                    "openai/gpt-5.5": {},
+                    "openrouter/anthropic/claude-sonnet-4": {}
+                  }
+                },
                 "list": [
-                  { "id": "main", "model": "gpt-5", "enabled": true }
+                  { "id": "main", "model": "gpt-5", "enabled": true },
+                  { "id": "main55", "model": "gpt-5.5", "enabled": true }
                 ]
               },
               "models": {
                 "providers": {
-                  "openai": { "apiKey": "${OPENAI_API_KEY}" }
+                  "openai": {
+                    "apiKey": "${OPENAI_API_KEY}",
+                    "models": [
+                      { "id": "gpt-5" },
+                      { "id": "gpt-5.5" }
+                    ]
+                  },
+                  "openrouter": {
+                    "baseURL": "https://openrouter.ai/api/v1",
+                    "apiKey": "${OPENROUTER_API_KEY}"
+                  }
                 }
               },
               "plugins": [

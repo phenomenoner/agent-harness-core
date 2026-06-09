@@ -64,6 +64,7 @@ pub struct HarnessChannelStatus {
     pub discord_send_log_present: bool,
     pub discord_event_log_present: bool,
     pub discord_gateway_probe: HarnessJsonlStatus,
+    pub discord_reply_context_receipts: HarnessJsonlStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -103,8 +104,26 @@ pub struct HarnessMemoryStatus {
     pub qdrant_edge: bool,
     pub lancedb: bool,
     pub openclaw_mem_sqlite: bool,
+    pub memory_credentials_env_present: bool,
     pub regular_files: usize,
     pub search_receipts: HarnessJsonlStatus,
+    pub vector_recall_receipts: HarnessJsonlStatus,
+    pub prompt_context_receipts: HarnessJsonlStatus,
+    pub lifecycle_receipts: HarnessJsonlStatus,
+    pub canvas_receipts: HarnessJsonlStatus,
+    pub capture_candidates: HarnessJsonlStatus,
+    pub summary: HarnessMemoryHealthSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessMemoryHealthSummary {
+    pub active_recall_backend: String,
+    pub qdrant_parity: String,
+    pub prompt_context_status: Option<String>,
+    pub lifecycle_status: Option<String>,
+    pub canvas_status: Option<String>,
+    pub capture_candidate_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -138,6 +157,7 @@ pub struct HarnessJsonlStatus {
     pub invalid_lines: usize,
     pub latest_status: Option<String>,
     pub latest_method: Option<String>,
+    pub latest_backend: Option<String>,
     pub latest_reason: Option<String>,
 }
 
@@ -304,25 +324,97 @@ fn channel_status(
         discord_gateway_probe: jsonl_status(
             channel_dir.join("discord-gateway-probe-receipts.jsonl"),
         )?,
+        discord_reply_context_receipts: jsonl_status(
+            channel_dir.join("discord-reply-context-receipts.jsonl"),
+        )?,
     })
 }
 
 fn memory_status(harness_home: &Path) -> io::Result<HarnessMemoryStatus> {
     let memory_dir = harness_home.join("memory");
+    let memory_state_dir = harness_home.join("state").join("memory");
+    let exists = memory_dir.is_dir();
+    let qdrant_edge = memory_dir.join("qdrant-edge").is_dir();
+    let lancedb = memory_dir.join("lancedb").is_dir();
+    let openclaw_mem_sqlite = memory_dir.join("openclaw-mem.sqlite").is_file();
+    let memory_credentials_env_present = harness_home
+        .join("secrets")
+        .join("memory-credentials.env")
+        .is_file();
+    let regular_files = count_regular_files(&memory_dir)?;
+    let search_receipts = jsonl_status(memory_state_dir.join("search-receipts.jsonl"))?;
+    let vector_recall_receipts =
+        jsonl_status(memory_state_dir.join("vector-recall-receipts.jsonl"))?;
+    let prompt_context_receipts =
+        jsonl_status(memory_state_dir.join("prompt-context-receipts.jsonl"))?;
+    let lifecycle_receipts = jsonl_status(memory_state_dir.join("lifecycle-receipts.jsonl"))?;
+    let canvas_receipts = jsonl_status(memory_state_dir.join("canvas-receipts.jsonl"))?;
+    let capture_candidates = jsonl_status(memory_state_dir.join("auto-capture-candidates.jsonl"))?;
+    let summary = memory_health_summary(
+        qdrant_edge,
+        openclaw_mem_sqlite,
+        &vector_recall_receipts,
+        &prompt_context_receipts,
+        &lifecycle_receipts,
+        &canvas_receipts,
+        &capture_candidates,
+    );
     Ok(HarnessMemoryStatus {
-        exists: memory_dir.is_dir(),
-        qdrant_edge: memory_dir.join("qdrant-edge").is_dir(),
-        lancedb: memory_dir.join("lancedb").is_dir(),
-        openclaw_mem_sqlite: memory_dir.join("openclaw-mem.sqlite").is_file(),
-        regular_files: count_regular_files(&memory_dir)?,
-        search_receipts: jsonl_status(
-            harness_home
-                .join("state")
-                .join("memory")
-                .join("search-receipts.jsonl"),
-        )?,
+        exists,
+        qdrant_edge,
+        lancedb,
+        openclaw_mem_sqlite,
+        memory_credentials_env_present,
+        regular_files,
+        search_receipts,
+        vector_recall_receipts,
+        prompt_context_receipts,
+        lifecycle_receipts,
+        canvas_receipts,
+        capture_candidates,
+        summary,
         memory_dir,
     })
+}
+
+fn memory_health_summary(
+    qdrant_edge: bool,
+    openclaw_mem_sqlite: bool,
+    vector_recall_receipts: &HarnessJsonlStatus,
+    prompt_context_receipts: &HarnessJsonlStatus,
+    lifecycle_receipts: &HarnessJsonlStatus,
+    canvas_receipts: &HarnessJsonlStatus,
+    capture_candidates: &HarnessJsonlStatus,
+) -> HarnessMemoryHealthSummary {
+    let vector_status = vector_recall_receipts.latest_status.as_deref();
+    let active_recall_backend = if matches!(vector_status, Some("ready" | "no-hits")) {
+        vector_recall_receipts
+            .latest_backend
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string())
+    } else if openclaw_mem_sqlite {
+        "sqlite-vector-available".to_string()
+    } else {
+        "none".to_string()
+    };
+    let qdrant_parity = if active_recall_backend
+        .to_ascii_lowercase()
+        .contains("qdrant")
+    {
+        "native-recall-active".to_string()
+    } else if qdrant_edge {
+        "snapshot-preserved; native-recall-not-active".to_string()
+    } else {
+        "not-present".to_string()
+    };
+    HarnessMemoryHealthSummary {
+        active_recall_backend,
+        qdrant_parity,
+        prompt_context_status: prompt_context_receipts.latest_status.clone(),
+        lifecycle_status: lifecycle_receipts.latest_status.clone(),
+        canvas_status: canvas_receipts.latest_status.clone(),
+        capture_candidate_count: capture_candidates.lines,
+    }
 }
 
 fn plugin_status(harness_home: &Path) -> io::Result<HarnessPluginStatus> {
@@ -428,6 +520,7 @@ fn jsonl_status(path: PathBuf) -> io::Result<HarnessJsonlStatus> {
                 status.lines += 1;
                 status.latest_status = string_path(&value, &["status"]);
                 status.latest_method = string_path(&value, &["method"]);
+                status.latest_backend = string_path(&value, &["backend"]);
                 status.latest_reason = string_path(&value, &["reason"]);
             }
             Err(_) => status.invalid_lines += 1,
@@ -564,6 +657,7 @@ mod tests {
         fs::create_dir_all(harness_home.join("state").join("channels")).unwrap();
         fs::create_dir_all(harness_home.join("state").join("logs")).unwrap();
         fs::create_dir_all(harness_home.join("state").join("plugin-sidecar")).unwrap();
+        fs::create_dir_all(harness_home.join("secrets")).unwrap();
         fs::create_dir_all(
             harness_home
                 .join("state")
@@ -571,6 +665,7 @@ mod tests {
                 .join("loop-heartbeats"),
         )
         .unwrap();
+        fs::create_dir_all(harness_home.join("state").join("memory")).unwrap();
         fs::create_dir_all(harness_home.join("memory").join("qdrant-edge")).unwrap();
         fs::write(
             harness_home.join("state").join("harness-registry.json"),
@@ -606,6 +701,14 @@ mod tests {
         fs::write(
             harness_home
                 .join("state")
+                .join("channels")
+                .join("discord-reply-context-receipts.jsonl"),
+            r#"{"status":"captured","referencedMessageId":"ref-1","reason":"ok"}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
                 .join("logs")
                 .join("harness.jsonl"),
             r#"{"event":"channel.receive"}
@@ -621,6 +724,52 @@ mod tests {
             r#"{"status":"no-work","iteration":7,"processId":42,"atMs":1000,"detail":"idle"}"#,
         )
         .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("memory")
+                .join("vector-recall-receipts.jsonl"),
+            r#"{"status":"ready","hitCount":2,"backend":"sqlite-vector","reason":"ok"}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("memory")
+                .join("prompt-context-receipts.jsonl"),
+            r#"{"status":"ready","hitCount":1,"reason":"ok"}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("memory")
+                .join("lifecycle-receipts.jsonl"),
+            r#"{"status":"recorded","episodesAppended":2,"reason":"ok"}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("memory")
+                .join("canvas-receipts.jsonl"),
+            r#"{"status":"written","candidatesRead":1,"episodesRead":2,"reason":"ok"}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("memory")
+                .join("auto-capture-candidates.jsonl"),
+            r#"{"kind":"candidate","text":"remember this"}
+{"kind":"candidate","text":"remember that"}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join("secrets").join("memory-credentials.env"),
+            "OPENCLAW_HARNESS_MEMORY_EMBEDDING_API_KEY=sk-test\n",
+        )
+        .unwrap();
 
         let report = collect_harness_status(HarnessStatusOptions {
             harness_home: harness_home.clone(),
@@ -634,7 +783,54 @@ mod tests {
             Some("completed")
         );
         assert_eq!(report.channels.outbox.all.pending, 1);
+        assert_eq!(
+            report
+                .channels
+                .discord_reply_context_receipts
+                .latest_status
+                .as_deref(),
+            Some("captured")
+        );
         assert!(report.memory.qdrant_edge);
+        assert!(report.memory.memory_credentials_env_present);
+        assert_eq!(
+            report
+                .memory
+                .vector_recall_receipts
+                .latest_status
+                .as_deref(),
+            Some("ready")
+        );
+        assert_eq!(
+            report
+                .memory
+                .vector_recall_receipts
+                .latest_backend
+                .as_deref(),
+            Some("sqlite-vector")
+        );
+        assert_eq!(report.memory.summary.active_recall_backend, "sqlite-vector");
+        assert_eq!(
+            report.memory.summary.qdrant_parity,
+            "snapshot-preserved; native-recall-not-active"
+        );
+        assert_eq!(report.memory.summary.capture_candidate_count, 2);
+        assert_eq!(
+            report
+                .memory
+                .prompt_context_receipts
+                .latest_status
+                .as_deref(),
+            Some("ready")
+        );
+        assert_eq!(
+            report.memory.lifecycle_receipts.latest_status.as_deref(),
+            Some("recorded")
+        );
+        assert_eq!(
+            report.memory.canvas_receipts.latest_status.as_deref(),
+            Some("written")
+        );
         let runtime_loop = report
             .loops
             .heartbeats

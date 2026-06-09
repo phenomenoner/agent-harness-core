@@ -7,7 +7,10 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
-    codex_runtime::{CodexApprovalPolicy, inspect_codex_approval_policy, inspect_codex_sandbox},
+    codex_runtime::{
+        CodexApprovalPolicy, inspect_codex_approval_policy, inspect_codex_sandbox,
+        inspect_codex_sandbox_policy,
+    },
     logging::current_log_time_ms,
     probe_harness_log_writable,
 };
@@ -112,6 +115,7 @@ pub fn check_activation_readiness(
     check_codex_config(&options.harness_home, &mut checks);
     check_codex_approval_policy(&options.harness_home, &mut checks);
     check_codex_sandbox(&options.harness_home, &mut checks);
+    check_codex_filesystem_sandbox(&options.harness_home, &mut checks);
 
     let summary = summarize(&checks);
     Ok(ActivationReadinessReport {
@@ -191,10 +195,13 @@ fn check_channels(
             "telegram-access-policy",
             "Telegram",
             &[
+                "OPENCLAW_TELEGRAM_ADMIN_USER_IDS",
                 "OPENCLAW_TELEGRAM_ALLOWED_USER_IDS",
+                "OPENCLAW_TELEGRAM_GROUP_ADMIN_USER_IDS",
                 "OPENCLAW_TELEGRAM_GROUP_ALLOWED_USER_IDS",
                 "OPENCLAW_TELEGRAM_DIRECT_CHAT_IDS",
                 "OPENCLAW_TELEGRAM_GROUP_CHAT_IDS",
+                "OPENCLAW_TELEGRAM_GROUP_OPEN",
             ],
         );
     }
@@ -212,9 +219,12 @@ fn check_channels(
             "discord-access-policy",
             "Discord",
             &[
+                "OPENCLAW_DISCORD_ADMIN_USER_IDS",
                 "OPENCLAW_DISCORD_ALLOWED_USER_IDS",
+                "OPENCLAW_DISCORD_GROUP_ALLOWED_USER_IDS",
                 "OPENCLAW_DISCORD_CHANNEL_IDS",
                 "OPENCLAW_DISCORD_GUILD_IDS",
+                "OPENCLAW_DISCORD_GROUP_OPEN",
             ],
         );
     }
@@ -1055,6 +1065,7 @@ fn check_logging(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>
         "discord.event-run-once",
         "no Discord inbound event summary found yet; run discord-event-run-once",
     );
+    check_discord_dm_poll_fallback(harness_home, checks);
     check_discord_real_inbound(harness_home, checks);
 }
 
@@ -1119,6 +1130,61 @@ fn check_discord_real_inbound(harness_home: &Path, checks: &mut Vec<ActivationRe
     }
 }
 
+fn check_discord_dm_poll_fallback(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let path = harness_home
+        .join("state")
+        .join("channels")
+        .join("discord-dm-poll-cursors.json");
+    match fs::read_to_string(&path) {
+        Ok(text) => {
+            let initialized_targets = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|value| {
+                    value.as_object().map(|targets| {
+                        targets
+                            .values()
+                            .filter(|target| {
+                                target
+                                    .get("initialized")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(false)
+                            })
+                            .count()
+                    })
+                })
+                .unwrap_or(0);
+            if initialized_targets > 0 {
+                checks.push(pass(
+                    "discord-dm-poll-fallback",
+                    format!(
+                        "Discord DM HTTP poll fallback initialized for {initialized_targets} target(s) at {}",
+                        path.display()
+                    ),
+                ));
+            } else {
+                checks.push(warn(
+                    "discord-dm-poll-fallback",
+                    format!(
+                        "Discord DM HTTP poll fallback cursor file exists but has no initialized targets at {}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+            "discord-dm-poll-fallback",
+            format!(
+                "Discord DM HTTP poll fallback has not initialized at {}; start discord-gateway-loop",
+                path.display()
+            ),
+        )),
+        Err(error) => checks.push(warn(
+            "discord-dm-poll-fallback",
+            format!("could not read {}: {error}", path.display()),
+        )),
+    }
+}
+
 fn check_memory_import(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
     let memory_dir = harness_home.join("memory");
     if memory_dir.is_dir() {
@@ -1134,13 +1200,18 @@ fn check_memory_import(harness_home: &Path, checks: &mut Vec<ActivationReadiness
         return;
     }
     check_memory_search_probe(harness_home, checks);
+    check_memory_credentials(harness_home, checks);
+    check_memory_vector_recall_probe(harness_home, checks);
+    check_memory_prompt_context_probe(harness_home, checks);
+    check_memory_lifecycle_probe(harness_home, checks);
+    check_memory_canvas_probe(harness_home, checks);
 
     let qdrant_edge = memory_dir.join("qdrant-edge");
     if qdrant_edge.is_dir() {
         checks.push(pass(
             "memory-qdrant-edge",
             format!(
-                "primary Qdrant edge memory backend found at {}",
+                "Qdrant edge memory snapshot found at {}; native Qdrant recall parity is tracked separately from active recall backend status",
                 qdrant_edge.display()
             ),
         ));
@@ -1148,7 +1219,7 @@ fn check_memory_import(harness_home: &Path, checks: &mut Vec<ActivationReadiness
         checks.push(warn(
             "memory-qdrant-edge",
             format!(
-                "primary Qdrant edge memory backend not found at {}; memory recall may fall back to SQLite/LanceDB or be unavailable",
+                "Qdrant edge memory snapshot not found at {}; memory recall may fall back to SQLite/LanceDB or be unavailable",
                 qdrant_edge.display()
             ),
         ));
@@ -1186,7 +1257,7 @@ fn check_memory_import(harness_home: &Path, checks: &mut Vec<ActivationReadiness
         checks.push(warn(
             "memory-lancedb",
             format!(
-                "LanceDB backup backend not found at {}; acceptable when Qdrant edge is primary",
+                "LanceDB backup backend not found at {}; acceptable when SQLite vector recall or another active recall lane is healthy",
                 lancedb.display()
             ),
         ));
@@ -1253,6 +1324,346 @@ fn check_memory_search_probe(harness_home: &Path, checks: &mut Vec<ActivationRea
             format!("could not read {}: {error}", path.display()),
         )),
     }
+}
+
+fn check_memory_credentials(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    const MEMORY_EMBEDDING_API_KEY_ENV: &str = "OPENCLAW_HARNESS_MEMORY_EMBEDDING_API_KEY";
+    let env_file = harness_home.join("secrets").join("memory-credentials.env");
+    match fs::read_to_string(&env_file) {
+        Ok(text) if env_file_has_nonempty_key(&text, MEMORY_EMBEDDING_API_KEY_ENV) => {
+            checks.push(pass(
+                "memory-embedding-secrets",
+                format!(
+                    "embedding key is available in harness memory secrets at {}; value is not disclosed",
+                    env_file.display()
+                ),
+            ));
+        }
+        Ok(_) => checks.push(warn(
+            "memory-embedding-secrets",
+            format!(
+                "memory credentials env exists but does not include a non-empty {MEMORY_EMBEDDING_API_KEY_ENV} at {}",
+                env_file.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+            "memory-embedding-secrets",
+            format!(
+                "embedding key may exist in imported snapshot but has not been moved into harness secrets at {}; run memory-credentials-export --include-sensitive",
+                env_file.display()
+            ),
+        )),
+        Err(error) => checks.push(warn(
+            "memory-embedding-secrets",
+            format!("could not read {}: {error}", env_file.display()),
+        )),
+    }
+
+    let receipt = harness_home
+        .join("secrets")
+        .join("memory-credentials-receipt.json");
+    if receipt.is_file() {
+        checks.push(pass(
+            "memory-credentials-receipt",
+            format!(
+                "memory credential migration receipt exists at {}; sensitive values are redacted",
+                receipt.display()
+            ),
+        ));
+    } else {
+        checks.push(warn(
+            "memory-credentials-receipt",
+            format!(
+                "not found yet: {}; run memory-credentials-export before memory handoff",
+                receipt.display()
+            ),
+        ));
+    }
+}
+
+fn check_memory_vector_recall_probe(
+    harness_home: &Path,
+    checks: &mut Vec<ActivationReadinessCheck>,
+) {
+    let path = harness_home
+        .join("state")
+        .join("memory")
+        .join("vector-recall-receipts.jsonl");
+    match latest_jsonl_value(&path) {
+        Ok(Some(value)) => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let reason = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason recorded");
+            let hit_count = value.get("hitCount").and_then(Value::as_u64).unwrap_or(0);
+            let backend = value
+                .get("backend")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            match status {
+                "ready" if hit_count > 0 => checks.push(pass(
+                    "memory-vector-recall",
+                    format!(
+                        "imported vector memory recall returned {hit_count} hit(s) via {backend} at {}",
+                        path.display()
+                    ),
+                )),
+                "no-hits" | "ready" => checks.push(warn(
+                    "memory-vector-recall",
+                    format!(
+                        "vector memory recall ran via {backend} but returned no hits at {}: {reason}",
+                        path.display()
+                    ),
+                )),
+                "skipped" => checks.push(warn(
+                    "memory-vector-recall",
+                    format!(
+                        "vector memory recall skipped at {}: {reason}",
+                        path.display()
+                    ),
+                )),
+                _ => checks.push(fail(
+                    "memory-vector-recall",
+                    format!(
+                        "vector memory recall status={status} at {}: {reason}",
+                        path.display()
+                    ),
+                )),
+            }
+        }
+        Ok(None) => checks.push(warn(
+            "memory-vector-recall",
+            format!(
+                "no vector recall receipt lines found at {}; run memory-vector-search --query <text>",
+                path.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+            "memory-vector-recall",
+            format!(
+                "not found yet: {}; run memory-vector-search --query <text> before claiming vector memory recall",
+                path.display()
+            ),
+        )),
+        Err(error) => checks.push(warn(
+            "memory-vector-recall",
+            format!("could not read {}: {error}", path.display()),
+        )),
+    }
+}
+
+fn check_memory_prompt_context_probe(
+    harness_home: &Path,
+    checks: &mut Vec<ActivationReadinessCheck>,
+) {
+    let path = harness_home
+        .join("state")
+        .join("memory")
+        .join("prompt-context-receipts.jsonl");
+    match latest_jsonl_value(&path) {
+        Ok(Some(value)) => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let reason = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason recorded");
+            let hit_count = value.get("hitCount").and_then(Value::as_u64).unwrap_or(0);
+            match status {
+                "ready" if hit_count > 0 => checks.push(pass(
+                    "memory-prompt-context",
+                    format!(
+                        "pre-turn imported memory context prepared {hit_count} hit(s) at {}",
+                        path.display()
+                    ),
+                )),
+                "no-hits" | "ready" => checks.push(warn(
+                    "memory-prompt-context",
+                    format!(
+                        "pre-turn memory context ran but no hit was injected at {}: {reason}",
+                        path.display()
+                    ),
+                )),
+                _ => checks.push(warn(
+                    "memory-prompt-context",
+                    format!(
+                        "pre-turn memory context status={status} at {}: {reason}",
+                        path.display()
+                    ),
+                )),
+            }
+        }
+        Ok(None) => checks.push(warn(
+            "memory-prompt-context",
+            format!(
+                "no memory prompt-context receipt lines found at {}",
+                path.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+            "memory-prompt-context",
+            format!(
+                "not found yet: {}; run an agent turn before claiming pre-turn memory recall",
+                path.display()
+            ),
+        )),
+        Err(error) => checks.push(warn(
+            "memory-prompt-context",
+            format!("could not read {}: {error}", path.display()),
+        )),
+    }
+}
+
+fn check_memory_lifecycle_probe(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let path = harness_home
+        .join("state")
+        .join("memory")
+        .join("lifecycle-receipts.jsonl");
+    match latest_jsonl_value(&path) {
+        Ok(Some(value)) => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let reason = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason recorded");
+            let episodes = value
+                .get("episodesAppended")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let candidates = value
+                .get("captureCandidates")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            match status {
+                "recorded" => checks.push(pass(
+                    "memory-lifecycle",
+                    format!(
+                        "post-turn memory lifecycle recorded episodes={episodes} captureCandidates={candidates} at {}",
+                        path.display()
+                    ),
+                )),
+                "skipped" => checks.push(warn(
+                    "memory-lifecycle",
+                    format!(
+                        "post-turn memory lifecycle skipped at {}: {reason}",
+                        path.display()
+                    ),
+                )),
+                _ => checks.push(warn(
+                    "memory-lifecycle",
+                    format!(
+                        "post-turn memory lifecycle status={status} at {}: {reason}",
+                        path.display()
+                    ),
+                )),
+            }
+        }
+        Ok(None) => checks.push(warn(
+            "memory-lifecycle",
+            format!(
+                "no memory lifecycle receipt lines found at {}",
+                path.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+            "memory-lifecycle",
+            format!(
+                "not found yet: {}; run a completed agent turn before claiming post-turn capture",
+                path.display()
+            ),
+        )),
+        Err(error) => checks.push(warn(
+            "memory-lifecycle",
+            format!("could not read {}: {error}", path.display()),
+        )),
+    }
+}
+
+fn check_memory_canvas_probe(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let path = harness_home
+        .join("state")
+        .join("memory")
+        .join("canvas-receipts.jsonl");
+    match latest_jsonl_value(&path) {
+        Ok(Some(value)) => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let reason = value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason recorded");
+            let candidates = value
+                .get("candidatesRead")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let episodes = value
+                .get("episodesRead")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            match status {
+                "written" => checks.push(pass(
+                    "memory-canvas",
+                    format!(
+                        "symbolic canvas worker wrote candidates={candidates} episodes={episodes} at {}",
+                        path.display()
+                    ),
+                )),
+                "skipped" => checks.push(warn(
+                    "memory-canvas",
+                    format!(
+                        "symbolic canvas worker skipped at {}: {reason}",
+                        path.display()
+                    ),
+                )),
+                _ => checks.push(warn(
+                    "memory-canvas",
+                    format!(
+                        "symbolic canvas worker status={status} at {}: {reason}",
+                        path.display()
+                    ),
+                )),
+            }
+        }
+        Ok(None) => checks.push(warn(
+            "memory-canvas",
+            format!("no canvas receipt lines found at {}", path.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
+            "memory-canvas",
+            format!(
+                "not found yet: {}; run memory-canvas-run or a successful turn with symbolic canvas enabled",
+                path.display()
+            ),
+        )),
+        Err(error) => checks.push(warn(
+            "memory-canvas",
+            format!("could not read {}: {error}", path.display()),
+        )),
+    }
+}
+
+fn env_file_has_nonempty_key(text: &str, key: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            return false;
+        }
+        let Some((name, value)) = trimmed.split_once('=') else {
+            return false;
+        };
+        name.trim() == key && !value.trim().is_empty()
+    })
 }
 
 fn check_codex_auth(checks: &mut Vec<ActivationReadinessCheck>) {
@@ -1360,6 +1771,30 @@ fn check_codex_sandbox(harness_home: &Path, checks: &mut Vec<ActivationReadiness
         "codex-sandbox",
         format!(
             "Codex Windows sandbox is {}; source={}",
+            inspection.sandbox, inspection.source
+        ),
+    ));
+}
+
+fn check_codex_filesystem_sandbox(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
+    let inspection = inspect_codex_sandbox_policy(harness_home);
+    if !inspection.warnings.is_empty() {
+        checks.push(warn(
+            "codex-filesystem-sandbox",
+            format!(
+                "{}; sandboxPolicy={} source={}",
+                inspection.warnings.join("; "),
+                inspection.sandbox,
+                inspection.source
+            ),
+        ));
+        return;
+    }
+
+    checks.push(pass(
+        "codex-filesystem-sandbox",
+        format!(
+            "Codex app-server filesystem sandbox policy is {}; source={}",
             inspection.sandbox, inspection.source
         ),
     ));

@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::{
-    AgentProfile, AgentRegistry, ChannelCommand, ChannelCommandIntent, ChannelSessionState,
-    OpenClawSource, PROMPT_FILE_NAMES, SkillIndex, SkillSelection, SkillSelectionQuery,
-    parse_channel_command, read_channel_session_state, select_skills,
+    AgentOverride, AgentProfile, AgentRegistry, ChannelCommand, ChannelCommandIntent,
+    ChannelSessionState, DEFAULT_THINKING_LEVEL, OpenClawSource, PROMPT_FILE_NAMES, SkillIndex,
+    SkillSelection, SkillSelectionQuery, parse_channel_command, read_agent_override,
+    read_channel_session_state, select_skills,
 };
 
 const TURN_PLAN_SCHEMA: &str = "openclaw-harness.turn-plan.v1";
@@ -19,6 +20,7 @@ pub struct TurnPlanInput {
     pub channel_id: String,
     pub user_id: String,
     pub text: String,
+    pub inbound_context: Option<String>,
     pub requested_agent_id: Option<String>,
     pub session_hint: Option<String>,
     pub skill_limit: usize,
@@ -35,10 +37,13 @@ pub struct TurnPlan {
     pub channel_id: String,
     pub user_id: String,
     pub message_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbound_context: Option<String>,
     pub session_key: String,
     pub dispatch: TurnDispatch,
     pub agent: Option<TurnAgent>,
     pub model_policy: TurnModelPolicy,
+    pub thinking_policy: TurnThinkingPolicy,
     pub channel_state: Option<ChannelSessionState>,
     pub command: Option<ChannelCommand>,
     pub command_intent: Option<ChannelCommandIntent>,
@@ -73,6 +78,13 @@ pub struct TurnModelPolicy {
     pub model: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnThinkingPolicy {
+    pub enabled: bool,
+    pub level: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnPromptFile {
@@ -97,6 +109,7 @@ pub fn build_turn_plan(
     let selected_agent = select_agent(registry, input.requested_agent_id.as_deref(), &mut warnings);
     let agent = selected_agent.map(turn_agent);
     let mut model_policy = selected_agent.map(turn_model_policy).unwrap_or_default();
+    let mut thinking_policy = TurnThinkingPolicy::default();
     let command = parse_channel_command(&input.text);
     let command_intent = command.clone().map(ChannelCommand::into_intent);
     let dispatch = if command.is_some() {
@@ -107,7 +120,15 @@ pub fn build_turn_plan(
         TurnDispatch::NoAgentAvailable
     };
     if dispatch == TurnDispatch::NoAgentAvailable {
-        warnings.push("no OpenClaw agent is available for this turn".to_string());
+        warnings.push("no harness agent is available for this turn".to_string());
+    }
+
+    if let Some(agent_override) = load_agent_override(
+        input.harness_home.as_deref(),
+        agent.as_ref().map(|agent| agent.id.as_str()),
+        &mut warnings,
+    ) {
+        apply_agent_override(&mut model_policy, &mut thinking_policy, &agent_override);
     }
 
     let channel_state = load_channel_state(
@@ -119,6 +140,7 @@ pub fn build_turn_plan(
     );
     if let Some(state) = &channel_state {
         apply_model_override(&mut model_policy, state);
+        apply_thinking_override(&mut thinking_policy, state);
     }
     let session_key = input
         .session_hint
@@ -165,10 +187,14 @@ pub fn build_turn_plan(
         channel_id: input.channel_id,
         user_id: input.user_id,
         message_text: input.text,
+        inbound_context: input
+            .inbound_context
+            .filter(|value| !value.trim().is_empty()),
         session_key,
         dispatch,
         agent,
         model_policy,
+        thinking_policy,
         channel_state,
         command,
         command_intent,
@@ -257,6 +283,27 @@ fn load_channel_state(
     }
 }
 
+fn load_agent_override(
+    harness_home: Option<&Path>,
+    agent_id: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Option<AgentOverride> {
+    let (Some(harness_home), Some(agent_id)) = (harness_home, agent_id) else {
+        return None;
+    };
+    match read_agent_override(harness_home, agent_id) {
+        Ok(override_entry) => override_entry,
+        Err(error) => {
+            warnings.push(format!(
+                "agent override state could not be read from {}: {}",
+                harness_home.display(),
+                error
+            ));
+            None
+        }
+    }
+}
+
 fn apply_model_override(model_policy: &mut TurnModelPolicy, state: &ChannelSessionState) {
     if let Some(provider) = &state.model_override_provider {
         model_policy.provider = Some(provider.clone());
@@ -266,11 +313,44 @@ fn apply_model_override(model_policy: &mut TurnModelPolicy, state: &ChannelSessi
     }
 }
 
+fn apply_agent_override(
+    model_policy: &mut TurnModelPolicy,
+    thinking_policy: &mut TurnThinkingPolicy,
+    override_entry: &AgentOverride,
+) {
+    if let Some(provider) = &override_entry.provider {
+        model_policy.provider = Some(provider.clone());
+    }
+    if let Some(model) = &override_entry.model {
+        model_policy.model = Some(model.clone());
+    }
+    if let Some(level) = &override_entry.thinking_level {
+        thinking_policy.enabled = true;
+        thinking_policy.level = Some(level.clone());
+    }
+}
+
+fn apply_thinking_override(thinking_policy: &mut TurnThinkingPolicy, state: &ChannelSessionState) {
+    if state.thinking_enabled || state.thinking_level.is_some() {
+        thinking_policy.enabled = true;
+        thinking_policy.level = Some(
+            state
+                .thinking_level
+                .clone()
+                .unwrap_or_else(|| DEFAULT_THINKING_LEVEL.to_string()),
+        );
+    }
+}
+
 fn channel_state_query_text(message: &str, state: Option<&ChannelSessionState>) -> String {
     let Some(state) = state else {
         return message.to_string();
     };
     let mut text = message.to_string();
+    if let Some(level) = &state.thinking_level {
+        text.push_str("\nthink_level: ");
+        text.push_str(level);
+    }
     if let Some(instruction) = &state.thinking_instruction {
         text.push_str("\nthink: ");
         text.push_str(instruction);
@@ -362,6 +442,7 @@ mod tests {
                 channel_id: "dm-42".to_string(),
                 user_id: "user-7".to_string(),
                 text: "please repair memory cron jobs".to_string(),
+                inbound_context: None,
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -401,6 +482,7 @@ mod tests {
                 channel_id: "dm#42".to_string(),
                 user_id: "user#7".to_string(),
                 text: "/status cron".to_string(),
+                inbound_context: None,
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -438,6 +520,7 @@ mod tests {
                 channel_id: "dm".to_string(),
                 user_id: "user".to_string(),
                 text: "hello".to_string(),
+                inbound_context: None,
                 requested_agent_id: Some("missing-agent".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -472,6 +555,7 @@ mod tests {
                 channel_id: "dm".to_string(),
                 user_id: "user".to_string(),
                 text: "hello".to_string(),
+                inbound_context: None,
                 requested_agent_id: None,
                 session_hint: Some("imported-session-key".to_string()),
                 skill_limit: 3,
@@ -512,6 +596,7 @@ mod tests {
               "modelOverrideProvider": "openrouter",
               "modelOverrideModel": "anthropic/claude-sonnet-4",
               "thinkingEnabled": true,
+              "thinkingLevel": "medium",
               "thinkingInstruction": "compare provider constraints",
               "stopRequested": false,
               "stopReason": null,
@@ -536,6 +621,7 @@ mod tests {
                 channel_id: "dm".to_string(),
                 user_id: "user".to_string(),
                 text: "continue".to_string(),
+                inbound_context: None,
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -549,11 +635,94 @@ mod tests {
             plan.model_policy.model.as_deref(),
             Some("anthropic/claude-sonnet-4")
         );
+        assert!(plan.thinking_policy.enabled);
+        assert_eq!(plan.thinking_policy.level.as_deref(), Some("medium"));
         assert!(plan.channel_state.is_some());
         assert_eq!(
             plan.selected_skills[0].skill_id,
             "workspace:openrouter-routing"
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn turn_plan_applies_per_agent_global_overrides() {
+        let root = temp_root("turn_plan_applies_per_agent_global_overrides");
+        let source = write_turn_source(&root);
+        let harness_home = root.join(".openclaw-harness");
+        write_agent_overrides(
+            &harness_home,
+            r#"{
+              "schema": "agent-harness.agent-overrides.v1",
+              "agents": {
+                "main": {
+                  "provider": "openrouter",
+                  "model": "anthropic/claude-sonnet-4",
+                  "thinkingLevel": "high",
+                  "updatedAtMs": 1000
+                },
+                "other": {
+                  "provider": "openai",
+                  "model": "gpt-5.4-mini",
+                  "thinkingLevel": "low",
+                  "updatedAtMs": 1000
+                }
+              }
+            }"#,
+        );
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+
+        let plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "continue".to_string(),
+                inbound_context: None,
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.model_policy.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            plan.model_policy.model.as_deref(),
+            Some("anthropic/claude-sonnet-4")
+        );
+        assert!(plan.thinking_policy.enabled);
+        assert_eq!(plan.thinking_policy.level.as_deref(), Some("high"));
+
+        let other_plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(root.join(".openclaw-harness")),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "continue".to_string(),
+                inbound_context: None,
+                requested_agent_id: Some("other".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        assert_eq!(other_plan.model_policy.provider.as_deref(), Some("openai"));
+        assert_eq!(
+            other_plan.model_policy.model.as_deref(),
+            Some("gpt-5.4-mini")
+        );
+        assert_eq!(other_plan.thinking_policy.level.as_deref(), Some("low"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -570,7 +739,8 @@ mod tests {
               "agents": {
                 "defaults": { "provider": "openai", "model": "codex" },
                 "list": [
-                  { "id": "main", "model": "gpt-5", "enabled": true }
+                  { "id": "main", "model": "gpt-5", "enabled": true },
+                  { "id": "other", "model": "gpt-5.4", "enabled": true }
                 ]
               }
             }"#,
@@ -597,6 +767,15 @@ mod tests {
             .join("state.json");
         fs::create_dir_all(state_file.parent().unwrap()).unwrap();
         fs::write(state_file, state_json).unwrap();
+    }
+
+    fn write_agent_overrides(harness_home: &Path, overrides_json: &str) {
+        let path = harness_home
+            .join("state")
+            .join("agents")
+            .join("overrides.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, overrides_json).unwrap();
     }
 
     fn temp_root(test_name: &str) -> PathBuf {

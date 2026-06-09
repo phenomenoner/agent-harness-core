@@ -33,7 +33,9 @@ pub use activation::{
     ActivationReadinessStatus, ActivationReadinessSummary, check_activation_readiness,
 };
 pub use channel_commands::{
-    ChannelCommand, ChannelCommandIntent, parse_channel_command, parse_channel_command_intent,
+    ChannelCommand, ChannelCommandIntent, DEFAULT_THINKING_LEVEL, THINKING_LEVELS,
+    XHIGH_THINKING_LEVEL, normalize_thinking_level, parse_channel_command,
+    parse_channel_command_intent,
 };
 pub use channel_delivery::{
     ChannelDeliveryPending, ChannelDeliveryReceipt, ChannelDeliveryRecordOptions,
@@ -53,9 +55,10 @@ pub use channel_runtime::{
     ChannelStepFile, build_channel_step, write_channel_step,
 };
 pub use channel_state::{
-    ChannelCommandApplyOptions, ChannelCommandApplyReceipt, ChannelCommandApplyReceiptStatus,
-    ChannelCommandApplyReport, ChannelCommandEvent, ChannelSessionNote, ChannelSessionState,
-    apply_channel_command_step, channel_session_state_file, read_channel_session_state,
+    AgentOverride, AgentOverridesStore, ChannelCommandApplyOptions, ChannelCommandApplyReceipt,
+    ChannelCommandApplyReceiptStatus, ChannelCommandApplyReport, ChannelCommandEvent,
+    ChannelSessionNote, ChannelSessionState, agent_overrides_file, apply_channel_command_step,
+    channel_session_state_file, read_agent_override, read_channel_session_state,
 };
 pub use codex_runtime::{
     CodexApprovalPolicy, CodexApprovalPolicyInspection, CodexEnvRequirement, CodexInvocationPlan,
@@ -67,9 +70,9 @@ pub use codex_runtime::{
     CodexRuntimePreflightReceipt, CodexRuntimePreflightReport, CodexRuntimePreflightStatus,
     CodexRuntimeReceipt, CodexRuntimeReceiptStatus, CodexRuntimeRunOptions, CodexRuntimeRunReceipt,
     CodexRuntimeRunReport, CodexRuntimeRunStatus, CodexSandboxInspection, CodexTransportPlan,
-    inspect_codex_approval_policy, inspect_codex_sandbox, plan_codex_runtime,
-    preflight_codex_runtime, probe_codex_runtime_launch, record_codex_runtime_completion,
-    run_codex_runtime,
+    inspect_codex_approval_policy, inspect_codex_sandbox, inspect_codex_sandbox_policy,
+    plan_codex_runtime, preflight_codex_runtime, probe_codex_runtime_launch,
+    record_codex_runtime_completion, run_codex_runtime,
 };
 pub use cron::{
     NativeCronJob, NativeCronJobState, NativeCronPlan, NativeCronPlanAction, NativeCronPlanEntry,
@@ -107,9 +110,21 @@ pub use logging::{
     harness_log_file, probe_harness_log_writable,
 };
 pub use memory::{
-    MemorySearchHit, MemorySearchOptions, MemorySearchReport, MemorySearchStatus,
-    memory_search_latest_file, memory_search_receipts_file, search_imported_memory,
-    write_memory_search_receipt,
+    MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport, MemoryCanvasWorkerStatus,
+    MemoryCredentialsExportEntry, MemoryCredentialsExportOptions, MemoryCredentialsExportReport,
+    MemoryLifecycleReport, MemoryLifecycleStatus, MemoryLifecycleTurnOptions,
+    MemoryPromptContextOptions, MemoryPromptContextReport, MemoryPromptContextStatus,
+    MemorySearchHit, MemorySearchOptions, MemorySearchReport, MemorySearchStatus, MemoryVectorHit,
+    MemoryVectorRecallOptions, MemoryVectorRecallReport, MemoryVectorRecallStatus,
+    build_memory_prompt_context, export_memory_credentials, memory_canvas_latest_file,
+    memory_canvas_receipts_file, memory_credentials_env_file, memory_credentials_receipt_file,
+    memory_lifecycle_latest_file, memory_lifecycle_receipts_file,
+    memory_prompt_context_latest_file, memory_prompt_context_receipts_file,
+    memory_search_latest_file, memory_search_receipts_file, memory_vector_recall_latest_file,
+    memory_vector_recall_receipts_file, record_memory_lifecycle_turn, run_memory_canvas_worker,
+    search_imported_memory, search_imported_vector_memory,
+    search_imported_vector_memory_with_embedding, write_memory_prompt_context_receipt,
+    write_memory_search_receipt, write_memory_vector_recall_receipt,
 };
 pub use prompt::{
     PromptAssemblyOptions, PromptBundle, PromptBundleFiles, PromptBundleSummary, PromptSection,
@@ -154,7 +169,7 @@ pub use supervisor::{
 };
 pub use turns::{
     TurnAgent, TurnDispatch, TurnModelPolicy, TurnPlan, TurnPlanFile, TurnPlanInput,
-    TurnPromptFile, build_turn_plan, write_turn_plan,
+    TurnPromptFile, TurnThinkingPolicy, build_turn_plan, write_turn_plan,
 };
 
 pub const PROMPT_FILE_NAMES: &[&str] = &[

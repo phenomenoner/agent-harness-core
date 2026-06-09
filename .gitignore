@@ -16,6 +16,7 @@ data/
 secrets/
 **/secrets/channel-credentials.env
 .tools/
+.debug/
 
 # Imported OpenClaw state should be staged intentionally.
 imports/

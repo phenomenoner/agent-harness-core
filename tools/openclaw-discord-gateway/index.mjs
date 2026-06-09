@@ -25,6 +25,9 @@ function parseArgs(argv) {
     stopFile: null,
     probe: false,
     writeReceipt: false,
+    dmPollFallback: process.env.DISCORD_DM_POLL_FALLBACK !== "0",
+    dmPollMs: Number.parseInt(process.env.DISCORD_DM_POLL_MS || "5000", 10),
+    dmPollLimit: Number.parseInt(process.env.DISCORD_DM_POLL_LIMIT || "20", 10),
   };
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
@@ -58,6 +61,14 @@ function parseArgs(argv) {
     } else if (flag === "--stop-file") {
       i += 1;
       args.stopFile = requiredValue(argv, i, flag);
+    } else if (flag === "--no-dm-poll-fallback") {
+      args.dmPollFallback = false;
+    } else if (flag === "--dm-poll-ms") {
+      i += 1;
+      args.dmPollMs = Number.parseInt(requiredValue(argv, i, flag), 10);
+    } else if (flag === "--dm-poll-limit") {
+      i += 1;
+      args.dmPollLimit = Number.parseInt(requiredValue(argv, i, flag), 10);
     } else if (flag === "--probe") {
       args.probe = true;
     } else if (flag === "--write-receipt") {
@@ -116,8 +127,12 @@ function buildProbe(args) {
       "discord.gateway.heartbeat",
       "discord.gateway.identify",
       "discord.gateway.message-create",
+      "discord.dm-http-poll-fallback",
       "discord.gateway.event-run-once",
     ],
+    dmPollFallback: args.dmPollFallback,
+    dmPollMs: args.dmPollMs,
+    dmPollLimit: args.dmPollLimit,
     warnings,
   };
 }
@@ -156,6 +171,7 @@ async function runGateway(args) {
   let sequence = null;
   let heartbeatTimer = null;
   let stopFileTimer = null;
+  let dmPollTimer = null;
   let handledMessages = 0;
   let dispatchLogCount = 0;
   const intents = discordIntents();
@@ -184,6 +200,9 @@ async function runGateway(args) {
       }
       if (stopFileTimer) {
         clearInterval(stopFileTimer);
+      }
+      if (dmPollTimer) {
+        clearInterval(dmPollTimer);
       }
       writeGatewayLog(args, "close", { code: event.code, reason: event.reason });
       writeLoopHeartbeat(args, "closed", `Discord gateway WebSocket closed code=${event.code}`);
@@ -250,6 +269,9 @@ async function runGateway(args) {
             username: payload.d?.user?.username,
           });
           writeLoopHeartbeat(args, "ready", `Discord gateway ready username=${payload.d?.user?.username ?? "-"}`);
+          if (args.dmPollFallback && args.maxMessages === 0 && !dmPollTimer) {
+            dmPollTimer = startDmPollFallback(args, token);
+          }
         } else if (dispatchLogCount <= 20) {
           writeGatewayLog(args, "dispatch", { type: payload.t, sequence });
         }
@@ -264,8 +286,8 @@ function identifyPayload(token, intents) {
     intents,
     properties: {
       os: process.platform,
-      browser: "openclaw-harness",
-      device: "openclaw-harness",
+      browser: "agent-harness",
+      device: "agent-harness",
     },
   };
 }
@@ -278,7 +300,7 @@ async function handleInteractionCreate(args, payload) {
   if (!content || !userId || !channelId) {
     const ackStatus = await acknowledgeInteraction(
       interaction,
-      "This Discord interaction type is not supported by the OpenClaw harness yet.",
+      "This Discord interaction type is not supported by the agent harness yet.",
     );
     return {
       ackStatus,
@@ -290,7 +312,7 @@ async function handleInteractionCreate(args, payload) {
 
   const ackStatus = await acknowledgeInteraction(
     interaction,
-    "Routing this through OpenClaw. Reply will appear in this channel.",
+    "Routing this through the agent harness. Reply will appear in this channel.",
   );
   const syntheticPayload = {
     t: "MESSAGE_CREATE",
@@ -317,6 +339,285 @@ async function handleInteractionCreate(args, payload) {
     status: result.status,
     reason: "Discord interaction normalized into channel-run-once",
   };
+}
+
+function startDmPollFallback(args, token) {
+  if (typeof fetch !== "function") {
+    writeGatewayLog(args, "dm-poll-disabled", { reason: "fetch unavailable" });
+    return null;
+  }
+  const state = { targets: null, running: false };
+  const intervalMs = Number.isFinite(args.dmPollMs) && args.dmPollMs > 0 ? args.dmPollMs : 5000;
+  const tick = async () => {
+    if (state.running) {
+      return;
+    }
+    state.running = true;
+    try {
+      if (!state.targets) {
+        state.targets = await loadDmPollTargets(args, token);
+        writeGatewayLog(args, "dm-poll-targets", { targets: state.targets.length });
+      }
+      const handled = await pollDmTargets(args, token, state.targets);
+      if (handled > 0) {
+        writeLoopHeartbeat(args, "dm-poll", `Discord DM HTTP poll handled=${handled}`);
+      }
+    } catch (error) {
+      writeGatewayLog(args, "dm-poll-error", { reason: error.message || String(error) });
+    } finally {
+      state.running = false;
+    }
+  };
+  void tick();
+  return setInterval(() => {
+    void tick();
+  }, intervalMs);
+}
+
+async function loadDmPollTargets(args, token) {
+  const byUser = new Map();
+  const probeTarget = readLatestDmProbeTarget(args);
+  if (probeTarget?.userId || probeTarget?.channelId) {
+    byUser.set(probeTarget.userId || `channel:${probeTarget.channelId}`, probeTarget);
+  }
+  for (const userId of readAllowedDiscordUserIds(args)) {
+    if (!byUser.has(userId)) {
+      byUser.set(userId, { userId, channelId: null });
+    }
+  }
+
+  const targets = [];
+  for (const target of byUser.values()) {
+    let channelId = target.channelId;
+    if (!channelId && target.userId) {
+      try {
+        channelId = await createDiscordDmChannel(token, target.userId);
+      } catch (error) {
+        writeGatewayLog(args, "dm-poll-target-error", {
+          userId: target.userId,
+          reason: error.message || String(error),
+        });
+        continue;
+      }
+    }
+    if (channelId) {
+      targets.push({ userId: target.userId ?? null, channelId });
+    }
+  }
+  return targets;
+}
+
+async function pollDmTargets(args, token, targets) {
+  let handled = 0;
+  const cursors = readDmPollCursors(args);
+  for (const target of targets) {
+    const cursor = cursors[target.channelId] ?? null;
+    const initialized = Boolean(cursor?.initialized);
+    const after = cursor?.lastMessageId || null;
+    const messages = await fetchDiscordChannelMessages(
+      token,
+      target.channelId,
+      args.dmPollLimit,
+      after,
+    );
+
+    if (!initialized) {
+      const newest = newestMessageId(messages);
+      cursors[target.channelId] = {
+        initialized: true,
+        lastMessageId: newest,
+        userId: target.userId,
+        updatedAt: new Date().toISOString(),
+      };
+      writeDmPollCursors(args, cursors);
+      writeGatewayLog(args, "dm-poll-initialized", {
+        channelId: target.channelId,
+        userId: target.userId,
+        latestMessageId: newest,
+      });
+      continue;
+    }
+
+    let latestSeen = after;
+    const ordered = [...messages].sort((a, b) => compareDiscordSnowflakes(a.id, b.id));
+    for (const message of ordered) {
+      if (!message?.id) {
+        continue;
+      }
+      latestSeen = maxDiscordSnowflake(latestSeen, message.id);
+      if (message.author?.bot || !String(message.content || "").trim()) {
+        continue;
+      }
+      const payload = { t: "MESSAGE_CREATE", d: message };
+      const result = runHarnessForEvent(args, payload);
+      handled += 1;
+      writeGatewayLog(args, "message-create", {
+        source: "http-poll",
+        messageId: message.id,
+        channelId: message.channel_id,
+        guildId: message.guild_id ?? null,
+        contentLength: typeof message.content === "string" ? message.content.length : null,
+        status: result.status,
+      });
+    }
+    cursors[target.channelId] = {
+      initialized: true,
+      lastMessageId: latestSeen,
+      userId: target.userId,
+      updatedAt: new Date().toISOString(),
+    };
+    writeDmPollCursors(args, cursors);
+  }
+  return handled;
+}
+
+function readLatestDmProbeTarget(args) {
+  const file = path.join(args.harnessHome, "state", "channels", "discord-dm-probe.json");
+  try {
+    const value = JSON.parse(fs.readFileSync(file, "utf8"));
+    return {
+      userId: typeof value.userId === "string" ? value.userId : null,
+      channelId: typeof value.channelId === "string" ? value.channelId : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function readAllowedDiscordUserIds(args) {
+  const values = [];
+  for (const key of ["OPENCLAW_DISCORD_ALLOWED_USER_IDS", "DISCORD_ALLOWED_USER_IDS"]) {
+    if (process.env[key]) {
+      values.push(process.env[key]);
+    }
+  }
+  const secrets = readHarnessSecretEnv(args);
+  for (const key of ["OPENCLAW_DISCORD_ALLOWED_USER_IDS", "DISCORD_ALLOWED_USER_IDS"]) {
+    if (secrets[key]) {
+      values.push(secrets[key]);
+    }
+  }
+  return [...new Set(values.flatMap(parseIdList).filter(Boolean))];
+}
+
+function readHarnessSecretEnv(args) {
+  const file = path.join(args.harnessHome, "secrets", "channel-credentials.env");
+  const values = {};
+  let text = "";
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return values;
+  }
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || !line.includes("=")) {
+      continue;
+    }
+    const index = line.indexOf("=");
+    const key = line.slice(0, index).trim();
+    let value = line.slice(index + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    values[key] = value;
+  }
+  return values;
+}
+
+function parseIdList(value) {
+  return String(value)
+    .split(/[\s,;]+/)
+    .map((item) => item.trim().replace(/^['"]|['"]$/g, ""))
+    .filter(Boolean);
+}
+
+async function createDiscordDmChannel(token, userId) {
+  const response = await discordApi(token, "/users/@me/channels", {
+    method: "POST",
+    body: JSON.stringify({ recipient_id: userId }),
+  });
+  const value = await response.json();
+  if (!value?.id) {
+    throw new Error("Discord create DM response did not include a channel id");
+  }
+  return value.id;
+}
+
+async function fetchDiscordChannelMessages(token, channelId, limit, after) {
+  const safeLimit =
+    Number.isFinite(limit) && limit > 0 ? Math.max(1, Math.min(Math.trunc(limit), 100)) : 20;
+  const query = new URLSearchParams({ limit: String(safeLimit) });
+  if (after) {
+    query.set("after", after);
+  }
+  const response = await discordApi(token, `/channels/${channelId}/messages?${query}`);
+  const value = await response.json();
+  return Array.isArray(value) ? value : [];
+}
+
+async function discordApi(token, route, init = {}) {
+  const normalized = String(token).replace(/^Bot\s+/i, "");
+  const headers = {
+    authorization: `Bot ${normalized}`,
+    ...(init.body ? { "content-type": "application/json" } : {}),
+    ...(init.headers || {}),
+  };
+  const response = await fetch(`${DISCORD_API_BASE}${route}`, { ...init, headers });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`Discord HTTP ${response.status}: ${body}`);
+  }
+  return response;
+}
+
+function dmPollCursorsFile(args) {
+  return path.join(args.harnessHome, "state", "channels", "discord-dm-poll-cursors.json");
+}
+
+function readDmPollCursors(args) {
+  try {
+    return JSON.parse(fs.readFileSync(dmPollCursorsFile(args), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function writeDmPollCursors(args, cursors) {
+  const file = dmPollCursorsFile(args);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(cursors, null, 2)}\n`);
+}
+
+function newestMessageId(messages) {
+  let latest = null;
+  for (const message of messages) {
+    latest = maxDiscordSnowflake(latest, message?.id || null);
+  }
+  return latest;
+}
+
+function maxDiscordSnowflake(left, right) {
+  if (!left) {
+    return right || null;
+  }
+  if (!right) {
+    return left;
+  }
+  return compareDiscordSnowflakes(left, right) >= 0 ? left : right;
+}
+
+function compareDiscordSnowflakes(left, right) {
+  try {
+    const a = BigInt(left);
+    const b = BigInt(right);
+    return a === b ? 0 : a > b ? 1 : -1;
+  } catch {
+    return String(left).localeCompare(String(right));
+  }
 }
 
 async function acknowledgeInteraction(interaction, content) {

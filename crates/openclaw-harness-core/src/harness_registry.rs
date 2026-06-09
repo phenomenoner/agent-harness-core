@@ -377,6 +377,7 @@ mod tests {
                 source: "models.providers".to_string(),
                 has_base_url: false,
                 has_api_key_reference: true,
+                models: vec!["gpt-5".to_string()],
             }],
             plugins: vec![PluginProfile {
                 id: "telegram".to_string(),

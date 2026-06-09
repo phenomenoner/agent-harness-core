@@ -13,17 +13,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use openclaw_harness_core::{
     ActivationReadinessOptions, ActivationReadinessReport, AgentRegistry,
-    BuiltinHarnessSkillSyncOptions, BuiltinHarnessSkillSyncReport, ChannelCommandApplyOptions,
-    ChannelCommandApplyReport, ChannelDeliveryReceipt, ChannelDeliveryRecordOptions,
-    ChannelDeliveryStatus, ChannelOutboxPlanOptions, ChannelOutboxPlanReport,
-    ChannelReceiveOptions, ChannelReceiveReport, ChannelRunOnceOptions, ChannelRunOnceReport,
-    ChannelStep, CodexRuntimeCompletionOptions, CodexRuntimeCompletionReport,
+    BuiltinHarnessSkillSyncOptions, BuiltinHarnessSkillSyncReport, ChannelCommand,
+    ChannelCommandApplyOptions, ChannelCommandApplyReport, ChannelDeliveryReceipt,
+    ChannelDeliveryRecordOptions, ChannelDeliveryStatus, ChannelOutboxPlanOptions,
+    ChannelOutboxPlanReport, ChannelReceiveOptions, ChannelReceiveReport, ChannelRunOnceOptions,
+    ChannelRunOnceReport, ChannelStep, CodexRuntimeCompletionOptions, CodexRuntimeCompletionReport,
     CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReport, CodexRuntimePlanOptions,
     CodexRuntimePlanReport, CodexRuntimePreflightOptions, CodexRuntimePreflightReport,
     CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy, DeterministicCronPlan,
     DeterministicCronPlanInput, DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent,
     HarnessLogLevel, HarnessStatusOptions, HarnessStatusReport, ImportPhaseStatus, ImportReport,
-    MemorySearchOptions, MemorySearchReport, NativeCronPlan, NativeCronPlanInput, OpenClawSource,
+    MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport, MemoryCanvasWorkerStatus,
+    MemoryCredentialsExportOptions, MemoryCredentialsExportReport, MemorySearchOptions,
+    MemorySearchReport, MemoryVectorRecallOptions, MemoryVectorRecallReport,
+    MemoryVectorRecallStatus, NativeCronPlan, NativeCronPlanInput, OpenClawSource,
     PromptAssemblyOptions, PromptBundle, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
     RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeRunOnceOptions,
     RuntimeRunOnceReport, RuntimeRunOnceStatus, SkillIndex, SkillSelectionQuery, SubagentPlan,
@@ -32,16 +35,17 @@ use openclaw_harness_core::{
     assemble_prompt_bundle, build_channel_step, build_dry_run_report, build_harness_skill_index,
     build_import_plan, build_runtime_skill_index, build_source_skill_index, build_turn_plan,
     check_activation_readiness, collect_harness_status, current_log_time_ms, enqueue_channel_step,
-    execute_import, export_harness_registry_files, inventory, load_agent_registry,
-    load_deterministic_cron_store, load_native_cron_store, load_subagent_ledger,
-    plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron, plan_native_cron,
-    plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
-    probe_codex_runtime_launch, receive_channel_message, record_channel_delivery,
-    record_codex_runtime_completion, run_channel_once, run_codex_runtime, run_runtime_queue_once,
-    search_imported_memory, select_skills, sync_builtin_harness_skills, write_channel_step,
-    write_deterministic_cron_plan, write_memory_search_receipt, write_native_cron_plan,
-    write_prompt_bundle, write_report_files, write_skill_index, write_subagent_plan,
-    write_turn_plan, write_windows_supervisor_plan,
+    execute_import, export_harness_registry_files, export_memory_credentials, inventory,
+    load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
+    load_subagent_ledger, parse_channel_command, plan_channel_outbox, plan_codex_runtime,
+    plan_deterministic_cron, plan_native_cron, plan_subagents, preflight_codex_runtime,
+    prepare_runtime_queue_item, probe_codex_runtime_launch, receive_channel_message,
+    record_channel_delivery, record_codex_runtime_completion, run_channel_once, run_codex_runtime,
+    run_memory_canvas_worker, run_runtime_queue_once, search_imported_memory,
+    search_imported_vector_memory, select_skills, sync_builtin_harness_skills, write_channel_step,
+    write_deterministic_cron_plan, write_memory_search_receipt, write_memory_vector_recall_receipt,
+    write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
+    write_subagent_plan, write_turn_plan, write_windows_supervisor_plan,
 };
 
 fn main() {
@@ -59,7 +63,10 @@ fn main() {
         "registry-export" => run_registry_export(&rest),
         "enable-check" => run_enable_check(&rest),
         "status" | "harness-status" => run_harness_status(&rest),
+        "memory-credentials-export" => run_memory_credentials_export(&rest),
         "memory-search" => run_memory_search(&rest),
+        "memory-vector-search" => run_memory_vector_search(&rest),
+        "memory-canvas-run" => run_memory_canvas_run(&rest),
         "supervisor-plan" => run_supervisor_plan(&rest),
         "harness-skills-sync" => run_harness_skills_sync(&rest),
         "skills" => run_skills(&rest),
@@ -76,6 +83,7 @@ fn main() {
         "discord-outbox-send-once" => run_discord_outbox_send_once(&rest),
         "discord-outbox-loop" => run_discord_outbox_loop(&rest),
         "discord-dm-probe" => run_discord_dm_probe(&rest),
+        "discord-dm-history-probe" => run_discord_dm_history_probe(&rest),
         "discord-event-run-once" => run_discord_event_run_once(&rest),
         "discord-gateway-probe" => run_discord_gateway_probe(&rest),
         "discord-gateway-loop" => run_discord_gateway_loop(&rest),
@@ -384,6 +392,127 @@ fn run_memory_search(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn run_memory_credentials_export(args: &[String]) -> Result<(), String> {
+    let args = memory_credentials_export_args_from_args(args)?;
+    let report = export_memory_credentials(MemoryCredentialsExportOptions {
+        source_home: args.openclaw_home,
+        harness_home: args.target_home.clone(),
+        include_sensitive: args.include_sensitive,
+    })
+    .map_err(|err| err.to_string())?;
+    append_harness_log(
+        &args.target_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            HarnessLogLevel::Info,
+            "memory",
+            "memory.credentials-export",
+            format!(
+                "entries={} includeSensitive={} envFile={}",
+                report.entries.len(),
+                yes_no(args.include_sensitive),
+                report.env_file.display()
+            ),
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|err| err.to_string())?
+        );
+    } else {
+        print_memory_credentials_export_report(&report, args.include_sensitive);
+    }
+    Ok(())
+}
+
+fn run_memory_vector_search(args: &[String]) -> Result<(), String> {
+    let args = memory_vector_search_args_from_args(args)?;
+    let report = search_imported_vector_memory(MemoryVectorRecallOptions {
+        harness_home: args.target_home.clone(),
+        query: args.query,
+        limit: args.limit,
+    })
+    .map_err(|err| err.to_string())?;
+    if args.write_receipt {
+        write_memory_vector_recall_receipt(&report).map_err(|err| err.to_string())?;
+    }
+    append_harness_log(
+        &args.target_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            if matches!(
+                report.status,
+                MemoryVectorRecallStatus::Ready | MemoryVectorRecallStatus::NoHits
+            ) {
+                HarnessLogLevel::Info
+            } else {
+                HarnessLogLevel::Warn
+            },
+            "memory",
+            "memory.vector-search",
+            format!(
+                "status={:?} hits={} backend={} dim={}",
+                report.status,
+                report.hits.len(),
+                report.backend,
+                report.query_embedding_dim
+            ),
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    if args.json {
+        print_memory_vector_report_json(&report)?;
+    } else {
+        print_memory_vector_report(&report);
+    }
+    match report.status {
+        MemoryVectorRecallStatus::Ready | MemoryVectorRecallStatus::NoHits => Ok(()),
+        MemoryVectorRecallStatus::Skipped | MemoryVectorRecallStatus::Failed => Err(report.reason),
+    }
+}
+
+fn run_memory_canvas_run(args: &[String]) -> Result<(), String> {
+    let args = memory_canvas_run_args_from_args(args)?;
+    let report = run_memory_canvas_worker(MemoryCanvasWorkerOptions {
+        harness_home: args.target_home.clone(),
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+    })
+    .map_err(|err| err.to_string())?;
+    append_harness_log(
+        &args.target_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            if report.status == MemoryCanvasWorkerStatus::Failed {
+                HarnessLogLevel::Warn
+            } else {
+                HarnessLogLevel::Info
+            },
+            "memory",
+            "memory.canvas-run",
+            format!(
+                "status={:?} candidates={} episodes={}",
+                report.status, report.candidates_read, report.episodes_read
+            ),
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|err| err.to_string())?
+        );
+    } else {
+        print_memory_canvas_report(&report);
+    }
+    if report.status == MemoryCanvasWorkerStatus::Failed {
+        Err(report.reason)
+    } else {
+        Ok(())
+    }
+}
+
 fn run_supervisor_plan(args: &[String]) -> Result<(), String> {
     let args = supervisor_plan_args_from_args(args)?;
     let report = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
@@ -486,6 +615,7 @@ fn run_turn_plan(args: &[String]) -> Result<(), String> {
             channel_id: args.channel_id,
             user_id: args.user_id,
             text: args.message,
+            inbound_context: None,
             requested_agent_id: args.agent_id,
             session_hint: args.session_key,
             skill_limit: args.skill_limit,
@@ -521,6 +651,7 @@ fn run_channel_step(args: &[String]) -> Result<(), String> {
             channel_id: args.channel_id,
             user_id: args.user_id,
             text: args.message,
+            inbound_context: None,
             requested_agent_id: args.agent_id,
             session_hint: args.session_key,
             skill_limit: args.skill_limit,
@@ -554,6 +685,7 @@ fn run_channel_apply(args: &[String]) -> Result<(), String> {
             channel_id: args.turn.channel_id,
             user_id: args.turn.user_id,
             text: args.turn.message,
+            inbound_context: None,
             requested_agent_id: args.turn.agent_id,
             session_hint: args.turn.session_key,
             skill_limit: args.turn.skill_limit,
@@ -589,6 +721,7 @@ fn run_channel_receive(args: &[String]) -> Result<(), String> {
         agent_id: args.turn.agent_id,
         session_key: args.turn.session_key,
         message: args.turn.message,
+        inbound_context: None,
         skill_limit: args.turn.skill_limit,
         now_ms: args.now_ms,
     })
@@ -610,6 +743,7 @@ fn run_channel_run_once(args: &[String]) -> Result<(), String> {
         agent_id: args.turn.agent_id,
         session_key: args.turn.session_key,
         message: args.turn.message,
+        inbound_context: None,
         skill_limit: args.turn.skill_limit,
         now_ms: args.now_ms,
         codex_executable: args.codex_exe,
@@ -913,7 +1047,8 @@ fn execute_telegram_poll_once(
             write_telegram_offset(&offset_file, next_offset)?;
             continue;
         };
-        let Some(text) = message.get("text").and_then(serde_json::Value::as_str) else {
+        let inbound_context = telegram_inbound_context(message);
+        let Some(text) = telegram_message_text(message, inbound_context.is_some()) else {
             skipped_updates += 1;
             write_telegram_offset(&offset_file, next_offset)?;
             continue;
@@ -937,12 +1072,22 @@ fn execute_telegram_poll_once(
             .get("chat")
             .and_then(|chat| chat.get("type"))
             .and_then(serde_json::Value::as_str);
-        if let ChannelAccessDecision::Denied(reason) =
-            telegram_access_decision(&access_policy, &chat_id, &user_id, chat_type)
-        {
+        let permission =
+            match telegram_access_decision(&access_policy, &chat_id, &user_id, chat_type) {
+                ChannelAccessDecision::Allowed(permission) => permission,
+                ChannelAccessDecision::Denied(reason) => {
+                    skipped_updates += 1;
+                    warnings.push(format!(
+                        "Telegram update {update_id} denied by channel access policy: {reason}"
+                    ));
+                    write_telegram_offset(&offset_file, next_offset)?;
+                    continue;
+                }
+            };
+        if let Err(reason) = channel_permission_allows_text(permission, &text) {
             skipped_updates += 1;
             warnings.push(format!(
-                "Telegram update {update_id} denied by imported channel allow-list: {reason}"
+                "Telegram update {update_id} denied by channel command permission: {reason}"
             ));
             write_telegram_offset(&offset_file, next_offset)?;
             continue;
@@ -961,7 +1106,8 @@ fn execute_telegram_poll_once(
             user_id,
             agent_id: telegram_effective_agent_id(args),
             session_key: None,
-            message: text.to_string(),
+            message: text,
+            inbound_context,
             skill_limit: args.skill_limit,
             now_ms: current_time_ms()?,
             codex_executable: args.codex_exe.clone(),
@@ -1059,6 +1205,227 @@ fn execute_telegram_poll_once(
     )
     .map_err(|err| err.to_string())?;
     Ok(report)
+}
+
+fn telegram_message_text(message: &serde_json::Value, has_inbound_context: bool) -> Option<String> {
+    telegram_text_or_caption(message)
+        .map(ToString::to_string)
+        .or_else(|| {
+            (has_inbound_context || telegram_has_media(message))
+                .then(|| "[telegram media message]".to_string())
+        })
+}
+
+fn telegram_text_or_caption(message: &serde_json::Value) -> Option<&str> {
+    message
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| message.get("caption").and_then(serde_json::Value::as_str))
+}
+
+const REPLY_CONTEXT_PREVIEW_MAX_CHARS: usize = 700;
+const REPLY_CONTEXT_FULL_TEXT_MAX_CHARS: usize = 4000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundedText {
+    text: String,
+    source_chars: usize,
+    truncated: bool,
+}
+
+fn telegram_inbound_context(message: &serde_json::Value) -> Option<String> {
+    let mut sections = Vec::new();
+    if let Some(reply) = message.get("reply_to_message") {
+        let mut lines = Vec::new();
+        lines.push("## ReferencedMessage: Telegram reply context".to_string());
+        if let Some(message_id) = reply.get("message_id").and_then(telegram_id_string) {
+            lines.push(format!("- messageId: {message_id}"));
+        }
+        if let Some(user_id) = reply
+            .get("from")
+            .and_then(|from| from.get("id"))
+            .and_then(telegram_id_string)
+        {
+            lines.push(format!("- authorUserId: {user_id}"));
+        }
+        if let Some(date) = reply.get("date").and_then(serde_json::Value::as_i64) {
+            lines.push(format!("- unixDate: {date}"));
+        }
+        if let Some(text) = telegram_text_or_caption(reply) {
+            let preview = compact_preview_text(text, REPLY_CONTEXT_PREVIEW_MAX_CHARS);
+            let full_text = bounded_text(text, REPLY_CONTEXT_FULL_TEXT_MAX_CHARS);
+            lines.push(format!(
+                "- textPreview: {}",
+                compact_preview_display(&preview)
+            ));
+            lines.push(format!("- textLength: {}", full_text.source_chars));
+            lines.push(format!("- textTruncated: {}", full_text.truncated));
+            lines.push(format!(
+                "- textMaxChars: {}",
+                REPLY_CONTEXT_FULL_TEXT_MAX_CHARS
+            ));
+            lines.push("- textSource: telegram.reply_to_message".to_string());
+            push_indented_text_block(&mut lines, "text", &full_text.text);
+        } else {
+            lines.push("- textAvailable: false".to_string());
+        }
+        sections.push(lines.join("\n"));
+    }
+
+    let media_lines = telegram_media_context_lines(message);
+    if !media_lines.is_empty() {
+        sections.push(format!(
+            "## InboundMedia: Telegram attachments\n{}",
+            media_lines.join("\n")
+        ));
+    }
+
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
+}
+
+fn telegram_has_media(message: &serde_json::Value) -> bool {
+    message.as_object().is_some_and(|object| {
+        TELEGRAM_MEDIA_FIELDS
+            .iter()
+            .any(|field| object.contains_key(*field))
+    })
+}
+
+const TELEGRAM_MEDIA_FIELDS: &[&str] = &[
+    "photo",
+    "document",
+    "video",
+    "audio",
+    "voice",
+    "sticker",
+    "animation",
+    "video_note",
+];
+
+fn telegram_media_context_lines(message: &serde_json::Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(photos) = message.get("photo").and_then(serde_json::Value::as_array) {
+        let largest = photos.iter().max_by_key(|photo| {
+            photo
+                .get("file_size")
+                .and_then(serde_json::Value::as_i64)
+                .or_else(|| photo.get("width").and_then(serde_json::Value::as_i64))
+                .unwrap_or(0)
+        });
+        let mut parts = vec![
+            "kind=photo".to_string(),
+            format!("variants={}", photos.len()),
+            format!("fileIdPresent={}", yes_no(true)),
+        ];
+        if let Some(largest) = largest {
+            push_json_i64_part(&mut parts, largest, "width");
+            push_json_i64_part(&mut parts, largest, "height");
+            push_json_i64_part(&mut parts, largest, "file_size");
+        }
+        lines.push(format!("- {}", parts.join(" ")));
+    }
+
+    for kind in TELEGRAM_MEDIA_FIELDS
+        .iter()
+        .copied()
+        .filter(|kind| *kind != "photo")
+    {
+        if let Some(value) = message.get(kind) {
+            let mut parts = vec![
+                format!("kind={kind}"),
+                format!("fileIdPresent={}", yes_no(value.get("file_id").is_some())),
+            ];
+            push_json_i64_part(&mut parts, value, "width");
+            push_json_i64_part(&mut parts, value, "height");
+            push_json_i64_part(&mut parts, value, "duration");
+            push_json_i64_part(&mut parts, value, "file_size");
+            push_json_string_preview_part(&mut parts, value, "mime_type", 160);
+            push_json_string_preview_part(&mut parts, value, "file_name", 240);
+            lines.push(format!("- {}", parts.join(" ")));
+        }
+    }
+
+    if let Some(caption) = message.get("caption").and_then(serde_json::Value::as_str) {
+        lines.push(format!(
+            "- captionPreview: {}",
+            compact_preview(caption, REPLY_CONTEXT_PREVIEW_MAX_CHARS)
+        ));
+    }
+    lines
+}
+
+fn push_json_i64_part(parts: &mut Vec<String>, value: &serde_json::Value, key: &str) {
+    if let Some(number) = value.get(key).and_then(serde_json::Value::as_i64) {
+        parts.push(format!("{key}={number}"));
+    }
+}
+
+fn push_json_string_preview_part(
+    parts: &mut Vec<String>,
+    value: &serde_json::Value,
+    key: &str,
+    max_chars: usize,
+) {
+    if let Some(text) = value.get(key).and_then(serde_json::Value::as_str) {
+        parts.push(format!("{key}={}", compact_preview(text, max_chars)));
+    }
+}
+
+fn bounded_text(value: &str, max_chars: usize) -> BoundedText {
+    let source_chars = value.chars().count();
+    let text = value.chars().take(max_chars).collect::<String>();
+    BoundedText {
+        text,
+        source_chars,
+        truncated: source_chars > max_chars,
+    }
+}
+
+fn compact_preview_text(value: &str, max_chars: usize) -> BoundedText {
+    let source_chars = value.chars().count();
+    let mut out = String::new();
+    let mut truncated = false;
+    for (index, ch) in value.chars().enumerate() {
+        if index >= max_chars {
+            truncated = true;
+            break;
+        }
+        if ch == '\r' || ch == '\n' || ch == '\t' {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    let text = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    BoundedText {
+        text,
+        source_chars,
+        truncated,
+    }
+}
+
+fn compact_preview(value: &str, max_chars: usize) -> String {
+    let preview = compact_preview_text(value, max_chars);
+    compact_preview_display(&preview)
+}
+
+fn compact_preview_display(preview: &BoundedText) -> String {
+    if preview.truncated {
+        format!("{}...", preview.text)
+    } else {
+        preview.text.clone()
+    }
+}
+
+fn push_indented_text_block(lines: &mut Vec<String>, field: &str, text: &str) {
+    lines.push(format!("- {field}:"));
+    if text.is_empty() {
+        lines.push("  ".to_string());
+        return;
+    }
+    for line in text.lines() {
+        lines.push(format!("  {line}"));
+    }
 }
 
 fn run_discord_outbox_send_once(args: &[String]) -> Result<(), String> {
@@ -1189,6 +1556,134 @@ fn run_discord_dm_probe(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn run_discord_dm_history_probe(args: &[String]) -> Result<(), String> {
+    let args = discord_dm_history_probe_args_from_args(args)?;
+    let token = discord_bot_token(&args.target_home)?;
+    let report = execute_discord_dm_history_probe(&args, &token);
+    write_discord_dm_history_probe_report(&report)?;
+    append_harness_log(
+        &args.target_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            if report.status == "ready" {
+                HarnessLogLevel::Info
+            } else {
+                HarnessLogLevel::Warn
+            },
+            "discord",
+            "discord.dm-history-probe",
+            report.reason.clone(),
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    print_discord_dm_history_probe_report(&report);
+    if report.status == "ready" {
+        Ok(())
+    } else {
+        Err(report.reason)
+    }
+}
+
+fn execute_discord_dm_history_probe(
+    args: &DiscordDmHistoryProbeArgs,
+    token: &str,
+) -> DiscordDmHistoryProbeReport {
+    let mut warnings = Vec::new();
+    let probe = if args.channel_id.is_none() || args.user_id.is_none() {
+        match latest_discord_dm_probe(&args.target_home) {
+            Ok(probe) => probe,
+            Err(error) => {
+                return DiscordDmHistoryProbeReport {
+                    harness_home: args.target_home.clone(),
+                    status: "failed".to_string(),
+                    reason: error,
+                    channel_id: args.channel_id.clone(),
+                    user_id: args.user_id.clone(),
+                    limit: args.limit,
+                    message_count: 0,
+                    user_message_count: 0,
+                    bot_message_count: 0,
+                    messages: Vec::new(),
+                    warnings,
+                };
+            }
+        }
+    } else {
+        DiscordDmProbeRef::default()
+    };
+    let channel_id = args
+        .channel_id
+        .clone()
+        .or(probe.channel_id)
+        .unwrap_or_default();
+    let user_id = args.user_id.clone().or(probe.user_id);
+    if channel_id.trim().is_empty() {
+        return DiscordDmHistoryProbeReport {
+            harness_home: args.target_home.clone(),
+            status: "failed".to_string(),
+            reason: "Discord DM channel id was not provided and latest discord-dm-probe has no channel id"
+                .to_string(),
+            channel_id: None,
+            user_id,
+            limit: args.limit,
+            message_count: 0,
+            user_message_count: 0,
+            bot_message_count: 0,
+            messages: Vec::new(),
+            warnings,
+        };
+    }
+
+    let messages = match discord_fetch_channel_messages(token, &channel_id, args.limit) {
+        Ok(messages) => messages,
+        Err(error) => {
+            return DiscordDmHistoryProbeReport {
+                harness_home: args.target_home.clone(),
+                status: "failed".to_string(),
+                reason: format!("failed to read Discord DM channel messages: {error}"),
+                channel_id: Some(channel_id),
+                user_id,
+                limit: args.limit,
+                message_count: 0,
+                user_message_count: 0,
+                bot_message_count: 0,
+                messages: Vec::new(),
+                warnings,
+            };
+        }
+    };
+    let message_count = messages.len();
+    let bot_message_count = messages
+        .iter()
+        .filter(|message| message.author_bot.unwrap_or(false))
+        .count();
+    let user_message_count = messages
+        .iter()
+        .filter(|message| !message.author_bot.unwrap_or(false))
+        .count();
+    if user_message_count == 0 {
+        warnings.push(
+            "Discord DM history was readable but no non-bot messages were found in the sampled window"
+                .to_string(),
+        );
+    }
+    DiscordDmHistoryProbeReport {
+        harness_home: args.target_home.clone(),
+        status: "ready".to_string(),
+        reason: format!(
+            "Discord DM history was readable; messages={message_count}, userMessages={user_message_count}, botMessages={bot_message_count}"
+        ),
+        channel_id: Some(channel_id),
+        user_id,
+        limit: args.limit,
+        message_count,
+        user_message_count,
+        bot_message_count,
+        messages,
+        warnings,
+    }
+}
+
 fn execute_discord_dm_probe(args: &DiscordDmProbeArgs, token: &str) -> DiscordDmProbeReport {
     let mut warnings = Vec::new();
     let channel_id = match discord_create_dm_channel(token, &args.user_id) {
@@ -1262,7 +1757,11 @@ fn execute_discord_outbox_send_once(
     let mut failed_deliveries = 0;
 
     for pending in delivery.pending {
-        match discord_send_message(&token, &pending.message.channel_id, &pending.message.text) {
+        match discord_send_message_chunks(
+            &token,
+            &pending.message.channel_id,
+            &pending.message.text,
+        ) {
             Ok(provider_message_id) => {
                 record_channel_delivery(ChannelDeliveryRecordOptions {
                     harness_home: args.target_home.clone(),
@@ -1356,7 +1855,7 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
             write_discord_event_receipt(&report)?;
             report
         }
-        Some(message) if message.content.trim().is_empty() => {
+        Some(message) if message.content.trim().is_empty() && message.inbound_context.is_none() => {
             let report = DiscordEventRunOnceReport {
                 harness_home: args.target_home.clone(),
                 status: "skipped".to_string(),
@@ -1371,10 +1870,9 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
             report
         }
         Some(message) => {
-            let report = if let ChannelAccessDecision::Denied(reason) =
-                discord_access_decision(&access_policy, &message)
-            {
-                DiscordEventRunOnceReport {
+            let message_text = discord_message_text(&message);
+            let report = match discord_access_decision(&access_policy, &message) {
+                ChannelAccessDecision::Denied(reason) => DiscordEventRunOnceReport {
                     harness_home: args.target_home.clone(),
                     status: "denied".to_string(),
                     reason,
@@ -1383,64 +1881,86 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
                     channel_id: Some(message.channel_id),
                     user_id: Some(message.user_id),
                     run: None,
-                }
-            } else if discord_event_seen(&args.target_home, &message.message_id)? {
-                DiscordEventRunOnceReport {
-                    harness_home: args.target_home.clone(),
-                    status: "duplicate".to_string(),
-                    reason: "message id already has a Discord event receipt".to_string(),
-                    message_id: Some(message.message_id),
-                    guild_id: message.guild_id,
-                    channel_id: Some(message.channel_id),
-                    user_id: Some(message.user_id),
-                    run: None,
-                }
-            } else {
-                if let Ok(token) = discord_bot_token(&args.target_home)
-                    && let Err(error) = discord_send_typing(&token, &message.channel_id)
-                {
-                    let _ = append_harness_log(
-                        &args.target_home,
-                        &HarnessLogEvent::new(
-                            current_log_time_ms().unwrap_or(0),
-                            HarnessLogLevel::Warn,
-                            "discord",
-                            "discord.typing-failed",
-                            error,
-                        ),
-                    );
-                }
-                let run = run_channel_once(ChannelRunOnceOptions {
-                    source: args.source.clone(),
-                    runtime_workspace: args.runtime_workspace.clone(),
-                    harness_home: args.target_home.clone(),
-                    platform: "discord".to_string(),
-                    channel_id: message.channel_id.clone(),
-                    user_id: message.user_id.clone(),
-                    agent_id: args.agent_id.clone(),
-                    session_key: None,
-                    message: message.content.clone(),
-                    skill_limit: args.skill_limit,
-                    now_ms: current_time_ms()?,
-                    codex_executable: args.codex_exe.clone(),
-                    timeout_ms: args.timeout_ms,
-                    prompt_options: PromptAssemblyOptions {
-                        harness_home: Some(args.target_home.clone()),
-                        ..PromptAssemblyOptions::default()
-                    },
-                    outbox_limit: args.outbox_limit,
-                    run_runtime: false,
-                })
-                .map_err(|err| err.to_string())?;
-                DiscordEventRunOnceReport {
-                    harness_home: args.target_home.clone(),
-                    status: "handled".to_string(),
-                    reason: "Discord message normalized into channel-run-once".to_string(),
-                    message_id: Some(message.message_id),
-                    guild_id: message.guild_id,
-                    channel_id: Some(message.channel_id),
-                    user_id: Some(message.user_id),
-                    run: Some(run),
+                },
+                ChannelAccessDecision::Allowed(permission) => {
+                    if let Err(reason) = channel_permission_allows_text(permission, &message_text) {
+                        DiscordEventRunOnceReport {
+                            harness_home: args.target_home.clone(),
+                            status: "denied".to_string(),
+                            reason,
+                            message_id: Some(message.message_id),
+                            guild_id: message.guild_id,
+                            channel_id: Some(message.channel_id),
+                            user_id: Some(message.user_id),
+                            run: None,
+                        }
+                    } else if discord_event_seen(&args.target_home, &message.message_id)? {
+                        DiscordEventRunOnceReport {
+                            harness_home: args.target_home.clone(),
+                            status: "duplicate".to_string(),
+                            reason: "message id already has a Discord event receipt".to_string(),
+                            message_id: Some(message.message_id),
+                            guild_id: message.guild_id,
+                            channel_id: Some(message.channel_id),
+                            user_id: Some(message.user_id),
+                            run: None,
+                        }
+                    } else {
+                        if let Ok(token) = discord_bot_token(&args.target_home)
+                            && let Err(error) = discord_send_typing(&token, &message.channel_id)
+                        {
+                            let _ = append_harness_log(
+                                &args.target_home,
+                                &HarnessLogEvent::new(
+                                    current_log_time_ms().unwrap_or(0),
+                                    HarnessLogLevel::Warn,
+                                    "discord",
+                                    "discord.typing-failed",
+                                    error,
+                                ),
+                            );
+                        }
+                        let run = run_channel_once(ChannelRunOnceOptions {
+                            source: args.source.clone(),
+                            runtime_workspace: args.runtime_workspace.clone(),
+                            harness_home: args.target_home.clone(),
+                            platform: "discord".to_string(),
+                            channel_id: message.channel_id.clone(),
+                            user_id: message.user_id.clone(),
+                            agent_id: args.agent_id.clone(),
+                            session_key: None,
+                            message: message_text,
+                            inbound_context: message.inbound_context.clone(),
+                            skill_limit: args.skill_limit,
+                            now_ms: current_time_ms()?,
+                            codex_executable: args.codex_exe.clone(),
+                            timeout_ms: args.timeout_ms,
+                            prompt_options: PromptAssemblyOptions {
+                                harness_home: Some(args.target_home.clone()),
+                                ..PromptAssemblyOptions::default()
+                            },
+                            outbox_limit: args.outbox_limit,
+                            run_runtime: false,
+                        })
+                        .map_err(|err| err.to_string())?;
+                        if message.reply_context.is_some() {
+                            write_discord_reply_context_receipt(
+                                &args.target_home,
+                                &message,
+                                "captured",
+                            )?;
+                        }
+                        DiscordEventRunOnceReport {
+                            harness_home: args.target_home.clone(),
+                            status: "handled".to_string(),
+                            reason: "Discord message normalized into channel-run-once".to_string(),
+                            message_id: Some(message.message_id),
+                            guild_id: message.guild_id,
+                            channel_id: Some(message.channel_id),
+                            user_id: Some(message.user_id),
+                            run: Some(run),
+                        }
+                    }
                 }
             };
             write_discord_event_receipt(&report)?;
@@ -1478,7 +1998,7 @@ fn run_discord_gateway_probe(args: &[String]) -> Result<(), String> {
                 args.node_exe.display()
             )
         })?;
-    println!("OpenClaw Discord gateway probe");
+    println!("Agent Harness Discord gateway probe");
     println!("Harness home: {}", args.target_home.display());
     println!("Node executable: {}", args.node_exe.display());
     println!("Gateway script: {}", args.gateway_script.display());
@@ -1688,7 +2208,7 @@ fn run_plugin_sidecar_probe(args: &[String]) -> Result<(), String> {
             )
         })?;
 
-    println!("OpenClaw plugin sidecar probe");
+    println!("Agent Harness plugin sidecar probe");
     println!("Harness home: {}", args.target_home.display());
     println!("Node executable: {}", args.node_exe.display());
     println!("Sidecar script: {}", args.sidecar_script.display());
@@ -1776,7 +2296,7 @@ fn run_plugin_sidecar_call(args: &[String]) -> Result<(), String> {
         stderr.trim(),
     )?;
 
-    println!("OpenClaw plugin sidecar call");
+    println!("Agent Harness plugin sidecar call");
     println!("Harness home: {}", args.target_home.display());
     println!("Node executable: {}", args.node_exe.display());
     println!("Sidecar script: {}", args.sidecar_script.display());
@@ -1810,6 +2330,7 @@ fn run_queue_enqueue(args: &[String]) -> Result<(), String> {
             channel_id: args.turn.channel_id,
             user_id: args.turn.user_id,
             text: args.turn.message,
+            inbound_context: None,
             requested_agent_id: args.turn.agent_id,
             session_hint: args.turn.session_key,
             skill_limit: args.turn.skill_limit,
@@ -2132,6 +2653,7 @@ fn run_prompt_bundle(args: &[String]) -> Result<(), String> {
             channel_id: args.channel_id,
             user_id: args.user_id,
             text: args.message,
+            inbound_context: None,
             requested_agent_id: args.agent_id,
             session_hint: args.session_key,
             skill_limit: args.skill_limit,
@@ -2322,6 +2844,26 @@ struct MemorySearchArgs {
     write_receipt: bool,
 }
 
+struct MemoryCredentialsExportArgs {
+    openclaw_home: PathBuf,
+    target_home: PathBuf,
+    include_sensitive: bool,
+    json: bool,
+}
+
+struct MemoryVectorSearchArgs {
+    target_home: PathBuf,
+    query: String,
+    limit: usize,
+    json: bool,
+    write_receipt: bool,
+}
+
+struct MemoryCanvasRunArgs {
+    target_home: PathBuf,
+    json: bool,
+}
+
 struct SupervisorPlanArgs {
     target_home: PathBuf,
     openclaw_home: PathBuf,
@@ -2453,19 +2995,31 @@ struct TelegramPollOnceReport {
 
 #[derive(Debug, Clone, Default)]
 struct ChannelAccessPolicy {
+    telegram_admin_user_ids: BTreeSet<String>,
     telegram_allowed_user_ids: BTreeSet<String>,
+    telegram_group_admin_user_ids: BTreeSet<String>,
     telegram_group_allowed_user_ids: BTreeSet<String>,
     telegram_direct_chat_ids: BTreeSet<String>,
     telegram_group_chat_ids: BTreeSet<String>,
+    telegram_group_open: bool,
+    discord_admin_user_ids: BTreeSet<String>,
     discord_allowed_user_ids: BTreeSet<String>,
+    discord_group_allowed_user_ids: BTreeSet<String>,
     discord_channel_ids: BTreeSet<String>,
     discord_guild_ids: BTreeSet<String>,
+    discord_group_open: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChannelAccessDecision {
-    Allowed,
+    Allowed(ChannelPermission),
     Denied(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelPermission {
+    Admin,
+    Limited,
 }
 
 struct TelegramLoopArgs {
@@ -2496,6 +3050,13 @@ struct DiscordDmProbeArgs {
     message: String,
 }
 
+struct DiscordDmHistoryProbeArgs {
+    target_home: PathBuf,
+    channel_id: Option<String>,
+    user_id: Option<String>,
+    limit: usize,
+}
+
 struct DiscordEventRunOnceArgs {
     source: OpenClawSource,
     runtime_workspace: Option<PathBuf>,
@@ -2515,7 +3076,26 @@ struct DiscordGatewayMessage {
     channel_id: String,
     user_id: String,
     content: String,
+    inbound_context: Option<String>,
+    reply_context: Option<DiscordReplyContext>,
     author_is_bot: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscordReplyContext {
+    referenced_message_id: Option<String>,
+    referenced_channel_id: Option<String>,
+    referenced_guild_id: Option<String>,
+    referenced_author_id: Option<String>,
+    referenced_text_preview: Option<String>,
+    referenced_preview_length: Option<usize>,
+    referenced_preview_truncated: Option<bool>,
+    referenced_text: Option<BoundedText>,
+    has_attachments: bool,
+    attachment_count: usize,
+    embeds_count: usize,
+    source: String,
+    source_available: bool,
 }
 
 struct DiscordEventRunOnceReport {
@@ -2572,6 +3152,35 @@ struct DiscordDmProbeReport {
     provider_message_id: Option<String>,
     sent_message: bool,
     warnings: Vec<String>,
+}
+
+#[derive(Default)]
+struct DiscordDmProbeRef {
+    channel_id: Option<String>,
+    user_id: Option<String>,
+}
+
+struct DiscordDmHistoryProbeReport {
+    harness_home: PathBuf,
+    status: String,
+    reason: String,
+    channel_id: Option<String>,
+    user_id: Option<String>,
+    limit: usize,
+    message_count: usize,
+    user_message_count: usize,
+    bot_message_count: usize,
+    messages: Vec<DiscordMessageSummary>,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone)]
+struct DiscordMessageSummary {
+    message_id: String,
+    author_id: Option<String>,
+    author_bot: Option<bool>,
+    timestamp: Option<String>,
+    content_length: Option<usize>,
 }
 
 struct QueuePrepareArgs {
@@ -2921,6 +3530,11 @@ fn harness_status_args_from_args(args: &[String]) -> Result<HarnessStatusArgs, S
                 i += 1;
                 target_home = parse_harness_home_path(args, i, flag)?;
             }
+            "--openclaw-home" | "--workspace" | "--runtime-workspace" => {
+                i += 1;
+                args.get(i)
+                    .ok_or_else(|| format!("{} requires a path", args[i - 1]))?;
+            }
             "--json" => json = true,
             flag => return Err(format!("unknown argument: {flag}")),
         }
@@ -2987,6 +3601,118 @@ fn memory_search_args_from_args(args: &[String]) -> Result<MemorySearchArgs, Str
         json,
         write_receipt,
     })
+}
+
+fn memory_credentials_export_args_from_args(
+    args: &[String],
+) -> Result<MemoryCredentialsExportArgs, String> {
+    let mut openclaw_home = default_openclaw_home();
+    let mut target_home = default_harness_home();
+    let mut include_sensitive = false;
+    let mut json = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--openclaw-home" => {
+                i += 1;
+                openclaw_home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--openclaw-home requires a path".to_string())?;
+            }
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--workspace" | "--runtime-workspace" => {
+                i += 1;
+                args.get(i)
+                    .ok_or_else(|| format!("{} requires a path", args[i - 1]))?;
+            }
+            "--include-sensitive" => include_sensitive = true,
+            "--json" => json = true,
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(MemoryCredentialsExportArgs {
+        openclaw_home,
+        target_home,
+        include_sensitive,
+        json,
+    })
+}
+
+fn memory_vector_search_args_from_args(args: &[String]) -> Result<MemoryVectorSearchArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut query = None;
+    let mut limit = 5usize;
+    let mut json = false;
+    let mut write_receipt = true;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--query" | "-q" => {
+                i += 1;
+                query = Some(
+                    args.get(i)
+                        .ok_or_else(|| "--query requires text".to_string())?
+                        .clone(),
+                );
+            }
+            "--limit" => {
+                i += 1;
+                limit = args
+                    .get(i)
+                    .ok_or_else(|| "--limit requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--json" => json = true,
+            "--no-receipt" => write_receipt = false,
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let query = query.ok_or_else(|| "--query is required".to_string())?;
+    if query.trim().is_empty() {
+        return Err("--query must not be empty".to_string());
+    }
+
+    Ok(MemoryVectorSearchArgs {
+        target_home,
+        query,
+        limit,
+        json,
+        write_receipt,
+    })
+}
+
+fn memory_canvas_run_args_from_args(args: &[String]) -> Result<MemoryCanvasRunArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut json = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--json" => json = true,
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(MemoryCanvasRunArgs { target_home, json })
 }
 
 fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs, String> {
@@ -4117,7 +4843,7 @@ fn discord_dm_probe_args_from_args(args: &[String]) -> Result<DiscordDmProbeArgs
     let mut target_home = default_harness_home();
     let mut user_id = None;
     let mut send_message = true;
-    let mut message = "OpenClaw harness Discord DM probe.".to_string();
+    let mut message = "Agent Harness Discord DM probe.".to_string();
     let mut i = 0;
 
     while i < args.len() {
@@ -4160,6 +4886,68 @@ fn discord_dm_probe_args_from_args(args: &[String]) -> Result<DiscordDmProbeArgs
         user_id,
         send_message,
         message,
+    })
+}
+
+fn discord_dm_history_probe_args_from_args(
+    args: &[String],
+) -> Result<DiscordDmHistoryProbeArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut channel_id = None;
+    let mut user_id = None;
+    let mut limit = 10usize;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--channel-id" => {
+                i += 1;
+                channel_id = Some(
+                    args.get(i)
+                        .ok_or_else(|| "--channel-id requires a Discord channel id".to_string())?
+                        .clone(),
+                );
+            }
+            "--user-id" => {
+                i += 1;
+                user_id = Some(
+                    args.get(i)
+                        .ok_or_else(|| "--user-id requires a Discord user id".to_string())?
+                        .clone(),
+                );
+            }
+            "--limit" => {
+                i += 1;
+                limit = args
+                    .get(i)
+                    .ok_or_else(|| "--limit requires a positive integer".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    if let Some(channel_id) = &channel_id
+        && channel_id.trim().is_empty()
+    {
+        return Err("--channel-id must not be empty".to_string());
+    }
+    if let Some(user_id) = &user_id
+        && user_id.trim().is_empty()
+    {
+        return Err("--user-id must not be empty".to_string());
+    }
+
+    Ok(DiscordDmHistoryProbeArgs {
+        target_home,
+        channel_id,
+        user_id,
+        limit,
     })
 }
 
@@ -5294,6 +6082,8 @@ fn parse_discord_gateway_message(
         .get("bot")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let reply_context = discord_reply_context(payload);
+    let inbound_context = discord_inbound_context(payload);
 
     Ok(Some(DiscordGatewayMessage {
         message_id: message_id.to_string(),
@@ -5301,8 +6091,186 @@ fn parse_discord_gateway_message(
         channel_id: channel_id.to_string(),
         user_id: user_id.to_string(),
         content: content.to_string(),
+        inbound_context,
+        reply_context,
         author_is_bot,
     }))
+}
+
+fn discord_message_text(message: &DiscordGatewayMessage) -> String {
+    if message.content.trim().is_empty() && message.inbound_context.is_some() {
+        "[discord attachment message]".to_string()
+    } else {
+        message.content.clone()
+    }
+}
+
+fn discord_inbound_context(payload: &serde_json::Value) -> Option<String> {
+    let mut sections = Vec::new();
+    if let Some(reply_context) = discord_reply_context(payload) {
+        let mut lines = Vec::new();
+        lines.push("## ReferencedMessage: Discord reply context".to_string());
+        if let Some(message_id) = &reply_context.referenced_message_id {
+            lines.push(format!("- referencedMessageId: {message_id}"));
+        }
+        if let Some(channel_id) = &reply_context.referenced_channel_id {
+            lines.push(format!("- referencedChannelId: {channel_id}"));
+        }
+        if let Some(guild_id) = &reply_context.referenced_guild_id {
+            lines.push(format!("- referencedGuildId: {guild_id}"));
+        }
+        if let Some(author_id) = &reply_context.referenced_author_id {
+            lines.push(format!("- referencedAuthorId: {author_id}"));
+        }
+        lines.push(format!("- source: {}", reply_context.source));
+        lines.push(format!(
+            "- sourceAvailable: {}",
+            reply_context.source_available
+        ));
+        if let Some(preview) = &reply_context.referenced_text_preview {
+            lines.push(format!("- referencedTextPreview: {preview}"));
+        }
+        if let Some(length) = reply_context.referenced_preview_length {
+            lines.push(format!("- referencedPreviewLength: {length}"));
+        }
+        if let Some(truncated) = reply_context.referenced_preview_truncated {
+            lines.push(format!("- referencedPreviewTruncated: {truncated}"));
+        }
+        if let Some(text) = &reply_context.referenced_text {
+            lines.push(format!("- referencedTextLength: {}", text.source_chars));
+            lines.push(format!("- referencedTextTruncated: {}", text.truncated));
+            lines.push(format!(
+                "- referencedTextMaxChars: {}",
+                REPLY_CONTEXT_FULL_TEXT_MAX_CHARS
+            ));
+            lines.push("- referencedTextSource: discord.referenced_message".to_string());
+            push_indented_text_block(&mut lines, "referencedText", &text.text);
+        } else {
+            lines.push("- referencedTextAvailable: false".to_string());
+        }
+        lines.push(format!(
+            "- referencedHasAttachments: {}",
+            reply_context.has_attachments
+        ));
+        lines.push(format!(
+            "- referencedAttachmentCount: {}",
+            reply_context.attachment_count
+        ));
+        lines.push(format!(
+            "- referencedEmbedsCount: {}",
+            reply_context.embeds_count
+        ));
+        sections.push(lines.join("\n"));
+    }
+
+    let attachment_lines = discord_attachment_context_lines(payload);
+    if !attachment_lines.is_empty() {
+        sections.push(format!(
+            "## InboundMedia: Discord attachments\n{}",
+            attachment_lines.join("\n")
+        ));
+    }
+
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
+}
+
+fn discord_reply_context(payload: &serde_json::Value) -> Option<DiscordReplyContext> {
+    let reference = payload.get("message_reference");
+    let referenced = payload
+        .get("referenced_message")
+        .filter(|value| value.is_object());
+    if reference.is_none() && referenced.is_none() {
+        return None;
+    }
+
+    let referenced_message_id = reference
+        .and_then(|reference| reference.get("message_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    let referenced_channel_id = reference
+        .and_then(|reference| reference.get("channel_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    let referenced_guild_id = reference
+        .and_then(|reference| reference.get("guild_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    let referenced_author_id = referenced
+        .and_then(|referenced| referenced.get("author"))
+        .and_then(|author| author.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    let content = referenced
+        .and_then(|referenced| referenced.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|content| !content.trim().is_empty());
+    let preview = content.map(|content| {
+        let preview = compact_preview_text(content, REPLY_CONTEXT_PREVIEW_MAX_CHARS);
+        BoundedText {
+            text: compact_preview_display(&preview),
+            source_chars: preview.source_chars,
+            truncated: preview.truncated,
+        }
+    });
+    let referenced_text =
+        content.map(|content| bounded_text(content, REPLY_CONTEXT_FULL_TEXT_MAX_CHARS));
+    let attachment_count = referenced
+        .and_then(|referenced| referenced.get("attachments"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let embeds_count = referenced
+        .and_then(|referenced| referenced.get("embeds"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    Some(DiscordReplyContext {
+        referenced_message_id,
+        referenced_channel_id,
+        referenced_guild_id,
+        referenced_author_id,
+        referenced_text_preview: preview.as_ref().map(|preview| preview.text.clone()),
+        referenced_preview_length: preview.as_ref().map(|preview| preview.text.chars().count()),
+        referenced_preview_truncated: preview.as_ref().map(|preview| preview.truncated),
+        referenced_text,
+        has_attachments: attachment_count > 0,
+        attachment_count,
+        embeds_count,
+        source: if referenced.is_some() {
+            "discord.referenced_message".to_string()
+        } else {
+            "discord.message_reference".to_string()
+        },
+        source_available: referenced.is_some(),
+    })
+}
+
+fn discord_attachment_context_lines(payload: &serde_json::Value) -> Vec<String> {
+    let Some(attachments) = payload
+        .get("attachments")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    attachments
+        .iter()
+        .take(12)
+        .enumerate()
+        .map(|(index, attachment)| {
+            let mut parts = vec![format!("index={index}")];
+            push_json_string_preview_part(&mut parts, attachment, "id", 120);
+            push_json_string_preview_part(&mut parts, attachment, "filename", 240);
+            push_json_string_preview_part(&mut parts, attachment, "content_type", 160);
+            push_json_i64_part(&mut parts, attachment, "size");
+            push_json_i64_part(&mut parts, attachment, "width");
+            push_json_i64_part(&mut parts, attachment, "height");
+            parts.push(format!(
+                "urlPresent={}",
+                yes_no(attachment.get("url").is_some())
+            ));
+            format!("- {}", parts.join(" "))
+        })
+        .collect()
 }
 
 fn discord_event_receipts_file(harness_home: &std::path::Path) -> PathBuf {
@@ -5310,6 +6278,13 @@ fn discord_event_receipts_file(harness_home: &std::path::Path) -> PathBuf {
         .join("state")
         .join("channels")
         .join("discord-event-receipts.jsonl")
+}
+
+fn discord_reply_context_receipts_file(harness_home: &std::path::Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("channels")
+        .join("discord-reply-context-receipts.jsonl")
 }
 
 fn discord_event_seen(harness_home: &std::path::Path, message_id: &str) -> Result<bool, String> {
@@ -5357,6 +6332,55 @@ fn write_discord_event_receipt(report: &DiscordEventRunOnceReport) -> Result<(),
         .map_err(|err| err.to_string())
 }
 
+fn write_discord_reply_context_receipt(
+    harness_home: &std::path::Path,
+    message: &DiscordGatewayMessage,
+    status: &str,
+) -> Result<(), String> {
+    let Some(reply_context) = &message.reply_context else {
+        return Ok(());
+    };
+    let path = discord_reply_context_receipts_file(harness_home);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let receipt = serde_json::json!({
+        "schema": "openclaw-harness.discord-reply-context-receipt.v1",
+        "atMs": current_log_time_ms().map_err(|err| err.to_string())?,
+        "status": status,
+        "messageId": message.message_id,
+        "channelId": message.channel_id,
+        "guildId": message.guild_id,
+        "userId": message.user_id,
+        "referencedMessageId": reply_context.referenced_message_id,
+        "referencedChannelId": reply_context.referenced_channel_id,
+        "referencedGuildId": reply_context.referenced_guild_id,
+        "referencedAuthorId": reply_context.referenced_author_id,
+        "previewLength": reply_context.referenced_preview_length.unwrap_or(0),
+        "previewTruncated": reply_context.referenced_preview_truncated,
+        "contentLength": reply_context
+            .referenced_text
+            .as_ref()
+            .map(|text| text.source_chars),
+        "contentTruncated": reply_context
+            .referenced_text
+            .as_ref()
+            .map(|text| text.truncated),
+        "contentMaxChars": REPLY_CONTEXT_FULL_TEXT_MAX_CHARS,
+        "hasAttachments": reply_context.has_attachments,
+        "attachmentCount": reply_context.attachment_count,
+        "embedsCount": reply_context.embeds_count,
+        "source": reply_context.source,
+        "sourceAvailable": reply_context.source_available,
+    });
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| writeln!(file, "{receipt}"))
+        .map_err(|err| err.to_string())
+}
+
 fn discord_dm_probe_report_file(harness_home: &std::path::Path) -> PathBuf {
     harness_home
         .join("state")
@@ -5369,6 +6393,20 @@ fn discord_dm_probe_receipts_file(harness_home: &std::path::Path) -> PathBuf {
         .join("state")
         .join("channels")
         .join("discord-dm-probe-receipts.jsonl")
+}
+
+fn discord_dm_history_probe_report_file(harness_home: &std::path::Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("channels")
+        .join("discord-dm-history-probe.json")
+}
+
+fn discord_dm_history_probe_receipts_file(harness_home: &std::path::Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("channels")
+        .join("discord-dm-history-probe-receipts.jsonl")
 }
 
 fn write_discord_dm_probe_report(report: &DiscordDmProbeReport) -> Result<(), String> {
@@ -5399,6 +6437,72 @@ fn write_discord_dm_probe_report(report: &DiscordDmProbeReport) -> Result<(), St
         .open(receipts_file)
         .and_then(|mut file| writeln!(file, "{receipt}"))
         .map_err(|err| err.to_string())
+}
+
+fn write_discord_dm_history_probe_report(
+    report: &DiscordDmHistoryProbeReport,
+) -> Result<(), String> {
+    let report_file = discord_dm_history_probe_report_file(&report.harness_home);
+    let receipts_file = discord_dm_history_probe_receipts_file(&report.harness_home);
+    if let Some(parent) = report_file.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let messages = report
+        .messages
+        .iter()
+        .map(|message| {
+            serde_json::json!({
+                "messageId": message.message_id,
+                "authorId": message.author_id,
+                "authorBot": message.author_bot,
+                "timestamp": message.timestamp,
+                "contentLength": message.content_length,
+            })
+        })
+        .collect::<Vec<_>>();
+    let receipt = serde_json::json!({
+        "schema": "openclaw-harness.discord-dm-history-probe-receipt.v1",
+        "status": report.status,
+        "reason": report.reason,
+        "channelId": report.channel_id,
+        "userId": report.user_id,
+        "limit": report.limit,
+        "messageCount": report.message_count,
+        "userMessageCount": report.user_message_count,
+        "botMessageCount": report.bot_message_count,
+        "messages": messages,
+        "warnings": report.warnings,
+        "atMs": current_log_time_ms().map_err(|err| err.to_string())?,
+    });
+    fs::write(
+        &report_file,
+        serde_json::to_string_pretty(&receipt).map_err(|err| err.to_string())?,
+    )
+    .map_err(|err| err.to_string())?;
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(receipts_file)
+        .and_then(|mut file| writeln!(file, "{receipt}"))
+        .map_err(|err| err.to_string())
+}
+
+fn latest_discord_dm_probe(harness_home: &Path) -> Result<DiscordDmProbeRef, String> {
+    let path = discord_dm_probe_report_file(harness_home);
+    let text = fs::read_to_string(&path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    Ok(DiscordDmProbeRef {
+        channel_id: value
+            .get("channelId")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        user_id: value
+            .get("userId")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+    })
 }
 
 fn export_channel_credentials(
@@ -5940,16 +7044,28 @@ fn secret_env_value(harness_home: &Path, env_name: &str) -> Option<String> {
 fn channel_access_policy(harness_home: &Path) -> Result<ChannelAccessPolicy, String> {
     let values = read_secret_env_map(&channel_credentials_env_file(harness_home))?;
     Ok(ChannelAccessPolicy {
+        telegram_admin_user_ids: channel_id_set(&values, "OPENCLAW_TELEGRAM_ADMIN_USER_IDS"),
         telegram_allowed_user_ids: channel_id_set(&values, "OPENCLAW_TELEGRAM_ALLOWED_USER_IDS"),
+        telegram_group_admin_user_ids: channel_id_set(
+            &values,
+            "OPENCLAW_TELEGRAM_GROUP_ADMIN_USER_IDS",
+        ),
         telegram_group_allowed_user_ids: channel_id_set(
             &values,
             "OPENCLAW_TELEGRAM_GROUP_ALLOWED_USER_IDS",
         ),
         telegram_direct_chat_ids: channel_id_set(&values, "OPENCLAW_TELEGRAM_DIRECT_CHAT_IDS"),
         telegram_group_chat_ids: channel_id_set(&values, "OPENCLAW_TELEGRAM_GROUP_CHAT_IDS"),
+        telegram_group_open: channel_bool(&values, "OPENCLAW_TELEGRAM_GROUP_OPEN"),
+        discord_admin_user_ids: channel_id_set(&values, "OPENCLAW_DISCORD_ADMIN_USER_IDS"),
         discord_allowed_user_ids: channel_id_set(&values, "OPENCLAW_DISCORD_ALLOWED_USER_IDS"),
+        discord_group_allowed_user_ids: channel_id_set(
+            &values,
+            "OPENCLAW_DISCORD_GROUP_ALLOWED_USER_IDS",
+        ),
         discord_channel_ids: channel_id_set(&values, "OPENCLAW_DISCORD_CHANNEL_IDS"),
         discord_guild_ids: channel_id_set(&values, "OPENCLAW_DISCORD_GUILD_IDS"),
+        discord_group_open: channel_bool(&values, "OPENCLAW_DISCORD_GROUP_OPEN"),
     })
 }
 
@@ -5971,6 +7087,19 @@ fn parse_channel_id_set(raw: Option<&str>) -> BTreeSet<String> {
         .collect()
 }
 
+fn channel_bool(values: &BTreeMap<String, String>, env_name: &str) -> bool {
+    let raw = env::var(env_name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| values.get(env_name).cloned());
+    raw.as_deref().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 fn telegram_access_decision(
     policy: &ChannelAccessPolicy,
     chat_id: &str,
@@ -5985,14 +7114,31 @@ fn telegram_access_decision(
                 "Telegram group chat id is not in OPENCLAW_TELEGRAM_GROUP_CHAT_IDS".to_string(),
             );
         }
-        if !policy.telegram_group_allowed_user_ids.is_empty()
-            && !policy.telegram_group_allowed_user_ids.contains(user_id)
+        if telegram_user_is_admin(policy, user_id)
+            || policy.telegram_group_admin_user_ids.contains(user_id)
         {
+            return ChannelAccessDecision::Allowed(ChannelPermission::Admin);
+        }
+        if policy.telegram_group_allowed_user_ids.contains(user_id) {
+            return ChannelAccessDecision::Allowed(ChannelPermission::Limited);
+        }
+        if policy.telegram_group_open
+            || (policy.telegram_group_allowed_user_ids.is_empty()
+                && policy.telegram_group_admin_user_ids.is_empty()
+                && !policy.telegram_group_chat_ids.is_empty())
+        {
+            return ChannelAccessDecision::Allowed(ChannelPermission::Limited);
+        }
+        if policy.telegram_group_chat_ids.is_empty() {
             return ChannelAccessDecision::Denied(
-                "Telegram group user id is not in OPENCLAW_TELEGRAM_GROUP_ALLOWED_USER_IDS"
+                "Telegram group chat id is not configured in OPENCLAW_TELEGRAM_GROUP_CHAT_IDS"
                     .to_string(),
             );
         }
+        return ChannelAccessDecision::Denied(
+            "Telegram group user id is not an admin, limited user, or open-group member"
+                .to_string(),
+        );
     } else {
         if !policy.telegram_direct_chat_ids.is_empty()
             && !policy.telegram_direct_chat_ids.contains(chat_id)
@@ -6001,15 +7147,13 @@ fn telegram_access_decision(
                 "Telegram direct chat id is not in OPENCLAW_TELEGRAM_DIRECT_CHAT_IDS".to_string(),
             );
         }
-        if !policy.telegram_allowed_user_ids.is_empty()
-            && !policy.telegram_allowed_user_ids.contains(user_id)
-        {
+        if !telegram_user_is_admin(policy, user_id) {
             return ChannelAccessDecision::Denied(
-                "Telegram user id is not in OPENCLAW_TELEGRAM_ALLOWED_USER_IDS".to_string(),
+                "Telegram DM user id is not in OPENCLAW_TELEGRAM_ADMIN_USER_IDS or OPENCLAW_TELEGRAM_ALLOWED_USER_IDS".to_string(),
             );
         }
     }
-    ChannelAccessDecision::Allowed
+    ChannelAccessDecision::Allowed(ChannelPermission::Admin)
 }
 
 fn telegram_is_group_context(
@@ -6038,15 +7182,73 @@ fn discord_access_decision(
                 "Discord channel id is not in OPENCLAW_DISCORD_CHANNEL_IDS".to_string(),
             );
         }
-    }
-    if !policy.discord_allowed_user_ids.is_empty()
-        && !policy.discord_allowed_user_ids.contains(&message.user_id)
-    {
+        if discord_user_is_admin(policy, &message.user_id) {
+            return ChannelAccessDecision::Allowed(ChannelPermission::Admin);
+        }
+        if policy
+            .discord_group_allowed_user_ids
+            .contains(&message.user_id)
+        {
+            return ChannelAccessDecision::Allowed(ChannelPermission::Limited);
+        }
+        if policy.discord_group_open
+            || (policy.discord_group_allowed_user_ids.is_empty()
+                && !policy.discord_channel_ids.is_empty())
+        {
+            return ChannelAccessDecision::Allowed(ChannelPermission::Limited);
+        }
         return ChannelAccessDecision::Denied(
-            "Discord user id is not in OPENCLAW_DISCORD_ALLOWED_USER_IDS".to_string(),
+            "Discord guild user id is not an admin, limited user, or open-guild member".to_string(),
         );
     }
-    ChannelAccessDecision::Allowed
+    if !discord_user_is_admin(policy, &message.user_id) {
+        return ChannelAccessDecision::Denied(
+            "Discord DM user id is not in OPENCLAW_DISCORD_ADMIN_USER_IDS or OPENCLAW_DISCORD_ALLOWED_USER_IDS".to_string(),
+        );
+    }
+    ChannelAccessDecision::Allowed(ChannelPermission::Admin)
+}
+
+fn telegram_user_is_admin(policy: &ChannelAccessPolicy, user_id: &str) -> bool {
+    policy.telegram_admin_user_ids.contains(user_id)
+        || policy.telegram_allowed_user_ids.contains(user_id)
+}
+
+fn discord_user_is_admin(policy: &ChannelAccessPolicy, user_id: &str) -> bool {
+    policy.discord_admin_user_ids.contains(user_id)
+        || policy.discord_allowed_user_ids.contains(user_id)
+}
+
+fn channel_permission_allows_text(permission: ChannelPermission, text: &str) -> Result<(), String> {
+    if permission == ChannelPermission::Admin {
+        return Ok(());
+    }
+    let Some(command) = parse_channel_command(text) else {
+        return Ok(());
+    };
+    if limited_permission_allows_command(&command) {
+        Ok(())
+    } else {
+        Err(format!(
+            "limited channel permission does not allow /{}",
+            command.name()
+        ))
+    }
+}
+
+fn limited_permission_allows_command(command: &ChannelCommand) -> bool {
+    match command {
+        ChannelCommand::Status { .. } => true,
+        ChannelCommand::Model {
+            target: None,
+            global: false,
+        } => true,
+        ChannelCommand::Think {
+            level: None,
+            global: false,
+        } => true,
+        _ => false,
+    }
 }
 
 fn telegram_bot_token(harness_home: &Path, account_id: Option<&str>) -> Result<String, String> {
@@ -6161,9 +7363,34 @@ fn write_telegram_offset(path: &std::path::Path, next_offset: Option<i64>) -> Re
     .map_err(|err| err.to_string())
 }
 
+const CHANNEL_HTTP_CONNECT_TIMEOUT_SECONDS: u64 = 10;
+const CHANNEL_HTTP_WRITE_TIMEOUT_SECONDS: u64 = 10;
+const CHANNEL_HTTP_SHORT_TIMEOUT_SECONDS: u64 = 30;
+const TELEGRAM_POLL_HTTP_GRACE_SECONDS: u64 = 10;
+
+fn channel_http_agent(read_timeout: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(CHANNEL_HTTP_CONNECT_TIMEOUT_SECONDS))
+        .timeout_read(read_timeout)
+        .timeout_write(Duration::from_secs(CHANNEL_HTTP_WRITE_TIMEOUT_SECONDS))
+        .build()
+}
+
+fn channel_http_short_agent() -> ureq::Agent {
+    channel_http_agent(Duration::from_secs(CHANNEL_HTTP_SHORT_TIMEOUT_SECONDS))
+}
+
+fn telegram_poll_agent(timeout_seconds: u64) -> ureq::Agent {
+    let read_timeout_seconds = timeout_seconds
+        .saturating_add(TELEGRAM_POLL_HTTP_GRACE_SECONDS)
+        .clamp(10, 120);
+    channel_http_agent(Duration::from_secs(read_timeout_seconds))
+}
+
 fn telegram_get_me(token: &str) -> Result<serde_json::Value, String> {
     let url = format!("https://api.telegram.org/bot{token}/getMe");
-    let response = ureq::get(&url).call().map_err(telegram_http_error)?;
+    let agent = channel_http_short_agent();
+    let response = agent.get(&url).call().map_err(telegram_http_error)?;
     let value: serde_json::Value = response.into_json().map_err(|err| err.to_string())?;
     if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
         return Err(format!("Telegram getMe returned non-ok response: {value}"));
@@ -6189,7 +7416,9 @@ fn telegram_get_updates(
     if let Some(offset) = offset {
         payload["offset"] = serde_json::json!(offset);
     }
-    let response = ureq::post(&url)
+    let agent = telegram_poll_agent(timeout_seconds);
+    let response = agent
+        .post(&url)
         .send_json(payload)
         .map_err(telegram_http_error)?;
     let value: serde_json::Value = response.into_json().map_err(|err| err.to_string())?;
@@ -6207,7 +7436,9 @@ fn telegram_get_updates(
 
 fn telegram_send_message(token: &str, chat_id: &str, text: &str) -> Result<Option<String>, String> {
     let url = format!("https://api.telegram.org/bot{token}/sendMessage");
-    let response = ureq::post(&url)
+    let agent = channel_http_short_agent();
+    let response = agent
+        .post(&url)
         .send_json(serde_json::json!({
             "chat_id": chat_id,
             "text": text,
@@ -6228,7 +7459,9 @@ fn telegram_send_message(token: &str, chat_id: &str, text: &str) -> Result<Optio
 
 fn telegram_send_chat_action(token: &str, chat_id: &str, action: &str) -> Result<(), String> {
     let url = format!("https://api.telegram.org/bot{token}/sendChatAction");
-    let response = ureq::post(&url)
+    let agent = channel_http_short_agent();
+    let response = agent
+        .post(&url)
         .send_json(serde_json::json!({
             "chat_id": chat_id,
             "action": action
@@ -6257,7 +7490,7 @@ fn telegram_http_error(error: ureq::Error) -> String {
             let body = response.into_string().unwrap_or_default();
             format!("Telegram HTTP status {code}: {body}")
         }
-        ureq::Error::Transport(_) => "Telegram transport error".to_string(),
+        ureq::Error::Transport(error) => format!("Telegram transport error: {error}"),
     }
 }
 
@@ -6283,18 +7516,78 @@ fn normalize_discord_bot_token(token: &str) -> String {
     }
 }
 
+const DISCORD_MESSAGE_CONTENT_LIMIT: usize = 2_000;
+
+fn discord_send_message_chunks(
+    token: &str,
+    channel_id: &str,
+    text: &str,
+) -> Result<Option<String>, String> {
+    let chunks = discord_message_chunks(text, DISCORD_MESSAGE_CONTENT_LIMIT);
+    let mut provider_message_ids = Vec::new();
+    for chunk in chunks {
+        if let Some(provider_message_id) = discord_send_message(token, channel_id, &chunk)? {
+            provider_message_ids.push(provider_message_id);
+        }
+    }
+    Ok((!provider_message_ids.is_empty()).then(|| provider_message_ids.join(",")))
+}
+
+fn discord_message_chunks(text: &str, max_chars: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    if text.chars().count() <= max_chars {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_chars = 0usize;
+    for segment in text.split_inclusive('\n') {
+        let segment_chars = segment.chars().count();
+        if segment_chars > max_chars {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+                current_chars = 0;
+            }
+            for ch in segment.chars() {
+                current.push(ch);
+                current_chars += 1;
+                if current_chars == max_chars {
+                    chunks.push(std::mem::take(&mut current));
+                    current_chars = 0;
+                }
+            }
+        } else if current_chars + segment_chars <= max_chars {
+            current.push_str(segment);
+            current_chars += segment_chars;
+        } else {
+            chunks.push(std::mem::take(&mut current));
+            current.push_str(segment);
+            current_chars = segment_chars;
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 fn discord_send_message(
     token: &str,
     channel_id: &str,
     text: &str,
 ) -> Result<Option<String>, String> {
-    if text.chars().count() > 2_000 {
+    if text.chars().count() > DISCORD_MESSAGE_CONTENT_LIMIT {
         return Err("Discord message exceeds the 2000 character content limit".to_string());
     }
     let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
     let token = normalize_discord_bot_token(token);
     let auth = format!("Bot {token}");
-    let response = ureq::post(&url)
+    let agent = channel_http_short_agent();
+    let response = agent
+        .post(&url)
         .set("Authorization", &auth)
         .set("Content-Type", "application/json")
         .send_json(serde_json::json!({
@@ -6314,7 +7607,9 @@ fn discord_send_message(
 fn discord_create_dm_channel(token: &str, user_id: &str) -> Result<String, String> {
     let token = normalize_discord_bot_token(token);
     let auth = format!("Bot {token}");
-    let response = ureq::post("https://discord.com/api/v10/users/@me/channels")
+    let agent = channel_http_short_agent();
+    let response = agent
+        .post("https://discord.com/api/v10/users/@me/channels")
         .set("Authorization", &auth)
         .set("Content-Type", "application/json")
         .send_json(serde_json::json!({
@@ -6329,11 +7624,62 @@ fn discord_create_dm_channel(token: &str, user_id: &str) -> Result<String, Strin
         .ok_or_else(|| "Discord create DM response did not include channel id".to_string())
 }
 
+fn discord_fetch_channel_messages(
+    token: &str,
+    channel_id: &str,
+    limit: usize,
+) -> Result<Vec<DiscordMessageSummary>, String> {
+    let limit = limit.clamp(1, 100);
+    let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages?limit={limit}");
+    let token = normalize_discord_bot_token(token);
+    let auth = format!("Bot {token}");
+    let agent = channel_http_short_agent();
+    let response = agent
+        .get(&url)
+        .set("Authorization", &auth)
+        .call()
+        .map_err(discord_http_error)?;
+    let value: serde_json::Value = response.into_json().map_err(|err| err.to_string())?;
+    let messages = value
+        .as_array()
+        .ok_or_else(|| "Discord messages response was not an array".to_string())?;
+    Ok(messages
+        .iter()
+        .filter_map(discord_message_summary)
+        .collect())
+}
+
+fn discord_message_summary(value: &serde_json::Value) -> Option<DiscordMessageSummary> {
+    let message_id = value.get("id")?.as_str()?.to_string();
+    let author = value.get("author");
+    let content_length = value
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .map(str::len);
+    Some(DiscordMessageSummary {
+        message_id,
+        author_id: author
+            .and_then(|author| author.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        author_bot: author
+            .and_then(|author| author.get("bot"))
+            .and_then(serde_json::Value::as_bool),
+        timestamp: value
+            .get("timestamp")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        content_length,
+    })
+}
+
 fn discord_send_typing(token: &str, channel_id: &str) -> Result<(), String> {
     let url = format!("https://discord.com/api/v10/channels/{channel_id}/typing");
     let token = normalize_discord_bot_token(token);
     let auth = format!("Bot {token}");
-    ureq::post(&url)
+    let agent = channel_http_short_agent();
+    agent
+        .post(&url)
         .set("Authorization", &auth)
         .call()
         .map_err(discord_http_error)?;
@@ -6346,7 +7692,7 @@ fn discord_http_error(error: ureq::Error) -> String {
             let body = response.into_string().unwrap_or_default();
             format!("Discord HTTP status {code}: {body}")
         }
-        ureq::Error::Transport(_) => "Discord transport error".to_string(),
+        ureq::Error::Transport(error) => format!("Discord transport error: {error}"),
     }
 }
 
@@ -6927,7 +8273,7 @@ fn print_activation_readiness_report(report: &ActivationReadinessReport) {
 }
 
 fn print_harness_status_report(report: &HarnessStatusReport) {
-    println!("OpenClaw harness status");
+    println!("Agent Harness status");
     println!("Harness home: {}", report.harness_home.display());
     println!(
         "Ready: {} (passed={} warnings={} failed={})",
@@ -6955,21 +8301,30 @@ fn print_harness_status_report(report: &HarnessStatusReport) {
         report.channels.outbox.all.invalid_lines
     );
     println!(
-        "Channels: telegramOffset={} telegramProbe={} telegramPollLog={} discordSendLog={} discordEventLog={} discordGateway={}",
+        "Channels: telegramOffset={} telegramProbe={} telegramPollLog={} discordSendLog={} discordEventLog={} discordGateway={} discordReplyContext={}",
         yes_no(report.channels.telegram_offset_present),
         receipt_summary(&report.channels.telegram_probe),
         yes_no(report.channels.telegram_poll_log_present),
         yes_no(report.channels.discord_send_log_present),
         yes_no(report.channels.discord_event_log_present),
-        receipt_summary(&report.channels.discord_gateway_probe)
+        receipt_summary(&report.channels.discord_gateway_probe),
+        receipt_summary(&report.channels.discord_reply_context_receipts)
     );
     println!(
-        "Memory: qdrantEdge={} lancedb={} openclawMemSqlite={} files={} search={}",
+        "Memory: qdrantEdge={} lancedb={} openclawMemSqlite={} embeddingSecrets={} files={} activeRecall={} qdrantParity={} captureCandidates={} search={} vectorRecall={} promptContext={} lifecycle={} canvas={}",
         yes_no(report.memory.qdrant_edge),
         yes_no(report.memory.lancedb),
         yes_no(report.memory.openclaw_mem_sqlite),
+        yes_no(report.memory.memory_credentials_env_present),
         report.memory.regular_files,
-        receipt_summary(&report.memory.search_receipts)
+        report.memory.summary.active_recall_backend,
+        report.memory.summary.qdrant_parity,
+        report.memory.summary.capture_candidate_count,
+        receipt_summary(&report.memory.search_receipts),
+        receipt_summary(&report.memory.vector_recall_receipts),
+        receipt_summary(&report.memory.prompt_context_receipts),
+        receipt_summary(&report.memory.lifecycle_receipts),
+        receipt_summary(&report.memory.canvas_receipts)
     );
     println!(
         "Plugins: catalog={} tools={} execution={} probe={} bridge={}",
@@ -7021,7 +8376,7 @@ fn print_memory_search_report_json(report: &MemorySearchReport) -> Result<(), St
 }
 
 fn print_memory_search_report(report: &MemorySearchReport) {
-    println!("OpenClaw imported memory search");
+    println!("Harness imported memory search");
     println!("Harness home: {}", report.harness_home.display());
     println!("Memory dir: {}", report.memory_dir.display());
     println!("Status: {}", report.status.as_str());
@@ -7044,6 +8399,113 @@ fn print_memory_search_report(report: &MemorySearchReport) {
             );
         }
     }
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
+fn print_memory_credentials_export_report(
+    report: &MemoryCredentialsExportReport,
+    include_sensitive: bool,
+) {
+    println!("Harness memory credentials export");
+    println!("Source home: {}", report.source_home.display());
+    println!("Target env file: {}", report.env_file.display());
+    println!("Receipt file: {}", report.receipt_file.display());
+    println!("Sensitive values written: {}", yes_no(include_sensitive));
+    println!("Entries: {}", report.entries.len());
+    for entry in &report.entries {
+        println!(
+            "- {}: exported={} sensitive={} length={} source={} ({})",
+            entry.env_name,
+            yes_no(entry.exported),
+            yes_no(entry.sensitive),
+            entry.length,
+            entry.source_path,
+            entry.reason
+        );
+    }
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
+fn print_memory_vector_report_json(report: &MemoryVectorRecallReport) -> Result<(), String> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(report).map_err(|err| err.to_string())?
+    );
+    Ok(())
+}
+
+fn print_memory_vector_report(report: &MemoryVectorRecallReport) {
+    println!("Harness imported vector memory search");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Status: {:?}", report.status);
+    println!("Reason: {}", report.reason);
+    println!("Backend: {}", report.backend);
+    println!(
+        "Embedding: model={} dim={}",
+        report.embedding_model.as_deref().unwrap_or("-"),
+        report.query_embedding_dim
+    );
+    println!(
+        "SQLite: {}",
+        report
+            .sqlite_database
+            .as_deref()
+            .map(Path::display)
+            .map(|display| display.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!(
+        "Qdrant edge snapshot: {}",
+        report
+            .qdrant_edge_dir
+            .as_deref()
+            .map(Path::display)
+            .map(|display| display.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!("Hits: {}", report.hits.len());
+    for hit in &report.hits {
+        println!(
+            "- [{}] score={:.4} id={} title={} source={}",
+            hit.lane,
+            hit.score,
+            hit.id,
+            hit.title,
+            hit.source.as_deref().unwrap_or("-")
+        );
+        if !hit.text.is_empty() {
+            println!("  {}", hit.text);
+        }
+    }
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
+fn print_memory_canvas_report(report: &MemoryCanvasWorkerReport) {
+    println!("Harness memory canvas worker");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Status: {:?}", report.status);
+    println!("Reason: {}", report.reason);
+    println!("Canvas JSON: {}", report.canvas_json.display());
+    println!("Canvas markdown: {}", report.canvas_markdown.display());
+    println!(
+        "Inputs: candidates={} episodes={}",
+        report.candidates_read, report.episodes_read
+    );
     if !report.warnings.is_empty() {
         println!("Warnings:");
         for warning in &report.warnings {
@@ -7420,6 +8882,42 @@ fn print_discord_dm_probe_report(report: &DiscordDmProbeReport) {
         report.provider_message_id.as_deref().unwrap_or("-")
     );
     println!("Sent message: {}", yes_no(report.sent_message));
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
+fn print_discord_dm_history_probe_report(report: &DiscordDmHistoryProbeReport) {
+    println!("OpenClaw Discord DM history probe");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Status: {}", report.status);
+    println!("Reason: {}", report.reason);
+    println!("Channel: {}", report.channel_id.as_deref().unwrap_or("-"));
+    println!("User: {}", report.user_id.as_deref().unwrap_or("-"));
+    println!("Limit: {}", report.limit);
+    println!(
+        "Messages: total={} user={} bot={}",
+        report.message_count, report.user_message_count, report.bot_message_count
+    );
+    if !report.messages.is_empty() {
+        println!("Message metadata:");
+        for message in &report.messages {
+            println!(
+                "- id={} author={} bot={} timestamp={} contentLength={}",
+                message.message_id,
+                message.author_id.as_deref().unwrap_or("-"),
+                message.author_bot.map(yes_no).unwrap_or("-"),
+                message.timestamp.as_deref().unwrap_or("-"),
+                message
+                    .content_length
+                    .map(|length| length.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            );
+        }
+    }
     if !report.warnings.is_empty() {
         println!("Warnings:");
         for warning in &report.warnings {
@@ -8118,7 +9616,12 @@ fn print_help() {
     println!(
         "  status          Summarize harness readiness, runtime, channels, memory, plugins, and logs"
     );
+    println!(
+        "  memory-credentials-export Export imported memory embedding config to harness secrets"
+    );
     println!("  memory-search   Search imported markdown/text memory files read-only");
+    println!("  memory-vector-search Search imported SQLite vector memory with embedding query");
+    println!("  memory-canvas-run Build compact symbolic canvas from captured candidates/episodes");
     println!("  supervisor-plan Generate Windows scheduled-task scripts for harness loops");
     println!("  harness-skills-sync Sync bundled harness operation skills");
     println!("  skills          Build a skill-first index and optionally match a task");
@@ -8135,6 +9638,7 @@ fn print_help() {
     println!("  discord-outbox-send-once Send pending Discord outbox messages once");
     println!("  discord-outbox-loop Send pending Discord outbox messages continuously");
     println!("  discord-dm-probe Create a Discord DM channel and optionally send a probe");
+    println!("  discord-dm-history-probe Read Discord DM message metadata without content");
     println!("  discord-event-run-once Normalize one Discord Gateway message event");
     println!("  discord-gateway-probe Probe Discord Gateway loop prerequisites");
     println!("  discord-gateway-loop Run Discord Gateway receive loop");
@@ -8175,7 +9679,7 @@ fn print_help() {
     println!("  --match-workspace <txt> Workspace hint for skill matching");
     println!("  --limit <n>             Maximum matched skills to print");
     println!("  --max-file-bytes <n>    Maximum imported memory file size for memory-search");
-    println!("  --no-receipt            Do not write memory-search probe receipts");
+    println!("  --no-receipt            Do not write memory search/vector-search probe receipts");
     println!("  --message <text>        Incoming channel message for turn-plan");
     println!("  --platform <name>       local, telegram, discord, or cron");
     println!("  --channel-id <id>       Channel identity for session mapping");
@@ -8233,9 +9737,23 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn set(values: &[&str]) -> BTreeSet<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn cli_temp_root(name: &str) -> PathBuf {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let path = std::env::temp_dir().join(format!(
+            "openclaw-harness-cli-test-{name}-{}-{millis}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        path
     }
 
     fn discord_message(
@@ -8249,6 +9767,8 @@ mod tests {
             channel_id: channel_id.to_string(),
             user_id: user_id.to_string(),
             content: "hello".to_string(),
+            inbound_context: None,
+            reply_context: None,
             author_is_bot: false,
         }
     }
@@ -8270,7 +9790,7 @@ mod tests {
 
         assert_eq!(
             telegram_access_decision(&policy, "chat-1", "user-1", Some("private")),
-            ChannelAccessDecision::Allowed
+            ChannelAccessDecision::Allowed(ChannelPermission::Admin)
         );
         assert!(matches!(
             telegram_access_decision(&policy, "chat-2", "user-1", Some("private")),
@@ -8292,7 +9812,7 @@ mod tests {
 
         assert_eq!(
             telegram_access_decision(&policy, "group-1", "user-1", Some("supergroup")),
-            ChannelAccessDecision::Allowed
+            ChannelAccessDecision::Allowed(ChannelPermission::Limited)
         );
         assert!(matches!(
             telegram_access_decision(&policy, "group-2", "user-1", Some("supergroup")),
@@ -8302,6 +9822,85 @@ mod tests {
             telegram_access_decision(&policy, "group-1", "user-2", Some("group")),
             ChannelAccessDecision::Denied(_)
         ));
+    }
+
+    #[test]
+    fn telegram_direct_policy_fails_closed_without_admin_user() {
+        let policy = ChannelAccessPolicy {
+            telegram_direct_chat_ids: set(&["chat-1"]),
+            ..ChannelAccessPolicy::default()
+        };
+
+        assert!(matches!(
+            telegram_access_decision(&policy, "chat-1", "user-1", Some("private")),
+            ChannelAccessDecision::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn telegram_group_open_grants_limited_permission_only() {
+        let policy = ChannelAccessPolicy {
+            telegram_group_chat_ids: set(&["group-1"]),
+            telegram_group_open: true,
+            ..ChannelAccessPolicy::default()
+        };
+
+        assert_eq!(
+            telegram_access_decision(&policy, "group-1", "user-2", Some("supergroup")),
+            ChannelAccessDecision::Allowed(ChannelPermission::Limited)
+        );
+        assert!(channel_permission_allows_text(ChannelPermission::Limited, "/status").is_ok());
+        assert!(
+            channel_permission_allows_text(ChannelPermission::Limited, "/model openai/gpt-5")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn telegram_inbound_context_extracts_reply_and_media_without_file_ids() {
+        let message = serde_json::json!({
+            "message_id": 10,
+            "caption": "see attached",
+            "reply_to_message": {
+                "message_id": 9,
+                "date": 1710000000,
+                "text": "previous message",
+                "from": { "id": 12345 }
+            },
+            "photo": [
+                {
+                    "file_id": "raw-photo-file-id",
+                    "width": 320,
+                    "height": 240,
+                    "file_size": 100
+                }
+            ],
+            "document": {
+                "file_id": "raw-doc-file-id",
+                "file_name": "notes.txt",
+                "mime_type": "text/plain",
+                "file_size": 20
+            }
+        });
+
+        assert_eq!(
+            telegram_message_text(&message, true),
+            Some("see attached".to_string())
+        );
+        let context = telegram_inbound_context(&message).unwrap();
+        assert!(context.contains("ReferencedMessage"));
+        assert!(context.contains("messageId: 9"));
+        assert!(context.contains("textPreview: previous message"));
+        assert!(context.contains("textLength: 16"));
+        assert!(context.contains("textTruncated: false"));
+        assert!(context.contains("textMaxChars: 4000"));
+        assert!(context.contains("textSource: telegram.reply_to_message"));
+        assert!(context.contains("\n  previous message"));
+        assert!(context.contains("kind=photo"));
+        assert!(context.contains("kind=document"));
+        assert!(context.contains("fileIdPresent=yes"));
+        assert!(!context.contains("raw-photo-file-id"));
+        assert!(!context.contains("raw-doc-file-id"));
     }
 
     #[test]
@@ -8318,11 +9917,11 @@ mod tests {
                 &policy,
                 &discord_message(Some("guild-1"), "channel-1", "user-1")
             ),
-            ChannelAccessDecision::Allowed
+            ChannelAccessDecision::Allowed(ChannelPermission::Admin)
         );
         assert_eq!(
             discord_access_decision(&policy, &discord_message(None, "dm-channel", "user-1")),
-            ChannelAccessDecision::Allowed
+            ChannelAccessDecision::Allowed(ChannelPermission::Admin)
         );
         assert!(matches!(
             discord_access_decision(
@@ -8342,6 +9941,184 @@ mod tests {
             discord_access_decision(&policy, &discord_message(None, "dm-channel", "user-2")),
             ChannelAccessDecision::Denied(_)
         ));
+    }
+
+    #[test]
+    fn discord_group_open_grants_limited_permission_only() {
+        let policy = ChannelAccessPolicy {
+            discord_channel_ids: set(&["channel-1"]),
+            discord_group_open: true,
+            ..ChannelAccessPolicy::default()
+        };
+
+        assert_eq!(
+            discord_access_decision(
+                &policy,
+                &discord_message(Some("guild-1"), "channel-1", "user-2")
+            ),
+            ChannelAccessDecision::Allowed(ChannelPermission::Limited)
+        );
+        assert!(channel_permission_allows_text(ChannelPermission::Limited, "/think").is_ok());
+        assert!(channel_permission_allows_text(ChannelPermission::Limited, "/think high").is_err());
+    }
+
+    #[test]
+    fn discord_direct_policy_fails_closed_without_admin_user() {
+        let policy = ChannelAccessPolicy::default();
+
+        assert!(matches!(
+            discord_access_decision(&policy, &discord_message(None, "dm-channel", "user-2")),
+            ChannelAccessDecision::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn discord_message_chunks_respect_content_limit() {
+        let text = "a".repeat(DISCORD_MESSAGE_CONTENT_LIMIT + 1);
+
+        let chunks = discord_message_chunks(&text, DISCORD_MESSAGE_CONTENT_LIMIT);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].chars().count(), DISCORD_MESSAGE_CONTENT_LIMIT);
+        assert_eq!(chunks[1].chars().count(), 1);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.chars().count() <= DISCORD_MESSAGE_CONTENT_LIMIT)
+        );
+    }
+
+    #[test]
+    fn discord_message_chunks_prefer_newline_boundaries() {
+        let text = format!("{}\n{}", "a".repeat(1_990), "b".repeat(20));
+
+        let chunks = discord_message_chunks(&text, DISCORD_MESSAGE_CONTENT_LIMIT);
+
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].ends_with('\n'));
+        assert_eq!(chunks[1], "b".repeat(20));
+    }
+
+    #[test]
+    fn discord_gateway_message_extracts_reply_and_attachment_context() {
+        let event = serde_json::json!({
+            "t": "MESSAGE_CREATE",
+            "d": {
+                "id": "message-1",
+                "channel_id": "channel-1",
+                "guild_id": "guild-1",
+                "content": "",
+                "author": { "id": "user-1" },
+                "message_reference": {
+                    "message_id": "ref-1",
+                    "channel_id": "channel-1",
+                    "guild_id": "guild-1"
+                },
+                "referenced_message": {
+                    "id": "ref-1",
+                    "content": "previous instruction-looking text",
+                    "author": { "id": "user-2" },
+                    "attachments": [{
+                        "id": "ref-att-1",
+                        "filename": "prior.txt",
+                        "content_type": "text/plain",
+                        "size": 12
+                    }],
+                    "embeds": [{}]
+                },
+                "attachments": [{
+                    "id": "att-1",
+                    "filename": "report.png",
+                    "content_type": "image/png",
+                    "size": 42,
+                    "width": 640,
+                    "height": 480,
+                    "url": "https://cdn.discordapp.example/report.png"
+                }]
+            }
+        });
+
+        let message = parse_discord_gateway_message(&event).unwrap().unwrap();
+
+        assert_eq!(
+            discord_message_text(&message),
+            "[discord attachment message]"
+        );
+        let reply_context = message.reply_context.as_ref().unwrap();
+        assert_eq!(
+            reply_context.referenced_message_id.as_deref(),
+            Some("ref-1")
+        );
+        assert_eq!(reply_context.attachment_count, 1);
+        assert_eq!(reply_context.embeds_count, 1);
+        assert!(reply_context.source_available);
+        let context = message.inbound_context.as_deref().unwrap();
+        assert!(context.contains("ReferencedMessage"));
+        assert!(context.contains("referencedMessageId: ref-1"));
+        assert!(context.contains("referencedTextLength: 33"));
+        assert!(context.contains("referencedTextTruncated: false"));
+        assert!(context.contains("referencedTextMaxChars: 4000"));
+        assert!(context.contains("referencedTextSource: discord.referenced_message"));
+        assert!(context.contains("referencedAttachmentCount: 1"));
+        assert!(context.contains("referencedEmbedsCount: 1"));
+        assert!(context.contains("\n  previous instruction-looking text"));
+        assert!(context.contains("filename=report.png"));
+        assert!(context.contains("urlPresent=yes"));
+        assert!(!context.contains("https://cdn.discordapp.example"));
+
+        let root = cli_temp_root("discord_reply_context_receipt");
+        write_discord_reply_context_receipt(&root, &message, "captured").unwrap();
+        let receipt_text = fs::read_to_string(discord_reply_context_receipts_file(&root)).unwrap();
+        let receipt =
+            serde_json::from_str::<serde_json::Value>(receipt_text.lines().next().unwrap())
+                .unwrap();
+        assert_eq!(
+            receipt.get("schema").and_then(serde_json::Value::as_str),
+            Some("openclaw-harness.discord-reply-context-receipt.v1")
+        );
+        assert_eq!(
+            receipt.get("status").and_then(serde_json::Value::as_str),
+            Some("captured")
+        );
+        assert_eq!(
+            receipt
+                .get("referencedMessageId")
+                .and_then(serde_json::Value::as_str),
+            Some("ref-1")
+        );
+        assert_eq!(
+            receipt
+                .get("attachmentCount")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            receipt
+                .get("sourceAvailable")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn harness_status_accepts_shared_activation_path_args() {
+        let args = vec![
+            "--openclaw-home".to_string(),
+            "source-home".to_string(),
+            "--workspace".to_string(),
+            "workspace".to_string(),
+            "--runtime-workspace".to_string(),
+            "runtime-workspace".to_string(),
+            "--harness-home".to_string(),
+            "harness-home".to_string(),
+            "--json".to_string(),
+        ];
+
+        let parsed = harness_status_args_from_args(&args).unwrap();
+
+        assert_eq!(parsed.target_home, PathBuf::from("harness-home"));
+        assert!(parsed.json);
     }
 
     #[test]
