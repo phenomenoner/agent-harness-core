@@ -1,0 +1,17 @@
+[package]
+name = "agent-harness-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "agent-harness"
+path = "src/main.rs"
+
+[dependencies]
+agent-harness-core = { path = "../agent-harness-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }

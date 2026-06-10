@@ -1,0 +1,22 @@
+/target/
+/.idea/
+/.vscode/
+*.pdb
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Local runtime state and credentials
+.env
+.env.*
+!.env.example
+.agent-harness/
+state/
+data/
+secrets/
+**/secrets/
+
+# Imported source snapshots are local operator data.
+imports/
+
