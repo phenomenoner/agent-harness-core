@@ -34,8 +34,10 @@ use agent_harness_core::{
     MemoryCredentialsExportReport, MemoryHookAdapterOptions, MemoryHookKind, MemorySearchOptions,
     MemorySearchReport, MemoryVectorRecallOptions, MemoryVectorRecallReport,
     MemoryVectorRecallStatus, NativeCronPlan, NativeCronPlanInput, NativeCronWorkerEnqueueOptions,
-    OpsBackupOptions, OpsControlAction, OpsControlOptions, OpsCutoverReceiptOptions,
-    PromptAssemblyOptions, PromptBundle, RuntimeQueueCapacityOptions, RuntimeQueueEnqueueOptions,
+    OpenClawMemServiceProposeOptions, OpenClawMemServiceRecallOptions, OpenClawMemServiceStatus,
+    OpenClawMemServiceStatusOptions, OpenClawMemServiceStoreOptions, OpsBackupOptions,
+    OpsControlAction, OpsControlOptions, OpsCutoverReceiptOptions, PromptAssemblyOptions,
+    PromptBundle, RuntimeQueueCapacityOptions, RuntimeQueueEnqueueOptions,
     RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
     RuntimeRunOnceOptions, RuntimeRunOnceReport, RuntimeRunOnceStatus, SkillIndex,
     SkillSelectionQuery, SubagentPlan, SubagentPlanInput, SubagentWorkerEnqueueOptions, TurnPlan,
@@ -48,19 +50,20 @@ use agent_harness_core::{
     create_ops_backup, current_log_time_ms, enqueue_channel_step,
     enqueue_deterministic_cron_workers, enqueue_native_cron_workers, enqueue_subagent_workers,
     enqueue_worker_job, execute_import, export_harness_registry_files, export_memory_credentials,
-    inspect_runtime_queue_capacity, inventory, load_agent_registry, load_deterministic_cron_store,
-    load_native_cron_store, load_subagent_ledger, parse_channel_command,
-    plan_agent_progress_delivery, plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron,
-    plan_native_cron, plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
-    probe_codex_runtime_launch, reap_stale_worker_jobs, receive_channel_message,
+    inspect_openclaw_mem_service, inspect_runtime_queue_capacity, inventory, load_agent_registry,
+    load_deterministic_cron_store, load_native_cron_store, load_subagent_ledger,
+    parse_channel_command, plan_agent_progress_delivery, plan_channel_outbox, plan_codex_runtime,
+    plan_deterministic_cron, plan_native_cron, plan_subagents, preflight_codex_runtime,
+    prepare_runtime_queue_item, probe_codex_runtime_launch, propose_openclaw_mem_service_memory,
+    reap_stale_worker_jobs, recall_openclaw_mem_service, receive_channel_message,
     record_agent_progress_delivery, record_channel_delivery, record_codex_runtime_completion,
     record_ops_control, record_ops_cutover_receipt, run_channel_once, run_codex_runtime,
     run_memory_canvas_worker, run_memory_hook_adapter, run_runtime_queue_once, run_worker_once,
     search_imported_memory, search_imported_vector_memory, select_skills,
-    sync_builtin_harness_skills, write_channel_step, write_deterministic_cron_plan,
-    write_memory_search_receipt, write_memory_vector_recall_receipt, write_native_cron_plan,
-    write_prompt_bundle, write_report_files, write_skill_index, write_subagent_plan,
-    write_turn_plan, write_windows_supervisor_plan,
+    store_openclaw_mem_service_memory, sync_builtin_harness_skills, write_channel_step,
+    write_deterministic_cron_plan, write_memory_search_receipt, write_memory_vector_recall_receipt,
+    write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
+    write_subagent_plan, write_turn_plan, write_windows_supervisor_plan,
 };
 
 const DEFAULT_CODEX_TIMEOUT_MS: u64 = 30 * 60 * 1000;
@@ -87,6 +90,10 @@ fn main() {
         "memory-vector-search" => run_memory_vector_search(&rest),
         "memory-canvas-run" => run_memory_canvas_run(&rest),
         "memory-hook" => run_memory_hook(&rest),
+        "memory-service-status" => run_memory_service_status(&rest),
+        "memory-service-recall" => run_memory_service_recall(&rest),
+        "memory-service-propose" => run_memory_service_propose(&rest),
+        "memory-service-store" => run_memory_service_store(&rest),
         "ops-backup" => run_ops_backup(&rest),
         "ops-cutover-receipt" => run_ops_cutover_receipt(&rest),
         "ops-control" => run_ops_control(&rest),
@@ -597,6 +604,197 @@ fn run_memory_hook(args: &[String]) -> Result<(), String> {
     )
     .map_err(|err| err.to_string())?;
     print_json(&report)
+}
+
+fn run_memory_service_status(args: &[String]) -> Result<(), String> {
+    let args = memory_service_status_args_from_args(args)?;
+    let report = inspect_openclaw_mem_service(OpenClawMemServiceStatusOptions {
+        harness_home: args.target_home.clone(),
+        agent_id: args.agent_id,
+    })
+    .map_err(|err| err.to_string())?;
+    append_harness_log(
+        &args.target_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            if report.status == OpenClawMemServiceStatus::Blocked {
+                HarnessLogLevel::Warn
+            } else {
+                HarnessLogLevel::Info
+            },
+            "memory",
+            "memory.openclaw-mem-service.status",
+            format!(
+                "status={:?} mode={} qdrantEdgeMode={}",
+                report.status, report.service_mode, report.qdrant_edge_mode
+            ),
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    if args.json {
+        print_json(&report)?;
+    } else {
+        println!("OpenClaw memory service status");
+        println!("Harness home: {}", report.harness_home.display());
+        println!(
+            "Agent: {}",
+            report.agent_id.as_deref().unwrap_or("(global)")
+        );
+        println!("Status: {:?}", report.status);
+        println!("Mode: {}", report.service_mode);
+        println!("Qdrant edge mode: {}", report.qdrant_edge_mode);
+        if let Some(path) = &report.qdrant_edge_dir {
+            println!("Qdrant edge: {}", path.display());
+        }
+        if let Some(path) = &report.sqlite_database {
+            println!("SQLite snapshot: {}", path.display());
+        }
+        println!("Store file: {}", report.agent_store_file.display());
+        println!("Reason: {}", report.reason);
+        for warning in &report.warnings {
+            println!("Warning: {warning}");
+        }
+    }
+    if report.status == OpenClawMemServiceStatus::Blocked {
+        Err(report.reason)
+    } else {
+        Ok(())
+    }
+}
+
+fn run_memory_service_recall(args: &[String]) -> Result<(), String> {
+    let args = memory_service_recall_args_from_args(args)?;
+    let report = recall_openclaw_mem_service(OpenClawMemServiceRecallOptions {
+        harness_home: args.target_home.clone(),
+        agent_id: args.agent_id,
+        query: args.query,
+        limit: args.limit,
+        max_file_bytes: args.max_file_bytes,
+    })
+    .map_err(|err| err.to_string())?;
+    append_harness_log(
+        &args.target_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            HarnessLogLevel::Info,
+            "memory",
+            "memory.openclaw-mem-service.recall",
+            format!(
+                "status={:?} hits={} backend={}",
+                report.status, report.hit_count, report.backend
+            ),
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    if args.json {
+        print_json(&report)?;
+    } else {
+        println!("OpenClaw memory service recall");
+        println!("Harness home: {}", report.harness_home.display());
+        println!(
+            "Agent: {}",
+            report.agent_id.as_deref().unwrap_or("(global)")
+        );
+        println!("Status: {:?}", report.status);
+        println!("Backend: {}", report.backend);
+        println!("Hits: {}", report.hit_count);
+        println!("Reason: {}", report.reason);
+        for hit in &report.hits {
+            println!(
+                "- [{}] {:.4} {} :: {}",
+                hit.lane, hit.score, hit.title, hit.text
+            );
+        }
+        for warning in &report.warnings {
+            println!("Warning: {warning}");
+        }
+    }
+    Ok(())
+}
+
+fn run_memory_service_propose(args: &[String]) -> Result<(), String> {
+    let args = memory_service_propose_args_from_args(args)?;
+    let report = propose_openclaw_mem_service_memory(OpenClawMemServiceProposeOptions {
+        harness_home: args.target_home.clone(),
+        agent_id: args.agent_id,
+        session_key: args.session_key,
+        text: args.text,
+        payload: args.payload,
+        now_ms: current_time_ms()?,
+    })
+    .map_err(|err| err.to_string())?;
+    append_harness_log(
+        &args.target_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            HarnessLogLevel::Info,
+            "memory",
+            "memory.openclaw-mem-service.propose",
+            format!(
+                "status={:?} proposalId={}",
+                report.status,
+                report.proposal_id.as_deref().unwrap_or("-")
+            ),
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    if args.json {
+        print_json(&report)
+    } else {
+        println!("OpenClaw memory service proposal");
+        println!("Status: {:?}", report.status);
+        println!("Reason: {}", report.reason);
+        println!("Proposal file: {}", report.proposal_file.display());
+        if let Some(id) = &report.proposal_id {
+            println!("Proposal id: {id}");
+        }
+        Ok(())
+    }
+}
+
+fn run_memory_service_store(args: &[String]) -> Result<(), String> {
+    let args = memory_service_store_args_from_args(args)?;
+    let report = store_openclaw_mem_service_memory(OpenClawMemServiceStoreOptions {
+        harness_home: args.target_home.clone(),
+        agent_id: args.agent_id,
+        session_key: args.session_key,
+        text: args.text,
+        payload: args.payload,
+        approved: args.approved,
+        now_ms: current_time_ms()?,
+    })
+    .map_err(|err| err.to_string())?;
+    append_harness_log(
+        &args.target_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            if args.approved {
+                HarnessLogLevel::Info
+            } else {
+                HarnessLogLevel::Warn
+            },
+            "memory",
+            "memory.openclaw-mem-service.store",
+            format!(
+                "status={:?} storeId={}",
+                report.status,
+                report.store_id.as_deref().unwrap_or("-")
+            ),
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    if args.json {
+        print_json(&report)?;
+    } else {
+        println!("OpenClaw memory service store");
+        println!("Status: {:?}", report.status);
+        println!("Reason: {}", report.reason);
+        println!("Store file: {}", report.store_file.display());
+        if let Some(id) = &report.store_id {
+            println!("Store id: {id}");
+        }
+    }
+    Ok(())
 }
 
 fn run_ops_backup(args: &[String]) -> Result<(), String> {
@@ -3873,6 +4071,40 @@ struct MemoryCanvasRunArgs {
     json: bool,
 }
 
+struct MemoryServiceStatusArgs {
+    target_home: PathBuf,
+    agent_id: Option<String>,
+    json: bool,
+}
+
+struct MemoryServiceRecallArgs {
+    target_home: PathBuf,
+    agent_id: Option<String>,
+    query: String,
+    limit: usize,
+    max_file_bytes: u64,
+    json: bool,
+}
+
+struct MemoryServiceProposeArgs {
+    target_home: PathBuf,
+    agent_id: Option<String>,
+    session_key: Option<String>,
+    text: String,
+    payload: serde_json::Value,
+    json: bool,
+}
+
+struct MemoryServiceStoreArgs {
+    target_home: PathBuf,
+    agent_id: Option<String>,
+    session_key: Option<String>,
+    text: String,
+    payload: serde_json::Value,
+    approved: bool,
+    json: bool,
+}
+
 struct SupervisorPlanArgs {
     target_home: PathBuf,
     source_home: PathBuf,
@@ -5289,6 +5521,212 @@ fn memory_hook_args_from_args(args: &[String]) -> Result<MemoryHookArgs, String>
         now_ms,
         limit,
         max_file_bytes,
+    })
+}
+
+fn memory_service_status_args_from_args(
+    args: &[String],
+) -> Result<MemoryServiceStatusArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut agent_id = None;
+    let mut json = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--agent" | "--agent-id" => {
+                i += 1;
+                agent_id = Some(required_arg(args, i, "--agent")?.to_string());
+            }
+            "--json" => json = true,
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(MemoryServiceStatusArgs {
+        target_home,
+        agent_id,
+        json,
+    })
+}
+
+fn memory_service_recall_args_from_args(
+    args: &[String],
+) -> Result<MemoryServiceRecallArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut agent_id = None;
+    let mut query = None;
+    let mut limit = 5usize;
+    let mut max_file_bytes = 0u64;
+    let mut json = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--agent" | "--agent-id" => {
+                i += 1;
+                agent_id = Some(required_arg(args, i, "--agent")?.to_string());
+            }
+            "--query" | "-q" => {
+                i += 1;
+                query = Some(required_arg(args, i, "--query")?.to_string());
+            }
+            "--limit" => {
+                i += 1;
+                limit = parse_limit(required_arg(args, i, "--limit")?)?;
+            }
+            "--max-file-bytes" => {
+                i += 1;
+                max_file_bytes = parse_u64(
+                    required_arg(args, i, "--max-file-bytes")?,
+                    "--max-file-bytes",
+                )?;
+            }
+            "--json" => json = true,
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let query = query.ok_or_else(|| "--query is required".to_string())?;
+    if query.trim().is_empty() {
+        return Err("--query must not be empty".to_string());
+    }
+    Ok(MemoryServiceRecallArgs {
+        target_home,
+        agent_id,
+        query,
+        limit,
+        max_file_bytes,
+        json,
+    })
+}
+
+fn memory_service_propose_args_from_args(
+    args: &[String],
+) -> Result<MemoryServiceProposeArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut agent_id = None;
+    let mut session_key = None;
+    let mut text = None;
+    let mut payload = serde_json::json!({});
+    let mut json = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--agent" | "--agent-id" => {
+                i += 1;
+                agent_id = Some(required_arg(args, i, "--agent")?.to_string());
+            }
+            "--session" | "--session-key" => {
+                i += 1;
+                session_key = Some(required_arg(args, i, "--session")?.to_string());
+            }
+            "--text" => {
+                i += 1;
+                text = Some(required_arg(args, i, "--text")?.to_string());
+            }
+            "--text-file" => {
+                i += 1;
+                let path = required_arg(args, i, "--text-file")?;
+                text = Some(fs::read_to_string(path).map_err(|err| format!("{path}: {err}"))?);
+            }
+            "--payload" => {
+                i += 1;
+                payload = parse_json_arg(required_arg(args, i, "--payload")?, "--payload")?;
+            }
+            "--payload-file" => {
+                i += 1;
+                payload = read_json_arg_file(required_arg(args, i, "--payload-file")?)?;
+            }
+            "--json" => json = true,
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let text = text.ok_or_else(|| "--text or --text-file is required".to_string())?;
+    Ok(MemoryServiceProposeArgs {
+        target_home,
+        agent_id,
+        session_key,
+        text,
+        payload,
+        json,
+    })
+}
+
+fn memory_service_store_args_from_args(args: &[String]) -> Result<MemoryServiceStoreArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut agent_id = None;
+    let mut session_key = None;
+    let mut text = None;
+    let mut payload = serde_json::json!({});
+    let mut approved = false;
+    let mut json = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--agent" | "--agent-id" => {
+                i += 1;
+                agent_id = Some(required_arg(args, i, "--agent")?.to_string());
+            }
+            "--session" | "--session-key" => {
+                i += 1;
+                session_key = Some(required_arg(args, i, "--session")?.to_string());
+            }
+            "--text" => {
+                i += 1;
+                text = Some(required_arg(args, i, "--text")?.to_string());
+            }
+            "--text-file" => {
+                i += 1;
+                let path = required_arg(args, i, "--text-file")?;
+                text = Some(fs::read_to_string(path).map_err(|err| format!("{path}: {err}"))?);
+            }
+            "--payload" => {
+                i += 1;
+                payload = parse_json_arg(required_arg(args, i, "--payload")?, "--payload")?;
+            }
+            "--payload-file" => {
+                i += 1;
+                payload = read_json_arg_file(required_arg(args, i, "--payload-file")?)?;
+            }
+            "--approved" => approved = true,
+            "--json" => json = true,
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let text = text.ok_or_else(|| "--text or --text-file is required".to_string())?;
+    Ok(MemoryServiceStoreArgs {
+        target_home,
+        agent_id,
+        session_key,
+        text,
+        payload,
+        approved,
+        json,
     })
 }
 
@@ -12147,6 +12585,10 @@ fn print_help() {
     println!("  memory-vector-search Search imported SQLite vector memory with embedding query");
     println!("  memory-canvas-run Build compact symbolic canvas from captured candidates/episodes");
     println!("  memory-hook     Record OpenClaw-compatible memory adapter hook receipt");
+    println!("  memory-service-status Inspect OpenClaw memory service/snapshot adapter readiness");
+    println!("  memory-service-recall Recall through OpenClaw memory service adapter");
+    println!("  memory-service-propose Record a reviewed OpenClaw memory proposal");
+    println!("  memory-service-store Store approved OpenClaw memory writeback");
     println!("  ops-backup      Copy non-secret harness state and write a backup manifest");
     println!("  ops-cutover-receipt Record readiness summary for cutover audit");
     println!("  ops-control     Create/clear/inspect supervisor stop files");
@@ -12222,6 +12664,9 @@ fn print_help() {
     println!("  --limit <n>             Maximum matched skills to print");
     println!("  --max-file-bytes <n>    Maximum imported memory file size for memory-search");
     println!("  --no-receipt            Do not write memory search/vector-search probe receipts");
+    println!("  --text <text>           Memory-service proposal/store text");
+    println!("  --text-file <path>      Memory-service proposal/store text file");
+    println!("  --approved              Approve memory-service-store writeback");
     println!("  --message <text>        Incoming channel message for turn-plan");
     println!("  --platform <name>       local, telegram, discord, or cron");
     println!("  --channel-id <id>       Channel identity for session mapping");

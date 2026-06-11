@@ -10,6 +10,7 @@ const CATALOG_SCHEMA = "agent-harness.plugin-sidecar-catalog.v1";
 const EXECUTION_RECEIPT_SCHEMA = "agent-harness.plugin-sidecar-execution-receipt.v1";
 const HOOK_RECEIPT_SCHEMA = "agent-harness.plugin-sidecar-hook-receipt.v1";
 const MEMORY_SLOT_RECEIPT_SCHEMA = "agent-harness.plugin-sidecar-memory-slot-receipt.v1";
+const OPENCLAW_MEM_SERVICE_RECEIPT_SCHEMA = "agent-harness.openclaw-mem-sidecar-receipt.v1";
 
 function parseArgs(argv) {
   const args = {
@@ -106,6 +107,10 @@ function buildProbe(harnessHome) {
       "tools.call",
       "hooks.invoke",
       "memory.slot",
+      "openclaw_mem.status",
+      "openclaw_mem.recall",
+      "openclaw_mem.propose",
+      "openclaw_mem.store",
     ],
     summary: {
       plugins: plugins.length,
@@ -419,6 +424,18 @@ function handleRequest(harnessHome, request) {
   if (method === "memory.slot") {
     return handleMemorySlot(harnessHome, request.params || {});
   }
+  if (method === "openclaw_mem.status") {
+    return handleOpenClawMemStatus(harnessHome, request.params || {});
+  }
+  if (method === "openclaw_mem.recall") {
+    return handleOpenClawMemRecall(harnessHome, request.params || {});
+  }
+  if (method === "openclaw_mem.propose") {
+    return handleOpenClawMemPropose(harnessHome, request.params || {});
+  }
+  if (method === "openclaw_mem.store") {
+    return handleOpenClawMemStore(harnessHome, request.params || {});
+  }
   throw new Error(`unknown method: ${method}`);
 }
 
@@ -532,6 +549,296 @@ function writeMemorySlotReceipt(harnessHome, entry) {
   };
   fs.appendFileSync(receiptsFile, `${JSON.stringify(receipt)}\n`);
   return { receiptsFile, ...receipt };
+}
+
+function handleOpenClawMemStatus(harnessHome, params) {
+  const agentId = stringParam(params.agentId || params.agent || null);
+  const qdrantEdgeDir = path.join(harnessHome, "memory", "qdrant-edge");
+  const sqliteDatabase = path.join(harnessHome, "memory", "openclaw-mem.sqlite");
+  const observationsFile = path.join(harnessHome, "memory", "openclaw-mem-observations.jsonl");
+  const episodesFile = path.join(harnessHome, "memory", "openclaw-mem-episodes.jsonl");
+  const storeFile = openClawMemStoreFile(harnessHome, agentId);
+  const endpoint = stringParam(process.env.AGENT_HARNESS_OPENCLAW_MEM_SERVICE_URL || null);
+  const hasReadable =
+    fs.existsSync(sqliteDatabase) ||
+    fs.existsSync(observationsFile) ||
+    fs.existsSync(episodesFile) ||
+    fs.existsSync(storeFile);
+  const qdrantPresent = fs.existsSync(qdrantEdgeDir);
+  const warnings = [];
+  if (endpoint) {
+    warnings.push(
+      "Live openclaw-mem service endpoint is configured, but no remote wire contract is available in the imported artifacts; sidecar is using local snapshot/writeback files."
+    );
+  } else {
+    warnings.push("No live openclaw-mem service endpoint configured; sidecar is using local snapshot/writeback files.");
+  }
+  if (qdrantPresent) {
+    warnings.push("Qdrant edge is present as an imported snapshot; this sidecar does not raw-read it as a live Qdrant service.");
+  }
+  const status = hasReadable ? "ready" : qdrantPresent ? "degraded" : "blocked";
+  const result = {
+    schema: "agent-harness.openclaw-mem-sidecar-status.v1",
+    status,
+    harnessHome,
+    agentId,
+    serviceMode: "snapshot-adapter",
+    serviceEndpoint: endpoint,
+    qdrantEdgeDir: qdrantPresent ? qdrantEdgeDir : null,
+    qdrantEdgeMode: qdrantPresent ? "preserved-snapshot" : "missing",
+    sqliteDatabase: fs.existsSync(sqliteDatabase) ? sqliteDatabase : null,
+    observationsFile: fs.existsSync(observationsFile) ? observationsFile : null,
+    episodesFile: fs.existsSync(episodesFile) ? episodesFile : null,
+    storeFile,
+    capabilities: ["status", "recall", "propose", "store-approved"],
+    warnings,
+  };
+  const receipt = writeOpenClawMemSidecarReceipt(harnessHome, "openclaw_mem.status", result, agentId);
+  return { ...result, receipt };
+}
+
+function handleOpenClawMemRecall(harnessHome, params) {
+  const agentId = stringParam(params.agentId || params.agent || null);
+  const query = stringParam(params.query || "");
+  const limit = positiveInt(params.limit, 5);
+  if (!query) {
+    throw new Error("openclaw_mem.recall requires params.query");
+  }
+  const hits = [];
+  for (const file of openClawMemSearchFiles(harnessHome, agentId)) {
+    if (!fs.existsSync(file)) {
+      continue;
+    }
+    const lines = fs.readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean);
+    for (const [index, line] of lines.entries()) {
+      const text = jsonLineText(line);
+      const score = lexicalScore(query, text);
+      if (score > 0) {
+        hits.push({
+          lane: file.includes("openclaw-mem-service-store") ? "service-writeback" : "snapshot-jsonl",
+          id: `${file}:${index + 1}`,
+          score,
+          title: path.basename(file),
+          text: text.slice(0, 320),
+          source: file,
+        });
+      }
+    }
+  }
+  hits.sort((a, b) => b.score - a.score);
+  const result = {
+    schema: "agent-harness.openclaw-mem-sidecar-recall.v1",
+    status: hits.length ? "ready" : "no-hits",
+    harnessHome,
+    agentId,
+    queryLength: query.length,
+    hits: hits.slice(0, limit),
+    hitCount: Math.min(hits.length, limit),
+    backend: "sidecar-jsonl-snapshot",
+    qdrantEdgeMode: fs.existsSync(path.join(harnessHome, "memory", "qdrant-edge"))
+      ? "preserved-snapshot"
+      : "missing",
+  };
+  const receipt = writeOpenClawMemSidecarReceipt(harnessHome, "openclaw_mem.recall", result, agentId);
+  return { ...result, receipt };
+}
+
+function handleOpenClawMemPropose(harnessHome, params) {
+  const agentId = stringParam(params.agentId || params.agent || null);
+  const sessionKey = stringParam(params.sessionKey || params.session || null);
+  const text = redactText(stringParam(params.text || ""));
+  if (!text) {
+    throw new Error("openclaw_mem.propose requires params.text");
+  }
+  const proposalId = stableId("proposal", agentId, sessionKey, text);
+  const proposal = {
+    schema: "openclaw-mem.service-proposal.v1",
+    proposalId,
+    status: "pending-review",
+    agentId,
+    sessionKey,
+    text: text.slice(0, 1200),
+    payload: redactJson(params.payload || {}),
+    createdAtMs: Date.now(),
+  };
+  const proposalFile = openClawMemProposalFile(harnessHome, agentId);
+  appendJsonLine(proposalFile, proposal);
+  const result = {
+    schema: "agent-harness.openclaw-mem-sidecar-proposal.v1",
+    status: "pending-review",
+    harnessHome,
+    agentId,
+    sessionKey,
+    proposalId,
+    proposalFile,
+  };
+  const receipt = writeOpenClawMemSidecarReceipt(harnessHome, "openclaw_mem.propose", result, agentId);
+  return { ...result, receipt };
+}
+
+function handleOpenClawMemStore(harnessHome, params) {
+  const agentId = stringParam(params.agentId || params.agent || null);
+  const sessionKey = stringParam(params.sessionKey || params.session || null);
+  const approved = params.approved === true;
+  const text = redactText(stringParam(params.text || ""));
+  if (!text) {
+    throw new Error("openclaw_mem.store requires params.text");
+  }
+  const storeFile = openClawMemStoreFile(harnessHome, agentId);
+  const storeId = approved ? stableId("store", agentId, sessionKey, text) : null;
+  if (approved) {
+    appendJsonLine(storeFile, {
+      schema: "openclaw-mem.service-store.v1",
+      storeId,
+      agentId,
+      sessionKey,
+      text: text.slice(0, 1200),
+      payload: redactJson(params.payload || {}),
+      storedAtMs: Date.now(),
+      refs: { source: "agent-plugin-sidecar-openclaw-mem" },
+    });
+  }
+  const result = {
+    schema: "agent-harness.openclaw-mem-sidecar-store.v1",
+    status: approved ? "stored" : "review-required",
+    harnessHome,
+    agentId,
+    sessionKey,
+    storeId,
+    storeFile,
+    reason: approved
+      ? "approved memory stored in sidecar writeback"
+      : "store blocked because params.approved was not true",
+  };
+  const receipt = writeOpenClawMemSidecarReceipt(harnessHome, "openclaw_mem.store", result, agentId);
+  return { ...result, receipt };
+}
+
+function openClawMemSearchFiles(harnessHome, agentId) {
+  return [
+    path.join(harnessHome, "memory", "openclaw-mem-observations.jsonl"),
+    path.join(harnessHome, "memory", "openclaw-mem-episodes.jsonl"),
+    openClawMemStoreFile(harnessHome, agentId),
+  ];
+}
+
+function openClawMemProposalFile(harnessHome, agentId) {
+  return path.join(openClawMemStateDir(harnessHome, agentId), "openclaw-mem-service-proposals.jsonl");
+}
+
+function openClawMemStoreFile(harnessHome, agentId) {
+  if (agentId) {
+    return path.join(harnessHome, "agents", normalizePathPart(agentId), "memory", "openclaw-mem-service-store.jsonl");
+  }
+  return path.join(harnessHome, "memory", "openclaw-mem-service-store.jsonl");
+}
+
+function openClawMemStateDir(harnessHome, agentId) {
+  if (agentId) {
+    return path.join(harnessHome, "state", "agents", normalizePathPart(agentId), "memory");
+  }
+  return path.join(harnessHome, "state", "memory");
+}
+
+function writeOpenClawMemSidecarReceipt(harnessHome, method, result, agentId) {
+  const dir = openClawMemStateDir(harnessHome, agentId);
+  fs.mkdirSync(dir, { recursive: true });
+  const receiptsFile = path.join(dir, "openclaw-mem-sidecar-receipts.jsonl");
+  const receipt = {
+    schema: OPENCLAW_MEM_SERVICE_RECEIPT_SCHEMA,
+    method,
+    status: result.status,
+    agentId,
+    atMs: Date.now(),
+    reason: result.reason || `${method} completed`,
+  };
+  fs.appendFileSync(receiptsFile, `${JSON.stringify(receipt)}\n`);
+  return { receiptsFile, ...receipt };
+}
+
+function appendJsonLine(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, `${JSON.stringify(value)}\n`);
+}
+
+function jsonLineText(line) {
+  try {
+    const value = JSON.parse(line);
+    return String(value.text || value.summary || value.content || value.payload?.text || line);
+  } catch {
+    return line;
+  }
+}
+
+function lexicalScore(query, text) {
+  const lower = text.toLowerCase();
+  return query
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter((term) => lower.includes(term)).length;
+}
+
+function positiveInt(value, fallback) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function stringParam(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const text = String(value).trim();
+  return text ? text : null;
+}
+
+function normalizePathPart(value) {
+  return String(value)
+    .split("")
+    .map((ch) => (/^[A-Za-z0-9_.-]$/.test(ch) ? ch.toLowerCase() : `_u${ch.codePointAt(0).toString(16)}_`))
+    .join("") || "unknown";
+}
+
+function stableId(kind, agentId, sessionKey, text) {
+  let hash = 0xcbf29ce484222325n;
+  const input = `${kind}|${agentId || "global"}|${sessionKey || "unknown"}|${text}`;
+  for (const ch of Buffer.from(input, "utf8")) {
+    hash ^= BigInt(ch);
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return `sidecar:${hash.toString(16).padStart(16, "0")}`;
+}
+
+function redactJson(value) {
+  if (typeof value === "string") {
+    return redactText(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map(redactJson);
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, child]) => {
+        const lower = key.toLowerCase();
+        if (lower.includes("key") || lower.includes("token") || lower.includes("secret") || lower.includes("password")) {
+          return [key, "[redacted]"];
+        }
+        return [key, redactJson(child)];
+      }),
+    );
+  }
+  return value;
+}
+
+function redactText(text) {
+  return String(text)
+    .split(/\s+/)
+    .map((token) =>
+      token.startsWith("sk-") || token.toLowerCase().includes("token=") || token.toLowerCase().includes("password=")
+        ? "[redacted]"
+        : token,
+    )
+    .join(" ");
 }
 
 async function main() {
