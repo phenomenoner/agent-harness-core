@@ -580,6 +580,8 @@ fn agent_id(value: &Value) -> Option<&str> {
 }
 
 fn model_route(value: &Value) -> (Option<String>, Option<String>) {
+    let has_explicit_provider = string_field(value, &["provider", "providerId", "provider_id"])
+        .is_some_and(|provider| !provider.trim().is_empty());
     let route = string_field(value, &["model", "modelId", "model_id"])
         .or_else(|| {
             value
@@ -588,6 +590,14 @@ fn model_route(value: &Value) -> (Option<String>, Option<String>) {
         })
         .or_else(|| string_field(value, &["primary"]));
     match route {
+        Some(route) if has_explicit_provider => {
+            let trimmed = route.trim();
+            if trimmed.is_empty() {
+                (None, None)
+            } else {
+                (None, Some(trimmed.to_string()))
+            }
+        }
         Some(route) => split_provider_model_route(route),
         None => (None, None),
     }
@@ -815,6 +825,40 @@ mod tests {
             openrouter.models,
             vec!["openai/gpt-5.4-mini", "qwen/qwen3.6-plus"]
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registry_preserves_slash_model_when_provider_is_explicit() {
+        let root = temp_root("registry_preserves_slash_model_when_provider_is_explicit");
+        let home = root.join(".openclaw");
+        fs::create_dir_all(home.join("agents").join("main").join("agent")).unwrap();
+        fs::write(
+            home.join("openclaw.json"),
+            r#"{
+              "agents": {
+                "defaults": {
+                  "provider": "openrouter",
+                  "model": "anthropic/claude-sonnet-4"
+                },
+                "list": [
+                  { "id": "main", "enabled": true }
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let registry = load_agent_registry(&AgentSource::new(&home)).unwrap();
+        assert_eq!(registry.defaults.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            registry.defaults.model.as_deref(),
+            Some("anthropic/claude-sonnet-4")
+        );
+        let main = agent(&registry, "main");
+        assert_eq!(main.provider.as_deref(), Some("openrouter"));
+        assert_eq!(main.model.as_deref(), Some("anthropic/claude-sonnet-4"));
 
         let _ = fs::remove_dir_all(root);
     }

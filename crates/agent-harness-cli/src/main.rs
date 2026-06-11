@@ -529,6 +529,7 @@ fn run_memory_canvas_run(args: &[String]) -> Result<(), String> {
     let args = memory_canvas_run_args_from_args(args)?;
     let report = run_memory_canvas_worker(MemoryCanvasWorkerOptions {
         harness_home: args.target_home.clone(),
+        agent_id: args.agent_id.clone(),
         now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
     })
     .map_err(|err| err.to_string())?;
@@ -3868,6 +3869,7 @@ struct MemoryVectorSearchArgs {
 
 struct MemoryCanvasRunArgs {
     target_home: PathBuf,
+    agent_id: Option<String>,
     json: bool,
 }
 
@@ -5150,6 +5152,7 @@ fn memory_vector_search_args_from_args(args: &[String]) -> Result<MemoryVectorSe
 
 fn memory_canvas_run_args_from_args(args: &[String]) -> Result<MemoryCanvasRunArgs, String> {
     let mut target_home = default_harness_home();
+    let mut agent_id = None;
     let mut json = false;
     let mut i = 0;
 
@@ -5159,13 +5162,21 @@ fn memory_canvas_run_args_from_args(args: &[String]) -> Result<MemoryCanvasRunAr
                 i += 1;
                 target_home = parse_harness_home_path(args, i, flag)?;
             }
+            "--agent" | "--agent-id" => {
+                i += 1;
+                agent_id = Some(required_arg(args, i, "--agent")?.to_string());
+            }
             "--json" => json = true,
             flag => return Err(format!("unknown argument: {flag}")),
         }
         i += 1;
     }
 
-    Ok(MemoryCanvasRunArgs { target_home, json })
+    Ok(MemoryCanvasRunArgs {
+        target_home,
+        agent_id,
+        json,
+    })
 }
 
 fn memory_hook_args_from_args(args: &[String]) -> Result<MemoryHookArgs, String> {
@@ -10977,6 +10988,10 @@ fn print_memory_vector_report(report: &MemoryVectorRecallReport) {
 fn print_memory_canvas_report(report: &MemoryCanvasWorkerReport) {
     println!("Harness memory canvas worker");
     println!("Harness home: {}", report.harness_home.display());
+    println!(
+        "Agent: {}",
+        report.agent_id.as_deref().unwrap_or("(global)")
+    );
     println!("Status: {:?}", report.status);
     println!("Reason: {}", report.reason);
     println!("Canvas JSON: {}", report.canvas_json.display());

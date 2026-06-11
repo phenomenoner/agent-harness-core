@@ -1207,8 +1207,14 @@ mod tests {
         .unwrap();
         assert!(lifecycle.contains(r#""status":"recorded""#));
         assert!(lifecycle.contains(r#""episodesAppended":2"#));
-        let episodes =
-            fs::read_to_string(harness_home.join("memory").join("episodes.jsonl")).unwrap();
+        let episodes = fs::read_to_string(
+            harness_home
+                .join("agents")
+                .join("main")
+                .join("memory")
+                .join("episodes.jsonl"),
+        )
+        .unwrap();
         assert_eq!(episodes.lines().count(), 2);
 
         let _ = fs::remove_dir_all(root);

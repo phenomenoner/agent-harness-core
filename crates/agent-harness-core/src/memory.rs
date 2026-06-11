@@ -229,6 +229,7 @@ pub enum MemoryLifecycleStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryCanvasWorkerOptions {
     pub harness_home: PathBuf,
+    pub agent_id: Option<String>,
     pub now_ms: i64,
 }
 
@@ -237,6 +238,7 @@ pub struct MemoryCanvasWorkerOptions {
 pub struct MemoryCanvasWorkerReport {
     pub schema: &'static str,
     pub harness_home: PathBuf,
+    pub agent_id: Option<String>,
     pub status: MemoryCanvasWorkerStatus,
     pub reason: String,
     pub canvas_json: PathBuf,
@@ -373,12 +375,27 @@ pub fn memory_prompt_context_receipts_file(harness_home: impl AsRef<Path>) -> Pa
         .join("prompt-context-receipts.jsonl")
 }
 
+pub fn memory_prompt_context_receipts_file_for_agent(
+    harness_home: impl AsRef<Path>,
+    agent_id: Option<&str>,
+) -> PathBuf {
+    memory_state_dir_for_agent(harness_home.as_ref(), agent_id)
+        .join("prompt-context-receipts.jsonl")
+}
+
 pub fn memory_prompt_context_latest_file(harness_home: impl AsRef<Path>) -> PathBuf {
     harness_home
         .as_ref()
         .join("state")
         .join("memory")
         .join("prompt-context-last.json")
+}
+
+pub fn memory_prompt_context_latest_file_for_agent(
+    harness_home: impl AsRef<Path>,
+    agent_id: Option<&str>,
+) -> PathBuf {
+    memory_state_dir_for_agent(harness_home.as_ref(), agent_id).join("prompt-context-last.json")
 }
 
 pub fn memory_vector_recall_receipts_file(harness_home: impl AsRef<Path>) -> PathBuf {
@@ -405,12 +422,26 @@ pub fn memory_lifecycle_receipts_file(harness_home: impl AsRef<Path>) -> PathBuf
         .join("lifecycle-receipts.jsonl")
 }
 
+pub fn memory_lifecycle_receipts_file_for_agent(
+    harness_home: impl AsRef<Path>,
+    agent_id: Option<&str>,
+) -> PathBuf {
+    memory_state_dir_for_agent(harness_home.as_ref(), agent_id).join("lifecycle-receipts.jsonl")
+}
+
 pub fn memory_lifecycle_latest_file(harness_home: impl AsRef<Path>) -> PathBuf {
     harness_home
         .as_ref()
         .join("state")
         .join("memory")
         .join("lifecycle-last.json")
+}
+
+pub fn memory_lifecycle_latest_file_for_agent(
+    harness_home: impl AsRef<Path>,
+    agent_id: Option<&str>,
+) -> PathBuf {
+    memory_state_dir_for_agent(harness_home.as_ref(), agent_id).join("lifecycle-last.json")
 }
 
 pub fn memory_canvas_receipts_file(harness_home: impl AsRef<Path>) -> PathBuf {
@@ -421,12 +452,26 @@ pub fn memory_canvas_receipts_file(harness_home: impl AsRef<Path>) -> PathBuf {
         .join("canvas-receipts.jsonl")
 }
 
+pub fn memory_canvas_receipts_file_for_agent(
+    harness_home: impl AsRef<Path>,
+    agent_id: Option<&str>,
+) -> PathBuf {
+    memory_state_dir_for_agent(harness_home.as_ref(), agent_id).join("canvas-receipts.jsonl")
+}
+
 pub fn memory_canvas_latest_file(harness_home: impl AsRef<Path>) -> PathBuf {
     harness_home
         .as_ref()
         .join("state")
         .join("memory")
         .join("canvas-last.json")
+}
+
+pub fn memory_canvas_latest_file_for_agent(
+    harness_home: impl AsRef<Path>,
+    agent_id: Option<&str>,
+) -> PathBuf {
+    memory_state_dir_for_agent(harness_home.as_ref(), agent_id).join("canvas-last.json")
 }
 
 pub fn memory_hook_receipts_file(harness_home: impl AsRef<Path>) -> PathBuf {
@@ -459,6 +504,36 @@ pub fn memory_slot_receipts_file(harness_home: impl AsRef<Path>) -> PathBuf {
         .join("state")
         .join("memory")
         .join("slot-receipts.jsonl")
+}
+
+fn memory_state_dir_for_agent(harness_home: &Path, agent_id: Option<&str>) -> PathBuf {
+    match normalized_agent_id(agent_id) {
+        Some(agent_id) => harness_home
+            .join("state")
+            .join("agents")
+            .join(agent_id)
+            .join("memory"),
+        None => harness_home.join("state").join("memory"),
+    }
+}
+
+fn memory_root_for_agent(harness_home: &Path, agent_id: Option<&str>) -> PathBuf {
+    match normalized_agent_id(agent_id) {
+        Some(agent_id) => harness_home.join("agents").join(agent_id),
+        None => harness_home.to_path_buf(),
+    }
+}
+
+fn memory_path_for_agent(
+    harness_home: &Path,
+    agent_id: Option<&str>,
+    relative_path: &Path,
+) -> PathBuf {
+    if relative_path.is_absolute() {
+        relative_path.to_path_buf()
+    } else {
+        memory_root_for_agent(harness_home, agent_id).join(relative_path)
+    }
 }
 
 pub fn run_memory_hook_adapter(options: MemoryHookAdapterOptions) -> io::Result<MemoryHookReport> {
@@ -498,8 +573,14 @@ pub fn run_memory_hook_adapter(options: MemoryHookAdapterOptions) -> io::Result<
                 status,
                 report.reason.clone(),
                 serde_json::json!({
-                    "promptContextLast": memory_prompt_context_latest_file(&options.harness_home),
-                    "promptContextReceipts": memory_prompt_context_receipts_file(&options.harness_home),
+                    "promptContextLast": memory_prompt_context_latest_file_for_agent(
+                        &options.harness_home,
+                        options.agent_id.as_deref(),
+                    ),
+                    "promptContextReceipts": memory_prompt_context_receipts_file_for_agent(
+                        &options.harness_home,
+                        options.agent_id.as_deref(),
+                    ),
                     "promptContextStatus": report.status,
                     "hitCount": report.hit_count,
                     "contextLength": report.context.as_ref().map(|text| text.chars().count()).unwrap_or(0),
@@ -547,8 +628,14 @@ pub fn run_memory_hook_adapter(options: MemoryHookAdapterOptions) -> io::Result<
                 status,
                 report.reason.clone(),
                 serde_json::json!({
-                    "lifecycleLast": memory_lifecycle_latest_file(&options.harness_home),
-                    "lifecycleReceipts": memory_lifecycle_receipts_file(&options.harness_home),
+                    "lifecycleLast": memory_lifecycle_latest_file_for_agent(
+                        &options.harness_home,
+                        report.agent_id.as_deref(),
+                    ),
+                    "lifecycleReceipts": memory_lifecycle_receipts_file_for_agent(
+                        &options.harness_home,
+                        report.agent_id.as_deref(),
+                    ),
                     "episodeFile": report.episode_file,
                     "captureCandidatesFile": report.capture_candidates_file,
                     "episodesAppended": report.episodes_appended,
@@ -559,6 +646,7 @@ pub fn run_memory_hook_adapter(options: MemoryHookAdapterOptions) -> io::Result<
         MemoryHookKind::CanvasMaintenance => {
             let report = run_memory_canvas_worker(MemoryCanvasWorkerOptions {
                 harness_home: options.harness_home.clone(),
+                agent_id: options.agent_id.clone(),
                 now_ms: options.now_ms,
             })?;
             warnings.extend(report.warnings.clone());
@@ -571,8 +659,14 @@ pub fn run_memory_hook_adapter(options: MemoryHookAdapterOptions) -> io::Result<
                 status,
                 report.reason.clone(),
                 serde_json::json!({
-                    "canvasLast": memory_canvas_latest_file(&options.harness_home),
-                    "canvasReceipts": memory_canvas_receipts_file(&options.harness_home),
+                    "canvasLast": memory_canvas_latest_file_for_agent(
+                        &options.harness_home,
+                        options.agent_id.as_deref(),
+                    ),
+                    "canvasReceipts": memory_canvas_receipts_file_for_agent(
+                        &options.harness_home,
+                        options.agent_id.as_deref(),
+                    ),
                     "canvasJson": report.canvas_json,
                     "canvasMarkdown": report.canvas_markdown,
                     "candidatesRead": report.candidates_read,
@@ -1182,6 +1276,14 @@ pub fn write_memory_search_receipt(report: &MemorySearchReport) -> io::Result<()
 pub fn write_memory_prompt_context_receipt(report: &MemoryPromptContextReport) -> io::Result<()> {
     let last_file = memory_prompt_context_latest_file(&report.harness_home);
     let receipts_file = memory_prompt_context_receipts_file(&report.harness_home);
+    let agent_last_file = memory_prompt_context_latest_file_for_agent(
+        &report.harness_home,
+        report.agent_id.as_deref(),
+    );
+    let agent_receipts_file = memory_prompt_context_receipts_file_for_agent(
+        &report.harness_home,
+        report.agent_id.as_deref(),
+    );
     if let Some(parent) = last_file.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1199,6 +1301,13 @@ pub fn write_memory_prompt_context_receipt(report: &MemoryPromptContextReport) -
     });
     fs::write(&last_file, serde_json::to_string_pretty(&value)?)?;
     append_json_line(&receipts_file, &value)?;
+    if agent_last_file != last_file || agent_receipts_file != receipts_file {
+        if let Some(parent) = agent_last_file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&agent_last_file, serde_json::to_string_pretty(&value)?)?;
+        append_json_line(&agent_receipts_file, &value)?;
+    }
     Ok(())
 }
 
@@ -1270,7 +1379,11 @@ pub fn record_memory_lifecycle_turn(
     let mut warnings = config.warnings;
     let mut episodes_appended = 0usize;
     let episode_file = if config.episodes_enabled {
-        let episode_file = options.harness_home.join(config.episodes_output_path);
+        let episode_file = memory_path_for_agent(
+            &options.harness_home,
+            agent_id.as_deref(),
+            &config.episodes_output_path,
+        );
         if !user_text.trim().is_empty() {
             append_json_line(
                 &episode_file,
@@ -1308,10 +1421,7 @@ pub fn record_memory_lifecycle_turn(
         Vec::new()
     };
     let capture_candidates_file = if !capture_candidates.is_empty() {
-        let file = options
-            .harness_home
-            .join("state")
-            .join("memory")
+        let file = memory_state_dir_for_agent(&options.harness_home, agent_id.as_deref())
             .join("auto-capture-candidates.jsonl");
         for candidate in &capture_candidates {
             append_json_line(
@@ -1335,6 +1445,7 @@ pub fn record_memory_lifecycle_turn(
     if config.symbolic_canvas_enabled {
         match run_memory_canvas_worker(MemoryCanvasWorkerOptions {
             harness_home: options.harness_home.clone(),
+            agent_id: agent_id.clone(),
             now_ms: options.now_ms,
         }) {
             Ok(canvas) => warnings.push(format!(
@@ -1374,42 +1485,50 @@ fn write_memory_lifecycle_report(
 ) -> io::Result<MemoryLifecycleReport> {
     let last_file = memory_lifecycle_latest_file(&report.harness_home);
     let receipts_file = memory_lifecycle_receipts_file(&report.harness_home);
+    let agent_last_file =
+        memory_lifecycle_latest_file_for_agent(&report.harness_home, report.agent_id.as_deref());
+    let agent_receipts_file =
+        memory_lifecycle_receipts_file_for_agent(&report.harness_home, report.agent_id.as_deref());
     if let Some(parent) = last_file.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(
-        &last_file,
-        serde_json::to_string_pretty(&report).map_err(io::Error::other)?,
-    )?;
+    let report_json = serde_json::to_string_pretty(&report).map_err(io::Error::other)?;
+    fs::write(&last_file, &report_json)?;
     append_json_line(&receipts_file, &report)?;
+    if agent_last_file != last_file || agent_receipts_file != receipts_file {
+        if let Some(parent) = agent_last_file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&agent_last_file, &report_json)?;
+        append_json_line(&agent_receipts_file, &report)?;
+    }
     Ok(report)
 }
 
 pub fn run_memory_canvas_worker(
     options: MemoryCanvasWorkerOptions,
 ) -> io::Result<MemoryCanvasWorkerReport> {
-    let canvas_dir = options
-        .harness_home
-        .join("state")
-        .join("memory")
-        .join("canvas");
+    let agent_id = options.agent_id.clone();
+    let memory_state_dir = memory_state_dir_for_agent(&options.harness_home, agent_id.as_deref());
+    let canvas_dir = memory_state_dir.join("canvas");
     let canvas_json = canvas_dir.join("symbolic-canvas.json");
     let canvas_markdown = canvas_dir.join("symbolic-canvas.md");
-    let candidates_file = options
-        .harness_home
-        .join("state")
-        .join("memory")
-        .join("auto-capture-candidates.jsonl");
+    let candidates_file = memory_state_dir.join("auto-capture-candidates.jsonl");
     let candidates = read_recent_jsonl_values(&candidates_file, 80)?;
     let mut episodes = read_recent_jsonl_values(
-        &options
-            .harness_home
-            .join("memory")
-            .join("openclaw-mem-episodes.jsonl"),
+        &memory_path_for_agent(
+            &options.harness_home,
+            agent_id.as_deref(),
+            Path::new("memory/openclaw-mem-episodes.jsonl"),
+        ),
         40,
     )?;
     episodes.extend(read_recent_jsonl_values(
-        &options.harness_home.join("memory").join("episodes.jsonl"),
+        &memory_path_for_agent(
+            &options.harness_home,
+            agent_id.as_deref(),
+            Path::new("memory/episodes.jsonl"),
+        ),
         40,
     )?);
 
@@ -1417,6 +1536,7 @@ pub fn run_memory_canvas_worker(
         return write_memory_canvas_report(MemoryCanvasWorkerReport {
             schema: MEMORY_CANVAS_RECEIPT_SCHEMA,
             harness_home: options.harness_home,
+            agent_id,
             status: MemoryCanvasWorkerStatus::Skipped,
             reason: "no memory candidates or episodes available for symbolic canvas".to_string(),
             canvas_json,
@@ -1460,6 +1580,7 @@ pub fn run_memory_canvas_worker(
         .collect::<Vec<_>>();
     let canvas = serde_json::json!({
         "schema": "agent-harness.symbolic-canvas.v1",
+        "agentId": agent_id,
         "generatedAtMs": options.now_ms,
         "categoryCounts": category_counts,
         "recentCandidates": recent_candidates,
@@ -1477,6 +1598,7 @@ pub fn run_memory_canvas_worker(
     write_memory_canvas_report(MemoryCanvasWorkerReport {
         schema: MEMORY_CANVAS_RECEIPT_SCHEMA,
         harness_home: options.harness_home,
+        agent_id: options.agent_id,
         status: MemoryCanvasWorkerStatus::Written,
         reason: "symbolic canvas worker wrote compact candidate/episode view".to_string(),
         canvas_json,
@@ -1492,14 +1614,23 @@ fn write_memory_canvas_report(
 ) -> io::Result<MemoryCanvasWorkerReport> {
     let last_file = memory_canvas_latest_file(&report.harness_home);
     let receipts_file = memory_canvas_receipts_file(&report.harness_home);
+    let agent_last_file =
+        memory_canvas_latest_file_for_agent(&report.harness_home, report.agent_id.as_deref());
+    let agent_receipts_file =
+        memory_canvas_receipts_file_for_agent(&report.harness_home, report.agent_id.as_deref());
     if let Some(parent) = last_file.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(
-        &last_file,
-        serde_json::to_string_pretty(&report).map_err(io::Error::other)?,
-    )?;
+    let report_json = serde_json::to_string_pretty(&report).map_err(io::Error::other)?;
+    fs::write(&last_file, &report_json)?;
     append_json_line(&receipts_file, &report)?;
+    if agent_last_file != last_file || agent_receipts_file != receipts_file {
+        if let Some(parent) = agent_last_file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&agent_last_file, &report_json)?;
+        append_json_line(&agent_receipts_file, &report)?;
+    }
     Ok(report)
 }
 
@@ -2315,6 +2446,33 @@ fn path_value(value: &Value, key: &str) -> Option<PathBuf> {
     string_value(value, key).map(PathBuf::from)
 }
 
+fn normalized_agent_id(agent_id: Option<&str>) -> Option<String> {
+    let agent_id = agent_id?.trim();
+    if agent_id.is_empty() {
+        None
+    } else {
+        Some(normalize_path_part(agent_id))
+    }
+}
+
+fn normalize_path_part(value: &str) -> String {
+    let mut normalized = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            normalized.push(ch.to_ascii_lowercase());
+        } else {
+            normalized.push_str("_u");
+            normalized.push_str(&format!("{:x}", ch as u32));
+            normalized.push('_');
+        }
+    }
+    if normalized.is_empty() {
+        "unknown".to_string()
+    } else {
+        normalized
+    }
+}
+
 fn redact_sensitive(text: &str) -> String {
     text.split_whitespace()
         .map(|token| {
@@ -2641,14 +2799,22 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("symbolic canvas worker status=Written"))
         );
-        let episodes =
-            fs::read_to_string(harness_home.join("memory").join("episodes.jsonl")).unwrap();
+        let episodes = fs::read_to_string(
+            harness_home
+                .join("agents")
+                .join("main")
+                .join("memory")
+                .join("episodes.jsonl"),
+        )
+        .unwrap();
         assert_eq!(episodes.lines().count(), 2);
         assert!(episodes.contains("conversation.user"));
         assert!(episodes.contains("conversation.assistant"));
         let candidates = fs::read_to_string(
             harness_home
                 .join("state")
+                .join("agents")
+                .join("main")
                 .join("memory")
                 .join("auto-capture-candidates.jsonl"),
         )
@@ -2657,6 +2823,8 @@ mod tests {
         assert!(
             harness_home
                 .join("state")
+                .join("agents")
+                .join("main")
                 .join("memory")
                 .join("canvas")
                 .join("symbolic-canvas.json")
@@ -2664,6 +2832,126 @@ mod tests {
         );
         let receipt = fs::read_to_string(memory_lifecycle_latest_file(&harness_home)).unwrap();
         assert!(receipt.contains(r#""status": "recorded""#));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn memory_lifecycle_keeps_agent_namespaces_independent() {
+        let root = temp_root("memory_lifecycle_keeps_agent_namespaces_independent");
+        let harness_home = root.join("harness");
+        let source_home = root.join(".openclaw");
+        fs::create_dir_all(&source_home).unwrap();
+        fs::write(
+            source_home.join("openclaw.json"),
+            r#"{
+              "plugins": {
+                "entries": {
+                  "openclaw-mem": {
+                    "config": {
+                      "episodes": {
+                        "enabled": true,
+                        "outputPath": "memory/episodes.jsonl"
+                      }
+                    }
+                  },
+                  "openclaw-mem-engine": {
+                    "config": {
+                      "autoCapture": { "enabled": true },
+                      "symbolicCanvas": { "autoBuild": { "enabled": true } }
+                    }
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let main_prompt = write_test_prompt_bundle(
+            &root,
+            &source_home,
+            "main",
+            "telegram:dm:user:main",
+            "remember main-only-memory preference",
+        );
+        let xiao_li_prompt = write_test_prompt_bundle(
+            &root,
+            &source_home,
+            "小小梨",
+            "telegram:dm:user:xiao-li",
+            "remember xiao-li-only-memory preference",
+        );
+
+        record_memory_lifecycle_turn(MemoryLifecycleTurnOptions {
+            harness_home: harness_home.clone(),
+            prompt_bundle_json: main_prompt,
+            assistant_text: "main-only-memory acknowledged".to_string(),
+            success: true,
+            now_ms: 1_000,
+        })
+        .unwrap();
+        record_memory_lifecycle_turn(MemoryLifecycleTurnOptions {
+            harness_home: harness_home.clone(),
+            prompt_bundle_json: xiao_li_prompt,
+            assistant_text: "xiao-li-only-memory acknowledged".to_string(),
+            success: true,
+            now_ms: 2_000,
+        })
+        .unwrap();
+
+        let main_episodes = fs::read_to_string(
+            harness_home
+                .join("agents")
+                .join("main")
+                .join("memory")
+                .join("episodes.jsonl"),
+        )
+        .unwrap();
+        let xiao_li_episode_file = memory_path_for_agent(
+            &harness_home,
+            Some("小小梨"),
+            Path::new("memory/episodes.jsonl"),
+        );
+        let xiao_li_episodes = fs::read_to_string(&xiao_li_episode_file).unwrap();
+        assert!(
+            xiao_li_episode_file
+                .to_string_lossy()
+                .contains("_u5c0f__u5c0f__u68a8_")
+        );
+        assert!(main_episodes.contains("main-only-memory"));
+        assert!(!main_episodes.contains("xiao-li-only-memory"));
+        assert!(xiao_li_episodes.contains("xiao-li-only-memory"));
+        assert!(!xiao_li_episodes.contains("main-only-memory"));
+
+        let main_candidates = fs::read_to_string(
+            memory_state_dir_for_agent(&harness_home, Some("main"))
+                .join("auto-capture-candidates.jsonl"),
+        )
+        .unwrap();
+        let xiao_li_candidates = fs::read_to_string(
+            memory_state_dir_for_agent(&harness_home, Some("小小梨"))
+                .join("auto-capture-candidates.jsonl"),
+        )
+        .unwrap();
+        assert!(main_candidates.contains(r#""agentId":"main""#));
+        assert!(xiao_li_candidates.contains(r#""agentId":"小小梨""#));
+
+        let main_canvas = fs::read_to_string(memory_canvas_latest_file_for_agent(
+            &harness_home,
+            Some("main"),
+        ))
+        .unwrap();
+        let xiao_li_canvas = fs::read_to_string(memory_canvas_latest_file_for_agent(
+            &harness_home,
+            Some("小小梨"),
+        ))
+        .unwrap();
+        assert!(main_canvas.contains(r#""agentId": "main""#));
+        assert!(xiao_li_canvas.contains(r#""agentId": "小小梨""#));
+
+        let global_receipts =
+            fs::read_to_string(memory_lifecycle_receipts_file(&harness_home)).unwrap();
+        assert_eq!(global_receipts.lines().count(), 2);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2855,6 +3143,7 @@ mod tests {
 
         let report = run_memory_canvas_worker(MemoryCanvasWorkerOptions {
             harness_home: harness_home.clone(),
+            agent_id: None,
             now_ms: 2_000,
         })
         .unwrap();
@@ -2942,6 +3231,36 @@ mod tests {
         assert!(!hook.contains("secret-memory-text"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_test_prompt_bundle(
+        root: &Path,
+        source_home: &Path,
+        agent_id: &str,
+        session_key: &str,
+        user_message: &str,
+    ) -> PathBuf {
+        let path = root.join(format!(
+            "prompt-bundle-{}.json",
+            normalize_path_part(agent_id)
+        ));
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "sourceHome": source_home,
+                "agentId": agent_id,
+                "sessionKey": session_key,
+                "sections": [
+                    {
+                        "kind": "user-message",
+                        "content": user_message
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
     }
 
     fn vector_blob(values: &[f32]) -> Vec<u8> {

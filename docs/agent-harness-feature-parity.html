@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Harness Feature Parity</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fb;
+      --ink: #172033;
+      --muted: #596579;
+      --line: #d9deea;
+      --panel: #ffffff;
+      --panel-2: #eef3f8;
+      --green: #147a4f;
+      --amber: #925500;
+      --red: #a33131;
+      --blue: #2563a8;
+      --shadow: 0 16px 42px rgba(18, 32, 55, 0.11);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Noto Sans TC", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      line-height: 1.55;
+    }
+
+    header {
+      background: #172033;
+      color: #fff;
+      padding: 42px 32px 34px;
+    }
+
+    .wrap {
+      max-width: 1180px;
+      margin: 0 auto;
+    }
+
+    .eyebrow {
+      color: #b8c5d8;
+      font-size: 13px;
+      letter-spacing: 0;
+      text-transform: uppercase;
+      margin: 0 0 10px;
+    }
+
+    h1 {
+      font-size: clamp(30px, 4vw, 48px);
+      line-height: 1.08;
+      margin: 0 0 14px;
+      letter-spacing: 0;
+      max-width: 980px;
+    }
+
+    .lead {
+      font-size: 18px;
+      color: #e2e8f0;
+      max-width: 960px;
+      margin: 0;
+    }
+
+    main {
+      padding: 28px 32px 48px;
+    }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin: -44px auto 26px;
+      max-width: 1180px;
+    }
+
+    .metric,
+    .panel,
+    .step {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .metric {
+      box-shadow: var(--shadow);
+      padding: 16px;
+      min-height: 112px;
+    }
+
+    .metric .label {
+      display: block;
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+
+    .metric .value {
+      display: block;
+      font-weight: 700;
+      font-size: 24px;
+      margin-bottom: 4px;
+    }
+
+    .metric .note {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    section { margin: 24px 0; }
+    h2 { font-size: 24px; margin: 0 0 12px; letter-spacing: 0; }
+    h3 { font-size: 18px; margin: 0 0 8px; letter-spacing: 0; }
+    .panel { padding: 20px; }
+
+    .summary {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 16px;
+    }
+
+    .callout {
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }
+
+    .callout ul,
+    .panel ul,
+    .step ol {
+      margin: 8px 0 0;
+      padding-left: 20px;
+    }
+
+    .legend {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin: 12px 0 16px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 3px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      font-size: 13px;
+      font-weight: 650;
+      background: #fff;
+      white-space: nowrap;
+    }
+
+    .done { color: var(--green); border-color: rgba(20, 122, 79, 0.25); background: #ecf8f2; }
+    .blocked { color: var(--red); border-color: rgba(163, 49, 49, 0.25); background: #fff0f0; }
+    .action { color: var(--amber); border-color: rgba(146, 85, 0, 0.25); background: #fff6e8; }
+
+    .matrix-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    table {
+      width: 100%;
+      min-width: 960px;
+      border-collapse: collapse;
+    }
+
+    th, td {
+      text-align: left;
+      vertical-align: top;
+      padding: 13px 14px;
+      border-bottom: 1px solid var(--line);
+      font-size: 14px;
+    }
+
+    th {
+      font-size: 13px;
+      color: #40506a;
+      background: #f0f4f8;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+    .feature { font-weight: 700; min-width: 190px; }
+
+    .roadmap {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .step { padding: 16px; }
+    .step .rank { color: var(--blue); font-weight: 800; font-size: 13px; margin-bottom: 6px; }
+
+    code {
+      font-family: Consolas, "Cascadia Mono", monospace;
+      font-size: 0.95em;
+      background: #eef2f7;
+      padding: 1px 5px;
+      border-radius: 5px;
+    }
+
+    footer {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 28px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+    }
+
+    @media (max-width: 860px) {
+      header { padding: 32px 20px 58px; }
+      main { padding: 20px; }
+      .status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: -48px; }
+      .summary,
+      .roadmap { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 520px) {
+      .status-grid { grid-template-columns: 1fr; }
+      h1 { font-size: 30px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <p class="eyebrow">Rust Windows Agent Harness</p>
+      <h1>Agent Harness 功能對照與升級狀態</h1>
+      <p class="lead">以 2026-06-12 repo-local <code>.agent-harness</code>、round3/round3-2 runtime fixes、public-facing hygiene export、OpenRouter provider route、以及 per-agent memory namespace 升級為準。此頁不再使用中間狀態：harness 端可完成的項目標為 Implemented，需要外部決策或憑證的項目標為 Blocked 或 Action Required。</p>
+    </div>
+  </header>
+
+  <main>
+    <div class="status-grid">
+      <div class="metric">
+        <span class="label">Readiness</span>
+        <span class="value">Ready: yes</span>
+        <span class="note">58 pass / 0 warn / 0 fail</span>
+      </div>
+      <div class="metric">
+        <span class="label">Provider Route</span>
+        <span class="value">OpenRouter</span>
+        <span class="note">Codex config + env preflight</span>
+      </div>
+      <div class="metric">
+        <span class="label">Multi-Agent</span>
+        <span class="value">Isolated</span>
+        <span class="note">config, sessions, memory roots</span>
+      </div>
+      <div class="metric">
+        <span class="label">Channels</span>
+        <span class="value">TG + Discord</span>
+        <span class="note">pending=0 baseline, delivered=186</span>
+      </div>
+    </div>
+
+    <div class="wrap">
+      <section class="summary">
+        <div class="panel">
+          <h2>Summary</h2>
+          <p>Agent Harness 已可做受控 live Telegram/Discord handoff 測試，也能透過 Codex backend 跑基本 agent turns。這次升級補上 OpenRouter provider path，之後可讓像 <code>小小梨</code> 這類 agent 使用 OpenRouter 模型，同時保有各自的設定、session transcript 與 memory/canvas 空間。</p>
+          <p>OpenRouter route 由 harness 產生 repo-local Codex config：<code>model_provider = "openrouter"</code>、<code>base_url = "https://openrouter.ai/api/v1"</code>、<code>env_key = "OPENROUTER_API_KEY"</code>、<code>wire_api = "chat"</code>。密鑰不會寫入 config；preflight 只檢查環境變數是否存在。</p>
+          <p>Multi-agent isolation 現在涵蓋 registry/model override、runtime transcript 路徑，以及 prompt/lifecycle/canvas memory artifacts。檔案路徑會正規化 agent id，但 receipt 仍保留原始 Unicode 名稱，例如 <code>小小梨</code>。</p>
+          <p>未能直接完成的項目已移到 Blocked/Action Required：native non-OpenAI provider adapters、Qdrant/openclaw-mem service parity、real plugin invocation、Windows unattended service registration、vaulted secrets migration，以及需要 operator 發送的 live smoke。</p>
+          <p>本輪本機驗證已通過 <code>cargo fmt --all</code>、<code>cargo test --workspace</code>（core 177、CLI 16、doctests 0）、<code>cargo build --workspace</code>、live <code>status</code>、live <code>enable-check</code> 與 channel outbox plan。</p>
+        </div>
+        <div class="callout">
+          <h3>Immediate Gates</h3>
+          <ul>
+            <li><span class="pill done">Implemented</span> OpenRouter route parsing and Codex provider config generation.</li>
+            <li><span class="pill done">Implemented</span> per-agent memory prompt/lifecycle/canvas roots.</li>
+            <li><span class="pill done">Implemented</span> slash model id preservation for explicit providers.</li>
+            <li><span class="pill action">Action Required</span> Set <code>OPENROUTER_API_KEY</code> for real OpenRouter smoke.</li>
+            <li><span class="pill action">Action Required</span> Choose <code>小小梨</code> model/profile before production use.</li>
+          </ul>
+        </div>
+      </section>
+
+      <section>
+        <h2>Feature Matrix</h2>
+        <div class="legend">
+          <span class="pill done">Implemented</span>
+          <span class="pill blocked">Blocked</span>
+          <span class="pill action">Action Required</span>
+        </div>
+        <div class="matrix-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Feature Family</th>
+                <th>Status</th>
+                <th>Implemented</th>
+                <th>Blocker / Required Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td class="feature">State import / migration</td><td><span class="pill done">Implemented</span></td><td>Imports core files, registry, channels, memory snapshots, sessions, plugin catalog inputs, non-secret ops backups, and redacted cutover receipts.</td><td><span class="pill action">Action</span> Choose encrypted/vaulted long-term backup policy if secret backups are required.</td></tr>
+              <tr><td class="feature">Multi-agent registry / isolation</td><td><span class="pill done">Implemented</span></td><td>Preserves 25 enabled agents, source dirs, sessions, auth/model hints, per-agent overrides, per-agent runtime transcripts, and per-agent memory/canvas namespaces. Upgrade test covers <code>main</code> and <code>小小梨</code>.</td><td><span class="pill action">Action</span> Run live smoke across imported providers/agents as credentials become available.</td></tr>
+              <tr><td class="feature">Telegram</td><td><span class="pill done">Implemented</span></td><td>Poll loop, allow-list, commands, queueing, typing path, native image/document delivery, receipts, and offset persistence.</td><td><span class="pill action">Action</span> Operator sends allowed-user smoke after deployment windows.</td></tr>
+              <tr><td class="feature">Discord</td><td><span class="pill done">Implemented</span></td><td>REST outbox, multipart attachments, gateway loop, DM probe, allow-list, event normalization, reply context, receipts, and live inbound evidence.</td><td><span class="pill action">Action</span> Operator sends allowed-user smoke; add reconnect/backoff monitoring for unattended gateway use.</td></tr>
+              <tr><td class="feature">Commands</td><td><span class="pill done">Implemented</span></td><td><code>/status</code>, <code>/model</code>, <code>/think</code>, <code>/new</code>, <code>/stop</code>, <code>/steer</code>, and <code>/btw</code> persist across Telegram/Discord/local state.</td><td><span class="pill action">Action</span> Add provider-native cancel/typing affordances only where provider APIs support them.</td></tr>
+              <tr><td class="feature">Codex runtime</td><td><span class="pill done">Implemented</span></td><td>Plan/preflight/run/resume, transcript/trajectory/binding, cancel-marker polling, token usage capture, assistant phase split, isolated workspace, adaptive idle timeout, hard max-turn timeout, and runtime leases.</td><td><span class="pill action">Action</span> Broaden live cancel/backoff smoke under real provider load.</td></tr>
+              <tr><td class="feature">Provider/model routing</td><td><span class="pill done">Implemented</span></td><td><code>/model provider/model</code>, per-agent defaults, explicit-provider slash model ids, and OpenRouter Codex config generation work. OpenRouter requires <code>OPENROUTER_API_KEY</code> but writes no secrets.</td><td><span class="pill blocked">Blocked</span> Native non-OpenAI-compatible adapters need provider list, SDK/API contract, credentials, and runtime semantics.</td></tr>
+              <tr><td class="feature">Prompt files / continuity</td><td><span class="pill done">Implemented</span></td><td>Prompt fallback to imported workspace, role headers for imported prompt files, and injection ledger for stable same-session context.</td><td><span class="pill action">Action</span> Add persona-sensitive regression tests for imported agents.</td></tr>
+              <tr><td class="feature">Skill-first guidance</td><td><span class="pill done">Implemented</span></td><td>Imports source skills, syncs bundled harness operation skills, and selects relevant <code>SKILL.md</code> bodies at runtime.</td><td><span class="pill blocked">Blocked</span> Agent-created skill propose/patch/archive flows need approved write policy and review boundary.</td></tr>
+              <tr><td class="feature">Memory inventory / recall</td><td><span class="pill done">Implemented</span></td><td>Detects Qdrant edge, SQLite, memory files, receipts; SQLite vector recall and prompt-context recall work through harness adapters. LanceDB remains hidden unless selected.</td><td><span class="pill blocked">Blocked</span> Qdrant-native recall needs approved sidecar/snapshot API, endpoint, credentials, and compatibility contract.</td></tr>
+              <tr><td class="feature">Memory lifecycle / canvas</td><td><span class="pill done">Implemented</span></td><td>Lifecycle adapter records episodes and capture candidates; compact canvas JSON/Markdown exists; memory hooks record OpenClaw-compatible receipts; artifacts can be scoped per agent.</td><td><span class="pill blocked">Blocked</span> Full routeAuto/autoRecall/propose/store and graph/canvas parity need compatible <code>openclaw-mem</code> service contracts.</td></tr>
+              <tr><td class="feature">Plugin bridge</td><td><span class="pill done">Implemented</span></td><td>Node sidecar manifest/catalog bridge, JSON-RPC status/list/probe, <code>hooks.invoke</code>, <code>memory.slot</code>, and native context-budget behavior.</td><td><span class="pill blocked">Blocked</span> Real tool invocation needs plugin trust policy, allow-list, timeout policy, per-agent/channel permissions, and fixtures.</td></tr>
+              <tr><td class="feature">Cron/subagent import</td><td><span class="pill done">Implemented</span></td><td>Native agent-turn cron, deterministic crontab/Supercronic-style cron, and subagent ledgers import into durable worker jobs with cutover safety.</td><td><span class="pill action">Action</span> Live smoke scheduler watermarks, active resume/cancel policy, and cron-to-agent paths.</td></tr>
+              <tr><td class="feature">Worker dispatch</td><td><span class="pill done">Implemented</span></td><td>SQLite store, idempotent enqueue, lease/run/reap/cancel/status, shell audit, LLM runtime-queue handoff, concurrency limits, rate leases, child groups, watchdogs, wakeups, and artifact pointers.</td><td><span class="pill action">Action</span> Add cascading timeout/cancel, provider backoff profiles, fairness, multi-host store abstraction, and broader fan-out smoke.</td></tr>
+              <tr><td class="feature">Operations</td><td><span class="pill done">Implemented</span></td><td>Status/readiness, JSONL logs, heartbeats, supervisor scripts, stop files, compact progress delivery, timeout reconciliation, direct-start fallback, log retention, atomic state writes, repair, backup, cutover, and ops control.</td><td><span class="pill action">Action</span> Approve Task Scheduler registration or Windows service wrapper, then add restart/stale-heartbeat monitor and ledger compaction.</td></tr>
+              <tr><td class="feature">Credentials / secrets</td><td><span class="pill done">Implemented</span></td><td>Telegram/Discord tokens, OpenRouter key requirements, and memory embedding secrets are represented as env vars or redacted env files; local harness keys use <code>AGENT_HARNESS_*</code>.</td><td><span class="pill blocked">Blocked</span> Vault migration needs a user choice: Windows Credential Manager or encrypted repo-local vault.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="summary">
+        <div class="panel">
+          <h2>Blocked Items</h2>
+          <ul>
+            <li>Native provider adapters beyond Codex/OpenAI/OpenRouter-compatible routing: provide provider list, SDK/API contract, credentials, model naming rules, cancellation/streaming expectations, and test fixtures.</li>
+            <li>Qdrant/openclaw-mem service parity: approve sidecar/service contract, endpoint, credentials, and review gates.</li>
+            <li>Plugin real invocation: approve plugin trust model, allow-list, timeout policy, per-agent/channel permissions, and fixtures.</li>
+            <li>Vaulted secrets: choose Windows Credential Manager or encrypted vault, then approve migration/rotation.</li>
+          </ul>
+        </div>
+        <div class="panel">
+          <h2>Operator Actions</h2>
+          <ul>
+            <li>Set <code>OPENROUTER_API_KEY</code> and select the OpenRouter model/profile for <code>小小梨</code>.</li>
+            <li>Send controlled Telegram, Discord, and OpenRouter-backed live smoke turns after deployment.</li>
+            <li>Approve Task Scheduler registration or a Windows service wrapper for unattended production.</li>
+            <li>Record smoke transcript and receipt paths in the readiness docs after the live tests.</li>
+          </ul>
+        </div>
+      </section>
+
+      <section>
+        <h2>Recommended Development Order</h2>
+        <div class="roadmap">
+          <div class="step"><div class="rank">P0</div><h3>Live Proof</h3><ol><li>Done: build <code>agent-harness.exe</code>.</li><li>Done: status and enable-check against <code>.agent-harness</code>.</li><li>Done: offline fake Codex smoke.</li><li>Done: regenerated supervisor scripts.</li><li>Action: operator Telegram, Discord, and OpenRouter live smoke.</li></ol></div>
+          <div class="step"><div class="rank">P1</div><h3>Durable Windows Operation</h3><ol><li>Done: single bounded-concurrency runtime loop plus worker-loop.</li><li>Done: ops stop/start/status, backup, and cutover receipt.</li><li>Done: direct-start fallback and log retention.</li><li>Action: approve Task Scheduler or Windows service wrapper.</li><li>Action: add restart and stale-heartbeat monitor after service strategy is selected.</li></ol></div>
+          <div class="step"><div class="rank">P2</div><h3>Memory Parity</h3><ol><li>Done: OpenClaw-compatible hooks.</li><li>Done: per-agent prompt/lifecycle/canvas memory artifact roots.</li><li>Done: LanceDB hidden unless explicitly selected.</li><li>Blocked: Qdrant-native recall, routeAuto/autoRecall, and full graph/canvas parity until service contracts are approved.</li></ol></div>
+          <div class="step"><div class="rank">P3</div><h3>Plugin Parity</h3><ol><li>Done: manifest/catalog bridge.</li><li>Done: <code>hooks.invoke</code>, <code>memory.slot</code>, and context budget behavior.</li><li>Blocked: real invocation until trust, timeout, permissions, and fixtures are approved.</li></ol></div>
+          <div class="step"><div class="rank">P4</div><h3>Worker Dispatch</h3><ol><li>Done: SQLite worker store, lease/reap/status/cancel.</li><li>Done: concurrency limits, shell jobs, LLM jobs, watchdogs, wakeups, rate leases.</li><li>Done: native cron, deterministic cron, and subagent enqueue adapters.</li><li>Action: cascading timeout/cancel, provider backoff, repeated watermarks, fairness, and live smoke.</li></ol></div>
+        </div>
+      </section>
+
+      <footer>
+        Markdown source: <code>docs/agent-harness-feature-parity.md</code>. Generated for local review on 2026-06-12.
+      </footer>
+    </div>
+  </main>
+</body>
+</html>
