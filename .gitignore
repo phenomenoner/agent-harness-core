@@ -7,16 +7,18 @@
 .DS_Store
 Thumbs.db
 
-# Local runtime state and credentials
+# Local state and secrets
 .env
 .env.*
 !.env.example
-.agent-harness/
 state/
 data/
 secrets/
 **/secrets/
+.tools/
+.debug/
+.public-export/
+.agent-harness/
 
-# Imported source snapshots are local operator data.
+# Imported legacy source state should be staged intentionally.
 imports/
-

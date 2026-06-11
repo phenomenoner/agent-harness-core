@@ -76,8 +76,66 @@ pub struct CodexRuntimeCompletionOptions {
     pub execution_dir: Option<PathBuf>,
     pub plan_file: Option<PathBuf>,
     pub assistant_message: String,
+    pub assistant_narration: Vec<CodexAssistantNarration>,
+    pub assistant_narration_mode: AssistantNarrationMode,
     pub thread_id: Option<String>,
     pub finished_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantNarrationMode {
+    Off,
+    #[default]
+    ProgressPanel,
+    InlinePreface,
+}
+
+impl AssistantNarrationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::ProgressPanel => "progress_panel",
+            Self::InlinePreface => "inline_preface",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantNarrationConfig {
+    pub mode: AssistantNarrationMode,
+    pub max_chars: usize,
+    pub progress_min_update_ms: i64,
+    pub final_prefix: String,
+    pub source: String,
+    pub configured: bool,
+    pub config_file: PathBuf,
+    pub warnings: Vec<String>,
+}
+
+impl Default for AssistantNarrationConfig {
+    fn default() -> Self {
+        Self {
+            mode: AssistantNarrationMode::ProgressPanel,
+            max_chars: 500,
+            progress_min_update_ms: 2_500,
+            final_prefix: "Work log".to_string(),
+            source: "default".to_string(),
+            configured: false,
+            config_file: PathBuf::new(),
+            warnings: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAssistantNarration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    pub phase: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -304,6 +362,12 @@ pub struct CodexRuntimeCompletionReceipt {
     pub trajectory_file: Option<PathBuf>,
     pub codex_binding_file: Option<PathBuf>,
     pub reason: String,
+    #[serde(default)]
+    pub assistant_narration_mode: AssistantNarrationMode,
+    #[serde(default)]
+    pub assistant_final_chars: usize,
+    #[serde(default)]
+    pub assistant_narration_items: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1053,6 +1117,8 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
         );
     }
 
+    let narration_config = load_assistant_narration_config(&options.harness_home)?;
+    warnings.extend(narration_config.warnings.clone());
     let started = Instant::now();
     let run_result = drive_codex_app_server(
         &options.harness_home,
@@ -1060,6 +1126,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
         options.timeout_ms,
         options.idle_timeout_ms,
         options.progress_context,
+        &narration_config,
     )?;
     let elapsed_ms = started.elapsed().as_millis();
     let finished_at_ms = current_log_time_ms()?;
@@ -1073,12 +1140,21 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
         } else {
             run_result.assistant_message
         };
+        if !run_result.assistant_final_found && !run_result.assistant_raw_message.trim().is_empty()
+        {
+            warnings.push(
+                "Codex app-server output had no final_answer agent message; raw assistant text was used as the final reply fallback"
+                    .to_string(),
+            );
+        }
         Some(record_codex_runtime_completion(
             CodexRuntimeCompletionOptions {
                 harness_home: options.harness_home.clone(),
                 execution_dir: execution_dir.clone(),
                 plan_file: Some(plan_file.clone()),
                 assistant_message,
+                assistant_narration: run_result.assistant_narration.clone(),
+                assistant_narration_mode: narration_config.mode,
                 thread_id: run_result.thread_id.clone(),
                 finished_at_ms,
             },
@@ -1181,6 +1257,9 @@ pub fn record_codex_runtime_completion(
             trajectory_file: None,
             codex_binding_file: None,
             reason: "no codex runtime plan found; run codex-plan first".to_string(),
+            assistant_narration_mode: options.assistant_narration_mode,
+            assistant_final_chars: options.assistant_message.chars().count(),
+            assistant_narration_items: options.assistant_narration.len(),
         };
         append_json_line(&receipts_file, &receipt)?;
         append_harness_log(
@@ -1228,6 +1307,9 @@ pub fn record_codex_runtime_completion(
                 trajectory_file: existing.trajectory_file.clone(),
                 codex_binding_file: existing.codex_binding_file.clone(),
                 reason: "codex runtime completion was already recorded".to_string(),
+                assistant_narration_mode: existing.assistant_narration_mode,
+                assistant_final_chars: existing.assistant_final_chars,
+                assistant_narration_items: existing.assistant_narration_items,
             };
             append_json_line(&receipts_file, &receipt)?;
             append_harness_log(
@@ -1271,6 +1353,9 @@ pub fn record_codex_runtime_completion(
         trajectory_file: Some(plan.outputs.trajectory_file.clone()),
         codex_binding_file: Some(plan.outputs.codex_binding_file.clone()),
         reason: "codex runtime completion recorded to transcript and trajectory".to_string(),
+        assistant_narration_mode: options.assistant_narration_mode,
+        assistant_final_chars: options.assistant_message.chars().count(),
+        assistant_narration_items: options.assistant_narration.len(),
     };
     if let Some(completion_file) = &completion_file {
         fs::write(
@@ -1372,10 +1457,103 @@ fn plan_completion_recorded(plan: &CodexRuntimePlanFile) -> io::Result<bool> {
     Ok(receipt.status == CodexRuntimeCompletionStatus::Recorded)
 }
 
+pub fn load_assistant_narration_config(
+    harness_home: impl AsRef<Path>,
+) -> io::Result<AssistantNarrationConfig> {
+    let harness_home = harness_home.as_ref();
+    let mut config = AssistantNarrationConfig {
+        config_file: harness_home.join(HARNESS_CONFIG_FILE_NAME),
+        ..AssistantNarrationConfig::default()
+    };
+
+    for path in [
+        harness_home.join(HARNESS_CONFIG_FILE_NAME),
+        harness_home.join("config").join(HARNESS_CONFIG_FILE_NAME),
+    ] {
+        if !path.is_file() {
+            continue;
+        }
+        config.config_file = path.clone();
+        let text = fs::read_to_string(&path)?;
+        let value = serde_json::from_str::<Value>(&text).map_err(io::Error::other)?;
+        let response = value.get("response").unwrap_or(&value);
+        let mut configured = false;
+        if let Some(mode) = response
+            .get("assistantNarrationMode")
+            .or_else(|| response.get("assistant_narration_mode"))
+            .and_then(Value::as_str)
+        {
+            configured = true;
+            match parse_assistant_narration_mode(mode) {
+                Some(mode) => config.mode = mode,
+                None => config.warnings.push(format!(
+                    "unknown response.assistantNarrationMode `{mode}`; using {}",
+                    config.mode.as_str()
+                )),
+            }
+        }
+        if let Some(max_chars) = response
+            .get("assistantNarrationMaxChars")
+            .or_else(|| response.get("assistant_narration_max_chars"))
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+        {
+            configured = true;
+            config.max_chars = max_chars;
+        }
+        if let Some(min_update_ms) = response
+            .get("assistantNarrationProgressMinUpdateMs")
+            .or_else(|| response.get("assistant_narration_progress_min_update_ms"))
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+        {
+            configured = true;
+            config.progress_min_update_ms = min_update_ms;
+        }
+        if let Some(prefix) = response
+            .get("assistantNarrationFinalPrefix")
+            .or_else(|| response.get("assistant_narration_final_prefix"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            configured = true;
+            config.final_prefix = prefix.to_string();
+        }
+        config.configured = configured;
+        config.source = if configured {
+            format!("config:{}", path.display())
+        } else {
+            "default".to_string()
+        };
+        break;
+    }
+
+    Ok(config)
+}
+
+fn parse_assistant_narration_mode(value: &str) -> Option<AssistantNarrationMode> {
+    let normalized = value.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    match normalized.as_str() {
+        "off" | "none" | "hidden" | "final_only" | "finalonly" => Some(AssistantNarrationMode::Off),
+        "progress" | "progress_panel" | "progresspanel" => {
+            Some(AssistantNarrationMode::ProgressPanel)
+        }
+        "inline" | "inline_preface" | "inlinepreface" | "preface" => {
+            Some(AssistantNarrationMode::InlinePreface)
+        }
+        _ => None,
+    }
+}
+
 struct CodexAppServerRunResult {
     status: CodexRuntimeRunStatus,
     reason: String,
     assistant_message: String,
+    assistant_narration: Vec<CodexAssistantNarration>,
+    assistant_raw_message: String,
+    assistant_final_found: bool,
     thread_id: Option<String>,
     event_count: usize,
     usage: Option<CodexRuntimeUsage>,
@@ -1484,6 +1662,7 @@ fn drive_codex_app_server(
     timeout_ms: u64,
     idle_timeout_ms: u64,
     progress_context: Option<AgentProgressContext>,
+    narration_config: &AssistantNarrationConfig,
 ) -> io::Result<CodexAppServerRunResult> {
     let execution_dir = runtime_execution_dir(plan);
     fs::create_dir_all(&execution_dir)?;
@@ -1510,6 +1689,9 @@ fn drive_codex_app_server(
                 status: CodexRuntimeRunStatus::SpawnFailed,
                 reason: format!("failed to spawn codex app-server process: {error}"),
                 assistant_message: String::new(),
+                assistant_narration: Vec::new(),
+                assistant_raw_message: String::new(),
+                assistant_final_found: false,
                 thread_id: None,
                 event_count: 0,
                 usage: None,
@@ -1525,6 +1707,9 @@ fn drive_codex_app_server(
             status: CodexRuntimeRunStatus::ProtocolError,
             reason: "codex app-server stdin pipe was unavailable".to_string(),
             assistant_message: String::new(),
+            assistant_narration: Vec::new(),
+            assistant_raw_message: String::new(),
+            assistant_final_found: false,
             thread_id: None,
             event_count: 0,
             usage: None,
@@ -1539,6 +1724,9 @@ fn drive_codex_app_server(
             status: CodexRuntimeRunStatus::ProtocolError,
             reason: "codex app-server stdout pipe was unavailable".to_string(),
             assistant_message: String::new(),
+            assistant_narration: Vec::new(),
+            assistant_raw_message: String::new(),
+            assistant_final_found: false,
             thread_id: None,
             event_count: 0,
             usage: None,
@@ -1618,6 +1806,7 @@ fn drive_codex_app_server(
         &mut timeouts,
         plan.invocation.approval_policy,
         Some(&cancel_check),
+        narration_config,
     )? {
         ProtocolWait::ThreadStarted(thread_id) => thread_id,
         ProtocolWait::TimedOut(reason) => {
@@ -1627,6 +1816,9 @@ fn drive_codex_app_server(
                 status: CodexRuntimeRunStatus::Timeout,
                 reason,
                 assistant_message: state.assistant_message_with_harness_notices(),
+                assistant_narration: state.assistant_narration_records(),
+                assistant_raw_message: state.assistant_raw_message(),
+                assistant_final_found: state.assistant_final_found(),
                 thread_id: None,
                 event_count: state.event_count,
                 usage: state.usage.clone(),
@@ -1642,6 +1834,9 @@ fn drive_codex_app_server(
                 status: CodexRuntimeRunStatus::ProtocolError,
                 reason,
                 assistant_message: state.assistant_message_with_harness_notices(),
+                assistant_narration: state.assistant_narration_records(),
+                assistant_raw_message: state.assistant_raw_message(),
+                assistant_final_found: state.assistant_final_found(),
                 thread_id: None,
                 event_count: state.event_count,
                 usage: state.usage.clone(),
@@ -1657,6 +1852,9 @@ fn drive_codex_app_server(
                 status: CodexRuntimeRunStatus::ProtocolError,
                 reason: "codex app-server reported turn completion before thread start".to_string(),
                 assistant_message: state.assistant_message_with_harness_notices(),
+                assistant_narration: state.assistant_narration_records(),
+                assistant_raw_message: state.assistant_raw_message(),
+                assistant_final_found: state.assistant_final_found(),
                 thread_id: None,
                 event_count: state.event_count,
                 usage: state.usage.clone(),
@@ -1672,6 +1870,9 @@ fn drive_codex_app_server(
                 status: CodexRuntimeRunStatus::Canceled,
                 reason,
                 assistant_message: state.assistant_message_with_harness_notices(),
+                assistant_narration: state.assistant_narration_records(),
+                assistant_raw_message: state.assistant_raw_message(),
+                assistant_final_found: state.assistant_final_found(),
                 thread_id: None,
                 event_count: state.event_count,
                 usage: state.usage.clone(),
@@ -1720,6 +1921,7 @@ fn drive_codex_app_server(
         &mut timeouts,
         plan.invocation.approval_policy,
         Some(&cancel_check),
+        narration_config,
     )? {
         ProtocolWait::TurnCompleted => CodexRuntimeRunStatus::Completed,
         ProtocolWait::TimedOut(reason) => {
@@ -1729,6 +1931,9 @@ fn drive_codex_app_server(
                 status: CodexRuntimeRunStatus::Timeout,
                 reason,
                 assistant_message: state.assistant_message_with_harness_notices(),
+                assistant_narration: state.assistant_narration_records(),
+                assistant_raw_message: state.assistant_raw_message(),
+                assistant_final_found: state.assistant_final_found(),
                 thread_id: Some(thread_id.clone()),
                 event_count: state.event_count,
                 usage: state.usage.clone(),
@@ -1744,6 +1949,9 @@ fn drive_codex_app_server(
                 status: CodexRuntimeRunStatus::ProtocolError,
                 reason,
                 assistant_message: state.assistant_message_with_harness_notices(),
+                assistant_narration: state.assistant_narration_records(),
+                assistant_raw_message: state.assistant_raw_message(),
+                assistant_final_found: state.assistant_final_found(),
                 thread_id: Some(thread_id.clone()),
                 event_count: state.event_count,
                 usage: state.usage.clone(),
@@ -1760,6 +1968,9 @@ fn drive_codex_app_server(
                 reason: "codex app-server returned a second thread/start response during turn"
                     .to_string(),
                 assistant_message: state.assistant_message_with_harness_notices(),
+                assistant_narration: state.assistant_narration_records(),
+                assistant_raw_message: state.assistant_raw_message(),
+                assistant_final_found: state.assistant_final_found(),
                 thread_id: Some(thread_id.clone()),
                 event_count: state.event_count,
                 usage: state.usage.clone(),
@@ -1784,6 +1995,9 @@ fn drive_codex_app_server(
                 status: CodexRuntimeRunStatus::Canceled,
                 reason,
                 assistant_message: state.assistant_message_with_harness_notices(),
+                assistant_narration: state.assistant_narration_records(),
+                assistant_raw_message: state.assistant_raw_message(),
+                assistant_final_found: state.assistant_final_found(),
                 thread_id: Some(thread_id.clone()),
                 event_count: state.event_count,
                 usage: state.usage.clone(),
@@ -1799,6 +2013,9 @@ fn drive_codex_app_server(
         status,
         reason: "codex app-server turn completed and assistant output was captured".to_string(),
         assistant_message: state.assistant_message_with_harness_notices(),
+        assistant_narration: state.assistant_narration_records(),
+        assistant_raw_message: state.assistant_raw_message(),
+        assistant_final_found: state.assistant_final_found(),
         thread_id: Some(thread_id),
         event_count: state.event_count,
         usage: state.usage.clone(),
@@ -1808,9 +2025,160 @@ fn drive_codex_app_server(
     })
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AssistantOutputCapture {
+    raw_text: String,
+    items: Vec<AssistantOutputItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssistantOutputItem {
+    item_id: Option<String>,
+    phase: AssistantOutputPhase,
+    text: String,
+    started_at_ms: Option<i64>,
+    completed_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssistantOutputPhase {
+    Narration,
+    Final,
+    Unknown,
+}
+
+impl AssistantOutputPhase {
+    fn from_str(value: Option<&str>) -> Self {
+        match value
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_")
+            .as_str()
+        {
+            "commentary" | "progress" | "narration" => Self::Narration,
+            "final" | "final_answer" | "answer" => Self::Final,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Narration => "commentary",
+            Self::Final => "final_answer",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl AssistantOutputCapture {
+    fn push_delta(&mut self, item_id: Option<String>, delta: String) {
+        self.raw_text.push_str(&delta);
+        if let Some(item_id) = item_id {
+            let item = self.item_mut(Some(item_id));
+            item.text.push_str(&delta);
+        }
+    }
+
+    fn note_item_started(
+        &mut self,
+        item_id: Option<String>,
+        phase: AssistantOutputPhase,
+        text: Option<String>,
+        at_ms: Option<i64>,
+    ) {
+        let item = self.item_mut(item_id);
+        if item.phase == AssistantOutputPhase::Unknown {
+            item.phase = phase;
+        }
+        item.started_at_ms = at_ms.or(item.started_at_ms);
+        if let Some(text) = text.filter(|text| !text.is_empty())
+            && item.text.is_empty()
+        {
+            item.text = text;
+        }
+    }
+
+    fn note_item_completed(
+        &mut self,
+        item_id: Option<String>,
+        phase: AssistantOutputPhase,
+        text: Option<String>,
+        at_ms: Option<i64>,
+    ) -> Option<AssistantOutputItem> {
+        let text = text.filter(|text| !text.is_empty());
+        if self.raw_text.is_empty()
+            && let Some(text) = text.as_ref()
+        {
+            self.raw_text.push_str(text);
+        }
+        let item = self.item_mut(item_id);
+        if item.phase == AssistantOutputPhase::Unknown {
+            item.phase = phase;
+        }
+        item.completed_at_ms = at_ms.or(item.completed_at_ms);
+        if let Some(text) = text {
+            item.text = text;
+        }
+        Some(item.clone())
+    }
+
+    fn final_text(&self) -> Option<String> {
+        self.items
+            .iter()
+            .rev()
+            .find(|item| item.phase == AssistantOutputPhase::Final && !item.text.trim().is_empty())
+            .map(|item| item.text.clone())
+    }
+
+    fn final_text_or_raw(&self) -> String {
+        self.final_text().unwrap_or_else(|| self.raw_text.clone())
+    }
+
+    fn final_found(&self) -> bool {
+        self.final_text().is_some()
+    }
+
+    fn narration_records(&self) -> Vec<CodexAssistantNarration> {
+        self.items
+            .iter()
+            .filter(|item| {
+                item.phase == AssistantOutputPhase::Narration && !item.text.trim().is_empty()
+            })
+            .map(|item| CodexAssistantNarration {
+                item_id: item.item_id.clone(),
+                phase: item.phase.as_str().to_string(),
+                text: item.text.clone(),
+            })
+            .collect()
+    }
+
+    fn raw_text(&self) -> String {
+        self.raw_text.clone()
+    }
+
+    fn item_mut(&mut self, item_id: Option<String>) -> &mut AssistantOutputItem {
+        if let Some(index) = self
+            .items
+            .iter()
+            .position(|item| item.item_id == item_id && item.item_id.is_some())
+        {
+            return &mut self.items[index];
+        }
+        self.items.push(AssistantOutputItem {
+            item_id,
+            phase: AssistantOutputPhase::Unknown,
+            text: String::new(),
+            started_at_ms: None,
+            completed_at_ms: None,
+        });
+        self.items.last_mut().unwrap()
+    }
+}
+
 #[derive(Default)]
 struct CodexProtocolState {
-    assistant_message: String,
+    assistant_output: AssistantOutputCapture,
     event_count: usize,
     usage: Option<CodexRuntimeUsage>,
     warnings: Vec<String>,
@@ -1819,7 +2187,7 @@ struct CodexProtocolState {
 
 impl CodexProtocolState {
     fn assistant_message_with_harness_notices(&self) -> String {
-        let mut message = self.assistant_message.clone();
+        let mut message = self.assistant_output.final_text_or_raw();
         if self.denied_approval_requests.is_empty() {
             return message;
         }
@@ -1844,6 +2212,18 @@ impl CodexProtocolState {
             message.push_str(&notice);
             message
         }
+    }
+
+    fn assistant_narration_records(&self) -> Vec<CodexAssistantNarration> {
+        self.assistant_output.narration_records()
+    }
+
+    fn assistant_raw_message(&self) -> String {
+        self.assistant_output.raw_text()
+    }
+
+    fn assistant_final_found(&self) -> bool {
+        self.assistant_output.final_found()
     }
 }
 
@@ -2036,6 +2416,7 @@ fn codex_progress_preview(value: &Value, kind: AgentProgressKind) -> Option<Stri
             "/params/item/query",
         ],
         AgentProgressKind::AssistantStream
+        | AgentProgressKind::AssistantNarration
         | AgentProgressKind::Delivery
         | AgentProgressKind::MemoryRecall
         | AgentProgressKind::Runtime => &["/params/text", "/params/input", "/params/name"],
@@ -2358,6 +2739,7 @@ fn wait_for_thread_start(
     timeouts: &mut CodexProtocolTimeouts,
     approval_policy: CodexApprovalPolicy,
     cancel_check: Option<&RuntimeCancelCheck>,
+    narration_config: &AssistantNarrationConfig,
 ) -> io::Result<ProtocolWait> {
     loop {
         match receive_protocol_event(line_rx, child, state, timeouts, cancel_check)? {
@@ -2381,7 +2763,7 @@ fn wait_for_thread_start(
                     record_turn_usage(&value, state);
                     return Ok(ProtocolWait::TurnCompleted);
                 }
-                collect_agent_delta(&value, state);
+                collect_agent_output(&value, state, progress, narration_config);
             }
             ProtocolEvent::TimedOut(reason) => return Ok(ProtocolWait::TimedOut(reason)),
             ProtocolEvent::Failed(reason) => return Ok(ProtocolWait::Failed(reason)),
@@ -2399,6 +2781,7 @@ fn wait_for_turn_completed(
     timeouts: &mut CodexProtocolTimeouts,
     approval_policy: CodexApprovalPolicy,
     cancel_check: Option<&RuntimeCancelCheck>,
+    narration_config: &AssistantNarrationConfig,
 ) -> io::Result<ProtocolWait> {
     loop {
         match receive_protocol_event(line_rx, child, state, timeouts, cancel_check)? {
@@ -2410,7 +2793,7 @@ fn wait_for_turn_completed(
                 if answer_unattended_server_request(&value, stdin, state, approval_policy)? {
                     continue;
                 }
-                collect_agent_delta(&value, state);
+                collect_agent_output(&value, state, progress, narration_config);
                 if is_turn_completed(&value) {
                     record_turn_usage(&value, state);
                     return Ok(ProtocolWait::TurnCompleted);
@@ -2761,13 +3144,43 @@ fn extract_thread_id(value: &Value) -> Option<String> {
     None
 }
 
-fn collect_agent_delta(value: &Value, state: &mut CodexProtocolState) {
+fn collect_agent_output(
+    value: &Value,
+    state: &mut CodexProtocolState,
+    progress: &mut Option<CodexProgressEmitter>,
+    narration_config: &AssistantNarrationConfig,
+) {
+    if let Some(event) = extract_agent_message_item_event(value) {
+        if event.completed {
+            if let Some(item) = state.assistant_output.note_item_completed(
+                event.item_id,
+                event.phase,
+                event.text,
+                event.at_ms,
+            ) {
+                emit_assistant_narration_progress(progress, state, narration_config, &item);
+            }
+        } else {
+            state.assistant_output.note_item_started(
+                event.item_id,
+                event.phase,
+                event.text,
+                event.at_ms,
+            );
+        }
+    }
     if let Some(delta) = extract_agent_delta(value) {
-        state.assistant_message.push_str(&delta);
+        state.assistant_output.push_delta(delta.item_id, delta.text);
     }
 }
 
-fn extract_agent_delta(value: &Value) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentDelta {
+    item_id: Option<String>,
+    text: String,
+}
+
+fn extract_agent_delta(value: &Value) -> Option<AgentDelta> {
     let method = json_method(value)?;
     let is_agent_delta = method.contains("agentMessage")
         || method.contains("agent_message")
@@ -2788,10 +3201,139 @@ fn extract_agent_delta(value: &Value) -> Option<String> {
         if let Some(candidate) = value.pointer(pointer)
             && let Some(text) = string_or_nested_text(candidate)
         {
-            return Some(text);
+            return Some(AgentDelta {
+                item_id: first_string_pointer(
+                    value,
+                    &[
+                        "/params/itemId",
+                        "/params/item/id",
+                        "/params/message/id",
+                        "/params/id",
+                    ],
+                ),
+                text,
+            });
         }
     }
     None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentMessageItemEvent {
+    completed: bool,
+    item_id: Option<String>,
+    phase: AssistantOutputPhase,
+    text: Option<String>,
+    at_ms: Option<i64>,
+}
+
+fn extract_agent_message_item_event(value: &Value) -> Option<AgentMessageItemEvent> {
+    let method = json_method(value)?;
+    let completed = match method {
+        "item/started" => false,
+        "item/completed" => true,
+        _ => return None,
+    };
+    let item = value.pointer("/params/item")?;
+    let item_type = string_field(item, &["type"])?;
+    if !item_type.eq_ignore_ascii_case("agentMessage")
+        && !item_type.eq_ignore_ascii_case("agent_message")
+        && !item_type.eq_ignore_ascii_case("agent-message")
+    {
+        return None;
+    }
+    let text = ["/params/item/text", "/params/item/content"]
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(string_or_nested_text));
+    let at_ms = if completed {
+        first_i64_pointer(
+            value,
+            &["/params/completedAtMs", "/params/item/completedAtMs"],
+        )
+    } else {
+        first_i64_pointer(value, &["/params/startedAtMs", "/params/item/startedAtMs"])
+    };
+    Some(AgentMessageItemEvent {
+        completed,
+        item_id: first_string_pointer(
+            value,
+            &[
+                "/params/item/id",
+                "/params/itemId",
+                "/params/message/id",
+                "/params/id",
+            ],
+        ),
+        phase: AssistantOutputPhase::from_str(string_field(item, &["phase"])),
+        text,
+        at_ms,
+    })
+}
+
+fn emit_assistant_narration_progress(
+    progress: &mut Option<CodexProgressEmitter>,
+    state: &mut CodexProtocolState,
+    config: &AssistantNarrationConfig,
+    item: &AssistantOutputItem,
+) {
+    if config.mode != AssistantNarrationMode::ProgressPanel
+        || item.phase != AssistantOutputPhase::Narration
+    {
+        return;
+    }
+    let Some(emitter) = progress.as_ref() else {
+        return;
+    };
+    let preview = compact_assistant_narration_preview(&item.text, config.max_chars);
+    if preview.is_empty() {
+        return;
+    }
+    let at_ms = match item.completed_at_ms {
+        Some(at_ms) => at_ms,
+        None => match current_log_time_ms() {
+            Ok(at_ms) => at_ms,
+            Err(error) => {
+                state.warnings.push(format!(
+                    "assistant narration progress timestamp could not be read: {error}"
+                ));
+                return;
+            }
+        },
+    };
+    let event = AgentProgressEvent::new(
+        &emitter.context,
+        AgentProgressKind::AssistantNarration,
+        "assistant_narration",
+        preview,
+        AgentProgressStatus::Progress,
+        at_ms,
+    )
+    .source("codex-runtime");
+    if let Err(error) = emitter.append(event) {
+        state.warnings.push(format!(
+            "assistant narration progress write failed: {error}"
+        ));
+    }
+}
+
+fn compact_assistant_narration_preview(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_for_notice(&compact, max_chars.max(1))
+}
+
+fn first_string_pointer(value: &Value, pointers: &[&str]) -> Option<String> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .map(ToString::to_string)
+}
+
+fn first_i64_pointer(value: &Value, pointers: &[&str]) -> Option<i64> {
+    pointers.iter().find_map(|pointer| {
+        value
+            .pointer(pointer)
+            .and_then(|value| value.as_i64().or_else(|| value.as_u64()?.try_into().ok()))
+    })
 }
 
 fn string_or_nested_text(value: &Value) -> Option<String> {
@@ -2937,6 +3479,44 @@ fn record_completion_outputs(
                 model: plan.model.clone(),
                 at_ms: options.finished_at_ms,
                 detail: "inbound message copied from prompt bundle".to_string(),
+            },
+        )?;
+    }
+    for narration in &options.assistant_narration {
+        append_json_line(
+            &plan.outputs.transcript_file,
+            &CodexTranscriptMessage {
+                schema: CODEX_TRANSCRIPT_MESSAGE_SCHEMA,
+                queue_id: plan.queue_id.clone(),
+                session_key: plan.session_key.clone(),
+                agent_id: plan.agent_id.clone(),
+                role: "assistant_narration",
+                content: narration.text.clone(),
+                provider: plan.provider.clone(),
+                model: plan.model.clone(),
+                source: "codex-runtime-narration",
+                at_ms: options.finished_at_ms,
+            },
+        )?;
+    }
+    if !options.assistant_narration.is_empty() {
+        append_json_line(
+            &plan.outputs.trajectory_file,
+            &CodexTrajectoryEvent {
+                schema: CODEX_TRAJECTORY_EVENT_SCHEMA,
+                queue_id: plan.queue_id.clone(),
+                session_key: plan.session_key.clone(),
+                agent_id: plan.agent_id.clone(),
+                event: "assistant-narration-recorded",
+                role: Some("assistant_narration"),
+                provider: plan.provider.clone(),
+                model: plan.model.clone(),
+                at_ms: options.finished_at_ms,
+                detail: format!(
+                    "{} narration item(s) captured; mode={}",
+                    options.assistant_narration.len(),
+                    options.assistant_narration_mode.as_str()
+                ),
             },
         )?;
     }
@@ -5063,7 +5643,7 @@ mod tests {
                 "id": 8,
                 "method": "item/commandExecution/requestApproval",
                 "params": {
-                    "cwd": "C:\\AgentHarness\\RuntimeWorkspace"
+                    "cwd": "D:\\Warehouse\\Research\\OpenClaw_WSL"
                 }
             }),
             &mut out,
@@ -5132,19 +5712,130 @@ mod tests {
             "danger-full-access"
         );
         assert_eq!(
-            app_server_sandbox_policy_value("danger-full-access", "C:\\Workspace"),
+            app_server_sandbox_policy_value("danger-full-access", "D:\\Workspace"),
             serde_json::json!({
                 "type": "dangerFullAccess"
             })
         );
         assert_eq!(
-            app_server_sandbox_policy_value("workspaceWrite", "C:\\Workspace"),
+            app_server_sandbox_policy_value("workspaceWrite", "D:\\Workspace"),
             serde_json::json!({
                 "type": "workspaceWrite",
-                "writableRoots": ["C:\\Workspace"],
+                "writableRoots": ["D:\\Workspace"],
                 "networkAccess": false
             })
         );
+    }
+
+    #[test]
+    fn assistant_output_capture_splits_narration_and_final_items() {
+        let mut state = CodexProtocolState::default();
+        let mut progress = None;
+        let config = AssistantNarrationConfig::default();
+
+        for value in [
+            serde_json::json!({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "msg-narration",
+                        "text": "",
+                        "phase": "commentary"
+                    },
+                    "startedAtMs": 1000
+                }
+            }),
+            serde_json::json!({
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "itemId": "msg-narration",
+                    "delta": "Checking config"
+                }
+            }),
+            serde_json::json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "msg-narration",
+                        "text": "Checking config",
+                        "phase": "commentary"
+                    },
+                    "completedAtMs": 1100
+                }
+            }),
+            serde_json::json!({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "msg-final",
+                        "text": "",
+                        "phase": "final_answer"
+                    },
+                    "startedAtMs": 1200
+                }
+            }),
+            serde_json::json!({
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "itemId": "msg-final",
+                    "delta": "Done."
+                }
+            }),
+            serde_json::json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "msg-final",
+                        "text": "Done.",
+                        "phase": "final_answer"
+                    },
+                    "completedAtMs": 1300
+                }
+            }),
+        ] {
+            collect_agent_output(&value, &mut state, &mut progress, &config);
+        }
+
+        assert_eq!(state.assistant_message_with_harness_notices(), "Done.");
+        assert!(state.assistant_final_found());
+        assert_eq!(
+            state.assistant_narration_records(),
+            vec![CodexAssistantNarration {
+                item_id: Some("msg-narration".to_string()),
+                phase: "commentary".to_string(),
+                text: "Checking config".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn assistant_output_capture_preserves_raw_delta_without_final_boundary() {
+        let mut state = CodexProtocolState::default();
+        let mut progress = None;
+        let config = AssistantNarrationConfig::default();
+
+        collect_agent_output(
+            &serde_json::json!({
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "delta": "Legacy fake reply."
+                }
+            }),
+            &mut state,
+            &mut progress,
+            &config,
+        );
+
+        assert_eq!(
+            state.assistant_message_with_harness_notices(),
+            "Legacy fake reply."
+        );
+        assert!(!state.assistant_final_found());
+        assert!(state.assistant_narration_records().is_empty());
     }
 
     #[test]
@@ -5189,6 +5880,8 @@ mod tests {
             execution_dir: None,
             plan_file: None,
             assistant_message: "Recorded assistant reply.".to_string(),
+            assistant_narration: Vec::new(),
+            assistant_narration_mode: AssistantNarrationMode::ProgressPanel,
             thread_id: Some("thread-recorded".to_string()),
             finished_at_ms: 12345,
         })
@@ -5219,6 +5912,8 @@ mod tests {
             execution_dir: None,
             plan_file: None,
             assistant_message: "Should not be duplicated.".to_string(),
+            assistant_narration: Vec::new(),
+            assistant_narration_mode: AssistantNarrationMode::ProgressPanel,
             thread_id: Some("ignored-thread".to_string()),
             finished_at_ms: 12346,
         })

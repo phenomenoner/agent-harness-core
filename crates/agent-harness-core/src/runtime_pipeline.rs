@@ -7,13 +7,14 @@ use serde_json::Value;
 
 use crate::{
     AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
-    ChannelOutboundAttachment, ChannelOutboundAttachmentKind, ChannelOutboundMessage,
-    ChannelOutboundMessageKind, CodexRuntimePlan, CodexRuntimePlanOptions, CodexRuntimePlanReport,
-    CodexRuntimeReceiptStatus, CodexRuntimeRunOptions, CodexRuntimeRunReport,
-    CodexRuntimeRunStatus, HarnessLogEvent, HarnessLogLevel, MemoryLifecycleTurnOptions,
-    PromptAssemblyOptions, RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions,
-    RuntimeQueuePrepareReport, RuntimeQueuePreparedItem, append_agent_progress_event,
-    append_harness_log, current_log_time_ms, plan_codex_runtime, prepare_runtime_queue_item,
+    AssistantNarrationConfig, AssistantNarrationMode, ChannelOutboundAttachment,
+    ChannelOutboundAttachmentKind, ChannelOutboundMessage, ChannelOutboundMessageKind,
+    CodexRuntimePlan, CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimeReceiptStatus,
+    CodexRuntimeRunOptions, CodexRuntimeRunReport, CodexRuntimeRunStatus, HarnessLogEvent,
+    HarnessLogLevel, MemoryLifecycleTurnOptions, PromptAssemblyOptions,
+    RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
+    RuntimeQueuePreparedItem, append_agent_progress_event, append_harness_log, current_log_time_ms,
+    load_assistant_narration_config, plan_codex_runtime, prepare_runtime_queue_item,
     read_channel_session_state, record_memory_lifecycle_turn, release_runtime_queue_lease,
     run_codex_runtime, write_json_atomic,
 };
@@ -278,8 +279,21 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             );
         } else if let Some(context) = channel_context {
             if let Some(transcript_file) = run.receipt.transcript_file.as_ref() {
-                match latest_assistant_message(transcript_file)? {
-                    Some(text) => {
+                let narration_config = match load_assistant_narration_config(&options.harness_home)
+                {
+                    Ok(config) => {
+                        warnings.extend(config.warnings.clone());
+                        config
+                    }
+                    Err(error) => {
+                        warnings.push(format!(
+                            "assistant narration config could not be loaded; using defaults: {error}"
+                        ));
+                        AssistantNarrationConfig::default()
+                    }
+                };
+                match latest_assistant_response(transcript_file, &narration_config)? {
+                    Some(response) => {
                         if channel_session_is_current(
                             &options.harness_home,
                             &context,
@@ -289,7 +303,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                 match record_memory_lifecycle_turn(MemoryLifecycleTurnOptions {
                                     harness_home: options.harness_home.clone(),
                                     prompt_bundle_json: codex_plan.prompt_bundle_json.clone(),
-                                    assistant_text: text.clone(),
+                                    assistant_text: response.final_text.clone(),
                                     success: true,
                                     now_ms: current_log_time_ms()?,
                                 }) {
@@ -299,7 +313,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                     )),
                                 }
                             }
-                            let (text, attachments) = split_outbound_media_directives(&text);
+                            let (text, attachments) =
+                                split_outbound_media_directives(&response.outbound_text);
                             let message = ChannelOutboundMessage {
                                 platform: context.platform,
                                 channel_id: context.channel_id,
@@ -842,9 +857,19 @@ fn find_queue_channel_context(
     Ok(None)
 }
 
-fn latest_assistant_message(transcript_file: &Path) -> io::Result<Option<String>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LatestAssistantResponse {
+    final_text: String,
+    outbound_text: String,
+}
+
+fn latest_assistant_response(
+    transcript_file: &Path,
+    config: &AssistantNarrationConfig,
+) -> io::Result<Option<LatestAssistantResponse>> {
     let text = fs::read_to_string(transcript_file)?;
-    for line in text.lines().rev() {
+    let mut entries = Vec::new();
+    for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -853,13 +878,56 @@ fn latest_assistant_message(transcript_file: &Path) -> io::Result<Option<String>
             Ok(value) => value,
             Err(_) => continue,
         };
-        if string_field(&value, &["role"]) == Some("assistant")
-            && let Some(content) = string_field(&value, &["content"])
-        {
-            return Ok(Some(content.to_string()));
-        }
+        let Some(role) = string_field(&value, &["role"]) else {
+            continue;
+        };
+        let Some(content) = string_field(&value, &["content"]) else {
+            continue;
+        };
+        entries.push((role.to_string(), content.to_string()));
     }
-    Ok(None)
+    let Some(assistant_index) = entries
+        .iter()
+        .rposition(|(role, content)| role == "assistant" && !content.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let final_text = entries[assistant_index].1.clone();
+    let outbound_text = match config.mode {
+        AssistantNarrationMode::Off | AssistantNarrationMode::ProgressPanel => final_text.clone(),
+        AssistantNarrationMode::InlinePreface => {
+            let prior_user_index = entries[..assistant_index]
+                .iter()
+                .rposition(|(role, _)| role == "user")
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            let narration = entries[prior_user_index..assistant_index]
+                .iter()
+                .filter(|(role, content)| {
+                    role == "assistant_narration" && !content.trim().is_empty()
+                })
+                .map(|(_, content)| compact_inline_narration(content))
+                .collect::<Vec<_>>();
+            if narration.is_empty() {
+                final_text.clone()
+            } else {
+                let narration_block =
+                    truncate_for_channel(&narration.join("\n\n"), config.max_chars.max(1));
+                format!(
+                    "{}\n---\n{}\n\nFinal reply\n---\n{}",
+                    config.final_prefix, narration_block, final_text
+                )
+            }
+        }
+    };
+    Ok(Some(LatestAssistantResponse {
+        final_text,
+        outbound_text,
+    }))
+}
+
+fn compact_inline_narration(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn split_outbound_media_directives(text: &str) -> (String, Vec<ChannelOutboundAttachment>) {
@@ -967,7 +1035,7 @@ mod tests {
     #[test]
     fn split_outbound_media_directives_extracts_attachments() {
         let (text, attachments) = split_outbound_media_directives(
-            "Here is the file.\nMEDIA:C:\\AgentHarness\\image.png\nDone.",
+            "Here is the file.\nMEDIA:D:\\Warehouse\\image.png\nDone.",
         );
 
         assert_eq!(text, "Here is the file.\nDone.");
@@ -977,8 +1045,76 @@ mod tests {
         assert_eq!(attachments[0].filename.as_deref(), Some("image.png"));
         assert_eq!(
             attachments[0].path,
-            PathBuf::from("C:\\AgentHarness\\image.png")
+            PathBuf::from("D:\\Warehouse\\image.png")
         );
+    }
+
+    #[test]
+    fn latest_assistant_response_defaults_to_final_only_with_narration_rows() {
+        let root =
+            temp_root("latest_assistant_response_defaults_to_final_only_with_narration_rows");
+        let transcript = root.join("transcript.jsonl");
+        append_json_line(
+            &transcript,
+            &serde_json::json!({"role": "user", "content": "Please check config"}),
+        )
+        .unwrap();
+        append_json_line(
+            &transcript,
+            &serde_json::json!({"role": "assistant_narration", "content": "Checking config"}),
+        )
+        .unwrap();
+        append_json_line(
+            &transcript,
+            &serde_json::json!({"role": "assistant", "content": "Done."}),
+        )
+        .unwrap();
+
+        let response = latest_assistant_response(&transcript, &AssistantNarrationConfig::default())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(response.final_text, "Done.");
+        assert_eq!(response.outbound_text, "Done.");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn latest_assistant_response_inline_preface_formats_work_log() {
+        let root = temp_root("latest_assistant_response_inline_preface_formats_work_log");
+        let transcript = root.join("transcript.jsonl");
+        append_json_line(
+            &transcript,
+            &serde_json::json!({"role": "user", "content": "Please check config"}),
+        )
+        .unwrap();
+        append_json_line(
+            &transcript,
+            &serde_json::json!({"role": "assistant_narration", "content": "Checking   config"}),
+        )
+        .unwrap();
+        append_json_line(
+            &transcript,
+            &serde_json::json!({"role": "assistant", "content": "Done."}),
+        )
+        .unwrap();
+        let config = AssistantNarrationConfig {
+            mode: AssistantNarrationMode::InlinePreface,
+            ..AssistantNarrationConfig::default()
+        };
+
+        let response = latest_assistant_response(&transcript, &config)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(response.final_text, "Done.");
+        assert_eq!(
+            response.outbound_text,
+            "Work log\n---\nChecking config\n\nFinal reply\n---\nDone."
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

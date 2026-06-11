@@ -18,8 +18,8 @@ The project is designed for Windows-first local operation, with most core logic 
 - Build a multi-agent registry and channel command state.
 - Queue Telegram/Discord/local channel turns into durable runtime work.
 - Assemble prompt bundles with explicit prompt-file role headers and dynamic skill selection.
-- Run prepared turns through `codex app-server`, record transcript/trajectory/binding files, and capture usage when available.
-- Deliver compact progress messages while suppressing low-value assistant stream previews.
+- Run prepared turns through `codex app-server`, record transcript/trajectory/binding files, split assistant narration from final replies, and capture usage when available.
+- Deliver compact progress messages while suppressing low-value assistant stream previews and routing assistant narration to an editable current-step status.
 - Run a bounded-concurrency `runtime-loop` with per-item leases and adaptive Codex JSONL idle timeout renewal.
 - Send Telegram/Discord outbox messages and native attachments from structured outbox records.
 - Generate Windows supervisor scripts with stop files, direct-start fallback, and per-component log retention.
@@ -63,6 +63,27 @@ Codex runtime commands support two timeout layers:
 
 Supervisor generation exposes the corresponding runtime-loop defaults through `--runtime-timeout-ms` and `--runtime-idle-timeout-ms`.
 
+## Assistant Narration
+
+Agent Harness can route intermediate assistant narration separately from final channel replies:
+
+```json
+{
+  "response": {
+    "assistantNarrationMode": "progress_panel",
+    "assistantNarrationMaxChars": 500,
+    "assistantNarrationProgressMinUpdateMs": 2500,
+    "assistantNarrationFinalPrefix": "Work log"
+  }
+}
+```
+
+Supported modes are:
+
+- `progress_panel` (default): show compact narration as the latest progress step and keep final replies focused on the final answer.
+- `inline_preface`: prefix the final reply with a compact work log for debugging.
+- `off`: preserve runtime artifacts but do not surface narration in progress or final replies.
+
 ## Secrets And State
 
 Do not commit harness state or credentials. Runtime data belongs under a local harness home such as `.agent-harness/`, which is ignored by this repository. Channel tokens, provider keys, memory credentials, logs, receipts, transcripts, and imported source snapshots are operator-local data.
@@ -75,4 +96,3 @@ Licensed under either of:
 - MIT license
 
 at your option.
-

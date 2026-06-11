@@ -35,6 +35,27 @@ global limit >= per-agent limit >= per-agent-per-channel limit
 
 Invalid narrower-to-wider settings are capped at runtime with warnings.
 
+## Assistant Narration
+
+`harness-config.json` can configure how intermediate Codex assistant narration is surfaced:
+
+```json
+{
+  "response": {
+    "assistantNarrationMode": "progress_panel",
+    "assistantNarrationMaxChars": 500,
+    "assistantNarrationProgressMinUpdateMs": 2500,
+    "assistantNarrationFinalPrefix": "Work log"
+  }
+}
+```
+
+Modes:
+
+- `progress_panel`: default. Store narration for audit, render it as the latest progress current step, and keep final channel replies final-answer only.
+- `inline_preface`: include a compact work-log preface before the final answer.
+- `off`: keep raw runtime artifacts but do not show narration in progress or final replies.
+
 ## Prompt Files
 
 Prompt bundle generation adds explicit role headers for known prompt files. Examples:
@@ -48,4 +69,3 @@ Prompt bundle generation adds explicit role headers for known prompt files. Exam
 - `BOOTSTRAP.md`: startup context.
 
 Skills are selected dynamically. Command-only turns may legitimately select zero skills; ordinary agent turns can inject relevant `SKILL.md` bodies.
-

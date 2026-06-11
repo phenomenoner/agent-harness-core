@@ -60,6 +60,7 @@ pub enum AgentProgressKind {
     ExecuteCode,
     ToolCall,
     AssistantStream,
+    AssistantNarration,
     MemoryRecall,
     Delivery,
 }
@@ -689,23 +690,39 @@ fn render_agent_progress_status(
             _ => format!("✅ Done — {elapsed}"),
         }
     } else {
-        format!("⏳ Working — {} — {}", elapsed, status_phrase(latest))
+        let mut status = format!("⏳ Working — {} — {}", elapsed, status_phrase(latest));
+        if let Some(narration) = latest_narration_event(events) {
+            status.push_str("\nCurrent step: ");
+            status.push_str(&quote_safe_preview(&narration.preview, max_preview_chars));
+        }
+        status
     }
 }
 
 fn is_rendered_action_event(event: &AgentProgressEvent) -> bool {
     !matches!(
         event.kind,
-        AgentProgressKind::Runtime | AgentProgressKind::AssistantStream
+        AgentProgressKind::Runtime
+            | AgentProgressKind::AssistantStream
+            | AgentProgressKind::AssistantNarration
     )
 }
 
 fn latest_status_event<'a>(events: &[&'a AgentProgressEvent]) -> Option<&'a AgentProgressEvent> {
+    events.iter().rev().copied().find(|event| {
+        !matches!(
+            event.kind,
+            AgentProgressKind::AssistantStream | AgentProgressKind::AssistantNarration
+        )
+    })
+}
+
+fn latest_narration_event<'a>(events: &[&'a AgentProgressEvent]) -> Option<&'a AgentProgressEvent> {
     events
         .iter()
         .rev()
         .copied()
-        .find(|event| event.kind != AgentProgressKind::AssistantStream)
+        .find(|event| event.kind == AgentProgressKind::AssistantNarration)
 }
 
 pub fn sanitize_progress_preview(value: &str, max_chars: usize) -> String {
@@ -797,6 +814,7 @@ fn quote_safe_preview(value: &str, max_preview_chars: usize) -> String {
 fn status_phrase(event: &AgentProgressEvent) -> &'static str {
     match event.kind {
         AgentProgressKind::AssistantStream => "receiving stream response",
+        AgentProgressKind::AssistantNarration => "working",
         AgentProgressKind::Terminal
         | AgentProgressKind::SearchFiles
         | AgentProgressKind::ReadFile
@@ -850,6 +868,7 @@ fn progress_icon(kind: AgentProgressKind) -> &'static str {
         AgentProgressKind::ExecuteCode => "🐍",
         AgentProgressKind::ToolCall => "🛠️",
         AgentProgressKind::AssistantStream => "💬",
+        AgentProgressKind::AssistantNarration => "📝",
         AgentProgressKind::MemoryRecall => "🧠",
         AgentProgressKind::Delivery => "📨",
     }
@@ -1000,6 +1019,39 @@ mod tests {
         assert_eq!(
             render_agent_progress_status(&refs, 45 * 60_000 + 1000, 120),
             "✅ Done — 1 min"
+        );
+    }
+
+    #[test]
+    fn assistant_narration_renders_as_current_step_only() {
+        let context = context();
+        let events = vec![
+            AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Terminal,
+                "terminal",
+                "pwsh: agent-harness status",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+            AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::AssistantNarration,
+                "current_step",
+                "verifying skills-index readback",
+                AgentProgressStatus::Progress,
+                4000,
+            ),
+        ];
+        let refs = events.iter().collect::<Vec<_>>();
+        let actions = render_agent_progress_actions(&refs, 8, 120);
+        let status = render_agent_progress_status(&refs, 61_000, 120);
+
+        assert!(actions.contains("pwsh: agent-harness status"));
+        assert!(!actions.contains("verifying skills-index"));
+        assert_eq!(
+            status,
+            "⏳ Working — 1 min — running tools\nCurrent step: verifying skills-index readback"
         );
     }
 
