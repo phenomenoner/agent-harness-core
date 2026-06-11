@@ -202,6 +202,30 @@ pub fn prepare_runtime_queue_item(
         .map(|item| (item.queue_id.clone(), item))
         .collect::<HashMap<_, _>>();
     if let Some(requested_queue_id) = options.queue_id.as_deref()
+        && terminal_run_ids.contains(requested_queue_id)
+    {
+        write_runtime_queue_leases(&queue_dir, &lease_state)?;
+        let receipt = RuntimeExecutionReceipt {
+            queue_id: Some(requested_queue_id.to_string()),
+            status: RuntimeExecutionReceiptStatus::NoPendingItem,
+            execution_dir: None,
+            prompt_bundle_json: None,
+            prompt_markdown: None,
+            runtime_workspace: None,
+            reason: "requested runtime queue item already has a terminal run receipt".to_string(),
+        };
+        append_json_line(&execution_receipts_file, &receipt)?;
+        return Ok(RuntimeQueuePrepareReport {
+            schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
+            harness_home: options.harness_home,
+            queue_file,
+            execution_receipts_file,
+            item: None,
+            receipt,
+            warnings,
+        });
+    }
+    if let Some(requested_queue_id) = options.queue_id.as_deref()
         && let Some(prepared) = prepared_receipts.get(requested_queue_id)
     {
         if lease_state.leases.contains_key(requested_queue_id) {
@@ -346,6 +370,7 @@ pub fn prepare_runtime_queue_item(
         pending_items,
         options.queue_id.as_deref(),
         &prepared_ids,
+        &terminal_run_ids,
         &lease_state,
         &options.harness_home,
         &mut warnings,
@@ -828,6 +853,7 @@ fn select_pending_item(
     pending_items: Vec<PendingQueueItem>,
     requested_queue_id: Option<&str>,
     prepared_ids: &HashSet<String>,
+    terminal_run_ids: &HashSet<String>,
     lease_state: &RuntimeQueueLeaseState,
     harness_home: &Path,
     warnings: &mut Vec<String>,
@@ -839,6 +865,13 @@ fn select_pending_item(
         if prepared_ids.contains(&item.queue_id) {
             warnings.push(format!(
                 "runtime queue item `{}` already has a prepared receipt; skipping",
+                item.queue_id
+            ));
+            continue;
+        }
+        if terminal_run_ids.contains(&item.queue_id) {
+            warnings.push(format!(
+                "runtime queue item `{}` already has a terminal run receipt; skipping",
                 item.queue_id
             ));
             continue;
@@ -983,7 +1016,7 @@ fn read_terminal_run_once_ids(
 fn is_terminal_run_once_status(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "failed-terminal" | "canceled" | "skipped" | "dead-letter"
+        "completed" | "timeout" | "failed-terminal" | "canceled" | "skipped" | "dead-letter"
     )
 }
 
@@ -1489,12 +1522,9 @@ mod tests {
         assert!(after_timeout.item.is_none());
         assert_eq!(
             after_timeout.receipt.status,
-            RuntimeExecutionReceiptStatus::AlreadyPrepared
+            RuntimeExecutionReceiptStatus::NoPendingItem
         );
-        assert_eq!(
-            after_timeout.receipt.queue_id.as_deref(),
-            Some(queue_id.as_str())
-        );
+        assert_eq!(after_timeout.receipt.queue_id, None);
 
         writeln!(
             run_once_file,
@@ -1516,10 +1546,10 @@ mod tests {
         assert!(explicit.item.is_none());
         assert_eq!(
             explicit.receipt.status,
-            RuntimeExecutionReceiptStatus::AlreadyPrepared
+            RuntimeExecutionReceiptStatus::NoPendingItem
         );
-        assert!(explicit.receipt.execution_dir.is_some());
-        assert!(explicit.receipt.prompt_bundle_json.is_some());
+        assert!(explicit.receipt.execution_dir.is_none());
+        assert!(explicit.receipt.reason.contains("terminal run receipt"));
 
         let after_terminal = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
             harness_home,

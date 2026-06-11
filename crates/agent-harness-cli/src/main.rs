@@ -3201,6 +3201,7 @@ fn handle_runtime_loop_task_result(
             } else if matches!(
                 status,
                 RuntimeRunOnceStatus::Completed
+                    | RuntimeRunOnceStatus::Timeout
                     | RuntimeRunOnceStatus::FailedTerminal
                     | RuntimeRunOnceStatus::Canceled
             ) {
@@ -10369,7 +10370,7 @@ fn terminal_runtime_queue_ids(path: &Path) -> Result<BTreeSet<String>, String> {
 fn is_runtime_terminal_status(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "failed-terminal" | "canceled" | "skipped" | "dead-letter"
+        "completed" | "timeout" | "failed-terminal" | "canceled" | "skipped" | "dead-letter"
     )
 }
 
@@ -12725,7 +12726,7 @@ mod tests {
     }
 
     #[test]
-    fn typing_context_ignores_retryable_runtime_receipts() {
+    fn typing_context_ignores_terminal_runtime_receipts() {
         let root = std::env::temp_dir().join(format!(
             "agent-harness-cli-typing-{}",
             current_time_ms().unwrap()
@@ -12754,11 +12755,11 @@ mod tests {
         )
         .unwrap();
 
-        let context = pending_runtime_typing_context(&root, Some("queue-1"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(context.platform, "telegram");
-        assert_eq!(context.channel_id, "chat-1");
+        assert!(
+            pending_runtime_typing_context(&root, Some("queue-1"))
+                .unwrap()
+                .is_none()
+        );
 
         fs::write(
             queue_dir.join("run-once-receipts.jsonl"),

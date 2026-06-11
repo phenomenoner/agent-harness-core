@@ -291,6 +291,7 @@ fn runtime_status(harness_home: &Path) -> io::Result<HarnessRuntimeStatus> {
         &queue_dir.join("run-once-receipts.jsonl"),
         &[
             "completed",
+            "timeout",
             "failed-terminal",
             "canceled",
             "skipped",
@@ -941,6 +942,68 @@ mod tests {
                 .get("runtime.loop-stopped")
                 .copied(),
             Some(true)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collect_status_treats_timeout_run_once_receipt_as_closed() {
+        let root = temp_root("collect_status_treats_timeout_run_once_receipt_as_closed");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(harness_home.join("state").join("runtime-queue")).unwrap();
+        fs::create_dir_all(harness_home.join("state").join("channels")).unwrap();
+        fs::create_dir_all(harness_home.join("state").join("logs")).unwrap();
+        fs::create_dir_all(harness_home.join("state").join("plugin-sidecar")).unwrap();
+        fs::create_dir_all(harness_home.join("state").join("memory")).unwrap();
+        fs::create_dir_all(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("loop-heartbeats"),
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join("state").join("harness-registry.json"),
+            r#"{
+              "agents": [{"id":"main","enabled":true}],
+              "providers": [],
+              "channels": {"telegram": false, "discord": false},
+              "plugins": []
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+            r#"{"queueId":"q-timeout","status":"queued"}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("run-once-receipts.jsonl"),
+            r#"{"queueId":"q-timeout","status":"timeout","reason":"idle timeout"}"#,
+        )
+        .unwrap();
+
+        let report = collect_harness_status(HarnessStatusOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+
+        assert_eq!(report.runtime.queued_items, 1);
+        assert_eq!(report.runtime.open_items, 0);
+        assert_eq!(
+            report
+                .runtime
+                .latest_non_idle_run_once
+                .as_ref()
+                .and_then(|receipt| receipt.status.as_deref()),
+            Some("timeout")
         );
 
         let _ = fs::remove_dir_all(root);

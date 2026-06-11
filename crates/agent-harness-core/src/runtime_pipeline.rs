@@ -675,7 +675,8 @@ fn final_run_once_reason(
 fn should_write_failure_outbox(status: RuntimeRunOnceStatus) -> bool {
     matches!(
         status,
-        RuntimeRunOnceStatus::FailedTerminal
+        RuntimeRunOnceStatus::Timeout
+            | RuntimeRunOnceStatus::FailedTerminal
             | RuntimeRunOnceStatus::Canceled
             | RuntimeRunOnceStatus::NoRuntimePlan
             | RuntimeRunOnceStatus::PreflightBlocked
@@ -741,7 +742,7 @@ fn count_prior_runtime_failures(receipts_file: &Path, queue_id: &str) -> io::Res
 fn is_terminal_run_once_status(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "failed-terminal" | "canceled" | "skipped" | "dead-letter"
+        "completed" | "timeout" | "failed-terminal" | "canceled" | "skipped" | "dead-letter"
     )
 }
 

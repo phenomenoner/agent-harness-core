@@ -13,6 +13,14 @@ Agent Harness Core reads most operator state from a harness home directory suppl
 
 Use `--source-home` for imported prompt files, registry, skills, and legacy context. Use `--runtime-workspace` only for the Codex working directory. Prompt assembly falls back to the imported source workspace when the runtime workspace does not contain prompt files.
 
+## Runtime Terminal State
+
+`timeout` run-once receipts are terminal for the parent queue id. Runtime selection, status open-item counts, native typing context, and progress delivery all treat the parent turn as closed after a timeout. To retry work, enqueue a new turn or explicit retry id rather than reusing the old queue id.
+
+Progress delivery state is terminal-monotonic. Once a parent queue id has delivered terminal runtime progress, later stray events for that same queue id must not downgrade the status panel back to non-terminal working state.
+
+Long-running jobs or local services that intentionally outlive the chat turn should be represented as managed worker/background jobs with independent accepted, heartbeat, status, completion, and cancellation receipts.
+
 ## Worker Limits
 
 `harness-config.json` can define worker dispatch limits:

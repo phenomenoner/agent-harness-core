@@ -20,6 +20,8 @@ The project is designed for Windows-first local operation, with most core logic 
 - Assemble prompt bundles with explicit prompt-file role headers and dynamic skill selection.
 - Run prepared turns through `codex app-server`, record transcript/trajectory/binding files, split assistant narration from final replies, and capture usage when available.
 - Deliver compact progress messages while suppressing low-value assistant stream previews and routing assistant narration to an editable current-step status.
+- Treat timed-out parent runtime turns as terminal for queue selection, status open-item counts, native typing context, and progress delivery state; retries should be represented by new queue ids.
+- Keep progress delivery terminal-monotonic so late stray events for a completed/failed parent turn do not turn the status panel back into working.
 - Run a bounded-concurrency `runtime-loop` with per-item leases and adaptive Codex JSONL idle timeout renewal.
 - Send Telegram/Discord outbox messages and native attachments from structured outbox records.
 - Generate Windows supervisor scripts with stop files, direct-start fallback, and per-component log retention.
@@ -63,6 +65,8 @@ Codex runtime commands support two timeout layers:
 
 Supervisor generation exposes the corresponding runtime-loop defaults through `--runtime-timeout-ms` and `--runtime-idle-timeout-ms`.
 
+A `timeout` run-once receipt closes the parent queue id for status, typing, progress delivery, and automatic queue selection. Long-running jobs that should outlive a chat turn should be moved into a managed worker/background-job contract with their own accepted, heartbeat, status, and completion receipts instead of relying on the parent Codex turn to stay open.
+
 ## Assistant Narration
 
 Agent Harness can route intermediate assistant narration separately from final channel replies:
@@ -87,6 +91,8 @@ Supported modes are:
 ## Secrets And State
 
 Do not commit harness state or credentials. Runtime data belongs under a local harness home such as `.agent-harness/`, which is ignored by this repository. Channel tokens, provider keys, memory credentials, logs, receipts, transcripts, and imported source snapshots are operator-local data.
+
+Public exports should include source, public docs, and tool wrappers only. Keep debug notes, review files, local harness homes, generated media, credentials, receipts, transcripts, and imported private source snapshots out of public commits.
 
 ## License
 
