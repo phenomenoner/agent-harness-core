@@ -40,6 +40,8 @@ pub(crate) const CODEX_SANDBOX_POLICY_ENV: &str = "AGENT_HARNESS_CODEX_SANDBOX_P
 const DEFAULT_CODEX_SANDBOX: &str = "elevated";
 const DEFAULT_CODEX_SANDBOX_POLICY: &str = "workspaceWrite";
 const RUNTIME_CANCEL_REQUEST_MAX_AGE_MS: i64 = 60_000;
+const CODEX_CHILD_TERMINATE_TIMEOUT_MS: u64 = 2_000;
+const CODEX_STDOUT_READER_JOIN_TIMEOUT_MS: u64 = 2_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRuntimePlanOptions {
@@ -1138,6 +1140,32 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
 
     let narration_config = load_assistant_narration_config(&options.harness_home)?;
     warnings.extend(narration_config.warnings.clone());
+    if let Some(stdout_log_path) = stdout_log.as_ref()
+        && let Some(recovered) = recover_completed_codex_run_from_stdout_log(
+            &plan,
+            stdout_log_path,
+            stderr_log.clone(),
+            &narration_config,
+        )?
+    {
+        warnings.push(format!(
+            "recovered completed Codex app-server turn from existing stdout log {}",
+            stdout_log_path.display()
+        ));
+        return finish_codex_runtime_run(
+            &options.harness_home,
+            &plan,
+            plan_file,
+            execution_dir,
+            run_file,
+            receipts_file,
+            recovered,
+            0,
+            current_log_time_ms()?,
+            &narration_config,
+            warnings,
+        );
+    }
     let started = Instant::now();
     let run_result = drive_codex_app_server(
         &options.harness_home,
@@ -1149,15 +1177,43 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
     )?;
     let elapsed_ms = started.elapsed().as_millis();
     let finished_at_ms = current_log_time_ms()?;
+    finish_codex_runtime_run(
+        &options.harness_home,
+        &plan,
+        plan_file,
+        execution_dir,
+        run_file,
+        receipts_file,
+        run_result,
+        elapsed_ms,
+        finished_at_ms,
+        &narration_config,
+        warnings,
+    )
+}
+
+fn finish_codex_runtime_run(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    plan_file: PathBuf,
+    execution_dir: Option<PathBuf>,
+    run_file: Option<PathBuf>,
+    receipts_file: PathBuf,
+    mut run_result: CodexAppServerRunResult,
+    elapsed_ms: u128,
+    finished_at_ms: i64,
+    narration_config: &AssistantNarrationConfig,
+    mut warnings: Vec<String>,
+) -> io::Result<CodexRuntimeRunReport> {
     let status = run_result.status;
     let reason = run_result.reason.clone();
-    warnings.extend(run_result.warnings);
+    warnings.append(&mut run_result.warnings);
     let completion = if status == CodexRuntimeRunStatus::Completed {
         let assistant_message = if run_result.assistant_message.trim().is_empty() {
             warnings.push("Codex app-server completed without captured assistant text".to_string());
             "(no assistant text captured from Codex app-server events)".to_string()
         } else {
-            run_result.assistant_message
+            std::mem::take(&mut run_result.assistant_message)
         };
         if !run_result.assistant_final_found && !run_result.assistant_raw_message.trim().is_empty()
         {
@@ -1168,7 +1224,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
         }
         Some(record_codex_runtime_completion(
             CodexRuntimeCompletionOptions {
-                harness_home: options.harness_home.clone(),
+                harness_home: harness_home.to_path_buf(),
                 execution_dir: execution_dir.clone(),
                 plan_file: Some(plan_file.clone()),
                 assistant_message,
@@ -1224,18 +1280,18 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
         CodexRuntimeRunStatus::Canceled => "codex.run.canceled",
     };
     append_codex_run_log(
-        &options.harness_home,
+        harness_home,
         log_level,
         log_event,
         &receipt.reason,
-        Some(&plan),
+        Some(plan),
         receipt.transcript_file.clone(),
     )?;
 
     write_codex_runtime_run_report(
         CodexRuntimeRunReport {
             schema: CODEX_RUNTIME_RUN_SCHEMA,
-            harness_home: options.harness_home,
+            harness_home: harness_home.to_path_buf(),
             execution_dir: receipt.execution_dir.clone(),
             plan_file: receipt.plan_file.clone(),
             run_file,
@@ -1248,6 +1304,64 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
         },
         true,
     )
+}
+
+fn recover_completed_codex_run_from_stdout_log(
+    plan: &CodexRuntimePlanFile,
+    stdout_log: &Path,
+    stderr_log: Option<PathBuf>,
+    narration_config: &AssistantNarrationConfig,
+) -> io::Result<Option<CodexAppServerRunResult>> {
+    if !stdout_log.is_file() || fs::metadata(stdout_log)?.len() == 0 {
+        return Ok(None);
+    }
+
+    let file = fs::File::open(stdout_log)?;
+    let reader = BufReader::new(file);
+    let mut state = CodexProtocolState::default();
+    let mut progress = None;
+    let mut event_count = 0usize;
+    let mut completed = false;
+    let mut thread_id = plan.invocation.thread_id.clone();
+
+    for line in reader.lines() {
+        let line = line?;
+        event_count += 1;
+        match serde_json::from_str::<Value>(&line) {
+            Ok(value) => {
+                if let Some(extracted_thread_id) = extract_thread_id(&value) {
+                    thread_id = Some(extracted_thread_id);
+                }
+                collect_agent_output(&value, &mut state, &mut progress, narration_config);
+                if is_turn_completed(&value) {
+                    record_turn_usage(&value, &mut state);
+                    completed = true;
+                }
+            }
+            Err(error) => state.warnings.push(format!(
+                "stdout recovery skipped non-JSON Codex app-server line: {error}"
+            )),
+        }
+    }
+
+    if !completed {
+        return Ok(None);
+    }
+
+    Ok(Some(CodexAppServerRunResult {
+        status: CodexRuntimeRunStatus::Completed,
+        reason: "recovered completed Codex app-server turn from stdout log".to_string(),
+        assistant_message: state.assistant_message_with_harness_notices(),
+        assistant_narration: state.assistant_narration_records(),
+        assistant_raw_message: state.assistant_raw_message(),
+        assistant_final_found: state.assistant_final_found(),
+        thread_id,
+        event_count,
+        usage: state.usage,
+        stdout_log: Some(stdout_log.to_path_buf()),
+        stderr_log,
+        warnings: state.warnings,
+    }))
 }
 
 pub fn record_codex_runtime_completion(
@@ -1602,6 +1716,25 @@ struct CodexAppServerRunResult {
     warnings: Vec<String>,
 }
 
+struct StdoutReaderHandle {
+    handle: Option<thread::JoinHandle<()>>,
+    done_rx: mpsc::Receiver<()>,
+}
+
+impl StdoutReaderHandle {
+    fn join_for(&mut self, timeout: Duration) -> bool {
+        match self.done_rx.recv_timeout(timeout) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+                true
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RuntimeCancelRequest {
@@ -1775,7 +1908,7 @@ fn drive_codex_app_server(
             warnings: Vec::new(),
         });
     };
-    let (line_rx, reader_handle) = spawn_stdout_reader(stdout, stdout_log.clone());
+    let (line_rx, mut reader_handle) = spawn_stdout_reader(stdout, stdout_log.clone());
     let mut timeouts = CodexProtocolTimeouts::new(timeout_ms, idle_timeout_ms);
     let mut state = CodexProtocolState::default();
     let cancel_check = RuntimeCancelCheck::new(harness_home, &plan.session_key);
@@ -1850,8 +1983,12 @@ fn drive_codex_app_server(
     )? {
         ProtocolWait::ThreadStarted(thread_id) => thread_id,
         ProtocolWait::TimedOut(reason) => {
-            let _ = terminate_child(&mut child);
-            let _ = reader_handle.join();
+            finish_codex_child_and_stdout_reader(
+                &mut child,
+                &mut reader_handle,
+                &mut state.warnings,
+                "thread start timed out",
+            );
             return Ok(CodexAppServerRunResult {
                 status: CodexRuntimeRunStatus::Timeout,
                 reason,
@@ -1868,8 +2005,12 @@ fn drive_codex_app_server(
             });
         }
         ProtocolWait::Failed(reason) => {
-            let _ = terminate_child(&mut child);
-            let _ = reader_handle.join();
+            finish_codex_child_and_stdout_reader(
+                &mut child,
+                &mut reader_handle,
+                &mut state.warnings,
+                "thread start failed",
+            );
             return Ok(CodexAppServerRunResult {
                 status: CodexRuntimeRunStatus::ProtocolError,
                 reason,
@@ -1886,8 +2027,12 @@ fn drive_codex_app_server(
             });
         }
         ProtocolWait::TurnCompleted => {
-            let _ = terminate_child(&mut child);
-            let _ = reader_handle.join();
+            finish_codex_child_and_stdout_reader(
+                &mut child,
+                &mut reader_handle,
+                &mut state.warnings,
+                "turn completed before thread start",
+            );
             return Ok(CodexAppServerRunResult {
                 status: CodexRuntimeRunStatus::ProtocolError,
                 reason: "codex app-server reported turn completion before thread start".to_string(),
@@ -1904,8 +2049,12 @@ fn drive_codex_app_server(
             });
         }
         ProtocolWait::Canceled(reason) => {
-            let _ = terminate_child(&mut child);
-            let _ = reader_handle.join();
+            finish_codex_child_and_stdout_reader(
+                &mut child,
+                &mut reader_handle,
+                &mut state.warnings,
+                "thread start canceled",
+            );
             return Ok(CodexAppServerRunResult {
                 status: CodexRuntimeRunStatus::Canceled,
                 reason,
@@ -1965,8 +2114,12 @@ fn drive_codex_app_server(
     )? {
         ProtocolWait::TurnCompleted => CodexRuntimeRunStatus::Completed,
         ProtocolWait::TimedOut(reason) => {
-            let _ = terminate_child(&mut child);
-            let _ = reader_handle.join();
+            finish_codex_child_and_stdout_reader(
+                &mut child,
+                &mut reader_handle,
+                &mut state.warnings,
+                "turn timed out",
+            );
             return Ok(CodexAppServerRunResult {
                 status: CodexRuntimeRunStatus::Timeout,
                 reason,
@@ -1983,8 +2136,12 @@ fn drive_codex_app_server(
             });
         }
         ProtocolWait::Failed(reason) => {
-            let _ = terminate_child(&mut child);
-            let _ = reader_handle.join();
+            finish_codex_child_and_stdout_reader(
+                &mut child,
+                &mut reader_handle,
+                &mut state.warnings,
+                "turn failed",
+            );
             return Ok(CodexAppServerRunResult {
                 status: CodexRuntimeRunStatus::ProtocolError,
                 reason,
@@ -2001,8 +2158,12 @@ fn drive_codex_app_server(
             });
         }
         ProtocolWait::ThreadStarted(_) => {
-            let _ = terminate_child(&mut child);
-            let _ = reader_handle.join();
+            finish_codex_child_and_stdout_reader(
+                &mut child,
+                &mut reader_handle,
+                &mut state.warnings,
+                "unexpected second thread start response",
+            );
             return Ok(CodexAppServerRunResult {
                 status: CodexRuntimeRunStatus::ProtocolError,
                 reason: "codex app-server returned a second thread/start response during turn"
@@ -2029,8 +2190,12 @@ fn drive_codex_app_server(
                     }
                 }),
             );
-            let _ = terminate_child(&mut child);
-            let _ = reader_handle.join();
+            finish_codex_child_and_stdout_reader(
+                &mut child,
+                &mut reader_handle,
+                &mut state.warnings,
+                "turn canceled",
+            );
             return Ok(CodexAppServerRunResult {
                 status: CodexRuntimeRunStatus::Canceled,
                 reason,
@@ -2047,8 +2212,12 @@ fn drive_codex_app_server(
             });
         }
     };
-    let _ = terminate_child(&mut child);
-    let _ = reader_handle.join();
+    finish_codex_child_and_stdout_reader(
+        &mut child,
+        &mut reader_handle,
+        &mut state.warnings,
+        "turn completed",
+    );
     Ok(CodexAppServerRunResult {
         status,
         reason: "codex app-server turn completed and assistant output was captured".to_string(),
@@ -2914,52 +3083,85 @@ fn receive_protocol_event(
     }
 }
 
+fn finish_codex_child_and_stdout_reader(
+    child: &mut std::process::Child,
+    reader_handle: &mut StdoutReaderHandle,
+    warnings: &mut Vec<String>,
+    context: &str,
+) {
+    match terminate_child_with_timeout(
+        child,
+        Duration::from_millis(CODEX_CHILD_TERMINATE_TIMEOUT_MS),
+    ) {
+        Ok(true) => {}
+        Ok(false) => warnings.push(format!(
+            "codex app-server child did not exit within {CODEX_CHILD_TERMINATE_TIMEOUT_MS}ms after {context}; terminal receipt will still be written"
+        )),
+        Err(error) => warnings.push(format!(
+            "codex app-server child termination failed after {context}: {error}"
+        )),
+    }
+    if !reader_handle.join_for(Duration::from_millis(CODEX_STDOUT_READER_JOIN_TIMEOUT_MS)) {
+        warnings.push(format!(
+            "codex app-server stdout reader did not finish within {CODEX_STDOUT_READER_JOIN_TIMEOUT_MS}ms after {context}; detached so terminal receipt can be written"
+        ));
+    }
+}
+
 fn spawn_stdout_reader<R: Read + Send + 'static>(
     stdout: R,
     stdout_log: PathBuf,
-) -> (
-    mpsc::Receiver<Result<String, String>>,
-    thread::JoinHandle<()>,
-) {
+) -> (mpsc::Receiver<Result<String, String>>, StdoutReaderHandle) {
     let (line_tx, line_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
     let handle = thread::spawn(move || {
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&stdout_log);
-        let mut log = match log {
-            Ok(log) => log,
-            Err(error) => {
-                let _ = line_tx.send(Err(format!(
-                    "failed to open stdout log {}: {error}",
-                    stdout_log.display()
-                )));
-                return;
-            }
-        };
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            match line {
-                Ok(line) => {
-                    if let Err(error) = writeln!(log, "{line}") {
-                        let _ = line_tx.send(Err(format!(
-                            "failed to write stdout log {}: {error}",
-                            stdout_log.display()
-                        )));
-                        return;
-                    }
-                    if line_tx.send(Ok(line)).is_err() {
-                        return;
-                    }
-                }
+        let _ = (|| -> Result<(), ()> {
+            let log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&stdout_log);
+            let mut log = match log {
+                Ok(log) => log,
                 Err(error) => {
-                    let _ = line_tx.send(Err(error.to_string()));
-                    return;
+                    let _ = line_tx.send(Err(format!(
+                        "failed to open stdout log {}: {error}",
+                        stdout_log.display()
+                    )));
+                    return Err(());
+                }
+            };
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        if let Err(error) = writeln!(log, "{line}") {
+                            let _ = line_tx.send(Err(format!(
+                                "failed to write stdout log {}: {error}",
+                                stdout_log.display()
+                            )));
+                            return Err(());
+                        }
+                        if line_tx.send(Ok(line)).is_err() {
+                            return Err(());
+                        }
+                    }
+                    Err(error) => {
+                        let _ = line_tx.send(Err(error.to_string()));
+                        return Err(());
+                    }
                 }
             }
-        }
+            Ok(())
+        })();
+        let _ = done_tx.send(());
     });
-    (line_rx, handle)
+    (
+        line_rx,
+        StdoutReaderHandle {
+            handle: Some(handle),
+            done_rx,
+        },
+    )
 }
 
 fn write_json_rpc(stdin: &mut impl Write, value: &Value) -> io::Result<()> {
@@ -2969,11 +3171,32 @@ fn write_json_rpc(stdin: &mut impl Write, value: &Value) -> io::Result<()> {
 }
 
 fn terminate_child(child: &mut std::process::Child) -> io::Result<()> {
-    if child.try_wait()?.is_none() {
-        terminate_child_process_tree(child);
-    }
-    let _ = child.wait();
+    let _ = terminate_child_with_timeout(
+        child,
+        Duration::from_millis(CODEX_CHILD_TERMINATE_TIMEOUT_MS),
+    )?;
     Ok(())
+}
+
+fn terminate_child_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> io::Result<bool> {
+    if child.try_wait()?.is_some() {
+        return Ok(true);
+    }
+
+    terminate_child_process_tree(child);
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        if started.elapsed() >= timeout {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[cfg(windows)]
@@ -2982,7 +3205,7 @@ fn terminate_child_process_tree(child: &mut std::process::Child) {
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .spawn();
     let _ = child.kill();
 }
 
@@ -5613,6 +5836,99 @@ mod tests {
     }
 
     #[test]
+    fn run_codex_runtime_recovers_completed_stdout_without_relaunch() {
+        let root = temp_root("run_codex_runtime_recovers_completed_stdout_without_relaunch");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let execution_dir = plan_report.execution_dir.as_ref().unwrap();
+        fs::write(
+            execution_dir.join("codex-runtime-run.stdout.jsonl"),
+            r#"{"id":1,"result":{"thread":{"id":"thread-recovered"}}}
+{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-recovered","text":"Recovered final reply.","phase":"final_answer"},"threadId":"thread-recovered","completedAtMs":1234}}
+{"method":"turn/completed","params":{"threadId":"thread-recovered","turn":{"id":"turn-recovered","status":"completed","usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15}}}}
+"#,
+        )
+        .unwrap();
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 5_000,
+            idle_timeout_ms: 5_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert!(report.receipt.reason.contains("recovered completed"));
+        assert_eq!(report.receipt.event_count, 3);
+        assert_eq!(
+            report
+                .receipt
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.total_tokens),
+            Some(15)
+        );
+        let transcript_file = report.completion.unwrap().transcript_file.unwrap();
+        let transcript = fs::read_to_string(transcript_file).unwrap();
+        assert!(transcript.contains("Recovered final reply."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_does_not_block_on_open_stdout_after_terminal_event() {
+        let root =
+            temp_root("run_codex_runtime_does_not_block_on_open_stdout_after_terminal_event");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = stdout_holding_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let started = Instant::now();
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 10_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "runtime should not wait for an inherited stdout handle to close"
+        );
+        let transcript_file = report.completion.unwrap().transcript_file.unwrap();
+        let transcript = fs::read_to_string(transcript_file).unwrap();
+        assert!(transcript.contains("stdout holder reply"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_codex_runtime_resumes_existing_thread_binding() {
         let root = temp_root("run_codex_runtime_resumes_existing_thread_binding");
         let source = write_codex_runtime_source(&root);
@@ -6277,6 +6593,59 @@ while ($true) {
         )
     }
 
+    #[cfg(windows)]
+    fn stdout_holding_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("stdout-holding-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try {
+        $msg = $line | ConvertFrom-Json
+    } catch {
+        continue
+    }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"stdout holder reply","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed"}}}')
+        [Console]::Out.Flush()
+        $holder = Join-Path $PSScriptRoot 'stdout-holder.ps1'
+        Set-Content -LiteralPath $holder -Value 'Start-Sleep -Seconds 5'
+        $powershell = (Get-Command powershell.exe).Source
+        Start-Process -FilePath $powershell -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$holder) -NoNewWindow
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
+
     #[cfg(not(windows))]
     fn fake_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
         let script = root.join("fake-app-server.sh");
@@ -6331,6 +6700,35 @@ while IFS= read -r line; do
             sleep 2.5
             printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-test","status":"completed"}}}'
             break
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        make_executable(&script);
+        (PathBuf::from("sh"), vec![script.display().to_string()])
+    }
+
+    #[cfg(not(windows))]
+    fn stdout_holding_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("stdout-holding-app-server.sh");
+        fs::write(
+            &script,
+            r#"
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"stdout holder reply","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed"}}}'
+            sleep 5 &
+            exit 0
             ;;
     esac
 done
