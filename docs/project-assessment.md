@@ -1,16 +1,18 @@
-# Rust OpenClaw Windows Harness Assessment
+# Rust Agent Harness Assessment
 
 Date: 2026-06-08
 
+Status note, 2026-06-11: this file is a historical assessment and architecture baseline. For current live topology, readiness counts, command shortcuts, and documentation pointers, start with `README.md`, then use `docs/agent-harness-dev-handoff.md`, `docs/agent-harness-test-handoff.md`, `docs/activation-readiness-plan.md`, and `docs/agent-harness-feature-parity.md`.
+
 ## Executive Summary
 
-Building a Windows 11 Rust implementation of the core OpenClaw agent harness is feasible. The right target is not a full OpenClaw rewrite. The pragmatic target is a small Rust harness that preserves the OpenClaw data model, delegates coding-agent execution to Codex app-server, and bridges existing OpenClaw plugins through a compatibility sidecar until the runtime contracts are stable enough for native Rust ports.
+Building a Windows 11 Rust implementation of the core imported agent harness is feasible. The right target is not a full OpenClaw rewrite. The pragmatic target is a small Rust harness that preserves the legacy source data model, delegates coding-agent execution to Codex app-server, and bridges existing legacy plugins through a compatibility sidecar until the runtime contracts are stable enough for native Rust ports.
 
-The initial local inspection found an existing Docker OpenClaw stack:
+The initial local inspection found an existing Docker legacy stack:
 
 - Gateway container: `openclaw-ubuntu`
 - Gateway ports: `127.0.0.1:18789-18790`
-- OpenClaw state mount inside container: `/root/.openclaw`
+- legacy source state mount inside container: `/root/.openclaw`
 - Workspace bind mount: `D:\Warehouse\Research\OpenClaw_WSL` to `/workspace`
 - Runtime version: `2026.5.26`
 - Agents: 11 active configured agents reported by status; deeper filesystem inventory found 24 agent directories under `/root/.openclaw/agents`
@@ -21,7 +23,7 @@ The initial local inspection found an existing Docker OpenClaw stack:
 
 Additional local findings on 2026-06-08:
 
-- OpenClaw native agent-turn cron lives in `/root/.openclaw/cron`.
+- legacy native agent-turn cron lives in `/root/.openclaw/cron`.
 - Native cron source files: `jobs.json`, `jobs-state.json`, and `runs/*.jsonl`.
 - Current native cron count: 110 jobs, 65 enabled.
 - Native cron job distribution by agent: `main` 55, `cron-lite` 35, `steamer-cron` 13, `mem-cron` 3, `comms-cron` 2, unassigned 2.
@@ -37,7 +39,7 @@ Additional local findings on 2026-06-08:
 - Agent-local sessions live under `/root/.openclaw/agents/<agent-id>/sessions`.
 - The container workspace bind mount is readable directly on the Windows host at `D:\Warehouse\Research\OpenClaw_WSL`; this should be accepted as an explicit `--workspace` source when importing.
 - If the Docker container is stopped but not deleted, host-mounted workspace files remain readable from Windows. Container-internal state such as `/root/.openclaw` still needs Docker volume/container copy access or a previous export snapshot.
-- The host path `D:\Warehouse\Research\OpenClaw_WSL` is a broad workspace root with multiple OpenClaw workspace subdirectories such as `openclaw-workspace-cron`; dry-run import should target the active workspace subdirectory when importing a specific agent workspace.
+- The host path `D:\Warehouse\Research\OpenClaw_WSL` is a broad workspace root with multiple legacy source workspace subdirectories such as `openclaw-workspace-cron`; dry-run import should target the active workspace subdirectory when importing a specific agent workspace.
 - Some workspace entries created from Linux appear on Windows as reparse points, such as `openclaw-workspace-cron\tools`; deterministic cron import needs explicit symlink/reparse handling or a container/WSL-side export to avoid missing linked runner files.
 
 ## Recommended Architecture
@@ -46,7 +48,7 @@ The project should be split into small boundaries:
 
 1. Rust harness core
    - Owns config loading, agent/session routing, channel envelopes, import planning, policy decisions, and persistence.
-   - Keeps OpenClaw-compatible concepts: agent id, workspace, prompt files, memory root, session key, channel identity.
+   - Keeps legacy-compatible concepts: agent id, workspace, prompt files, memory root, session key, channel identity.
 
 2. Codex runtime adapter
    - Talks to `codex app-server` over stdio JSON-RPC first.
@@ -65,19 +67,20 @@ The project should be split into small boundaries:
 
 5. Plugin compatibility sidecar
    - Do not start by rewriting the OpenClaw TypeScript plugin SDK in Rust.
-   - Run a Node/OpenClaw plugin-host sidecar that exposes tools, hooks, memory slot operations, and provider metadata over JSON-RPC or gRPC.
+   - Run a Node/legacy plugin-host sidecar that exposes tools, hooks, memory slot operations, and provider metadata over JSON-RPC or gRPC.
    - Port only high-value stable plugins to native Rust after the bridge contract proves itself.
 
 6. Memory integration
    - Treat `openclaw-mem` as a first-class external service and data source.
+   - Keep `openclaw-mem` dual-compatible with both OpenClaw and Agent Harness; implement harness-specific behavior through OpenClaw-compatible adapters and hooks instead of modifying `openclaw-mem` internals.
    - Use gateway/pack/search contracts instead of direct SQLite mutation where possible.
    - Preserve raw Markdown memory, JSONL observation logs, SQLite DBs, Qdrant edge data, LanceDB backup data, graph/vector sidecars, and receipts.
-   - Treat `memory/qdrant-edge` as the primary vector backend when present. LanceDB is backup/optional and should not block initial activation when Qdrant edge and SQLite snapshots are present.
+   - Treat `memory/qdrant-edge` as the primary vector backend when present. LanceDB should stay hidden from readiness unless a source explicitly selects it.
 
 7. Skill-first runtime
    - Treat skills as procedural memory that the harness can discover, rank, view, create, patch, and reference per task.
    - Keep a small indexed summary for each skill and load full `SKILL.md` plus `references/`, `templates/`, `scripts/`, and `assets/` only when selected.
-   - Import OpenClaw workspace skills, managed OpenClaw skills, and project `.agents/skills` into a stable skill registry before runtime prompt assembly.
+   - Import legacy source workspace skills, managed OpenClaw skills, and project `.agents/skills` into a stable skill registry before runtime prompt assembly.
    - Add a skill writer/linter path so agents can turn repeated task procedures into reviewed skills instead of growing global prompt files.
 
 ## Hermes Design References
@@ -85,7 +88,7 @@ The project should be split into small boundaries:
 Hermes contributes two separate ideas, and the harness should keep them separate in implementation:
 
 1. Migration strategy
-   - This is about safely moving OpenClaw state into the new harness home.
+   - This is about safely moving legacy source state into the new harness home.
    - It should use dry-run first, structured reports, redacted receipts, presets, and conflict policies.
    - It should not decide per-turn runtime behavior.
 
@@ -100,15 +103,15 @@ Hermes contributes two separate ideas, and the harness should keep them separate
 
 Use a staged import. The first stage is read-only and produces an import plan. Later stages perform copy/transform/resume.
 
-Hermes Agent is a useful migration reference here. Its OpenClaw migration skill uses `hermes claw migrate`, starts with `--dry-run`, emits structured reports, supports presets such as `user-data` and `full`, keeps secrets opt-in, and handles file conflicts with `skip`, `overwrite`, or `rename`. The same safety shape should be reused, but not copied blindly: Hermes can archive some OpenClaw cron and multi-agent data because Hermes has its own scheduler/profile model. This Rust harness must actively preserve and execute OpenClaw native cron, deterministic cron, multi-agent routing, and subagent ledgers for gateway handoff.
+Hermes Agent is a useful migration reference here. Its legacy migration skill uses `hermes claw migrate`, starts with `--dry-run`, emits structured reports, supports presets such as `user-data` and `full`, keeps secrets opt-in, and handles file conflicts with `skip`, `overwrite`, or `rename`. The same safety shape should be reused, but not copied blindly: Hermes can archive some OpenClaw cron and multi-agent data because Hermes has its own scheduler/profile model. This Rust harness must actively preserve native cron, extended deterministic crontab/Supercronic-style cron, multi-agent routing, and subagent ledgers for gateway handoff.
 
 Hermes references checked:
 
 - [Hermes Agent README](https://github.com/NousResearch/hermes-agent)
 - [Hermes Skills System](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills/)
-- [Hermes OpenClaw migration guide](https://hermes-agent.nousresearch.com/docs/zh-Hans/guides/migrate-from-openclaw)
-- [OpenClaw migration skill](https://github.com/NousResearch/hermes-agent/blob/main/optional-skills/migration/openclaw-migration/SKILL.md)
-- [OpenClaw to Hermes migration script](https://github.com/NousResearch/hermes-agent/blob/main/optional-skills/migration/openclaw-migration/scripts/openclaw_to_hermes.py)
+- [Hermes legacy migration guide](https://hermes-agent.nousresearch.com/docs/zh-Hans/guides/migrate-from-openclaw)
+- [legacy migration skill](https://github.com/NousResearch/hermes-agent/blob/main/optional-skills/migration/openclaw-migration/SKILL.md)
+- [legacy-to-Hermes migration script](https://github.com/NousResearch/hermes-agent/blob/main/optional-skills/migration/openclaw-migration/scripts/openclaw_to_hermes.py)
 
 Importer policy borrowed from Hermes:
 
@@ -116,7 +119,7 @@ Importer policy borrowed from Hermes:
 - Use presets: `user-data` for normal handoff, `full` for operator-approved deep import, and module include/exclude flags for narrow repair runs.
 - Treat secrets as opt-in. Resolve environment references and known credential fields only when the operator explicitly enables secret migration; otherwise write redacted receipts and prompt for re-entry.
 - Use conflict modes: `skip`, `overwrite` with backup, and `rename`. Hash identical files and mark them as already matched rather than overwriting.
-- Keep source fallback logic: OpenClaw home workspace, `workspace.default`, `workspace-main`, per-agent workspaces, and explicit Windows host path overrides such as `D:\Warehouse\Research\OpenClaw_WSL`.
+- Keep source fallback logic: Source home workspace, `workspace.default`, `workspace-main`, per-agent workspaces, and explicit Windows host path overrides such as `D:\Warehouse\Research\OpenClaw_WSL`.
 - Rebrand only human-readable prompt text where needed. Do not rewrite code, scripts, serialized state, memory DB rows, or historical transcripts in place.
 - Keep cron and multi-agent import as active runtime state for this harness, even where Hermes archives those records for manual recreation.
 
@@ -140,7 +143,7 @@ Importer policy borrowed from Hermes:
 4. Skill import
    - Import skills from workspace `skills/`, `.openclaw/skills/`, `.agents/skills/`, and workspace `.agents/skills/`.
    - Preserve the full skill directory shape: `SKILL.md`, `references/`, `templates/`, `scripts/`, and `assets/`.
-   - Store imported OpenClaw skills in a distinct namespace or category such as `openclaw-imports` while retaining original ids for reference.
+   - Store imported OpenClaw skills in a distinct namespace or category such as `legacy-imports` while retaining original ids for reference.
    - Build a progressive disclosure index: skill list metadata first, full skill body on demand, referenced files only when the selected skill asks for them.
    - Provide agent-managed skill operations: propose, create, patch, lint, and archive, with receipts and review gates for scripts or destructive shell snippets.
 
@@ -156,22 +159,24 @@ Importer policy borrowed from Hermes:
    - Preserve `id`, `name`, `agentId`, `enabled`, `schedule`, `wakeMode`, `sessionTarget`, `delivery`, and payload metadata.
    - Preserve `runs/*.jsonl` as historical execution receipts.
    - On first cutover, do not immediately fire overdue jobs. Compute a cutover watermark and require an explicit `resume-cron` command.
-   - Runtime implementation needs an agent-turn scheduler that can enqueue a message into the selected agent's session and invoke the LLM-backed runtime.
+   - Runtime implementation should enqueue LLM-backed agent/subagent jobs into the unified worker dispatch layer rather than invoking the runtime directly from the scheduler.
 
-7. Deterministic cron import
+7. Extended deterministic crontab/Supercronic-style cron import
    - Read workspace crontabs and job scripts under `tools/cron-runner` and `tools/backup-cron-runner`.
    - Preserve `locks/`, `state/`, and `logs/` as operational evidence.
-   - Run these jobs through a deterministic job runner path with no LLM/model request capability.
+   - Enqueue these jobs into the deterministic shell lane with no LLM/model request capability.
    - Prefer native Rust process supervision on Windows; use WSL/Docker only as a compatibility fallback for shell scripts that are not portable yet.
 
 8. Subagent import
    - Preserve `/subagents/runs.json`.
    - Preserve subagent ready/running/completed ledgers before enabling native worker execution.
-   - Keep subagent execution behind a queue with per-agent concurrency limits, cancellation, retries, and receipt files.
+   - Keep subagent execution behind the unified worker dispatch queue with per-agent concurrency limits, cancellation, retries, and receipt files.
+   - Preserve the master-agent wakeup behavior: child LLM or deterministic jobs should wake the master through an idempotent watchdog/master-wakeup flow with bounded status and artifact pointers.
+   - Enforce harness-configured global, per-agent/group, and per-agent-per-channel concurrency limits so excess child work waits in the queue instead of overloading the host or provider request limits.
 
 9. Memory import
    - Preserve `.openclaw/memory/*.md`, `openclaw-mem.sqlite`, `openclaw-mem-observations.jsonl`, `openclaw-mem-episodes.jsonl`, mem-engine DBs, `qdrant-edge`, LanceDB backup data, and graph/vector sidecars.
-   - Import `qdrant-edge` before LanceDB because the current OpenClaw memory backend uses Qdrant edge as primary and LanceDB as backup.
+   - Import `qdrant-edge` before optional LanceDB data because the current active memory backend uses Qdrant edge as primary.
    - SQLite files should be copied from a stopped gateway or through a backup API to avoid WAL loss.
 
 10. Plugin import
@@ -180,13 +185,13 @@ Importer policy borrowed from Hermes:
 
 11. Credential and login-state import
    - Importing raw login state is best-effort only.
-   - Provider API keys, Telegram/Discord bot tokens, and OpenClaw gateway secrets should be migrated into Windows Credential Manager or an encrypted harness vault.
+   - Provider API keys, Telegram/Discord bot tokens, and legacy gateway secrets should be migrated into Windows Credential Manager or an encrypted harness vault.
    - Browser/session cookies and service-specific login state should be treated as non-portable unless the source plugin explicitly supports export/import.
    - The handoff path should assume credentials may need to be re-entered and make that flow cheap.
 
 ## Gateway Handoff Requirements
 
-To shut down the Docker OpenClaw gateway and let the Rust Windows harness take over current work, the MVP needs more than import. It needs runtime parity for the active surfaces currently doing work.
+To shut down the Docker legacy gateway and let the Rust Windows harness take over current work, the MVP needs more than import. It needs runtime parity for the active surfaces currently doing work.
 
 The operational cutover gates are tracked in [Activation Readiness Plan](activation-readiness-plan.md).
 
@@ -209,7 +214,7 @@ Required for a real cutover:
    - Create/resume sessions per agent.
    - Feed prompt files, memory pack, channel envelope, and imported session context.
    - Preserve Codex ownership of its system prompt, built-in tool schemas, MCP/tool inventory, approvals, and backend session continuity; the harness should pass OpenClaw context as turn input rather than mutating Codex internals.
-   - Persist transcript, trajectory, and Codex binding mirror files in an OpenClaw-compatible layout.
+   - Persist transcript, trajectory, and Codex binding mirror files in an legacy-compatible layout.
 
 4. Provider routing
    - Support Codex/OpenAI as the primary path.
@@ -218,7 +223,7 @@ Required for a real cutover:
 
 5. Tool execution and approval
    - Implement a tool registry.
-   - Bridge OpenClaw plugin tools through a Node sidecar first.
+   - Bridge legacy plugin tools through a Node sidecar first.
    - Support shell/tool approval policy and audit logs.
    - Keep deterministic cron jobs on a separate execution path that cannot call model runtime.
 
@@ -232,27 +237,31 @@ Required for a real cutover:
 7. Messaging channels
    - Telegram bot receive/send, direct-message mapping, delivery receipts, and retry queue.
    - Discord bot receive/send, DM/thread/channel mapping, delivery receipts, and retry queue.
-   - Imported channel identity must map to the same OpenClaw session key shape where practical.
-   - Shared channel command parser for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, `/status`, and future OpenClaw-compatible chat commands.
+   - Imported channel identity must map to the same legacy session key shape where practical.
+   - Shared channel command parser for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, `/status`, and future legacy-compatible chat commands.
    - Commands must be parsed before ordinary message dispatch and must behave consistently across Telegram DM and Discord DM.
 
-8. Cron scheduler
-   - Native agent-turn cron scheduler for `/cron/jobs.json`.
+8. Worker dispatch scheduler
+   - Native agent-turn cron scheduler ticks for `/cron/jobs.json` that enqueue LLM-backed jobs.
    - Runtime state writer for `/cron/jobs-state.json`.
    - Run logs compatible with `/cron/runs/*.jsonl`.
-   - Deterministic cron scheduler for workspace crontabs and shell jobs.
+   - Extended deterministic crontab/Supercronic-style scheduler ticks for workspace crontabs and shell jobs that enqueue no-LLM deterministic shell jobs.
+   - Shared worker store, leases, retries/backoff, audit logs, rate leases, and timeout/cancel semantics.
+   - Global, per-agent/group, per-agent-per-channel, and lane concurrency limits enforced before worker lease; overflow remains queued.
+   - Deterministic watchdogs for fan-out groups, with master-agent wakeup on all-completed, any-failed, timeout, checkpoint, or threshold policies.
    - Cutover safety: no automatic catch-up storm on first boot.
 
 9. Memory
    - Import raw memory files and DB snapshots without requiring a running gateway.
    - Prioritize Qdrant edge as the primary memory database backend when `memory/qdrant-edge` exists.
-   - Treat LanceDB as backup/optional during first handoff unless the active OpenClaw config explicitly points to LanceDB.
+   - Treat LanceDB as hidden/optional during first handoff unless the active source config explicitly points to LanceDB.
    - Optional `openclaw-mem` gateway adapter for pack/search/propose when an operator enables it.
+   - Add OpenClaw-compatible plugin adapters and agent-turn hooks for `openclaw-mem`/`openclaw-mem-engine` instead of creating Agent Harness-only memory behavior inside the `openclaw-mem` repo.
    - Restore mem-engine lookup/writeback jobs.
    - Treat imported memory as evidence, not executable instruction.
 
 10. Plugin compatibility
-   - Node plugin-host sidecar that can load OpenClaw plugins, expose tools/hooks/memory slots, and return typed receipts.
+   - Node plugin-host sidecar that can load legacy plugins, expose tools/hooks/memory slots, and return typed receipts.
    - Rust-native plugin ABI can wait until the bridge has real coverage.
 
 11. Operations
@@ -270,14 +279,14 @@ Minimum viable handoff order:
 4. Bring up Telegram/Discord.
 5. Bring up shared channel commands in Telegram/Discord DM.
 6. Bring up memory import and whichever memory adapter is enabled.
-7. Enable native cron in dry-run.
-8. Enable deterministic cron.
+7. Enable native cron and deterministic cron in dry-run.
+8. Enable unified worker dispatch for no-LLM shell jobs and LLM subagent jobs.
 9. Enable plugin sidecar tools.
 10. Stop Docker gateway and run Rust harness with cron catch-up disabled.
 
 ## Major Risks
 
-The largest risk is full OpenClaw plugin compatibility. OpenClaw plugins can register providers, channels, CLI backends, agent harnesses, hooks, tools, memory slots, services, and commands. Rebuilding that API natively in Rust before the rest of the harness exists would dominate the project.
+The largest risk is full legacy plugin compatibility. legacy plugins can register providers, channels, CLI backends, agent harnesses, hooks, tools, memory slots, services, and commands. Rebuilding that API natively in Rust before the rest of the harness exists would dominate the project.
 
 The second risk is Codex app-server protocol churn. It is the right integration point, but the harness should pin tested Codex versions and isolate protocol structs behind a narrow adapter.
 
@@ -289,47 +298,47 @@ Current implemented foundation:
 
 - `doctor` performs read-only OpenClaw layout inventory.
 - `import-plan` reports staged readiness across config, workspace, agents, skills, sessions, native cron, deterministic cron, subagents, memory, and plugins.
-- `import-dry-run` builds a structured migration report, supports `skip`, `overwrite`, and `rename` conflict policies, extracts non-secret semantic summaries from OpenClaw config/session/cron JSON, and can write `report.json` plus `summary.md`.
+- `import-dry-run` builds a structured migration report, supports `skip`, `overwrite`, and `rename` conflict policies, extracts non-secret semantic summaries from legacy source config/session/cron JSON, and can write `report.json` plus `summary.md`.
 - `registry` builds a read-only multi-agent registry from `openclaw.json` plus `/agents/<id>` directories, including provider/model/workspace metadata and local auth/session/model file presence.
 - `registry-export` writes the target harness registry state to `state/harness-registry.json` plus `state/harness-registry-receipts.json`, with conflict policy support and no raw secret migration.
 - `enable-check` produces the formal cutover readiness report across registry, enabled agents, Telegram/Discord tokens, provider credentials, plugin sidecar blockers, runtime receipts, latest runtime-loop report, channel state/outbox, Telegram getMe probe evidence, Telegram offset state, Telegram/Discord adapter log evidence, Codex auth, memory-adapter status, and operational-log writability.
-- `enable-check` now treats `memory/qdrant-edge` as the primary memory backend, treats missing LanceDB as a warning when Qdrant edge is present, and fails a recorded Codex launch probe when the latest `codex-runtime-launch-receipts.jsonl` status is not `started-and-stopped`.
+- `enable-check` now treats `memory/qdrant-edge` as the primary memory snapshot, hides missing LanceDB unless source config explicitly selects LanceDB, and fails a recorded Codex launch probe when the latest `codex-runtime-launch-receipts.jsonl` status is not `started-and-stopped`.
 - `status` provides the operator health summary for handoff and monitoring. It aggregates readiness, runtime queued/open/prepared/completed work, channel outbox delivery state, Telegram/Discord smoke evidence, memory backend presence, plugin sidecar receipts, and operational log event coverage, with `--json` for scheduled-task or monitor integration.
 - `state/logs/harness.jsonl` is the append-only operational log for activation checks and runtime events such as channel ingress, queue prepare, `runtime-run-once`, `runtime-loop`, `codex-run`, and Codex completion; receipts/transcripts remain separate audit artifacts.
 - `supervisor-plan` generates a Windows Task Scheduler handoff bundle under `state/supervisor/windows-scheduled-tasks`: runner scripts for `runtime-loop`, `telegram-loop`, and `discord-gateway-loop`, install/start/stop/uninstall scripts, stop files, and `supervisor-plan.json`. It writes absolute paths and does not register tasks automatically.
-- `harness-skills-sync` seeds bundled harness operation skills under `skills/openclaw-harness-core/*` and tracks them with `.openclaw-harness-builtins.json`; user-modified skills are skipped unless `--force` is explicit. This is the Hermes-inspired versioned runbook path for harness operation lead.
+- `harness-skills-sync` seeds bundled harness operation skills under `skills/agent-harness-core/*` and tracks them with `.agent-harness-builtins.json`; user-modified skills are skipped unless `--force` is explicit. This is the Hermes-inspired versioned runbook path for harness operation lead.
 - The dry-run planner currently covers config, prompt files, skill directories, agent directories, native cron store, deterministic cron stores, subagent store, memory store, plugin install record, and plugin-state directory.
 - `import-execute` safe-copies planned prompt files, skills, agent directories, sessions, cron stores, subagent ledgers, memory snapshots, and plugin records; it skips raw sensitive items by default, omits known auth/secret files inside copied directories unless `--include-sensitive` is set, backs up overwrite targets, and writes `state/import-execute-receipts.json`.
 - Local activation smoke passes with a workspace-local official Codex CLI install at `.tools/codex-cli/node_modules/.bin/codex.cmd`; the Codex Desktop MSIX resource path resolves on `PATH` but is not spawnable by this harness environment.
-- `plugin-sidecar-probe` starts a dependency-free Node sidecar probe, reads the imported harness registry and plugin install manifest, and writes `state/plugin-sidecar/probe.json` plus JSONL receipts. `plugin-sidecar-call` verifies the JSON-RPC bridge with `sidecar.status`, `plugins.list`, `tools.list`, and `tools.probe`, writing bridge and execution receipts for `enable-check`. `tools.probe` resolves imported plugin manifests through `OPENCLAW_PLUGIN_SOURCE_ROOTS`, writes `state/plugin-sidecar/catalog.json`, and currently reports 5 sidecar-required plugins resolved plus 2 manifest-derived tools. Plugin-specific tool/hook executor adapters are still pending beyond the catalog bridge.
+- `plugin-sidecar-probe` starts a dependency-free Node sidecar probe, reads the imported harness registry and plugin install manifest, and writes `state/plugin-sidecar/probe.json` plus JSONL receipts. `plugin-sidecar-call` verifies the JSON-RPC bridge with `sidecar.status`, `plugins.list`, `tools.list`, and `tools.probe`, writing bridge and execution receipts for `enable-check`. `tools.probe` resolves imported plugin manifests through `AGENT_HARNESS_PLUGIN_SOURCE_ROOTS`, writes `state/plugin-sidecar/catalog.json`, and currently reports 5 sidecar-required plugins resolved plus 2 manifest-derived tools. Plugin-specific tool/hook executor adapters are still pending beyond the catalog bridge.
 - `channel-credentials-export` imports Telegram/Discord bot tokens plus known channel/user/guild IDs from an existing OpenClaw `openclaw.json` into `secrets/channel-credentials.env`, with redacted receipts in `secrets/channel-credentials-receipts.json`. The adapter and readiness paths now accept either process env vars or that harness secret env file.
 - `telegram-probe` validates the imported Telegram token through Bot API `getMe` without consuming updates or sending messages, writes `state/channels/telegram-probe.json`, appends `telegram-probe-receipts.jsonl`, logs `telegram.probe`, and is surfaced in `enable-check` plus `status`.
-- `tools/openclaw-fake-codex-app-server` is a dependency-free offline Codex app-server fixture for activation smoke. It speaks the minimal stdio JSONL protocol used by the harness tests, lets `channel-run-once` and `runtime-run-once` exercise prompt assembly, Codex run receipts, completion receipts, transcript/trajectory writes, outbox generation, and delivery receipts without a model request.
+- `tools/agent-fake-codex-app-server` is a dependency-free offline Codex app-server fixture for activation smoke. It speaks the minimal stdio JSONL protocol used by the harness tests, lets `channel-run-once` and `runtime-run-once` exercise prompt assembly, Codex run receipts, completion receipts, transcript/trajectory writes, outbox generation, and delivery receipts without a model request.
 - The CLI-level `runtime-loop` exists for queue draining and handoff smoke, and `supervisor-plan` provides the scheduled-task install/start/stop/uninstall path. SQLite-consistent backup, Docker volume export, Windows Credential Manager vault migration, live channel bot handoff, scheduler execution, process supervisor health integration, and plugin-specific executor adapters are still pending.
 - A shared channel command parser and runtime-intent mapper exists for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`; `/model` covers show/switch model, and `/status` covers global/scoped status requests.
 - `skills` builds a skill-first index from source OpenClaw skill directories or an imported harness home, preserves skill metadata/capability flags, writes `skill-index.json`, and can deterministically rank skills for a task turn using query, agent, channel, and workspace hints. Runtime turn planning uses a merged index across source, imported, and bundled harness skills.
-- `turn-plan` builds a runtime-facing dry-run plan for one inbound message: command-vs-agent dispatch, OpenClaw agent routing, channel command state inheritance, session key mapping, provider/model policy, prompt file availability, and selected skills before any model/tool execution.
+- `turn-plan` builds a runtime-facing dry-run plan for one inbound message: command-vs-agent dispatch, imported agent routing, channel command state inheritance, session key mapping, provider/model policy, prompt file availability, and selected skills before any model/tool execution.
 - `channel-step` builds the shared Telegram/Discord-style channel bridge contract for one inbound DM: command turns produce typed command effects plus outbound reply text, and ordinary messages produce an agent-turn dispatch envelope for the future runtime queue.
 - `channel-apply` persists command effects for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status` into per-channel state, command events, and command-apply receipts without invoking the model path.
 - `channel-receive` is the single-message ingress handler future Telegram/Discord adapters can call; it routes commands to channel state/outbox and ordinary messages to the runtime queue with receive receipts.
 - `channel-run-once` is the single-message adapter/smoke entrypoint: it runs `channel-receive`, invokes `runtime-run-once` when the message is an ordinary agent turn, and returns pending outbox delivery work.
 - `channel-outbox-plan` and `channel-delivery-record` provide the shared Telegram/Discord delivery retry ledger: pending outbox messages get stable delivery ids, delivered receipts are skipped, failed receipts remain retryable, and delivery events are written to the operational log.
 - `telegram-poll-once` is the first real Telegram Bot API smoke adapter: it reads `TELEGRAM_BOT_TOKEN` from process env or `secrets/channel-credentials.env`, stores update offsets in `state/channels/telegram-offset.json`, normalizes text updates into `channel-run-once`, sends pending Telegram replies, records delivery receipts, and writes `telegram.poll-once` operational log summaries. `telegram-loop` repeats the same path with finite or infinite iterations and optional stop-file shutdown for operator-run handoff.
-- `discord-event-run-once` is the Discord inbound normalizer for one Gateway `MESSAGE_CREATE` event: it accepts `--event-file` or `--event-json`, skips bot/empty/duplicate messages, normalizes text into `channel-run-once`, writes Discord event receipts, and logs `discord.event-run-once`. `discord-gateway-probe` and `discord-gateway-loop` provide the Node-based WebSocket receive wrapper; gateway loop supports stop-file shutdown, and live handoff still needs an operator-run Discord DM smoke after the old gateway is offline.
+- `discord-event-run-once` is the Discord inbound normalizer for one Gateway `MESSAGE_CREATE` event: it accepts `--event-file` or `--event-json`, skips bot/empty/duplicate messages, normalizes text into `channel-run-once`, writes Discord event receipts, and logs `discord.event-run-once`. `discord-gateway-probe` and `discord-gateway-loop` provide the Node-based WebSocket receive wrapper; gateway loop supports stop-file shutdown, and the live Discord gateway/outbox path is part of the current six-process topology. Re-run operator DM regression smoke after runtime/channel changes.
 - `discord-outbox-send-once` is the first Discord delivery adapter: it reads `DISCORD_BOT_TOKEN` from process env or `secrets/channel-credentials.env`, sends pending Discord outbox messages through Discord REST, records delivery receipts, and writes `discord.outbox-send-once` operational log summaries.
 - `queue-enqueue` and `queue-prepare` read channel command state from the target harness home so active session keys, model overrides, and steering/think/btw notes survive into queued turns and prompt bundles.
 - `queue-prepare` uses prepared execution receipts as idempotence state: automatic selection skips already prepared queue ids, while explicit `--queue-id` requests return an `AlreadyPrepared` no-op receipt with the prior output paths.
-- `queue-enqueue` persists channel agent-turn dispatches to `state/runtime-queue/pending.jsonl`, appends receipts to `state/runtime-queue/receipts.jsonl`, and precomputes OpenClaw-compatible transcript/trajectory paths for the future Codex runtime worker.
+- `queue-enqueue` persists channel agent-turn dispatches to `state/runtime-queue/pending.jsonl`, appends receipts to `state/runtime-queue/receipts.jsonl`, and precomputes legacy-compatible transcript/trajectory paths for the future Codex runtime worker.
 - `queue-prepare` reads pending runtime queue items, rebuilds turn context from queued source/workspace/session metadata, writes `prompt-bundle.json` plus `prompt.md` under `state/runtime-queue/executions/<queue-id>/`, updates `state/prompt-injection-ledgers/<agent>/<session>.json`, and records execution receipts without invoking a model.
 - `runtime-run-once` is the first worker-facing pipeline: it prepares one queued item, writes a Codex plan, runs Codex app-server, records completion outputs, appends `run-once-receipts.jsonl`, writes `run-once-last.json`, and writes fresh assistant replies to `state/channels/outbox.jsonl` as `agent-reply` messages for Telegram/Discord delivery adapters.
 - `runtime-loop` wraps `runtime-run-once` for operator-run drain/smoke: it supports finite or infinite iterations, idle sleep, `--stop-when-idle`, bounded consecutive errors, `state/runtime-queue/loop-last.json`, and `runtime.loop-stopped` / `runtime.loop-error` operational logs.
-- `codex-plan` reads a prepared runtime execution, writes `codex-runtime-plan.json` and `codex-runtime-receipt.json`, records the stdio `codex app-server` invocation contract, and maps outputs to OpenClaw-compatible transcript/trajectory/Codex binding files without starting the process.
+- `codex-plan` reads a prepared runtime execution, writes `codex-runtime-plan.json` and `codex-runtime-receipt.json`, records the stdio `codex app-server` invocation contract, and maps outputs to legacy-compatible transcript/trajectory/Codex binding files without starting the process.
 - `codex-preflight` reads a runtime plan and writes `codex-runtime-preflight.json` plus `codex-runtime-preflight-receipts.jsonl`, checking executable resolution, prompt file presence, output directory containment/writability, and provider credentials before process start. OpenAI/Codex routes accept either `OPENAI_API_KEY` or local Codex OAuth auth state; OpenRouter routes still require `OPENROUTER_API_KEY`.
 - `codex-launch-probe` re-runs preflight, starts the planned app-server process only when local gates pass, sends no prompt or JSON-RPC request, terminates the process after a short probe window, and records stdout/stderr log paths plus launch receipts.
-- `codex-run` re-runs preflight, skips already completed executions, starts `codex app-server` over stdio JSONL, sends the prepared OpenClaw prompt payload as `turn/start` input, captures assistant deltas until `turn/completed`, writes raw stdout/stderr logs, and records the result through the OpenClaw-compatible transcript/trajectory/Codex binding completion sink. Tests and offline activation smoke use a fake app-server and do not call a real model.
-- `codex-complete` records assistant output to the planned OpenClaw-compatible transcript, trajectory, and Codex binding files with idempotent completion receipts; this gives the future app-server JSON-RPC adapter a deterministic output sink.
+- `codex-run` re-runs preflight, skips already completed executions, starts `codex app-server` over stdio JSONL, sends the prepared legacy prompt payload as `turn/start` input, captures assistant deltas until `turn/completed`, writes raw stdout/stderr logs, and records the result through the legacy-compatible transcript/trajectory/Codex binding completion sink. Tests and offline activation smoke use a fake app-server and do not call a real model.
+- `codex-complete` records assistant output to the planned legacy-compatible transcript, trajectory, and Codex binding files with idempotent completion receipts; this gives the future app-server JSON-RPC adapter a deterministic output sink.
 - `prompt-bundle` consumes an agent turn plan and writes `prompt-bundle.json` plus `prompt.md` containing runtime context, imported prompt file bodies, selected `SKILL.md` bodies, Codex session-continuity notes, and the inbound message with byte caps. The harness does not own Codex system prompt or tool schemas; those stay inside Codex CLI/app-server.
-- `cron-plan` parses OpenClaw native agent-turn cron jobs/state and produces a dry-run dispatch plan with cutover hold safety; it validates agent ids, extracts cron payload text when possible, classifies due `at` jobs, and registers cron expressions for future scheduler evaluation without firing anything.
+- `cron-plan` parses legacy native agent-turn cron jobs/state and produces a dry-run dispatch plan with cutover hold safety; it validates agent ids, extracts cron payload text when possible, classifies due `at` jobs, and registers cron expressions for future scheduler evaluation without firing anything.
 - `deterministic-cron-plan` parses workspace `tools/cron-runner` and `tools/backup-cron-runner` crontabs, resolves deterministic `jobs/*` scripts, classifies Windows shell compatibility and missing scripts, and preserves `llmAccessAllowed=false` throughout the dry-run plan.
 - `subagent-plan` parses `.openclaw/subagents/runs.json`, summarizes queued/running/completed/failed/canceled/unknown runs, holds queued/running work at cutover by default, and only marks them as resume candidates when `--resume-subagents` is explicitly set.
 
@@ -338,7 +347,7 @@ Current implemented foundation:
 - Initialize git repo.
 - Add this assessment and an architecture decision record.
 - Create Rust workspace with `core` and `cli`.
-- Implement read-only OpenClaw home inventory.
+- Implement read-only Source home inventory.
 - Implement import-plan generation.
 - Verify with `cargo test`.
 
@@ -355,7 +364,7 @@ Current implemented foundation:
 
 ### Phase 1.5: Skill-First Substrate
 
-- Import skill directories from workspace, OpenClaw home, and `.agents/skills`.
+- Import skill directories from workspace, Source home, and `.agents/skills`.
 - Build a skill metadata index and deterministic task matcher.
 - Add selected-skill full-body/reference loading for prompt assembly.
 - Keep bundled harness operation skills synced into the target harness home and selectable by runtime turns.
@@ -366,21 +375,22 @@ Current implemented foundation:
 
 ### Phase 2: Runtime MVP
 
-- Keep hardening the Codex app-server client against protocol/version drift; the current adapter stores returned `threadId` values in the OpenClaw-compatible binding file and uses `thread/resume` for later turns in the same OpenClaw session.
+- Keep hardening the Codex app-server client against protocol/version drift; the current adapter stores returned `threadId` values in the legacy-compatible binding file and uses `thread/resume` for later turns in the same legacy session.
 - Add local direct-message CLI or HTTP channel for testing.
 - Use the imported multi-agent registry to route direct messages and cron payloads by `agentId`.
 - Promote the generated scheduled-task handoff from plan artifacts into an operator-run installed service path with monitor integration: consume queued prompt bundles continuously, start/resume sessions, stream events, update delivery outboxes, persist transcript/trajectory/Codex binding receipts, and expose process health.
-- Extend `cron-plan` into a real native scheduler after the Codex adapter and transcript writer exist.
-- Extend `deterministic-cron-plan` into a supervised Windows process runner with explicit WSL/Git Bash fallback policy and no model/tool-runtime access.
-- Extend `subagent-plan` into a worker queue with per-agent concurrency limits, cancellation, retry policy, and run receipts after the Codex runtime adapter exists.
-- Mirror replies into OpenClaw-compatible transcript files.
+- Extend `cron-plan`, `deterministic-cron-plan`, and `subagent-plan` into enqueue adapters over the unified worker dispatch layer after the Codex adapter and transcript writer exist.
+- Add worker dispatch config and validation for global, per-agent/group, per-agent-per-channel, and lane concurrency limits.
+- Implement deterministic shell workers with explicit WSL/Git Bash fallback policy and no model/tool-runtime access.
+- Implement LLM subagent workers with per-agent concurrency limits, cancellation, retry policy, child job links, deterministic watchdogs, master-agent wakeups, artifact pointers, and run receipts.
+- Mirror replies into legacy-compatible transcript files.
 
 ### Phase 3: Messaging Channels
 
-- Add Telegram channel. Current status: `telegram-probe` exists for non-consuming token/API checks, `telegram-poll-once` exists for smoke tests, `telegram-loop` exists for operator-run continuous polling, imported Telegram direct/group chat and user allow-lists are enforced before runtime dispatch, and `supervisor-plan` can generate the scheduled-task wrapper; live Telegram handoff and full health management are still pending.
-- Add Discord channel. Current status: outbound REST delivery exists through `discord-outbox-send-once`; inbound Gateway receive exists through the Node `discord-gateway-loop` wrapper, imported Discord user/channel/guild allow-lists are enforced before runtime dispatch, with live Discord DM handoff still pending.
+- Add Telegram channel. Current status: `telegram-probe`, `telegram-poll-once`, and `telegram-loop` exist; imported Telegram direct/group chat and user allow-lists are enforced before runtime dispatch; native `sendPhoto`/`sendDocument` attachment delivery and delivery receipts are implemented; the live loop is part of the six-process supervisor topology. Remaining work is production-grade restart monitoring/service integration.
+- Add Discord channel. Current status: outbound REST delivery exists through `discord-outbox-send-once`; inbound Gateway receive exists through the Node `discord-gateway-loop` wrapper; imported Discord user/channel/guild allow-lists are enforced before runtime dispatch; multipart attachment delivery, reply-context capture, and delivery receipts are implemented; the live gateway/outbox loops are part of the six-process supervisor topology. Remaining work is reconnect/backoff hardening and production-grade restart monitoring/service integration.
 - Implement channel session key compatibility.
-- Route real Telegram/Discord bot events into `channel-run-once` and deliver replies through the shared `channel-outbox-plan` / `channel-delivery-record` ledger. Telegram probe/poll/loop coverage exists with imported allow-list enforcement; Discord outbound and inbound gateway wrapper coverage exists with imported allow-list enforcement; live DM handoff smoke is pending.
+- Route real Telegram/Discord bot events into `channel-run-once` and deliver replies through the shared `channel-outbox-plan` / `channel-delivery-record` ledger. Telegram probe/poll/loop coverage and Discord outbound/inbound gateway wrapper coverage are live with imported allow-list enforcement; continue live DM regression smoke after runtime/channel changes.
 - Expose persisted command effects such as model switch, new session, steering notes, and stop requests through the real bot UX and status replies.
 - Implement approval UX for shell/tool requests.
 
@@ -394,7 +404,7 @@ Current implemented foundation:
 
 - `openclaw/openclaw`: data layout, config shape, plugin system, channel behavior, Codex harness split.
 - `openai/codex`: app-server protocol, MCP server interface, Rust implementation patterns.
-- `nousresearch/hermes-agent`: skill-first procedural memory, native Windows packaging references, and OpenClaw migration safety patterns.
+- `nousresearch/hermes-agent`: skill-first procedural memory, native Windows packaging references, and legacy migration safety patterns.
 - `phenomenoner/openclaw-mem`: memory sidecar, ContextPack, gateway approach.
 - `teloxide/teloxide`: Telegram bot framework for Rust.
 - `serenity-rs/serenity` and `serenity-rs/poise`: Discord bot and command framework.

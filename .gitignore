@@ -17,6 +17,10 @@ secrets/
 **/secrets/channel-credentials.env
 .tools/
 .debug/
+.review/
+.public-export/
+.agent-harness/
+.agent-harness-*/
 
-# Imported OpenClaw state should be staged intentionally.
+# Imported legacy source state should be staged intentionally.
 imports/

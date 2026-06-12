@@ -9,6 +9,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agent-harness-cli"
+version = "0.1.0"
+dependencies = [
+ "agent-harness-core",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
+name = "agent-harness-core"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -293,25 +315,6 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
-
-[[package]]
-name = "openclaw-harness-cli"
-version = "0.1.0"
-dependencies = [
- "openclaw-harness-core",
- "serde_json",
- "ureq",
-]
-
-[[package]]
-name = "openclaw-harness-core"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "serde",
- "serde_json",
- "ureq",
-]
 
 [[package]]
 name = "percent-encoding"

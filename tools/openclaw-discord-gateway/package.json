@@ -1,9 +1,0 @@
-{
-  "name": "openclaw-discord-gateway",
-  "private": true,
-  "type": "module",
-  "version": "0.1.0",
-  "bin": {
-    "openclaw-discord-gateway": "./index.mjs"
-  }
-}

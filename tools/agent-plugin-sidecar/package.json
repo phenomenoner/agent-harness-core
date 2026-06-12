@@ -1,0 +1,9 @@
+{
+  "name": "agent-plugin-sidecar",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "bin": {
+    "agent-plugin-sidecar": "./index.mjs"
+  }
+}

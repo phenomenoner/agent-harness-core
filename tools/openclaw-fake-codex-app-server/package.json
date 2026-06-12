@@ -1,9 +1,0 @@
-{
-  "name": "openclaw-fake-codex-app-server",
-  "private": true,
-  "type": "module",
-  "version": "0.1.0",
-  "bin": {
-    "openclaw-fake-codex-app-server": "./index.mjs"
-  }
-}

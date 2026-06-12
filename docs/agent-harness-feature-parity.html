@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Harness Feature Parity</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fb;
+      --ink: #172033;
+      --muted: #596579;
+      --line: #d9deea;
+      --panel: #ffffff;
+      --panel-2: #eef3f8;
+      --green: #147a4f;
+      --amber: #925500;
+      --red: #a33131;
+      --blue: #2563a8;
+      --shadow: 0 16px 42px rgba(18, 32, 55, 0.11);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Noto Sans TC", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      line-height: 1.55;
+    }
+
+    header {
+      background: #172033;
+      color: #fff;
+      padding: 42px 32px 34px;
+    }
+
+    .wrap {
+      max-width: 1180px;
+      margin: 0 auto;
+    }
+
+    .eyebrow {
+      color: #b8c5d8;
+      font-size: 13px;
+      letter-spacing: 0;
+      text-transform: uppercase;
+      margin: 0 0 10px;
+    }
+
+    h1 {
+      font-size: clamp(30px, 4vw, 48px);
+      line-height: 1.08;
+      margin: 0 0 14px;
+      letter-spacing: 0;
+      max-width: 980px;
+    }
+
+    .lead {
+      font-size: 18px;
+      color: #e2e8f0;
+      max-width: 960px;
+      margin: 0;
+    }
+
+    main {
+      padding: 28px 32px 48px;
+    }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin: -44px auto 26px;
+      max-width: 1180px;
+    }
+
+    .metric,
+    .panel,
+    .step {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .metric {
+      box-shadow: var(--shadow);
+      padding: 16px;
+      min-height: 112px;
+    }
+
+    .metric .label {
+      display: block;
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+
+    .metric .value {
+      display: block;
+      font-weight: 700;
+      font-size: 24px;
+      margin-bottom: 4px;
+    }
+
+    .metric .note {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    section { margin: 24px 0; }
+    h2 { font-size: 24px; margin: 0 0 12px; letter-spacing: 0; }
+    h3 { font-size: 18px; margin: 0 0 8px; letter-spacing: 0; }
+    .panel { padding: 20px; }
+
+    .summary {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 16px;
+    }
+
+    .callout {
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }
+
+    .callout ul,
+    .panel ul,
+    .step ol {
+      margin: 8px 0 0;
+      padding-left: 20px;
+    }
+
+    .legend {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin: 12px 0 16px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 3px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      font-size: 13px;
+      font-weight: 650;
+      background: #fff;
+      white-space: nowrap;
+    }
+
+    .done { color: var(--green); border-color: rgba(20, 122, 79, 0.25); background: #ecf8f2; }
+    .blocked { color: var(--red); border-color: rgba(163, 49, 49, 0.25); background: #fff0f0; }
+    .action { color: var(--amber); border-color: rgba(146, 85, 0, 0.25); background: #fff6e8; }
+    .deferred { color: var(--blue); border-color: rgba(37, 99, 168, 0.25); background: #edf5ff; }
+
+    .matrix-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    table {
+      width: 100%;
+      min-width: 960px;
+      border-collapse: collapse;
+    }
+
+    th, td {
+      text-align: left;
+      vertical-align: top;
+      padding: 13px 14px;
+      border-bottom: 1px solid var(--line);
+      font-size: 14px;
+    }
+
+    th {
+      font-size: 13px;
+      color: #40506a;
+      background: #f0f4f8;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+    .feature { font-weight: 700; min-width: 190px; }
+
+    .roadmap {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .step { padding: 16px; }
+    .step .rank { color: var(--blue); font-weight: 800; font-size: 13px; margin-bottom: 6px; }
+
+    code {
+      font-family: Consolas, "Cascadia Mono", monospace;
+      font-size: 0.95em;
+      background: #eef2f7;
+      padding: 1px 5px;
+      border-radius: 5px;
+    }
+
+    footer {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 28px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+    }
+
+    @media (max-width: 860px) {
+      header { padding: 32px 20px 58px; }
+      main { padding: 20px; }
+      .status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: -48px; }
+      .summary,
+      .roadmap { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 520px) {
+      .status-grid { grid-template-columns: 1fr; }
+      h1 { font-size: 30px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <p class="eyebrow">Rust Windows Agent Harness</p>
+      <h1>Agent Harness 功能對照與升級狀態</h1>
+      <p class="lead">以 2026-06-12 repo-local <code>.agent-harness</code>、round3/round3-2 runtime fixes、public-facing hygiene export、OpenRouter provider route、以及 per-agent memory namespace 升級為準。此頁不再使用中間狀態：harness 端可完成的項目標為 Implemented，需要外部決策或憑證的項目標為 Blocked 或 Action Required，使用者明確延後的項目標為 Deferred。後續 roadmap/backlog 以 <code>docs/agent-harness-core-roadmap-backlog.md</code> 為權威。</p>
+    </div>
+  </header>
+
+  <main>
+    <div class="status-grid">
+      <div class="metric">
+        <span class="label">Readiness</span>
+        <span class="value">Ready: yes</span>
+        <span class="note">58 pass / 0 warn / 0 fail</span>
+      </div>
+      <div class="metric">
+        <span class="label">Provider Route</span>
+        <span class="value">OpenRouter</span>
+        <span class="note">Codex config + env preflight</span>
+      </div>
+      <div class="metric">
+        <span class="label">Multi-Agent</span>
+        <span class="value">Isolated</span>
+        <span class="note">config, sessions, memory roots</span>
+      </div>
+      <div class="metric">
+        <span class="label">Channels</span>
+        <span class="value">TG + Discord</span>
+        <span class="note">pending=0 baseline, delivered=186</span>
+      </div>
+    </div>
+
+    <div class="wrap">
+      <section class="summary">
+        <div class="panel">
+          <h2>Summary</h2>
+          <p>Agent Harness 已可做受控 live Telegram/Discord handoff 測試，也能透過 Codex backend 跑基本 agent turns。這次升級補上 OpenRouter provider path，之後可讓像 <code>小小梨</code> 這類 agent 使用 OpenRouter 模型，同時保有各自的設定、session transcript 與 memory/canvas 空間。</p>
+          <p>OpenRouter route 由 harness 產生 repo-local Codex config：<code>model_provider = "openrouter"</code>、<code>base_url = "https://openrouter.ai/api/v1"</code>、<code>env_key = "OPENROUTER_API_KEY"</code>、<code>wire_api = "chat"</code>。密鑰不會寫入 config；preflight 只檢查環境變數是否存在。</p>
+          <p>Multi-agent isolation 現在涵蓋 registry/model override、runtime transcript 路徑，以及 prompt/lifecycle/canvas memory artifacts。檔案路徑會正規化 agent id，但 receipt 仍保留原始 Unicode 名稱，例如 <code>小小梨</code>。</p>
+          <p>OpenClawMem 現在以 harness-side service adapter 完成：CLI 與 sidecar 均支援 status、recall、reviewed propose、approved store、per-agent writeback 與 receipts。實際匯入內容確認是 Qdrant edge preserved snapshot、SQLite、JSONL 與 engine state，沒有 live remote service endpoint；因此目前正確模式是 <code>snapshot-adapter</code>。</p>
+          <p>未能以 code-only 完成的項目已移到 live/soak gates：real plugin invocation、Windows service-wrapper registration/reboot proof、repo-local encrypted vault live migration，以及需要 operator 發送的 Telegram/Discord/OpenRouter live smoke。Native non-OpenAI provider adapters 已依 2026-06-12 使用者決策移到 Deferred backlog，短期不阻塞 OpenRouter-centered provider path。若未來要升級到 remote <code>openclaw-mem</code> service，需補 endpoint、API/wire contract、credentials 與 fixtures。</p>
+          <p>2026-06-12 外部 roadmap 已整合進 <code>docs/agent-harness-core-roadmap-backlog.md</code>：P0-P7、Track T、Track M、Icebox 全部都有實作步驟、驗收標準、staging implementation status 與 pending live gates。staging pass 已補上 fail-closed config、retry/dead-letter、log rotation、queue retry/skip、supervision evaluation、health/trace/metrics、canary receipts、queue shadow、background registry、token gates、learning proposals、MCP request handling、repo-local encrypted vault、security scans、invariants、schema registry、release docs 與 operator CLI gates。</p>
+          <p>驗收標準已對齊外部 comparative review 的十個面向：concurrency、persistence、error recovery、supervision、security、observability、token efficiency、extensibility、testing quality、maturity。Deterministic code paths 以 tests/fixtures 為證據；queue shadow parity、live channel smoke、reboot recovery、canary deploy、advisory audit、30-day SLO 這類項目必須等 live/soak receipts，不能只靠本機測試宣稱完成。</p>
+          <p>本輪 staging 驗證已通過 <code>cargo fmt --all</code>、<code>cargo test -p agent-harness-cli --target-dir target\staging-test-cli</code>、<code>cargo test --workspace --target-dir target\staging-test-workspace</code>（core 201、CLI 16、doctests 0），以及 <code>cargo tree --workspace --duplicates</code> 本地 dependency hygiene check。</p>
+        </div>
+        <div class="callout">
+          <h3>Immediate Gates</h3>
+          <ul>
+            <li><span class="pill done">Implemented</span> OpenRouter route parsing and Codex provider config generation.</li>
+            <li><span class="pill done">Implemented</span> per-agent memory prompt/lifecycle/canvas roots.</li>
+            <li><span class="pill done">Implemented</span> OpenClawMem snapshot/service adapter and sidecar writeback contract.</li>
+            <li><span class="pill done">Implemented</span> slash model id preservation for explicit providers.</li>
+            <li><span class="pill action">Action Required</span> Run OpenRouter live smoke through the live/main-agent operator path using legacy OpenClaw key and <code>小小梨</code> settings.</li>
+            <li><span class="pill done">Implemented</span> Repo-local encrypted vault primitives and CLI gates; live secret migration/rotation remains pending.</li>
+          </ul>
+        </div>
+      </section>
+
+      <section>
+        <div class="panel">
+          <h2>Roadmap Staging Status</h2>
+          <p>詳細逐項 coverage matrix 以 <code>docs/agent-harness-core-roadmap-backlog.md</code> 為權威。此表只列 feature-parity/review 視角的目前狀態。</p>
+          <div class="matrix-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Area</th>
+                  <th>Current Staging Status</th>
+                  <th>Evidence Now</th>
+                  <th>Pending Gate</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td class="feature">P0 Foundation</td><td><span class="pill done">Implemented</span></td><td>Config validation, retry/dead-letter, log rotation, queue retry/skip, atomic-write audit, CLI gates.</td><td>Live invalid-config, rotation, and dead-letter notification drills.</td></tr>
+                <tr><td class="feature">P1 Supervision</td><td><span class="pill action">Mechanism Ready</span></td><td>Supervision evaluator, healthz, trace, metrics, deploy canary receipts.</td><td>WinSW/service-wrapper child management, reboot proof, kill/restart transcript.</td></tr>
+                <tr><td class="feature">P2 Queue</td><td><span class="pill action">Shadow Ready</span></td><td>SQLite queue shadow record/compare and divergence receipts.</td><td>Seven-day zero-divergence shadow summary and explicit cutover.</td></tr>
+                <tr><td class="feature">P3 Semantics</td><td><span class="pill done">Core Implemented</span></td><td>Scoped stop, admission control, background registry, long-task model.</td><td>Collect/interrupt replay fixtures and live long-task/cancel receipts.</td></tr>
+                <tr><td class="feature">P4 Tokens</td><td><span class="pill done">Implemented</span></td><td>Token aggregation and prompt-reduction/stable-prefix gate.</td><td>Golden traffic proof of >=30% same-session reduction.</td></tr>
+                <tr><td class="feature">P5 Autonomy</td><td><span class="pill action">Safe Foundations</span></td><td>Task entities, budget counters, drift detection, learning proposals, MCP request handling.</td><td>Long-running stdio MCP server, bounded chaining, operator apply/archive receipts.</td></tr>
+                <tr><td class="feature">Track T</td><td><span class="pill action">Catalog Ready</span></td><td><code>docs/invariants.md</code>, invariant CLI, race/unit tests.</td><td>Seeded crash simulation, replay corpus, restore drill receipt.</td></tr>
+                <tr><td class="feature">Track M</td><td><span class="pill action">Contracts Ready</span></td><td>ContextPack parser, ingest idempotency, MCP hash pinning.</td><td>External openclaw-mem fixtures and direct memory MCP proof.</td></tr>
+                <tr><td class="feature">P6 Security</td><td><span class="pill done">Implemented</span></td><td>Encrypted vault, security scan, trust-boundary doc, SECURITY.md, local duplicate dependency check.</td><td>Live secret migration/rotation and network-backed advisory audit.</td></tr>
+                <tr><td class="feature">P7 Quality</td><td><span class="pill action">Scaffold Ready</span></td><td>Schema registry, release checklist, changelog, public hygiene scanner, local workspace tests.</td><td>CI runner, Codex wire fixtures, tagged release checklist execution.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Feature Matrix</h2>
+        <div class="legend">
+          <span class="pill done">Implemented</span>
+          <span class="pill blocked">Blocked</span>
+          <span class="pill action">Action Required</span>
+          <span class="pill deferred">Deferred</span>
+        </div>
+        <div class="matrix-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Feature Family</th>
+                <th>Status</th>
+                <th>Implemented</th>
+                <th>Blocker / Required Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td class="feature">State import / migration</td><td><span class="pill done">Implemented</span></td><td>Imports core files, registry, channels, memory snapshots, sessions, plugin catalog inputs, non-secret ops backups, redacted cutover receipts, and now has repo-local encrypted vault primitives for future secret migration.</td><td><span class="pill action">Action</span> Run live vault migration/rotation/backup receipts before retiring old plaintext env-file stores.</td></tr>
+              <tr><td class="feature">Multi-agent registry / isolation</td><td><span class="pill done">Implemented</span></td><td>Preserves 25 enabled agents, source dirs, sessions, auth/model hints, per-agent overrides, per-agent runtime transcripts, and per-agent memory/canvas namespaces. Upgrade test covers <code>main</code> and <code>小小梨</code>.</td><td><span class="pill action">Action</span> Run live smoke across imported providers/agents as credentials become available.</td></tr>
+              <tr><td class="feature">Telegram</td><td><span class="pill done">Implemented</span></td><td>Poll loop, allow-list, commands, queueing, typing path, native image/document delivery, receipts, and offset persistence.</td><td><span class="pill action">Action</span> Operator sends allowed-user smoke after deployment windows.</td></tr>
+              <tr><td class="feature">Discord</td><td><span class="pill done">Implemented</span></td><td>REST outbox, multipart attachments, gateway loop, DM probe, allow-list, event normalization, reply context, receipts, and live inbound evidence.</td><td><span class="pill action">Action</span> Operator sends allowed-user smoke; add reconnect/backoff monitoring for unattended gateway use.</td></tr>
+              <tr><td class="feature">Commands</td><td><span class="pill done">Implemented</span></td><td><code>/status</code>, <code>/model</code>, <code>/think</code>, <code>/new</code>, <code>/stop</code>, <code>/steer</code>, and <code>/btw</code> persist across Telegram/Discord/local state.</td><td><span class="pill action">Action</span> Add provider-native cancel/typing affordances only where provider APIs support them.</td></tr>
+              <tr><td class="feature">Codex runtime</td><td><span class="pill done">Implemented</span></td><td>Plan/preflight/run/resume, transcript/trajectory/binding, cancel-marker polling, token usage capture, assistant phase split, isolated workspace, adaptive idle timeout, hard max-turn timeout, and runtime leases.</td><td><span class="pill action">Action</span> Broaden live cancel/backoff smoke under real provider load.</td></tr>
+              <tr><td class="feature">Provider/model routing</td><td><span class="pill done">Implemented</span></td><td><code>/model provider/model</code>, per-agent defaults, explicit-provider slash model ids, and OpenRouter Codex config generation work. OpenRouter requires <code>OPENROUTER_API_KEY</code> but writes no secrets.</td><td><span class="pill deferred">Deferred</span> Native non-OpenAI-compatible adapters are needed later, but are not a current delivery blocker while OpenRouter is the multi-provider gateway.</td></tr>
+              <tr><td class="feature">Prompt files / continuity</td><td><span class="pill done">Implemented</span></td><td>Prompt fallback to imported workspace, role headers for imported prompt files, and injection ledger for stable same-session context.</td><td><span class="pill action">Action</span> Add persona-sensitive regression tests for imported agents.</td></tr>
+              <tr><td class="feature">Skill-first guidance</td><td><span class="pill done">Implemented</span></td><td>Imports source skills, syncs bundled harness operation skills, and selects relevant <code>SKILL.md</code> bodies at runtime.</td><td><span class="pill deferred">Decision</span> Learning defaults on in propose-only mode; bundled/imported/agent-created skills can all receive patch/archive proposals with backups and receipts.</td></tr>
+              <tr><td class="feature">Memory inventory / recall</td><td><span class="pill done">Implemented</span></td><td>Detects Qdrant edge, SQLite, memory files, receipts; SQLite vector recall, text recall, service-writeback recall, and prompt-context recall work through the OpenClawMem service adapter. LanceDB remains hidden unless selected.</td><td><span class="pill action">Action</span> Future remote service mode needs a runnable <code>openclaw-mem</code> endpoint, wire contract, credentials, and fixtures.</td></tr>
+              <tr><td class="feature">Memory lifecycle / canvas</td><td><span class="pill done">Implemented</span></td><td>Lifecycle adapter records episodes and capture candidates; compact canvas JSON/Markdown exists; memory hooks and <code>memory-service-*</code> commands record OpenClaw-compatible receipts; reviewed proposals and approved per-agent writeback are implemented.</td><td><span class="pill action">Action</span> Future graph/canvas parity beyond snapshot adapter needs the remote <code>openclaw-mem</code>/<code>openclaw-mem-engine</code> service contract.</td></tr>
+              <tr><td class="feature">Plugin bridge</td><td><span class="pill done">Implemented</span></td><td>Node sidecar manifest/catalog bridge, JSON-RPC status/list/probe, <code>hooks.invoke</code>, <code>memory.slot</code>, and native context-budget behavior.</td><td><span class="pill blocked">Blocked</span> Real tool invocation needs plugin trust policy, allow-list, timeout policy, per-agent/channel permissions, and fixtures.</td></tr>
+              <tr><td class="feature">Cron/subagent import</td><td><span class="pill done">Implemented</span></td><td>Native agent-turn cron, deterministic crontab/Supercronic-style cron, and subagent ledgers import into durable worker jobs with cutover safety.</td><td><span class="pill action">Action</span> Live smoke scheduler watermarks, active resume/cancel policy, and cron-to-agent paths.</td></tr>
+              <tr><td class="feature">Worker dispatch</td><td><span class="pill done">Implemented</span></td><td>SQLite store, idempotent enqueue, lease/run/reap/cancel/status, shell audit, LLM runtime-queue handoff, concurrency limits, rate leases, child groups, watchdogs, wakeups, and artifact pointers.</td><td><span class="pill action">Action</span> Add cascading timeout/cancel, provider backoff profiles, fairness, multi-host store abstraction, and broader fan-out smoke.</td></tr>
+              <tr><td class="feature">Operations</td><td><span class="pill done">Implemented</span></td><td>Status/readiness, JSONL logs, heartbeats, supervisor scripts, stop files, compact progress delivery, timeout reconciliation, direct-start fallback, log retention, atomic state writes, repair, backup, cutover, ops control, healthz, trace, metrics, supervision evaluation, and canary receipts.</td><td><span class="pill action">Action</span> WinSW/service-wrapper restart/reboot proof remains pending; Task Scheduler remains fallback/compatibility.</td></tr>
+              <tr><td class="feature">Credentials / secrets</td><td><span class="pill done">Implemented</span></td><td>Telegram/Discord tokens, OpenRouter key requirements, and memory embedding secrets are represented as env vars or redacted env files; local harness keys use <code>AGENT_HARNESS_*</code>. Repo-local encrypted vault primitives and CLI gates are implemented.</td><td><span class="pill action">Action</span> Live migration, rotation, backup/restore, and redacted receipts remain pending.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="summary">
+        <div class="panel">
+          <h2>Blocked Items</h2>
+          <ul>
+            <li>Plugin real invocation: implement the approved conservative trust model: allow-list, timeout policy, per-agent/channel permissions, receipts, and fixtures.</li>
+            <li>Vaulted secrets live migration: repo-local encrypted vault primitives are implemented; existing long-lived keys still need migration/rotation/backup receipts.</li>
+            <li>Remote openclaw-mem beyond snapshot adapter: provide runnable endpoint, API/wire contract, credentials, and fixtures if this becomes required.</li>
+          </ul>
+        </div>
+        <div class="panel">
+          <h2>Operator Actions</h2>
+          <ul>
+            <li>Run the OpenRouter live smoke through the live/main-agent operator path using the legacy OpenClaw API key and <code>小小梨</code> settings, then record trace/receipt evidence.</li>
+            <li>Send controlled Telegram, Discord, and OpenRouter-backed live smoke turns after deployment.</li>
+            <li>Implement WinSW/service-wrapper style supervision for unattended production; keep Task Scheduler scripts as fallback.</li>
+            <li>Record smoke transcript and receipt paths in the readiness docs after the live tests.</li>
+          </ul>
+        </div>
+      </section>
+
+      <section>
+        <div class="panel">
+          <h2>Forward Roadmap Backlog</h2>
+          <p>詳細實作步驟與驗收標準見 <code>docs/agent-harness-core-roadmap-backlog.md</code>。下表只保留 feature-parity 視角的覆蓋摘要。</p>
+          <div class="matrix-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Roadmap Area</th>
+                  <th>Adopted Coverage</th>
+                  <th>Verification Gate</th>
+                  <th>Review Dimensions</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td class="feature">P0 Foundation</td><td>Atomic write audit, transient error classes, 3-attempt backoff, dead-letter notification, receipt/log rotation, queue retry/skip, and fail-closed config validation.</td><td>Mutable state survives write faults; transient failures dead-letter with user notification; invalid config fails preflight loudly.</td><td>Persistence, error recovery, observability, testing</td></tr>
+                <tr><td class="feature">P1 Supervision / Observability</td><td>First-class <code>supervise</code>, child tree, restart backoff, crash-loop breaker, stale heartbeat detection, alerts, ordered shutdown, OS persistence choice, <code>/healthz</code>, end-to-end <code>traceId</code>, <code>trace &lt;id&gt;</code>, canary deploy/rollback, metrics, and <code>status --watch</code>.</td><td>Reboot restores loops within 60 seconds; killed loops restart; bad deploy rolls back; message traces reconstruct causality.</td><td>Supervision, observability, recovery, maturity</td></tr>
+                <tr><td class="feature">P2 Queue Unification</td><td><code>channel_turn</code> lane in WorkerStore, shadow dual-write, divergence receipts, JSONL-to-SQLite cutover, old lease/lock retirement, compaction, WAL/backup, sequence cursors, and wake-file/event-driven queue wakeups.</td><td>Seven live days with zero shadow divergence; large ledgers stay fast; concurrent loops cannot duplicate execution.</td><td>Persistence, concurrency, recovery, testing</td></tr>
+                <tr><td class="feature">P3 Semantics / Background Work</td><td>Scoped <code>/stop</code>, steer/followup/collect/interrupt semantics, per-session serial lanes, measured warm pool, inbound rate limit, queue-depth admission, SQLite-backed background registry, and long-task receipts.</td><td>Scoped stop tests pass; flood tests refuse instead of piling up; services and long tasks are visible, stoppable, and bounded in status.</td><td>Concurrency, operations, observability</td></tr>
+                <tr><td class="feature">P4 Token Efficiency</td><td>Token aggregation, identity/runtime dedup, prompt-cache prefix stability, memory-recall ledger, progressive skill disclosure, job-kind routing, session rotation, handoff summaries, and golden prompt bundles.</td><td>Same-session input tokens drop at least 30% in golden scenarios; stable prefix order and token reports are receipt-backed.</td><td>Token efficiency, observability, testing</td></tr>
+                <tr><td class="feature">P5 Autonomy / Learning</td><td>Task files, deterministic heartbeat, SQLite budgets, native MCP request handling with future <code>agent-harness mcp-serve</code>, bounded chaining, drift detection, skill proposal/apply, skill usage receipts, FTS session search, memory nudge, signal-gated review, curator, and local user-model proposals.</td><td>Learning defaults on in propose-only mode; auto-apply is config opt-in; budget checks precede tools; proposals are scanned and receipted; MCP protocol fixtures and latency gates pass.</td><td>Extensibility, safety, maturity</td></tr>
+                <tr><td class="feature">Track T Testing Spine</td><td>Invariants document, seeded deterministic simulation, scenario replay evals, and restore drills.</td><td>Invariants cover queue/terminal/cancel/budget/trace; failed simulations print replayable seeds; restore drill receipts prove backup works.</td><td>Testing, persistence, recovery</td></tr>
+                <tr><td class="feature">Track M openclaw-mem</td><td>ContextPack v1, consumer-driven fixtures, receipt ingest, fail-open MCP memory path, tool-description hash pinning, provenance chain, and dogfooding flows.</td><td>Invalid memory packs fail open; MCP recall degrades safely; hash drift is caught; recall/proposal/writeback provenance is traceable.</td><td>Extensibility, security, observability</td></tr>
+                <tr><td class="feature">P6 Security</td><td>Repo-local encrypted vault migration, prompt fence hardening, adversarial tests, shell canonicalization/hash pinning/env scrubbing, dependency audit, <code>SECURITY.md</code>, and trust-boundary docs.</td><td>No long-lived plaintext secret store after migration; vault backup/restore is documented; shell escape tests fail closed; MCP descriptions are semi-trusted and pinned.</td><td>Security, maturity</td></tr>
+                <tr><td class="feature">P7 Quality / Publication</td><td>CI, large-module split, Codex version pin, real wire fixtures, release checklist, <code>CHANGELOG.md</code>, and schema registry.</td><td>CI blocks schema/golden/simulation/hygiene failures; protocol drift is detected; every receipt/state schema has owner and version.</td><td>Testing, maturity, extensibility</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="summary">
+        <div class="panel">
+          <h2>Roadmap Notes</h2>
+          <ul>
+            <li>Accepted correction: round3-2 B1 background lifecycle state goes into SQLite WorkerStore; JSONL remains audit/receipt only.</li>
+            <li>Native MCP is adopted, but the first pass should target initialize/list/call fixtures rather than every optional MCP feature.</li>
+            <li>Warm app-server pooling is gated by measurement and must prove no session, cwd, auth, or agent-context contamination.</li>
+            <li>Canary deploy must support fake-only canary when live provider credentials are unavailable.</li>
+            <li><code>/healthz</code> must be local/admin-gated by default and never expose secrets or raw prompt/memory content.</li>
+          </ul>
+        </div>
+        <div class="panel">
+          <h2>Deferred / Icebox</h2>
+          <ul>
+            <li>Native provider adapters beyond Codex/OpenAI/OpenRouter-compatible routing: user confirmed on 2026-06-12 that this is needed, but should be done later. When resumed, provide provider list, SDK/API contract, credentials, model naming rules, cancellation/streaming expectations, and test fixtures.</li>
+            <li>Icebox: full Tokio/async rewrite, new channels, TypeScript plugin SDK rewrite, web dashboard, multi-user/multi-tenant mode, cloud deployment, in-house vector/rerank/memory governance, and benchmark leaderboard chasing.</li>
+          </ul>
+        </div>
+      </section>
+
+      <section>
+        <h2>Recommended Development Order</h2>
+        <div class="roadmap">
+          <div class="step"><div class="rank">P0 + T</div><h3>Foundation First</h3><ol><li>Close atomic write, retry/dead-letter, config, queue operator commands, and log-bound gaps.</li><li>Start invariants and deterministic simulation before the queue migration.</li></ol></div>
+          <div class="step"><div class="rank">P1</div><h3>Supervise / Trace</h3><ol><li>Implement <code>supervise</code>, restart policy, heartbeat, alerts, ordered shutdown, and OS persistence.</li><li>Add <code>/healthz</code>, metrics, end-to-end trace ids, <code>trace &lt;id&gt;</code>, canary deploy, and rollback.</li></ol></div>
+          <div class="step"><div class="rank">P2</div><h3>Queue Shadow Cutover</h3><ol><li>Dual-write JSONL and SQLite channel turns.</li><li>Require seven days zero divergence before SQLite becomes execution source.</li><li>Drain and retire JSONL execution writes after one audit-only release.</li></ol></div>
+          <div class="step"><div class="rank">P3</div><h3>Jobs / Semantics</h3><ol><li>Add scoped stop, collect/interrupt, per-session serial lanes, rate/admission control, and long-task contract.</li><li>Store background lifecycle state in WorkerStore, not a new JSONL execution registry.</li></ol></div>
+          <div class="step"><div class="rank">P4</div><h3>Token Efficiency</h3><ol><li>Aggregate token telemetry and prove stable-context dedup.</li><li>Add recall ledger, progressive skill disclosure, job-kind routing, session rotation, and golden prompt bundles.</li></ol></div>
+          <div class="step"><div class="rank">P5 + M/P6/P7</div><h3>Autonomy With Gates</h3><ol><li>Add tasks, heartbeat, budgets, native MCP request handling, future stdio serve, chaining, drift, and learning-loop proposals with learning default-on in propose-only mode.</li><li>Run memory contracts, security hardening, CI, schema registry, release, and public hygiene tracks in parallel where gated.</li></ol></div>
+        </div>
+      </section>
+
+      <footer>
+        Markdown source: <code>docs/agent-harness-feature-parity.md</code>. Generated for local review on 2026-06-12.
+      </footer>
+    </div>
+  </main>
+</body>
+</html>

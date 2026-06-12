@@ -1,14 +1,33 @@
 # Activation Readiness Plan
 
-Date: 2026-06-08
+Date: 2026-06-11
 
-This is the working checklist for turning the Rust Windows OpenClaw harness from a local core runtime into the active replacement for the Docker OpenClaw gateway.
+This is the working checklist for turning the Rust Windows Agent Harness from a local core runtime into the active replacement for the Docker legacy gateway.
+
+## Latest Verified State
+
+2026-06-12 repo-local harness-home baseline after round3-2 timeout/progress reconciliation:
+
+- Live harness home is now repo-local `.agent-harness`; `.agent-harness/` is ignored by git. `imports/activation-harness` remains only as a pre-rebase backup.
+- `agent-harness.exe` builds; `cargo fmt --all` and full `cargo test --workspace` passed with 174 core tests, 16 CLI tests, and doctests. Previous activation also passed `cargo build`.
+- Latest deployment validation passed `cargo build --workspace`, gateway stop/start with direct runners, live `status`, live `enable-check`, and outbox plan.
+- Supervisor scripts were regenerated with `target/debug/agent-harness.exe`, `--source-home`, `--runtime-workspace D:\Warehouse\Research\OpenClaw_WSL`, `tools/agent-discord-gateway/index.mjs`, one bounded-concurrency `runtime-loop.ps1`, and `worker-loop.ps1`.
+- `AgentHarness-*` scheduled task registration returned access-denied in this environment, so the runtime workers, worker, progress delivery, Telegram, Discord outbox, and Discord gateway loops were started manually as hidden PowerShell processes from the generated scripts.
+- Round3-2 timeout/progress reconciliation is implemented: `timeout` is terminal for runtime queue selection, status open-item counts, native typing context, and progress delivery state. A queued pending row with a timeout receipt should no longer be interpreted as open work. See `docs/round3-2-implementation-and-upgrade-plan.md`.
+- Latest live status after restart: `ready=true`, `passed=58`, `warnings=0`, `failed=0`; runtime `queued=123`, `open=0`, `prepared=123`, `completed=120`; outbox `pending=0`, `delivered=186`, `retryable=0`, `invalid=0`.
+- Loop heartbeats are live for runtime, worker, progress delivery, Telegram, Discord outbox, and Discord gateway. The supervisor plan contains 6 task entries: one bounded-concurrency runtime loop plus the non-runtime loops.
+- Worker config is live at global=12, per-agent/group=6, per-agent-per-channel=3, lane limits `llm=6`, `shell=6`, `watchdog=2`, `maintenance=2`, `plugin=2`, with no worker config warnings.
+- Prompt-file loading now falls back from runtime cwd to imported workspace when needed, and injected prompt files include role headers for `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `USER.md`, `IDENTITY.md`, `HEARTBEAT.md`, and `BOOTSTRAP.md`. Skills are dynamic task context, so `Skills: 0 selected` can be normal for command/status turns.
+- Progress rendering now compacts long PowerShell/Codex tool-call previews, suppressed low-value `assistant_stream` deltas, routes assistant narration to the editable `Current step` status under the default `progress_panel` setting, skipped-denied progress delivery advances the cursor to prevent repeated Telegram `Working` messages, and terminal runtime progress cannot be downgraded by later stray events for the same parent queue id.
+- `ops-cutover-receipt` recorded `status=ready`; the latest activation notes include runtime UX hardening, durable ops activation, assistant narration routing, and docs sync.
+- `memory-lancedb` is hidden unless the source config explicitly selects LanceDB as the active memory backend.
+- Controlled online testing can proceed by having an allowed Telegram/Discord user send a normal message, then recording transcript and delivery receipt paths here.
 
 ## Activation Target
 
 The target state is:
 
-- Docker OpenClaw gateway can be stopped, not deleted.
+- Docker legacy gateway can be stopped, not deleted.
 - Rust harness can receive Telegram/Discord DM input.
 - Slash commands work consistently across Telegram/Discord.
 - Ordinary DM input can route to the right imported agent/session, run Codex through app-server, write transcript/trajectory/Codex binding files, and deliver the assistant reply.
@@ -32,21 +51,21 @@ These must pass before cutover.
 
 3. Skill gate
    - Run `harness-skills-sync`.
-   - Confirm `skills/.openclaw-harness-builtins.json` exists.
+   - Confirm `skills/.agent-harness-builtins.json` exists.
    - Run `skills --harness-home ... --query "<task>"` and confirm imported plus bundled skills are visible.
 
 4. Credential gate
    - Prefer Codex OAuth for Codex models.
    - Confirm Codex auth through local `CODEX_HOME`, `%USERPROFILE%\.codex\auth.json`, or `%USERPROFILE%\.codex\auth.toml`.
    - Confirm the harness uses a spawnable Codex CLI binary. The Codex Desktop MSIX resource path may resolve on `PATH` but fail to spawn with Windows `os error 5`; use a standalone release or a local npm install such as `.tools/codex-cli/node_modules/.bin/codex.cmd`.
-   - Run `channel-credentials-export --include-sensitive` when migrating from an existing OpenClaw home. It writes Telegram/Discord tokens and known channel/user/guild IDs into `secrets/channel-credentials.env` and redacted receipts into `secrets/channel-credentials-receipts.json`.
+   - Run `channel-credentials-export --include-sensitive` when migrating from an existing Source home. It writes Telegram/Discord tokens and known channel/user/guild IDs into `secrets/channel-credentials.env` and redacted receipts into `secrets/channel-credentials-receipts.json`.
    - Confirm `TELEGRAM_BOT_TOKEN` is present either in process env or `secrets/channel-credentials.env` when Telegram is enabled.
    - Confirm `DISCORD_BOT_TOKEN` is present either in process env or `secrets/channel-credentials.env` when Discord is enabled.
-   - Confirm `enable-check` reports `telegram-access-policy` and `discord-access-policy` as pass when importing from an existing OpenClaw channel configuration. Missing access policies are warnings because fresh deployments may intentionally configure them later.
+   - Confirm `enable-check` reports `telegram-access-policy` and `discord-access-policy` as pass when importing from an existing legacy channel configuration. Missing access policies are warnings because fresh deployments may intentionally configure them later.
    - Run `telegram-probe` to validate Telegram Bot API `getMe` without consuming updates or sending messages.
-   - Run `memory-credentials-export --include-sensitive` when migrating imported memory search. It writes `OPENCLAW_HARNESS_MEMORY_EMBEDDING_API_KEY`, model, and base URL into `secrets/memory-credentials.env`; receipts disclose env names, source paths, and lengths only.
+   - Run `memory-credentials-export --include-sensitive` when migrating imported memory search. It writes `AGENT_HARNESS_MEMORY_EMBEDDING_API_KEY`, model, and base URL into `secrets/memory-credentials.env`; receipts disclose env names, source paths, and lengths only.
    - Confirm `OPENROUTER_API_KEY` only when OpenRouter providers are active.
-   - Do not rely on an imported OpenClaw embedding-only `OPENAI_API_KEY` for Codex agent turns.
+   - Do not rely on an imported legacy embedding-only `OPENAI_API_KEY` for Codex agent turns.
 
 5. Runtime gate
    - Run `channel-receive` for a normal DM.
@@ -56,6 +75,7 @@ These must pass before cutover.
    - Run `runtime-run-once` with the intended Codex executable.
    - Confirm `state/runtime-queue/run-once-last.json`.
    - Confirm `state/runtime-queue/run-once-receipts.jsonl`.
+   - Confirm a `timeout` run-once receipt closes the parent queue id for status/typing/progress; retry should be represented by a new queue id.
    - Run `runtime-loop --stop-when-idle --iterations 1` for idle/drain smoke, or `runtime-loop --iterations 0` only under an operator/supervisor after handoff.
    - Confirm `state/runtime-queue/loop-last.json`.
    - Confirm `enable-check` reports `runtime-loop` as pass.
@@ -120,7 +140,7 @@ These should be run before stopping the Docker gateway.
 6. Historical state smoke
    - Confirm imported session indexes and transcript files are present.
    - Confirm memory files/databases are imported or explicitly documented as unavailable.
-   - Confirm `memory/qdrant-edge` is present when Qdrant edge is the active OpenClaw memory backend.
+   - Confirm `memory/qdrant-edge` is present when Qdrant edge is the active legacy memory backend.
    - Confirm `openclaw-mem.sqlite` and memory JSONL files are present as snapshot/audit sources.
    - Run `memory-vector-search --query "<known memory>"` and confirm `state/memory/vector-recall-receipts.jsonl` reports `ready` with hits.
    - Run `memory-canvas-run` and confirm `state/memory/canvas-receipts.jsonl` reports `written` or an explicit `skipped` reason.
@@ -148,19 +168,23 @@ These should be run before stopping the Docker gateway.
    - Done for scheduled-task handoff path: `supervisor-plan` writes Task Scheduler install/start/stop/uninstall scripts for runtime, Telegram, and Discord loops, with absolute paths and stop files; it does not register tasks automatically.
    - Still required for formal service activation: operator execution of generated scheduled-task installer, process supervisor health integration, `/stop` cancellation of already-running model turns, and richer retry/backoff policy.
 
-4. Scheduler execution
-   - Native OpenClaw cron scheduler that can enqueue agent turns.
-   - Deterministic cron runner with no model path.
-   - Cutover watermark to avoid catch-up storms.
+4. Unified worker dispatch for schedulers
+   - Native legacy `.openclaw/cron` scheduler ticks enqueue LLM-backed agent/subagent jobs.
+   - Extended deterministic crontab/Supercronic-style scheduler ticks enqueue no-LLM shell jobs.
+   - Shared worker execution provides durable leases, retries/backoff, audit logs, rate leases, and timeout/cancel semantics.
+   - Harness-configured global, per-agent/group, per-agent-per-channel, and lane concurrency limits prevent fan-out or cron bursts from overloading local processes or provider rate limits; excess jobs remain queued.
+   - Fan-out work uses deterministic watchdogs to wake the master agent with child status and artifact pointers on completion, failure, timeout, or checkpoint policies.
+   - Cutover watermarks avoid catch-up storms.
 
 5. Memory adapter
-   - Done for inventory: imported memory files, Qdrant edge snapshot, LanceDB backup presence, and `openclaw-mem.sqlite` are surfaced in `status` and `enable-check`.
+   - Done for inventory: imported memory files, Qdrant edge snapshot, and `openclaw-mem.sqlite` are surfaced in `status` and `enable-check`; LanceDB is surfaced only when source config explicitly selects it.
    - Done for text fallback: `memory-search` scans imported markdown/text/JSONL memory files read-only and writes redacted receipts.
    - Done for embedding secrets: `memory-credentials-export` migrates imported embedding key/model/base URL into harness memory secrets without logging raw values.
    - Done for readable vector recall: `memory-vector-search` embeds the query and searches imported SQLite embedding tables for observations, docs chunks, and episodic events; prompt assembly uses this before text fallback when configured.
    - Done for minimal canvas: lifecycle capture writes conservative auto-capture candidates and `memory-canvas-run` builds compact JSON/Markdown symbolic canvas receipts.
    - Qdrant edge is still treated as the preserved primary snapshot. The Rust adapter detects and reports it but does not raw-read Qdrant segment files; Qdrant-native recall should use a sidecar/service or a supported snapshot API.
-   - Still required for full parity: LanceDB read fallback, direct Qdrant-native adapter, routeAuto/autoRecall policy matching, direct propose/store semantics, and imported Node plugin hook parity when explicitly enabled.
+   - Integration boundary: `openclaw-mem` remains an external dual-consumer memory product. Agent Harness should add OpenClaw-compatible adapters and agent-turn hooks, not patch `openclaw-mem` internals for harness-only behavior.
+   - Still required for full parity: LanceDB read fallback only when explicitly selected, direct Qdrant-native adapter, routeAuto/autoRecall policy matching, direct propose/store semantics, and imported Node plugin hook parity when explicitly enabled.
 
 6. Plugin sidecar
    - Run `plugin-sidecar-probe` and confirm `enable-check` reports `plugin-sidecar-probe` as pass.
@@ -179,11 +203,25 @@ These should be run before stopping the Docker gateway.
 
 ## Current Activation Snapshot
 
+As of 2026-06-11 live verification:
+
+- Live activation harness: `.agent-harness`.
+- Previous activation backup: `imports/activation-harness`.
+- `.\harness.ps1 gateway status` reports `Ready: yes`, `passed=58`, `warnings=0`, `failed=0`.
+- Runtime queue latest stable readback: `queued=117`, `prepared=117`, `completed=113`, `open=1`. The current `open=1` is not a normal clean-idle state; it is linked to the round3-2 Discord stale timeout/background-task triage.
+- Channel outbox is clean: `pending=0`, `delivered=177`, `retryable=0`, `invalid=0`. The previous stale Telegram retry was manually read back and marked delivered with provider id `manual-readback-20260611`.
+- Supervisor plan has 6 task entries: `runtime-loop`, `worker-loop`, `progress-delivery-loop`, `telegram-loop`, `discord-outbox-loop`, and `discord-gateway-loop`.
+- Canonical status heartbeats are live for runtime, progress delivery, Telegram, Discord outbox, Discord gateway, and worker loops.
+- Runtime queue leasing uses `state/runtime-queue/runtime-leases.json` plus a lock file to let multiple runtime loops run without duplicating queue items.
+- Worker dispatch config is global 12, per-agent/group 6, per-agent-per-channel 3, lane limits `llm=6`, `shell=6`, `watchdog=2`, `maintenance=2`, `plugin=2`.
+- Prompt files are resolved from the imported workspace when the runtime workspace is only Codex cwd, so a live `/status` should not show `Prompt files 0/7` for the imported agent. Skills are selected dynamically and may be 0 for status-only turns.
+- Progress events use compact tool-call previews, assistant narration current-step status, and permission-skipped progress cursors, preventing repeated Telegram `Working` status spam while keeping final replies clean.
+
 As of 2026-06-08 local verification:
 
 - Imported activation harness: `imports/activation-harness`.
 - Qdrant edge is present and passes as the primary memory backend.
-- LanceDB is absent from the filtered activation snapshot and is treated as backup/optional.
+- LanceDB is absent from the filtered activation snapshot and is not part of the default readiness surface because the active memory slot uses `openclaw-mem-engine`.
 - `openclaw-mem.sqlite` is present as a snapshot/audit source.
 - Offline `/status` channel smoke passes against the imported registry: 25 enabled agents, 2 providers, 13 plugins, Telegram and Discord enabled.
 - Runtime queue prepare, Codex plan, Codex preflight, and Codex launch probe pass when using workspace-local `@openai/codex` via `.tools/codex-cli/node_modules/.bin/codex.cmd`.
@@ -195,11 +233,11 @@ As of 2026-06-08 local verification:
 - `discord-outbox-send-once` passes with an empty pending outbox, writes `discord.outbox-send-once`, and does not send any message when `pending=0`.
 - `supervisor-plan` generated three Windows scheduled-task plans (`runtime-loop`, `telegram-loop`, `discord-gateway-loop`) plus install/start/stop/uninstall scripts under `imports/activation-harness/state/supervisor/windows-scheduled-tasks`; generated scripts use absolute paths, point at the local `imports/openclaw-core-snapshot` source because the mounted `D:\Warehouse\Research\OpenClaw_WSL\.openclaw` path is absent, and contain no raw token/key/secret strings.
 - The Codex Desktop MSIX `codex.exe` path is not spawnable from this harness environment and should not be used for service runtime.
-- Offline normal-turn smoke passes through `channel-run-once` with `tools/openclaw-fake-codex-app-server/fake-codex-app-server.cmd`, producing runtime-run-once, Codex run, Codex completion, transcript, outbox, delivery receipt, and operational log evidence without a model request or channel send.
+- Offline normal-turn smoke passes through `channel-run-once` with `tools/agent-fake-codex-app-server/fake-codex-app-server.cmd`, producing runtime-run-once, Codex run, Codex completion, transcript, outbox, delivery receipt, and operational log evidence without a model request or channel send.
 - Runtime loop idle/drain smoke passes with `runtime-loop --stop-when-idle` and writes `state/runtime-queue/loop-last.json` without a model request when no pending queue items remain.
 - `telegram-poll-once` has run successfully against the imported Telegram token and allow-lists. No pending updates were present, so `state/channels/telegram-offset.json` currently records `nextOffset=null`; this still proves the poll adapter can take over without consuming stale updates.
 - `status` reports `queued=2 open=0 prepared=2 completed=2`, outbox `pending=0 delivered=4`, Telegram offset/probe/poll-log present, Qdrant edge primary memory present, plugin catalog ready with 2 manifest-derived tools, and operational log event coverage for offline runtime/delivery smoke.
-- `enable-check` currently reports `Ready: yes` with `passed=35 warnings=1 failed=0`; `telegram-access-policy`, `discord-access-policy`, `telegram-probe`, `telegram-offset`, `telegram-poll-log`, `runtime-loop`, and `supervisor-plan` are pass. The remaining warning is optional LanceDB backup absence while Qdrant edge is primary.
+- Earlier `enable-check` reported `Ready: yes` with `passed=35 warnings=1 failed=0`; that warning was the old optional LanceDB backup absence check and is no longer emitted unless LanceDB is explicitly selected.
 
 As of 2026-06-09 live activation follow-up:
 
@@ -210,10 +248,11 @@ As of 2026-06-09 live activation follow-up:
 - `/status` channel replies use `Agent Harness Status`, and `/model` plus `/think` report the current session setting before listing or changing options.
 - `/model <provider>/<model> --global` and `/think <level> --global` are per-agent defaults. They are persisted under `state/agents/overrides.json` for the current agent only and do not affect other imported agents.
 - Discord DM HTTP poll fallback is initialized and records cursors under `state/channels/discord-dm-poll-cursors.json`. A real allowed-user Discord DM still needs to be sent to clear the `discord-real-inbound` warning.
-- `openclaw-mem` and `openclaw-mem-engine` plugin manifests are resolved from `D:\Warehouse\Research\OpenClaw_WSL\openclaw-mem-gateway\openclaw-mem-src\extensions`, but their manifest files declare no direct `tools` or `hooks`; the behavior is registered at runtime through the OpenClaw plugin API.
+- `openclaw-mem` and `openclaw-mem-engine` plugin manifests are resolved from `D:\Warehouse\Research\OpenClaw_WSL\openclaw-mem-gateway\openclaw-mem-src\extensions`, but their manifest files declare no direct `tools` or `hooks`; the behavior is registered at runtime through the legacy plugin API.
 - Original `openclaw-mem-engine` lifecycle behavior uses `before_prompt_build` with fallback `before_agent_start` for auto recall or routeAuto prompt mutation, and `agent_end` for autoCapture. `openclaw-mem` uses tool-result and `agent_end` capture paths for observations and episodes.
+- The Agent Harness parity target is to reproduce those OpenClaw hook boundaries in the harness adapter layer, while keeping future `openclaw-mem` engine, graph, and sidecar features usable by both OpenClaw and Agent Harness.
 - Imported mem-engine config uses Qdrant edge retrieval, `text-embedding-3-small`, `autoRecall.enabled=false` with `routeAuto.enabled=true`, `autoCapture.enabled=true`, episodes enabled, and symbolic canvas auto build enabled.
-- The imported embedding key is present in `imports/openclaw-core-snapshot/openclaw.json` under `plugins.entries["openclaw-mem-engine"].config.embedding.apiKey`. `memory-credentials-export --include-sensitive` migrates it into harness memory secrets under `OPENCLAW_HARNESS_MEMORY_EMBEDDING_API_KEY`, separate from Codex/OpenAI agent-turn auth. A minimal OpenAI embeddings smoke test with that imported key succeeded against `text-embedding-3-small` and returned a 1536-dimensional vector.
+- The imported embedding key is present in `imports/openclaw-core-snapshot/openclaw.json` under `plugins.entries["openclaw-mem-engine"].config.embedding.apiKey`. `memory-credentials-export --include-sensitive` migrates it into harness memory secrets under `AGENT_HARNESS_MEMORY_EMBEDDING_API_KEY`, separate from Codex/OpenAI agent-turn auth. A minimal OpenAI embeddings smoke test with that imported key succeeded against `text-embedding-3-small` and returned a 1536-dimensional vector.
 - Rust memory support now includes an in-harness lifecycle adapter at the two OpenClaw-equivalent boundaries:
   - pre-turn prompt assembly tries imported SQLite vector recall first when memory embedding secrets are present, then falls back to imported text recall; it injects one bounded `MemoryContext` section before the user message and writes `state/memory/prompt-context-receipts.jsonl`.
   - post-turn successful runtime completion records episode spool lines and conservative auto-capture candidates according to imported `openclaw-mem` / `openclaw-mem-engine` config; it writes `state/memory/lifecycle-receipts.jsonl`.
@@ -224,8 +263,8 @@ As of 2026-06-09 live activation follow-up:
   - `memory-vector-search --query "Qdrant edge memory backend and symbolic canvas"` returned 5 hits via SQLite vector recall using `text-embedding-3-small`, 1536-dimensional embeddings.
   - `prompt-bundle` smoke wrote a prompt-context receipt with 5 memory hits.
   - `memory-canvas-run` wrote compact canvas JSON/Markdown from 40 imported episodes.
-- Current memory warnings are expected: `memory-lifecycle` remains a warning until the next successful live agent turn writes a post-turn lifecycle receipt; LanceDB is absent and optional because Qdrant edge is primary.
-- Still required for full openclaw-mem parity: direct Qdrant edge service/sidecar recall, LanceDB fallback, routeAuto/autoRecall policy matching, direct openclaw-mem propose/store semantics, and imported Node plugin hook parity.
+- Current memory readiness has no LanceDB warning; `memory-lancedb` only appears when source config explicitly selects LanceDB.
+- Still required for full openclaw-mem parity: direct Qdrant edge service/sidecar recall, routeAuto/autoRecall policy matching, direct openclaw-mem propose/store semantics, and imported Node plugin hook parity.
 
 ## Verification Commands
 
@@ -233,26 +272,26 @@ As of 2026-06-09 live activation follow-up:
 cargo fmt --all
 cargo test --workspace --quiet
 cargo clippy --workspace --all-targets -- -D warnings
-cargo run -p openclaw-harness-cli -- help
-cargo run -p openclaw-harness-cli -- channel-credentials-export --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --include-sensitive
-cargo run -p openclaw-harness-cli -- telegram-probe --harness-home C:\path\to\.openclaw-harness
-cargo run -p openclaw-harness-cli -- enable-check --harness-home C:\path\to\.openclaw-harness
-cargo run -p openclaw-harness-cli -- status --harness-home C:\path\to\.openclaw-harness --json
-cargo run -p openclaw-harness-cli -- supervisor-plan --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw --workspace C:\path\to\workspace --harness-cli C:\path\to\openclaw-harness.exe --codex-exe C:\path\to\codex.cmd --agent main
-cargo run -p openclaw-harness-cli -- channel-run-once --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw --platform telegram --channel-id smoke --user-id operator --message /status
-cargo run -p openclaw-harness-cli -- channel-run-once --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw --platform telegram --channel-id offline-runtime-smoke --user-id operator --message "offline runtime smoke" --agent main --codex-exe tools\openclaw-fake-codex-app-server\fake-codex-app-server.cmd --timeout-ms 5000
-cargo run -p openclaw-harness-cli -- runtime-loop --harness-home C:\path\to\.openclaw-harness --codex-exe tools\openclaw-fake-codex-app-server\fake-codex-app-server.cmd --iterations 1 --idle-ms 1 --stop-when-idle
-cargo run -p openclaw-harness-cli -- codex-launch-probe --harness-home C:\path\to\.openclaw-harness --execution-dir C:\path\to\prepared-execution --startup-probe-ms 750
-cargo run -p openclaw-harness-cli -- plugin-sidecar-probe --harness-home C:\path\to\.openclaw-harness
-cargo run -p openclaw-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\.openclaw-harness --method sidecar.status
-cargo run -p openclaw-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\.openclaw-harness --method plugins.list
-$env:OPENCLAW_PLUGIN_SOURCE_ROOTS='C:\path\to\openclaw-src\extensions;C:\path\to\openclaw-mem-src\extensions'
-cargo run -p openclaw-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\.openclaw-harness --method tools.probe
-cargo run -p openclaw-harness-cli -- discord-event-run-once --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw --event-file C:\path\to\discord-message-create.json
-cargo run -p openclaw-harness-cli -- discord-gateway-probe --harness-home C:\path\to\.openclaw-harness --openclaw-home C:\path\to\.openclaw
-cargo run -p openclaw-harness-cli -- telegram-poll-once --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.cmd --poll-timeout-seconds 1 --max-updates 10
-cargo run -p openclaw-harness-cli -- telegram-loop --openclaw-home C:\path\to\.openclaw --harness-home C:\path\to\.openclaw-harness --agent main --codex-exe C:\path\to\codex.cmd --iterations 1 --idle-ms 1000
-cargo run -p openclaw-harness-cli -- discord-outbox-send-once --harness-home C:\path\to\.openclaw-harness --outbox-limit 20
+cargo run -p agent-harness-cli -- help
+cargo run -p agent-harness-cli -- channel-credentials-export --source-home C:\path\to\.openclaw --harness-home C:\path\to\.agent-harness --include-sensitive
+cargo run -p agent-harness-cli -- telegram-probe --harness-home C:\path\to\.agent-harness
+cargo run -p agent-harness-cli -- enable-check --harness-home C:\path\to\.agent-harness
+cargo run -p agent-harness-cli -- status --harness-home C:\path\to\.agent-harness --json
+cargo run -p agent-harness-cli -- supervisor-plan --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.openclaw --workspace C:\path\to\workspace --harness-cli C:\path\to\agent-harness.exe --codex-exe C:\path\to\codex.cmd --agent main
+cargo run -p agent-harness-cli -- channel-run-once --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.openclaw --platform telegram --channel-id smoke --user-id operator --message /status
+cargo run -p agent-harness-cli -- channel-run-once --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.openclaw --platform telegram --channel-id offline-runtime-smoke --user-id operator --message "offline runtime smoke" --agent main --codex-exe tools\agent-fake-codex-app-server\fake-codex-app-server.cmd --timeout-ms 5000
+cargo run -p agent-harness-cli -- runtime-loop --harness-home C:\path\to\.agent-harness --codex-exe tools\agent-fake-codex-app-server\fake-codex-app-server.cmd --iterations 1 --idle-ms 1 --stop-when-idle
+cargo run -p agent-harness-cli -- codex-launch-probe --harness-home C:\path\to\.agent-harness --execution-dir C:\path\to\prepared-execution --startup-probe-ms 750
+cargo run -p agent-harness-cli -- plugin-sidecar-probe --harness-home C:\path\to\.agent-harness
+cargo run -p agent-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\.agent-harness --method sidecar.status
+cargo run -p agent-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\.agent-harness --method plugins.list
+$env:AGENT_HARNESS_PLUGIN_SOURCE_ROOTS='C:\path\to\openclaw-src\extensions;C:\path\to\openclaw-mem-src\extensions'
+cargo run -p agent-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\.agent-harness --method tools.probe
+cargo run -p agent-harness-cli -- discord-event-run-once --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.openclaw --event-file C:\path\to\discord-message-create.json
+cargo run -p agent-harness-cli -- discord-gateway-probe --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.openclaw
+cargo run -p agent-harness-cli -- telegram-poll-once --source-home C:\path\to\.openclaw --harness-home C:\path\to\.agent-harness --agent main --codex-exe C:\path\to\codex.cmd --poll-timeout-seconds 1 --max-updates 10
+cargo run -p agent-harness-cli -- telegram-loop --source-home C:\path\to\.openclaw --harness-home C:\path\to\.agent-harness --agent main --codex-exe C:\path\to\codex.cmd --iterations 1 --idle-ms 1000
+cargo run -p agent-harness-cli -- discord-outbox-send-once --harness-home C:\path\to\.agent-harness --outbox-limit 20
 ```
 
-Use `tools/openclaw-fake-codex-app-server` for offline CI and activation smoke. Use real `codex app-server` only in operator-run smoke tests because it may make model requests.
+Use `tools/agent-fake-codex-app-server` for offline CI and activation smoke. Use real `codex app-server` only in operator-run smoke tests because it may make model requests.

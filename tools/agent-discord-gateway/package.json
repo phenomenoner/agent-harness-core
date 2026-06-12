@@ -1,0 +1,9 @@
+{
+  "name": "agent-discord-gateway",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "bin": {
+    "agent-discord-gateway": "./index.mjs"
+  }
+}
