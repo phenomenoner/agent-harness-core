@@ -9,6 +9,7 @@ use crate::{AgentSource, SKILL_FILE_NAME};
 
 const SKILL_INDEX_SCHEMA: &str = "agent-harness.skill-index.v1";
 const IMPORTED_SKILL_NAMESPACE: &str = "legacy-imports";
+const OPENCLAW_IMPORTED_SKILL_NAMESPACE: &str = "openclaw-imports";
 pub const HARNESS_BUILTIN_SKILL_NAMESPACE: &str = "agent-harness-core";
 const MAX_KEYWORDS: usize = 80;
 
@@ -152,26 +153,33 @@ pub fn build_source_skill_index(source: &AgentSource) -> io::Result<SkillIndex> 
 
 pub fn build_harness_skill_index(harness_home: impl AsRef<Path>) -> io::Result<SkillIndex> {
     let harness_home = harness_home.as_ref();
-    let imported_root = harness_home.join("skills").join(IMPORTED_SKILL_NAMESPACE);
+    let imported_roots = [
+        harness_home.join("skills").join(IMPORTED_SKILL_NAMESPACE),
+        harness_home
+            .join("skills")
+            .join(OPENCLAW_IMPORTED_SKILL_NAMESPACE),
+    ];
     let builtin_root = harness_home
         .join("skills")
         .join(HARNESS_BUILTIN_SKILL_NAMESPACE);
     let mut skills = Vec::new();
-    add_skill_root(
-        &mut skills,
-        SkillSourceKind::ImportedWorkspace,
-        &imported_root.join("workspace"),
-    )?;
-    add_skill_root(
-        &mut skills,
-        SkillSourceKind::ImportedManaged,
-        &imported_root.join("managed"),
-    )?;
-    add_skill_root(
-        &mut skills,
-        SkillSourceKind::ImportedProjectAgent,
-        &imported_root.join("project-agents"),
-    )?;
+    for imported_root in imported_roots {
+        add_skill_root(
+            &mut skills,
+            SkillSourceKind::ImportedWorkspace,
+            &imported_root.join("workspace"),
+        )?;
+        add_skill_root(
+            &mut skills,
+            SkillSourceKind::ImportedManaged,
+            &imported_root.join("managed"),
+        )?;
+        add_skill_root(
+            &mut skills,
+            SkillSourceKind::ImportedProjectAgent,
+            &imported_root.join("project-agents"),
+        )?;
+    }
     add_skill_root(&mut skills, SkillSourceKind::HarnessBuiltin, &builtin_root)?;
     skills.sort_by(|left, right| left.id.cmp(&right.id));
 
@@ -672,6 +680,35 @@ mod tests {
         assert_eq!(index.summary.total_skills, 1);
         assert_eq!(index.summary.imported_project_agent_skills, 1);
         assert_eq!(index.skills[0].id, "imported-project-agent:handoff");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn harness_skill_index_discovers_openclaw_imported_namespace() {
+        let root = temp_root("harness_skill_index_discovers_openclaw_imported_namespace");
+        let harness_home = root.join("harness-home");
+        let imported_skill = harness_home
+            .join("skills")
+            .join(OPENCLAW_IMPORTED_SKILL_NAMESPACE)
+            .join("workspace")
+            .join("xiaoxiaoli-neoapi-guardrails");
+        fs::create_dir_all(&imported_skill).unwrap();
+        fs::write(
+            imported_skill.join(SKILL_FILE_NAME),
+            "# Xiaoxiaoli NeoAPI Guardrails\n\nKeep NeoAPI order guidance bounded.",
+        )
+        .unwrap();
+
+        let index = build_harness_skill_index(&harness_home).unwrap();
+
+        assert_eq!(index.origin, SkillIndexOrigin::HarnessImport);
+        assert_eq!(index.summary.total_skills, 1);
+        assert_eq!(index.summary.imported_workspace_skills, 1);
+        assert_eq!(
+            index.skills[0].id,
+            "imported-workspace:xiaoxiaoli-neoapi-guardrails"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

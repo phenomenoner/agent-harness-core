@@ -122,7 +122,7 @@ Prompt strategy:
 - It uses prompt bundle assembly plus prompt-injection ledger.
 - Stable prompt files and selected skills can be reused by reference.
 - Each injected prompt file carries an explicit role header so the agent knows how to treat it. Known mappings include `AGENTS.md` for workspace instructions, `SOUL.md` for persona/voice, `TOOLS.md` for tool policy, `USER.md` for user preferences, `IDENTITY.md` for agent identity, `HEARTBEAT.md` for cadence/liveness guidance, and `BOOTSTRAP.md` for startup context.
-- Skills are dynamic task context. `/status` and other command-only turns can legitimately show `Skills: 0 selected`; ordinary agent turns use the merged skill index and load relevant `SKILL.md` bodies on demand.
+- Skills are dynamic task context. `/status` and other command-only turns can legitimately show `Skills: 0 selected`; ordinary agent turns use the merged skill index and load relevant `SKILL.md` bodies on demand. Harness imported skill discovery covers both `skills\legacy-imports` and `skills\openclaw-imports`, because current OpenClaw workspace skill imports use the latter namespace.
 - Imported memory context is inserted before the user message as a bounded untrusted `<MEMORY_CONTEXT>` section.
 - Telegram reply/media metadata and Discord reply/attachment metadata are inserted before the user message as a bounded untrusted `<INBOUND_CHANNEL_CONTEXT>` section.
 - Reply targets include preview, source, length, truncation metadata, and up to 4000 characters of referenced text when the platform payload exposes text.

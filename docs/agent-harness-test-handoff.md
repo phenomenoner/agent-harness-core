@@ -45,7 +45,7 @@ Latest known state:
 - Memory prompt context: ready
 - Memory canvas: written
 - Prompt files: should resolve from the imported workspace even when runtime cwd is `D:\Warehouse\Research\OpenClaw_WSL`; `/status` should not show `Prompt files 0/7`.
-- Skills: selected dynamically. `Skills: 0 selected` can be normal for command/status turns; ordinary agent turns should load task-relevant skill bodies when matched.
+- Skills: selected dynamically. `Skills: 0 selected` can be normal for command/status turns; ordinary agent turns should load task-relevant skill bodies when matched. If an imported workspace guardrail is missing from an ordinary turn, verify the canonical binary indexes both `skills\legacy-imports` and `skills\openclaw-imports`.
 - Worker concurrency: global=12, per-agent/group=6, per-agent-per-channel=3, lane limits `llm=6`, `shell=6`, `watchdog=2`, `maintenance=2`, `plugin=2`.
 - Progress UI: tool-call previews should be compact, low-value `assistant_stream` deltas should not appear, assistant narration should show as `Current step: ...` under the editable `Working` status, and Telegram should not repeat identical `Working` progress messages for a skipped/denied event.
 - Progress terminal state is monotonic: after a timeout/failure/completion terminal runtime event, later stray progress for the same parent queue id should not turn the status back into `Working`.

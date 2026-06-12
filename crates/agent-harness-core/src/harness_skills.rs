@@ -14,7 +14,7 @@ const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
 description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, and Codex prompt continuity policy.
-version: 0.1.1
+version: 0.1.2
 platforms: [windows]
 metadata:
   agent_harness:
@@ -73,6 +73,13 @@ The harness may assemble a turn payload containing legacy prompt files, channel 
 - changed fingerprint: include the changed content again and update the ledger
 
 This keeps the turn payload compact and aligns with Codex session continuity instead of repeatedly appending legacy instruction blocks.
+
+## Skill Import Layout
+
+- Treat `skills\legacy-imports` and `skills\openclaw-imports` as valid imported skill namespaces.
+- Current OpenClaw workspace skills are expected under `skills\openclaw-imports\workspace`; legacy backup imports may still use `skills\legacy-imports`.
+- When a live prompt bundle is missing an imported guardrail or specialist skill, first compare the source tree with `agent-harness skills --harness-home <harness> --limit <n>`.
+- If an isolated build sees imported skills but `target\debug\agent-harness.exe` does not, schedule a controlled live stop, rebuild the canonical binary, restart through the supervisor path, then re-run canonical skill-index and local smoke tests.
 
 ## Channel Commands
 
