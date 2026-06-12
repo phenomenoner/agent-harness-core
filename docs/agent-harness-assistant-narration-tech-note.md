@@ -32,8 +32,9 @@ Implemented on 2026-06-11.
 - `emojiAccentMode` was added later as a separate final-reply tone policy. It is
   not part of assistant narration segmentation and is applied only at the
   successful `agent-reply` outbox boundary.
-- Verification: `cargo test --workspace` passed with 172 core tests and 16 CLI
-  tests after implementation.
+- Verification: `cargo test -p agent-harness-core` passed with 219 core tests
+  and `cargo test -p agent-harness-cli` passed with 17 CLI tests after the
+  round4 response/reconnect update.
 
 ## Pre-Implementation Behavior
 
@@ -89,12 +90,12 @@ Suggested schema:
     "assistantNarrationMaxChars": 500,
     "assistantNarrationProgressMinUpdateMs": 2500,
     "assistantNarrationFinalPrefix": "Work log",
-    "emojiAccentMode": "subtle",
+    "emojiAccentMode": "off",
     "emojiAccentAgentModes": {
-      "ops": "off"
+      "ops": "subtle"
     },
     "emojiAccentChannelModes": {
-      "telegram:12345": "off"
+      "telegram:12345": "subtle"
     }
   }
 }
@@ -120,13 +121,13 @@ Modes:
 Final-reply tone policy:
 
 - `emojiAccentMode = "subtle"`
-  - Default.
+  - Opt-in.
   - Appends one small accent only to successful `agent-reply` text.
   - Does not alter command replies, `/status`, error/failure replies, progress
     status, fenced code, code-heavy replies, risk/security/status-style replies,
     or text that already ends in an emoji.
 - `emojiAccentMode = "off"`
-  - Disables the accent globally, per agent, or per channel.
+  - Default. Disables the accent globally, per agent, or per channel.
 
 Channel overrides win over agent overrides, which win over the global default.
 Channel selectors can be `platform:channelId:userId`, `platform:channelId`,

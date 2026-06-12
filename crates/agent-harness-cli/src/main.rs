@@ -1895,6 +1895,7 @@ fn execute_progress_delivery_once(
         min_update_interval_ms: args.min_update_interval_ms,
         max_events_per_panel: args.max_events_per_panel,
         max_preview_chars: args.max_preview_chars,
+        current_step_max_chars: args.current_step_max_chars,
     })
     .map_err(|err| err.to_string())?;
     let mut warnings = plan.warnings.clone();
@@ -4868,6 +4869,7 @@ struct ProgressDeliveryOnceArgs {
     min_update_interval_ms: i64,
     max_events_per_panel: usize,
     max_preview_chars: usize,
+    current_step_max_chars: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -7405,6 +7407,7 @@ fn progress_delivery_once_args_from_args(
     let mut min_update_interval_ms = 2_500_i64;
     let mut max_events_per_panel = 8usize;
     let mut max_preview_chars = 120usize;
+    let mut current_step_max_chars = 1200usize;
     let mut i = 0;
 
     while i < args.len() {
@@ -7455,6 +7458,15 @@ fn progress_delivery_once_args_from_args(
                     .ok_or_else(|| "--max-preview-chars requires a positive integer".to_string())
                     .and_then(|value| parse_limit(value))?;
             }
+            "--current-step-max-chars" => {
+                i += 1;
+                current_step_max_chars = args
+                    .get(i)
+                    .ok_or_else(|| {
+                        "--current-step-max-chars requires a positive integer".to_string()
+                    })
+                    .and_then(|value| parse_limit(value))?;
+            }
             flag => return Err(format!("unknown argument: {flag}")),
         }
         i += 1;
@@ -7467,6 +7479,7 @@ fn progress_delivery_once_args_from_args(
         min_update_interval_ms,
         max_events_per_panel,
         max_preview_chars,
+        current_step_max_chars,
     })
 }
 
@@ -7547,6 +7560,7 @@ fn option_takes_value(flag: &str) -> bool {
             | "--min-update-interval-ms"
             | "--max-events"
             | "--max-preview-chars"
+            | "--current-step-max-chars"
     )
 }
 
@@ -10766,16 +10780,7 @@ fn telegram_send_attachment(
 }
 
 fn format_channel_reply_text(text: &str) -> String {
-    let trimmed = text.trim();
-    if trimmed.is_empty()
-        || trimmed.starts_with("◆ Agent")
-        || trimmed.starts_with("⏳ ")
-        || trimmed.starts_with("✅ ")
-        || trimmed.starts_with("⚠️ ")
-    {
-        return trimmed.to_string();
-    }
-    format!("◆ Agent\n\n{trimmed}")
+    text.trim().to_string()
 }
 
 fn telegram_edit_message_text(
@@ -13534,6 +13539,9 @@ fn print_help() {
     println!("  --min-update-interval-ms <n> Minimum progress panel edit interval");
     println!("  --max-events <n>        Maximum action lines shown in a progress panel");
     println!("  --max-preview-chars <n> Maximum preview characters per progress action");
+    println!(
+        "  --current-step-max-chars <n> Maximum preview characters for current-step narration"
+    );
     println!("  --timeout-ms <n>        Maximum Codex turn runtime before hard timeout");
     println!("  --idle-timeout-ms <n>   Codex JSONL inactivity timeout, renewed on each event");
     println!("  --event-file <path>     Discord Gateway event JSON file");
@@ -13672,8 +13680,8 @@ mod tests {
     }
 
     #[test]
-    fn formats_channel_reply_with_short_plain_header() {
-        assert_eq!(format_channel_reply_text("  done\n"), "◆ Agent\n\ndone");
+    fn formats_channel_reply_without_plain_header() {
+        assert_eq!(format_channel_reply_text("  done\n"), "done");
         assert_eq!(
             format_channel_reply_text("⏳ Working — <1 min — running tools"),
             "⏳ Working — <1 min — running tools"

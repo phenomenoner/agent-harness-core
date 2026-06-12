@@ -39,7 +39,7 @@ Born as a ground-up Rust rebuild of a Docker-based legacy agent gateway ("OpenCl
 | | What you get |
 |---|---|
 | 🧾 **A receipt for everything** | Every ingress, queue write, model turn, delivery, and retry appends to JSONL ledgers. Reconstruct any incident after the fact — no black boxes. |
-| 📨 **Chat-native agents** | First-class Telegram Bot API and Discord (REST + Gateway) adapters: replies, media, attachments, message splitting, edit-in-place progress panels, guarded subtle final-reply tone, and `/new` `/model` `/think` `/steer` `/stop` `/status` commands. |
+| 📨 **Chat-native agents** | First-class Telegram Bot API and Discord (REST + Gateway) adapters: replies, media, attachments, message splitting, edit-in-place progress panels, default-off opt-in final-reply tone, and `/new` `/model` `/think` `/steer` `/stop` `/status` commands. |
 | 🔐 **Fail-closed by default** | DMs require explicit admin allow-lists; groups and guilds get admin / limited / open-limited policy tiers. Unknown senders never reach the model. |
 | ⚙️ **Durable, bounded work** | SQLite-backed worker dispatch with leases, retry/backoff, stale reaping, watchdogs, and concurrency limits per global / agent / channel / lane. A long Telegram turn never blocks a Discord turn. |
 | 🤖 **Model-agnostic routing** | Codex app-server executes turns; OpenRouter routing switches any conversation to e.g. `anthropic/claude-sonnet-4` with one `/model` command. Provider-specific Codex homes keep OpenRouter config out of the default Codex/OAuth path; secrets are checked at preflight, never written to disk. |

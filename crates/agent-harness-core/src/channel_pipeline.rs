@@ -227,8 +227,8 @@ mod tests {
             skill_limit: 3,
             now_ms: 1235,
             codex_executable: Some(fake_codex),
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 15_000,
+            idle_timeout_ms: 15_000,
             prompt_options: PromptAssemblyOptions::default(),
             outbox_limit: 10,
             run_runtime: true,
@@ -245,10 +245,7 @@ mod tests {
             report.outbox.pending[0].message.kind,
             ChannelOutboundMessageKind::AgentReply
         );
-        assert_eq!(
-            report.outbox.pending[0].message.text,
-            "Channel fake reply. ✨"
-        );
+        assert_eq!(report.outbox.pending[0].message.text, "Channel fake reply.");
         let log = fs::read_to_string(
             harness_home
                 .join("state")

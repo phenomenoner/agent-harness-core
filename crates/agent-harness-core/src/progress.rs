@@ -12,6 +12,7 @@ const AGENT_PROGRESS_DELIVERY_PLAN_SCHEMA: &str = "agent-harness.progress-delive
 const AGENT_PROGRESS_DELIVERY_STATE_SCHEMA: &str = "agent-harness.progress-delivery-state.v1";
 const AGENT_PROGRESS_DELIVERY_RECEIPT_SCHEMA: &str = "agent-harness.progress-delivery-receipt.v1";
 const DEFAULT_PREVIEW_CHARS: usize = 120;
+const DEFAULT_CURRENT_STEP_CHARS: usize = 1200;
 const SENSITIVE_PREVIEW: &str = "[redacted sensitive preview]";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +83,7 @@ pub struct AgentProgressDeliveryPlanOptions {
     pub min_update_interval_ms: i64,
     pub max_events_per_panel: usize,
     pub max_preview_chars: usize,
+    pub current_step_max_chars: usize,
 }
 
 impl Default for AgentProgressDeliveryPlanOptions {
@@ -93,6 +95,7 @@ impl Default for AgentProgressDeliveryPlanOptions {
             min_update_interval_ms: 2_500,
             max_events_per_panel: 8,
             max_preview_chars: DEFAULT_PREVIEW_CHARS,
+            current_step_max_chars: DEFAULT_CURRENT_STEP_CHARS,
         }
     }
 }
@@ -484,6 +487,7 @@ pub fn plan_agent_progress_delivery(
                     event_refs.as_slice(),
                     options.now_ms,
                     options.max_preview_chars,
+                    options.current_step_max_chars,
                 ),
             ),
         ];
@@ -615,7 +619,12 @@ pub fn render_agent_progress_panel(
     max_preview_chars: usize,
 ) -> String {
     let actions = render_agent_progress_actions(events, max_events, max_preview_chars);
-    let status = render_agent_progress_status(events, now_ms, max_preview_chars);
+    let status = render_agent_progress_status(
+        events,
+        now_ms,
+        max_preview_chars,
+        DEFAULT_CURRENT_STEP_CHARS,
+    );
     if actions.trim().is_empty() {
         status
     } else {
@@ -661,6 +670,7 @@ fn render_agent_progress_status(
     events: &[&AgentProgressEvent],
     now_ms: i64,
     max_preview_chars: usize,
+    current_step_max_chars: usize,
 ) -> String {
     if events.is_empty() {
         return "⏳ Working — <1 min — starting".to_string();
@@ -694,7 +704,10 @@ fn render_agent_progress_status(
         let mut status = format!("⏳ Working — {} — {}", elapsed, status_phrase(latest));
         if let Some(narration) = latest_narration_event(events) {
             status.push_str("\nCurrent step: ");
-            status.push_str(&quote_safe_preview(&narration.preview, max_preview_chars));
+            status.push_str(&quote_safe_preview(
+                &narration.preview,
+                current_step_max_chars,
+            ));
         }
         status
     }
@@ -981,7 +994,7 @@ mod tests {
         ];
         let refs = events.iter().collect::<Vec<_>>();
         let actions = render_agent_progress_actions(&refs, 8, 120);
-        let status = render_agent_progress_status(&refs, 9 * 60_000 + 1000, 120);
+        let status = render_agent_progress_status(&refs, 9 * 60_000 + 1000, 120, 1200);
         let panel = render_agent_progress_panel(&refs, 9 * 60_000 + 1000, 8, 120);
 
         assert!(actions.contains("📚 skill_view: \"codebase-inspection\""));
@@ -1016,11 +1029,11 @@ mod tests {
         let refs = events.iter().collect::<Vec<_>>();
 
         assert_eq!(
-            render_agent_progress_status(&refs, 44 * 60_000 + 1000, 120),
+            render_agent_progress_status(&refs, 44 * 60_000 + 1000, 120, 1200),
             "✅ Done — 1 min"
         );
         assert_eq!(
-            render_agent_progress_status(&refs, 45 * 60_000 + 1000, 120),
+            render_agent_progress_status(&refs, 45 * 60_000 + 1000, 120, 1200),
             "✅ Done — 1 min"
         );
     }
@@ -1048,7 +1061,7 @@ mod tests {
         ];
         let refs = events.iter().collect::<Vec<_>>();
         let actions = render_agent_progress_actions(&refs, 8, 120);
-        let status = render_agent_progress_status(&refs, 61_000, 120);
+        let status = render_agent_progress_status(&refs, 61_000, 120, 1200);
 
         assert!(actions.contains("pwsh: agent-harness status"));
         assert!(!actions.contains("verifying skills-index"));
@@ -1056,6 +1069,36 @@ mod tests {
             status,
             "⏳ Working — 1 min — running tools\nCurrent step: verifying skills-index readback"
         );
+    }
+
+    #[test]
+    fn current_step_uses_separate_preview_limit() {
+        let context = context();
+        let long_step = "checking reconnect recovery while preserving the existing Telegram session binding and avoiding a duplicate final reply";
+        let events = vec![
+            AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Terminal,
+                "terminal",
+                "pwsh: agent-harness status",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+            AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::AssistantNarration,
+                "current_step",
+                long_step,
+                AgentProgressStatus::Progress,
+                4000,
+            ),
+        ];
+        let refs = events.iter().collect::<Vec<_>>();
+
+        let status = render_agent_progress_status(&refs, 61_000, 24, 200);
+
+        assert!(status.contains(long_step));
+        assert!(!status.contains("..."));
     }
 
     #[test]
@@ -1314,7 +1357,9 @@ mod tests {
             .iter()
             .map(|stored| &stored.event)
             .collect::<Vec<_>>();
-        assert!(render_agent_progress_status(event_refs.as_slice(), 4000, 120).contains("Failed"));
+        assert!(
+            render_agent_progress_status(event_refs.as_slice(), 4000, 120, 1200).contains("Failed")
+        );
 
         let _ = fs::remove_dir_all(root);
     }

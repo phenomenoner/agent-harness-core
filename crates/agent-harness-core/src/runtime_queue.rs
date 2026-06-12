@@ -535,6 +535,39 @@ mod tests {
         assert!(queue_text.contains(&original_queue_id));
         assert!(queue_text.contains(&new_queue_id));
         assert!(queue_text.contains("retryOfQueueId"));
+        let queued_items = queue_text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let original_item = queued_items
+            .iter()
+            .find(|item| {
+                item.get("queueId").and_then(Value::as_str) == Some(original_queue_id.as_str())
+            })
+            .unwrap();
+        let retry_item = queued_items
+            .iter()
+            .find(|item| item.get("queueId").and_then(Value::as_str) == Some(new_queue_id.as_str()))
+            .unwrap();
+        assert_eq!(
+            retry_item.get("retryOfQueueId").and_then(Value::as_str),
+            Some(original_queue_id.as_str())
+        );
+        for field in [
+            "agentId",
+            "sessionKey",
+            "platform",
+            "channelId",
+            "userId",
+            "provider",
+            "model",
+            "selectedSkillIds",
+            "plannedTranscriptFile",
+            "plannedTrajectoryFile",
+            "source",
+        ] {
+            assert_eq!(retry_item.get(field), original_item.get(field), "{field}");
+        }
 
         let skip = control_runtime_queue_item(RuntimeQueueControlOptions {
             harness_home,

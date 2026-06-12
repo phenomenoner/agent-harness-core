@@ -271,7 +271,7 @@ Progress UI notes:
 - Codex tool/action previews come from explicit command/path/query/name fields. Raw JSON wrappers, output-only deltas, and long PowerShell executable paths are compacted or skipped to keep messages Hermes-style compact. Common PowerShell wrappers are summarized as short forms such as `pwsh: read file ...`, `pwsh: get date`, or `pwsh: agent-harness status`.
 - Progress delivery maintains separate body/status cursors in `state/channels/progress-delivery-state.json`; older single-message state can be taken over by the body lane.
 - Permission-denied or policy-skipped progress deliveries still advance the cursor, so Telegram does not repeatedly receive the same `Working` status event while Discord remains normal.
-- Normal Telegram/Discord outbox replies add a short plain-text `◆ Agent` header. Progress messages do not add that header.
+- Normal Telegram/Discord final replies are sent as trimmed assistant text without a mechanical `◆ Agent` header. Progress messages keep their compact action/status format.
 
 Current operational caveat:
 

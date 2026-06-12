@@ -12,6 +12,9 @@
 - Treat Codex app-server protocol errors and failed `turn/completed` events as terminal runtime failures instead of successful empty assistant replies.
 - Updated builtin harness ops skill, release checklist, operations docs, and feature parity docs so stale guidance review covers docs, skills, and CLI help during future behavior-changing upgrades.
 - Updated response UX docs and the builtin harness ops skill for the guarded final-reply tone policy, including removal of stale "before real Telegram/Discord loops exist" channel-run-once guidance.
+- Treat known Codex app-server stream disconnect protocol errors (`Reconnecting...`, `stream disconnected before completion`, and `websocket closed by server before response.completed`) as retryable transient failures before dead-lettering, preserving the existing queue/session context across attempts.
+- Changed `response.emojiAccentMode` default to `off`, keeping `subtle` as explicit opt-in, and removed the mechanical `◆ Agent` wrapper from successful final Telegram/Discord replies.
+- Split progress current-step narration length from short action/error preview length; current-step status now uses a longer default cap while redaction and platform-safe truncation stay in place.
 
 ### Added
 
@@ -34,7 +37,7 @@
 - Invariants catalog, schema registry, release checklist, trust-boundary documentation, atomic-write audit, and security policy.
 - Operator CLI commands for the new staging gates.
 - Harness secret-env handoff for provider-specific app-server child processes.
-- Guarded `response.emojiAccentMode` response tone policy, defaulting to `subtle`, with per-agent/channel overrides and skips for command, status, error, code-heavy, and risk/security replies.
+- Guarded `response.emojiAccentMode` response tone policy with default `off`, opt-in `subtle`, per-agent/channel overrides, and skips for command, status, error, code-heavy, and risk/security replies.
 
 ### Verification
 
@@ -48,6 +51,16 @@
 - `cargo tree --workspace --duplicates`
 - `cargo test --workspace --target-dir target\staging-test-response-tone-workspace`
 - `agent-harness harness-skills-sync --target-home .\.agent-harness`
+- `cargo test -p agent-harness-core`
+- `cargo test -p agent-harness-cli`
+- `cargo build -p agent-harness-cli --target-dir target\staging-build-round4-reconnect-tone`
+- `git diff --check`
+- `target\staging-build-round4-reconnect-tone\debug\agent-harness.exe public-hygiene --root target\staging-public-hygiene-round4-reconnect-tone\public-export`
+- `cargo build -p agent-harness-cli`
+- `target\debug\agent-harness.exe config-validate --target-home .\.agent-harness`
+- `target\debug\agent-harness.exe harness-skills-sync --target-home .\.agent-harness`
+- `target\debug\agent-harness.exe healthz --target-home .\.agent-harness --require-writable-state`
+- `target\debug\agent-harness.exe status --target-home .\.agent-harness --json`
 
 ### Pending Live Evidence
 

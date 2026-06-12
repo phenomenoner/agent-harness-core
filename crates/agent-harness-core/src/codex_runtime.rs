@@ -3799,6 +3799,11 @@ fn render_protocol_error(error: &Value) -> String {
         return text.to_string();
     }
     if let Some(message) = error.get("message").and_then(Value::as_str) {
+        if let Some(details) = error.get("additionalDetails").and_then(Value::as_str)
+            && !details.trim().is_empty()
+        {
+            return format!("{message}; {}", details.trim());
+        }
         return message.to_string();
     }
     error.to_string()

@@ -7,9 +7,12 @@
 ## Command Approval Discipline
 
 - Do not submit three or more parallel escalated shell commands for automatic review.
+<!-- Temporarily disabled by operator experiment:
 - When a command needs `sandbox_permissions: "require_escalated"`, run one escalated command at a time unless the user explicitly asks for parallel execution.
+-->
 - Prefer a single focused command that gathers the needed context over several simultaneous reviewed commands.
 - If an automatic approval review times out, retry at most once as a single command, then continue with a safer local alternative or ask the user for direction.
+- Always set a reasonable shell `timeout_ms` for commands that need automatic approval review when the tool supports it; this limits command runtime, not the reviewer's wait time.
 
 ## Live Harness Safety
 

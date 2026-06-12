@@ -9,17 +9,17 @@ use crate::{HARNESS_BUILTIN_SKILL_NAMESPACE, SKILL_FILE_NAME};
 const BUILTIN_HARNESS_SKILL_SYNC_SCHEMA: &str = "agent-harness.builtin-skill-sync.v1";
 const BUILTIN_HARNESS_SKILL_MANIFEST_SCHEMA: &str = "agent-harness.builtin-skill-manifest.v1";
 const AGENT_WINDOWS_HARNESS_SKILL_ID: &str = "agent-windows-harness";
-const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = env!("CARGO_PKG_VERSION");
+const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.5";
 
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
 description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, response tone, and Codex prompt continuity policy.
-version: 0.1.4
+version: 0.1.5
 platforms: [windows]
 metadata:
   agent_harness:
     category: operations
-    tags: [legacy-import, codex, openrouter, telegram, discord, migration, activation, response-tone]
+    tags: [legacy-import, codex, openrouter, telegram, discord, migration, activation, response-tone, reconnect]
 ---
 
 # Agent Windows Harness
@@ -54,7 +54,7 @@ Use it when the user mentions:
 13. Use supervisor-plan to generate Windows Task Scheduler install/start/stop/uninstall scripts. It writes scripts and receipts only; it does not register tasks automatically.
 14. Use status --json for operator health checks; it should show runtime openItems=0 and outbox pending=0 before live handoff.
 15. Treat harness-config.json security.codexApprovalPolicy and security.codexSandbox as operator-controlled runtime safety settings. Use codexApprovalPolicy="accept" only for an intentionally unattended trusted channel runtime.
-16. Keep response tone policy scoped to successful final agent replies. Do not post-process command replies, /status, error/failure replies, progress/status panels, code-heavy replies, or risk/security/status replies.
+16. Keep response tone policy scoped to successful final agent replies. The default is off; subtle emoji accenting is opt-in. Do not post-process command replies, /status, error/failure replies, progress/status panels, code-heavy replies, or risk/security/status replies.
 
 ## Prompt And Tool Schema Policy
 
@@ -91,12 +91,24 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - Treat `recoveredLines>0` with `invalid=0` as successful recovery of concatenated JSON values such as `}{`; treat `invalid>0` as quarantine that needs manual inspection before claiming the ledger is clean.
 - After repair, run `healthz --require-writable-state` and `status --json`; affected ledgers should report `invalidLines=0`.
 
+## Runtime Reconnect And Session Recovery
+
+- Telegram and Discord share the same runtime path after ingress: channel receive, queue, prepare, codex-run, runtime-run-once, outbox. Fix reconnect/session recovery in the runtime/Codex layer, not in one adapter.
+- Known transient Codex app-server stream disconnect protocol errors are retryable: `Reconnecting...`, `stream disconnected before completion`, and `websocket closed by server before response.completed`.
+- Retry-pending runtime failures are non-terminal. They should not write user-visible error replies, and progress should stay resumable for the same queue/session context.
+- Non-matching protocol/config/preflight/spawn failures stay failed-terminal. Gateway restart alone does not resume failed-terminal or dead-letter queue items.
+- When retry attempts are exhausted, runtime-run-once dead-letters the item and writes an operator-friendly error reply. The original session context is still preserved in receipts and queue data.
+- Use `queue-retry` for manual recovery of a timeout/dead-letter item. It creates a fresh queue id while preserving `sessionKey`, agent, platform/channel/user, provider/model, selected skills, and planned transcript/trajectory paths.
+- To verify a reconnect fix, test both early retry-pending and final dead-letter behavior, and confirm unrelated protocol errors remain terminal.
+
 ## Response Tone Policy
 
-- response.emojiAccentMode defaults to subtle. It appends one guarded accent only when runtime-run-once writes a successful agent-reply to state/channels/outbox.jsonl.
-- Use response.emojiAccentMode="off" to disable globally. Use response.emojiAccentAgentModes for agent-specific overrides and response.emojiAccentChannelModes for channel-specific overrides.
+- response.emojiAccentMode defaults to off. Use response.emojiAccentMode="subtle" only as an explicit opt-in. It appends one guarded accent only when runtime-run-once writes a successful agent-reply to state/channels/outbox.jsonl.
+- Use response.emojiAccentAgentModes for agent-specific overrides and response.emojiAccentChannelModes for channel-specific overrides.
 - Channel selectors can be platform:channelId:userId, platform:channelId, channelId, or platform. Channel overrides win over agent overrides; agent overrides win over the global mode.
 - The policy must skip command replies, /status, error/failure replies, progress/status panels, fenced code blocks, code-heavy replies, risk/security/status-style replies, and text already ending with an emoji.
+- Do not wrap final Telegram/Discord replies with a mechanical `◆ Agent` header. Send trimmed assistant text as-is unless a future delivery-intent policy explicitly says otherwise.
+- Current-step narration in progress delivery uses a separate longer cap (`--current-step-max-chars`, default 1200). Keep action/error preview caps short.
 - Do not implement tone as blind delivery-layer post-processing. Keep it at the successful agent-reply outbox boundary so audit artifacts and non-agent replies stay unpolluted.
 
 ## Channel Commands

@@ -258,17 +258,6 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         progress_context: progress_context.clone(),
     })?;
     warnings.extend(run.warnings.clone());
-    if let Some(context) = &progress_context {
-        append_runtime_progress_finished(
-            &options.harness_home,
-            context,
-            run.receipt.status,
-            &run.receipt.reason,
-            run.receipt.elapsed_ms,
-            &mut warnings,
-        );
-    }
-
     let queue_failure_attempts = run
         .receipt
         .queue_id
@@ -278,13 +267,27 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         .transpose()?
         .map(|attempts| attempts.saturating_add(1))
         .unwrap_or(0);
-    let receipt_status = final_run_once_status(run.receipt.status, queue_failure_attempts);
+    let receipt_status = final_run_once_status(
+        run.receipt.status,
+        queue_failure_attempts,
+        &run.receipt.reason,
+    );
     let receipt_reason = final_run_once_reason(
         receipt_status,
         run.receipt.status,
         queue_failure_attempts,
         &run.receipt.reason,
     );
+    if let Some(context) = &progress_context {
+        append_runtime_progress_finished(
+            &options.harness_home,
+            context,
+            receipt_status,
+            &receipt_reason,
+            run.receipt.elapsed_ms,
+            &mut warnings,
+        );
+    }
     let mut outbox_file = None;
     let mut outbound_message = None;
     if run.receipt.status == CodexRuntimeRunStatus::Completed {
@@ -413,7 +416,11 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 user_id: context.user_id,
                 session_key: context.session_key,
                 kind: ChannelOutboundMessageKind::ErrorReply,
-                text: runtime_failure_reply_text(status, &receipt_reason),
+                text: runtime_failure_reply_text(
+                    status,
+                    &receipt_reason,
+                    run.receipt.queue_id.as_deref(),
+                ),
                 attachments: Vec::new(),
             };
             let file = append_outbound_message(&options.harness_home, &message)?;
@@ -628,7 +635,7 @@ fn append_runtime_progress_started(
 fn append_runtime_progress_finished(
     harness_home: &Path,
     context: &AgentProgressContext,
-    status: CodexRuntimeRunStatus,
+    status: RuntimeRunOnceStatus,
     reason: &str,
     elapsed_ms: u128,
     warnings: &mut Vec<String>,
@@ -637,16 +644,12 @@ fn append_runtime_progress_finished(
         warnings.push("progress event timestamp could not be read".to_string());
         return;
     };
-    let progress_status = if status == CodexRuntimeRunStatus::Completed {
-        AgentProgressStatus::Completed
-    } else {
-        AgentProgressStatus::Failed
+    let progress_status = match status {
+        RuntimeRunOnceStatus::Completed => AgentProgressStatus::Completed,
+        RuntimeRunOnceStatus::RetryPending => AgentProgressStatus::Progress,
+        _ => AgentProgressStatus::Failed,
     };
-    let preview = if status == CodexRuntimeRunStatus::Completed {
-        "done".to_string()
-    } else {
-        reason.to_string()
-    };
+    let preview = runtime_progress_preview(status, reason);
     append_progress_nonfatal(
         harness_home,
         AgentProgressEvent::new(
@@ -661,6 +664,20 @@ fn append_runtime_progress_finished(
         .source("runtime-pipeline"),
         warnings,
     );
+}
+
+fn runtime_progress_preview(status: RuntimeRunOnceStatus, reason: &str) -> String {
+    match status {
+        RuntimeRunOnceStatus::Completed => "done".to_string(),
+        RuntimeRunOnceStatus::RetryPending => {
+            "transient runtime failure; preserving session for retry".to_string()
+        }
+        RuntimeRunOnceStatus::DeadLetter if is_retryable_codex_protocol_error(reason) => {
+            "transient Codex stream disconnect exhausted retry budget; moved to dead-letter"
+                .to_string()
+        }
+        _ => reason.to_string(),
+    }
 }
 
 fn append_progress_nonfatal(
@@ -685,24 +702,31 @@ fn map_run_once_status(status: CodexRuntimeRunStatus) -> RuntimeRunOnceStatus {
     }
 }
 
-fn runtime_failure_reply_text(status: RuntimeRunOnceStatus, reason: &str) -> String {
+fn runtime_failure_reply_text(
+    status: RuntimeRunOnceStatus,
+    reason: &str,
+    queue_id: Option<&str>,
+) -> String {
+    let queue_line = queue_id
+        .map(|queue_id| format!("\nQueue: {queue_id}"))
+        .unwrap_or_default();
     if status == RuntimeRunOnceStatus::Canceled {
         return "Stopped.".to_string();
     }
     if status == RuntimeRunOnceStatus::FailedTerminal {
         return format!(
-            "Agent harness could not process this request and marked it failed-terminal.\nReason: {}\n\nUse /status runtime to inspect the queue.",
-            truncate_for_channel(reason, 360)
+            "Agent harness could not process this request and marked it failed-terminal.{queue_line}\nReason: {}\n\nGateway restart will not resume a terminal queue item. Use /status runtime to inspect the queue.",
+            truncate_for_channel(reason, 360),
         );
     }
     if status == RuntimeRunOnceStatus::DeadLetter {
         return format!(
-            "Agent harness retried this request and moved it to dead-letter.\nReason: {}\n\nUse queue-retry with the queue id to create a fresh retry.",
-            truncate_for_channel(reason, 360)
+            "Agent harness retried this request and moved it to dead-letter.{queue_line}\nReason: {}\n\nSession context is preserved; use queue-retry with the queue id to create a fresh retry.",
+            truncate_for_channel(reason, 360),
         );
     }
     format!(
-        "Agent harness runtime error: {:?}\nReason: {}\n\nUse /status security to check approvals and sandbox policy.",
+        "Agent harness runtime error: {:?}{queue_line}\nReason: {}\n\nUse /status security to check approvals and sandbox policy.",
         status,
         truncate_for_channel(reason, 360)
     )
@@ -711,6 +735,7 @@ fn runtime_failure_reply_text(status: RuntimeRunOnceStatus, reason: &str) -> Str
 fn final_run_once_status(
     codex_status: CodexRuntimeRunStatus,
     failure_attempts: usize,
+    reason: &str,
 ) -> RuntimeRunOnceStatus {
     match codex_status {
         CodexRuntimeRunStatus::Completed => RuntimeRunOnceStatus::Completed,
@@ -719,11 +744,27 @@ fn final_run_once_status(
             RuntimeRunOnceStatus::RetryPending
         }
         CodexRuntimeRunStatus::Timeout => RuntimeRunOnceStatus::DeadLetter,
+        CodexRuntimeRunStatus::ProtocolError
+            if is_retryable_codex_protocol_error(reason)
+                && failure_attempts < MAX_RUNTIME_FAILURE_ATTEMPTS =>
+        {
+            RuntimeRunOnceStatus::RetryPending
+        }
+        CodexRuntimeRunStatus::ProtocolError if is_retryable_codex_protocol_error(reason) => {
+            RuntimeRunOnceStatus::DeadLetter
+        }
         CodexRuntimeRunStatus::PreflightBlocked
         | CodexRuntimeRunStatus::NoRuntimePlan
         | CodexRuntimeRunStatus::SpawnFailed
         | CodexRuntimeRunStatus::ProtocolError => RuntimeRunOnceStatus::FailedTerminal,
     }
+}
+
+fn is_retryable_codex_protocol_error(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("stream disconnected before completion")
+        || lower.contains("websocket closed by server before response.completed")
+        || lower.contains("reconnecting...")
 }
 
 fn final_run_once_reason(
@@ -1269,11 +1310,11 @@ mod tests {
         assert_eq!(outbound.platform, "telegram");
         assert_eq!(outbound.channel_id, "dm-42");
         assert_eq!(outbound.user_id, "user-7");
-        assert_eq!(outbound.text, "Pipeline fake reply. ✨");
+        assert_eq!(outbound.text, "Pipeline fake reply.");
         let outbox_file = report.outbox_file.unwrap();
         let outbox = fs::read_to_string(outbox_file).unwrap();
         assert!(outbox.contains("\"kind\":\"agent-reply\""));
-        assert!(outbox.contains("Pipeline fake reply. ✨"));
+        assert!(outbox.contains("Pipeline fake reply."));
         let log = fs::read_to_string(
             harness_home
                 .join("state")
@@ -1497,15 +1538,15 @@ mod tests {
     #[test]
     fn timeout_policy_retries_then_dead_letters() {
         assert_eq!(
-            final_run_once_status(CodexRuntimeRunStatus::Timeout, 1),
+            final_run_once_status(CodexRuntimeRunStatus::Timeout, 1, "idle timeout"),
             RuntimeRunOnceStatus::RetryPending
         );
         assert_eq!(
-            final_run_once_status(CodexRuntimeRunStatus::Timeout, 2),
+            final_run_once_status(CodexRuntimeRunStatus::Timeout, 2, "idle timeout"),
             RuntimeRunOnceStatus::RetryPending
         );
         assert_eq!(
-            final_run_once_status(CodexRuntimeRunStatus::Timeout, 3),
+            final_run_once_status(CodexRuntimeRunStatus::Timeout, 3, "idle timeout"),
             RuntimeRunOnceStatus::DeadLetter
         );
         assert!(!should_write_failure_outbox(
@@ -1544,6 +1585,140 @@ mod tests {
         .unwrap();
         assert!(receipt_text.contains("\"status\":\"dead-letter\""));
         assert!(receipt_text.contains("queue-timeout"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retryable_protocol_error_policy_retries_then_dead_letters() {
+        let reason = "Reconnecting... 2/5; stream disconnected before completion: websocket closed by server before response.completed";
+
+        assert!(is_retryable_codex_protocol_error(reason));
+        assert_eq!(
+            final_run_once_status(CodexRuntimeRunStatus::ProtocolError, 1, reason),
+            RuntimeRunOnceStatus::RetryPending
+        );
+        assert_eq!(
+            final_run_once_status(CodexRuntimeRunStatus::ProtocolError, 2, reason),
+            RuntimeRunOnceStatus::RetryPending
+        );
+        assert_eq!(
+            final_run_once_status(CodexRuntimeRunStatus::ProtocolError, 3, reason),
+            RuntimeRunOnceStatus::DeadLetter
+        );
+        assert_eq!(
+            final_run_once_status(
+                CodexRuntimeRunStatus::ProtocolError,
+                1,
+                "synthetic app-server refusal"
+            ),
+            RuntimeRunOnceStatus::FailedTerminal
+        );
+        assert_eq!(
+            runtime_progress_preview(RuntimeRunOnceStatus::RetryPending, reason),
+            "transient runtime failure; preserving session for retry"
+        );
+    }
+
+    #[test]
+    fn run_runtime_queue_once_retries_reconnecting_protocol_error_then_dead_letters() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root(
+            "run_runtime_queue_once_retries_reconnecting_protocol_error_then_dead_letters",
+        );
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "keep my session while reconnecting".to_string(),
+            inbound_context: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+        let queue_id = receive.queue_id.unwrap();
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let first = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: Some(fake_reconnecting_codex_executable(&root)),
+            timeout_ms: 5_000,
+            idle_timeout_ms: 5_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(first.receipt.status, RuntimeRunOnceStatus::RetryPending);
+        assert_eq!(
+            first.run.as_ref().unwrap().receipt.status,
+            CodexRuntimeRunStatus::ProtocolError
+        );
+        assert!(first.outbound_message.is_none());
+        assert!(
+            first
+                .receipt
+                .reason
+                .contains("stream disconnected before completion")
+        );
+
+        let second = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: Some(fake_reconnecting_codex_executable(&root)),
+            timeout_ms: 5_000,
+            idle_timeout_ms: 5_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(second.receipt.status, RuntimeRunOnceStatus::RetryPending);
+        assert!(second.outbound_message.is_none());
+
+        let third = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: Some(fake_reconnecting_codex_executable(&root)),
+            timeout_ms: 5_000,
+            idle_timeout_ms: 5_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(third.receipt.status, RuntimeRunOnceStatus::DeadLetter);
+        let outbound = third.outbound_message.unwrap();
+        assert_eq!(outbound.kind, ChannelOutboundMessageKind::ErrorReply);
+        assert!(outbound.text.contains("dead-letter"));
+        assert!(outbound.text.contains(&queue_id));
+        assert!(outbound.text.contains("Session context is preserved"));
+        let dead_letter = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("dead-letter-receipts.jsonl"),
+        )
+        .unwrap();
+        assert!(dead_letter.contains("\"status\":\"dead-letter\""));
+        assert!(dead_letter.contains(&queue_id));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1815,6 +1990,47 @@ while ($true) {
         cmd
     }
 
+    #[cfg(windows)]
+    fn fake_reconnecting_codex_executable(root: &Path) -> PathBuf {
+        let script = root.join("fake-reconnecting-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try {
+        $msg = $line | ConvertFrom-Json
+    } catch {
+        continue
+    }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-reconnect"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"error","params":{"message":"Reconnecting... 2/5","additionalDetails":"stream disconnected before completion: websocket closed by server before response.completed"}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let cmd = root.join("fake-reconnecting-codex.cmd");
+        fs::write(
+            &cmd,
+            format!(
+                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        cmd
+    }
+
     #[cfg(not(windows))]
     fn fake_codex_executable(root: &Path) -> PathBuf {
         let script = root.join("fake-codex");
@@ -1862,6 +2078,39 @@ while IFS= read -r line; do
             ;;
         *'"method":"thread/start"'*)
             printf '%s\n' '{"id":1,"error":{"message":"synthetic app-server refusal"}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+        script
+    }
+
+    #[cfg(not(windows))]
+    fn fake_reconnecting_codex_executable(root: &Path) -> PathBuf {
+        let script = root.join("fake-reconnecting-codex");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-reconnect"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"error","params":{"message":"Reconnecting... 2/5","additionalDetails":"stream disconnected before completion: websocket closed by server before response.completed"}}'
             exit 0
             ;;
     esac

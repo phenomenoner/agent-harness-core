@@ -54,13 +54,13 @@ Invalid narrower-to-wider settings are capped at runtime with warnings.
     "assistantNarrationMaxChars": 500,
     "assistantNarrationProgressMinUpdateMs": 2500,
     "assistantNarrationFinalPrefix": "Work log",
-    "emojiAccentMode": "subtle",
+    "emojiAccentMode": "off",
     "emojiAccentAgentModes": {
       "main": "subtle",
       "ops": "off"
     },
     "emojiAccentChannelModes": {
-      "telegram:12345": "off"
+      "telegram:12345": "subtle"
     }
   }
 }
@@ -74,10 +74,10 @@ Assistant narration modes:
 
 Emoji accent modes:
 
-- `subtle`: default. Append one small accent to successful `agent-reply` text only.
-- `off`: disable the accent globally, per agent, or per channel.
+- `off`: default. Do not mechanically append an accent.
+- `subtle`: opt-in. Append one small accent to successful `agent-reply` text only.
 
-The accent policy is applied at the final `agent-reply` outbox boundary after a successful runtime turn. It does not alter command replies, `/status`, error replies, progress/status messages, code-heavy replies, fenced code blocks, risk/security/status-style replies, or text that already ends with an emoji. Channel overrides win over agent overrides, and agent overrides win over the global default. Channel selectors can be `platform:channelId:userId`, `platform:channelId`, `channelId`, or `platform`.
+The accent policy is applied at the final `agent-reply` outbox boundary after a successful runtime turn when `subtle` is selected. It does not alter command replies, `/status`, error replies, progress/status messages, code-heavy replies, fenced code blocks, risk/security/status-style replies, or text that already ends with an emoji. Channel overrides win over agent overrides, and agent overrides win over the global default. Channel selectors can be `platform:channelId:userId`, `platform:channelId`, `channelId`, or `platform`.
 
 ## Prompt Files
 

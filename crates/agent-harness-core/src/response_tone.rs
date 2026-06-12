@@ -14,8 +14,8 @@ use crate::{
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EmojiAccentMode {
-    Off,
     #[default]
+    Off,
     Subtle,
 }
 
@@ -44,7 +44,7 @@ pub struct ResponseToneConfig {
 impl Default for ResponseToneConfig {
     fn default() -> Self {
         Self {
-            emoji_accent_mode: EmojiAccentMode::Subtle,
+            emoji_accent_mode: EmojiAccentMode::Off,
             emoji_accent: "✨".to_string(),
             emoji_accent_agent_modes: BTreeMap::new(),
             emoji_accent_channel_modes: BTreeMap::new(),
@@ -320,8 +320,20 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn subtle_mode_adds_single_accent_to_agent_reply_text() {
+    fn default_mode_does_not_add_accent_to_agent_reply_text() {
         let config = ResponseToneConfig::default();
+
+        let text = apply_response_tone("Done.", context(Some("main")), &config);
+
+        assert_eq!(text, "Done.");
+    }
+
+    #[test]
+    fn explicit_subtle_mode_adds_single_accent_to_agent_reply_text() {
+        let config = ResponseToneConfig {
+            emoji_accent_mode: EmojiAccentMode::Subtle,
+            ..ResponseToneConfig::default()
+        };
 
         let text = apply_response_tone("Done.", context(Some("main")), &config);
 
@@ -330,7 +342,10 @@ mod tests {
 
     #[test]
     fn subtle_mode_skips_code_status_risk_and_existing_emoji() {
-        let config = ResponseToneConfig::default();
+        let config = ResponseToneConfig {
+            emoji_accent_mode: EmojiAccentMode::Subtle,
+            ..ResponseToneConfig::default()
+        };
 
         assert_eq!(
             apply_response_tone(
@@ -356,7 +371,10 @@ mod tests {
 
     #[test]
     fn agent_and_channel_overrides_disable_accent() {
-        let mut config = ResponseToneConfig::default();
+        let mut config = ResponseToneConfig {
+            emoji_accent_mode: EmojiAccentMode::Subtle,
+            ..ResponseToneConfig::default()
+        };
         config
             .emoji_accent_agent_modes
             .insert("main".to_string(), EmojiAccentMode::Off);
