@@ -32,6 +32,7 @@ pub mod prompt;
 pub mod quality;
 pub mod queue_shadow;
 pub mod registry;
+pub mod response_tone;
 pub mod runtime_pipeline;
 pub mod runtime_queue;
 pub mod runtime_worker;
@@ -235,6 +236,10 @@ pub use queue_shadow::{
 pub use registry::{
     AgentDefaults, AgentProfile, AgentProfileSource, AgentRegistry, ChannelRegistry, PluginProfile,
     ProviderProfile, load_agent_registry,
+};
+pub use response_tone::{
+    EmojiAccentMode, ResponseToneConfig, ResponseToneContext, apply_response_tone,
+    load_response_tone_config, parse_emoji_accent_mode,
 };
 pub use runtime_pipeline::{
     RuntimeRunOnceOptions, RuntimeRunOnceReceipt, RuntimeRunOnceReport, RuntimeRunOnceStatus,

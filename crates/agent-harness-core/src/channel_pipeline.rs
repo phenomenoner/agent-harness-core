@@ -245,7 +245,10 @@ mod tests {
             report.outbox.pending[0].message.kind,
             ChannelOutboundMessageKind::AgentReply
         );
-        assert_eq!(report.outbox.pending[0].message.text, "Channel fake reply.");
+        assert_eq!(
+            report.outbox.pending[0].message.text,
+            "Channel fake reply. ✨"
+        );
         let log = fs::read_to_string(
             harness_home
                 .join("state")

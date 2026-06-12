@@ -39,7 +39,7 @@ Born as a ground-up Rust rebuild of a Docker-based legacy agent gateway ("OpenCl
 | | What you get |
 |---|---|
 | 🧾 **A receipt for everything** | Every ingress, queue write, model turn, delivery, and retry appends to JSONL ledgers. Reconstruct any incident after the fact — no black boxes. |
-| 📨 **Chat-native agents** | First-class Telegram Bot API and Discord (REST + Gateway) adapters: replies, media, attachments, message splitting, edit-in-place progress panels, and `/new` `/model` `/think` `/steer` `/stop` `/status` commands. |
+| 📨 **Chat-native agents** | First-class Telegram Bot API and Discord (REST + Gateway) adapters: replies, media, attachments, message splitting, edit-in-place progress panels, guarded subtle final-reply tone, and `/new` `/model` `/think` `/steer` `/stop` `/status` commands. |
 | 🔐 **Fail-closed by default** | DMs require explicit admin allow-lists; groups and guilds get admin / limited / open-limited policy tiers. Unknown senders never reach the model. |
 | ⚙️ **Durable, bounded work** | SQLite-backed worker dispatch with leases, retry/backoff, stale reaping, watchdogs, and concurrency limits per global / agent / channel / lane. A long Telegram turn never blocks a Discord turn. |
 | 🤖 **Model-agnostic routing** | Codex app-server executes turns; OpenRouter routing switches any conversation to e.g. `anthropic/claude-sonnet-4` with one `/model` command. Provider-specific Codex homes keep OpenRouter config out of the default Codex/OAuth path; secrets are checked at preflight, never written to disk. |
@@ -99,7 +99,7 @@ One binary, `agent-harness`, grouped into clear families:
 |---|---|---|
 | **Import & registry** | `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `channel-credentials-export` | Migrate a legacy agent deployment with dry-run reports, conflict policies, and redacted credential receipts. |
 | **Channels** | `channel-receive`, `channel-run-once`, `channel-outbox-plan`, `telegram-probe`, `telegram-loop`, `discord-gateway-loop`, `discord-outbox-send-once`, … | Telegram/Discord ingress, permission gating, slash commands, outbox delivery with retry ledgers. |
-| **Runtime & queue** | `queue-enqueue`, `queue-prepare`, `runtime-run-once`, `runtime-loop`, `progress-delivery-loop` | Durable agent-turn queue, bounded-concurrency runtime loop, live progress panels. |
+| **Runtime & queue** | `queue-enqueue`, `queue-prepare`, `runtime-run-once`, `runtime-loop`, `progress-delivery-loop` | Durable agent-turn queue, bounded-concurrency runtime loop, live progress panels, final-reply tone policy. |
 | **Codex pipeline** | `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle` | Plan → preflight → launch → run → record, each stage inspectable and receipt-backed. |
 | **Workers & scheduling** | `worker-enqueue`, `worker-loop`, `worker-status`, `cron-plan`, `native-cron-enqueue`, `deterministic-cron-plan`, `subagent-plan`, … | SQLite-durable jobs: LLM subagents, no-LLM deterministic shell cron, watchdogs, master wakeups. |
 | **Memory** | `memory-hook`, `memory-search`, `memory-vector-search`, `memory-service-status/recall/propose/store` | OpenClaw-compatible memory hooks and vector recall over imported snapshots. |

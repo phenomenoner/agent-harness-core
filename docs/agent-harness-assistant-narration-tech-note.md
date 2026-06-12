@@ -29,6 +29,9 @@ Implemented on 2026-06-11.
   config only for channel outbound formatting.
 - `inline_preface` is implemented for debug/operator channels; `off` suppresses
   narration in progress and final replies while retaining raw runtime artifacts.
+- `emojiAccentMode` was added later as a separate final-reply tone policy. It is
+  not part of assistant narration segmentation and is applied only at the
+  successful `agent-reply` outbox boundary.
 - Verification: `cargo test --workspace` passed with 172 core tests and 16 CLI
   tests after implementation.
 
@@ -85,7 +88,14 @@ Suggested schema:
     "assistantNarrationMode": "progress_panel",
     "assistantNarrationMaxChars": 500,
     "assistantNarrationProgressMinUpdateMs": 2500,
-    "assistantNarrationFinalPrefix": "Work log"
+    "assistantNarrationFinalPrefix": "Work log",
+    "emojiAccentMode": "subtle",
+    "emojiAccentAgentModes": {
+      "ops": "off"
+    },
+    "emojiAccentChannelModes": {
+      "telegram:12345": "off"
+    }
   }
 }
 ```
@@ -106,6 +116,21 @@ Modes:
   - Add clear formatting separators so operators can distinguish work narration
     from the final reply.
   - Intended for debugging/internal channels, not the default DM experience.
+
+Final-reply tone policy:
+
+- `emojiAccentMode = "subtle"`
+  - Default.
+  - Appends one small accent only to successful `agent-reply` text.
+  - Does not alter command replies, `/status`, error/failure replies, progress
+    status, fenced code, code-heavy replies, risk/security/status-style replies,
+    or text that already ends in an emoji.
+- `emojiAccentMode = "off"`
+  - Disables the accent globally, per agent, or per channel.
+
+Channel overrides win over agent overrides, which win over the global default.
+Channel selectors can be `platform:channelId:userId`, `platform:channelId`,
+`channelId`, or `platform`.
 
 ## Target Data Model
 

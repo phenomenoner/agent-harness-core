@@ -43,9 +43,9 @@ global limit >= per-agent limit >= per-agent-per-channel limit
 
 Invalid narrower-to-wider settings are capped at runtime with warnings.
 
-## Assistant Narration
+## Response Formatting
 
-`harness-config.json` can configure how intermediate Codex assistant narration is surfaced:
+`harness-config.json` can configure how intermediate Codex assistant narration and final channel reply tone are surfaced:
 
 ```json
 {
@@ -53,16 +53,31 @@ Invalid narrower-to-wider settings are capped at runtime with warnings.
     "assistantNarrationMode": "progress_panel",
     "assistantNarrationMaxChars": 500,
     "assistantNarrationProgressMinUpdateMs": 2500,
-    "assistantNarrationFinalPrefix": "Work log"
+    "assistantNarrationFinalPrefix": "Work log",
+    "emojiAccentMode": "subtle",
+    "emojiAccentAgentModes": {
+      "main": "subtle",
+      "ops": "off"
+    },
+    "emojiAccentChannelModes": {
+      "telegram:12345": "off"
+    }
   }
 }
 ```
 
-Modes:
+Assistant narration modes:
 
 - `progress_panel`: default. Store narration for audit, render it as the latest progress current step, and keep final channel replies final-answer only.
 - `inline_preface`: include a compact work-log preface before the final answer.
 - `off`: keep raw runtime artifacts but do not show narration in progress or final replies.
+
+Emoji accent modes:
+
+- `subtle`: default. Append one small accent to successful `agent-reply` text only.
+- `off`: disable the accent globally, per agent, or per channel.
+
+The accent policy is applied at the final `agent-reply` outbox boundary after a successful runtime turn. It does not alter command replies, `/status`, error replies, progress/status messages, code-heavy replies, fenced code blocks, risk/security/status-style replies, or text that already ends with an emoji. Channel overrides win over agent overrides, and agent overrides win over the global default. Channel selectors can be `platform:channelId:userId`, `platform:channelId`, `channelId`, or `platform`.
 
 ## Prompt Files
 

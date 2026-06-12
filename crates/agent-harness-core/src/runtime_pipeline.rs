@@ -11,10 +11,11 @@ use crate::{
     ChannelOutboundAttachmentKind, ChannelOutboundMessage, ChannelOutboundMessageKind,
     CodexRuntimePlan, CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimeReceiptStatus,
     CodexRuntimeRunOptions, CodexRuntimeRunReport, CodexRuntimeRunStatus, HarnessLogEvent,
-    HarnessLogLevel, MemoryLifecycleTurnOptions, PromptAssemblyOptions,
-    RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
-    RuntimeQueuePreparedItem, append_agent_progress_event, append_harness_log, current_log_time_ms,
-    load_assistant_narration_config, plan_codex_runtime, prepare_runtime_queue_item,
+    HarnessLogLevel, MemoryLifecycleTurnOptions, PromptAssemblyOptions, ResponseToneConfig,
+    ResponseToneContext, RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions,
+    RuntimeQueuePrepareReport, RuntimeQueuePreparedItem, append_agent_progress_event,
+    append_harness_log, apply_response_tone, current_log_time_ms, load_assistant_narration_config,
+    load_response_tone_config, plan_codex_runtime, prepare_runtime_queue_item,
     read_channel_session_state, record_memory_lifecycle_turn, release_runtime_queue_lease,
     run_codex_runtime, write_json_atomic,
 };
@@ -328,8 +329,38 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                     )),
                                 }
                             }
-                            let (text, attachments) =
+                            let (mut text, attachments) =
                                 split_outbound_media_directives(&response.outbound_text);
+                            let tone_config = match load_response_tone_config(&options.harness_home)
+                            {
+                                Ok(config) => {
+                                    warnings.extend(config.warnings.clone());
+                                    config
+                                }
+                                Err(error) => {
+                                    warnings.push(format!(
+                                            "response tone config could not be loaded; using defaults: {error}"
+                                        ));
+                                    ResponseToneConfig::default()
+                                }
+                            };
+                            let agent_id = prepare
+                                .item
+                                .as_ref()
+                                .map(|item| item.agent_id.as_str())
+                                .or_else(|| {
+                                    plan.plan.as_ref().and_then(|plan| plan.agent_id.as_deref())
+                                });
+                            text = apply_response_tone(
+                                &text,
+                                ResponseToneContext {
+                                    agent_id,
+                                    platform: &context.platform,
+                                    channel_id: &context.channel_id,
+                                    user_id: &context.user_id,
+                                },
+                                &tone_config,
+                            );
                             let message = ChannelOutboundMessage {
                                 platform: context.platform,
                                 channel_id: context.channel_id,
@@ -1238,11 +1269,11 @@ mod tests {
         assert_eq!(outbound.platform, "telegram");
         assert_eq!(outbound.channel_id, "dm-42");
         assert_eq!(outbound.user_id, "user-7");
-        assert_eq!(outbound.text, "Pipeline fake reply.");
+        assert_eq!(outbound.text, "Pipeline fake reply. ✨");
         let outbox_file = report.outbox_file.unwrap();
         let outbox = fs::read_to_string(outbox_file).unwrap();
         assert!(outbox.contains("\"kind\":\"agent-reply\""));
-        assert!(outbox.contains("Pipeline fake reply."));
+        assert!(outbox.contains("Pipeline fake reply. ✨"));
         let log = fs::read_to_string(
             harness_home
                 .join("state")
@@ -1269,6 +1300,62 @@ mod tests {
         )
         .unwrap();
         assert_eq!(episodes.lines().count(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_runtime_queue_once_respects_emoji_accent_off_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("run_runtime_queue_once_respects_emoji_accent_off_config");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"response":{"emojiAccentMode":"off"}}"#,
+        )
+        .unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "repair memory cron".to_string(),
+            inbound_context: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+        let fake_codex = fake_codex_executable(&root);
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            codex_executable: Some(fake_codex),
+            timeout_ms: 5_000,
+            idle_timeout_ms: 5_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        let outbound = report.outbound_message.unwrap();
+        assert_eq!(outbound.kind, ChannelOutboundMessageKind::AgentReply);
+        assert_eq!(outbound.text, "Pipeline fake reply.");
 
         let _ = fs::remove_dir_all(root);
     }

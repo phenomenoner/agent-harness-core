@@ -155,9 +155,39 @@ fn validate_response_object(path: &str, value: &Value, errors: &mut Vec<String>)
             "assistantNarrationFinalPrefix" | "assistant_narration_final_prefix" => {
                 expect_string(path_key(path, key), child, errors)
             }
+            "emojiAccentMode" | "emoji_accent_mode" => {
+                expect_emoji_accent_mode(path_key(path, key), child, errors)
+            }
+            "emojiAccentAgentModes" | "emoji_accent_agent_modes" => {
+                validate_emoji_accent_mode_map(path_key(path, key), child, errors)
+            }
+            "emojiAccentChannelModes" | "emoji_accent_channel_modes" => {
+                validate_emoji_accent_mode_map(path_key(path, key), child, errors)
+            }
             other => errors.push(format!("unknown response config key `{other}` at {path}")),
         }
     }
+}
+
+fn validate_emoji_accent_mode_map(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(&path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        expect_emoji_accent_mode(path_key(&path, key), child, errors);
+    }
+}
+
+fn expect_emoji_accent_mode(path: impl Into<String>, value: &Value, errors: &mut Vec<String>) {
+    expect_enum(
+        path,
+        value,
+        &[
+            "off", "none", "disabled", "disable", "false", "subtle", "on", "enabled", "enable",
+            "true",
+        ],
+        errors,
+    );
 }
 
 fn validate_security_object(path: &str, value: &Value, errors: &mut Vec<String>) {
@@ -482,7 +512,10 @@ mod tests {
                 "assistantNarrationMode": "progress_panel",
                 "assistantNarrationMaxChars": 500,
                 "assistantNarrationProgressMinUpdateMs": 2500,
-                "assistantNarrationFinalPrefix": "Work log"
+                "assistantNarrationFinalPrefix": "Work log",
+                "emojiAccentMode": "subtle",
+                "emojiAccentAgentModes": { "main": "on", "ops": "off" },
+                "emojiAccentChannelModes": { "telegram:dm-42": "enabled" }
               },
               "security": {
                 "codexApprovalPolicy": "accept",
@@ -576,7 +609,10 @@ mod tests {
         fs::write(
             harness_home.join(HARNESS_CONFIG_FILE_NAME),
             r#"{
-              "response": { "assistantNarrationMode": "chatty" },
+              "response": {
+                "assistantNarrationMode": "chatty",
+                "emojiAccentMode": "loud"
+              },
               "security": { "codexApprovalPolicy": "YOLO" },
               "workerDispatch": {
                 "globalConcurrencyLimit": 2,
@@ -598,6 +634,12 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.contains("assistantNarrationMode"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("emojiAccentMode"))
         );
         assert!(
             report

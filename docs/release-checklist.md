@@ -1,6 +1,6 @@
 # Agent Harness Release Checklist
 
-Date: 2026-06-12
+Date: 2026-06-13
 
 This checklist is mirrored by `agent-harness release-checklist`. It is intentionally review-oriented: passing it should leave evidence that maps to the external review dimensions.
 
@@ -38,3 +38,4 @@ This checklist is mirrored by `agent-harness release-checklist`. It is intention
 - 2026-06-12: `cargo tree --workspace --duplicates` reported duplicate `webpki-roots` through `ureq`/TLS only.
 - 2026-06-12: Provider-isolation hotfix added stale-guidance review to the release checklist and updated the builtin harness ops skill so OpenRouter routes use provider-specific Codex homes instead of the shared Codex/OAuth home.
 - 2026-06-12: Ledger hygiene passed `cargo fmt --all`, `cargo test --workspace --target-dir target\staging-test-ledger-hygiene-workspace` (17 CLI tests, 210 core tests, 0 doc-tests), canonical `cargo build -p agent-harness-cli`, tracked-file public export `public-hygiene` with `forbiddenHits=[]`, live `jsonl-repair --apply` with backups for the three affected ledgers, live `healthz --target-home .\.agent-harness --require-writable-state`, and live `status --target-home .\.agent-harness --json` with affected ledger `invalidLines=0`.
+- 2026-06-13: Response tone passed `cargo fmt --all`, `cargo test --workspace --target-dir target\staging-test-response-tone-workspace` (17 CLI tests, 215 core tests, 0 doc-tests), `git diff --check`, staging `cargo build -p agent-harness-cli --target-dir target\staging-build-response-tone`, tracked-file public export `public-hygiene` with `forbiddenHits=[]`, canonical `cargo build -p agent-harness-cli`, live `harness-skills-sync` for `agent-windows-harness` v0.1.4, live `healthz --target-home .\.agent-harness --require-writable-state`, and live `status --target-home .\.agent-harness --json`.

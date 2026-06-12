@@ -11,6 +11,7 @@
 - Isolated OpenRouter Codex config into provider-specific Codex homes and added a readiness failure when the shared default Codex/OAuth home contains stale OpenRouter provider config.
 - Treat Codex app-server protocol errors and failed `turn/completed` events as terminal runtime failures instead of successful empty assistant replies.
 - Updated builtin harness ops skill, release checklist, operations docs, and feature parity docs so stale guidance review covers docs, skills, and CLI help during future behavior-changing upgrades.
+- Updated response UX docs and the builtin harness ops skill for the guarded final-reply tone policy, including removal of stale "before real Telegram/Discord loops exist" channel-run-once guidance.
 
 ### Added
 
@@ -33,6 +34,7 @@
 - Invariants catalog, schema registry, release checklist, trust-boundary documentation, atomic-write audit, and security policy.
 - Operator CLI commands for the new staging gates.
 - Harness secret-env handoff for provider-specific app-server child processes.
+- Guarded `response.emojiAccentMode` response tone policy, defaulting to `subtle`, with per-agent/channel overrides and skips for command, status, error, code-heavy, and risk/security replies.
 
 ### Verification
 
@@ -44,6 +46,8 @@
 - `agent-harness status --target-home .\.agent-harness --json`
 - `agent-harness healthz --target-home .\.agent-harness --require-writable-state`
 - `cargo tree --workspace --duplicates`
+- `cargo test --workspace --target-dir target\staging-test-response-tone-workspace`
+- `agent-harness harness-skills-sync --target-home .\.agent-harness`
 
 ### Pending Live Evidence
 

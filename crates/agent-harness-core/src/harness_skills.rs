@@ -13,13 +13,13 @@ const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
-description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, and Codex prompt continuity policy.
-version: 0.1.3
+description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, response tone, and Codex prompt continuity policy.
+version: 0.1.4
 platforms: [windows]
 metadata:
   agent_harness:
     category: operations
-    tags: [legacy-import, codex, openrouter, telegram, discord, migration, activation]
+    tags: [legacy-import, codex, openrouter, telegram, discord, migration, activation, response-tone]
 ---
 
 # Agent Windows Harness
@@ -34,6 +34,7 @@ Use it when the user mentions:
 - Telegram or Discord DM operation
 - slash commands such as /new, /think, /stop, /steer, /btw, /model, or /status
 - Codex CLI, Codex OAuth, app-server, OpenRouter provider routing, prompt injection, tool schema, or session continuity
+- response tone, emoji accent, assistant narration, progress panel, or final reply formatting
 - activation readiness, runtime queue, operational logs, or gateway handoff
 
 ## Operating Lead
@@ -53,6 +54,7 @@ Use it when the user mentions:
 13. Use supervisor-plan to generate Windows Task Scheduler install/start/stop/uninstall scripts. It writes scripts and receipts only; it does not register tasks automatically.
 14. Use status --json for operator health checks; it should show runtime openItems=0 and outbox pending=0 before live handoff.
 15. Treat harness-config.json security.codexApprovalPolicy and security.codexSandbox as operator-controlled runtime safety settings. Use codexApprovalPolicy="accept" only for an intentionally unattended trusted channel runtime.
+16. Keep response tone policy scoped to successful final agent replies. Do not post-process command replies, /status, error/failure replies, progress/status panels, code-heavy replies, or risk/security/status replies.
 
 ## Prompt And Tool Schema Policy
 
@@ -89,6 +91,14 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - Treat `recoveredLines>0` with `invalid=0` as successful recovery of concatenated JSON values such as `}{`; treat `invalid>0` as quarantine that needs manual inspection before claiming the ledger is clean.
 - After repair, run `healthz --require-writable-state` and `status --json`; affected ledgers should report `invalidLines=0`.
 
+## Response Tone Policy
+
+- response.emojiAccentMode defaults to subtle. It appends one guarded accent only when runtime-run-once writes a successful agent-reply to state/channels/outbox.jsonl.
+- Use response.emojiAccentMode="off" to disable globally. Use response.emojiAccentAgentModes for agent-specific overrides and response.emojiAccentChannelModes for channel-specific overrides.
+- Channel selectors can be platform:channelId:userId, platform:channelId, channelId, or platform. Channel overrides win over agent overrides; agent overrides win over the global mode.
+- The policy must skip command replies, /status, error/failure replies, progress/status panels, fenced code blocks, code-heavy replies, risk/security/status-style replies, and text already ending with an emoji.
+- Do not implement tone as blind delivery-layer post-processing. Keep it at the successful agent-reply outbox boundary so audit artifacts and non-agent replies stay unpolluted.
+
 ## Channel Commands
 
 - /new starts or switches to a fresh session key for the channel and agent.
@@ -104,7 +114,7 @@ Commands should update channel state and receipts before enqueueing agent turns.
 ## Channel Delivery
 
 - Command replies and agent replies are both appended to state/channels/outbox.jsonl.
-- Use channel-run-once as the single-message adapter entrypoint before real Telegram/Discord loops exist.
+- Use channel-run-once for offline smoke and adapter-level single-message tests.
 - Use channel-outbox-plan to list pending delivery work by platform.
 - Use channel-delivery-record after Telegram/Discord send attempts to record delivered or failed receipts.
 - Use channel-credentials-export --include-sensitive during legacy cutover to import Telegram/Discord bot tokens and known channel/user/guild IDs into secrets/channel-credentials.env with redacted receipts. Telegram poll and Discord event adapters enforce those imported allow-lists before channel-run-once.
