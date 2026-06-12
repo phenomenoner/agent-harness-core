@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Harness Core — Engineering is table stakes. Community is the moat.</title>
+<meta name="description" content="A one-person, AI-paired Rust agent harness that reached mechanism-level parity with 100k★+ agent platforms in under a day — as reviewed by Claude (Fable 5). A craftsmanship pursuit, and a social experiment in software engineering.">
+<meta property="og:title" content="Agent Harness Core — Engineering is table stakes. Community is the moat.">
+<meta property="og:description" content="In under a day, an AI-paired solo project matched multi-month, 100k★+ agent platforms on most core engineering dimensions — says an AI reviewer. The part AI can't compress? Operation time, trust, community. That's the experiment.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://phenomenoner.github.io/agent-harness-core/">
+<style>
+  :root{
+    --bg:#0a0d13; --bg2:#0f141d; --panel:#121927; --line:#1f2a3d;
+    --txt:#dbe4f0; --dim:#8fa0b8; --faint:#5c6b82;
+    --amber:#fbbf24; --amber-dim:#b98a10; --green:#34d399; --red:#f87171; --cyan:#67e8f9;
+    --mono:ui-monospace,'Cascadia Code','SF Mono',Consolas,monospace;
+    --sans:system-ui,-apple-system,'Segoe UI',Roboto,'Noto Sans',sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--txt);font-family:var(--sans);line-height:1.65;font-size:17px}
+  a{color:var(--amber);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{max-width:1060px;margin:0 auto;padding:0 24px}
+  section{padding:88px 0;border-top:1px solid var(--line)}
+  h2{font-size:2rem;line-height:1.2;margin-bottom:8px}
+  h3{font-size:1.15rem;margin-bottom:6px}
+  .eyebrow{font-family:var(--mono);font-size:.8rem;letter-spacing:.18em;text-transform:uppercase;color:var(--amber);margin-bottom:14px}
+  .lead{color:var(--dim);font-size:1.08rem;max-width:62ch}
+  .mono{font-family:var(--mono)}
+
+  /* hero */
+  .hero{padding:110px 0 80px;border-top:none;background:
+    radial-gradient(1200px 500px at 70% -10%, rgba(251,191,36,.07), transparent 60%),
+    radial-gradient(900px 400px at 10% 10%, rgba(103,232,249,.05), transparent 60%)}
+  .hero h1{font-size:clamp(2.6rem,6vw,4.2rem);line-height:1.05;letter-spacing:-.02em}
+  .hero h1 .accent{color:var(--amber)}
+  .hook{margin:26px 0 8px;font-size:clamp(1.15rem,2.4vw,1.5rem);max-width:30ch;font-weight:600;line-height:1.35}
+  .hook em{color:var(--amber);font-style:normal}
+  .sub{color:var(--dim);max-width:64ch;margin-top:14px}
+  .cta{display:flex;gap:14px;flex-wrap:wrap;margin-top:34px}
+  .btn{display:inline-block;padding:13px 22px;border-radius:10px;font-weight:600;font-size:.95rem}
+  .btn-primary{background:var(--amber);color:#1a1206}
+  .btn-primary:hover{background:#ffd34d;text-decoration:none}
+  .btn-ghost{border:1px solid var(--line);color:var(--txt)}
+  .btn-ghost:hover{border-color:var(--amber);text-decoration:none}
+  .stats{display:flex;gap:0;flex-wrap:wrap;margin-top:54px;border:1px solid var(--line);border-radius:14px;overflow:hidden}
+  .stat{flex:1 1 160px;padding:18px 20px;background:var(--bg2);border-right:1px solid var(--line)}
+  .stat:last-child{border-right:none}
+  .stat b{display:block;font-family:var(--mono);font-size:1.25rem;color:var(--amber)}
+  .stat span{font-size:.82rem;color:var(--faint)}
+
+  /* experiment */
+  .thesis{margin:34px 0;padding:28px 30px;border-left:3px solid var(--amber);background:var(--panel);border-radius:0 12px 12px 0;font-size:1.18rem;font-weight:600;line-height:1.5}
+  .thesis .q{color:var(--amber)}
+  .timeline{margin-top:40px;display:grid;gap:0}
+  .tl{display:grid;grid-template-columns:130px 1fr;gap:20px;padding:20px 0;border-bottom:1px dashed var(--line)}
+  .tl:last-child{border-bottom:none}
+  .tl time{font-family:var(--mono);color:var(--amber);font-size:.88rem;padding-top:2px}
+  .tl p{color:var(--dim);font-size:.97rem}
+  .tl b{color:var(--txt)}
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:40px}
+  .half{padding:26px;border:1px solid var(--line);border-radius:14px;background:var(--bg2)}
+  .half h3{font-family:var(--mono);font-size:.95rem}
+  .half.compressed h3{color:var(--green)}
+  .half.not h3{color:var(--red)}
+  .half ul{list-style:none;margin-top:12px}
+  .half li{padding:5px 0 5px 22px;position:relative;color:var(--dim);font-size:.95rem}
+  .half.compressed li::before{content:"▸";position:absolute;left:0;color:var(--green)}
+  .half.not li::before{content:"▸";position:absolute;left:0;color:var(--red)}
+
+  /* verdict */
+  .reviewer{display:flex;align-items:center;gap:14px;margin:26px 0}
+  .reviewer .avatar{width:46px;height:46px;border-radius:12px;background:linear-gradient(135deg,#d97706,#fbbf24);display:flex;align-items:center;justify-content:center;font-weight:800;color:#1a1206;font-family:var(--mono)}
+  .reviewer small{display:block;color:var(--faint)}
+  blockquote{margin:22px 0;padding:22px 26px;background:var(--panel);border:1px solid var(--line);border-radius:12px;font-size:1.06rem;font-style:italic;color:var(--txt)}
+  blockquote footer{margin-top:10px;font-style:normal;font-size:.82rem;color:var(--faint);font-family:var(--mono)}
+  .tablewrap{overflow-x:auto;margin:34px 0 10px;border:1px solid var(--line);border-radius:14px}
+  table{border-collapse:collapse;width:100%;min-width:720px;font-size:.92rem;background:var(--bg2)}
+  th,td{padding:11px 14px;text-align:center;border-bottom:1px solid var(--line)}
+  th{font-family:var(--mono);font-size:.78rem;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);background:var(--panel)}
+  td:first-child,th:first-child{text-align:left;position:sticky;left:0;background:var(--panel)}
+  tr:last-child td{border-bottom:none}
+  .hi{color:var(--amber);font-weight:700}
+  .lo{color:var(--faint)}
+  .win td{background:rgba(251,191,36,.04)}
+  .legend{font-size:.82rem;color:var(--faint);margin-top:10px}
+  .disclosure{margin-top:36px;padding:22px 26px;border:1px dashed var(--amber-dim);border-radius:12px;background:rgba(251,191,36,.04);font-size:.95rem;color:var(--dim)}
+  .disclosure b{color:var(--amber)}
+
+  /* proving ground */
+  .proofs{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:40px}
+  .proof{padding:28px 24px;border:1px solid var(--line);border-radius:16px;background:var(--bg2);position:relative}
+  .proof .num{font-family:var(--mono);font-size:.78rem;color:var(--amber);letter-spacing:.15em}
+  .proof h3{margin:10px 0 10px;font-size:1.2rem}
+  .proof p{color:var(--dim);font-size:.93rem}
+  .badge{display:inline-block;margin-top:16px;padding:4px 12px;border-radius:999px;font-family:var(--mono);font-size:.72rem;letter-spacing:.08em}
+  .b-run{background:rgba(52,211,153,.12);color:var(--green);border:1px solid rgba(52,211,153,.35)}
+  .b-mech{background:rgba(251,191,36,.1);color:var(--amber);border:1px solid rgba(251,191,36,.35)}
+  .b-q{background:rgba(143,160,184,.1);color:var(--dim);border:1px solid var(--line)}
+  .gates{display:flex;flex-wrap:wrap;gap:10px;margin-top:30px}
+  .gate{font-family:var(--mono);font-size:.8rem;color:var(--dim);border:1px solid var(--line);border-radius:8px;padding:7px 13px;background:var(--bg2)}
+  .receipt-note{margin-top:30px;font-size:.95rem;color:var(--dim)}
+
+  /* product */
+  .qgrid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:38px}
+  .qcard{padding:24px;border:1px solid var(--line);border-radius:14px;background:var(--bg2)}
+  .qcard h3{font-size:1.02rem;color:var(--amber)}
+  .qcard p{color:var(--dim);font-size:.93rem;margin-top:8px}
+  .qcard .mono{font-size:.85rem;color:var(--cyan)}
+  .feat{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:38px}
+  .f{padding:20px;border:1px solid var(--line);border-radius:12px;background:var(--bg2);font-size:.9rem;color:var(--dim)}
+  .f b{display:block;color:var(--txt);margin-bottom:6px;font-size:.95rem}
+
+  /* code block */
+  pre{background:#0c1018;border:1px solid var(--line);border-radius:12px;padding:20px 22px;overflow-x:auto;font-family:var(--mono);font-size:.84rem;line-height:1.7;color:#b9c7da;margin-top:28px}
+  pre .c{color:var(--faint)} pre .g{color:var(--green)} pre .a{color:var(--amber)}
+
+  /* footer */
+  footer.site{padding:60px 0 80px;border-top:1px solid var(--line);color:var(--faint);font-size:.88rem}
+  footer.site .links{display:flex;gap:22px;flex-wrap:wrap;margin-bottom:26px}
+  .starline{margin-top:30px;padding:24px 28px;border:1px solid var(--line);border-radius:14px;background:var(--panel);color:var(--txt);font-size:1.05rem}
+  .starline b{color:var(--amber)}
+
+  @media (max-width:760px){
+    .split,.qgrid{grid-template-columns:1fr}
+    .proofs,.feat{grid-template-columns:1fr}
+    .tl{grid-template-columns:1fr;gap:4px}
+    section{padding:64px 0}
+  }
+</style>
+</head>
+<body>
+
+<!-- ============ HERO ============ -->
+<header class="hero">
+  <div class="wrap">
+    <div class="eyebrow">A craftsmanship pursuit · A social experiment in software engineering</div>
+    <h1>Agent Harness <span class="accent">Core</span></h1>
+    <p class="hook">Engineering is now <em>table stakes</em>.<br>Community is the moat.<br>This repo is the experiment.</p>
+    <p class="sub">A self-hosted AI agent runtime in Rust — every step gated, every step receipted. On <span class="mono">2026-06-12</span>, this one-person, AI-paired project reached mechanism-level parity — or better — with agent platforms carrying hundreds of thousands of GitHub stars, across most core engineering dimensions. <b>In under a day.</b> This page is about what that means — and, just as honestly, what it doesn't yet.</p>
+    <div class="cta">
+      <a class="btn btn-primary" href="https://github.com/phenomenoner/agent-harness-core">★ Star the experiment</a>
+      <a class="btn btn-ghost" href="#verdict">Read the AI's verdict ↓</a>
+      <a class="btn btn-ghost" href="#proving">The proving ground ↓</a>
+    </div>
+    <div class="stats">
+      <div class="stat"><b>6</b><span>dependencies, total</span></div>
+      <div class="stat"><b>0</b><span>async runtimes</span></div>
+      <div class="stat"><b>207+16</b><span>tests, zero model calls</span></div>
+      <div class="stat"><b>&lt; 1 day</b><span>review → roadmap → mechanisms</span></div>
+      <div class="stat"><b>1 + 1</b><span>human + AI</span></div>
+    </div>
+  </div>
+</header>
+
+<!-- ============ THE EXPERIMENT ============ -->
+<section id="experiment">
+  <div class="wrap">
+    <div class="eyebrow">01 · The Experiment</div>
+    <h2>What happens when engineering stops being scarce?</h2>
+    <p class="lead">For decades, engineering depth was the moat: months of queue design, supervision trees, audit trails. AI pair-engineering just collapsed that cost. This project tests the consequence in public.</p>
+
+    <div class="timeline">
+      <div class="tl"><time>06-12 morning</time><p><b>The review.</b> An AI architect — Claude (Fable&nbsp;5) — reviewed three agent harnesses side by side: OpenClaw (378k★), Hermes Agent by Nous Research (191k★), and this repo (then 4 commits, 0 stars). The verdict was blunt: best-in-trio security posture and observability — worst-in-trio supervision, ecosystem, maturity.</p></div>
+      <div class="tl"><time>06-12 midday</time><p><b>The roadmap.</b> The same reviewer wrote an overtaking plan: ~50 work items across ten dimensions — SRE-grade SLOs, deterministic-simulation testing, shadow migrations, canary deploys, an invariants catalog. Sequenced by dependency, importance, ROI.</p></div>
+      <div class="tl"><time>06-12 evening</time><p><b>The build.</b> A staging pass implemented essentially all of it at mechanism level: dead-letter retry policy, end-to-end trace IDs, admission control, encrypted secret vault, MCP tool-description pinning, schema registry, queue shadow dual-writes. <span class="mono">207</span> core tests. Hours, not months.</p></div>
+      <div class="tl"><time>06-12 night</time><p><b>The re-review.</b> Same AI, second pass, deliberately harsher: a dual <i>mechanism / proven</i> scoring system, because code that exists is not code that has survived production. Scores below.</p></div>
+    </div>
+
+    <div class="split">
+      <div class="half compressed">
+        <h3>// what AI compressed</h3>
+        <ul>
+          <li>Months of mechanism design → hours</li>
+          <li>Queue, supervision, vault, tracing subsystems</li>
+          <li>Test scaffolding, invariants, schema registry</li>
+          <li>The entire distance from "gap identified" to "code + tests exist"</li>
+        </ul>
+      </div>
+      <div class="half not">
+        <h3>// what AI cannot compress</h3>
+        <ul>
+          <li>A 7-day shadow soak takes 7 days</li>
+          <li>A 30-day unattended SLO takes 30 days</li>
+          <li>Trust, scrutiny, third-party verification</li>
+          <li>Community — which accrues at human speed</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="thesis">
+      If a solo developer with an AI can match the <span class="q">engineering</span> of 100k★ projects in a day —<br>
+      then engineering is no longer what decides how far a project goes. <span class="q">People are.</span><br>
+      This repo runs that hypothesis in public. The star button is the dependent variable.
+    </div>
+  </div>
+</section>
+
+<!-- ============ THE VERDICT ============ -->
+<section id="verdict">
+  <div class="wrap">
+    <div class="eyebrow">02 · The Verdict</div>
+    <h2>Reviewed by an AI. Scored without mercy.</h2>
+
+    <div class="reviewer">
+      <div class="avatar">F5</div>
+      <div><b>Claude — Fable 5</b> <small>AI agent-harness architect · two review rounds, 2026-06-12 · opinions are the model's own</small></div>
+    </div>
+
+    <blockquote>
+      "OpenClaw sells breadth. Hermes sells engineering. Agent Harness Core sells a small thing you can trust."
+      <footer>— round 1, comparative review</footer>
+    </blockquote>
+    <blockquote>
+      "By engineering-discipline density per thousand lines of code, this is now first of the three. … Mechanisms ready. Evidence en route."
+      <footer>— round 2, after the staging pass</footer>
+    </blockquote>
+
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>Dimension</th><th>OpenClaw<br>378k★</th><th>Hermes<br>191k★</th><th>AHC<br>mechanism</th><th>AHC<br>proven</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Concurrency &amp; throughput</td><td class="hi">4.5</td><td>3.5</td><td>4.0</td><td class="lo">3.5</td></tr>
+          <tr class="win"><td>Persistence &amp; data integrity</td><td>3.0</td><td class="hi">4.5</td><td class="hi">4.5</td><td>4.0</td></tr>
+          <tr class="win"><td>Error handling &amp; recovery</td><td>3.5</td><td>4.0</td><td class="hi">4.5</td><td class="lo">3.5</td></tr>
+          <tr><td>Supervision &amp; operations</td><td class="hi">4.0</td><td>3.5</td><td>4.0</td><td class="lo">2.5</td></tr>
+          <tr class="win"><td>Security</td><td class="lo">2.0</td><td>3.5</td><td class="hi">4.5</td><td>4.0</td></tr>
+          <tr class="win"><td>Observability &amp; debuggability</td><td>3.5</td><td>3.0</td><td class="hi">5.0</td><td>4.5</td></tr>
+          <tr><td>Token / resource efficiency</td><td>3.0</td><td class="hi">4.5</td><td class="hi">4.5</td><td>4.0</td></tr>
+          <tr><td>Extensibility &amp; ecosystem</td><td class="hi">5.0</td><td>4.5</td><td class="lo">2.5</td><td class="lo">2.0</td></tr>
+          <tr class="win"><td>Testing &amp; quality engineering</td><td>3.0</td><td>3.5</td><td class="hi">4.5</td><td>4.0</td></tr>
+          <tr><td>Maturity &amp; community</td><td class="hi">4.5</td><td class="hi">4.5</td><td class="lo">2.0</td><td class="lo">2.0</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="legend">Mechanism = code + staging tests exist, per the repo's own four-tier status ledger. Proven = validated under live traffic. Highlighted rows: AHC mechanism score ties or beats both incumbents. Scores are one AI reviewer's opinion (Claude, Fable&nbsp;5), from public documentation for OpenClaw/Hermes and full source access for AHC.</p>
+
+    <div class="disclosure">
+      <b>Full disclosure, by design:</b> the roadmap this project implemented was written by the same AI that scored it. That self-referential loop is precisely why the scoring is split into <i>mechanism</i> vs <i>proven</i>, why pending items get zero credit, and why every claim must point at a receipt, a test, or a ledger entry in the repo. The honesty <i>is</i> the methodology — and the gap between the two columns is not the reviewer's hedge; it is the project's own published TODO list.
+    </div>
+  </div>
+</section>
+
+<!-- ============ PROVING GROUND ============ -->
+<section id="proving">
+  <div class="wrap">
+    <div class="eyebrow">03 · The Proving Ground</div>
+    <h2>Don't believe the scores. Watch us earn them.</h2>
+    <p class="lead">Everything still standing between "mechanism" and "proven" is published as a roadmap of public proofs. Each one lands as receipts in the repo — JSONL you can read, not claims you have to trust.</p>
+
+    <div class="proofs">
+      <div class="proof">
+        <div class="num">PROOF 01</div>
+        <h3>Seven-Day Shadow Parity</h3>
+        <p>Every channel turn dual-writes to the new SQLite worker-store lane while the old queue keeps executing. Seven live days of <b>zero divergence</b> — receipt-compared — before cutover. A database migration conducted like an experiment.</p>
+        <span class="badge b-mech">SHADOW MECHANISM LIVE-GATED</span>
+      </div>
+      <div class="proof">
+        <div class="num">PROOF 02</div>
+        <h3>Reboot-Proof Supervision</h3>
+        <p>Service-wrapper registration, kill-a-loop auto-restart with backoff, crash-loop breaker that DMs the operator, and canary deploys with automatic rollback. The harness that notices it is sick — and tells you.</p>
+        <span class="badge b-mech">MECHANISM SHIPPED · DRILL PENDING</span>
+      </div>
+      <div class="proof">
+        <div class="num">PROOF 03</div>
+        <h3>30-Day Unattended SLO</h3>
+        <p>≥99.5% delivery. <b>Zero silent failures.</b> Every failure reconstructable from receipts within five minutes, via one <span class="mono">trace</span> command. The north star — the clock starts at supervision cutover.</p>
+        <span class="badge b-q">CLOCK NOT YET STARTED</span>
+      </div>
+    </div>
+
+    <div class="gates">
+      <span class="gate">CI pipeline</span>
+      <span class="gate">deterministic simulation — seeded crash/interleave replays</span>
+      <span class="gate">sanitized real-traffic replay corpus</span>
+      <span class="gate">real Codex wire fixtures</span>
+      <span class="gate">openclaw-mem ContextPack fixture exchange</span>
+      <span class="gate">network advisory audit</span>
+      <span class="gate">first tagged release</span>
+    </div>
+
+    <p class="receipt-note">Progress is tracked item-by-item in the repo's <a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/agent-harness-core-roadmap-backlog.md">roadmap &amp; backlog</a> with a four-tier honesty vocabulary — <span class="mono">staging-tested · pending live gate · pending fixtures · deferred by policy</span> — and a named remaining gate for every single item. Few projects of any size publish their uncertainty this precisely. That, too, is the product.</p>
+  </div>
+</section>
+
+<!-- ============ WHAT IT IS ============ -->
+<section id="product">
+  <div class="wrap">
+    <div class="eyebrow">04 · The Product</div>
+    <h2>The operations layer your agent framework forgot.</h2>
+    <p class="lead">Agent Harness Core is not another prompt-orchestration library. It sits <i>around</i> your agents — ingress, permissions, durable queuing, concurrency, delivery, audit, recovery — and answers the questions frameworks leave to you:</p>
+
+    <div class="qgrid">
+      <div class="qcard"><h3>"The process died mid-turn. Now what?"</h3><p>Durable queue + completed-turn recovery. The turn is not lost. <span class="mono">→ pending.jsonl, leases, receipts</span></p></div>
+      <div class="qcard"><h3>"Who is allowed to talk to my agent?"</h3><p>Fail-closed allow-lists per user, chat, channel, and guild. Unknown senders never reach the model. <span class="mono">→ admin / limited / open-limited tiers</span></p></div>
+      <div class="qcard"><h3>"What exactly did it do at 03:12?"</h3><p>Append-only JSONL logs, receipts, transcripts and trajectories for everything. One command rebuilds the causal chain. <span class="mono">→ trace &lt;id&gt;</span></p></div>
+      <div class="qcard"><h3>"How do I stop a runaway turn?"</h3><p>Scoped cancellation honored by the runtime poll loop — the turn, the job, or everything in the session. <span class="mono">→ /stop · /stop turn · /stop job &lt;id&gt;</span></p></div>
+    </div>
+
+    <pre><span class="c"># build and verify — no model account needed</span>
+cargo test                                      <span class="g"># 207 core + 16 CLI, zero model calls</span>
+cargo run -p agent-harness-cli -- doctor
+
+<span class="c"># smoke the full pipeline offline with the bundled fake Codex app-server</span>
+cargo run -p agent-harness-cli -- channel-run-once <span class="a">--codex-exe tools\agent-fake-codex-app-server\fake-codex-app-server.cmd</span> ...
+
+<span class="c"># then go live: Telegram / Discord ingress → durable queue → Codex/OpenRouter → receipts</span>
+cargo run -p agent-harness-cli -- enable-check --target-home C:\path\to\.agent-harness</pre>
+  </div>
+</section>
+
+<!-- ============ BUILT DIFFERENT ============ -->
+<section id="craft">
+  <div class="wrap">
+    <div class="eyebrow">05 · The Craft</div>
+    <h2>Boring code. Radical accountability.</h2>
+    <p class="lead">The craftsmanship challenge: how much operational rigor fits into a codebase one person can fully audit?</p>
+    <div class="feat">
+      <div class="f"><b>Six dependencies. Total.</b> serde, serde_json, ureq, rusqlite, ring, base64. No tokio, no clap, no framework. Synchronous Rust you can read in an afternoon.</div>
+      <div class="f"><b>Receipts over trust.</b> Two-phase persistence: intent written before side effects, results after. If it isn't in a ledger, it didn't happen.</div>
+      <div class="f"><b>Fail-closed everything.</b> No allow-list match → no model access. Missing credentials fail at preflight, not mid-turn. Unknown config keys refuse to boot.</div>
+      <div class="f"><b>Invariants as a CLI command.</b> <span class="mono">invariants</span> and <span class="mono">schema-registry</span> are executable contracts, not wiki pages — the test suite enforces them.</div>
+      <div class="f"><b>Encrypted vault.</b> PBKDF2-HMAC-SHA256 + ChaCha20-Poly1305, repo-local. <span class="mono">vault-get</span> reports presence and length — never plaintext.</div>
+      <div class="f"><b>MCP, natively.</b> In-process Rust MCP server scaffold with per-agent tool allow-lists — plus hash-pinned tool descriptions, because tool poisoning is a real attack class.</div>
+      <div class="f"><b>Model-agnostic by one command.</b> Codex app-server executes; <span class="mono">/model openrouter/anthropic/claude-sonnet-4</span> reroutes a conversation without redeploying.</div>
+      <div class="f"><b>Memory, governed.</b> openclaw-mem integration is external, contract-tested, and fail-open — citations in, silent corruption out.</div>
+      <div class="f"><b>Windows-first, honestly.</b> Exclusive file-handle locks, Task Scheduler / service-wrapper supervision plans. Cross-platform is roadmap, not marketing.</div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FOOTER ============ -->
+<footer class="site">
+  <div class="wrap">
+    <div class="links">
+      <a href="https://github.com/phenomenoner/agent-harness-core">GitHub</a>
+      <a href="https://github.com/phenomenoner/agent-harness-core#readme">README</a>
+      <a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/agent-harness-core-roadmap-backlog.md">Roadmap &amp; Backlog</a>
+      <a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/agent-harness-operations-handbook.md">Operations Handbook</a>
+      <a href="https://github.com/phenomenoner/agent-harness-core/blob/main/SECURITY.md">Security</a>
+    </div>
+    <p>Opinions quoted on this page are from two architecture reviews authored by <b>Claude (Fable&nbsp;5, Anthropic)</b> on 2026-06-12 — an AI reviewing a codebase built in pair with AI, scoring it against platforms built by thousands of humans. Welcome to 2026.</p>
+    <p style="margin-top:10px">Dual-licensed MIT OR Apache-2.0 · Pre-release · Windows-first · Live-validated daily on a real deployment.</p>
+    <div class="starline">
+      <b>The experiment needs its variable.</b> If a one-day engineering sprint matching 100k★ platforms made you curious whether community really is the last moat — <a href="https://github.com/phenomenoner/agent-harness-core">star the repo</a>. Either outcome proves something.
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
