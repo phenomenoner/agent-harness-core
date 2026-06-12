@@ -6,10 +6,10 @@ This document compares the Rust Windows Agent Harness against the legacy feature
 
 Current activation state after the repo-local harness-home rebase, round3/round3-1 runtime/channel fixes, assistant narration routing, public-facing hygiened export, round3-2 timeout/progress reconciliation, the OpenRouter/per-agent memory upgrade, the Codex terminal cleanup/recovery fix, and the provider-isolation hotfix:
 
-- Readiness before this upgrade: `ready=true`, `passed=58`, `warnings=0`, `failed=0`.
+- Readiness after provider-isolation deploy: `ready=true`, `passed=59`, `warnings=0`, `failed=0`.
 - Harness home: `.agent-harness` under the repo root; `imports/activation-harness` is retained as a pre-rebase backup.
-- Runtime queue after live completed-stdout recovery: `queued=128`, `open=0`, `prepared=128`, `completed=125`. Timeout and recovered completed run-once receipts are terminal for queue selection, status open-item counts, native typing context, and progress delivery state.
-- Channel outbox before this upgrade: `pending=0`, `delivered=186`, `retryable=0`, `invalid=0`.
+- Runtime queue after provider-isolation live deployment: `queued=150`, `open=0`, `prepared=150`, `completed=146`. Timeout, recovered completed run-once receipts, and provider protocol failures are terminal for queue selection, status open-item counts, native typing context, and progress delivery state.
+- Channel outbox after provider-isolation live deployment: `pending=6`, `delivered=221`, `retryable=0`, `invalid=0`; platform-specific Telegram and Discord pending counts are both 0 in the deployment status report.
 - Channels: Telegram and Discord enabled; Telegram probe ready; Discord gateway probe ready; Discord real inbound evidence present.
 - Live loops: one bounded-concurrency runtime loop plus worker, progress delivery, Telegram, Discord outbox, and Discord gateway are run from regenerated scripts. The runtime loop process uses `--runtime-concurrency 12`.
 - Runtime response UX: `response.assistantNarrationMode` defaults to `progress_panel`; Codex `phase=commentary` assistant items are stored as `assistant_narration`, rendered as compact `Current step: ...` progress status, and kept out of final channel replies.

@@ -41,6 +41,8 @@
 - `cargo test --workspace --target-dir target\staging-test-workspace`
 - `cargo build --workspace --target-dir target\deploy-build`
 - `agent-harness public-hygiene --root target\staging-public-hygiene\public-export`
+- `agent-harness status --target-home .\.agent-harness --json`
+- `agent-harness healthz --target-home .\.agent-harness --require-writable-state`
 - `cargo tree --workspace --duplicates`
 
 ### Pending Live Evidence
