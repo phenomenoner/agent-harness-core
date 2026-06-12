@@ -14,7 +14,7 @@ const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
 description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, and Codex prompt continuity policy.
-version: 0.1.2
+version: 0.1.3
 platforms: [windows]
 metadata:
   agent_harness:
@@ -80,6 +80,14 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - Current OpenClaw workspace skills are expected under `skills\openclaw-imports\workspace`; legacy backup imports may still use `skills\legacy-imports`.
 - When a live prompt bundle is missing an imported guardrail or specialist skill, first compare the source tree with `agent-harness skills --harness-home <harness> --limit <n>`.
 - If an isolated build sees imported skills but `target\debug\agent-harness.exe` does not, schedule a controlled live stop, rebuild the canonical binary, restart through the supervisor path, then re-run canonical skill-index and local smoke tests.
+
+## JSONL Ledger Hygiene
+
+- Use the shared harness JSONL append path for new receipt/log writers; do not add ad hoc `OpenOptions::append(true)` plus `writeln!` JSONL writers.
+- `jsonl-repair --path <ledger>` is the dry-run validation path. It writes repaired and invalid sidecars and reports `valid`, `output`, `recoveredLines`, `recoveredValues`, and `invalid`.
+- For live ledger repair, stop the gateway first, build the canonical binary, run `jsonl-repair --path <ledger> --apply`, then restart the gateway. `--apply` writes a `.bak-<timestamp>.jsonl` backup before replacing the ledger.
+- Treat `recoveredLines>0` with `invalid=0` as successful recovery of concatenated JSON values such as `}{`; treat `invalid>0` as quarantine that needs manual inspection before claiming the ledger is clean.
+- After repair, run `healthz --require-writable-state` and `status --json`; affected ledgers should report `invalidLines=0`.
 
 ## Channel Commands
 

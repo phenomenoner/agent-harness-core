@@ -1056,10 +1056,7 @@ fn queue_execution_dir(harness_home: &Path, queue_id: &str) -> PathBuf {
 }
 
 fn append_json_line(path: &Path, value: &impl Serialize) -> io::Result<()> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    let line = serde_json::to_string(value).map_err(io::Error::other)?;
-    writeln!(file, "{line}")?;
-    Ok(())
+    crate::append_jsonl_value(path, value)
 }
 
 fn string_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {

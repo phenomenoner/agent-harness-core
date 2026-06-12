@@ -52,22 +52,22 @@ use agent_harness_core::{
     VaultPutOptions, WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport,
     WorkerCancelOptions, WorkerEnqueueOptions, WorkerJobKind, WorkerReapStaleOptions,
     WorkerRunOnceOptions, WorkerRunOnceStatus, WorkerStatusOptions, acquire_budget,
-    append_harness_log, apply_channel_command_step, assemble_prompt_bundle, build_channel_step,
-    build_dry_run_report, build_harness_skill_index, build_import_plan, build_runtime_skill_index,
-    build_source_skill_index, build_turn_plan, cancel_worker_job, check_activation_readiness,
-    check_config_drift, check_tool_description_pin, collect_harness_metrics,
-    collect_harness_status, collect_healthz, collect_token_efficiency, collect_worker_status,
-    compare_channel_turn_shadow, control_runtime_queue_item, create_learning_proposal,
-    create_ops_backup, current_log_time_ms, default_supervisor_child_specs, enqueue_channel_step,
-    enqueue_deterministic_cron_workers, enqueue_native_cron_workers, enqueue_subagent_workers,
-    enqueue_worker_job, evaluate_admission, evaluate_prompt_reduction,
-    evaluate_supervisor_children, execute_import, export_harness_registry_files,
-    export_memory_credentials, get_vault_secret, handle_mcp_request, inspect_openclaw_mem_service,
-    inspect_runtime_queue_capacity, invariant_catalog, inventory, list_background_tasks,
-    load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
-    load_subagent_ledger, parse_channel_command, parse_context_pack, plan_agent_progress_delivery,
-    plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron, plan_native_cron,
-    plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
+    append_harness_log, append_jsonl_value, apply_channel_command_step, assemble_prompt_bundle,
+    build_channel_step, build_dry_run_report, build_harness_skill_index, build_import_plan,
+    build_runtime_skill_index, build_source_skill_index, build_turn_plan, cancel_worker_job,
+    check_activation_readiness, check_config_drift, check_tool_description_pin,
+    collect_harness_metrics, collect_harness_status, collect_healthz, collect_token_efficiency,
+    collect_worker_status, compare_channel_turn_shadow, control_runtime_queue_item,
+    create_learning_proposal, create_ops_backup, current_log_time_ms,
+    default_supervisor_child_specs, enqueue_channel_step, enqueue_deterministic_cron_workers,
+    enqueue_native_cron_workers, enqueue_subagent_workers, enqueue_worker_job, evaluate_admission,
+    evaluate_prompt_reduction, evaluate_supervisor_children, execute_import,
+    export_harness_registry_files, export_memory_credentials, get_vault_secret, handle_mcp_request,
+    inspect_openclaw_mem_service, inspect_runtime_queue_capacity, invariant_catalog, inventory,
+    list_background_tasks, load_agent_registry, load_deterministic_cron_store,
+    load_native_cron_store, load_subagent_ledger, parse_channel_command, parse_context_pack,
+    plan_agent_progress_delivery, plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron,
+    plan_native_cron, plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
     probe_codex_runtime_launch, propose_openclaw_mem_service_memory, put_vault_secret,
     reap_stale_worker_jobs, recall_openclaw_mem_service, receive_channel_message,
     record_agent_progress_delivery, record_channel_delivery, record_channel_turn_shadow,
@@ -1057,8 +1057,13 @@ fn run_jsonl_repair(args: &[String]) -> Result<(), String> {
         println!("Backup: {}", backup.display());
     }
     println!(
-        "Lines: total={} valid={} invalid={}",
-        report.total_lines, report.valid_lines, report.invalid_lines
+        "Lines: total={} valid={} output={} recoveredLines={} recoveredValues={} invalid={}",
+        report.total_lines,
+        report.valid_lines,
+        report.output_lines,
+        report.recovered_lines,
+        report.recovered_values,
+        report.invalid_lines
     );
     println!("Applied: {}", yes_no(report.applied));
     Ok(())
@@ -2345,12 +2350,7 @@ fn write_telegram_probe_result(report: TelegramProbeReport) -> Result<TelegramPr
         serde_json::to_string_pretty(&receipt).map_err(|err| err.to_string())?,
     )
     .map_err(|err| err.to_string())?;
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&report.receipt_file)
-        .and_then(|mut file| writeln!(file, "{receipt}"))
-        .map_err(|err| err.to_string())?;
+    append_jsonl_value(&report.receipt_file, &receipt).map_err(|err| err.to_string())?;
     append_harness_log(
         &report.harness_home,
         &HarnessLogEvent::new(
@@ -4695,6 +4695,9 @@ struct JsonlRepairReport {
     backup: Option<PathBuf>,
     total_lines: usize,
     valid_lines: usize,
+    output_lines: usize,
+    recovered_lines: usize,
+    recovered_values: usize,
     invalid_lines: usize,
     applied: bool,
 }
@@ -9304,12 +9307,7 @@ fn write_plugin_sidecar_bridge_receipt(
         "responseFile": response_file.display().to_string(),
         "reason": reason,
     });
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(receipts_file)
-        .and_then(|mut file| writeln!(file, "{receipt}"))
-        .map_err(|err| err.to_string())
+    append_jsonl_value(&receipts_file, &receipt).map_err(|err| err.to_string())
 }
 
 fn read_discord_event_json(args: &DiscordEventRunOnceArgs) -> Result<serde_json::Value, String> {
@@ -9600,12 +9598,7 @@ fn write_discord_event_receipt(report: &DiscordEventRunOnceReport) -> Result<(),
         "userId": report.user_id,
         "sessionKey": report.run.as_ref().map(|run| run.receive.session_key.clone()),
     });
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut file| writeln!(file, "{receipt}"))
-        .map_err(|err| err.to_string())
+    append_jsonl_value(&path, &receipt).map_err(|err| err.to_string())
 }
 
 fn write_discord_reply_context_receipt(
@@ -9649,12 +9642,7 @@ fn write_discord_reply_context_receipt(
         "source": reply_context.source,
         "sourceAvailable": reply_context.source_available,
     });
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut file| writeln!(file, "{receipt}"))
-        .map_err(|err| err.to_string())
+    append_jsonl_value(&path, &receipt).map_err(|err| err.to_string())
 }
 
 fn discord_dm_probe_report_file(harness_home: &std::path::Path) -> PathBuf {
@@ -9707,12 +9695,7 @@ fn write_discord_dm_probe_report(report: &DiscordDmProbeReport) -> Result<(), St
         serde_json::to_string_pretty(&receipt).map_err(|err| err.to_string())?,
     )
     .map_err(|err| err.to_string())?;
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(receipts_file)
-        .and_then(|mut file| writeln!(file, "{receipt}"))
-        .map_err(|err| err.to_string())
+    append_jsonl_value(&receipts_file, &receipt).map_err(|err| err.to_string())
 }
 
 fn write_discord_dm_history_probe_report(
@@ -9755,12 +9738,7 @@ fn write_discord_dm_history_probe_report(
         serde_json::to_string_pretty(&receipt).map_err(|err| err.to_string())?,
     )
     .map_err(|err| err.to_string())?;
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(receipts_file)
-        .and_then(|mut file| writeln!(file, "{receipt}"))
-        .map_err(|err| err.to_string())
+    append_jsonl_value(&receipts_file, &receipt).map_err(|err| err.to_string())
 }
 
 fn latest_discord_dm_probe(harness_home: &Path) -> Result<DiscordDmProbeRef, String> {
@@ -11402,9 +11380,12 @@ fn repair_jsonl_file(args: &JsonlRepairArgs) -> Result<JsonlRepairReport, String
         .invalid_output
         .clone()
         .unwrap_or_else(|| args.path.with_extension("invalid.jsonl"));
-    let mut valid_lines = Vec::new();
+    let mut repaired_lines = Vec::new();
     let mut invalid_records = Vec::new();
     let mut total_lines = 0usize;
+    let mut valid_lines = 0usize;
+    let mut recovered_lines = 0usize;
+    let mut recovered_values = 0usize;
 
     for (index, line) in text.lines().enumerate() {
         let trimmed = line.trim();
@@ -11412,11 +11393,20 @@ fn repair_jsonl_file(args: &JsonlRepairArgs) -> Result<JsonlRepairReport, String
             continue;
         }
         total_lines += 1;
-        match serde_json::from_str::<serde_json::Value>(trimmed) {
-            Ok(_) => valid_lines.push(trimmed.to_string()),
+        if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+            valid_lines += 1;
+            repaired_lines.push(trimmed.to_string());
+            continue;
+        }
+        match recover_jsonl_values(trimmed) {
+            Ok(values) => {
+                recovered_lines += 1;
+                recovered_values += values.len();
+                repaired_lines.extend(values);
+            }
             Err(error) => invalid_records.push(serde_json::json!({
                 "lineNumber": index + 1,
-                "error": error.to_string(),
+                "error": error,
                 "raw": line,
             })),
         }
@@ -11428,10 +11418,10 @@ fn repair_jsonl_file(args: &JsonlRepairArgs) -> Result<JsonlRepairReport, String
     if let Some(parent) = invalid_output.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
-    let repaired_text = if valid_lines.is_empty() {
+    let repaired_text = if repaired_lines.is_empty() {
         String::new()
     } else {
-        format!("{}\n", valid_lines.join("\n"))
+        format!("{}\n", repaired_lines.join("\n"))
     };
     fs::write(&output, &repaired_text)
         .map_err(|err| format!("failed to write {}: {err}", output.display()))?;
@@ -11474,10 +11464,25 @@ fn repair_jsonl_file(args: &JsonlRepairArgs) -> Result<JsonlRepairReport, String
         invalid_output,
         backup,
         total_lines,
-        valid_lines: valid_lines.len(),
+        valid_lines,
+        output_lines: repaired_lines.len(),
+        recovered_lines,
+        recovered_values,
         invalid_lines: invalid_records.len(),
         applied: args.apply,
     })
+}
+
+fn recover_jsonl_values(line: &str) -> Result<Vec<String>, String> {
+    let mut recovered = Vec::new();
+    for value in serde_json::Deserializer::from_str(line).into_iter::<serde_json::Value>() {
+        let value = value.map_err(|err| err.to_string())?;
+        recovered.push(serde_json::to_string(&value).map_err(|err| err.to_string())?);
+    }
+    if recovered.len() < 2 {
+        return Err("line does not contain multiple complete JSON values".to_string());
+    }
+    Ok(recovered)
 }
 
 #[derive(Debug, Clone)]
@@ -14011,6 +14016,58 @@ mod tests {
                 .and_then(serde_json::Value::as_bool),
             Some(true)
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn jsonl_repair_recovers_concatenated_records() {
+        let root = cli_temp_root("jsonl_repair_recovers_concatenated_records");
+        let path = root.join("receipts.jsonl");
+        let output = root.join("repaired.jsonl");
+        let invalid_output = root.join("invalid.jsonl");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            &path,
+            concat!(
+                "{\"queueId\":\"q1\",\"status\":\"ok\"}\n",
+                "{\"queueId\":\"q2\",\"status\":\"ok\"}{\"queueId\":\"q3\",\"status\":\"ok\"}\n",
+                "{not-json}\n"
+            ),
+        )
+        .unwrap();
+
+        let report = repair_jsonl_file(&JsonlRepairArgs {
+            path: path.clone(),
+            output: Some(output.clone()),
+            invalid_output: Some(invalid_output.clone()),
+            apply: false,
+        })
+        .unwrap();
+
+        assert_eq!(report.total_lines, 3);
+        assert_eq!(report.valid_lines, 1);
+        assert_eq!(report.recovered_lines, 1);
+        assert_eq!(report.recovered_values, 2);
+        assert_eq!(report.output_lines, 3);
+        assert_eq!(report.invalid_lines, 1);
+        assert!(!report.applied);
+        assert!(report.backup.is_none());
+
+        let repaired_text = fs::read_to_string(output).unwrap();
+        let repaired_values = repaired_text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(repaired_values.len(), 3);
+        assert_eq!(repaired_values[0]["queueId"], "q1");
+        assert_eq!(repaired_values[1]["queueId"], "q2");
+        assert_eq!(repaired_values[2]["queueId"], "q3");
+
+        let invalid_text = fs::read_to_string(invalid_output).unwrap();
+        let invalid = serde_json::from_str::<serde_json::Value>(invalid_text.trim()).unwrap();
+        assert_eq!(invalid["lineNumber"], 3);
+        assert_eq!(invalid["raw"], "{not-json}");
+
         let _ = fs::remove_dir_all(root);
     }
 

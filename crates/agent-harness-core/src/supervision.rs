@@ -1,5 +1,4 @@
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -329,18 +328,13 @@ fn summarize(children: &[SupervisorChildEvaluation]) -> SupervisionSummary {
 }
 
 fn append_json_line(path: &Path, value: &impl Serialize) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    let line = serde_json::to_string(value).map_err(io::Error::other)?;
-    writeln!(file, "{line}")?;
-    Ok(())
+    crate::append_jsonl_value(path, value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]

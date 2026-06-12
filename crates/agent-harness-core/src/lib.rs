@@ -157,8 +157,9 @@ pub use importer::{
 };
 pub use logging::{
     HarnessLogEvent, HarnessLogLevel, HarnessLogRotationOptions, HarnessLogRotationReport,
-    HarnessLogRotationStatus, HarnessLogWrite, append_harness_log, current_log_time_ms,
-    harness_log_file, probe_harness_log_writable, rotate_harness_log_if_needed, write_json_atomic,
+    HarnessLogRotationStatus, HarnessLogWrite, append_harness_log, append_jsonl_value,
+    current_log_time_ms, harness_log_file, probe_harness_log_writable,
+    rotate_harness_log_if_needed, write_json_atomic,
 };
 pub use mcp::{McpRequestOptions, McpToolReceipt, handle_mcp_request};
 pub use memory::{

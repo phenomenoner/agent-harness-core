@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -797,13 +797,7 @@ fn write_delivery_state(state_file: &Path, state: &AgentProgressDeliveryState) -
 }
 
 fn append_json_line(path: &Path, value: &impl Serialize) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    let line = serde_json::to_string(value).map_err(io::Error::other)?;
-    writeln!(file, "{line}")?;
-    Ok(())
+    crate::append_jsonl_value(path, value)
 }
 
 fn render_action_line(event: &AgentProgressEvent, max_preview_chars: usize) -> String {
