@@ -1,307 +1,166 @@
-# Rust Agent Harness
+<div align="center">
 
-Minimal Rust/Windows agent harness for importing a legacy agent deployment and running channel-backed Codex turns.
+# Agent Harness Core
 
-The project starts with a small, testable foundation:
+**Self-hosted AI agent runtime in Rust. Run autonomous LLM agents over Telegram and Discord — with durable queues, fail-closed permissions, and an auditable receipt for every single step.**
 
-- Import planning for an existing legacy source home directory.
-- A core crate with data-layout detection logic for config, workspace prompts, agents, skills, sessions, native cron, deterministic cron, subagents, memory, and plugins.
-- A read-only importer dry-run report with Hermes-style conflict policy and receipts.
-- A read-only multi-agent registry parser for imported agents, providers, plugins, channels, and local agent state.
-- A target harness registry exporter that writes non-secret agent/provider/plugin/channel state with receipts.
-- An activation readiness checker that validates registry/channel/runtime/Codex/logging prerequisites before cutover.
-- A safe-copy import executor that copies planned non-sensitive state, skips raw secrets by default, backs up overwrite targets, and writes receipts.
-- A JSONL operational log at `state/logs/harness.jsonl` for activation checks, channel ingress, queue prepare, and Codex completion events.
-- A compact agent progress stream at `state/runtime-queue/progress-events.jsonl` with separate Telegram/Discord action and status messages, delivery receipts, and edit-in-place updates.
-- A shared channel command parser and runtime-intent contract for legacy-style DM commands.
-- A shared channel permission gate for Telegram/Discord DM and group/guild contexts with admin, limited, and open-limited modes.
-- A skill-first indexer and deterministic task matcher for source, imported, and bundled harness operation skills.
-- A turn planner that maps one inbound channel message to command handling, agent/session/model routing, imported channel command state, prompt files, and selected skills.
-- A shared channel runtime bridge that maps one Telegram/Discord-style DM into either an immediate command reply or an agent-turn dispatch envelope.
-- A deterministic channel command state writer for `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status` effects.
-- A channel receive handler that turns one DM into either command state/outbox records or a queued agent turn.
-- A channel run-once pipeline that handles one DM, runs the runtime when needed, and returns pending delivery work.
-- A channel outbox delivery planner/receipt ledger for Telegram/Discord delivery retry, including structured outbound attachments.
-- Telegram Bot API adapters: `telegram-probe` for non-consuming token/API readiness, `telegram-poll-once` for controlled smoke tests, `telegram-loop` for continuous polling with bounded consecutive-error handling, and native media delivery through `sendPhoto` / `sendDocument` for structured outbox attachments.
-- A Discord REST outbox sender that delivers pending Discord replies and attachments, splits messages over Discord's 2000-character content limit into multiple sends, records delivery receipts, and logs delivery summaries.
-- A Discord Gateway event normalizer that preserves reply references, writes `state/channels/discord-reply-context-receipts.jsonl` for handled reply-context captures, and keeps attachment URLs out of prompt context.
-- A durable runtime queue writer that appends channel agent turns to `state/runtime-queue/pending.jsonl` with receipts and planned transcript paths.
-- A runtime queue prepare worker that reads pending items, assembles prompt bundles, and writes execution receipts before the Codex adapter is connected.
-- A one-shot runtime pipeline that prepares, plans, runs Codex, records completion, and writes an agent reply to the shared channel outbox.
-- A supervised runtime queue loop that drains queued work with bounded in-process concurrency, idle exit, bounded consecutive-error handling, exclusive Windows runtime lease locking, terminal failure/cancel statuses, and a `loop-last.json` status file.
-- A Codex runtime planner that turns a prepared queue execution into an inspectable `codex app-server` invocation plan and output-path contract.
-- A Codex runtime preflight checker that validates the plan, executable, prompt files, output directories, and required environment variables before process start.
-- A Codex runtime launch probe that starts the planned app-server process, sends no prompt or JSON-RPC request, then stops it and records process receipts/log paths.
-- A Codex runtime runner that drives one prepared `codex app-server` JSONL turn, polls `/stop` cancel markers, records stdout/stderr logs plus token usage when provided by Codex, compacts noisy tool-call previews, splits assistant narration from final answers, bounds terminal child/stdout cleanup so a completed turn cannot hang receipt writing, recovers completed turns from existing stdout logs when a prior run missed terminalization, and writes legacy-compatible completion outputs.
-- A Codex completion recorder that writes final assistant output separately from `assistant_narration` transcript rows, trajectory audit events, and Codex binding files.
-- A prompt bundle assembler that turns an agent turn plan into inspectable agent context payloads, gives each known prompt file an explicit role header, wraps memory and inbound platform context as untrusted bounded sections, preserves reply/media metadata with truncation metadata for reply targets, and uses a per-session injection ledger to avoid repeating prompt files/skill bodies.
-- A Windows supervisor planner that writes Task Scheduler install/start/stop/uninstall scripts for runtime, worker, Telegram, and Discord loops without directly registering tasks; `--runtime-workers` now maps to in-process runtime concurrency on one `runtime-loop`.
-- A native agent-turn cron parser and dry-run dispatch planner with cutover hold safety.
-- A deterministic cron parser and no-LLM dry-run planner for workspace cron runners.
-- A subagent ledger parser and dry-run planner for `/subagents/runs.json` cutover safety.
-- A Minions-inspired worker dispatch MVP that unifies deterministic shell jobs, LLM subagent jobs, watchdog jobs, and master wakeups with durable SQLite persistence, leases, stale reaping, retry/backoff, shell audit, configurable global/per-agent/per-agent-channel/lane concurrency limits, optional rate leases, parent/child job groups, and artifact-pointer wakeups.
-- Cron/subagent worker enqueue adapters for native agent-turn cron, deterministic crontab/Supercronic-style cron, and imported subagent ledgers.
-- OpenClaw-compatible memory hook receipts for before-prompt recall, post-turn lifecycle, store proposals, memory slots, tool-result handoff, and canvas maintenance without modifying `openclaw-mem`.
-- OpenClawMem service-adapter and sidecar methods for `status`, `recall`, reviewed `propose`, approved `store`, per-agent writeback, receipts, and canvas input without pretending a live remote service exists when only snapshots were imported.
-- Operator ops commands for non-secret backup manifests/copies, readiness cutover receipts, and supervisor stop/start/status stop-file control.
-- A CLI crate with `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `channel-credentials-export`, `registry`, `registry-export`, `enable-check`, `status`, `jsonl-repair`, `memory-credentials-export`, `memory-search`, `memory-vector-search`, `memory-canvas-run`, `memory-hook`, `memory-service-status`, `memory-service-recall`, `memory-service-propose`, `memory-service-store`, `ops-backup`, `ops-cutover-receipt`, `ops-control`, `supervisor-plan`, `harness-skills-sync`, `skills`, `turn-plan`, `channel-step`, `channel-apply`, `channel-receive`, `channel-run-once`, `channel-outbox-plan`, `channel-delivery-record`, `progress-delivery-once`, `progress-delivery-loop`, `telegram-probe`, `telegram-poll-once`, `telegram-loop`, `discord-outbox-send-once`, `discord-event-run-once`, `discord-dm-history-probe`, `discord-gateway-probe`, `discord-gateway-loop`, `plugin-sidecar-probe`, `plugin-sidecar-call`, `queue-enqueue`, `queue-prepare`, `runtime-run-once`, `runtime-loop`, `worker-enqueue`, `worker-run-once`, `worker-loop`, `worker-status`, `worker-cancel`, `worker-reap-stale`, `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle`, `cron-plan`, `native-cron-enqueue`, `deterministic-cron-plan`, `deterministic-cron-enqueue`, `subagent-plan`, and `subagent-enqueue` commands.
-- Minimal external crates for current scope: `serde`/`serde_json` for stable JSON reports and `ureq` for the first Telegram/Discord REST smoke adapters.
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](rust-toolchain.toml)
+[![Edition 2024](https://img.shields.io/badge/edition-2024-red.svg)](Cargo.toml)
+[![Platform: Windows-first](https://img.shields.io/badge/platform-Windows--first-0078d4.svg)](#faq)
+[![Status: Pre-release](https://img.shields.io/badge/status-pre--release-yellow.svg)](CHANGELOG.md)
 
-## Current Live Validation
+[Quick Start](#quick-start) •
+[Features](#why-agent-harness-core) •
+[Architecture](#how-it-works) •
+[CLI](#cli-at-a-glance) •
+[Docs](#documentation) •
+[FAQ](#faq)
 
-As of 2026-06-12, the rebuilt live gateway is running the roadmap staging cutover on the repo-local `target\debug\agent-harness.exe` and reports `ready=true`, `passed=59`, `warnings=0`, `failed=0`; runtime `queued=128`, `open=0`, `prepared=128`, `completed=125`; and channel outbox `pending=0`, `delivered=194`, `retryable=0`, `invalid=0`. `timeout` is now terminal for parent runtime-turn selection, status open-item counts, native typing heartbeat context, and progress delivery state. A queued row plus a timeout run-once receipt no longer keeps the parent turn eligible for typing or progress resurrection; retrying a timed-out turn must use a new queue id. The repo-local `.agent-harness` home remains ignored by git. Use `.\harness.ps1 gateway status` for the current live value before tests or restarts. The regenerated supervisor plan has 6 tasks: one `runtime-loop` started with `--runtime-concurrency 12` plus worker, progress-delivery, Telegram, Discord outbox, and Discord gateway loops. Response narration defaults to `progress_panel`, so intermediate Codex assistant commentary updates the progress status while the final channel reply remains final-answer only. The current upgrade adds OpenRouter provider routing through generated harness-local Codex config, preserves explicit-provider slash model ids such as `anthropic/claude-sonnet-4`, scopes memory prompt/lifecycle/canvas artifacts per agent, exposes OpenClawMem snapshot-adapter status/recall/propose/store through both CLI and sidecar, and adds the P0-P7 roadmap operator gates: config validation, healthz, trace, metrics, deploy canary receipts, queue shadow compare, encrypted vault, security scans, schema registry, invariants, and release hygiene docs. Local verification passed `cargo fmt --all`, `cargo test -p agent-harness-cli --target-dir target\staging-test-cli` (16 CLI tests), `cargo test --workspace --target-dir target\staging-test-workspace` (203 core tests, 16 CLI tests, doctests), `agent-harness public-hygiene --root target\staging-public-hygiene\public-export`, `cargo build --workspace --target-dir target\deploy-build`, live `config-validate`, live `status`, and live `healthz --require-writable-state`.
+</div>
 
-Follow-up Discord typing triage on 2026-06-12 found a completed `codex app-server` turn whose stdout log contained final `item/completed` and `turn/completed` events, but whose runtime pipeline had not written `codex-runtime-run.json`, `run-once-receipts.jsonl`, an outbox reply, or a terminal progress event. The fix bounds app-server child/stdout cleanup after terminal events and adds completed-stdout recovery, so `/stop` is no longer the only escape hatch for a completed-but-unterminalized turn. Verification passed `cargo fmt --all`, `cargo test -p agent-harness-core run_codex_runtime_ --target-dir target\staging-test-core` (6 Codex runtime tests), and `cargo test -p agent-harness-core --target-dir target\staging-test-core` (203 core tests plus doctests).
+---
 
-The old `imports/activation-harness` tree is retained only as a pre-rebase backup. The old `imports/openclaw-core-snapshot` tree is retained as a legacy source archive and rollback reference. New runtime settings, state, receipts, databases, logs, prompt injection ledgers, secrets, and supervisor artifacts should live under `.agent-harness`.
+## What is Agent Harness Core?
 
-## Start Here: Topology And Docs
+Agent Harness Core is a **self-hosted AI agent harness written in Rust**: a runtime that connects chat channels (Telegram, Discord) to LLM coding agents (OpenAI Codex app-server, plus any model reachable through OpenRouter — Claude, GPT, Gemini, and more) through a durable job queue, bounded concurrency, and append-only JSONL receipts for every turn.
 
-For a new session, read this section first, then follow the pointers below instead of rediscovering the project from scratch.
+It is **not** another prompt-orchestration library. It is the **operations layer** for personal and small-team AI agents — the part that answers questions frameworks usually leave to you:
 
-Live topology:
+- What happens when the process dies mid-turn? *(durable queue + completed-turn recovery — the turn is not lost)*
+- Who is allowed to talk to my agent? *(fail-closed allow-lists per user, chat, channel, and guild)*
+- What exactly did the agent do at 03:12? *(append-only JSONL logs, receipts, transcripts, and trajectories for everything)*
+- How do I stop a runaway turn? *(`/stop` cancel markers honored by the runtime poll loop)*
 
-- Active harness home: `.agent-harness`.
-- Active prompt/config authority: `.agent-harness/workspace`, `.agent-harness/openclaw.json`, and `.agent-harness/harness-config.json`.
-- Runtime state: `.agent-harness/state`, including runtime queue, channel outbox, delivery receipts, progress events, worker SQLite store, logs, and supervisor artifacts.
-- Secrets: `.agent-harness/secrets`; never print or commit these files.
-- Legacy archives: `imports/openclaw-core-snapshot` and `imports/activation-harness`; treat them as historical/rollback inputs, not active authority.
-- Codex runtime cwd for live loops: `D:\Warehouse\Research\OpenClaw_WSL`; this is the Codex working directory, not the prompt-file authority.
-- Live process set: one bounded-concurrency `runtime-loop` plus `worker-loop`, `progress-delivery-loop`, `telegram-loop`, `discord-outbox-loop`, and `discord-gateway-loop`.
-- Runtime capacity policy: global 12, per-agent/group 6, per-agent-per-channel 3; the live runtime loop uses `--runtime-concurrency 12`.
-- Response UX: `response.assistantNarrationMode=progress_panel`; assistant narration goes to the editable progress current-step panel, final channel replies stay final-answer only.
-- OpenRouter routing: `/model openrouter/<provider-model-id>` and explicit provider defaults generate Codex config with `model_provider = "openrouter"` and require `OPENROUTER_API_KEY` at preflight without writing the secret to disk.
-- Per-agent memory scope: agent-specific prompt context, lifecycle, canvas, and capture-candidate artifacts live under `state/agents/<agent>/memory` and `agents/<agent>/memory` when an agent id is supplied; global paths remain available for legacy/no-agent calls.
-- OpenClawMem service mode: active `.agent-harness` currently reports `serviceMode=snapshot-adapter` and `qdrantEdgeMode=preserved-snapshot`; imported evidence includes Qdrant edge, SQLite, JSONL, and `openclaw-mem-engine/sunrise_state.json`, not a live remote service endpoint.
-- Public hygiened repo: `https://github.com/phenomenoner/agent-harness-core`; local public export staging lives under `.public-export/agent-harness-core`.
+Born as a ground-up Rust rebuild of a Docker-based legacy agent gateway ("OpenClaw"), it keeps full import compatibility with that ecosystem — agents, sessions, skills, cron jobs, subagents, and memory snapshots migrate in with dry-run reports and receipts.
 
-Operator command entrypoints:
+## Why Agent Harness Core?
 
-```powershell
-.\harness.ps1 gateway status
-.\harness.ps1 gateway start
-.\harness.ps1 gateway stop
-.\harness.ps1 gateway restart
-.\harness.ps1 gateway tail runtime 200
-.\harness.ps1 gateway tail telegram 200
-.\harness.ps1 gateway tail discord-gateway 200
+| | What you get |
+|---|---|
+| 🧾 **A receipt for everything** | Every ingress, queue write, model turn, delivery, and retry appends to JSONL ledgers. Reconstruct any incident after the fact — no black boxes. |
+| 📨 **Chat-native agents** | First-class Telegram Bot API and Discord (REST + Gateway) adapters: replies, media, attachments, message splitting, edit-in-place progress panels, and `/new` `/model` `/think` `/steer` `/stop` `/status` commands. |
+| 🔐 **Fail-closed by default** | DMs require explicit admin allow-lists; groups and guilds get admin / limited / open-limited policy tiers. Unknown senders never reach the model. |
+| ⚙️ **Durable, bounded work** | SQLite-backed worker dispatch with leases, retry/backoff, stale reaping, watchdogs, and concurrency limits per global / agent / channel / lane. A long Telegram turn never blocks a Discord turn. |
+| 🤖 **Model-agnostic routing** | Codex app-server executes turns; OpenRouter routing switches any conversation to e.g. `anthropic/claude-sonnet-4` with one `/model` command. Secrets are checked at preflight, never written to disk. |
+| 🧠 **Memory-aware** | OpenClaw-compatible memory hooks (recall, lifecycle capture, store proposals) with vector recall over imported SQLite embeddings — integrated via adapters, not forks. |
+| 📦 **Skills as runtime state** | Versioned, indexed `SKILL.md` runbooks are matched per turn and injected once per session via an injection ledger — no prompt bloat, no stale docs. |
+| 🪶 **Minimal dependencies** | Six crates: `serde`, `serde_json`, `ureq`, `rusqlite`, `ring`, `base64`. No tokio, no async runtime, no clap. Synchronous Rust you can read in an afternoon and audit forever. |
+| 🔑 **Encrypted secret vault** | Repo-local vault using PBKDF2-HMAC-SHA256 + ChaCha20-Poly1305; `vault-get` reports presence and length, never plaintext. |
+| 🔁 **Legacy migration built in** | Read-only dry-run import plans, conflict policies (skip/overwrite/rename), safe-copy execution that skips raw secrets by default, and cutover readiness gates. |
+
+## How It Works
+
+```mermaid
+flowchart LR
+    TG[Telegram Bot API] --> IN
+    DC[Discord Gateway / REST] --> IN
+    IN[Ingress + fail-closed\nallow-list gate] --> CMD{Command or\nagent turn?}
+    CMD -- "/model /status /stop ..." --> ST[Channel state\n+ command reply]
+    CMD -- ordinary message --> Q[(Durable runtime queue\npending.jsonl + leases)]
+    Q --> PB[Prompt bundle\nprompts + skills + memory]
+    PB --> CX[Codex app-server\nOpenAI / OpenRouter models]
+    CX --> OUT[(Channel outbox\n+ delivery receipts)]
+    OUT --> TG2[Telegram reply + media]
+    OUT --> DC2[Discord reply + attachments]
+    CX -.progress events.-> PR[Progress panel\nedit-in-place status]
+    W[(SQLite worker dispatch\ncron / subagents / watchdogs)] --> Q
+    ALL[every stage] -.appends.-> LOG[(JSONL logs, receipts,\ntranscripts, trajectories)]
 ```
 
-Documentation map:
-
-- [Development Handoff](docs/agent-harness-dev-handoff.md): technical architecture, current baseline, runtime flow, modules, and implementation priorities.
-- [Test Handoff](docs/agent-harness-test-handoff.md): step-by-step live Telegram/Discord test plan and expected receipts.
-- [Activation Readiness Plan](docs/activation-readiness-plan.md): activation gates, current readiness snapshot, and historical cutover notes.
-- [Feature Parity](docs/agent-harness-feature-parity.md) and [HTML Feature Parity](docs/agent-harness-feature-parity.html): implemented feature families, blocked items with required user actions, OpenRouter provider route status, per-agent memory isolation, and recommended development order.
-- [Assistant Narration Tech Note](docs/agent-harness-assistant-narration-tech-note.md): `off`, `progress_panel`, and `inline_preface` routing design and implementation notes.
-- [TG/Discord DM Self-Check Guide](docs/agent-harness-channel-self-check.md): operator prompt/checklist for asking `main` to self-check the live channel paths.
-- [Worker Dispatch Strategy](docs/agent-worker-dispatch-strategy.md): durable worker, cron, subagent, watchdog, and concurrency design.
-- [Round3-2 Implementation And Upgrade Plan](docs/round3-2-implementation-and-upgrade-plan.md): timeout/progress fixes, background-job contract, long-task contract, and Hermes-style learning-loop roadmap.
-- [Project Assessment](docs/project-assessment.md): broader historical assessment; prefer the handoff/parity/readiness docs above for current live state.
+The harness owns ingress, permissions, queuing, prompt assembly, delivery, and audit. **Codex owns the model**: system prompt, tool schemas, MCP, sandbox, approvals, and session continuity. That split keeps the harness small, deterministic, and testable — 200+ tests run without any model call, using a bundled fake Codex app-server.
 
 ## Quick Start
 
 ```powershell
+# Build and verify (no model account needed)
 cargo test
 cargo run -p agent-harness-cli -- doctor
-cargo run -p agent-harness-cli -- import-plan --source-home C:\path\to\.openclaw
+
+# Import an existing OpenClaw-style deployment (read-only dry run first)
 cargo run -p agent-harness-cli -- import-dry-run --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --conflict skip --output imports\dry-run
 cargo run -p agent-harness-cli -- import-execute --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --conflict skip
-cargo run -p agent-harness-cli -- registry --source-home C:\path\to\.openclaw
-cargo run -p agent-harness-cli -- registry-export --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --conflict skip
-cargo run -p agent-harness-cli -- channel-credentials-export --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --include-sensitive
+
+# Check channel + runtime readiness, then go live
 cargo run -p agent-harness-cli -- telegram-probe --target-home C:\path\to\.agent-harness
-cargo run -p agent-harness-cli -- harness-skills-sync --target-home C:\path\to\.agent-harness
 cargo run -p agent-harness-cli -- enable-check --target-home C:\path\to\.agent-harness
 cargo run -p agent-harness-cli -- status --target-home C:\path\to\.agent-harness --json
-cargo run -p agent-harness-cli -- jsonl-repair --path C:\path\to\.agent-harness\state\runtime-queue\run-once-receipts.jsonl
-cargo run -p agent-harness-cli -- memory-hook --target-home C:\path\to\.agent-harness --hook before-prompt-build --agent main --session smoke --query "memory smoke"
-cargo run -p agent-harness-cli -- ops-backup --target-home C:\path\to\.agent-harness --label pre-cutover
-cargo run -p agent-harness-cli -- ops-cutover-receipt --target-home C:\path\to\.agent-harness --note "pre-cutover readiness"
-cargo run -p agent-harness-cli -- worker-status --target-home C:\path\to\.agent-harness
-cargo run -p agent-harness-cli -- supervisor-plan --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --harness-cli C:\path\to\agent-harness.exe --codex-exe C:\path\to\codex.cmd --agent main
-cargo run -p agent-harness-cli -- skills --source-home C:\path\to\.openclaw --query "repair memory cron" --agent mem-cron --limit 3
-cargo run -p agent-harness-cli -- skills --harness-home C:\path\to\.agent-harness --output imports\skills
-cargo run -p agent-harness-cli -- turn-plan --source-home C:\path\to\.openclaw --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron"
-cargo run -p agent-harness-cli -- channel-step --source-home C:\path\to\.openclaw --platform discord --channel-id dm-123 --user-id user-456 --agent main --message "/status channels" --output imports\channel
-cargo run -p agent-harness-cli -- channel-apply --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "/model openrouter/anthropic/claude-sonnet-4"
-cargo run -p agent-harness-cli -- channel-receive --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "continue with the selected model"
-cargo run -p agent-harness-cli -- channel-run-once --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "continue with the selected model" --codex-exe C:\path\to\codex.exe
-cargo run -p agent-harness-cli -- channel-outbox-plan --target-home C:\path\to\.agent-harness --platform telegram --limit 20
-cargo run -p agent-harness-cli -- telegram-poll-once --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --agent main --codex-exe C:\path\to\codex.exe --poll-timeout-seconds 1 --max-updates 10
-cargo run -p agent-harness-cli -- telegram-loop --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --agent main --codex-exe C:\path\to\codex.exe --iterations 0 --idle-ms 1000 --max-consecutive-errors 5
-cargo run -p agent-harness-cli -- discord-outbox-send-once --target-home C:\path\to\.agent-harness --outbox-limit 20
-cargo run -p agent-harness-cli -- turn-plan --source-home C:\path\to\.openclaw --harness-home C:\path\to\.agent-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "continue with the selected model"
-cargo run -p agent-harness-cli -- queue-enqueue --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron"
-cargo run -p agent-harness-cli -- queue-prepare --target-home C:\path\to\.agent-harness
-cargo run -p agent-harness-cli -- runtime-run-once --target-home C:\path\to\.agent-harness --codex-exe C:\path\to\codex.exe --timeout-ms 300000
-cargo run -p agent-harness-cli -- runtime-loop --target-home C:\path\to\.agent-harness --codex-exe C:\path\to\codex.exe --runtime-concurrency 3 --iterations 0 --idle-ms 1000 --max-consecutive-errors 5
-cargo run -p agent-harness-cli -- progress-delivery-loop --target-home C:\path\to\.agent-harness --iterations 0 --idle-ms 1000 --max-consecutive-errors 5
-cargo run -p agent-harness-cli -- codex-plan --target-home C:\path\to\.agent-harness --codex-exe C:\path\to\codex.exe
-cargo run -p agent-harness-cli -- codex-preflight --target-home C:\path\to\.agent-harness
-cargo run -p agent-harness-cli -- codex-launch-probe --target-home C:\path\to\.agent-harness --startup-probe-ms 750
-cargo run -p agent-harness-cli -- codex-run --target-home C:\path\to\.agent-harness --timeout-ms 300000
-cargo run -p agent-harness-cli -- codex-complete --target-home C:\path\to\.agent-harness --assistant-message "Smoke completion recorded."
-cargo run -p agent-harness-cli -- prompt-bundle --source-home C:\path\to\.openclaw --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron" --output imports\prompt
-cargo run -p agent-harness-cli -- cron-plan --source-home C:\path\to\.openclaw --output imports\cron
-cargo run -p agent-harness-cli -- native-cron-enqueue --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --resume-cron --master-agent main
-cargo run -p agent-harness-cli -- deterministic-cron-plan --workspace C:\path\to\workspace --output imports\deterministic-cron
-cargo run -p agent-harness-cli -- deterministic-cron-enqueue --workspace C:\path\to\workspace --target-home C:\path\to\.agent-harness --allow-deterministic-run --dry-run-shell --master-agent main
-cargo run -p agent-harness-cli -- subagent-plan --source-home C:\path\to\.openclaw --output imports\subagents
-cargo run -p agent-harness-cli -- subagent-enqueue --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --resume-subagents --master-agent main
 ```
 
-If `cargo` is not visible in a newly opened terminal, restart the terminal or use:
+Want to smoke-test the full pipeline offline? Pass `--codex-exe tools\agent-fake-codex-app-server\fake-codex-app-server.cmd` to `channel-run-once` and exercise prompt assembly, receipts, transcripts, and outbox delivery without a single model request.
 
-```powershell
-$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
-```
+The full ~70-command walkthrough — every importer, channel, queue, runtime, worker, cron, subagent, memory, and ops command with arguments — lives in the [Operations Handbook](docs/agent-harness-operations-handbook.md).
 
-## Current Direction
+## CLI at a Glance
 
-The recommended path is a Rust harness core that delegates native coding-agent execution to Codex app-server, keeps legacy-compatible workspace/session/memory import semantics, and initially bridges legacy plugins through a sidecar instead of reimplementing the full TypeScript plugin SDK.
+One binary, `agent-harness`, grouped into clear families:
 
-Skills are first-class runtime state, not documentation leftovers. The importer preserves legacy source workspace skills, managed legacy skills, and project `.agents/skills`; `harness-skills-sync` also seeds bundled harness operation skills under `skills/agent-harness-core/*` with a manifest so user-modified copies are not overwritten unless `--force` is explicit. The bundled harness operation skill is the versioned runbook for how agents should operate this harness, following the Hermes practice of keeping agent operating lead in skills that are updated with the harness instead of only in static docs. Runtime turn planning uses a merged skill index across source, imported, and bundled harness skills. Agent-created skill propose/patch/archive flows are still pending.
+| Family | Commands | What they do |
+|---|---|---|
+| **Import & registry** | `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `channel-credentials-export` | Migrate a legacy agent deployment with dry-run reports, conflict policies, and redacted credential receipts. |
+| **Channels** | `channel-receive`, `channel-run-once`, `channel-outbox-plan`, `telegram-probe`, `telegram-loop`, `discord-gateway-loop`, `discord-outbox-send-once`, … | Telegram/Discord ingress, permission gating, slash commands, outbox delivery with retry ledgers. |
+| **Runtime & queue** | `queue-enqueue`, `queue-prepare`, `runtime-run-once`, `runtime-loop`, `progress-delivery-loop` | Durable agent-turn queue, bounded-concurrency runtime loop, live progress panels. |
+| **Codex pipeline** | `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle` | Plan → preflight → launch → run → record, each stage inspectable and receipt-backed. |
+| **Workers & scheduling** | `worker-enqueue`, `worker-loop`, `worker-status`, `cron-plan`, `native-cron-enqueue`, `deterministic-cron-plan`, `subagent-plan`, … | SQLite-durable jobs: LLM subagents, no-LLM deterministic shell cron, watchdogs, master wakeups. |
+| **Memory** | `memory-hook`, `memory-search`, `memory-vector-search`, `memory-service-status/recall/propose/store` | OpenClaw-compatible memory hooks and vector recall over imported snapshots. |
+| **Ops & security** | `status`, `enable-check`, `healthz`, `ops-backup`, `ops-control`, `supervisor-plan`, `vault-put`/`vault-get`, `public-hygiene`, `invariants`, `schema-registry` | Health, cutover gates, backups, Windows Task Scheduler supervision plans, encrypted vault, release hygiene. |
 
-Codex remains the owner of the model system prompt, built-in tool schemas, MCP tools, sandbox, approvals, and session continuity. The Rust harness only builds the agent turn payload: runtime context, channel command state, imported prompt files, matched skills, untrusted inbound platform context, and the inbound user message. Prompt file injection includes an explicit role header for each known file, such as `AGENTS.md` for workspace operating instructions, `SOUL.md` for persona/voice, `TOOLS.md` for tool policy, `USER.md` for user preferences, `IDENTITY.md` for agent identity, `HEARTBEAT.md` for cadence/liveness guidance, and `BOOTSTRAP.md` for startup context. Skills remain dynamic task context: status/command turns may legitimately show `Skills: 0 selected`, while ordinary agent turns select and inject relevant `SKILL.md` bodies on demand. Telegram replies/media and Discord replies/attachments are passed as a separate `InboundContext` prompt section before the user message; reply targets include preview, bounded full text, source, length, and truncation metadata when the platform payload exposes text. Raw Telegram file IDs and Discord attachment URLs are not injected. When a harness home is available, `prompt-bundle` and `queue-prepare` use `state/prompt-injection-ledgers/<agent>/<session>.json` so the same session only receives unchanged prompt files or skill bodies once; later turns receive a compact continuity note and rely on the Codex backend session to retain prior context.
+## Design Principles
 
-Cron and subagents are not copied as separate legacy-style runners. The imported container deployment has two cron source lanes: native `.openclaw/cron` agent-turn cron that may create LLM-backed work, and extended deterministic crontab/Supercronic-style cron from workspace runner directories that must stay no-LLM. The P4 path now runs through unified Agent Worker Dispatch, inspired by gbrain Minions for durable worker semantics only: both cron lanes and LLM subagents share two-phase persistence, leasing, retry/backoff, timeout, audit, harness-configurable global/per-agent/per-agent-channel/lane concurrency limits, optional rate leases, parent/child job handling, watchdog status checks, and master-agent wakeups with artifact pointers. The memory strategy remains the harness memory-adapter design, not gbrain's. See [Agent Worker Dispatch Strategy](docs/agent-worker-dispatch-strategy.md).
+1. **Receipts over trust.** Two-phase persistence: intent is written before side effects, results are written after. If it isn't in a ledger, it didn't happen.
+2. **Deterministic before generative.** Slash commands, permission checks, cron planning, and queue mechanics never call a model. Only ordinary agent turns do.
+3. **Fail closed.** No allow-list match, no model access. Missing credentials fail at preflight, not mid-turn.
+4. **Small surface, sync Rust.** No async runtime, no macro-heavy frameworks. Boring code that one person can fully audit.
+5. **The model backend is a contractor, not a roommate.** The harness assembles payloads and records outcomes; Codex keeps its own session, tools, and sandbox.
 
-The first importer command is intentionally read-only. `import-dry-run` produces a structured migration report, flags conflicts, supports `skip`, `overwrite`, and `rename` policies, and can write `report.json` plus `summary.md` when `--output` is provided.
+## Project Status
 
-`import-execute` applies the same plan as safe copy. It copies prompt files, skills, agent directories, sessions, cron stores, subagent ledgers, memory snapshots, and plugin records when planned. Raw sensitive items are skipped by default, sensitive files inside copied directories are omitted, and `--include-sensitive` is required to copy raw config/auth/plugin-state. `overwrite` creates `.bak` receipts before replacing a destination.
+Pre-release, under active development, and **live-validated daily**: the reference deployment runs a single supervised runtime loop (concurrency 12) plus worker, progress, Telegram, and Discord loops, with hundreds of delivered turns on record. Current verification: 203 core tests + 16 CLI tests + doctests, `cargo fmt` clean.
 
-The registry command is also read-only. It merges `openclaw.json` agent config with `/agents/<id>` directories and reports per-agent model/provider/workspace plus local session/auth/model state.
+See the [Changelog](CHANGELOG.md), the [Roadmap & Backlog](docs/agent-harness-core-roadmap-backlog.md), and the [Activation Readiness Plan](docs/activation-readiness-plan.md) for what's done, gated, and next.
 
-`registry-export` writes the first target harness state files under `state/harness-registry.json` and `state/harness-registry-receipts.json`. It records credential presence as metadata only; it does not copy raw API keys, tokens, or login state.
+## Documentation
 
-`channel-credentials-export` is the explicit channel-secret handoff path. It reads Telegram/Discord bot tokens plus known allow-list, chat, channel, and guild IDs from an existing legacy source `openclaw.json` and writes them to the target harness `secrets/channel-credentials.env` only when `--include-sensitive` is passed. Receipts in `secrets/channel-credentials-receipts.json` stay redacted and record names, source paths, lengths, and export status, not raw values. The live Telegram and Discord ingress adapters enforce those imported ID allow-lists before a message can enter `channel-run-once`. DMs fail closed and require an admin user id (`AGENT_HARNESS_TELEGRAM_ADMIN_USER_IDS` or `AGENT_HARNESS_TELEGRAM_ALLOWED_USER_IDS`; `AGENT_HARNESS_DISCORD_ADMIN_USER_IDS` or `AGENT_HARNESS_DISCORD_ALLOWED_USER_IDS`). Configured groups/guild channels can grant admin users full control, limited users ordinary-message and read-only command access, or open-limited access when explicitly enabled.
+| Document | What's inside |
+|---|---|
+| [Operations Handbook](docs/agent-harness-operations-handbook.md) | **Start here for operating the harness** — live topology, full command walkthrough, capability ledger. |
+| [Development Handoff](docs/agent-harness-dev-handoff.md) | Architecture, runtime flow, module map, implementation priorities. |
+| [Configuration](docs/configuration.md) | `harness-config.json` reference. |
+| [Worker Dispatch Strategy](docs/agent-worker-dispatch-strategy.md) | Durable workers, cron lanes, subagents, watchdog design. |
+| [Trust Boundaries](docs/trust-boundaries.md) | Where untrusted input enters and how it's bounded. |
+| [Invariants](docs/invariants.md) & [Schema Registry](docs/schema-registry.md) | The contracts the test suite enforces. |
+| [Test Handoff](docs/agent-harness-test-handoff.md) | Step-by-step live Telegram/Discord test plan. |
+| [Release Checklist](docs/release-checklist.md) & [SECURITY.md](SECURITY.md) | Release gates and security policy. |
 
-`harness-skills-sync` writes the bundled `agent-windows-harness` skill and `.agent-harness-builtins.json` manifest into the target harness home. It follows the Hermes-style bundled-skill safety rule: current files are left alone, manifest-matched old files are updated, user-modified files are skipped unless `--force` is set.
+## FAQ
 
-`enable-check` is the formal cutover readiness report. It checks the exported registry, enabled agents, Telegram/Discord token presence and imported access-policy ID lists when those channels are enabled, provider credentials, plugin sidecar blockers, runtime queue receipts, channel outbox/state, Telegram getMe probe evidence, Telegram offset state, Telegram/Discord adapter log evidence, Codex auth, memory-adapter status, and whether `state/logs/harness.jsonl` is writable. It appends an activation event to that log every time it runs.
+**Which LLMs can I use?**
+Any model Codex app-server can drive: OpenAI models natively, and the whole OpenRouter catalog (Anthropic Claude, Google Gemini, Meta Llama, …) via `/model openrouter/<provider-model-id>`. Switching models is a chat command, not a redeploy.
 
-`status` is the operator health summary for handoff and monitoring. It aggregates readiness, queued/open/prepared/completed runtime work, the latest non-idle runtime receipt, channel outbox delivery state, Telegram/Discord smoke evidence, Discord reply-context receipts, memory backend presence, active recall backend, Qdrant parity state, capture candidate count, plugin sidecar receipts, and operational log event coverage. `open` excludes terminal runtime statuses such as `failed-terminal` and `canceled`; use `latestNonIdleRunOnce` to avoid being misled by the idle `run-once-last.json` tick. Use `--json` when a scheduled task or monitor needs machine-readable output.
+**Does it run on Linux or macOS?**
+The core library and CLI are portable Rust, but the project is currently **Windows-first**: the supervisor planner targets Windows Task Scheduler and runtime lease locking uses exclusive Windows file handles. Cross-platform supervision is on the roadmap.
 
-`supervisor-plan` writes a Windows Task Scheduler handoff bundle under `state/supervisor/windows-scheduled-tasks` by default. It generates one `runtime-loop` runner script, maps `--runtime-workers <n>` to that script's `--runtime-concurrency <n>`, and also generates `progress-delivery-loop`, `telegram-loop`, `discord-outbox-loop`, `discord-gateway-loop`, and `worker-loop`, plus install/start/stop/uninstall scripts and `supervisor-plan.json`. The live plan intentionally avoids multiple blind runtime-loop processes; one runtime-loop owns scheduling and uses runtime leases plus the configured global/per-agent/per-agent-channel limits to run bounded concurrent Codex tasks. It uses stop files for graceful loop shutdown and writes absolute paths so tasks do not depend on the scheduler working directory. It does not register or start tasks by itself.
+**Do I need Telegram or Discord?**
+No. Every pipeline stage is a CLI command — you can enqueue, run, and inspect agent turns entirely from a terminal or your own scheduler.
 
-Runtime operations write an append-only JSONL operational log at `state/logs/harness.jsonl`. Current events include activation checks, Telegram getMe probes, Telegram poll-once summaries, `channel-receive`, `queue-prepare`, `runtime-run-once`, `runtime-loop`, `progress.delivery-once`, `codex-run`, `codex-complete`, and channel delivery receipts, with level, component, event name, message, queue id, session key, agent/channel ids, and relevant paths. This complements receipts and transcript/trajectory files and is the file to tail for monitoring/debugging.
+**Is my data sent anywhere besides the model provider?**
+No. The harness is fully self-hosted: state is local JSONL/SQLite under your harness home, secrets stay in env files or the encrypted vault, and the only network calls are to your chat platforms and your chosen model endpoint.
 
-Agent progress streaming is a separate compact status lane. Runtime pipeline writes `todo`, `skill_view`, `terminal`, `assistant_narration`, and terminal `run` events to `state/runtime-queue/progress-events.jsonl`; low-value `assistant_stream` deltas are suppressed. Codex tool/event previews are extracted from explicit command/path/query/name fields; raw JSON event wrappers, output-only delta payloads, and long PowerShell executable paths are compacted or skipped instead of being rendered as noisy tool lines. `progress-delivery-loop` renders the latest events for each queue item as two provider messages when possible: an action stream message such as `terminal: cargo test ...` and a following status message such as `Working - 9 min - running tools`, with the latest assistant narration rendered as `Current step: ...`; later the status becomes `Done - ...` or `Failed - ...`. Each lane has its own edit cursor, rate limit, delivery receipt, and fallback replacement send. Permission-denied progress deliveries advance the delivery cursor so Telegram status messages do not repeat indefinitely for the same skipped event.
+**How is this different from LangChain-style agent frameworks?**
+Those help you *compose prompts and tools inside* an agent. Agent Harness Core sits *around* agents: ingress, permissions, durable queuing, concurrency, delivery, audit, and recovery. Use both if you like — the harness doesn't care how the model thinks, only that every step is gated and recorded.
 
-Telegram and Discord adapters share the same channel command parser, permission gate, and intent mapper. Current parser coverage is `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status`; slash commands tolerate whitespace after `/`. `/think` accepts the standard `minimal`, `low`, `medium`, `high` levels plus `xhigh` aliases such as `x-high`, `extra-high`, `very-high`, and Chinese `超高`/`最高` when the active model route supports the extra-high level. `/model` maps to show-or-switch model intents, and `/status` maps to scoped or global status intents. Limited group/guild users may send ordinary messages and query `/status`, `/model`, or `/think`, but cannot switch model/thinking state or mutate session state. Normal Telegram/Discord outbox replies use a short plain-text `◆ Agent` header; progress messages keep their compact action/status format.
+**Is it production-ready?**
+It's pre-release. It runs a real daily-driver deployment with hundreds of completed turns, but interfaces may change and some release gates (e.g. long-horizon parity evidence, advisory audits) are still being collected. Read [SECURITY.md](SECURITY.md) before exposing it to anyone you don't trust.
 
-`turn-plan` is the first runtime-facing dry run. It does not call a model or execute tools. It proves the shared pre-dispatch path: parse channel commands before ordinary messages, route to an imported agent, compute or inherit the active session key, surface provider/model policy, list prompt files, and select relevant skills for prompt assembly. When `--harness-home` is provided, it reads channel command state and selects from the merged runtime skill index so `/new`, `/think`, `/steer`, `/btw`, `/model`, and `/stop` can affect the next ordinary turn.
+## Security
 
-`channel-step` is the shared channel bridge that Telegram and Discord adapters should call after receiving a DM. It consumes the same turn plan and writes `channel-step.json`. Command turns such as `/status` and `/model` produce immediate outbound command replies plus typed command effects. Plain user messages produce an agent-turn dispatch envelope for the future runtime queue and no immediate model call.
+Secrets never enter receipts or logs; exports redact by default and `--include-sensitive` must be explicit. Inbound platform text is wrapped as bounded, untrusted context — never trusted instructions. See [SECURITY.md](SECURITY.md) for the reporting process and current posture.
 
-`channel-apply` persists the command side of `channel-step`. It writes per-channel/user state under `state/channels/<platform>/<channel-id>/<user-id>/state.json`, appends command events to `events.jsonl`, appends receipts to `state/channels/command-apply-receipts.jsonl`, and returns the outbound command reply text. It handles `/new`, `/think`, `/stop`, `/steer`, `/btw`, `/model`, and `/status` without enqueueing an agent turn or calling a model. `/stop` also writes a bounded runtime cancel marker for the active session so a running Codex app-server turn can be interrupted on the runtime poll loop. The next `turn-plan`, `queue-enqueue`, and `queue-prepare` pass can read that state and apply active session/model override plus steering/think/btw context.
+## License
 
-`channel-receive` is the single-message ingress contract for future Telegram and Discord adapters. It builds the same channel step, applies command turns into channel state and `state/channels/outbox.jsonl`, or queues ordinary agent turns into `state/runtime-queue/pending.jsonl`. It writes `state/channels/receive-receipts.jsonl` for retry/audit and never calls a model directly.
+Dual-licensed under either of:
 
-`channel-run-once` is the single-message smoke and future adapter entrypoint. It calls `channel-receive`, runs `runtime-run-once` for ordinary agent turns, then returns a `channel-outbox-plan` view for delivery. Command messages never enter the model path; ordinary messages may start `codex app-server` and make a model request. For offline smoke, pass `--codex-exe tools\agent-fake-codex-app-server\fake-codex-app-server.cmd` to exercise prompt assembly, runtime receipts, transcript/trajectory writes, and outbox generation without a model request.
+- **MIT License** ([LICENSE-MIT](LICENSE-MIT) or https://opensource.org/licenses/MIT)
+- **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE) or https://www.apache.org/licenses/LICENSE-2.0)
 
-`channel-outbox-plan` reads `state/channels/outbox.jsonl`, filters by platform, excludes delivered messages, and returns retryable pending messages with stable delivery ids, attempt counts, and last delivery status. `channel-delivery-record` appends delivered/failed receipts to `state/channels/delivery-receipts.jsonl` and logs delivery events. Telegram and Discord adapters should use this shared ledger so command replies and agent replies follow the same retry/audit path.
-
-`telegram-probe` is the non-consuming Telegram readiness check. It reads `TELEGRAM_BOT_TOKEN` from the environment or `secrets/channel-credentials.env`, calls Bot API `getMe`, writes `state/channels/telegram-probe.json`, appends `state/channels/telegram-probe-receipts.jsonl`, and logs `telegram.probe`. It does not call `getUpdates` and does not send messages.
-
-`telegram-poll-once` is the first real Telegram Bot API smoke adapter. It reads `TELEGRAM_BOT_TOKEN` and imported Telegram user/chat allow-lists from the environment or `secrets/channel-credentials.env`, stores the next update offset state at `state/channels/telegram-offset.json` after every successful poll, denies non-allowed direct/group updates before runtime dispatch, normalizes allowed text/caption/media updates into `channel-run-once`, preserves reply/media metadata as bounded untrusted inbound context, includes reply-target text length/source/truncation metadata plus up to 4000 characters of referenced text when Telegram supplies it, delivers pending Telegram outbox text through `sendMessage`, delivers structured image/document attachments through `sendPhoto` or `sendDocument`, records delivery receipts, and logs a `telegram.poll-once` summary.
-
-`telegram-loop` wraps the same poll-once core in a continuous polling loop with `--iterations`, `--idle-ms`, `--max-consecutive-errors`, and optional `--stop-file`. Use `--iterations 1` or another finite count for controlled tests and `--iterations 0` for an operator-run handoff loop.
-
-`discord-outbox-send-once` is the first Discord delivery adapter. It reads `DISCORD_BOT_TOKEN` from the environment or `secrets/channel-credentials.env`, sends pending `platform=discord` outbox messages and structured attachments through Discord's channel message REST endpoint, splits text over Discord's 2000-character content limit into multiple sends, records delivery receipts, and logs a `discord.outbox-send-once` summary.
-
-`discord-event-run-once` normalizes one Discord Gateway `MESSAGE_CREATE` event into the shared channel pipeline after enforcing imported Discord user/channel/guild allow-lists. Discord DMs are checked by admin user id; guild messages are checked by guild, channel, and admin/limited/open-limited policy when those lists are configured. Reply references and attachment metadata are preserved as bounded untrusted inbound context without injecting attachment URLs; when Discord includes `referenced_message.content`, the prompt context includes preview, source, length, truncation metadata, and up to 4000 characters of referenced text. Successfully handled reply events also append `state/channels/discord-reply-context-receipts.jsonl` with referenced ids, source availability, content length/truncation, attachment count, and embed count. Attachment-only messages are converted into a placeholder user message plus inbound context instead of being dropped. `discord-gateway-probe` and `discord-gateway-loop` provide the Node WebSocket receive wrapper for operator-run live handoff. The gateway loop accepts `--stop-file` through the CLI wrapper and closes the WebSocket cleanly when the file appears.
-
-`queue-enqueue` persists the agent-turn side of `channel-step`. It appends queued turns to `state/runtime-queue/pending.jsonl`, appends every queued/skipped attempt to `state/runtime-queue/receipts.jsonl`, and precomputes legacy-compatible transcript and trajectory paths under `agents/<agent-id>/sessions/`. Command-only channel steps are recorded as skipped receipts and are not sent to the agent queue.
-
-`queue-prepare` reads one queued runtime item, rebuilds the turn context from its stored source/session metadata, assembles `prompt-bundle.json` plus `prompt.md` under `state/runtime-queue/executions/<queue-id>/`, and writes `execution-receipt.json` plus `execution-receipts.jsonl`. Prompt files, skills, and registry state are resolved from the imported legacy source home `workspace` when it exists, even when the queued item carries a separate runtime workspace for Codex cwd. If the runtime workspace has no prompt files but the imported workspace does, turn planning falls back to the imported workspace and surfaces that in the plan so `/status` no longer reports `Prompt files 0/7` just because Codex cwd is different. It uses the merged runtime skill index and the prompt injection ledger, so unchanged prompt files and skill bodies are not repeated in the same session. It treats existing `Prepared` receipts as idempotence state, skips already prepared queue ids during automatic selection, and returns `AlreadyPrepared` when an operator explicitly requests a prepared `--queue-id`. This is the handoff point for the Codex app-server worker; it does not call a model by itself.
-
-`runtime-run-once` is the first worker-facing pipeline. It calls `queue-prepare`, `codex-plan`, and `codex-run` for one queued or already prepared item, writes `state/runtime-queue/run-once-last.json`, appends `run-once-receipts.jsonl`, and writes a `kind=agent-reply` message to `state/channels/outbox.jsonl` when a fresh assistant reply is recorded. It reads structured transcript rows so memory lifecycle recording uses final assistant text, while channel output follows the configured assistant narration mode. A standalone `MEDIA:<path>` line in the final assistant output is converted into a structured outbox attachment and removed from the text body so Telegram/Discord adapters can send native media instead of plain directive text. This is the core function a Telegram or Discord adapter can call after enqueueing a normal DM. If `codex-run` reports an already recorded completion, it skips the outbox write to avoid duplicate delivery. If an interrupted previous run left a stdout log with a `turn/completed` event but no run receipt, `codex-run` recovers the final answer and terminal receipt from that log instead of relaunching the turn.
-
-`runtime-loop` wraps `runtime-run-once` for operator handoff or a Windows scheduled-task wrapper. It drains queued runtime work until `--iterations` is reached, `--stop-when-idle` sees an idle queue, `--stop-file` appears, or `--max-consecutive-errors` is exceeded. `--runtime-concurrency <n>` enables one loop process to run up to `n` in-flight Codex runtime tasks after inspecting claimable queue ids. Runtime leasing uses `state/runtime-queue/runtime-leases.json` plus an exclusive `runtime-leases.lock` handle on Windows, then releases the lease after completion, terminal failure, cancellation, or no-work exit. The lease policy enforces the configured global/per-agent/per-agent-channel limits, so a long Telegram turn no longer has to block a Discord turn, and vice versa, when capacity is available. `NoWork`, `NoPreparedExecution`, already recorded completions, `failed-terminal`, and `canceled` are treated as terminal/idle outcomes for loop control so the worker does not poison-retry the latest failed or completed execution. It writes `state/runtime-queue/loop-last.json` with `runtimeConcurrency` and appends `runtime.loop-stopped` plus `runtime.loop-error` events to `state/logs/harness.jsonl`.
-
-`progress-delivery-once` and `progress-delivery-loop` send the compact runtime progress lane to Telegram/Discord. They read `state/runtime-queue/progress-events.jsonl`, re-check the same channel permission policy as ingress before delivery, send separate body/status provider messages, edit each lane for later updates when possible, and fall back to a replacement send if the provider edit fails. Delivery cursor state lives at `state/channels/progress-delivery-state.json`; receipts live at `state/channels/progress-delivery-receipts.jsonl`.
-
-Assistant narration routing is configured under `response` in `.agent-harness/harness-config.json`:
-
-```json
-{
-  "response": {
-    "assistantNarrationMode": "progress_panel",
-    "assistantNarrationMaxChars": 500,
-    "assistantNarrationProgressMinUpdateMs": 2500,
-    "assistantNarrationFinalPrefix": "Work log"
-  }
-}
-```
-
-Supported modes are `off`, `progress_panel`, and `inline_preface`. The default `progress_panel` stores narration for audit, sends compact commentary to the editable progress status, keeps channel `agent-reply` text final-answer only, and records memory lifecycle from the final assistant text rather than narration.
-
-`codex-plan` reads the latest prepared execution or an explicit `--execution-dir`, writes `codex-runtime-plan.json` plus `codex-runtime-receipt.json`, and appends `codex-runtime-receipts.jsonl`. It plans a stdio `codex app-server` invocation, model/env requirements, and legacy-compatible transcript/trajectory/Codex binding output paths. It still does not start Codex or make a model request.
-
-`codex-preflight` reads the latest `codex-runtime-plan.json`, or an explicit `--execution-dir`/`--plan-file`, and writes `codex-runtime-preflight.json` plus `codex-runtime-preflight-receipts.jsonl`. It checks that the Codex executable can be resolved, prompt files exist, output parents stay under the harness home and are writable, and provider credentials are present. OpenAI/Codex routes accept either `OPENAI_API_KEY` or local Codex OAuth auth state; OpenRouter routes still require `OPENROUTER_API_KEY`. It still does not start Codex or make a model request.
-
-`codex-launch-probe` re-runs preflight, starts the planned app-server process only when preflight is ready, sends no JSON-RPC request and no prompt, waits for `--startup-probe-ms`, then terminates and waits for the child process. It writes `codex-runtime-launch-probe.json`, appends `codex-runtime-launch-receipts.jsonl`, and keeps stdout/stderr logs under the prepared execution directory. This proves process supervision before the worker starts real model-backed turns.
-
-`codex-run` re-runs preflight, skips the model request if a completion receipt already exists, otherwise starts `codex app-server`, sends `initialize`, `initialized`, `thread/start` or `thread/resume`, and `turn/start` over JSONL stdio, captures assistant `agentMessage` item ids and phases, waits for `turn/completed`, and then calls the deterministic completion sink. `phase=commentary` is treated as assistant narration, `phase=final_answer` is treated as the final reply, and legacy delta-only streams fall back to raw assistant text instead of dropping content. It uses the imported legacy source workspace as the Codex thread cwd, stores the returned `threadId` in the Codex binding file for same-session resume, writes `codex-runtime-run.json`, appends `codex-runtime-run-receipts.jsonl`, and keeps raw app-server stdout/stderr logs under the prepared execution directory. The harness sends the assembled agent turn payload as user input; Codex remains responsible for its own system prompt, built-in tool schemas, MCP/tool inventory, approvals, and session continuity.
-
-`codex-complete` records assistant output into the output contract from `codex-plan`. It reads `codex-runtime-plan.json`, copies the inbound user message from `prompt-bundle.json`, appends user, optional `assistant_narration`, and final assistant entries to the planned transcript JSONL, appends trajectory events, writes the Codex binding mirror, writes `codex-runtime-completion-receipt.json`, and appends `codex-runtime-completion-receipts.jsonl`. Completion receipts include the selected narration mode, final reply character count, and narration item count.
-
-`prompt-bundle` consumes the same turn plan and assembles the agent turn payload that a Codex runtime adapter will eventually send: runtime context, imported channel command state when available, existing legacy prompt files, selected `SKILL.md` bodies, continuity notes, imported memory context, optional untrusted inbound platform context, and the inbound message. It writes `prompt-bundle.json` and `prompt.md`, uses per-file byte caps, and when `--harness-home` is provided updates the per-session injection ledger.
-
-`worker-enqueue`, `worker-run-once`, `worker-loop`, `worker-status`, `worker-cancel`, and `worker-reap-stale` are the durable worker-dispatch surface. The store lives at `state/workers/worker-jobs.sqlite`; jobs are inserted before side effects, leased before execution, reaped after stale leases, and summarized by lane/status/blocker. `deterministic_shell` jobs write capped shell audit JSON under `state/workers/audit`; `llm_subagent` and `master_wakeup` jobs enqueue durable runtime turns into `state/runtime-queue/pending.jsonl`; `watchdog` jobs inspect a `job_group_id` and enqueue one idempotent master wakeup when all-completed, any-failed, all-succeeded, or timeout policy fires.
-
-Worker concurrency is configured through `harness-config.json` or `config/harness-config.json`:
-
-```json
-{
-  "workerDispatch": {
-    "globalConcurrencyLimit": 12,
-    "groupConcurrencyLimit": 6,
-    "channelConcurrencyLimit": 3,
-    "laneConcurrencyLimits": {
-      "llm": 6,
-      "shell": 6,
-      "watchdog": 2,
-      "maintenance": 2,
-      "plugin": 2
-    },
-    "rateLeaseLimit": 0,
-    "rateLeaseWindowMs": 60000,
-    "allowedScriptRoots": []
-  }
-}
-```
-
-The concurrency invariant is `globalConcurrencyLimit >= groupConcurrencyLimit >= channelConcurrencyLimit`. If config violates that invariant, the narrower limit is capped and surfaced as a warning. `rateLeaseLimit=0` disables rate leases. When enabled, jobs with the same `rate_key` are also limited within `rateLeaseWindowMs`.
-
-Cron import has two separate source lanes: legacy native agent-turn cron under `.openclaw/cron`, and extended deterministic crontab/Supercronic-style workspace cron runners under `workspace/tools/cron-runner` plus `workspace/tools/backup-cron-runner`. The Rust harness keeps those paths separate because only the native lane is allowed to enqueue LLM-backed agent or subagent turns. Execution now converges on the unified worker dispatch layer instead of direct scheduler execution.
-
-`cron-plan` covers the native lane only. It reads `.openclaw/cron/jobs.json` plus `jobs-state.json`, validates agent ids against the imported registry, extracts agent-turn message text where possible, and writes `native-cron-plan.json`. By default, enabled jobs are held under cutover safety; `--resume-cron` must be explicit before the dry-run marks due one-shot jobs as enqueueable or cron expressions as registered for scheduler evaluation.
-
-`native-cron-enqueue` converts the native cron plan into durable `llm_subagent` worker jobs and adds a watchdog for master wakeup. By default it enqueues due one-shot jobs only; use `--include-registered-cron` for an operator-controlled scheduler tick that also enqueues registered cron expressions. The adapter is idempotent per tick and obeys worker global/per-agent/per-agent-channel/lane/rate capacity when `worker-loop` drains it.
-
-`deterministic-cron-plan` covers the workspace runner lane only. It scans `workspace/tools/cron-runner` and `workspace/tools/backup-cron-runner`, parses crontab entries, resolves `jobs/*` scripts, and writes `deterministic-cron-plan.json` with `llmAccessAllowed=false`. By default all commands are held; `--allow-deterministic-run` only changes dry-run classification into ready/missing/script-compatibility states and does not execute anything.
-
-`deterministic-cron-enqueue` converts ready deterministic cron entries into durable `deterministic_shell` worker jobs and adds a watchdog for master wakeup. It defaults to `--dry-run-shell`, so the worker records shell audit without launching the script; `--execute-shell` is required for actual process execution and the script path must be under `workerDispatch.allowedScriptRoots`.
-
-`subagent-plan` reads `.openclaw/subagents/runs.json` and writes `subagent-plan.json`. Completed, failed, and canceled runs stay historical no-ops. Queued and running runs are held by default to avoid duplicate worker execution during gateway handoff; `--resume-subagents` only marks them as resume candidates in the dry-run plan and does not start a worker.
-
-`subagent-enqueue` converts resume candidates into durable `llm_subagent` worker jobs and adds a watchdog for master wakeup. This preserves the old "subagent completion wakes the master" behavior and extends it to fan-out groups containing both LLM and deterministic child jobs.
-
-This workspace disables Codex-side `openclaw-mem` gateway lookups through [AGENTS.md](AGENTS.md). The harness product requirement still includes importing existing legacy memory files/databases and supporting memory adapters when enabled.
-
-`openclaw-mem` remains an external, dual-consumer memory product rather than code to fork into this harness. Agent Harness should integrate it through OpenClaw-compatible plugin adapters and agent-turn hooks: `before_prompt_build`/`before_agent_start` recall, tool-result observation capture, `agent_end` lifecycle capture, memory slot operations, sidecar/gateway calls, and bounded ContextPack or prompt injection. Do not patch `openclaw-mem` internals in this repo to make Agent Harness-specific behavior; future `openclaw-mem` engine, graph, and sidecar work should stay usable by both OpenClaw and Agent Harness.
-
-`memory-hook` records the Agent Harness side of those OpenClaw-compatible hooks. `before-prompt-build` delegates to imported memory prompt-context recall; `agent-end` delegates to the lifecycle/capture/canvas path when a prompt bundle and assistant text are provided; `store-propose`, `memory-slot`, and `tool-result` write redacted receipt summaries and artifact pointers for external memory adapters. Hook receipts live under `state/memory/hook-receipts.jsonl`; raw hook payloads are not stored in those receipts.
-
-`memory-service-status`, `memory-service-recall`, `memory-service-propose`, and `memory-service-store` are the explicit OpenClawMem service-adapter surface. The Node plugin sidecar also exposes JSON-RPC `openclaw_mem.status`, `openclaw_mem.recall`, `openclaw_mem.propose`, and `openclaw_mem.store`. Store operations require explicit approval and write per-agent service-writeback JSONL; proposal operations stay pending review. Receipts are written under the target harness state and omit raw secret payloads.
-
-Memory import preserves `memory/qdrant-edge` as the primary imported snapshot when present, but active vector recall currently uses the imported `openclaw-mem.sqlite` embedding tables plus JSONL/text/writeback adapters. The active harness confirmation on 2026-06-12 found Qdrant edge, `openclaw-mem.sqlite`, observations/episodes JSONL, and `openclaw-mem-engine/sunrise_state.json`; it did not find a runnable live `openclaw-mem` service endpoint or source tree. `memory-service-status` and sidecar `openclaw_mem.status` therefore report `serviceMode=snapshot-adapter` and `qdrantEdgeMode=preserved-snapshot`. `AGENT_HARNESS_OPENCLAW_MEM_SERVICE_URL` is surfaced as configured metadata only until a compatible remote service wire contract is supplied. `status --json` reports `memory.summary.activeRecallBackend`, `memory.summary.qdrantParity`, and `memory.summary.captureCandidateCount` so operators can distinguish "Qdrant snapshot preserved" from "Qdrant-native recall active". Memory JSONL files and Markdown memory are still imported as snapshot/audit sources; LanceDB is hidden from readiness unless the active source config explicitly selects it.
-
-`ops-backup`, `ops-cutover-receipt`, and `ops-control` are the operator handoff commands for P1. `ops-backup` copies non-secret harness state into `state/backups/<label>/files` and writes a manifest. `ops-cutover-receipt` records the current readiness summary under `state/cutover/cutover-receipts.jsonl`. `ops-control stop|start|status` creates, clears, or inspects supervisor stop files and writes `state/ops/control-receipts.jsonl`; it does not register scheduled tasks or launch processes by itself.
-
-The cutover checklist is tracked in [Activation Readiness Plan](docs/activation-readiness-plan.md). The operator prompt/checklist for asking `main` to self-check Telegram DM and Discord DM live paths is [Agent Harness TG/Discord DM Self-Check Guide](docs/agent-harness-channel-self-check.md).
-
-See [Project Assessment](docs/project-assessment.md).
+at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this work by you, as defined in the Apache-2.0 license, shall be dual-licensed as above, without any additional terms or conditions.

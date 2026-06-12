@@ -1,5 +1,9 @@
 # Project Agent Instructions
 
+## Start Here
+
+- For a new working session, read [docs/agent-harness-operations-handbook.md](docs/agent-harness-operations-handbook.md) first: it holds the live topology, current live validation, the full command walkthrough, and the documentation map. The root `README.md` is the public-facing overview, not the operational source of truth.
+
 ## Command Approval Discipline
 
 - Do not submit three or more parallel escalated shell commands for automatic review.
