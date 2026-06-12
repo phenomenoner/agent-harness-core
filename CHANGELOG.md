@@ -8,6 +8,9 @@
 - Replaced the condensed `LICENSE-APACHE` text with the canonical Apache License 2.0 text so GitHub license detection no longer reports "Other".
 - Fixed the placeholder workspace `repository` URL in `Cargo.toml` and added crate `description` metadata.
 - Added root `DOC-GUIDELINES.md` documentation writing guideline, linked from the README documentation table and the operations handbook documentation map.
+- Isolated OpenRouter Codex config into provider-specific Codex homes and added a readiness failure when the shared default Codex/OAuth home contains stale OpenRouter provider config.
+- Treat Codex app-server protocol errors and failed `turn/completed` events as terminal runtime failures instead of successful empty assistant replies.
+- Updated builtin harness ops skill, release checklist, operations docs, and feature parity docs so stale guidance review covers docs, skills, and CLI help during future behavior-changing upgrades.
 
 ### Added
 
@@ -29,12 +32,15 @@
 - Security scan helpers for prompt boundary markers and shell allowed-root checks.
 - Invariants catalog, schema registry, release checklist, trust-boundary documentation, atomic-write audit, and security policy.
 - Operator CLI commands for the new staging gates.
+- Harness secret-env handoff for provider-specific app-server child processes.
 
 ### Verification
 
 - `cargo fmt --all`
 - `cargo test -p agent-harness-cli --target-dir target\staging-test-cli`
 - `cargo test --workspace --target-dir target\staging-test-workspace`
+- `cargo build --workspace --target-dir target\deploy-build`
+- `agent-harness public-hygiene --root target\staging-public-hygiene\public-export`
 - `cargo tree --workspace --duplicates`
 
 ### Pending Live Evidence

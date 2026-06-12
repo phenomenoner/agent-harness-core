@@ -610,7 +610,7 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
     let app_server_approval_policy = codex_app_server_approval_policy(approval_policy).to_string();
     let app_server_sandbox = resolve_codex_sandbox_policy(&options.harness_home, &mut warnings);
     let provider_config = codex_provider_config(provider.as_deref());
-    let codex_home = harness_codex_home(&options.harness_home, provider_config.is_some());
+    let codex_home = harness_codex_home(&options.harness_home, provider_config.as_ref());
     ensure_harness_codex_config(
         codex_home.as_deref(),
         &working_directory,
@@ -734,7 +734,10 @@ pub fn preflight_codex_runtime(
         &plan.invocation.prompt_input_file,
     ));
     checks.extend(check_output_paths(&options.harness_home, &plan.outputs)?);
-    checks.extend(check_env_requirements(&plan.invocation.env_requirements));
+    checks.extend(check_env_requirements(
+        &options.harness_home,
+        &plan.invocation.env_requirements,
+    ));
     let has_failures = checks
         .iter()
         .any(|check| check.status == CodexRuntimePreflightCheckStatus::Fail);
@@ -884,7 +887,7 @@ pub fn probe_codex_runtime_launch(
     };
 
     let plan: CodexRuntimePlanFile = read_json_file_as(&plan_file)?;
-    let probe_result = spawn_launch_probe(&plan, options.startup_probe_ms)?;
+    let probe_result = spawn_launch_probe(&options.harness_home, &plan, options.startup_probe_ms)?;
     let status = match probe_result.status {
         LaunchProbeProcessStatus::StartedAndStopped => {
             CodexRuntimeLaunchProbeStatus::StartedAndStopped
@@ -1322,6 +1325,7 @@ fn recover_completed_codex_run_from_stdout_log(
     let mut progress = None;
     let mut event_count = 0usize;
     let mut completed = false;
+    let mut terminal_error = None;
     let mut thread_id = plan.invocation.thread_id.clone();
 
     for line in reader.lines() {
@@ -1332,9 +1336,30 @@ fn recover_completed_codex_run_from_stdout_log(
                 if let Some(extracted_thread_id) = extract_thread_id(&value) {
                     thread_id = Some(extracted_thread_id);
                 }
+                if let Some(error) = protocol_error(&value) {
+                    terminal_error = Some(error);
+                }
                 collect_agent_output(&value, &mut state, &mut progress, narration_config);
                 if is_turn_completed(&value) {
                     record_turn_usage(&value, &mut state);
+                    if let Some(reason) =
+                        turn_completed_failure_reason(&value).or_else(|| terminal_error.clone())
+                    {
+                        return Ok(Some(CodexAppServerRunResult {
+                            status: CodexRuntimeRunStatus::ProtocolError,
+                            reason,
+                            assistant_message: state.assistant_message_with_harness_notices(),
+                            assistant_narration: state.assistant_narration_records(),
+                            assistant_raw_message: state.assistant_raw_message(),
+                            assistant_final_found: state.assistant_final_found(),
+                            thread_id,
+                            event_count,
+                            usage: state.usage,
+                            stdout_log: Some(stdout_log.to_path_buf()),
+                            stderr_log,
+                            warnings: state.warnings,
+                        }));
+                    }
                     completed = true;
                 }
             }
@@ -1853,6 +1878,11 @@ fn drive_codex_app_server(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));
+    apply_required_secret_env(
+        &mut command,
+        harness_home,
+        &plan.invocation.env_requirements,
+    );
     apply_codex_home_env(&mut command, plan);
 
     let mut child = match command.spawn() {
@@ -1949,6 +1979,9 @@ fn drive_codex_app_server(
         .to_string();
     if let Some(model) = &plan.model {
         thread_params["model"] = json!(model);
+    }
+    if let Some(provider) = app_server_model_provider(plan) {
+        thread_params["modelProvider"] = json!(provider);
     }
     thread_params["cwd"] = json!(runtime_workspace_root.clone());
     thread_params["approvalPolicy"] = json!(app_server_approval_policy.clone());
@@ -2232,6 +2265,16 @@ fn drive_codex_app_server(
         stderr_log: Some(stderr_log),
         warnings: state.warnings,
     })
+}
+
+fn app_server_model_provider(plan: &CodexRuntimePlanFile) -> Option<String> {
+    plan.invocation
+        .provider_config
+        .as_ref()
+        .map(|config| config.provider.clone())
+        .or_else(|| plan.provider.clone())
+        .map(|provider| provider.trim().to_string())
+        .filter(|provider| !provider.is_empty())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2970,6 +3013,9 @@ fn wait_for_thread_start(
                 }
                 if is_turn_completed(&value) {
                     record_turn_usage(&value, state);
+                    if let Some(reason) = turn_completed_failure_reason(&value) {
+                        return Ok(ProtocolWait::Failed(reason));
+                    }
                     return Ok(ProtocolWait::TurnCompleted);
                 }
                 collect_agent_output(&value, state, progress, narration_config);
@@ -3005,6 +3051,9 @@ fn wait_for_turn_completed(
                 collect_agent_output(&value, state, progress, narration_config);
                 if is_turn_completed(&value) {
                     record_turn_usage(&value, state);
+                    if let Some(reason) = turn_completed_failure_reason(&value) {
+                        return Ok(ProtocolWait::Failed(reason));
+                    }
                     return Ok(ProtocolWait::TurnCompleted);
                 }
                 if json_id(&value) == Some(1)
@@ -3629,6 +3678,44 @@ fn is_turn_completed(value: &Value) -> bool {
     matches!(json_method(value), Some("turn/completed"))
 }
 
+fn turn_completed_failure_reason(value: &Value) -> Option<String> {
+    if !is_turn_completed(value) {
+        return None;
+    }
+    let status = value
+        .pointer("/params/turn/status")
+        .or_else(|| value.pointer("/params/status"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if status.is_empty()
+        || matches!(
+            status.to_ascii_lowercase().as_str(),
+            "completed" | "complete" | "succeeded" | "success" | "ok"
+        )
+    {
+        return None;
+    }
+
+    let detail = value
+        .pointer("/params/turn/error")
+        .or_else(|| value.pointer("/params/error"))
+        .map(render_protocol_error)
+        .or_else(|| {
+            value
+                .pointer("/params/turn/error/message")
+                .or_else(|| value.pointer("/params/error/message"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        });
+    Some(match detail {
+        Some(detail) if !detail.trim().is_empty() => {
+            format!("codex app-server turn completed with status `{status}`: {detail}")
+        }
+        _ => format!("codex app-server turn completed with status `{status}`"),
+    })
+}
+
 fn record_turn_usage(value: &Value, state: &mut CodexProtocolState) {
     if let Some(usage) = extract_turn_usage(value) {
         state.usage = Some(usage);
@@ -3695,14 +3782,26 @@ fn usage_u64(value: &Value, keys: &[&str]) -> Option<u64> {
 }
 
 fn protocol_error(value: &Value) -> Option<String> {
-    let error = value.get("error")?;
+    let error = if matches!(json_method(value), Some("error")) {
+        value
+            .pointer("/params/error")
+            .or_else(|| value.get("error"))
+            .or_else(|| value.get("params"))
+            .unwrap_or(value)
+    } else {
+        value.get("error")?
+    };
+    Some(render_protocol_error(error))
+}
+
+fn render_protocol_error(error: &Value) -> String {
     if let Some(text) = error.as_str() {
-        return Some(text.to_string());
+        return text.to_string();
     }
     if let Some(message) = error.get("message").and_then(Value::as_str) {
-        return Some(message.to_string());
+        return message.to_string();
     }
-    Some(error.to_string())
+    error.to_string()
 }
 
 fn record_completion_outputs(
@@ -3872,6 +3971,7 @@ enum LaunchProbeProcessStatus {
 }
 
 fn spawn_launch_probe(
+    harness_home: &Path,
     plan: &CodexRuntimePlanFile,
     startup_probe_ms: u64,
 ) -> io::Result<LaunchProbeProcessResult> {
@@ -3896,6 +3996,11 @@ fn spawn_launch_probe(
         .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    apply_required_secret_env(
+        &mut command,
+        harness_home,
+        &plan.invocation.env_requirements,
+    );
     apply_codex_home_env(&mut command, plan);
 
     let mut child = match command.spawn() {
@@ -4090,7 +4195,7 @@ fn codex_provider_config(provider: Option<&str>) -> Option<CodexProviderConfig> 
             display_name: "OpenRouter".to_string(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             env_key: "OPENROUTER_API_KEY".to_string(),
-            wire_api: "chat".to_string(),
+            wire_api: "responses".to_string(),
         }),
         _ => None,
     }
@@ -4671,7 +4776,10 @@ fn normalize_lexical_path(path: &Path) -> PathBuf {
     normalized
 }
 
-fn check_env_requirements(requirements: &[CodexEnvRequirement]) -> Vec<CodexRuntimePreflightCheck> {
+fn check_env_requirements(
+    harness_home: &Path,
+    requirements: &[CodexEnvRequirement],
+) -> Vec<CodexRuntimePreflightCheck> {
     if requirements.is_empty() {
         return vec![pass_check(
             "environment",
@@ -4680,17 +4788,18 @@ fn check_env_requirements(requirements: &[CodexEnvRequirement]) -> Vec<CodexRunt
     }
     requirements
         .iter()
-        .flat_map(check_credential_requirement)
+        .flat_map(|requirement| check_credential_requirement(harness_home, requirement))
         .collect()
 }
 
 fn check_credential_requirement(
+    harness_home: &Path,
     requirement: &CodexEnvRequirement,
 ) -> Vec<CodexRuntimePreflightCheck> {
     if requirement.name == "OPENAI_API_KEY" {
         return check_openai_or_codex_oauth_requirement(requirement);
     }
-    vec![check_env_requirement(requirement)]
+    vec![check_env_requirement(harness_home, requirement)]
 }
 
 fn check_openai_or_codex_oauth_requirement(
@@ -4731,11 +4840,22 @@ fn check_openai_or_codex_oauth_requirement_with_candidates(
     )]
 }
 
-fn check_env_requirement(requirement: &CodexEnvRequirement) -> CodexRuntimePreflightCheck {
+fn check_env_requirement(
+    harness_home: &Path,
+    requirement: &CodexEnvRequirement,
+) -> CodexRuntimePreflightCheck {
     if env::var_os(&requirement.name).is_some() {
         pass_check(
             format!("env:{}", requirement.name),
             format!("{} is present", requirement.name),
+        )
+    } else if secret_env_value(harness_home, &requirement.name).is_some() {
+        pass_check(
+            format!("env:{}", requirement.name),
+            format!(
+                "{} is present in harness secrets env; value is not disclosed",
+                requirement.name
+            ),
         )
     } else {
         fail_check(
@@ -4743,6 +4863,50 @@ fn check_env_requirement(requirement: &CodexEnvRequirement) -> CodexRuntimePrefl
             format!("{} is missing: {}", requirement.name, requirement.reason),
         )
     }
+}
+
+fn apply_required_secret_env(
+    command: &mut Command,
+    harness_home: &Path,
+    requirements: &[CodexEnvRequirement],
+) {
+    for requirement in requirements {
+        if env::var_os(&requirement.name).is_none() {
+            if let Some(value) = secret_env_value(harness_home, &requirement.name) {
+                command.env(&requirement.name, value);
+            }
+        }
+    }
+}
+
+fn secret_env_value(harness_home: &Path, name: &str) -> Option<String> {
+    for relative in [
+        ["secrets", "channel-credentials.env"],
+        ["secrets", "memory-credentials.env"],
+    ] {
+        let path = relative
+            .iter()
+            .fold(harness_home.to_path_buf(), |path, part| path.join(part));
+        if let Some(value) = secret_env_file_value(&path, name) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn secret_env_file_value(path: &Path, name: &str) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let prefix = format!("{name}=");
+    text.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return None;
+        }
+        trimmed
+            .strip_prefix(&prefix)
+            .map(|value| value.trim_matches('"').to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn codex_oauth_auth_candidates() -> Vec<PathBuf> {
@@ -4908,12 +5072,22 @@ fn completion_receipt_file(plan: &CodexRuntimePlanFile) -> PathBuf {
     runtime_execution_dir(plan).join("codex-runtime-completion-receipt.json")
 }
 
-fn harness_codex_home(harness_home: &Path, force_generated_config: bool) -> Option<PathBuf> {
-    let codex_home = absolute_for_config(harness_home).join("codex-home");
-    if force_generated_config
-        || [codex_home.join("auth.json"), codex_home.join("auth.toml")]
-            .iter()
-            .any(|path| path.is_file())
+fn harness_codex_home(
+    harness_home: &Path,
+    provider_config: Option<&CodexProviderConfig>,
+) -> Option<PathBuf> {
+    let harness_home = absolute_for_config(harness_home);
+    if let Some(provider_config) = provider_config {
+        return Some(
+            harness_home
+                .join("codex-home-providers")
+                .join(safe_path_component(&provider_config.provider)),
+        );
+    }
+    let codex_home = harness_home.join("codex-home");
+    if [codex_home.join("auth.json"), codex_home.join("auth.toml")]
+        .iter()
+        .any(|path| path.is_file())
     {
         Some(codex_home)
     } else {
@@ -4935,7 +5109,18 @@ fn ensure_harness_codex_config(
     let config_file = codex_home.join("config.toml");
     if config_file.is_file() {
         let existing = fs::read_to_string(&config_file)?;
-        if existing.starts_with("# Generated by agent-harness.") {
+        if let Some(provider_config) = provider_config {
+            let updated = ensure_provider_config_in_toml(&existing, provider_config);
+            if updated != existing {
+                fs::write(&config_file, updated)?;
+                warnings.push(format!(
+                    "updated harness-local Codex config provider stanza at {}",
+                    config_file.display()
+                ));
+            }
+            return Ok(());
+        }
+        if is_generated_harness_codex_config(&existing) {
             let desired = harness_codex_config_toml(
                 working_directory,
                 harness_home,
@@ -4962,6 +5147,124 @@ fn ensure_harness_codex_config(
         config_file.display(),
     ));
     Ok(())
+}
+
+fn is_generated_harness_codex_config(existing: &str) -> bool {
+    existing.starts_with("# Generated by agent-harness.")
+        || existing.starts_with("# Generated by openclaw-harness.")
+}
+
+fn ensure_provider_config_in_toml(existing: &str, provider_config: &CodexProviderConfig) -> String {
+    let mut config = ensure_top_level_toml_key(
+        existing,
+        "model_provider",
+        &toml_basic_string(&provider_config.provider),
+    );
+    let table_header = format!("[model_providers.{}]", provider_config.provider);
+    if !config.lines().any(|line| line.trim() == table_header) {
+        if !config.ends_with('\n') {
+            config.push('\n');
+        }
+        config.push('\n');
+        config.push_str(&table_header);
+        config.push('\n');
+        config.push_str("name = ");
+        config.push_str(&toml_basic_string(&provider_config.display_name));
+        config.push_str("\nbase_url = ");
+        config.push_str(&toml_basic_string(&provider_config.base_url));
+        config.push_str("\nenv_key = ");
+        config.push_str(&toml_basic_string(&provider_config.env_key));
+        config.push_str("\nwire_api = ");
+        config.push_str(&toml_basic_string(&provider_config.wire_api));
+        config.push('\n');
+    } else {
+        config = ensure_table_toml_key(
+            &config,
+            &table_header,
+            "name",
+            &toml_basic_string(&provider_config.display_name),
+        );
+        config = ensure_table_toml_key(
+            &config,
+            &table_header,
+            "base_url",
+            &toml_basic_string(&provider_config.base_url),
+        );
+        config = ensure_table_toml_key(
+            &config,
+            &table_header,
+            "env_key",
+            &toml_basic_string(&provider_config.env_key),
+        );
+        config = ensure_table_toml_key(
+            &config,
+            &table_header,
+            "wire_api",
+            &toml_basic_string(&provider_config.wire_api),
+        );
+    }
+    config
+}
+
+fn ensure_top_level_toml_key(existing: &str, key: &str, rendered_value: &str) -> String {
+    let desired_line = format!("{key} = {rendered_value}");
+    let mut lines: Vec<String> = existing.lines().map(ToString::to_string).collect();
+    for line in &mut lines {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(&format!("{key} ")) || trimmed.starts_with(&format!("{key}=")) {
+            *line = desired_line;
+            return join_toml_lines(lines, existing.ends_with('\n'));
+        }
+        if trimmed.starts_with('[') {
+            break;
+        }
+    }
+
+    let insert_at = lines
+        .iter()
+        .position(|line| {
+            let trimmed = line.trim();
+            !(trimmed.is_empty() || trimmed.starts_with('#'))
+        })
+        .unwrap_or(lines.len());
+    lines.insert(insert_at, desired_line);
+    join_toml_lines(lines, true)
+}
+
+fn ensure_table_toml_key(
+    existing: &str,
+    table_header: &str,
+    key: &str,
+    rendered_value: &str,
+) -> String {
+    let desired_line = format!("{key} = {rendered_value}");
+    let mut lines: Vec<String> = existing.lines().map(ToString::to_string).collect();
+    let Some(start) = lines.iter().position(|line| line.trim() == table_header) else {
+        return existing.to_string();
+    };
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(index, line)| line.trim_start().starts_with('[').then_some(index))
+        .unwrap_or(lines.len());
+    for line in lines.iter_mut().take(end).skip(start + 1) {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(&format!("{key} ")) || trimmed.starts_with(&format!("{key}=")) {
+            *line = desired_line;
+            return join_toml_lines(lines, existing.ends_with('\n'));
+        }
+    }
+    lines.insert(end, desired_line);
+    join_toml_lines(lines, true)
+}
+
+fn join_toml_lines(lines: Vec<String>, trailing_newline: bool) -> String {
+    let mut text = lines.join("\n");
+    if trailing_newline && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
 }
 
 fn harness_codex_config_toml(
@@ -5025,6 +5328,24 @@ fn absolute_for_config(path: &Path) -> PathBuf {
         env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
+    }
+}
+
+fn safe_path_component(value: &str) -> String {
+    let component: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if component.is_empty() {
+        "provider".to_string()
+    } else {
+        component
     }
 }
 
@@ -5263,17 +5584,115 @@ mod tests {
         assert_eq!(provider_config.provider, "openrouter");
         assert_eq!(provider_config.env_key, "OPENROUTER_API_KEY");
         assert_eq!(provider_config.base_url, "https://openrouter.ai/api/v1");
-        assert_eq!(provider_config.wire_api, "chat");
+        assert_eq!(provider_config.wire_api, "responses");
 
         let codex_home = plan.invocation.codex_home.as_ref().unwrap();
+        assert!(codex_home.ends_with(PathBuf::from("codex-home-providers").join("openrouter")));
         let config = fs::read_to_string(codex_home.join("config.toml")).unwrap();
         assert!(config.contains("model_provider = \"openrouter\""));
         assert!(config.contains("[model_providers.openrouter]"));
         assert!(config.contains("base_url = \"https://openrouter.ai/api/v1\""));
         assert!(config.contains("env_key = \"OPENROUTER_API_KEY\""));
         assert!(!config.contains("sk-"));
+        assert!(!harness_home.join("codex-home").join("config.toml").exists());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plan_codex_runtime_isolates_openrouter_from_shared_codex_home() {
+        let root = temp_root("plan_codex_runtime_isolates_openrouter_from_shared_codex_home");
+        let harness_home = root.join(".agent-harness");
+        let openrouter_source = write_openrouter_codex_runtime_source(&root.join("openrouter"));
+        let shared_codex_home = harness_home.join("codex-home");
+        fs::create_dir_all(&shared_codex_home).unwrap();
+        fs::write(shared_codex_home.join("auth.json"), "{}").unwrap();
+        fs::write(
+            shared_codex_home.join("config.toml"),
+            "# Generated by openclaw-harness. Contains no secrets.\n\
+             # Codex OAuth state stays in auth.json/auth.toml.\n\
+             \n\
+             model_provider = \"openrouter\"\n\
+             [windows]\n\
+             sandbox = \"elevated\"\n\
+             \n\
+             [model_providers.openrouter]\n\
+             name = \"OpenRouter\"\n\
+             base_url = \"https://openrouter.ai/api/v1\"\n\
+             env_key = \"OPENROUTER_API_KEY\"\n\
+             wire_api = \"responses\"\n",
+        )
+        .unwrap();
+        enqueue_and_prepare(&openrouter_source, &harness_home);
+        let openrouter_execution_dir = latest_prepared_execution_dir(&harness_home);
+
+        let openrouter_plan = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: Some(openrouter_execution_dir),
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap()
+        .plan
+        .unwrap();
+
+        assert!(
+            openrouter_plan
+                .invocation
+                .codex_home
+                .as_ref()
+                .unwrap()
+                .ends_with(PathBuf::from("codex-home-providers").join("openrouter"))
+        );
+        let shared_after_openrouter =
+            fs::read_to_string(shared_codex_home.join("config.toml")).unwrap();
+        assert!(shared_after_openrouter.contains("model_provider = \"openrouter\""));
+
+        let main_source = write_codex_runtime_source(&root.join("main"));
+        enqueue_and_prepare_at(&main_source, &harness_home, 1235);
+        let main_execution_dir = latest_prepared_execution_dir(&harness_home);
+        let main_plan = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: Some(main_execution_dir),
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap()
+        .plan
+        .unwrap();
+
+        assert_eq!(main_plan.provider.as_deref(), Some("openai"));
+        assert_eq!(
+            main_plan.invocation.codex_home.as_deref(),
+            Some(shared_codex_home.as_path())
+        );
+        let shared_after_main = fs::read_to_string(shared_codex_home.join("config.toml")).unwrap();
+        assert!(shared_after_main.starts_with("# Generated by agent-harness."));
+        assert!(!shared_after_main.contains("model_provider = \"openrouter\""));
+        assert!(!shared_after_main.contains("[model_providers.openrouter]"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_provider_config_updates_existing_openrouter_table() {
+        let provider_config = codex_provider_config(Some("openrouter")).unwrap();
+        let stale = "# Generated by agent-harness. Contains no secrets.\n\
+             model_provider = \"openrouter\"\n\
+             [model_providers.openrouter]\n\
+             name = \"Old Router\"\n\
+             base_url = \"https://old.example/v1\"\n\
+             env_key = \"OLD_OPENROUTER_KEY\"\n\
+             wire_api = \"chat\"\n";
+
+        let updated = ensure_provider_config_in_toml(stale, &provider_config);
+
+        assert!(updated.contains("name = \"OpenRouter\""));
+        assert!(updated.contains("base_url = \"https://openrouter.ai/api/v1\""));
+        assert!(updated.contains("env_key = \"OPENROUTER_API_KEY\""));
+        assert!(updated.contains("wire_api = \"responses\""));
+        assert!(!updated.contains("Old Router"));
+        assert!(!updated.contains("https://old.example/v1"));
+        assert!(!updated.contains("OLD_OPENROUTER_KEY"));
+        assert!(!updated.contains("wire_api = \"chat\""));
     }
 
     fn progress_context() -> AgentProgressContext {
@@ -5482,7 +5901,7 @@ mod tests {
         fs::create_dir_all(&codex_home).unwrap();
         fs::write(codex_home.join("auth.json"), "{}").unwrap();
 
-        let resolved = harness_codex_home(&harness_home, false).unwrap();
+        let resolved = harness_codex_home(&harness_home, None).unwrap();
 
         assert!(resolved.is_absolute());
         assert!(resolved.ends_with(harness_home.join("codex-home")));
@@ -5924,6 +6343,43 @@ mod tests {
         let transcript_file = report.completion.unwrap().transcript_file.unwrap();
         let transcript = fs::read_to_string(transcript_file).unwrap();
         assert!(transcript.contains("stdout holder reply"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_treats_app_server_error_as_protocol_failure() {
+        let root = temp_root("run_codex_runtime_treats_app_server_error_as_protocol_failure");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = failing_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 10_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+        assert!(report.receipt.reason.contains("OPENROUTER_API_KEY"));
+        assert!(report.completion.is_none());
+        let run_file = report.run_file.unwrap();
+        let run_json = fs::read_to_string(run_file).unwrap();
+        assert!(!run_json.contains("(no assistant text captured"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -6400,10 +6856,28 @@ mod tests {
         enqueue_and_prepare_with_runtime_workspace(source, harness_home, None);
     }
 
+    fn enqueue_and_prepare_at(source: &crate::AgentSource, harness_home: &Path, now_ms: i64) {
+        enqueue_and_prepare_with_runtime_workspace_at(source, harness_home, None, now_ms);
+    }
+
     fn enqueue_and_prepare_with_runtime_workspace(
         source: &crate::AgentSource,
         harness_home: &Path,
         runtime_workspace: Option<PathBuf>,
+    ) {
+        enqueue_and_prepare_with_runtime_workspace_at(
+            source,
+            harness_home,
+            runtime_workspace,
+            1234,
+        );
+    }
+
+    fn enqueue_and_prepare_with_runtime_workspace_at(
+        source: &crate::AgentSource,
+        harness_home: &Path,
+        runtime_workspace: Option<PathBuf>,
+        now_ms: i64,
     ) {
         let registry = load_agent_registry(source).unwrap();
         let skills = build_source_skill_index(source).unwrap();
@@ -6430,7 +6904,7 @@ mod tests {
             RuntimeQueueEnqueueOptions {
                 harness_home: harness_home.to_path_buf(),
                 runtime_workspace,
-                now_ms: 1234,
+                now_ms,
             },
         )
         .unwrap();
@@ -6446,6 +6920,21 @@ mod tests {
         let mut value: Value = serde_json::from_slice(&fs::read(plan_file).unwrap()).unwrap();
         value["invocation"]["envRequirements"] = requirements;
         fs::write(plan_file, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    }
+
+    fn latest_prepared_execution_dir(harness_home: &Path) -> PathBuf {
+        fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("execution-receipts.jsonl"),
+        )
+        .unwrap()
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|value| path_field(&value, &["executionDir", "execution_dir"]))
+        .unwrap()
     }
 
     fn replace_invocation(plan_file: &Path, executable: PathBuf, arguments: Vec<String>) {
@@ -6646,6 +7135,55 @@ while ($true) {
         )
     }
 
+    #[cfg(windows)]
+    fn failing_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("failing-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try {
+        $msg = $line | ConvertFrom-Json
+    } catch {
+        continue
+    }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"error","params":{"error":{"message":"Missing environment variable: `OPENROUTER_API_KEY`.","codexErrorInfo":"other","additionalDetails":null},"willRetry":false,"threadId":"thread-test","turnId":"turn-failed"}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-failed","status":"failed","error":{"message":"Missing environment variable: `OPENROUTER_API_KEY`."}}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
+
     #[cfg(not(windows))]
     fn fake_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
         let script = root.join("fake-app-server.sh");
@@ -6728,6 +7266,34 @@ while IFS= read -r line; do
             printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"stdout holder reply","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}'
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed"}}}'
             sleep 5 &
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        make_executable(&script);
+        (PathBuf::from("sh"), vec![script.display().to_string()])
+    }
+
+    #[cfg(not(windows))]
+    fn failing_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("failing-app-server.sh");
+        fs::write(
+            &script,
+            r#"
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"error","params":{"error":{"message":"Missing environment variable: `OPENROUTER_API_KEY`.","codexErrorInfo":"other","additionalDetails":null},"willRetry":false,"threadId":"thread-test","turnId":"turn-failed"}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-failed","status":"failed","error":{"message":"Missing environment variable: `OPENROUTER_API_KEY`."}}}}'
             exit 0
             ;;
     esac

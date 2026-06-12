@@ -13,13 +13,13 @@ const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
-description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, and Codex prompt continuity policy.
-version: 0.1.0
+description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, and Codex prompt continuity policy.
+version: 0.1.1
 platforms: [windows]
 metadata:
   agent_harness:
     category: operations
-    tags: [legacy-import, codex, telegram, discord, migration, activation]
+    tags: [legacy-import, codex, openrouter, telegram, discord, migration, activation]
 ---
 
 # Agent Windows Harness
@@ -33,7 +33,7 @@ Use it when the user mentions:
 - importing legacy source state, memory, cron, plugins, sessions, agents, subagents, or workspace files
 - Telegram or Discord DM operation
 - slash commands such as /new, /think, /stop, /steer, /btw, /model, or /status
-- Codex CLI, Codex OAuth, app-server, prompt injection, tool schema, or session continuity
+- Codex CLI, Codex OAuth, app-server, OpenRouter provider routing, prompt injection, tool schema, or session continuity
 - activation readiness, runtime queue, operational logs, or gateway handoff
 
 ## Operating Lead
@@ -45,7 +45,7 @@ Use it when the user mentions:
 5. Keep deterministic cron off the LLM path. Agent-turn cron may enqueue runtime work.
 6. Keep Telegram and Discord session keys stable: platform, channel id, user id, and agent id determine continuity unless /new changes it.
 7. Keep multi-agent readiness intact. Do not collapse imported agents into a single default agent.
-8. Treat credentials as best-effort imports. Codex OAuth is preferred for Codex models; API keys may be provider-specific and model-limited.
+8. Treat credentials as best-effort imports. Codex OAuth is preferred for default Codex/OpenAI models; API keys may be provider-specific and model-limited. Do not apply OpenRouter credentials or provider config to the default Codex/OAuth route.
 9. Treat memory/qdrant-edge as the primary memory backend when present. LanceDB is backup/optional unless the active legacy source config points to it.
 10. Use a Codex CLI binary that the harness can spawn. On Windows, the Codex Desktop MSIX resource path may be visible on PATH but fail with os error 5; prefer a standalone release or local npm install and pass it with --codex-exe.
 11. Use tools/agent-fake-codex-app-server for offline runtime smoke when the goal is to verify harness receipts and logs without a model request.
@@ -64,7 +64,7 @@ The harness does not own the Codex system prompt or Codex tool schema. Codex CLI
 - sandbox and approval policy
 - session continuity
 
-The harness-local Codex config is generated under codex-home/config.toml when harness-local Codex OAuth auth is present. Generated config uses security.codexSandbox from harness-config.json or AGENT_HARNESS_CODEX_SANDBOX, defaulting to Windows sandbox "elevated". Approval requests are controlled separately by security.codexApprovalPolicy or AGENT_HARNESS_CODEX_APPROVAL_POLICY.
+The default harness-local Codex config is generated under codex-home/config.toml only when harness-local Codex OAuth auth is present. Explicit OpenRouter routes use a provider-specific Codex home under codex-home-providers/openrouter with model_provider="openrouter", base_url="https://openrouter.ai/api/v1", env_key="OPENROUTER_API_KEY", and wire_api="responses". Never write OpenRouter provider config into the shared codex-home; that home is reserved for the default OpenAI/Codex OAuth route. Generated config uses security.codexSandbox from harness-config.json or AGENT_HARNESS_CODEX_SANDBOX, defaulting to Windows sandbox "elevated". Approval requests are controlled separately by security.codexApprovalPolicy or AGENT_HARNESS_CODEX_APPROVAL_POLICY.
 
 The harness may assemble a turn payload containing legacy prompt files, channel state, matched skills, and the user message. Same-session payload assembly must use the prompt injection ledger:
 
@@ -119,7 +119,7 @@ Before replacing the Docker legacy gateway:
 12. Confirm memory-qdrant-edge is present when the current legacy source uses Qdrant edge as primary memory backend.
 13. Run memory-search --harness-home <harness> --query <known term> to prove imported markdown/text memory files are readable. This is a read-only recall probe and does not replace the Qdrant edge vector adapter.
 14. Confirm /status security, enable-check codex-approval-policy, and enable-check codex-sandbox show the intended unattended safety posture.
-15. Confirm codex-runtime-launch-probe passes with the intended --codex-exe before any real runtime handoff.
+15. Confirm codex-runtime-launch-probe passes with the intended --codex-exe before any real runtime handoff. For OpenRouter smoke, confirm the plan uses codex-home-providers/openrouter; for default Codex/OAuth smoke, confirm shared codex-home/config.toml has no OpenRouter model_provider override.
 16. Run plugin-sidecar-probe and plugin-sidecar-call for sidecar.status/plugins.list/tools.probe; set AGENT_HARNESS_PLUGIN_SOURCE_ROOTS when imported manifests live outside the harness home. Confirm plugin-sidecar, plugin-sidecar-probe, and plugin-sidecar-bridge are pass in enable-check. This proves manifest catalog and JSON-RPC bridge readiness; plugin-specific tool executors still need dedicated adapters.
 17. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt. Use tools/agent-fake-codex-app-server/fake-codex-app-server.cmd for offline smoke; use the intended Codex CLI only for operator-run model smoke.
 18. Run runtime-loop --stop-when-idle for idle/drain smoke and confirm state/runtime-queue/loop-last.json plus runtime.loop-stopped log evidence.
@@ -129,8 +129,9 @@ Before replacing the Docker legacy gateway:
 
 For a normal queued channel turn, the current worker-facing path is runtime-run-once:
 
-- It prepares one queue item, plans Codex, runs Codex app-server, records transcript/trajectory/Codex binding outputs, and writes an agent-reply message to state/channels/outbox.jsonl.
+- It prepares one queue item, plans Codex, runs Codex app-server, records transcript/trajectory/Codex binding outputs, and writes an agent-reply message to state/channels/outbox.jsonl only after a successful app-server turn.
 - If the Codex completion receipt already exists, it skips the model request/outbox write to avoid duplicate delivery.
+- App-server method=error events and failed turn/completed statuses are terminal protocol failures; they must not be converted into placeholder assistant replies.
 
 For operator-run drain or service-wrapper handoff, use runtime-loop:
 

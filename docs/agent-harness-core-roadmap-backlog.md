@@ -58,7 +58,7 @@ Status vocabulary:
 Latest staging evidence:
 
 - `cargo fmt --all` passed.
-- `cargo test --workspace --target-dir target\staging-test-workspace` passed with 16 CLI tests, 201 core tests, and 0 doc-tests.
+- `cargo test --workspace --target-dir target\staging-test-workspace` passed with 16 CLI tests, 207 core tests, and 0 doc-tests.
 - `cargo tree --workspace --duplicates` was run locally; the only duplicate tree is `webpki-roots` through `ureq`/TLS. A network-backed advisory audit remains a release gate when `cargo audit` or an equivalent advisory DB is available.
 - No live `.agent-harness` loop was stopped, restarted, or cut over. All tests used staging target dirs.
 

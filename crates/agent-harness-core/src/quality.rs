@@ -237,6 +237,7 @@ pub fn release_checklist() -> ReleaseChecklist {
             "cargo test --workspace",
             "schema registry updated",
             "CHANGELOG.md updated",
+            "docs/skills/help stale guidance review completed",
             "public hygiene report passed",
             "rollback notes recorded",
             "staging healthz and trace samples captured",
@@ -275,6 +276,11 @@ mod tests {
             release_checklist()
                 .required_items
                 .contains(&"public hygiene report passed")
+        );
+        assert!(
+            release_checklist()
+                .required_items
+                .contains(&"docs/skills/help stale guidance review completed")
         );
 
         let root = temp_root("quality_catalogs_and_hygiene_report_are_actionable");

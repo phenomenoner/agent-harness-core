@@ -16,6 +16,7 @@ This checklist is mirrored by `agent-harness release-checklist`. It is intention
 - `agent-harness public-hygiene --root <public-export-root>`
 - Changelog entry updated.
 - Schema registry updated for every new receipt/state schema.
+- Docs/skills/help stale-guidance review completed: update or remove outdated, misleading, or ambiguous instructions in public docs, generated CLI help, builtin harness skills, feature parity HTML/Markdown, and operational runbooks. Do not satisfy this gate by only adding new notes while leaving old contradictory guidance in place.
 - Rollback note recorded for the deployment candidate.
 - Staging trace sample captured for normal, canceled, timeout, and dead-letter paths.
 
@@ -33,5 +34,6 @@ This checklist is mirrored by `agent-harness release-checklist`. It is intention
 
 - 2026-06-12: `cargo fmt --all` passed.
 - 2026-06-12: `cargo test -p agent-harness-cli --target-dir target\staging-test-cli` passed, 16 tests.
-- 2026-06-12: `cargo test --workspace --target-dir target\staging-test-workspace` passed, 16 CLI tests, 201 core tests, 0 doc-tests.
+- 2026-06-12: `cargo test --workspace --target-dir target\staging-test-workspace` passed, 16 CLI tests, 207 core tests, 0 doc-tests.
 - 2026-06-12: `cargo tree --workspace --duplicates` reported duplicate `webpki-roots` through `ureq`/TLS only.
+- 2026-06-12: Provider-isolation hotfix added stale-guidance review to the release checklist and updated the builtin harness ops skill so OpenRouter routes use provider-specific Codex homes instead of the shared Codex/OAuth home.

@@ -9,7 +9,7 @@ This is the working checklist for turning the Rust Windows Agent Harness from a 
 2026-06-12 repo-local harness-home baseline after round3-2 timeout/progress reconciliation:
 
 - Live harness home is now repo-local `.agent-harness`; `.agent-harness/` is ignored by git. `imports/activation-harness` remains only as a pre-rebase backup.
-- `agent-harness.exe` builds; `cargo fmt --all` and full `cargo test --workspace` passed with 174 core tests, 16 CLI tests, and doctests. Previous activation also passed `cargo build`.
+- `agent-harness.exe` builds; `cargo fmt --all` and full `cargo test --workspace` passed with 207 core tests, 16 CLI tests, and doc-tests. Previous activation also passed `cargo build`.
 - Latest deployment validation passed `cargo build --workspace`, gateway stop/start with direct runners, live `status`, live `enable-check`, and outbox plan.
 - Supervisor scripts were regenerated with `target/debug/agent-harness.exe`, `--source-home`, `--runtime-workspace D:\Warehouse\Research\OpenClaw_WSL`, `tools/agent-discord-gateway/index.mjs`, one bounded-concurrency `runtime-loop.ps1`, and `worker-loop.ps1`.
 - `AgentHarness-*` scheduled task registration returned access-denied in this environment, so the runtime workers, worker, progress delivery, Telegram, Discord outbox, and Discord gateway loops were started manually as hidden PowerShell processes from the generated scripts.
@@ -64,13 +64,13 @@ These must pass before cutover.
    - Confirm `enable-check` reports `telegram-access-policy` and `discord-access-policy` as pass when importing from an existing legacy channel configuration. Missing access policies are warnings because fresh deployments may intentionally configure them later.
    - Run `telegram-probe` to validate Telegram Bot API `getMe` without consuming updates or sending messages.
    - Run `memory-credentials-export --include-sensitive` when migrating imported memory search. It writes `AGENT_HARNESS_MEMORY_EMBEDDING_API_KEY`, model, and base URL into `secrets/memory-credentials.env`; receipts disclose env names, source paths, and lengths only.
-   - Confirm `OPENROUTER_API_KEY` only when OpenRouter providers are active.
+   - Confirm `OPENROUTER_API_KEY` only when an OpenRouter route or agent is active; default OpenAI/Codex OAuth turns must not inherit OpenRouter provider config.
    - Do not rely on an imported legacy embedding-only `OPENAI_API_KEY` for Codex agent turns.
 
 5. Runtime gate
    - Run `channel-receive` for a normal DM.
    - Prefer `channel-run-once` for one-message end-to-end smoke.
-   - Run `queue-prepare`, `codex-plan`, `codex-preflight`, and `codex-launch-probe` before the first real model run.
+   - Run `queue-prepare`, `codex-plan`, `codex-preflight`, and `codex-launch-probe` before the first real model run. For OpenRouter smoke, confirm the generated Codex home is `codex-home-providers/openrouter`; for default Codex/OAuth smoke, confirm the shared `codex-home` has no OpenRouter `model_provider` override.
    - Confirm `enable-check` reports `codex-runtime-launch-probe` as pass.
    - Run `runtime-run-once` with the intended Codex executable.
    - Confirm `state/runtime-queue/run-once-last.json`.
