@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engineering Is No Longer the Moat. I Have the Receipts. — Agent Harness Core</title>
+<meta name="description" content="What a one-day experiment with an AI architect taught me about the future of software — and what it means for every PM, engineer, and open-source maintainer.">
+<meta property="og:title" content="Engineering Is No Longer the Moat. I Have the Receipts.">
+<meta property="og:description" content="An AI ranked my 0-star side project last in the morning — and first or tied on 5 of 10 engineering dimensions by midnight, same day. The part AI can't compress is the experiment.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://phenomenoner.github.io/agent-harness-core/essay/">
+<style>
+  :root{
+    --bg:#0a0d13; --bg2:#0f141d; --panel:#121927; --line:#1f2a3d;
+    --txt:#dbe4f0; --dim:#8fa0b8; --faint:#5c6b82;
+    --amber:#fbbf24; --amber-dim:#b98a10; --green:#34d399; --red:#f87171;
+    --mono:ui-monospace,'Cascadia Code','SF Mono',Consolas,monospace;
+    --sans:system-ui,-apple-system,'Segoe UI',Roboto,'Noto Sans',sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--txt);font-family:var(--sans);line-height:1.75;font-size:18px}
+  a{color:var(--amber);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .nav{max-width:780px;margin:0 auto;padding:26px 24px;display:flex;justify-content:space-between;font-family:var(--mono);font-size:.85rem}
+  .nav a{color:var(--dim)} .nav a:hover{color:var(--amber)}
+  .wrap{max-width:780px;margin:0 auto;padding:0 24px 100px}
+
+  header.hero{padding:30px 0 10px}
+  .eyebrow{font-family:var(--mono);font-size:.78rem;letter-spacing:.18em;text-transform:uppercase;color:var(--amber);margin-bottom:18px}
+  h1{font-size:clamp(2rem,5vw,2.9rem);line-height:1.15;letter-spacing:-.02em;margin-bottom:18px}
+  .standfirst{font-size:1.18rem;color:var(--dim);font-style:italic;margin-bottom:26px}
+  .byline{font-family:var(--mono);font-size:.82rem;color:var(--faint);padding-bottom:30px;border-bottom:1px solid var(--line)}
+  .byline b{color:var(--dim)}
+
+  article{padding-top:10px}
+  article h2{font-size:1.5rem;margin:52px 0 16px;letter-spacing:-.01em}
+  article p{margin:0 0 20px;color:var(--txt)}
+  article p.dim{color:var(--dim)}
+  article strong{color:#fff}
+  article em{color:var(--dim)}
+  article ul{margin:0 0 20px;padding-left:26px;color:var(--txt)}
+  article li{margin-bottom:10px}
+  blockquote{margin:30px 0;padding:22px 28px;background:var(--panel);border-left:4px solid var(--amber);border-radius:0 12px 12px 0;font-size:1.15rem;font-weight:600}
+  hr{border:none;border-top:1px solid var(--line);margin:48px 0}
+  figure{margin:38px 0}
+  figure svg{display:block;width:100%;height:auto;border-radius:14px;border:1px solid var(--line)}
+  figcaption{font-family:var(--mono);font-size:.75rem;color:var(--faint);margin-top:10px;letter-spacing:.05em}
+
+  .cta-box{margin:48px 0;padding:28px 30px;border:1px solid var(--line);border-radius:14px;background:var(--bg2)}
+  .cta-box .btn{display:inline-block;margin:10px 12px 0 0;padding:12px 20px;border-radius:10px;font-weight:600;font-size:.92rem}
+  .btn-primary{background:var(--amber);color:#1a1206}
+  .btn-primary:hover{background:#ffd34d;text-decoration:none}
+  .btn-ghost{border:1px solid var(--line);color:var(--txt)}
+  .btn-ghost:hover{border-color:var(--amber);text-decoration:none}
+
+  footer.site{max-width:780px;margin:0 auto;padding:34px 24px 80px;border-top:1px solid var(--line);color:var(--faint);font-size:.85rem}
+  footer.site a{margin-right:18px}
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <a href="../">← agent-harness-core</a>
+  <a href="https://github.com/phenomenoner/agent-harness-core">GitHub ↗</a>
+</nav>
+
+<div class="wrap">
+
+<header class="hero">
+  <div class="eyebrow">Field notes · The experiment, long form</div>
+  <h1>Engineering Is No Longer the Moat.<br>I Have the Receipts.</h1>
+  <p class="standfirst">What a one-day experiment with an AI architect taught me about the future of software — and what it means for every PM, engineer, and open-source maintainer reading this.</p>
+  <p class="byline"><b>phenomenoner</b> · software PM &amp; AI observer · drafted in pair with Claude (Fable&nbsp;5) · 2026-06-12</p>
+</header>
+
+<article>
+
+  <p>On June 12th, an AI reviewed my solo side project against two of the most popular AI agent platforms on GitHub. One has 378,000 stars. The other has 191,000. Mine had four commits and zero stars.</p>
+  <p>In the morning, the AI ranked us last on almost everything that matters operationally.</p>
+  <p>By midnight — <em>the same day</em> — it scored us first or tied on five of ten core engineering dimensions.</p>
+  <p>Nothing about those two giants changed in between. What changed was twelve hours of AI-paired engineering on my side.</p>
+  <p>I've been a software PM long enough to have shipped roadmaps that took quarters. This one took a day. I haven't stopped thinking about what that means — and I don't think you should either.</p>
+
+  <h2>The experiment</h2>
+  <p>Here's what actually happened, hour by hour.</p>
+
+  <figure>
+    <svg viewBox="0 0 1200 675" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,Segoe UI,sans-serif" role="img" aria-label="Timeline of the one-day experiment">
+      <rect width="1200" height="675" fill="#0a0d13"/>
+      <text x="80" y="90" fill="#fbbf24" font-size="20" letter-spacing="5" font-family="Consolas,monospace">JUNE 12, 2026 — ONE DAY, FOUR ACTS</text>
+      <line x1="100" y1="360" x2="1100" y2="360" stroke="#1f2a3d" stroke-width="3"/>
+      <g>
+        <circle cx="170" cy="360" r="14" fill="#fbbf24"/>
+        <text x="170" y="300" fill="#fbbf24" font-size="26" font-weight="700" text-anchor="middle" font-family="Consolas,monospace">MORNING</text>
+        <text x="170" y="420" fill="#dbe4f0" font-size="22" text-anchor="middle" font-weight="600">The brutal review</text>
+        <text x="170" y="452" fill="#8fa0b8" font-size="18" text-anchor="middle">3 harnesses compared.</text>
+        <text x="170" y="478" fill="#8fa0b8" font-size="18" text-anchor="middle">We rank last on ops.</text>
+      </g>
+      <g>
+        <circle cx="430" cy="360" r="14" fill="#fbbf24"/>
+        <text x="430" y="300" fill="#fbbf24" font-size="26" font-weight="700" text-anchor="middle" font-family="Consolas,monospace">MIDDAY</text>
+        <text x="430" y="420" fill="#dbe4f0" font-size="22" text-anchor="middle" font-weight="600">The roadmap</text>
+        <text x="430" y="452" fill="#8fa0b8" font-size="18" text-anchor="middle">~50 items, 10 dimensions,</text>
+        <text x="430" y="478" fill="#8fa0b8" font-size="18" text-anchor="middle">SLOs + stop-the-line.</text>
+      </g>
+      <g>
+        <circle cx="690" cy="360" r="14" fill="#fbbf24"/>
+        <text x="690" y="300" fill="#fbbf24" font-size="26" font-weight="700" text-anchor="middle" font-family="Consolas,monospace">EVENING</text>
+        <text x="690" y="420" fill="#dbe4f0" font-size="22" text-anchor="middle" font-weight="600">The build</text>
+        <text x="690" y="452" fill="#8fa0b8" font-size="18" text-anchor="middle">Mechanisms shipped.</text>
+        <text x="690" y="478" fill="#8fa0b8" font-size="18" text-anchor="middle">207 tests, zero model calls.</text>
+      </g>
+      <g>
+        <circle cx="950" cy="360" r="14" fill="#34d399"/>
+        <text x="950" y="300" fill="#34d399" font-size="26" font-weight="700" text-anchor="middle" font-family="Consolas,monospace">MIDNIGHT</text>
+        <text x="950" y="420" fill="#dbe4f0" font-size="22" text-anchor="middle" font-weight="600">The harsher re-review</text>
+        <text x="950" y="452" fill="#8fa0b8" font-size="18" text-anchor="middle">Dual scores: mechanism</text>
+        <text x="950" y="478" fill="#8fa0b8" font-size="18" text-anchor="middle">vs. proven. Zero credit if pending.</text>
+      </g>
+      <text x="80" y="610" fill="#5c6b82" font-size="18" font-family="Consolas,monospace">reviewer: Claude (Fable 5) · subject: Agent Harness Core vs OpenClaw 378k★ vs Hermes 191k★</text>
+    </svg>
+    <figcaption>FIG. 1 — one day, four acts.</figcaption>
+  </figure>
+
+  <p><strong>Morning.</strong> I asked an AI architect to do an impartial, brutally honest comparative review of three agent harnesses: OpenClaw (378k★), Hermes Agent by Nous Research (191k★), and my project, Agent Harness Core: a self-hosted Rust runtime for AI agents. Think of it as the <em>operations layer</em> most agent frameworks forget — durable queues, fail-closed permissions, and an auditable receipt for every single step an agent takes.</p>
+  <p>The architect: Claude's <strong>Fable 5</strong> — the frontier model many in the industry currently call the smartest AI available to the public. If you're going to get judged, get judged by the toughest judge you can find.</p>
+  <p>The verdict was uncomfortable. Best-in-trio security posture and observability. Worst-in-trio supervision, ecosystem, maturity. The AI did not flatter me. I have the report.</p>
+  <p><strong>Midday.</strong> The same AI wrote the overtaking roadmap: roughly fifty work items across ten engineering dimensions. Not vague directions — SRE-grade SLOs with a stop-the-line rule, shadow-mode database migration, canary deploys with automatic rollback, a deterministic-simulation testing strategy borrowed from the FoundationDB school, an invariants catalog as an executable CLI command.</p>
+  <p><strong>Evening.</strong> We implemented essentially all of it at mechanism level. Dead-letter retry policies. End-to-end trace IDs. Admission control. An encrypted secrets vault. MCP tool-description pinning, because tool poisoning is a real attack class now. 207 tests passing, without a single model call.</p>
+  <p><strong>Midnight.</strong> I asked the AI to review everything again — and to be <em>harsher</em>. It came back with a dual scoring system: "mechanism" scores for code that exists and passes staging tests, and "proven" scores for what has actually survived live traffic. Anything pending got zero credit.</p>
+
+  <figure>
+    <svg viewBox="0 0 1200 675" xmlns="http://www.w3.org/2000/svg" font-family="Consolas,ui-monospace,monospace" role="img" aria-label="Dual-track scorecard">
+      <rect width="1200" height="675" fill="#0a0d13"/>
+      <text x="80" y="66" fill="#fbbf24" font-size="20" letter-spacing="5">THE VERDICT — SCORED BY CLAUDE (FABLE 5) · 2026-06-12</text>
+      <g font-size="17" fill="#5c6b82">
+        <text x="80"  y="120">DIMENSION</text>
+        <text x="560" y="120" text-anchor="middle">OPENCLAW</text>
+        <text x="560" y="142" text-anchor="middle" font-size="13">378k★</text>
+        <text x="710" y="120" text-anchor="middle">HERMES</text>
+        <text x="710" y="142" text-anchor="middle" font-size="13">191k★</text>
+        <text x="880" y="120" text-anchor="middle" fill="#fbbf24">AHC·MECHANISM</text>
+        <text x="880" y="142" text-anchor="middle" font-size="13" fill="#fbbf24">code + tests exist</text>
+        <text x="1060" y="120" text-anchor="middle" fill="#8fa0b8">AHC·PROVEN</text>
+        <text x="1060" y="142" text-anchor="middle" font-size="13">survived live traffic</text>
+      </g>
+      <line x1="80" y1="156" x2="1120" y2="156" stroke="#1f2a3d" stroke-width="2"/>
+      <g font-size="19">
+        <rect x="70" y="210" width="1060" height="40" fill="#fbbf24" opacity="0.06"/>
+        <rect x="70" y="254" width="1060" height="40" fill="#fbbf24" opacity="0.06"/>
+        <rect x="70" y="342" width="1060" height="40" fill="#fbbf24" opacity="0.06"/>
+        <rect x="70" y="386" width="1060" height="40" fill="#fbbf24" opacity="0.06"/>
+        <rect x="70" y="474" width="1060" height="40" fill="#fbbf24" opacity="0.06"/>
+        <g fill="#dbe4f0">
+          <text x="80" y="192">Concurrency &amp; throughput</text>
+          <text x="80" y="236">Persistence &amp; integrity</text>
+          <text x="80" y="280">Error handling &amp; recovery</text>
+          <text x="80" y="324">Supervision &amp; operations</text>
+          <text x="80" y="368">Security</text>
+          <text x="80" y="412">Observability</text>
+          <text x="80" y="456">Token / resource efficiency</text>
+          <text x="80" y="500">Testing &amp; quality</text>
+          <text x="80" y="544">Ecosystem</text>
+          <text x="80" y="588">Maturity &amp; community</text>
+        </g>
+        <g fill="#8fa0b8" text-anchor="middle">
+          <text x="560" y="192" fill="#fbbf24">4.5</text><text x="710" y="192">3.5</text><text x="880" y="192">4.0</text><text x="1060" y="192">3.5</text>
+          <text x="560" y="236">3.0</text><text x="710" y="236">4.5</text><text x="880" y="236" fill="#fbbf24" font-weight="700">4.5</text><text x="1060" y="236">4.0</text>
+          <text x="560" y="280">3.5</text><text x="710" y="280">4.0</text><text x="880" y="280" fill="#fbbf24" font-weight="700">4.5</text><text x="1060" y="280">3.5</text>
+          <text x="560" y="324" fill="#fbbf24">4.0</text><text x="710" y="324">3.5</text><text x="880" y="324">4.0</text><text x="1060" y="324" fill="#f87171">2.5</text>
+          <text x="560" y="368" fill="#f87171">2.0</text><text x="710" y="368">3.5</text><text x="880" y="368" fill="#fbbf24" font-weight="700">4.5</text><text x="1060" y="368">4.0</text>
+          <text x="560" y="412">3.5</text><text x="710" y="412">3.0</text><text x="880" y="412" fill="#fbbf24" font-weight="700">5.0</text><text x="1060" y="412">4.5</text>
+          <text x="560" y="456">3.0</text><text x="710" y="456" fill="#fbbf24">4.5</text><text x="880" y="456" fill="#fbbf24" font-weight="700">4.5</text><text x="1060" y="456">4.0</text>
+          <text x="560" y="500">3.0</text><text x="710" y="500">3.5</text><text x="880" y="500" fill="#fbbf24" font-weight="700">4.5</text><text x="1060" y="500">4.0</text>
+          <text x="560" y="544" fill="#fbbf24">5.0</text><text x="710" y="544">4.5</text><text x="880" y="544" fill="#f87171">2.5</text><text x="1060" y="544" fill="#f87171">2.0</text>
+          <text x="560" y="588" fill="#fbbf24">4.5</text><text x="710" y="588" fill="#fbbf24">4.5</text><text x="880" y="588" fill="#f87171">2.0</text><text x="1060" y="588" fill="#f87171">2.0</text>
+        </g>
+      </g>
+      <line x1="80" y1="612" x2="1120" y2="612" stroke="#1f2a3d" stroke-width="2"/>
+      <text x="80" y="648" fill="#5c6b82" font-size="16">highlighted rows: a 0-star project ties or beats both giants — at mechanism level. the proven column is the experiment.</text>
+    </svg>
+    <figcaption>FIG. 2 — the dual-track scorecard. pending = zero credit.</figcaption>
+  </figure>
+
+  <p>Mechanism-level: we tied or beat both giants on persistence, error recovery, security, observability, and testing discipline.</p>
+  <p>Proven-level: we're still behind. And that gap is the most interesting part of this whole story.</p>
+
+  <h2>The part that should bother you</h2>
+  <p>Let me say the quiet part loudly.</p>
+  <p><strong>Months of engineering throughput just became a one-day commodity.</strong> Queue architectures, supervision trees, audit systems, migration strategies — the stuff that used to take senior teams entire quarters — can now be specified in the morning and exist by dinner.</p>
+  <p>But here's what the AI's harsher second review made unmissable. There are things no model can compress:</p>
+  <ul>
+    <li>A seven-day shadow soak takes seven days. Physics doesn't read prompts.</li>
+    <li>A 30-day unattended reliability SLO takes thirty days.</li>
+    <li>Trust, third-party scrutiny, real users hitting real edge cases — these accrue at human speed.</li>
+    <li>And community? Community accrues at <em>relationship</em> speed — the slowest and most valuable speed there is.</li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 1200 675" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,Segoe UI,sans-serif" role="img" aria-label="What AI compresses versus what it cannot">
+      <rect width="1200" height="675" fill="#0a0d13"/>
+      <text x="600" y="80" fill="#dbe4f0" font-size="34" font-weight="800" text-anchor="middle">What AI compresses — and what it can't</text>
+      <rect x="70" y="130" width="510" height="460" rx="18" fill="#121927" stroke="#34d399" stroke-opacity="0.4"/>
+      <text x="100" y="186" fill="#34d399" font-size="24" font-family="Consolas,monospace" font-weight="700">// COMPRESSED: months → hours</text>
+      <g fill="#8fa0b8" font-size="21">
+        <text x="100" y="245">▸ Queue &amp; supervision architecture</text>
+        <text x="100" y="295">▸ Audit trails, trace IDs, vaults</text>
+        <text x="100" y="345">▸ Migration &amp; rollback strategy</text>
+        <text x="100" y="395">▸ Test scaffolds &amp; invariants</text>
+        <text x="100" y="445">▸ The gap between "identified"</text>
+        <text x="120" y="478">and "code + tests exist"</text>
+      </g>
+      <text x="100" y="555" fill="#34d399" font-size="40" font-weight="800">⏱ 1 day</text>
+      <rect x="620" y="130" width="510" height="460" rx="18" fill="#121927" stroke="#f87171" stroke-opacity="0.4"/>
+      <text x="650" y="186" fill="#f87171" font-size="24" font-family="Consolas,monospace" font-weight="700">// INCOMPRESSIBLE</text>
+      <g fill="#8fa0b8" font-size="21">
+        <text x="650" y="245">▸ A 7-day soak takes 7 days</text>
+        <text x="650" y="295">▸ A 30-day SLO takes 30 days</text>
+        <text x="650" y="345">▸ Trust &amp; third-party scrutiny</text>
+        <text x="650" y="395">▸ Real users, real edge cases</text>
+        <text x="650" y="445">▸ Community — which accrues</text>
+        <text x="670" y="478">at relationship speed</text>
+      </g>
+      <text x="650" y="555" fill="#f87171" font-size="40" font-weight="800">📅 calendar time</text>
+      <text x="600" y="645" fill="#fbbf24" font-size="22" text-anchor="middle" font-family="Consolas,monospace">engineering = table stakes · community = the moat</text>
+    </svg>
+    <figcaption>FIG. 3 — the asymmetry this whole experiment rests on.</figcaption>
+  </figure>
+
+  <p>So here's my thesis, and the reason this project exists as a public experiment:</p>
+  <blockquote>If engineering is now table stakes, then community is the moat.</blockquote>
+  <p>Those 378,000 stars on the incumbent? The day after AI parity, they stop measuring engineering quality. They start measuring something rarer: gravity. Distribution. The accumulated trust of thousands of people who chose to depend on something together.</p>
+  <p>That can't be generated. It has to be <em>earned</em> — in calendar time, in public.</p>
+
+  <h2>What this means if you ship software for a living</h2>
+  <p>Three takeaways I'm acting on as a PM:</p>
+  <p><strong>1. Roadmaps should become experiments with public evidence.</strong> We published ours as a "Proving Ground": three falsifiable proofs — seven days of shadow-migration parity with zero divergence, reboot-proof supervision with receipts, a 30-day unattended SLO. Not promises. Proofs, landing as machine-readable ledgers anyone can audit. If your roadmap can be replicated by a competitor's AI in a weekend, the only durable thing on it is the evidence you generate while running it.</p>
+
+  <figure>
+    <svg viewBox="0 0 1200 675" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,Segoe UI,sans-serif" role="img" aria-label="The Proving Ground: three public proofs">
+      <rect width="1200" height="675" fill="#0a0d13"/>
+      <text x="80" y="80" fill="#fbbf24" font-size="20" letter-spacing="5" font-family="Consolas,monospace">THE PROVING GROUND — DON'T BELIEVE THE SCORES. WATCH US EARN THEM.</text>
+      <rect x="70" y="130" width="340" height="430" rx="18" fill="#121927" stroke="#1f2a3d"/>
+      <text x="100" y="186" fill="#fbbf24" font-size="17" font-family="Consolas,monospace">PROOF 01</text>
+      <text x="100" y="235" fill="#dbe4f0" font-size="27" font-weight="700">7-Day Shadow</text>
+      <text x="100" y="270" fill="#dbe4f0" font-size="27" font-weight="700">Parity</text>
+      <text x="100" y="320" fill="#8fa0b8" font-size="18">Dual-write every turn to the</text>
+      <text x="100" y="348" fill="#8fa0b8" font-size="18">new SQLite lane. Seven live</text>
+      <text x="100" y="376" fill="#8fa0b8" font-size="18">days of zero divergence —</text>
+      <text x="100" y="404" fill="#8fa0b8" font-size="18">receipt-compared — before</text>
+      <text x="100" y="432" fill="#8fa0b8" font-size="18">cutover.</text>
+      <rect x="100" y="480" width="220" height="36" rx="18" fill="#fbbf24" opacity="0.12"/>
+      <text x="210" y="504" fill="#fbbf24" font-size="14" text-anchor="middle" font-family="Consolas,monospace">SHADOW LIVE-GATED</text>
+      <rect x="430" y="130" width="340" height="430" rx="18" fill="#121927" stroke="#1f2a3d"/>
+      <text x="460" y="186" fill="#fbbf24" font-size="17" font-family="Consolas,monospace">PROOF 02</text>
+      <text x="460" y="235" fill="#dbe4f0" font-size="27" font-weight="700">Reboot-Proof</text>
+      <text x="460" y="270" fill="#dbe4f0" font-size="27" font-weight="700">Supervision</text>
+      <text x="460" y="320" fill="#8fa0b8" font-size="18">Auto-restart with backoff,</text>
+      <text x="460" y="348" fill="#8fa0b8" font-size="18">crash-loop breaker that DMs</text>
+      <text x="460" y="376" fill="#8fa0b8" font-size="18">the operator, canary deploys</text>
+      <text x="460" y="404" fill="#8fa0b8" font-size="18">with automatic rollback —</text>
+      <text x="460" y="432" fill="#8fa0b8" font-size="18">all with receipts.</text>
+      <rect x="460" y="480" width="250" height="36" rx="18" fill="#fbbf24" opacity="0.12"/>
+      <text x="585" y="504" fill="#fbbf24" font-size="14" text-anchor="middle" font-family="Consolas,monospace">MECHANISM · DRILL PENDING</text>
+      <rect x="790" y="130" width="340" height="430" rx="18" fill="#121927" stroke="#1f2a3d"/>
+      <text x="820" y="186" fill="#fbbf24" font-size="17" font-family="Consolas,monospace">PROOF 03</text>
+      <text x="820" y="235" fill="#dbe4f0" font-size="27" font-weight="700">30-Day</text>
+      <text x="820" y="270" fill="#dbe4f0" font-size="27" font-weight="700">Unattended SLO</text>
+      <text x="820" y="320" fill="#8fa0b8" font-size="18">≥99.5% delivery. Zero silent</text>
+      <text x="820" y="348" fill="#8fa0b8" font-size="18">failures. Every failure recon-</text>
+      <text x="820" y="376" fill="#8fa0b8" font-size="18">structable from receipts in</text>
+      <text x="820" y="404" fill="#8fa0b8" font-size="18">5 minutes, with one</text>
+      <text x="820" y="432" fill="#8fa0b8" font-size="18">trace command.</text>
+      <rect x="820" y="480" width="250" height="36" rx="18" fill="#5c6b82" opacity="0.15"/>
+      <text x="945" y="504" fill="#8fa0b8" font-size="14" text-anchor="middle" font-family="Consolas,monospace">CLOCK NOT YET STARTED</text>
+      <text x="80" y="625" fill="#5c6b82" font-size="18" font-family="Consolas,monospace">proofs land as machine-readable ledgers in the repo — JSONL you can read, not claims you have to trust.</text>
+    </svg>
+    <figcaption>FIG. 4 — the roadmap, rewritten as falsifiable proofs.</figcaption>
+  </figure>
+
+  <p><strong>2. The scarce skill has moved.</strong> It's no longer "can your team build it." It's "can your team <em>specify</em> it precisely and <em>verify</em> it honestly." The most valuable artifacts we produced that day weren't code — they were the invariants catalog, the SLO definitions, and a four-tier honesty vocabulary that labels every claim as staging-tested, pending live gate, pending fixtures, or deferred by policy. Specification and verification are the new senior engineering.</p>
+  <p><strong>3. Honesty is a feature — maybe <em>the</em> feature.</strong> Full disclosure, because it matters: the AI that scored our work is the same AI that wrote our roadmap. A self-referential loop — which is exactly why we split the scoring into mechanism vs. proven, gave zero credit to anything unverified, and published the methodology. In a world where anyone can generate impressive-looking claims in an afternoon, <em>auditable honesty becomes the differentiator</em>. Our product literally writes a receipt for everything. So does our marketing.</p>
+
+  <h2>The trust dilemma (pick a side)</h2>
+  <p>One more thing before the open questions — the fork this experiment quietly forces on everyone reading it:</p>
+  <p><strong>Either</strong> the smartest publicly available AI just produced a credible engineering assessment — in which case the scorecard stands, and a zero-star side project really did reach mechanism parity with hundred-thousand-star platforms in a single day.</p>
+  <p><strong>Or</strong> even the most capable AI on the market can't be trusted with a bounded, checkable, receipts-on-the-table engineering review — in which case, why are we comfortable deploying AI on decisions that are harder, fuzzier, and far less verifiable than this one? Medical triage. Legal research. Your company's quarterly strategy.</p>
+  <p>There is no comfortable third door. And if your instinct is <em>"it depends on whether you can verify the claims"</em> — congratulations, you've just articulated this project's entire design philosophy. That's why every step writes a receipt.</p>
+
+  <h2>The open questions (this is where you come in)</h2>
+  <p>I genuinely don't know the answers to these, and I'd rather argue about them than pretend I do:</p>
+  <ul>
+    <li>If AI collapses engineering cost to near zero, <strong>what's the last moat?</strong> Community? Distribution? Taste? Regulatory position? Proprietary data? Something else?</li>
+    <li>When stars stop signaling engineering quality, <strong>what should we measure instead?</strong> Soak time? Incident transparency? Receipt density?</li>
+    <li>And the one that keeps me up at night: if a solo PM with an AI can reach mechanism parity with hundred-thousand-star projects in a day — <strong>what exactly are we paying for when we fund fifty-person platform teams?</strong></li>
+  </ul>
+  <p>The experiment is live and running in public. The scores, the brutal reviews, the unproven gaps — all of it is published, receipts included.</p>
+
+  <div class="cta-box">
+    <strong>The star button is, quite literally, the dependent variable of this experiment.</strong> Either outcome proves something.
+    <br>
+    <a class="btn btn-primary" href="https://github.com/phenomenoner/agent-harness-core">★ Star the repo</a>
+    <a class="btn btn-ghost" href="../">The experiment, at a glance →</a>
+  </div>
+
+  <p class="dim">And yes — this essay was drafted in pair with the same AI that reviewed the code. Welcome to 2026.</p>
+
+  <hr>
+  <p class="dim"><em>Agent Harness Core: a self-hosted AI agent runtime in Rust. Six dependencies. No async runtime. 207 tests without a model call. Every step gated, every step receipted. Pre-release, Windows-first, dual-licensed MIT/Apache-2.0.</em></p>
+
+</article>
+</div>
+
+<footer class="site">
+  <a href="../">Home</a>
+  <a href="https://github.com/phenomenoner/agent-harness-core">GitHub</a>
+  <a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/agent-harness-core-roadmap-backlog.md">Roadmap &amp; Backlog</a>
+  <a href="https://github.com/phenomenoner/agent-harness-core/blob/main/SECURITY.md">Security</a>
+  <p style="margin-top:18px">Opinions quoted are from architecture reviews by Claude (Fable&nbsp;5, Anthropic), 2026-06-12. Dual-licensed MIT OR Apache-2.0.</p>
+</footer>
+
+</body>
+</html>
