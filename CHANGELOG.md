@@ -7,6 +7,7 @@
 - Reworked `README.md` into a public-facing overview (positioning, architecture diagram, CLI family table, FAQ, dual-license section); moved the internal live-validation, topology, full command walkthrough, and capability ledger content verbatim to `docs/agent-harness-operations-handbook.md`, now referenced from `AGENTS.md` as the session entry point.
 - Replaced the condensed `LICENSE-APACHE` text with the canonical Apache License 2.0 text so GitHub license detection no longer reports "Other".
 - Fixed the placeholder workspace `repository` URL in `Cargo.toml` and added crate `description` metadata.
+- Added root `DOC-GUIDELINES.md` documentation writing guideline, linked from the README documentation table and the operations handbook documentation map.
 
 ### Added
 

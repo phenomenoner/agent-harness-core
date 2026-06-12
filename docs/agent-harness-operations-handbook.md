@@ -51,6 +51,7 @@ Documentation map:
 - [Worker Dispatch Strategy](agent-worker-dispatch-strategy.md): durable worker, cron, subagent, watchdog, and concurrency design.
 - [Round3-2 Implementation And Upgrade Plan](round3-2-implementation-and-upgrade-plan.md): timeout/progress fixes, background-job contract, long-task contract, and Hermes-style learning-loop roadmap.
 - [Project Assessment](project-assessment.md): broader historical assessment; prefer the handoff/parity/readiness docs above for current live state.
+- [Doc Writing Guidelines](../DOC-GUIDELINES.md): document roles, style rules for public vs internal docs, hygiene hard rules, and update discipline.
 
 ## Capability Ledger
 

@@ -131,6 +131,7 @@ See the [Changelog](CHANGELOG.md), the [Roadmap & Backlog](docs/agent-harness-co
 | [Invariants](docs/invariants.md) & [Schema Registry](docs/schema-registry.md) | The contracts the test suite enforces. |
 | [Test Handoff](docs/agent-harness-test-handoff.md) | Step-by-step live Telegram/Discord test plan. |
 | [Release Checklist](docs/release-checklist.md) & [SECURITY.md](SECURITY.md) | Release gates and security policy. |
+| [Doc Writing Guidelines](DOC-GUIDELINES.md) | How documentation in this repo is written and kept honest. |
 
 ## FAQ
 
