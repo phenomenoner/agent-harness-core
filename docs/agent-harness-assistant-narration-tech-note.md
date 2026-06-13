@@ -36,7 +36,9 @@ Implemented on 2026-06-11.
   successful `agent-reply` outbox boundary.
 - Verification: `cargo test -p agent-harness-core` passed with 224 core tests
   and `cargo test -p agent-harness-cli` passed with 17 CLI tests after the
-  round4 response/reconnect update.
+  round4 response/reconnect update. The later 2026-06-13 channel identity /
+  delivery intent / cron scheduler pass raised the verified suite to 229 core
+  tests, 18 CLI tests, and 0 doctests.
 
 ## Changelog
 

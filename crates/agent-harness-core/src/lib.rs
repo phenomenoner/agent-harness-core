@@ -8,6 +8,7 @@ pub mod autonomy;
 pub mod background;
 pub mod channel_commands;
 pub mod channel_delivery;
+pub mod channel_identity;
 pub mod channel_ingress;
 pub mod channel_pipeline;
 pub mod channel_runtime;
@@ -15,6 +16,7 @@ pub mod channel_state;
 pub mod codex_runtime;
 pub mod config;
 pub mod cron;
+pub mod cron_scheduler;
 pub mod deploy;
 pub mod deterministic_cron;
 pub mod harness_registry;
@@ -34,6 +36,7 @@ pub mod queue_shadow;
 pub mod registry;
 pub mod response_tone;
 pub mod runtime_pipeline;
+pub mod runtime_policy;
 pub mod runtime_queue;
 pub mod runtime_worker;
 pub mod security;
@@ -78,6 +81,11 @@ pub use channel_delivery::{
     ChannelDeliveryStatus, ChannelOutboxPlanOptions, ChannelOutboxPlanReport,
     ChannelOutboxPlanSummary, plan_channel_outbox, record_channel_delivery,
 };
+pub use channel_identity::{
+    ChannelIdentityBinding, ChannelIdentityLookup, ChannelIdentityRegistry,
+    ChannelIdentityResolution, ChannelIdentityResolutionStatus,
+    channel_identity_registry_candidates, resolve_channel_identity,
+};
 pub use channel_ingress::{
     ChannelReceiveOptions, ChannelReceiveReceipt, ChannelReceiveReport, ChannelReceiveStatus,
     receive_channel_message,
@@ -86,10 +94,10 @@ pub use channel_pipeline::{
     ChannelRunOnceOptions, ChannelRunOnceReport, ChannelRunOnceStatus, run_channel_once,
 };
 pub use channel_runtime::{
-    ChannelAgentTurnDispatch, ChannelCommandEffect, ChannelOutboundAttachment,
-    ChannelOutboundAttachmentKind, ChannelOutboundMessage, ChannelOutboundMessageKind,
-    ChannelStatusSnapshot, ChannelStep, ChannelStepAction, ChannelStepFile, build_channel_step,
-    write_channel_step,
+    ChannelAgentTurnDispatch, ChannelCommandEffect, ChannelDeliveryIntent,
+    ChannelDeliveryIntentKind, ChannelOutboundAttachment, ChannelOutboundAttachmentKind,
+    ChannelOutboundMessage, ChannelOutboundMessageKind, ChannelStatusSnapshot, ChannelStep,
+    ChannelStepAction, ChannelStepFile, build_channel_step, write_channel_step,
 };
 pub use channel_state::{
     AgentOverride, AgentOverridesStore, ChannelCommandApplyOptions, ChannelCommandApplyReceipt,
@@ -122,6 +130,12 @@ pub use cron::{
     NativeCronPlanFile, NativeCronPlanInput, NativeCronPlanSummary, NativeCronSchedule,
     NativeCronStore, NativeCronStoreSummary, load_native_cron_store, plan_native_cron,
     write_native_cron_plan,
+};
+pub use cron_scheduler::{
+    CronSchedulerConfig, CronSchedulerDeterministicConfig, CronSchedulerJobDecision,
+    CronSchedulerJobDecisionStatus, CronSchedulerLoopOptions, CronSchedulerNativeConfig,
+    CronSchedulerRunOnceOptions, CronSchedulerRunOnceReport, CronSchedulerTickReceipt,
+    CronSchedulerTickStatus, CronSchedulerTickSummary, run_cron_scheduler_once,
 };
 pub use deploy::{
     SuperviseDeployCanaryOptions, SuperviseDeployCanaryReport, SuperviseDeployDecision,
@@ -245,6 +259,10 @@ pub use runtime_pipeline::{
     RuntimeRunOnceOptions, RuntimeRunOnceReceipt, RuntimeRunOnceReport, RuntimeRunOnceStatus,
     run_runtime_queue_once,
 };
+pub use runtime_policy::{
+    RuntimeBackoffPolicy, RuntimeBackoffPolicyInspection, RuntimeProviderFallbackRule,
+    inspect_runtime_backoff_policy,
+};
 pub use runtime_queue::{
     RuntimeQueueControlAction, RuntimeQueueControlOptions, RuntimeQueueControlReport,
     RuntimeQueueControlStatus, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
@@ -265,9 +283,10 @@ pub use skills::{
     write_skill_index,
 };
 pub use status::{
-    HarnessChannelStatus, HarnessJsonlStatus, HarnessMemoryStatus, HarnessOperationalLogStatus,
-    HarnessOutboxStatus, HarnessPluginStatus, HarnessRuntimeReceiptStatus, HarnessRuntimeStatus,
-    HarnessStatusOptions, HarnessStatusReport, collect_harness_status,
+    HarnessChannelStatus, HarnessCronSchedulerStatus, HarnessJsonlStatus, HarnessMemoryStatus,
+    HarnessOperationalLogStatus, HarnessOutboxStatus, HarnessPluginStatus,
+    HarnessRuntimeReceiptStatus, HarnessRuntimeStatus, HarnessStatusOptions, HarnessStatusReport,
+    collect_harness_status,
 };
 pub use subagents::{
     SubagentLedger, SubagentLedgerSummary, SubagentPlan, SubagentPlanAction, SubagentPlanEntry,

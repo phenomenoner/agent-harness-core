@@ -9,17 +9,17 @@ use crate::{HARNESS_BUILTIN_SKILL_NAMESPACE, SKILL_FILE_NAME};
 const BUILTIN_HARNESS_SKILL_SYNC_SCHEMA: &str = "agent-harness.builtin-skill-sync.v1";
 const BUILTIN_HARNESS_SKILL_MANIFEST_SCHEMA: &str = "agent-harness.builtin-skill-manifest.v1";
 const AGENT_WINDOWS_HARNESS_SKILL_ID: &str = "agent-windows-harness";
-const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.7";
+const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.8";
 
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
 description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, response tone, and Codex prompt continuity policy.
-version: 0.1.7
+version: 0.1.8
 platforms: [windows]
 metadata:
   agent_harness:
     category: operations
-    tags: [legacy-import, codex, openrouter, telegram, discord, migration, activation, response-tone, reconnect]
+    tags: [legacy-import, codex, openrouter, telegram, discord, migration, activation, response-tone, reconnect, channel-identity, cron-scheduler]
 ---
 
 # Agent Windows Harness
@@ -32,10 +32,12 @@ Use it when the user mentions:
 
 - importing legacy source state, memory, cron, plugins, sessions, agents, subagents, or workspace files
 - Telegram or Discord DM operation
+- channel identity binding, delivery intent, or multi-account adapter operation
 - slash commands such as /new, /think, /stop, /steer, /btw, /model, or /status
 - Codex CLI, Codex OAuth, app-server, OpenRouter provider routing, prompt injection, tool schema, or session continuity
 - response tone, emoji accent, assistant narration, progress panel, or final reply formatting
 - activation readiness, runtime queue, operational logs, or gateway handoff
+- cron scheduler ticks, worker enqueue watermarks, or cron-scheduler-loop supervision
 
 ## Operating Lead
 
@@ -56,6 +58,8 @@ Use it when the user mentions:
 15. Treat harness-config.json security.codexApprovalPolicy and security.codexSandbox as operator-controlled runtime safety settings. Use codexApprovalPolicy="accept" only for an intentionally unattended trusted channel runtime.
 16. Keep response tone policy scoped to successful final agent replies. The default is off; subtle emoji accenting is opt-in. Do not post-process command replies, /status, error/failure replies, progress/status panels, code-heavy replies, or risk/security/status replies.
 17. For every new functional component or behavior change, add or update a `/docs/` note that records the design rationale and a concise changelog. Do not leave feature history discoverable only through git commits or chat context.
+18. Treat channel identity registry misses, disabled bindings, ambiguous bindings, and agent mismatches as fail-closed ingress stops. Allow-lists are necessary but not sufficient when a channel identity registry is present.
+19. Treat cron-scheduler-loop as a scheduler/enqueue loop only. Worker-loop owns job execution, retry, leases, and recovery.
 
 ## Prompt And Tool Schema Policy
 
@@ -99,7 +103,7 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - Retry-pending runtime failures are non-terminal. They should not write user-visible error replies, and progress should stay resumable for the same queue/session context.
 - Retry-pending receipts must make the same queue id immediately claimable again. If a retry-pending Telegram or Discord turn shows `openItems>0` while `runtime-loop` reports `no-work`, inspect `state/runtime-queue/runtime-leases.json`; stale retry-pending leases are a runtime lease-cleanup bug, not a channel adapter issue.
 - Non-matching protocol/config/preflight/spawn failures stay failed-terminal. Gateway restart alone does not resume failed-terminal or dead-letter queue items.
-- When retry attempts are exhausted, runtime-run-once dead-letters the item and writes an operator-friendly error reply. The original session context is still preserved in receipts and queue data.
+- `runtimeBackoff` config controls retry caps and delay hints for retryable runtime failures. When retry attempts are exhausted, runtime-run-once dead-letters the item and writes an operator-friendly error reply. Provider/model fallback is operator-guided; the harness should not silently switch providers on behalf of a user turn.
 - Use `queue-retry` for manual recovery of a timeout/dead-letter item. It creates a fresh queue id while preserving `sessionKey`, agent, platform/channel/user, provider/model, selected skills, and planned transcript/trajectory paths.
 - To verify a reconnect fix, test both early retry-pending and final dead-letter behavior, and confirm unrelated protocol errors remain terminal.
 
@@ -109,7 +113,7 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - Use response.emojiAccentAgentModes for agent-specific overrides and response.emojiAccentChannelModes for channel-specific overrides.
 - Channel selectors can be platform:channelId:userId, platform:channelId, channelId, or platform. Channel overrides win over agent overrides; agent overrides win over the global mode.
 - The policy must skip command replies, /status, error/failure replies, progress/status panels, fenced code blocks, code-heavy replies, risk/security/status-style replies, and text already ending with an emoji.
-- Do not wrap final Telegram/Discord replies with a mechanical `◆ Agent` header. Send trimmed assistant text as-is unless a future delivery-intent policy explicitly says otherwise.
+- Do not wrap final Telegram/Discord replies with a mechanical `◆ Agent` header. Send trimmed assistant text as-is. Reply/reference targeting is represented by harness-validated outbound `deliveryIntent`, never by model-authored quote text.
 - Current-step narration in progress delivery uses assistant narration only, with a separate longer cap (`--current-step-max-chars`, default 1200). If assistant narration is absent, omit the `Current step:` line; keep runtime/tool operation names in action/status lanes and never relabel them as Codex execution summaries.
 - Do not implement tone as blind delivery-layer post-processing. Keep it at the successful agent-reply outbox boundary so audit artifacts and non-agent replies stay unpolluted.
 
@@ -131,14 +135,21 @@ Commands should update channel state and receipts before enqueueing agent turns.
 - Use channel-run-once for offline smoke and adapter-level single-message tests.
 - Use channel-outbox-plan to list pending delivery work by platform.
 - Use channel-delivery-record after Telegram/Discord send attempts to record delivered or failed receipts.
-- Use channel-credentials-export --include-sensitive during legacy cutover to import Telegram/Discord bot tokens and known channel/user/guild IDs into secrets/channel-credentials.env with redacted receipts. Telegram poll and Discord event adapters enforce those imported allow-lists before channel-run-once.
+- Use channel-credentials-export --include-sensitive during legacy cutover to import Telegram/Discord bot tokens and known channel/user/guild IDs into secrets/channel-credentials.env with redacted receipts. Telegram poll and Discord event adapters enforce those imported allow-lists, then resolve channel identity bindings before channel-run-once.
+- Use channel-identity-check before live handoff for every enabled platform/account/channel tuple. A bound result identifies the owning agent; missing/disabled/conflicting bindings are fail-closed and must be fixed in config rather than bypassed at runtime.
 - Use telegram-probe before live Telegram handoff to validate Bot API getMe without consuming updates or sending messages. It writes state/channels/telegram-probe.json, appends telegram-probe-receipts.jsonl, and logs telegram.probe.
-- Use telegram-poll-once for Telegram Bot API smoke tests. It reads TELEGRAM_BOT_TOKEN plus imported Telegram chat/user allow-lists from the environment or secrets/channel-credentials.env, stores offset state in state/channels/telegram-offset.json after every successful poll, denies non-allowed updates before runtime dispatch, runs channel-run-once for allowed text updates, sends pending replies, records delivery receipts, and writes a telegram.poll-once operational log.
-- Use telegram-loop for operator-run Telegram handoff. It repeats the same poll-once path with --iterations, --idle-ms, --max-consecutive-errors, and optional --stop-file. Use finite iterations for tests and --iterations 0 only when the old gateway is not also consuming Telegram updates.
-- Use discord-outbox-send-once for Discord outbound smoke. It reads DISCORD_BOT_TOKEN from the environment or secrets/channel-credentials.env, sends pending platform=discord outbox messages through Discord REST, records delivery receipts, and writes a discord.outbox-send-once operational log.
-- Use discord-event-run-once for Discord inbound normalization smoke. It accepts a Discord Gateway MESSAGE_CREATE event from --event-file or --event-json, skips bot/empty/duplicate messages, enforces imported Discord user/channel/guild allow-lists, calls channel-run-once for allowed text, writes discord-event receipts, and logs discord.event-run-once. Use discord-gateway-probe before discord-gateway-loop for live WebSocket handoff. The gateway loop accepts --stop-file and closes the WebSocket when that file appears. INTERACTION_CREATE application commands are acknowledged by the Node gateway, translated to slash-command text, and routed through the same Discord event pipeline; real DM text readiness still requires a MESSAGE_CREATE receipt.
+- Use telegram-poll-once for Telegram Bot API smoke tests. It reads TELEGRAM_BOT_TOKEN or AGENT_HARNESS_TELEGRAM_ACCOUNT_<ID>_BOT_TOKEN plus imported Telegram chat/user allow-lists from the environment or secrets/channel-credentials.env, stores account-specific offset state after every successful poll, denies non-allowed/unbound updates before runtime dispatch, runs channel-run-once for allowed text updates, sends matching-account pending replies, records delivery receipts, and writes a telegram.poll-once operational log.
+- Use telegram-loop for operator-run Telegram handoff. It repeats the same poll-once path with --telegram-account, --iterations, --idle-ms, --max-consecutive-errors, and optional --stop-file. Use finite iterations for tests and --iterations 0 only when the old gateway is not also consuming Telegram updates.
+- Use discord-outbox-send-once for Discord outbound smoke. It reads DISCORD_BOT_TOKEN or AGENT_HARNESS_DISCORD_ACCOUNT_<ID>_BOT_TOKEN from the environment or secrets/channel-credentials.env, sends pending platform=discord outbox messages for the selected account through Discord REST, records delivery receipts, and writes a discord.outbox-send-once operational log.
+- Use discord-event-run-once for Discord inbound normalization smoke. It accepts a Discord Gateway MESSAGE_CREATE event from --event-file or --event-json, skips bot/empty/duplicate messages, enforces imported Discord user/channel/guild allow-lists, resolves channel identity, calls channel-run-once for allowed text, writes discord-event receipts, and logs discord.event-run-once. Use discord-gateway-probe before discord-gateway-loop for live WebSocket handoff. The gateway loop accepts --discord-account and --stop-file, passes the account selector to event-run-once, and closes the WebSocket when the stop file appears. INTERACTION_CREATE application commands are acknowledged by the Node gateway, translated to slash-command text, and routed through the same Discord event pipeline; real DM text readiness still requires a MESSAGE_CREATE receipt.
 - Failed receipts stay retryable; delivered receipts are skipped by future outbox plans.
 - Do not send the same already recorded Codex completion twice.
+
+## Cron Scheduler
+
+- `cron-scheduler-run-once` evaluates imported native agent-turn cron and deterministic crontab/Supercronic-style cron, then enqueues due work into WorkerStore with durable watermarks under `state/cron-scheduler/watermarks.sqlite`.
+- Use `--dry-run` for readback and `--enable` plus explicit `--resume-cron` or `--allow-deterministic-run` gates for intentional enqueue. A scheduler tick should write job-decision receipts even when entries are skipped by policy.
+- `cron-scheduler-loop` repeats the tick with heartbeat, stop-file, consecutive-error, and `loop-last.json` status support. Generate it through `supervisor-plan --include-cron-scheduler` only after operator approval to activate live scheduling.
 
 ## Activation Checklist
 

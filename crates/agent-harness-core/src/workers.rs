@@ -1299,6 +1299,7 @@ fn queue_llm_worker_turn(
         agent_id: agent_id.to_string(),
         session_key: session_key.to_string(),
         platform: platform.to_string(),
+        account_id: None,
         channel_id: channel_id.to_string(),
         user_id: user_id.to_string(),
         message_text: message_text.to_string(),

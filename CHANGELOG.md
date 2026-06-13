@@ -15,6 +15,8 @@
 - Treat known Codex app-server stream disconnect protocol errors (`Reconnecting...`, `stream disconnected before completion`, and `websocket closed by server before response.completed`) as retryable transient failures before dead-lettering, preserving the existing queue/session context across attempts.
 - Changed `response.emojiAccentMode` default to `off`, keeping `subtle` as explicit opt-in, and removed the mechanical `◆ Agent` wrapper from successful final Telegram/Discord replies.
 - Split progress current-step narration length from short action/error preview length; current-step status now uses a longer default cap while redaction and platform-safe truncation stay in place.
+- Route Telegram/Discord ingress through channel identity bindings after allow-list checks, preserving explicit account ids through queue, outbox, delivery receipts, and gateway callbacks.
+- Make runtime retry caps and operator fallback hints configurable through `runtimeBackoff` instead of a fixed hard-coded attempt count.
 
 ### Added
 
@@ -38,6 +40,11 @@
 - Operator CLI commands for the new staging gates.
 - Harness secret-env handoff for provider-specific app-server child processes.
 - Guarded `response.emojiAccentMode` response tone policy with default `off`, opt-in `subtle`, per-agent/channel overrides, and skips for command, status, error, code-heavy, and risk/security replies.
+- `channel-identity-check` for platform/account/channel binding smoke checks.
+- Harness-validated outbound `deliveryIntent` for provider-native reply references, constructed from captured inbound provider ids rather than model text.
+- `cron-scheduler-run-once` and `cron-scheduler-loop`, with scheduler locks, SQLite watermarks, decision receipts, idempotent worker enqueue, status readback, and optional supervisor-plan integration.
+- Account-specific Discord gateway selector support through `--discord-account`, matching the existing event and outbox account selectors.
+- Schema registry entries and docs for channel identity, delivery intent, and cron scheduler receipts.
 
 ### Verification
 
@@ -61,6 +68,10 @@
 - `target\debug\agent-harness.exe harness-skills-sync --target-home .\.agent-harness`
 - `target\debug\agent-harness.exe healthz --target-home .\.agent-harness --require-writable-state`
 - `target\debug\agent-harness.exe status --target-home .\.agent-harness --json`
+- `cargo fmt`
+- `cargo check`
+- `cargo test`
+- tracked-file `public-hygiene` with `forbiddenHits=[]`
 
 ### Pending Live Evidence
 

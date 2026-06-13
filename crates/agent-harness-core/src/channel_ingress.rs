@@ -21,6 +21,7 @@ pub struct ChannelReceiveOptions {
     pub harness_home: PathBuf,
     pub skill_index: SkillIndex,
     pub platform: String,
+    pub account_id: Option<String>,
     pub channel_id: String,
     pub user_id: String,
     pub agent_id: Option<String>,
@@ -37,6 +38,8 @@ pub struct ChannelReceiveReport {
     pub schema: &'static str,
     pub harness_home: PathBuf,
     pub platform: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub channel_id: String,
     pub user_id: String,
     pub session_key: String,
@@ -67,6 +70,8 @@ pub enum ChannelReceiveStatus {
 pub struct ChannelReceiveReceipt {
     pub status: ChannelReceiveStatus,
     pub platform: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub channel_id: String,
     pub user_id: String,
     pub session_key: String,
@@ -98,7 +103,8 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
             skill_limit: options.skill_limit,
         },
     )?;
-    let step = build_channel_step(&registry, &turn);
+    let mut step = build_channel_step(&registry, &turn);
+    step.account_id = options.account_id.clone();
     let command_name = turn
         .command
         .as_ref()
@@ -115,12 +121,14 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
                         now_ms: options.now_ms,
                     },
                 )?;
-                append_outbound_messages(&outbox_file, &apply.outbound_messages)?;
+                let outbound =
+                    with_account_id(apply.outbound_messages.clone(), options.account_id.clone());
+                append_outbound_messages(&outbox_file, &outbound)?;
                 (
                     ChannelReceiveStatus::CommandApplied,
                     Some(apply.clone()),
                     None,
-                    apply.outbound_messages,
+                    outbound,
                     None,
                     "channel command applied and outbound reply recorded".to_string(),
                 )
@@ -146,12 +154,14 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
                 )
             }
             ChannelStepAction::NoAgentAvailable => {
-                append_outbound_messages(&outbox_file, &step.outbound_messages)?;
+                let outbound =
+                    with_account_id(step.outbound_messages.clone(), options.account_id.clone());
+                append_outbound_messages(&outbox_file, &outbound)?;
                 (
                     ChannelReceiveStatus::ErrorReplied,
                     None,
                     None,
-                    step.outbound_messages.clone(),
+                    outbound,
                     None,
                     "channel error reply recorded".to_string(),
                 )
@@ -161,6 +171,7 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
     let receipt = ChannelReceiveReceipt {
         status,
         platform: options.platform,
+        account_id: options.account_id.clone(),
         channel_id: options.channel_id,
         user_id: options.user_id,
         session_key: step.session_key.clone(),
@@ -198,6 +209,7 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
         schema: CHANNEL_RECEIVE_SCHEMA,
         harness_home: options.harness_home,
         platform: receipt.platform.clone(),
+        account_id: receipt.account_id.clone(),
         channel_id: receipt.channel_id.clone(),
         user_id: receipt.user_id.clone(),
         session_key: step.session_key,
@@ -220,6 +232,18 @@ fn append_outbound_messages(path: &Path, messages: &[ChannelOutboundMessage]) ->
         append_json_line(path, message)?;
     }
     Ok(())
+}
+
+fn with_account_id(
+    mut messages: Vec<ChannelOutboundMessage>,
+    account_id: Option<String>,
+) -> Vec<ChannelOutboundMessage> {
+    if let Some(account_id) = account_id {
+        for message in &mut messages {
+            message.account_id = Some(account_id.clone());
+        }
+    }
+    messages
 }
 
 fn append_json_line(path: &Path, value: &impl Serialize) -> io::Result<()> {
@@ -245,6 +269,7 @@ mod tests {
             harness_home: harness_home.clone(),
             skill_index: skills,
             platform: "telegram".to_string(),
+            account_id: None,
             channel_id: "dm".to_string(),
             user_id: "user".to_string(),
             agent_id: Some("main".to_string()),
@@ -280,6 +305,7 @@ mod tests {
             harness_home: harness_home.clone(),
             skill_index: skills.clone(),
             platform: "telegram".to_string(),
+            account_id: None,
             channel_id: "dm".to_string(),
             user_id: "user".to_string(),
             agent_id: Some("main".to_string()),
@@ -297,6 +323,7 @@ mod tests {
             harness_home,
             skill_index: skills,
             platform: "telegram".to_string(),
+            account_id: None,
             channel_id: "dm".to_string(),
             user_id: "user".to_string(),
             agent_id: Some("main".to_string()),

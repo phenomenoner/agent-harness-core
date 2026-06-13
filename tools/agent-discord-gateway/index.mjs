@@ -19,6 +19,7 @@ function parseArgs(argv) {
     runtimeWorkspace: null,
     harnessCli: process.env.AGENT_HARNESS_CLI || defaultHarnessCli(),
     agent: null,
+    discordAccount: null,
     codexExe: null,
     gatewayUrl: DISCORD_GATEWAY_URL,
     maxMessages: 0,
@@ -49,6 +50,9 @@ function parseArgs(argv) {
     } else if (flag === "--agent") {
       i += 1;
       args.agent = requiredValue(argv, i, flag);
+    } else if (flag === "--discord-account" || flag === "--account") {
+      i += 1;
+      args.discordAccount = requiredValue(argv, i, flag);
     } else if (flag === "--codex-exe") {
       i += 1;
       args.codexExe = requiredValue(argv, i, flag);
@@ -115,6 +119,7 @@ function buildProbe(args) {
     sourceHome: args.sourceHome,
     workspace: args.workspace,
     runtimeWorkspace: args.runtimeWorkspace,
+    discordAccount: args.discordAccount,
     harnessCli: args.harnessCli,
     gatewayUrl: args.gatewayUrl,
     intents: discordIntents(),
@@ -575,7 +580,16 @@ async function discordApi(token, route, init = {}) {
 }
 
 function dmPollCursorsFile(args) {
-  return path.join(args.harnessHome, "state", "channels", "discord-dm-poll-cursors.json");
+  const suffix = args.discordAccount ? `-${safePathPart(args.discordAccount)}` : "";
+  return path.join(args.harnessHome, "state", "channels", `discord-dm-poll-cursors${suffix}.json`);
+}
+
+function safePathPart(value) {
+  return String(value)
+    .trim()
+    .replace(/[^A-Za-z0-9._-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    || "account";
 }
 
 function readDmPollCursors(args) {
@@ -703,6 +717,9 @@ function runHarnessForEvent(args, payload) {
   }
   if (args.agent) {
     cliArgs.push("--agent", args.agent);
+  }
+  if (args.discordAccount) {
+    cliArgs.push("--discord-account", args.discordAccount);
   }
   if (args.codexExe) {
     cliArgs.push("--codex-exe", args.codexExe);

@@ -101,6 +101,36 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "append-only receipts; retry creates fresh ids",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.channel-identity-check.v1",
+            owner_module: "channel_identity",
+            compatibility: "additive fields only in v1; non-bound statuses remain fail-closed",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.channel-identity-registry.v1",
+            owner_module: "channel_identity",
+            compatibility: "additive binding fields only in v1; ambiguous bindings must fail closed",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.channel-delivery-intent.v1",
+            owner_module: "channel_runtime",
+            compatibility: "additive fields only in v1; provider ids must come from captured inbound context",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.cron-scheduler.run-once.v1",
+            owner_module: "cron_scheduler",
+            compatibility: "additive fields only in v1; dry-run must not enqueue or write watermarks",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.cron-scheduler.tick.v1",
+            owner_module: "cron_scheduler",
+            compatibility: "append-only receipts; additive fields only in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.cron-scheduler.job-decision.v1",
+            owner_module: "cron_scheduler",
+            compatibility: "append-only receipts; idempotency key semantics are stable in v1",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.config-validation.v1",
             owner_module: "config",
             compatibility: "additive diagnostics only in v1; invalid config remains fail-closed",

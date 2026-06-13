@@ -102,6 +102,9 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
         "staging",
         "codex",
         "runtime",
+        "runtimeBackoff",
+        "cronScheduler",
+        "channelIdentity",
     ];
     let has_known_section = object
         .keys()
@@ -121,6 +124,11 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
             "staging" => validate_staging_object("$.staging", child, errors),
             "codex" => validate_codex_object("$.codex", child, errors),
             "runtime" => validate_runtime_object("$.runtime", child, errors),
+            "runtimeBackoff" => validate_runtime_backoff_object("$.runtimeBackoff", child, errors),
+            "cronScheduler" => validate_cron_scheduler_object("$.cronScheduler", child, errors),
+            "channelIdentity" => {
+                validate_channel_identity_object("$.channelIdentity", child, errors)
+            }
             other => errors.push(format!("unknown harness-config key `{other}` at $")),
         }
     }
@@ -281,7 +289,142 @@ fn validate_runtime_object(path: &str, value: &Value, errors: &mut Vec<String>) 
                     errors,
                 )
             }
+            "backoff" => validate_runtime_backoff_object(&path_key(path, key), child, errors),
             other => errors.push(format!("unknown runtime config key `{other}` at {path}")),
+        }
+    }
+}
+
+fn validate_runtime_backoff_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "maxFailureAttempts" => expect_positive_u64(path_key(path, key), child, errors),
+            "baseDelayMs" | "maxDelayMs" => expect_positive_i64(path_key(path, key), child, errors),
+            "operatorHints" => expect_bool(path_key(path, key), child, errors),
+            "providerFallbacks" => validate_runtime_fallbacks(path_key(path, key), child, errors),
+            other => errors.push(format!(
+                "unknown runtimeBackoff config key `{other}` at {path}"
+            )),
+        }
+    }
+}
+
+fn validate_runtime_fallbacks(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(array) = value.as_array() else {
+        errors.push(format!("{path} must be an array"));
+        return;
+    };
+    for (index, child) in array.iter().enumerate() {
+        let item_path = format!("{path}[{index}]");
+        let Some(object) = expect_object(&item_path, child, errors) else {
+            continue;
+        };
+        for (key, value) in object {
+            match key.as_str() {
+                "fromProvider" | "toProvider" | "toModel" | "reason" => {
+                    expect_string(path_key(&item_path, key), value, errors)
+                }
+                "fromModel" => expect_string(path_key(&item_path, key), value, errors),
+                other => errors.push(format!(
+                    "unknown runtimeBackoff providerFallbacks key `{other}` at {item_path}"
+                )),
+            }
+        }
+    }
+}
+
+fn validate_cron_scheduler_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "enabled" => expect_bool(path_key(path, key), child, errors),
+            "intervalMs" => expect_positive_i64(path_key(path, key), child, errors),
+            "maxCatchupPerTick" | "maxEnqueuePerTick" => {
+                expect_positive_u64(path_key(path, key), child, errors)
+            }
+            "nativeCron" => validate_cron_scheduler_native(path_key(path, key), child, errors),
+            "deterministicCron" => {
+                validate_cron_scheduler_deterministic(path_key(path, key), child, errors)
+            }
+            other => errors.push(format!(
+                "unknown cronScheduler config key `{other}` at {path}"
+            )),
+        }
+    }
+}
+
+fn validate_cron_scheduler_native(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(&path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "enabled" | "resumeCron" | "includeRegisteredCron" => {
+                expect_bool(path_key(&path, key), child, errors)
+            }
+            other => errors.push(format!(
+                "unknown cronScheduler.nativeCron config key `{other}` at {path}"
+            )),
+        }
+    }
+}
+
+fn validate_cron_scheduler_deterministic(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(&path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "enabled" | "allowDeterministicRun" | "executeShell" => {
+                expect_bool(path_key(&path, key), child, errors)
+            }
+            other => errors.push(format!(
+                "unknown cronScheduler.deterministicCron config key `{other}` at {path}"
+            )),
+        }
+    }
+}
+
+fn validate_channel_identity_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "schema" => expect_string(path_key(path, key), child, errors),
+            "bindings" => validate_channel_identity_bindings(path_key(path, key), child, errors),
+            other => errors.push(format!(
+                "unknown channelIdentity config key `{other}` at {path}"
+            )),
+        }
+    }
+}
+
+fn validate_channel_identity_bindings(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(array) = value.as_array() else {
+        errors.push(format!("{path} must be an array"));
+        return;
+    };
+    for (index, child) in array.iter().enumerate() {
+        let item_path = format!("{path}[{index}]");
+        let Some(object) = expect_object(&item_path, child, errors) else {
+            continue;
+        };
+        for (key, value) in object {
+            match key.as_str() {
+                "platform" | "accountId" | "chatId" | "threadId" | "agentId" | "secretRef" => {
+                    expect_string(path_key(&item_path, key), value, errors)
+                }
+                "enabled" => expect_bool(path_key(&item_path, key), value, errors),
+                other => errors.push(format!(
+                    "unknown channelIdentity binding key `{other}` at {item_path}"
+                )),
+            }
         }
     }
 }

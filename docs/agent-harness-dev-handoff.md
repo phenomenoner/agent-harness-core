@@ -1,6 +1,6 @@
 # Agent Harness Development Handoff
 
-Date: 2026-06-11
+Date: 2026-06-13
 
 This handoff is for a developer or a new Codex session continuing implementation of the Rust Windows Agent Harness. It summarizes the project context, current architecture, verified state, important files, and next development priorities.
 
@@ -8,7 +8,8 @@ This handoff is for a developer or a new Codex session continuing implementation
 
 Start with these files before making changes:
 
-- `README.md`: current live topology, active authority, command shortcuts, and documentation map.
+- `docs/agent-harness-operations-handbook.md`: current live topology, active authority, command shortcuts, and documentation map.
+- `README.md`: public-facing overview and quick start.
 - `docs/activation-readiness-plan.md`: activation checklist, verified smoke results, current warnings.
 - `docs/agent-harness-channel-self-check.md`: Telegram DM and Discord DM prompts/checklists for `main` agent live self-checks.
 - `docs/agent-harness-feature-parity.md`: feature parity matrix against the imported legacy deployment.
@@ -48,13 +49,13 @@ Latest local status after the 2026-06-10 repo-local harness-home rebase, round3 
 - Runtime timeout/progress reconciliation is implemented after the round3-2 triage: `timeout` is terminal for queue selection, status open-item counts, native typing context, and progress delivery state. Latest live readback after restart is `queued=123`, `open=0`, `prepared=123`, `completed=120`. A queued row with a timeout receipt should no longer appear as normal open work; retry requires a new queue id. See `docs/round3-2-implementation-and-upgrade-plan.md` for the full disposition and background-task upgrade plan.
 - Outbox: `pending=0`, `delivered=186`, `retryable=0`, `invalid=0`; the old Telegram retry from the pre-narration-routing reply format was manually read back and marked delivered with provider id `manual-readback-20260611`.
 - Channels: Telegram and Discord are enabled; Telegram probe ready; Discord gateway probe ready; Discord real inbound evidence is present; Discord reply-context receipt file is now tracked by status and will appear after the next handled Discord reply event.
-- Loops: one runtime loop plus worker, progress delivery, Telegram, Discord outbox, and Discord gateway loops are running. The runtime loop owns bounded in-process runtime concurrency via `--runtime-concurrency 12`; regenerated scripts also pass configurable `--timeout-ms` and `--idle-timeout-ms` for Codex app-server turns. `supervisor-plan --runtime-workers <n>` maps to that flag instead of producing `runtime-loop-2` style task scripts. The status surface tracks the 6 canonical loop heartbeats; the supervisor plan contains 6 task entries.
+- Loops: one runtime loop plus worker, progress delivery, Telegram, Discord outbox, and Discord gateway loops are running. The runtime loop owns bounded in-process runtime concurrency via `--runtime-concurrency 12`; regenerated scripts also pass configurable `--timeout-ms` and `--idle-timeout-ms` for Codex app-server turns. `supervisor-plan --runtime-workers <n>` maps to that flag instead of producing `runtime-loop-2` style task scripts. The status surface tracks the 6 canonical loop heartbeats, with `cron-scheduler-loop` added when `supervisor-plan --include-cron-scheduler` is used.
 - Runtime UX hardening: low-value `assistant_stream` progress previews are no longer emitted/rendered, Codex `agentMessage` items are split by protocol phase into `assistant_narration` versus final assistant replies, `response.assistantNarrationMode` defaults to `progress_panel`, and the Codex protocol idle timeout renews on each JSONL event while a separate max-turn timeout prevents infinite runs.
 - Durable ops: generated `start-scheduled-tasks.ps1` falls back to hidden direct `Start-Process` runner launches when `AgentHarness-*` scheduled tasks are not registered; generated runner scripts retain the newest 20 supervisor logs per component.
 - Memory: Qdrant edge snapshot present, `openclaw-mem.sqlite` present, active recall via `sqlite-vector`, `qdrantParity=snapshot-preserved; native-recall-not-active`, embedding secret migrated, vector recall ready, prompt context ready, lifecycle receipts present, capture candidates=7, compact canvas written, and `memory-hook` receipt recorded.
 - Plugins: sidecar catalog present, 2 manifest-derived tools visible, sidecar bridge OK, `hooks.invoke` receipt recorded, and `memory.slot` receipt recorded.
 - Workers: SQLite worker store is implemented at `state/workers/worker-jobs.sqlite`; `worker-loop` is generated and running; current worker store totals are `total=0`, `pending=0`, `running=0`, `failedTerminal=0`.
-- Validation: latest local implementation test pass is `cargo test --workspace` with core 174 tests and CLI 16 tests passing, plus `cargo fmt --all`. Deployment validation passed `cargo build --workspace`, gateway restart, live `status`, live `enable-check`, outbox plan, and process listing. Previous round3-1 activation also passed `cargo fmt --check`, `cargo build --target-dir target\codex-build`, supervisor-plan smoke, process command-line verification, and `jsonl-repair` smoke.
+- Validation: latest local implementation test pass is `cargo fmt`, `cargo check`, and `cargo test` with 229 core tests, 18 CLI tests, and 0 doctests. Deployment validation passed `cargo build --workspace`, gateway restart, live `status`, live `enable-check`, outbox plan, and process listing. Previous round3-1 activation also passed `cargo fmt --check`, `cargo build --target-dir target\codex-build`, supervisor-plan smoke, process command-line verification, and `jsonl-repair` smoke.
 - Live-test readiness: regenerated supervisor scripts point to `target/debug/agent-harness.exe`, `.agent-harness` as `--source-home`, `--runtime-workspace D:\Warehouse\Research\OpenClaw_WSL`, `tools/agent-discord-gateway/index.mjs`, one `runtime-loop.ps1`, and `worker-loop.ps1`; loops were restarted manually as hidden PowerShell processes because `AgentHarness-*` scheduled task registration returned access-denied in this environment; latest `status` and `enable-check` are ready with no warnings.
 
 Current non-blocking warning:
@@ -83,6 +84,7 @@ Important core modules:
 
 - `registry.rs`: parses imported legacy registry, providers, agents, plugins.
 - `harness_registry.rs`: exports target harness registry and redacted receipts.
+- `channel_identity.rs`: fail-closed platform/account/channel binding registry and smoke-check resolution.
 - `channel_commands.rs`: parses slash commands.
 - `channel_state.rs`: persists per-session command state and per-agent global overrides.
 - `channel_runtime.rs`: turns channel input into command replies or runtime dispatch.
@@ -92,10 +94,12 @@ Important core modules:
 - `prompt.rs`: prompt bundle assembly, memory context injection, prompt injection ledger.
 - `codex_runtime.rs`: Codex app-server planning/preflight/run/completion.
 - `progress.rs`: compact runtime action/status event schema, panel rendering, delivery cursor state, and progress delivery receipts.
-- `runtime_queue.rs`, `runtime_worker.rs`, `runtime_pipeline.rs`: queue, preparation, runtime capacity leases, runtime pipeline, and outbox attachment extraction.
+- `runtime_queue.rs`, `runtime_worker.rs`, `runtime_pipeline.rs`: queue, preparation, runtime capacity leases, runtime pipeline, validated delivery intent construction, and outbox attachment extraction.
+- `runtime_policy.rs`: configurable runtime retry/backoff policy and operator fallback hints.
 - `memory.rs`: imported memory search, vector recall, credentials export, lifecycle, canvas worker.
 - `workers.rs`: durable worker store, lease/run/reap/cancel/status, deterministic shell audit, LLM runtime-queue handoff, watchdog and master-wakeup jobs, concurrency and rate-lease gates.
 - `worker_adapters.rs`: native cron, deterministic cron, and subagent plan-to-worker enqueue adapters.
+- `cron_scheduler.rs`: long-running scheduler tick that watermarks imported cron sources and enqueues due worker jobs.
 - `ops.rs`: non-secret backup, cutover receipt, and supervisor stop-file control.
 - `status.rs`: `status` report aggregation.
 - `activation.rs`: `enable-check` readiness checks.
@@ -112,8 +116,8 @@ Auxiliary tooling:
 Channel normal message flow:
 
 1. Telegram/Discord adapter receives a DM or configured group/guild message.
-2. The adapter enforces admin/limited/open-limited access policy before runtime dispatch.
-3. `channel-receive` normalizes it and carries bounded inbound reply/media context when available.
+2. The adapter enforces admin/limited/open-limited access policy and then resolves the platform/account/channel identity binding before runtime dispatch.
+3. `channel-receive` normalizes it with the resolved account/agent and carries bounded inbound reply/media context when available.
 4. Slash commands are handled immediately; ordinary messages enqueue a runtime item.
 5. `runtime-loop` inspects runtime capacity and runs claimable queue ids through bounded in-process runtime tasks.
 6. `queue-prepare` builds a turn plan and prompt bundle.
@@ -139,11 +143,12 @@ Prompt strategy:
 - `queue-prepare` resolves prompt files, skills, and registry state from the imported legacy source home `workspace` when present; a separate runtime workspace is only used as Codex cwd and must not make prompt files disappear after `/new` or other session changes. Round3 fixed the case where a queued item used `D:\Warehouse\Research\OpenClaw_WSL` as runtime cwd and `/status` showed `Prompt files 0/7`: turn planning now falls back to the imported workspace when the runtime workspace has no prompt files.
 - Codex's app-server/session continuity is relied on for backend continuity where possible.
 
-Reply-context audit:
+Reply-context and delivery-intent audit:
 
 - Discord handled reply events append `state/channels/discord-reply-context-receipts.jsonl` with referenced ids, source availability, preview/content length, truncation, attachment count, and embed count.
 - Denied or duplicate Discord events do not write a reply-context receipt with referenced content.
-- Runtime queue items still carry the model-facing `inboundContext` string; a structured `replyContext` queue field remains a follow-up schema slice.
+- Runtime queue items carry model-facing `inboundContext` plus structured inbound context used by the harness to construct outbound delivery intent.
+- Telegram/Discord final replies are sent with a validated `deliveryIntent` only when the inbound provider payload supplied the referenced message/channel ids. The model cannot invent quote/reply ids or force a reply target through prompt text.
 
 Command state:
 
@@ -161,6 +166,7 @@ Command state:
 Channel access policy:
 
 - Telegram/Discord DMs fail closed and require an admin user id.
+- Telegram/Discord ingress also fails closed if the channel identity registry exists but the platform/account/channel/thread tuple is unbound, disabled, ambiguous, or mapped to a different requested agent.
 - Legacy `AGENT_HARNESS_TELEGRAM_ALLOWED_USER_IDS` and `AGENT_HARNESS_DISCORD_ALLOWED_USER_IDS` remain admin-compatible for migration.
 - Configured Telegram groups and Discord guild channels can grant limited users ordinary-message access plus read-only `/status`, `/model`, and `/think` queries.
 - Limited users cannot switch model/thinking state and cannot run `/new`, `/stop`, `/steer`, or `/btw`.
@@ -234,6 +240,8 @@ Current state:
 - The two cron source lanes stay separate for policy and import fidelity: native `.openclaw/cron` may enqueue LLM-backed agent/subagent work; deterministic crontab/Supercronic-style workspace runners enqueue only no-LLM shell jobs.
 - Subagent and deterministic child-job completion must be able to wake the master agent. Fan-out work should create a `job_group_id` and a deterministic watchdog that wakes the master on all-completed, any-failed, timeout, checkpoint, or threshold policies with bounded artifact pointers.
 - Worker leasing enforces harness-configurable concurrency limits before execution: a global limit, a per-agent/group limit, a per-agent-per-channel limit, optional lane limits, and optional rate leases. The current live defaults are global 12, per-agent 6, per-agent-per-channel 3, lane limits `llm=6`, `shell=6`, `watchdog=2`, `maintenance=2`, `plugin=2`. If a limit is reached, extra subagent, deterministic, or cron jobs stay queued instead of starting.
+- `cron-scheduler-run-once` and `cron-scheduler-loop` now provide the repeated scheduler tick. They evaluate native and deterministic cron sources, write durable watermarks under `state/cron-scheduler/watermarks.sqlite`, append scheduler decision receipts, and enqueue due work into the worker store with an idempotency key based on source kind, source id, entry id, and scheduled time.
+- The scheduler is opt-in through `cronScheduler.enabled`, `--enable`, or an intentionally generated `cron-scheduler-loop` supervisor task. Dry-run remains the default-safe operator mode for validation.
 
 Implemented MVP:
 
@@ -243,12 +251,13 @@ Implemented MVP:
 - Native cron, deterministic cron, and imported subagent adapters that enqueue worker jobs.
 - Child job grouping, rate leases, watchdog jobs, master wakeup jobs, wake policy idempotency, and bounded artifact-pointer summaries for mixed LLM/deterministic child groups.
 - Harness config schema/status reporting for global, per-agent/group, per-agent-per-channel, lane worker concurrency limits, allowed script roots, and rate lease windows.
+- Repeated scheduler tick watermarks, idempotent scheduler enqueue, lock-protected tick execution, scheduler receipts, `loop-last.json`, and `status --json` cron scheduler readback.
 
 Remaining hardening:
 
 - Cascading timeout/cancel for active child processes.
-- Provider-specific backoff and per-provider rate profiles.
-- Watermarking for repeated cron scheduler ticks beyond explicit operator enqueue.
+- Automatic provider/model fallback remains operator-guided; `runtimeBackoff` records retry delays and fallback hints but does not silently switch providers.
+- Per-provider rate profiles beyond existing worker rate leases.
 - Round-robin fairness across busy master groups.
 - Multi-host store abstraction if a Postgres/service-backed pool becomes necessary.
 
@@ -272,15 +281,17 @@ Implemented:
 - Compact progress event ledger plus Telegram/Discord action/status progress messages.
 - `progress-delivery-loop` generated with the supervised loop bundle.
 - Windows scheduled-task script generation.
+- Optional `cron-scheduler-loop` supervisor script generation through `supervisor-plan --include-cron-scheduler`.
+- Channel identity smoke checks through `channel-identity-check`.
 - Atomic JSON writes for mutable state files such as channel state, runtime lease state, run-once reports, delivery cursors, Codex run reports, and execution receipts.
-- Runtime failure policy records `failed-terminal` for non-retryable protocol/preflight/spawn/no-plan failures and stops retrying timeout failures after three attempts. Canceled runs are terminal and reply with `Stopped.`.
+- Runtime failure policy records `failed-terminal` for non-retryable protocol/preflight/spawn/no-plan failures and stops retrying retryable failures at the configured `runtimeBackoff.maxAttempts` cap. Canceled runs are terminal and reply with `Stopped.`.
 
 Progress UI notes:
 
 - Codex tool/action previews come from explicit command/path/query/name fields. Raw JSON wrappers, output-only deltas, and long PowerShell executable paths are compacted or skipped to keep messages Hermes-style compact. Common PowerShell wrappers are summarized as short forms such as `pwsh: read file ...`, `pwsh: get date`, or `pwsh: agent-harness status`.
 - Progress delivery maintains separate body/status cursors in `state/channels/progress-delivery-state.json`; older single-message state can be taken over by the body lane.
 - Permission-denied or policy-skipped progress deliveries still advance the cursor, so Telegram does not repeatedly receive the same `Working` status event while Discord remains normal.
-- Normal Telegram/Discord final replies are sent as trimmed assistant text without a mechanical `◆ Agent` header. Progress messages keep their compact action/status format.
+- Normal Telegram/Discord final replies are sent as trimmed assistant text without a mechanical `◆ Agent` header. Validated provider reply targets are carried by outbound `deliveryIntent`; progress messages keep their compact action/status format.
 
 Current operational caveat:
 
@@ -297,6 +308,8 @@ Useful commands:
 .\target\debug\agent-harness.exe channel-outbox-plan --harness-home .\.agent-harness --limit 20
 .\target\debug\agent-harness.exe progress-delivery-once --harness-home .\.agent-harness
 .\target\debug\agent-harness.exe worker-status --harness-home .\.agent-harness
+.\target\debug\agent-harness.exe channel-identity-check --harness-home .\.agent-harness --platform telegram --account-id default --chat-id <chat-id> --agent main
+.\target\debug\agent-harness.exe cron-scheduler-run-once --harness-home .\.agent-harness --dry-run --enable
 .\target\debug\agent-harness.exe ops-backup --harness-home .\.agent-harness --label pre-cutover
 .\target\debug\agent-harness.exe ops-cutover-receipt --harness-home .\.agent-harness --note "pre-cutover"
 ```
@@ -330,8 +343,8 @@ cargo build -p agent-harness-cli
 
 Current passing results:
 
-- Core tests: 167 passed after round3 prompt, progress, runtime lease, atomic state writes, cancellation, terminal failure, supervisor, runtime UX hardening, and worker concurrency fixes.
-- CLI tests: 16 passed.
+- Core tests: 229 passed after channel identity, delivery intent, runtime backoff, cron scheduler, progress, runtime lease, atomic state writes, cancellation, terminal failure, supervisor, runtime UX hardening, and worker concurrency fixes.
+- CLI tests: 18 passed.
 - Build: `cargo build -p agent-harness-cli` passed after stopping old live loops that were holding `target/debug/agent-harness.exe`.
 
 Important test notes:
@@ -362,7 +375,7 @@ Important test notes:
    - Hook execution policy.
    - Memory plugin paths.
 5. Harden unified worker dispatch:
-   - cascading timeout/cancel, provider backoff, repeated cron watermarks, fairness, and multi-host store abstraction.
+   - cascading timeout/cancel, per-provider rate profiles, fairness, and multi-host store abstraction.
 6. Broaden provider parity:
    - provider health diagnostics.
    - non-Codex provider execution adapters where needed.

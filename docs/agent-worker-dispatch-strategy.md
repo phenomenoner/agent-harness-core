@@ -254,6 +254,8 @@ Cron/subagent adapter commands:
 
 ```powershell
 agent-harness native-cron-enqueue --harness-home .\.agent-harness --source-home .\imports\openclaw-core-snapshot --resume-cron --master-agent main
+agent-harness cron-scheduler-run-once --harness-home .\.agent-harness --source-home .\imports\openclaw-core-snapshot --dry-run --enable --resume-cron --allow-deterministic-run
+agent-harness cron-scheduler-loop --harness-home .\.agent-harness --source-home .\imports\openclaw-core-snapshot --iterations 0 --idle-ms 60000 --max-consecutive-errors 5
 agent-harness deterministic-cron-enqueue --harness-home .\.agent-harness --workspace D:\path\to\workspace --allow-deterministic-run --dry-run-shell --master-agent main
 agent-harness subagent-enqueue --harness-home .\.agent-harness --source-home .\imports\openclaw-core-snapshot --resume-subagents --master-agent main
 ```
@@ -268,4 +270,5 @@ agent-harness subagent-enqueue --harness-home .\.agent-harness --source-home .\i
 6. Done: LLM subagent/master wakeup lane enqueues runtime queue turns on top of the existing prompt bundle/Codex runner.
 7. Done: native agent-turn cron and imported subagent resume can enqueue worker jobs.
 8. Done: child job linkage, job groups, group concurrency keys, parent refs, rate leases, deterministic watchdog jobs, and idempotent `master_wakeup` jobs for all-completed, any-failed, timeout, and all-succeeded policies.
-9. Remaining: cascading timeout/cancel for active child processes, external-provider backoff profiles, repeated cron watermarks, fairness across busy master groups, and live smoke tests for global-limit queueing, deterministic cron, native cron-to-agent, parent-to-subagent, and mixed fan-out/watchdog/master-wakeup flows.
+9. Done: repeated cron scheduler ticks write durable watermarks and idempotently enqueue due native/deterministic cron jobs through WorkerStore.
+10. Remaining: cascading timeout/cancel for active child processes, external-provider rate profiles, fairness across busy master groups, and live smoke tests for global-limit queueing, deterministic cron, native cron-to-agent, parent-to-subagent, and mixed fan-out/watchdog/master-wakeup flows.

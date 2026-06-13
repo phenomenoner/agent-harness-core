@@ -1,6 +1,6 @@
 # Agent Harness TG/Discord DM Self-Check Guide
 
-Date: 2026-06-11
+Date: 2026-06-13
 
 This guide is the operator handoff for asking the `main` agent to verify the live Telegram DM and Discord DM channel paths from inside Agent Harness. It is designed for a single normal-message turn in each DM channel, with the agent doing as much read-only verification as it can and returning artifact pointers for operator follow-up.
 
@@ -15,7 +15,8 @@ Current activation baseline:
 - Latest readiness target: `ready=true`, `passed=58`, `warnings=0`, `failed=0`
 - Latest channel outbox target: `pending=0`, `retryable=0`; any new test backlog should drain after delivery settles.
 - Live loops currently running in status: `runtime-loop`, `worker-loop`, `progress-delivery-loop`, `telegram-loop`, `discord-outbox-loop`, `discord-gateway-loop`
-- Supervisor plan: 6 task entries: `runtime-loop`, `worker-loop`, `progress-delivery-loop`, `telegram-loop`, `discord-outbox-loop`, and `discord-gateway-loop`. `runtime-loop` is a single process with bounded in-process runtime concurrency via `--runtime-concurrency 12`.
+- Supervisor plan: 6 canonical task entries: `runtime-loop`, `worker-loop`, `progress-delivery-loop`, `telegram-loop`, `discord-outbox-loop`, and `discord-gateway-loop`; `cron-scheduler-loop` appears only after explicit scheduler cutover. `runtime-loop` is a single process with bounded in-process runtime concurrency via `--runtime-concurrency 12`.
+- Channel identity: when a binding registry is configured, the platform/account/channel tuple must resolve to `main` before the DM reaches the model.
 
 ## Safety Rules
 
@@ -54,7 +55,7 @@ Expected baseline:
 
 - `enable-check`: `Ready: yes`, `passed=58`, `warnings=0`, `failed=0`
 - `status`: `ready=true`, `runtime.openItems=0`, and `runtime.latestNonIdleRunOnce` should show the last real runtime event instead of an idle `no-work` tick.
-- `loops.heartbeats`: all six canonical loop heartbeats present and fresh
+- `loops.heartbeats`: all six canonical loop heartbeats present and fresh; `cron-scheduler-loop` is optional and only expected after explicit scheduler activation
 - `workers.totals.failedTerminal=0`
 - channel outbox has no unexpected retryable backlog
 

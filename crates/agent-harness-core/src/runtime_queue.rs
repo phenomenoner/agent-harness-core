@@ -40,6 +40,8 @@ pub struct RuntimeQueueItem {
     pub agent_id: String,
     pub session_key: String,
     pub platform: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub channel_id: String,
     pub user_id: String,
     pub message_text: String,
@@ -304,6 +306,7 @@ fn build_queue_item(
         agent_id: agent_turn.agent_id.clone(),
         session_key: agent_turn.session_key.clone(),
         platform: step.platform.clone(),
+        account_id: step.account_id.clone(),
         channel_id: step.channel_id.clone(),
         user_id: step.user_id.clone(),
         message_text: step.message_text.clone(),

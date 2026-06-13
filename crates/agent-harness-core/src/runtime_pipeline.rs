@@ -7,14 +7,15 @@ use serde_json::Value;
 
 use crate::{
     AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
-    AssistantNarrationConfig, AssistantNarrationMode, ChannelOutboundAttachment,
-    ChannelOutboundAttachmentKind, ChannelOutboundMessage, ChannelOutboundMessageKind,
-    CodexRuntimePlan, CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimeReceiptStatus,
-    CodexRuntimeRunOptions, CodexRuntimeRunReport, CodexRuntimeRunStatus, HarnessLogEvent,
-    HarnessLogLevel, MemoryLifecycleTurnOptions, PromptAssemblyOptions, ResponseToneConfig,
-    ResponseToneContext, RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions,
-    RuntimeQueuePrepareReport, RuntimeQueuePreparedItem, append_agent_progress_event,
-    append_harness_log, apply_response_tone, current_log_time_ms, load_assistant_narration_config,
+    AssistantNarrationConfig, AssistantNarrationMode, ChannelDeliveryIntent,
+    ChannelDeliveryIntentKind, ChannelOutboundAttachment, ChannelOutboundAttachmentKind,
+    ChannelOutboundMessage, ChannelOutboundMessageKind, CodexRuntimePlan, CodexRuntimePlanOptions,
+    CodexRuntimePlanReport, CodexRuntimeReceiptStatus, CodexRuntimeRunOptions,
+    CodexRuntimeRunReport, CodexRuntimeRunStatus, HarnessLogEvent, HarnessLogLevel,
+    MemoryLifecycleTurnOptions, PromptAssemblyOptions, ResponseToneConfig, ResponseToneContext,
+    RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
+    RuntimeQueuePreparedItem, append_agent_progress_event, append_harness_log, apply_response_tone,
+    current_log_time_ms, inspect_runtime_backoff_policy, load_assistant_narration_config,
     load_response_tone_config, plan_codex_runtime, prepare_runtime_queue_item,
     read_channel_session_state, record_memory_lifecycle_turn, release_runtime_queue_lease,
     run_codex_runtime, write_json_atomic,
@@ -22,7 +23,6 @@ use crate::{
 
 const RUNTIME_RUN_ONCE_SCHEMA: &str = "agent-harness.runtime-run-once.v1";
 const RUNTIME_DEAD_LETTER_SCHEMA: &str = "agent-harness.runtime-dead-letter.v1";
-const MAX_RUNTIME_FAILURE_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeRunOnceOptions {
@@ -93,9 +93,11 @@ struct RuntimeDeadLetterReceipt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct QueueChannelContext {
     platform: String,
+    account_id: Option<String>,
     channel_id: String,
     user_id: String,
     session_key: String,
+    inbound_context: Option<String>,
 }
 
 pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<RuntimeRunOnceReport> {
@@ -269,17 +271,49 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         .transpose()?
         .map(|attempts| attempts.saturating_add(1))
         .unwrap_or(0);
+    let retry_policy = inspect_runtime_backoff_policy(&options.harness_home)?;
+    warnings.extend(retry_policy.warnings.clone());
     let receipt_status = final_run_once_status(
         run.receipt.status,
         queue_failure_attempts,
         &run.receipt.reason,
+        retry_policy.policy.max_failure_attempts,
     );
     let receipt_reason = final_run_once_reason(
         receipt_status,
         run.receipt.status,
         queue_failure_attempts,
+        retry_policy.policy.max_failure_attempts,
         &run.receipt.reason,
     );
+    if receipt_status == RuntimeRunOnceStatus::RetryPending {
+        let delay_ms = retry_policy.policy.retry_delay_ms(queue_failure_attempts);
+        warnings.push(format!(
+            "runtime retry policy scheduled attempt {}/{} after about {} ms",
+            queue_failure_attempts, retry_policy.policy.max_failure_attempts, delay_ms
+        ));
+    } else if matches!(
+        receipt_status,
+        RuntimeRunOnceStatus::DeadLetter | RuntimeRunOnceStatus::FailedTerminal
+    ) && retry_policy.policy.operator_hints
+    {
+        let provider = prepare
+            .item
+            .as_ref()
+            .and_then(|item| item.provider.as_deref())
+            .or_else(|| plan.plan.as_ref().and_then(|plan| plan.provider.as_deref()));
+        let model = prepare
+            .item
+            .as_ref()
+            .and_then(|item| item.model.as_deref())
+            .or_else(|| plan.plan.as_ref().and_then(|plan| plan.model.as_deref()));
+        if let Some(hint) = retry_policy
+            .policy
+            .fallback_hint(provider, model, &run.receipt.reason)
+        {
+            warnings.push(hint);
+        }
+    }
     if let Some(context) = &progress_context {
         append_runtime_progress_finished(
             &options.harness_home,
@@ -367,12 +401,18 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                 &tone_config,
                             );
                             let message = ChannelOutboundMessage {
-                                platform: context.platform,
-                                channel_id: context.channel_id,
-                                user_id: context.user_id,
-                                session_key: context.session_key,
+                                platform: context.platform.clone(),
+                                account_id: context.account_id.clone(),
+                                channel_id: context.channel_id.clone(),
+                                user_id: context.user_id.clone(),
+                                session_key: context.session_key.clone(),
                                 kind: ChannelOutboundMessageKind::AgentReply,
                                 text,
+                                delivery_intent: delivery_intent_from_inbound_context(
+                                    &context.platform,
+                                    &context.channel_id,
+                                    context.inbound_context.as_deref(),
+                                ),
                                 attachments,
                             };
                             let file = append_outbound_message(&options.harness_home, &message)?;
@@ -413,15 +453,21 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         let status = receipt_status;
         if channel_session_is_current(&options.harness_home, &context, &mut warnings)? {
             let message = ChannelOutboundMessage {
-                platform: context.platform,
-                channel_id: context.channel_id,
-                user_id: context.user_id,
-                session_key: context.session_key,
+                platform: context.platform.clone(),
+                account_id: context.account_id.clone(),
+                channel_id: context.channel_id.clone(),
+                user_id: context.user_id.clone(),
+                session_key: context.session_key.clone(),
                 kind: ChannelOutboundMessageKind::ErrorReply,
                 text: runtime_failure_reply_text(
                     status,
                     &receipt_reason,
                     run.receipt.queue_id.as_deref(),
+                ),
+                delivery_intent: delivery_intent_from_inbound_context(
+                    &context.platform,
+                    &context.channel_id,
+                    context.inbound_context.as_deref(),
                 ),
                 attachments: Vec::new(),
             };
@@ -451,7 +497,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         );
     } else {
         warnings.push(format!(
-            "runtime failure for queue item will be retried; attempt {queue_failure_attempts}/{MAX_RUNTIME_FAILURE_ATTEMPTS}"
+            "runtime failure for queue item will be retried; attempt {}/{}",
+            queue_failure_attempts, retry_policy.policy.max_failure_attempts
         ));
     }
 
@@ -740,17 +787,18 @@ fn final_run_once_status(
     codex_status: CodexRuntimeRunStatus,
     failure_attempts: usize,
     reason: &str,
+    max_failure_attempts: usize,
 ) -> RuntimeRunOnceStatus {
     match codex_status {
         CodexRuntimeRunStatus::Completed => RuntimeRunOnceStatus::Completed,
         CodexRuntimeRunStatus::Canceled => RuntimeRunOnceStatus::Canceled,
-        CodexRuntimeRunStatus::Timeout if failure_attempts < MAX_RUNTIME_FAILURE_ATTEMPTS => {
+        CodexRuntimeRunStatus::Timeout if failure_attempts < max_failure_attempts => {
             RuntimeRunOnceStatus::RetryPending
         }
         CodexRuntimeRunStatus::Timeout => RuntimeRunOnceStatus::DeadLetter,
         CodexRuntimeRunStatus::ProtocolError
             if is_retryable_codex_protocol_error(reason)
-                && failure_attempts < MAX_RUNTIME_FAILURE_ATTEMPTS =>
+                && failure_attempts < max_failure_attempts =>
         {
             RuntimeRunOnceStatus::RetryPending
         }
@@ -775,11 +823,12 @@ fn final_run_once_reason(
     receipt_status: RuntimeRunOnceStatus,
     codex_status: CodexRuntimeRunStatus,
     failure_attempts: usize,
+    max_failure_attempts: usize,
     reason: &str,
 ) -> String {
     match receipt_status {
         RuntimeRunOnceStatus::RetryPending => format!(
-            "runtime queue item transient failure attempt {failure_attempts}/{MAX_RUNTIME_FAILURE_ATTEMPTS}; last codex status={codex_status:?}; reason: {reason}"
+            "runtime queue item transient failure attempt {failure_attempts}/{max_failure_attempts}; last codex status={codex_status:?}; reason: {reason}"
         ),
         RuntimeRunOnceStatus::DeadLetter => format!(
             "runtime queue item dead-lettered after {failure_attempts} attempt(s); last codex status={codex_status:?}; reason: {reason}"
@@ -903,9 +952,11 @@ fn append_runtime_dead_letter_receipt(
 fn channel_context_from_prepared_item(item: &RuntimeQueuePreparedItem) -> QueueChannelContext {
     QueueChannelContext {
         platform: item.platform.clone(),
+        account_id: item.account_id.clone(),
         channel_id: item.channel_id.clone(),
         user_id: item.user_id.clone(),
         session_key: item.session_key.clone(),
+        inbound_context: item.inbound_context.clone(),
     }
 }
 
@@ -974,6 +1025,7 @@ fn find_queue_channel_context(
             platform: string_field(&value, &["platform"])
                 .unwrap_or("unknown")
                 .to_string(),
+            account_id: string_field(&value, &["accountId", "account_id"]).map(ToString::to_string),
             channel_id: string_field(&value, &["channelId", "channel_id"])
                 .unwrap_or("unknown")
                 .to_string(),
@@ -983,12 +1035,83 @@ fn find_queue_channel_context(
             session_key: string_field(&value, &["sessionKey", "session_key"])
                 .unwrap_or("unknown")
                 .to_string(),
+            inbound_context: string_field(&value, &["inboundContext", "inbound_context"])
+                .map(ToString::to_string),
         }));
     }
     warnings.push(format!(
         "runtime queue item `{queue_id}` was not found while resolving channel context"
     ));
     Ok(None)
+}
+
+fn delivery_intent_from_inbound_context(
+    platform: &str,
+    channel_id: &str,
+    inbound_context: Option<&str>,
+) -> Option<ChannelDeliveryIntent> {
+    let inbound_context = inbound_context?;
+    let platform = platform.to_ascii_lowercase();
+    if platform == "telegram" {
+        let message_id = context_value(inbound_context, "messageId")?;
+        return Some(ChannelDeliveryIntent {
+            schema: "agent-harness.delivery-intent.v1".to_string(),
+            kind: ChannelDeliveryIntentKind::ReplyToMessage,
+            platform_message_id: Some(message_id),
+            platform_channel_id: Some(channel_id.to_string()),
+            platform_thread_id: None,
+            quote_text: context_text_block(inbound_context),
+            validated: true,
+            downgrade_reason: None,
+        });
+    }
+    if platform == "discord" {
+        let message_id = context_value(inbound_context, "referencedMessageId")?;
+        let referenced_channel = context_value(inbound_context, "referencedChannelId")
+            .unwrap_or_else(|| channel_id.to_string());
+        return Some(ChannelDeliveryIntent {
+            schema: "agent-harness.delivery-intent.v1".to_string(),
+            kind: ChannelDeliveryIntentKind::ReplyToMessage,
+            platform_message_id: Some(message_id),
+            platform_channel_id: Some(referenced_channel),
+            platform_thread_id: None,
+            quote_text: context_text_block(inbound_context),
+            validated: true,
+            downgrade_reason: None,
+        });
+    }
+    None
+}
+
+fn context_value(context: &str, key: &str) -> Option<String> {
+    let prefix = format!("- {key}:");
+    context.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(&prefix)
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "-")
+            .map(ToString::to_string)
+    })
+}
+
+fn context_text_block(context: &str) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut in_block = false;
+    for line in context.lines() {
+        if line.trim() == "text:" || line.trim() == "referencedText:" {
+            in_block = true;
+            continue;
+        }
+        if in_block {
+            if let Some(text) = line.strip_prefix("  ") {
+                lines.push(text.to_string());
+            } else if !line.trim().is_empty() {
+                break;
+            }
+        }
+    }
+    let text = lines.join("\n").trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1260,6 +1383,7 @@ mod tests {
             harness_home: harness_home.clone(),
             skill_index: skills,
             platform: "telegram".to_string(),
+            account_id: None,
             channel_id: "dm-42".to_string(),
             user_id: "user-7".to_string(),
             agent_id: Some("main".to_string()),
@@ -1368,6 +1492,7 @@ mod tests {
             harness_home: harness_home.clone(),
             skill_index: skills,
             platform: "telegram".to_string(),
+            account_id: None,
             channel_id: "dm-42".to_string(),
             user_id: "user-7".to_string(),
             agent_id: Some("main".to_string()),
@@ -1418,6 +1543,7 @@ mod tests {
             harness_home: harness_home.clone(),
             skill_index: skills,
             platform: "telegram".to_string(),
+            account_id: None,
             channel_id: "dm-42".to_string(),
             user_id: "user-7".to_string(),
             agent_id: Some("main".to_string()),
@@ -1477,6 +1603,7 @@ mod tests {
             harness_home: harness_home.clone(),
             skill_index: skills,
             platform: "telegram".to_string(),
+            account_id: None,
             channel_id: "dm-42".to_string(),
             user_id: "user-7".to_string(),
             agent_id: Some("main".to_string()),
@@ -1542,15 +1669,15 @@ mod tests {
     #[test]
     fn timeout_policy_retries_then_dead_letters() {
         assert_eq!(
-            final_run_once_status(CodexRuntimeRunStatus::Timeout, 1, "idle timeout"),
+            final_run_once_status(CodexRuntimeRunStatus::Timeout, 1, "idle timeout", 3),
             RuntimeRunOnceStatus::RetryPending
         );
         assert_eq!(
-            final_run_once_status(CodexRuntimeRunStatus::Timeout, 2, "idle timeout"),
+            final_run_once_status(CodexRuntimeRunStatus::Timeout, 2, "idle timeout", 3),
             RuntimeRunOnceStatus::RetryPending
         );
         assert_eq!(
-            final_run_once_status(CodexRuntimeRunStatus::Timeout, 3, "idle timeout"),
+            final_run_once_status(CodexRuntimeRunStatus::Timeout, 3, "idle timeout", 3),
             RuntimeRunOnceStatus::DeadLetter
         );
         assert!(!should_write_failure_outbox(
@@ -1574,6 +1701,7 @@ mod tests {
                 reason: final_run_once_reason(
                     RuntimeRunOnceStatus::DeadLetter,
                     CodexRuntimeRunStatus::Timeout,
+                    3,
                     3,
                     "idle timeout",
                 ),
@@ -1599,22 +1727,23 @@ mod tests {
 
         assert!(is_retryable_codex_protocol_error(reason));
         assert_eq!(
-            final_run_once_status(CodexRuntimeRunStatus::ProtocolError, 1, reason),
+            final_run_once_status(CodexRuntimeRunStatus::ProtocolError, 1, reason, 3),
             RuntimeRunOnceStatus::RetryPending
         );
         assert_eq!(
-            final_run_once_status(CodexRuntimeRunStatus::ProtocolError, 2, reason),
+            final_run_once_status(CodexRuntimeRunStatus::ProtocolError, 2, reason, 3),
             RuntimeRunOnceStatus::RetryPending
         );
         assert_eq!(
-            final_run_once_status(CodexRuntimeRunStatus::ProtocolError, 3, reason),
+            final_run_once_status(CodexRuntimeRunStatus::ProtocolError, 3, reason, 3),
             RuntimeRunOnceStatus::DeadLetter
         );
         assert_eq!(
             final_run_once_status(
                 CodexRuntimeRunStatus::ProtocolError,
                 1,
-                "synthetic app-server refusal"
+                "synthetic app-server refusal",
+                3
             ),
             RuntimeRunOnceStatus::FailedTerminal
         );
@@ -1639,6 +1768,7 @@ mod tests {
             harness_home: harness_home.clone(),
             skill_index: skills,
             platform: "telegram".to_string(),
+            account_id: None,
             channel_id: "dm-42".to_string(),
             user_id: "user-7".to_string(),
             agent_id: Some("main".to_string()),
@@ -1741,6 +1871,7 @@ mod tests {
             harness_home: harness_home.clone(),
             skill_index: skills.clone(),
             platform: "telegram".to_string(),
+            account_id: None,
             channel_id: "dm-42".to_string(),
             user_id: "user-7".to_string(),
             agent_id: Some("main".to_string()),
@@ -1759,6 +1890,7 @@ mod tests {
             harness_home: harness_home.clone(),
             skill_index: skills,
             platform: "telegram".to_string(),
+            account_id: None,
             channel_id: "dm-42".to_string(),
             user_id: "user-7".to_string(),
             agent_id: Some("main".to_string()),
@@ -1824,6 +1956,7 @@ mod tests {
             harness_home: harness_home.clone(),
             skill_index: skills,
             platform: "telegram".to_string(),
+            account_id: None,
             channel_id: "dm-42".to_string(),
             user_id: "user-7".to_string(),
             agent_id: Some("main".to_string()),

@@ -21,16 +21,18 @@ use agent_harness_core::{
     AssistantNarrationMode, BackgroundTaskListOptions, BackgroundTaskRecord,
     BackgroundTaskUpsertOptions, BudgetAcquireOptions, BuiltinHarnessSkillSyncOptions,
     BuiltinHarnessSkillSyncReport, ChannelCommand, ChannelCommandApplyOptions,
-    ChannelCommandApplyReport, ChannelDeliveryReceipt, ChannelDeliveryRecordOptions,
-    ChannelDeliveryStatus, ChannelOutboundAttachment, ChannelOutboundAttachmentKind,
+    ChannelCommandApplyReport, ChannelDeliveryIntentKind, ChannelDeliveryReceipt,
+    ChannelDeliveryRecordOptions, ChannelDeliveryStatus, ChannelIdentityLookup,
+    ChannelIdentityResolutionStatus, ChannelOutboundAttachment, ChannelOutboundAttachmentKind,
     ChannelOutboundMessage, ChannelOutboxPlanOptions, ChannelOutboxPlanReport,
     ChannelReceiveOptions, ChannelReceiveReport, ChannelRunOnceOptions, ChannelRunOnceReport,
     ChannelStep, CodexRuntimeCompletionOptions, CodexRuntimeCompletionReport,
     CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReport, CodexRuntimePlanOptions,
     CodexRuntimePlanReport, CodexRuntimePreflightOptions, CodexRuntimePreflightReport,
     CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy, ContextPackParseOptions,
-    DeterministicCronPlan, DeterministicCronPlanInput, DeterministicCronWorkerEnqueueOptions,
-    DriftCheckOptions, DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel,
+    CronSchedulerRunOnceOptions, CronSchedulerTickStatus, DeterministicCronPlan,
+    DeterministicCronPlanInput, DeterministicCronWorkerEnqueueOptions, DriftCheckOptions,
+    DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel,
     HarnessLogRotationOptions, HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport,
     HealthzOptions, ImportPhaseStatus, ImportReport, LearningProposalOptions, McpRequestOptions,
     MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport, MemoryCanvasWorkerStatus,
@@ -73,12 +75,12 @@ use agent_harness_core::{
     record_agent_progress_delivery, record_channel_delivery, record_channel_turn_shadow,
     record_codex_runtime_completion, record_ops_control, record_ops_cutover_receipt,
     record_scoped_stop, record_supervise_deploy_canary, release_checklist,
-    rotate_harness_log_if_needed, run_channel_once, run_codex_runtime, run_memory_canvas_worker,
-    run_memory_hook_adapter, run_public_hygiene, run_runtime_queue_once, run_worker_once,
-    scan_security_boundaries, schema_registry_entries, search_imported_memory,
-    search_imported_vector_memory, select_skills, store_openclaw_mem_service_memory,
-    sync_builtin_harness_skills, tool_description_hash, trace_harness_event,
-    upsert_background_task, validate_harness_config, write_channel_step,
+    resolve_channel_identity, rotate_harness_log_if_needed, run_channel_once, run_codex_runtime,
+    run_cron_scheduler_once, run_memory_canvas_worker, run_memory_hook_adapter, run_public_hygiene,
+    run_runtime_queue_once, run_worker_once, scan_security_boundaries, schema_registry_entries,
+    search_imported_memory, search_imported_vector_memory, select_skills,
+    store_openclaw_mem_service_memory, sync_builtin_harness_skills, tool_description_hash,
+    trace_harness_event, upsert_background_task, validate_harness_config, write_channel_step,
     write_deterministic_cron_plan, write_memory_search_receipt, write_memory_vector_recall_receipt,
     write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
     write_subagent_plan, write_task_entity, write_turn_plan, write_windows_supervisor_plan,
@@ -157,6 +159,7 @@ fn main() {
         "channel-run-once" => run_channel_run_once(&rest),
         "channel-outbox-plan" => run_channel_outbox_plan(&rest),
         "channel-delivery-record" => run_channel_delivery_record(&rest),
+        "channel-identity-check" => run_channel_identity_check(&rest),
         "progress-delivery-once" => run_progress_delivery_once(&rest),
         "progress-delivery-loop" => run_progress_delivery_loop(&rest),
         "telegram-probe" => run_telegram_probe(&rest),
@@ -191,6 +194,8 @@ fn main() {
         "native-cron-enqueue" => run_native_cron_enqueue(&rest),
         "deterministic-cron-plan" => run_deterministic_cron_plan(&rest),
         "deterministic-cron-enqueue" => run_deterministic_cron_enqueue(&rest),
+        "cron-scheduler-run-once" => run_cron_scheduler_run_once(&rest),
+        "cron-scheduler-loop" => run_cron_scheduler_loop(&rest),
         "subagent-plan" => run_subagent_plan(&rest),
         "subagent-enqueue" => run_subagent_enqueue(&rest),
         "help" | "-h" | "--help" => {
@@ -1512,6 +1517,7 @@ fn run_supervisor_plan(args: &[String]) -> Result<(), String> {
         include_runtime: args.include_runtime,
         runtime_workers: args.runtime_workers,
         include_worker: args.include_worker,
+        include_cron_scheduler: args.include_cron_scheduler,
         include_progress: args.include_progress,
         include_telegram: args.include_telegram,
         include_discord: args.include_discord,
@@ -1703,6 +1709,7 @@ fn run_channel_receive(args: &[String]) -> Result<(), String> {
         harness_home: args.target_home,
         skill_index,
         platform: args.turn.platform,
+        account_id: None,
         channel_id: args.turn.channel_id,
         user_id: args.turn.user_id,
         agent_id: args.turn.agent_id,
@@ -1725,6 +1732,7 @@ fn run_channel_run_once(args: &[String]) -> Result<(), String> {
         runtime_workspace: args.runtime_workspace,
         harness_home: args.target_home.clone(),
         platform: args.turn.platform,
+        account_id: None,
         channel_id: args.turn.channel_id,
         user_id: args.turn.user_id,
         agent_id: args.turn.agent_id,
@@ -1770,6 +1778,7 @@ fn run_channel_delivery_record(args: &[String]) -> Result<(), String> {
         delivery_id: args.delivery_id,
         status: args.status,
         platform: args.platform,
+        account_id: None,
         channel_id: args.channel_id,
         user_id: args.user_id,
         session_key: args.session_key,
@@ -1781,6 +1790,39 @@ fn run_channel_delivery_record(args: &[String]) -> Result<(), String> {
 
     print_channel_delivery_receipt(&receipt);
     Ok(())
+}
+
+fn run_channel_identity_check(args: &[String]) -> Result<(), String> {
+    let args = channel_identity_check_args_from_args(args)?;
+    let report = resolve_channel_identity(ChannelIdentityLookup {
+        harness_home: args.target_home,
+        platform: args.platform,
+        account_id: args.account_id,
+        chat_id: args.chat_id,
+        thread_id: args.thread_id,
+        requested_agent_id: args.agent_id,
+    })
+    .map_err(|err| err.to_string())?;
+    if args.json {
+        print_json(&report)
+    } else {
+        println!("Status: {:?}", report.status);
+        println!("Reason: {}", report.reason);
+        if let Some(agent_id) = report.agent_id {
+            println!("Agent: {agent_id}");
+        }
+        if let Some(secret_ref) = report.secret_ref {
+            println!("Secret: {secret_ref}");
+        }
+        for warning in report.warnings {
+            println!("Warning: {warning}");
+        }
+        if report.status == ChannelIdentityResolutionStatus::Bound {
+            Ok(())
+        } else {
+            Err("channel identity check failed closed".to_string())
+        }
+    }
 }
 
 fn run_progress_delivery_once(args: &[String]) -> Result<(), String> {
@@ -1996,13 +2038,18 @@ fn deliver_progress_pending(
             let token = telegram_bot_token(&args.target_home, args.telegram_account.as_deref())?;
             match pending.action {
                 AgentProgressDeliveryAction::Send => {
-                    telegram_send_message(&token, &pending.channel_id, &pending.text)
+                    telegram_send_message(&token, &pending.channel_id, &pending.text, None)
                         .map(|id| (AgentProgressDeliveryAction::Send, id))
                 }
                 AgentProgressDeliveryAction::Edit => {
                     let Some(message_id) = pending.provider_message_id.as_deref() else {
-                        return telegram_send_message(&token, &pending.channel_id, &pending.text)
-                            .map(|id| (AgentProgressDeliveryAction::Send, id));
+                        return telegram_send_message(
+                            &token,
+                            &pending.channel_id,
+                            &pending.text,
+                            None,
+                        )
+                        .map(|id| (AgentProgressDeliveryAction::Send, id));
                     };
                     telegram_edit_message_text(
                         &token,
@@ -2012,7 +2059,7 @@ fn deliver_progress_pending(
                     )
                     .map(|id| (AgentProgressDeliveryAction::Edit, id.or(Some(message_id.to_string()))))
                     .or_else(|edit_error| {
-                        telegram_send_message(&token, &pending.channel_id, &pending.text)
+                    telegram_send_message(&token, &pending.channel_id, &pending.text, None)
                             .and_then(|id| {
                                 id.map(|id| (AgentProgressDeliveryAction::Send, Some(id)))
                                     .ok_or_else(|| {
@@ -2031,16 +2078,21 @@ fn deliver_progress_pending(
             }
         }
         "discord" => {
-            let token = discord_bot_token(&args.target_home)?;
+            let token = discord_bot_token(&args.target_home, None)?;
             match pending.action {
                 AgentProgressDeliveryAction::Send => {
-                    discord_send_message(&token, &pending.channel_id, &pending.text)
+                    discord_send_message(&token, &pending.channel_id, &pending.text, None)
                         .map(|id| (AgentProgressDeliveryAction::Send, id))
                 }
                 AgentProgressDeliveryAction::Edit => {
                     let Some(message_id) = pending.provider_message_id.as_deref() else {
-                        return discord_send_message(&token, &pending.channel_id, &pending.text)
-                            .map(|id| (AgentProgressDeliveryAction::Send, id));
+                        return discord_send_message(
+                            &token,
+                            &pending.channel_id,
+                            &pending.text,
+                            None,
+                        )
+                        .map(|id| (AgentProgressDeliveryAction::Send, id));
                     };
                     discord_edit_message(&token, &pending.channel_id, message_id, &pending.text)
                         .map(|id| {
@@ -2050,7 +2102,7 @@ fn deliver_progress_pending(
                             )
                         })
                         .or_else(|edit_error| {
-                            discord_send_message(&token, &pending.channel_id, &pending.text)
+                    discord_send_message(&token, &pending.channel_id, &pending.text, None)
                                 .map(|id| (AgentProgressDeliveryAction::Send, id))
                                 .map_err(|send_error| {
                                     format!(
@@ -2428,6 +2480,28 @@ fn execute_telegram_poll_once(
             .get("chat")
             .and_then(|chat| chat.get("type"))
             .and_then(serde_json::Value::as_str);
+        let account_id = telegram_account_id(args.telegram_account.as_deref());
+        let thread_id = message
+            .get("message_thread_id")
+            .and_then(telegram_id_string);
+        let identity = resolve_channel_identity(ChannelIdentityLookup {
+            harness_home: args.target_home.clone(),
+            platform: "telegram".to_string(),
+            account_id: account_id.clone(),
+            chat_id: chat_id.clone(),
+            thread_id: thread_id.clone(),
+            requested_agent_id: args.agent_id.clone(),
+        })
+        .map_err(|err| err.to_string())?;
+        if !identity.is_bound() {
+            skipped_updates += 1;
+            warnings.push(format!(
+                "Telegram update {update_id} denied by channel identity registry: {}",
+                identity.reason
+            ));
+            write_telegram_offset(&offset_file, next_offset)?;
+            continue;
+        }
         let permission =
             match telegram_access_decision(&access_policy, &chat_id, &user_id, chat_type) {
                 ChannelAccessDecision::Allowed(permission) => permission,
@@ -2458,9 +2532,10 @@ fn execute_telegram_poll_once(
             runtime_workspace: args.runtime_workspace.clone(),
             harness_home: args.target_home.clone(),
             platform: "telegram".to_string(),
+            account_id: Some(account_id.clone()),
             channel_id: chat_id,
             user_id,
-            agent_id: telegram_effective_agent_id(args),
+            agent_id: identity.agent_id.clone(),
             session_key: None,
             message: text,
             inbound_context,
@@ -2492,16 +2567,22 @@ fn execute_telegram_poll_once(
     let mut delivered_messages = 0;
     let mut failed_deliveries = 0;
     for pending in delivery.pending {
+        if outbound_message_account_id(&pending.message)
+            != telegram_account_id(args.telegram_account.as_deref())
+        {
+            continue;
+        }
         match telegram_send_outbound_message(token, &pending.message) {
             Ok(provider_message_id) => {
                 record_channel_delivery(ChannelDeliveryRecordOptions {
                     harness_home: args.target_home.clone(),
                     delivery_id: pending.delivery_id,
                     status: ChannelDeliveryStatus::Delivered,
-                    platform: pending.message.platform,
-                    channel_id: pending.message.channel_id,
-                    user_id: pending.message.user_id,
-                    session_key: pending.message.session_key,
+                    platform: pending.message.platform.clone(),
+                    account_id: pending.message.account_id.clone(),
+                    channel_id: pending.message.channel_id.clone(),
+                    user_id: pending.message.user_id.clone(),
+                    session_key: pending.message.session_key.clone(),
                     provider_message_id,
                     error: None,
                     now_ms: current_time_ms()?,
@@ -2514,10 +2595,11 @@ fn execute_telegram_poll_once(
                     harness_home: args.target_home.clone(),
                     delivery_id: pending.delivery_id,
                     status: ChannelDeliveryStatus::Failed,
-                    platform: pending.message.platform,
-                    channel_id: pending.message.channel_id,
-                    user_id: pending.message.user_id,
-                    session_key: pending.message.session_key,
+                    platform: pending.message.platform.clone(),
+                    account_id: pending.message.account_id.clone(),
+                    channel_id: pending.message.channel_id.clone(),
+                    user_id: pending.message.user_id.clone(),
+                    session_key: pending.message.session_key.clone(),
                     provider_message_id: None,
                     error: Some(error.clone()),
                     now_ms: current_time_ms()?,
@@ -2787,7 +2869,7 @@ fn push_indented_text_block(lines: &mut Vec<String>, field: &str, text: &str) {
 
 fn run_discord_outbox_send_once(args: &[String]) -> Result<(), String> {
     let args = discord_outbox_send_once_args_from_args(args)?;
-    let token = discord_bot_token(&args.target_home)?;
+    let token = discord_bot_token(&args.target_home, args.discord_account.as_deref())?;
     let report = execute_discord_outbox_send_once(&args, &token)?;
     print_discord_outbox_send_once_report(&report);
     Ok(())
@@ -2795,7 +2877,7 @@ fn run_discord_outbox_send_once(args: &[String]) -> Result<(), String> {
 
 fn run_discord_outbox_loop(args: &[String]) -> Result<(), String> {
     let args = discord_outbox_loop_args_from_args(args)?;
-    let token = discord_bot_token(&args.send.target_home)?;
+    let token = discord_bot_token(&args.send.target_home, args.send.discord_account.as_deref())?;
     let mut iterations = 0usize;
     let mut consecutive_errors = 0usize;
 
@@ -2887,7 +2969,7 @@ fn run_discord_outbox_loop(args: &[String]) -> Result<(), String> {
 
 fn run_discord_dm_probe(args: &[String]) -> Result<(), String> {
     let args = discord_dm_probe_args_from_args(args)?;
-    let token = discord_bot_token(&args.target_home)?;
+    let token = discord_bot_token(&args.target_home, None)?;
     let report = execute_discord_dm_probe(&args, &token);
     write_discord_dm_probe_report(&report)?;
     append_harness_log(
@@ -2915,7 +2997,7 @@ fn run_discord_dm_probe(args: &[String]) -> Result<(), String> {
 
 fn run_discord_dm_history_probe(args: &[String]) -> Result<(), String> {
     let args = discord_dm_history_probe_args_from_args(args)?;
-    let token = discord_bot_token(&args.target_home)?;
+    let token = discord_bot_token(&args.target_home, None)?;
     let report = execute_discord_dm_history_probe(&args, &token);
     write_discord_dm_history_probe_report(&report)?;
     append_harness_log(
@@ -3060,7 +3142,7 @@ fn execute_discord_dm_probe(args: &DiscordDmProbeArgs, token: &str) -> DiscordDm
     };
 
     let provider_message_id = if args.send_message {
-        match discord_send_message(token, &channel_id, &args.message) {
+        match discord_send_message(token, &channel_id, &args.message, None) {
             Ok(provider_message_id) => provider_message_id,
             Err(error) => {
                 return DiscordDmProbeReport {
@@ -3114,16 +3196,22 @@ fn execute_discord_outbox_send_once(
     let mut failed_deliveries = 0;
 
     for pending in delivery.pending {
+        if outbound_message_account_id(&pending.message)
+            != discord_account_id(args.discord_account.as_deref())
+        {
+            continue;
+        }
         match discord_send_outbound_message(&token, &pending.message) {
             Ok(provider_message_id) => {
                 record_channel_delivery(ChannelDeliveryRecordOptions {
                     harness_home: args.target_home.clone(),
                     delivery_id: pending.delivery_id,
                     status: ChannelDeliveryStatus::Delivered,
-                    platform: pending.message.platform,
-                    channel_id: pending.message.channel_id,
-                    user_id: pending.message.user_id,
-                    session_key: pending.message.session_key,
+                    platform: pending.message.platform.clone(),
+                    account_id: pending.message.account_id.clone(),
+                    channel_id: pending.message.channel_id.clone(),
+                    user_id: pending.message.user_id.clone(),
+                    session_key: pending.message.session_key.clone(),
                     provider_message_id,
                     error: None,
                     now_ms: current_time_ms()?,
@@ -3136,10 +3224,11 @@ fn execute_discord_outbox_send_once(
                     harness_home: args.target_home.clone(),
                     delivery_id: pending.delivery_id,
                     status: ChannelDeliveryStatus::Failed,
-                    platform: pending.message.platform,
-                    channel_id: pending.message.channel_id,
-                    user_id: pending.message.user_id,
-                    session_key: pending.message.session_key,
+                    platform: pending.message.platform.clone(),
+                    account_id: pending.message.account_id.clone(),
+                    channel_id: pending.message.channel_id.clone(),
+                    user_id: pending.message.user_id.clone(),
+                    session_key: pending.message.session_key.clone(),
                     provider_message_id: None,
                     error: Some(error.clone()),
                     now_ms: current_time_ms()?,
@@ -3259,60 +3348,91 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
                             run: None,
                         }
                     } else {
-                        if let Ok(token) = discord_bot_token(&args.target_home)
-                            && let Err(error) = discord_send_typing(&token, &message.channel_id)
-                        {
-                            let _ = append_harness_log(
-                                &args.target_home,
-                                &HarnessLogEvent::new(
-                                    current_log_time_ms().unwrap_or(0),
-                                    HarnessLogLevel::Warn,
-                                    "discord",
-                                    "discord.typing-failed",
-                                    error,
-                                ),
-                            );
-                        }
-                        let run = run_channel_once(ChannelRunOnceOptions {
-                            source: args.source.clone(),
-                            runtime_workspace: args.runtime_workspace.clone(),
+                        let account_id = discord_account_id(args.discord_account.as_deref());
+                        let identity = resolve_channel_identity(ChannelIdentityLookup {
                             harness_home: args.target_home.clone(),
                             platform: "discord".to_string(),
-                            channel_id: message.channel_id.clone(),
-                            user_id: message.user_id.clone(),
-                            agent_id: args.agent_id.clone(),
-                            session_key: None,
-                            message: message_text,
-                            inbound_context: message.inbound_context.clone(),
-                            skill_limit: args.skill_limit,
-                            now_ms: current_time_ms()?,
-                            codex_executable: args.codex_exe.clone(),
-                            timeout_ms: args.timeout_ms,
-                            idle_timeout_ms: args.idle_timeout_ms,
-                            prompt_options: PromptAssemblyOptions {
-                                harness_home: Some(args.target_home.clone()),
-                                ..PromptAssemblyOptions::default()
-                            },
-                            outbox_limit: args.outbox_limit,
-                            run_runtime: false,
+                            account_id: account_id.clone(),
+                            chat_id: message.channel_id.clone(),
+                            thread_id: None,
+                            requested_agent_id: args.agent_id.clone(),
                         })
                         .map_err(|err| err.to_string())?;
-                        if message.reply_context.is_some() {
-                            write_discord_reply_context_receipt(
+                        if !identity.is_bound() {
+                            DiscordEventRunOnceReport {
+                                harness_home: args.target_home.clone(),
+                                status: "denied".to_string(),
+                                reason: format!(
+                                    "channel identity registry denied event: {}",
+                                    identity.reason
+                                ),
+                                message_id: Some(message.message_id),
+                                guild_id: message.guild_id,
+                                channel_id: Some(message.channel_id),
+                                user_id: Some(message.user_id),
+                                run: None,
+                            }
+                        } else {
+                            if let Ok(token) = discord_bot_token(
                                 &args.target_home,
-                                &message,
-                                "captured",
-                            )?;
-                        }
-                        DiscordEventRunOnceReport {
-                            harness_home: args.target_home.clone(),
-                            status: "handled".to_string(),
-                            reason: "Discord message normalized into channel-run-once".to_string(),
-                            message_id: Some(message.message_id),
-                            guild_id: message.guild_id,
-                            channel_id: Some(message.channel_id),
-                            user_id: Some(message.user_id),
-                            run: Some(run),
+                                args.discord_account.as_deref(),
+                            ) && let Err(error) =
+                                discord_send_typing(&token, &message.channel_id)
+                            {
+                                let _ = append_harness_log(
+                                    &args.target_home,
+                                    &HarnessLogEvent::new(
+                                        current_log_time_ms().unwrap_or(0),
+                                        HarnessLogLevel::Warn,
+                                        "discord",
+                                        "discord.typing-failed",
+                                        error,
+                                    ),
+                                );
+                            }
+                            let run = run_channel_once(ChannelRunOnceOptions {
+                                source: args.source.clone(),
+                                runtime_workspace: args.runtime_workspace.clone(),
+                                harness_home: args.target_home.clone(),
+                                platform: "discord".to_string(),
+                                account_id: Some(account_id),
+                                channel_id: message.channel_id.clone(),
+                                user_id: message.user_id.clone(),
+                                agent_id: identity.agent_id.clone(),
+                                session_key: None,
+                                message: message_text,
+                                inbound_context: message.inbound_context.clone(),
+                                skill_limit: args.skill_limit,
+                                now_ms: current_time_ms()?,
+                                codex_executable: args.codex_exe.clone(),
+                                timeout_ms: args.timeout_ms,
+                                idle_timeout_ms: args.idle_timeout_ms,
+                                prompt_options: PromptAssemblyOptions {
+                                    harness_home: Some(args.target_home.clone()),
+                                    ..PromptAssemblyOptions::default()
+                                },
+                                outbox_limit: args.outbox_limit,
+                                run_runtime: false,
+                            })
+                            .map_err(|err| err.to_string())?;
+                            if message.reply_context.is_some() {
+                                write_discord_reply_context_receipt(
+                                    &args.target_home,
+                                    &message,
+                                    "captured",
+                                )?;
+                            }
+                            DiscordEventRunOnceReport {
+                                harness_home: args.target_home.clone(),
+                                status: "handled".to_string(),
+                                reason: "Discord message normalized into channel-run-once"
+                                    .to_string(),
+                                message_id: Some(message.message_id),
+                                guild_id: message.guild_id,
+                                channel_id: Some(message.channel_id),
+                                user_id: Some(message.user_id),
+                                run: Some(run),
+                            }
                         }
                     }
                 }
@@ -3532,6 +3652,9 @@ fn discord_gateway_command(args: &DiscordGatewayArgs) -> Command {
     if let Some(agent_id) = &args.agent_id {
         command.arg("--agent").arg(agent_id);
     }
+    if let Some(account_id) = &args.discord_account {
+        command.arg("--discord-account").arg(account_id);
+    }
     if let Some(codex_exe) = &args.codex_exe {
         command.arg("--codex-exe").arg(codex_exe);
     }
@@ -3539,9 +3662,9 @@ fn discord_gateway_command(args: &DiscordGatewayArgs) -> Command {
         command.arg("--stop-file").arg(stop_file);
     }
     if env::var_os("DISCORD_BOT_TOKEN").is_none()
-        && let Some(token) = secret_env_value(&args.target_home, "DISCORD_BOT_TOKEN")
+        && let Ok(token) = discord_bot_token(&args.target_home, args.discord_account.as_deref())
     {
-        command.env("DISCORD_BOT_TOKEN", normalize_discord_bot_token(&token));
+        command.env("DISCORD_BOT_TOKEN", token);
     }
     command
 }
@@ -4505,6 +4628,137 @@ fn run_deterministic_cron_enqueue(args: &[String]) -> Result<(), String> {
     print_json(&report)
 }
 
+fn run_cron_scheduler_run_once(args: &[String]) -> Result<(), String> {
+    let args = cron_scheduler_run_once_args_from_args(args)?;
+    let report = run_cron_scheduler_once(CronSchedulerRunOnceOptions {
+        harness_home: args.target_home,
+        source: args.source,
+        runtime_workspace: args.runtime_workspace,
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+        dry_run: args.dry_run,
+        enabled_override: args.enabled_override,
+        native_enabled_override: args.native_enabled_override,
+        deterministic_enabled_override: args.deterministic_enabled_override,
+        resume_cron_override: args.resume_cron_override,
+        include_registered_cron_override: args.include_registered_cron_override,
+        allow_deterministic_run_override: args.allow_deterministic_run_override,
+        execute_shell_override: args.execute_shell_override,
+        max_catchup_per_tick_override: args.max_catchup_per_tick_override,
+        max_enqueue_per_tick_override: args.max_enqueue_per_tick_override,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
+}
+
+fn run_cron_scheduler_loop(args: &[String]) -> Result<(), String> {
+    let args = cron_scheduler_loop_args_from_args(args)?;
+    let mut iterations = 0usize;
+    let mut consecutive_errors = 0usize;
+    loop {
+        if stop_file_requested(args.stop_file.as_deref()) {
+            append_loop_stop_log(
+                &args.run_once.target_home,
+                "cron-scheduler",
+                "cron-scheduler.loop-stopped",
+                iterations,
+                "stop file requested",
+            )?;
+            write_loop_heartbeat(
+                &args.run_once.target_home,
+                "cron-scheduler-loop",
+                "stopped",
+                iterations,
+                "stop file requested",
+            )?;
+            break;
+        }
+        if args.iterations != 0 && iterations >= args.iterations {
+            write_loop_heartbeat(
+                &args.run_once.target_home,
+                "cron-scheduler-loop",
+                "stopped",
+                iterations,
+                "iteration limit reached",
+            )?;
+            break;
+        }
+        iterations += 1;
+        let report = run_cron_scheduler_once(CronSchedulerRunOnceOptions {
+            harness_home: args.run_once.target_home.clone(),
+            source: args.run_once.source.clone(),
+            runtime_workspace: args.run_once.runtime_workspace.clone(),
+            now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+            dry_run: args.run_once.dry_run,
+            enabled_override: args.run_once.enabled_override,
+            native_enabled_override: args.run_once.native_enabled_override,
+            deterministic_enabled_override: args.run_once.deterministic_enabled_override,
+            resume_cron_override: args.run_once.resume_cron_override,
+            include_registered_cron_override: args.run_once.include_registered_cron_override,
+            allow_deterministic_run_override: args.run_once.allow_deterministic_run_override,
+            execute_shell_override: args.run_once.execute_shell_override,
+            max_catchup_per_tick_override: args.run_once.max_catchup_per_tick_override,
+            max_enqueue_per_tick_override: args.run_once.max_enqueue_per_tick_override,
+        });
+        match report {
+            Ok(report) => {
+                let detail = format!(
+                    "status={:?} enqueued={} duplicate={} errors={}",
+                    report.status,
+                    report.summary.enqueued,
+                    report.summary.skipped_duplicate,
+                    report.summary.errors
+                );
+                println!("{detail}");
+                consecutive_errors = if report.status == CronSchedulerTickStatus::Error {
+                    consecutive_errors.saturating_add(1)
+                } else {
+                    0
+                };
+                write_loop_heartbeat(
+                    &args.run_once.target_home,
+                    "cron-scheduler-loop",
+                    if report.status == CronSchedulerTickStatus::Error {
+                        "error"
+                    } else {
+                        "running"
+                    },
+                    iterations,
+                    &detail,
+                )?;
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                append_harness_log(
+                    &args.run_once.target_home,
+                    &HarnessLogEvent::new(
+                        current_log_time_ms().unwrap_or(0),
+                        HarnessLogLevel::Warn,
+                        "cron-scheduler",
+                        "cron-scheduler.loop-error",
+                        format!("iteration {iterations} failed: {detail}"),
+                    ),
+                )
+                .map_err(|err| err.to_string())?;
+                write_loop_heartbeat(
+                    &args.run_once.target_home,
+                    "cron-scheduler-loop",
+                    "error",
+                    iterations,
+                    &detail,
+                )?;
+            }
+        }
+        if consecutive_errors >= args.max_consecutive_errors {
+            return Err(format!(
+                "cron scheduler loop stopped after {consecutive_errors} consecutive errors"
+            ));
+        }
+        thread::sleep(Duration::from_millis(args.idle_ms));
+    }
+    Ok(())
+}
+
 fn run_subagent_plan(args: &[String]) -> Result<(), String> {
     let args = subagent_plan_args_from_args(args)?;
     let ledger = load_subagent_ledger(&args.source).map_err(|err| err.to_string())?;
@@ -4571,6 +4825,284 @@ fn source_from_args(args: &[String]) -> Result<AgentSource, String> {
         Some(workspace) => AgentSource::with_workspace(home, workspace),
         None => AgentSource::new(home),
     })
+}
+
+fn channel_identity_check_args_from_args(
+    args: &[String],
+) -> Result<ChannelIdentityCheckArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut platform = None;
+    let mut account_id = "default".to_string();
+    let mut chat_id = None;
+    let mut thread_id = None;
+    let mut agent_id = None;
+    let mut json = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--platform" => {
+                i += 1;
+                platform = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--platform requires a value".to_string())?,
+                );
+            }
+            "--account-id" | "--account" => {
+                i += 1;
+                account_id = args
+                    .get(i)
+                    .cloned()
+                    .ok_or_else(|| "--account-id requires a value".to_string())?;
+            }
+            "--chat-id" | "--channel-id" => {
+                i += 1;
+                chat_id = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--chat-id requires a value".to_string())?,
+                );
+            }
+            "--thread-id" => {
+                i += 1;
+                thread_id = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--thread-id requires a value".to_string())?,
+                );
+            }
+            "--agent" => {
+                i += 1;
+                agent_id = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--agent requires an id".to_string())?,
+                );
+            }
+            "--json" => json = true,
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(ChannelIdentityCheckArgs {
+        target_home,
+        platform: platform.ok_or_else(|| "--platform is required".to_string())?,
+        account_id,
+        chat_id: chat_id.ok_or_else(|| "--chat-id is required".to_string())?,
+        thread_id,
+        agent_id,
+        json,
+    })
+}
+
+fn cron_scheduler_run_once_args_from_args(
+    args: &[String],
+) -> Result<CronSchedulerRunOnceArgs, String> {
+    let mut home = default_source_home();
+    let mut workspace = None;
+    let mut runtime_workspace = None;
+    let mut target_home = default_harness_home();
+    let mut dry_run = false;
+    let mut enabled_override = None;
+    let mut native_enabled_override = None;
+    let mut deterministic_enabled_override = None;
+    let mut resume_cron_override = None;
+    let mut include_registered_cron_override = None;
+    let mut allow_deterministic_run_override = None;
+    let mut execute_shell_override = None;
+    let mut max_catchup_per_tick_override = None;
+    let mut max_enqueue_per_tick_override = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--source-home" => {
+                i += 1;
+                home = args
+                    .get(i)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--source-home requires a path".to_string())?;
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--workspace requires a path".to_string())?,
+                );
+            }
+            "--runtime-workspace" => {
+                i += 1;
+                runtime_workspace = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--runtime-workspace requires a path".to_string())?,
+                );
+            }
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--dry-run" => dry_run = true,
+            "--enable" | "--enabled" => enabled_override = Some(true),
+            "--disable" | "--disabled" => enabled_override = Some(false),
+            "--native-cron" => native_enabled_override = Some(true),
+            "--no-native-cron" => native_enabled_override = Some(false),
+            "--deterministic-cron" => deterministic_enabled_override = Some(true),
+            "--no-deterministic-cron" => deterministic_enabled_override = Some(false),
+            "--resume-cron" => resume_cron_override = Some(true),
+            "--hold-cron" => resume_cron_override = Some(false),
+            "--include-registered-cron" => include_registered_cron_override = Some(true),
+            "--no-include-registered-cron" => include_registered_cron_override = Some(false),
+            "--allow-deterministic-run" => allow_deterministic_run_override = Some(true),
+            "--hold-deterministic-run" => allow_deterministic_run_override = Some(false),
+            "--execute-shell" => execute_shell_override = Some(true),
+            "--dry-run-shell" => execute_shell_override = Some(false),
+            "--max-catchup-per-tick" => {
+                i += 1;
+                max_catchup_per_tick_override = Some(
+                    args.get(i)
+                        .ok_or_else(|| {
+                            "--max-catchup-per-tick requires a positive integer".to_string()
+                        })
+                        .and_then(|value| parse_limit(value))?,
+                );
+            }
+            "--max-enqueue-per-tick" => {
+                i += 1;
+                max_enqueue_per_tick_override = Some(
+                    args.get(i)
+                        .ok_or_else(|| {
+                            "--max-enqueue-per-tick requires a positive integer".to_string()
+                        })
+                        .and_then(|value| parse_limit(value))?,
+                );
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    let source = match workspace {
+        Some(workspace) => AgentSource::with_workspace(home, workspace),
+        None => AgentSource::new(home),
+    };
+    Ok(CronSchedulerRunOnceArgs {
+        source,
+        runtime_workspace,
+        target_home,
+        dry_run,
+        enabled_override,
+        native_enabled_override,
+        deterministic_enabled_override,
+        resume_cron_override,
+        include_registered_cron_override,
+        allow_deterministic_run_override,
+        execute_shell_override,
+        max_catchup_per_tick_override,
+        max_enqueue_per_tick_override,
+    })
+}
+
+fn cron_scheduler_loop_args_from_args(args: &[String]) -> Result<CronSchedulerLoopArgs, String> {
+    let mut loop_only = Vec::new();
+    let mut run_once_args = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--iterations" | "--idle-ms" | "--max-consecutive-errors" | "--stop-file" => {
+                loop_only.push(args[i].clone());
+                i += 1;
+                loop_only.push(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| format!("{} requires a value", args[i - 1]))?,
+                );
+            }
+            flag => {
+                run_once_args.push(flag.to_string());
+                if cron_scheduler_run_once_arg_requires_value(flag) {
+                    i += 1;
+                    run_once_args.push(
+                        args.get(i)
+                            .cloned()
+                            .ok_or_else(|| format!("{flag} requires a value"))?,
+                    );
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let run_once = cron_scheduler_run_once_args_from_args(&run_once_args)?;
+    let mut iterations = 0usize;
+    let mut idle_ms = 60_000u64;
+    let mut max_consecutive_errors = 5usize;
+    let mut stop_file = None;
+    let mut i = 0;
+    while i < loop_only.len() {
+        match loop_only[i].as_str() {
+            "--iterations" => {
+                i += 1;
+                iterations = loop_only
+                    .get(i)
+                    .ok_or_else(|| "--iterations requires a value".to_string())
+                    .and_then(|value| parse_usize(value, "--iterations"))?;
+            }
+            "--idle-ms" => {
+                i += 1;
+                idle_ms = loop_only
+                    .get(i)
+                    .ok_or_else(|| "--idle-ms requires a value".to_string())
+                    .and_then(|value| parse_u64(value, "--idle-ms"))?;
+            }
+            "--max-consecutive-errors" => {
+                i += 1;
+                max_consecutive_errors = loop_only
+                    .get(i)
+                    .ok_or_else(|| "--max-consecutive-errors requires a value".to_string())
+                    .and_then(|value| parse_limit(value))?;
+            }
+            "--stop-file" => {
+                i += 1;
+                stop_file = Some(
+                    loop_only
+                        .get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--stop-file requires a path".to_string())?,
+                );
+            }
+            flag => return Err(format!("unknown loop argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(CronSchedulerLoopArgs {
+        run_once,
+        iterations,
+        idle_ms,
+        max_consecutive_errors,
+        stop_file,
+    })
+}
+
+fn cron_scheduler_run_once_arg_requires_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--source-home"
+            | "--workspace"
+            | "--runtime-workspace"
+            | "--harness-home"
+            | "--target-home"
+            | "--max-catchup-per-tick"
+            | "--max-enqueue-per-tick"
+    )
 }
 
 struct DryRunArgs {
@@ -4680,6 +5212,41 @@ struct HarnessStatusArgs {
     json: bool,
 }
 
+struct ChannelIdentityCheckArgs {
+    target_home: PathBuf,
+    platform: String,
+    account_id: String,
+    chat_id: String,
+    thread_id: Option<String>,
+    agent_id: Option<String>,
+    json: bool,
+}
+
+#[derive(Clone)]
+struct CronSchedulerRunOnceArgs {
+    source: AgentSource,
+    runtime_workspace: Option<PathBuf>,
+    target_home: PathBuf,
+    dry_run: bool,
+    enabled_override: Option<bool>,
+    native_enabled_override: Option<bool>,
+    deterministic_enabled_override: Option<bool>,
+    resume_cron_override: Option<bool>,
+    include_registered_cron_override: Option<bool>,
+    allow_deterministic_run_override: Option<bool>,
+    execute_shell_override: Option<bool>,
+    max_catchup_per_tick_override: Option<usize>,
+    max_enqueue_per_tick_override: Option<usize>,
+}
+
+struct CronSchedulerLoopArgs {
+    run_once: CronSchedulerRunOnceArgs,
+    iterations: usize,
+    idle_ms: u64,
+    max_consecutive_errors: usize,
+    stop_file: Option<PathBuf>,
+}
+
 struct JsonlRepairArgs {
     path: PathBuf,
     output: Option<PathBuf>,
@@ -4782,6 +5349,7 @@ struct SupervisorPlanArgs {
     include_runtime: bool,
     runtime_workers: usize,
     include_worker: bool,
+    include_cron_scheduler: bool,
     include_progress: bool,
     include_telegram: bool,
     include_discord: bool,
@@ -4972,6 +5540,7 @@ struct TelegramLoopArgs {
 
 struct DiscordOutboxSendOnceArgs {
     target_home: PathBuf,
+    discord_account: Option<String>,
     outbox_limit: usize,
 }
 
@@ -5002,6 +5571,7 @@ struct DiscordEventRunOnceArgs {
     runtime_workspace: Option<PathBuf>,
     target_home: PathBuf,
     agent_id: Option<String>,
+    discord_account: Option<String>,
     skill_limit: usize,
     codex_exe: Option<PathBuf>,
     timeout_ms: u64,
@@ -5058,6 +5628,7 @@ struct DiscordGatewayArgs {
     gateway_script: PathBuf,
     harness_cli: PathBuf,
     agent_id: Option<String>,
+    discord_account: Option<String>,
     codex_exe: Option<PathBuf>,
     max_messages: usize,
     stop_file: Option<PathBuf>,
@@ -6660,6 +7231,7 @@ fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs,
     let mut include_runtime = true;
     let mut runtime_workers = 1usize;
     let mut include_worker = true;
+    let mut include_cron_scheduler = false;
     let mut include_progress = true;
     let mut include_telegram = true;
     let mut include_discord = true;
@@ -6763,6 +7335,8 @@ fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs,
                     .max(1);
             }
             "--no-worker" => include_worker = false,
+            "--include-cron-scheduler" => include_cron_scheduler = true,
+            "--no-cron-scheduler" => include_cron_scheduler = false,
             "--no-progress" => include_progress = false,
             "--no-telegram" => include_telegram = false,
             "--no-discord" => include_discord = false,
@@ -6839,6 +7413,7 @@ fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs,
         include_runtime,
         runtime_workers,
         include_worker,
+        include_cron_scheduler,
         include_progress,
         include_telegram,
         include_discord,
@@ -7899,6 +8474,7 @@ fn discord_outbox_send_once_args_from_args(
     args: &[String],
 ) -> Result<DiscordOutboxSendOnceArgs, String> {
     let mut target_home = default_harness_home();
+    let mut discord_account = None;
     let mut outbox_limit = 20;
     let mut i = 0;
 
@@ -7907,6 +8483,14 @@ fn discord_outbox_send_once_args_from_args(
             flag if is_harness_home_arg(flag) => {
                 i += 1;
                 target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--discord-account" | "--account" => {
+                i += 1;
+                discord_account = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--discord-account requires an account id".to_string())?,
+                );
             }
             "--outbox-limit" => {
                 i += 1;
@@ -7922,12 +8506,14 @@ fn discord_outbox_send_once_args_from_args(
 
     Ok(DiscordOutboxSendOnceArgs {
         target_home,
+        discord_account,
         outbox_limit,
     })
 }
 
 fn discord_outbox_loop_args_from_args(args: &[String]) -> Result<DiscordOutboxLoopArgs, String> {
     let mut target_home = default_harness_home();
+    let mut discord_account = None;
     let mut outbox_limit = 20;
     let mut iterations = 0usize;
     let mut idle_ms = 1_000u64;
@@ -7940,6 +8526,14 @@ fn discord_outbox_loop_args_from_args(args: &[String]) -> Result<DiscordOutboxLo
             flag if is_harness_home_arg(flag) => {
                 i += 1;
                 target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--discord-account" | "--account" => {
+                i += 1;
+                discord_account = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--discord-account requires an account id".to_string())?,
+                );
             }
             "--outbox-limit" => {
                 i += 1;
@@ -7987,6 +8581,7 @@ fn discord_outbox_loop_args_from_args(args: &[String]) -> Result<DiscordOutboxLo
     Ok(DiscordOutboxLoopArgs {
         send: DiscordOutboxSendOnceArgs {
             target_home,
+            discord_account,
             outbox_limit,
         },
         iterations,
@@ -8116,6 +8711,7 @@ fn discord_event_run_once_args_from_args(
     let mut runtime_workspace = None;
     let mut target_home = default_harness_home();
     let mut agent_id = None;
+    let mut discord_account = None;
     let mut skill_limit = 5;
     let mut codex_exe = None;
     let mut timeout_ms = DEFAULT_CODEX_TIMEOUT_MS;
@@ -8160,6 +8756,14 @@ fn discord_event_run_once_args_from_args(
                     args.get(i)
                         .cloned()
                         .ok_or_else(|| "--agent requires an id".to_string())?,
+                );
+            }
+            "--discord-account" | "--account" => {
+                i += 1;
+                discord_account = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--discord-account requires an account id".to_string())?,
                 );
             }
             "--skill-limit" => {
@@ -8232,6 +8836,7 @@ fn discord_event_run_once_args_from_args(
         runtime_workspace,
         target_home,
         agent_id,
+        discord_account,
         skill_limit,
         codex_exe,
         timeout_ms,
@@ -8253,6 +8858,7 @@ fn discord_gateway_args_from_args(args: &[String]) -> Result<DiscordGatewayArgs,
         .join("index.mjs");
     let mut harness_cli = default_harness_cli();
     let mut agent_id = None;
+    let mut discord_account = None;
     let mut codex_exe = None;
     let mut max_messages = 0;
     let mut stop_file = None;
@@ -8316,6 +8922,14 @@ fn discord_gateway_args_from_args(args: &[String]) -> Result<DiscordGatewayArgs,
                         .ok_or_else(|| "--agent requires an id".to_string())?,
                 );
             }
+            "--discord-account" | "--account" => {
+                i += 1;
+                discord_account = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--discord-account requires an account id".to_string())?,
+                );
+            }
             "--codex-exe" => {
                 i += 1;
                 codex_exe = Some(
@@ -8356,6 +8970,7 @@ fn discord_gateway_args_from_args(args: &[String]) -> Result<DiscordGatewayArgs,
         gateway_script,
         harness_cli,
         agent_id,
+        discord_account,
         codex_exe,
         max_messages,
         stop_file,
@@ -10560,17 +11175,22 @@ fn sanitize_file_component(value: &str) -> String {
     output.trim_matches('-').to_string()
 }
 
-fn telegram_effective_agent_id(args: &TelegramPollOnceArgs) -> Option<String> {
-    args.agent_id.clone().or_else(|| {
-        args.telegram_account.as_ref().and_then(|account| {
-            let account = account.trim();
-            if account.is_empty() || account == "default" {
-                None
-            } else {
-                Some(account.to_string())
-            }
-        })
-    })
+fn telegram_account_id(account_id: Option<&str>) -> String {
+    account_id
+        .map(str::trim)
+        .filter(|account_id| !account_id.is_empty())
+        .unwrap_or("default")
+        .to_ascii_lowercase()
+}
+
+fn outbound_message_account_id(message: &ChannelOutboundMessage) -> String {
+    message
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|account_id| !account_id.is_empty())
+        .unwrap_or("default")
+        .to_ascii_lowercase()
 }
 
 fn telegram_offset_file(harness_home: &std::path::Path, account_id: Option<&str>) -> PathBuf {
@@ -10706,16 +11326,26 @@ fn telegram_get_updates(
         .unwrap_or_default())
 }
 
-fn telegram_send_message(token: &str, chat_id: &str, text: &str) -> Result<Option<String>, String> {
+fn telegram_send_message(
+    token: &str,
+    chat_id: &str,
+    text: &str,
+    reply_to_message_id: Option<i64>,
+) -> Result<Option<String>, String> {
     let url = format!("https://api.telegram.org/bot{token}/sendMessage");
     let agent = channel_http_short_agent();
+    let mut payload = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": true
+    });
+    if let Some(reply_to_message_id) = reply_to_message_id {
+        payload["reply_to_message_id"] = serde_json::json!(reply_to_message_id);
+        payload["allow_sending_without_reply"] = serde_json::json!(true);
+    }
     let response = agent
         .post(&url)
-        .send_json(serde_json::json!({
-            "chat_id": chat_id,
-            "text": text,
-            "disable_web_page_preview": true
-        }))
+        .send_json(payload)
         .map_err(telegram_http_error)?;
     let value: serde_json::Value = response.into_json().map_err(|err| err.to_string())?;
     if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
@@ -10736,8 +11366,12 @@ fn telegram_send_outbound_message(
     let mut provider_message_ids = Vec::new();
     let text = format_channel_reply_text(&message.text);
     if message.attachments.is_empty() || !text.trim().is_empty() {
-        if let Some(provider_message_id) = telegram_send_message(token, &message.channel_id, &text)?
-        {
+        if let Some(provider_message_id) = telegram_send_message(
+            token,
+            &message.channel_id,
+            &text,
+            telegram_reply_to_message_id(message),
+        )? {
             provider_message_ids.push(provider_message_id);
         }
     }
@@ -10749,6 +11383,24 @@ fn telegram_send_outbound_message(
         }
     }
     Ok((!provider_message_ids.is_empty()).then(|| provider_message_ids.join(",")))
+}
+
+fn telegram_reply_to_message_id(message: &ChannelOutboundMessage) -> Option<i64> {
+    let intent = message.delivery_intent.as_ref()?;
+    if !intent.validated || intent.kind != ChannelDeliveryIntentKind::ReplyToMessage {
+        return None;
+    }
+    if intent
+        .platform_channel_id
+        .as_deref()
+        .is_some_and(|channel_id| channel_id != message.channel_id)
+    {
+        return None;
+    }
+    intent
+        .platform_message_id
+        .as_deref()
+        .and_then(|value| value.parse::<i64>().ok())
 }
 
 fn telegram_send_attachment(
@@ -10994,14 +11646,36 @@ fn telegram_http_error(error: ureq::Error) -> String {
     }
 }
 
-fn discord_bot_token(harness_home: &Path) -> Result<String, String> {
-    env::var("DISCORD_BOT_TOKEN")
+fn discord_bot_token(harness_home: &Path, account_id: Option<&str>) -> Result<String, String> {
+    let account_id = account_id
+        .map(str::trim)
+        .filter(|account_id| !account_id.is_empty());
+    let env_name = account_id
+        .filter(|account_id| *account_id != "default")
+        .map(discord_account_token_env_name)
+        .unwrap_or_else(|| "DISCORD_BOT_TOKEN".to_string());
+    env::var(&env_name)
         .ok()
-        .or_else(|| secret_env_value(harness_home, "DISCORD_BOT_TOKEN"))
+        .or_else(|| secret_env_value(harness_home, &env_name))
         .map(|token| normalize_discord_bot_token(&token))
         .ok_or_else(|| {
-            "DISCORD_BOT_TOKEN is required for Discord adapters; run channel-credentials-export or set the env var".to_string()
+            format!("{env_name} is required for Discord adapters; run channel-credentials-export or set the env var")
         })
+}
+
+fn discord_account_token_env_name(account_id: &str) -> String {
+    format!(
+        "AGENT_HARNESS_DISCORD_ACCOUNT_{}_BOT_TOKEN",
+        sanitize_env_suffix(account_id)
+    )
+}
+
+fn discord_account_id(account_id: Option<&str>) -> String {
+    account_id
+        .map(str::trim)
+        .filter(|account_id| !account_id.is_empty())
+        .unwrap_or("default")
+        .to_ascii_lowercase()
 }
 
 fn normalize_discord_bot_token(token: &str) -> String {
@@ -11025,9 +11699,12 @@ fn discord_send_outbound_message(
     let mut provider_message_ids = Vec::new();
     let text = format_channel_reply_text(&message.text);
     if !text.trim().is_empty() {
-        if let Some(provider_message_id) =
-            discord_send_message_chunks(token, &message.channel_id, &text)?
-        {
+        if let Some(provider_message_id) = discord_send_message_chunks(
+            token,
+            &message.channel_id,
+            &text,
+            discord_message_reference(message),
+        )? {
             provider_message_ids.push(provider_message_id);
         }
     }
@@ -11039,24 +11716,51 @@ fn discord_send_outbound_message(
         }
     }
     if provider_message_ids.is_empty() && message.attachments.is_empty() {
-        if let Some(provider_message_id) =
-            discord_send_message_chunks(token, &message.channel_id, &text)?
-        {
+        if let Some(provider_message_id) = discord_send_message_chunks(
+            token,
+            &message.channel_id,
+            &text,
+            discord_message_reference(message),
+        )? {
             provider_message_ids.push(provider_message_id);
         }
     }
     Ok((!provider_message_ids.is_empty()).then(|| provider_message_ids.join(",")))
 }
 
+fn discord_message_reference(message: &ChannelOutboundMessage) -> Option<serde_json::Value> {
+    let intent = message.delivery_intent.as_ref()?;
+    if !intent.validated || intent.kind != ChannelDeliveryIntentKind::ReplyToMessage {
+        return None;
+    }
+    let message_id = intent.platform_message_id.as_deref()?;
+    let channel_id = intent
+        .platform_channel_id
+        .as_deref()
+        .unwrap_or(&message.channel_id);
+    if channel_id != message.channel_id {
+        return None;
+    }
+    Some(serde_json::json!({
+        "message_id": message_id,
+        "channel_id": channel_id,
+        "fail_if_not_exists": false
+    }))
+}
+
 fn discord_send_message_chunks(
     token: &str,
     channel_id: &str,
     text: &str,
+    message_reference: Option<serde_json::Value>,
 ) -> Result<Option<String>, String> {
     let chunks = discord_message_chunks(text, DISCORD_MESSAGE_CONTENT_LIMIT);
     let mut provider_message_ids = Vec::new();
-    for chunk in chunks {
-        if let Some(provider_message_id) = discord_send_message(token, channel_id, &chunk)? {
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let reference = (index == 0).then(|| message_reference.clone()).flatten();
+        if let Some(provider_message_id) =
+            discord_send_message(token, channel_id, &chunk, reference)?
+        {
             provider_message_ids.push(provider_message_id);
         }
     }
@@ -11108,6 +11812,7 @@ fn discord_send_message(
     token: &str,
     channel_id: &str,
     text: &str,
+    message_reference: Option<serde_json::Value>,
 ) -> Result<Option<String>, String> {
     if text.chars().count() > DISCORD_MESSAGE_CONTENT_LIMIT {
         return Err("Discord message exceeds the 2000 character content limit".to_string());
@@ -11116,16 +11821,20 @@ fn discord_send_message(
     let token = normalize_discord_bot_token(token);
     let auth = format!("Bot {token}");
     let agent = channel_http_short_agent();
+    let mut payload = serde_json::json!({
+        "content": text,
+        "allowed_mentions": {
+            "parse": []
+        }
+    });
+    if let Some(reference) = message_reference {
+        payload["message_reference"] = reference;
+    }
     let response = agent
         .post(&url)
         .set("Authorization", &auth)
         .set("Content-Type", "application/json")
-        .send_json(serde_json::json!({
-            "content": text,
-            "allowed_mentions": {
-                "parse": []
-            }
-        }))
+        .send_json(payload)
         .map_err(discord_http_error)?;
     let value: serde_json::Value = response.into_json().map_err(|err| err.to_string())?;
     Ok(value
@@ -11555,7 +12264,7 @@ fn runtime_typing_sender(
             }))
         }
         "discord" => {
-            let token = discord_bot_token(harness_home).ok()?;
+            let token = discord_bot_token(harness_home, None).ok()?;
             let channel_id = context.channel_id.clone();
             Some(Box::new(move || {
                 let _ = discord_send_typing(&token, &channel_id);
@@ -13461,6 +14170,7 @@ fn print_help() {
     println!("  channel-run-once Handle one DM, run runtime if needed, and plan delivery");
     println!("  channel-outbox-plan List pending Telegram/Discord delivery messages");
     println!("  channel-delivery-record Record delivery success or retryable failure");
+    println!("  channel-identity-check Verify platform/account/channel binding before ingress");
     println!("  progress-delivery-once Send/edit compact runtime progress panels once");
     println!("  progress-delivery-loop Send/edit compact runtime progress panels continuously");
     println!("  telegram-probe  Probe Telegram Bot API getMe without consuming updates");
@@ -13493,6 +14203,8 @@ fn print_help() {
     println!("  prompt-bundle   Assemble prompt files, selected skills, and message");
     println!("  cron-plan       Dry-run legacy native agent-turn cron dispatch");
     println!("  native-cron-enqueue Persist native cron work into worker dispatch");
+    println!("  cron-scheduler-run-once Tick cron registries/crontabs into worker jobs");
+    println!("  cron-scheduler-loop Run the cron scheduler tick loop until stopped");
     println!("  deterministic-cron-plan Dry-run deterministic cron without LLM access");
     println!("  deterministic-cron-enqueue Persist deterministic cron into worker dispatch");
     println!("  subagent-plan   Dry-run subagent ledger cutover/resume planning");
@@ -13518,6 +14230,7 @@ fn print_help() {
     println!("  --query <text>          Match skills or search imported memory");
     println!("  --agent <id>            Agent hint for skill matching");
     println!("  --telegram-account <id> Telegram account token/offset selector");
+    println!("  --discord-account <id> Discord account token/outbox/gateway selector");
     println!("  --channel <name>        Channel hint for skill matching");
     println!("  --match-workspace <txt> Workspace hint for skill matching");
     println!("  --limit <n>             Maximum matched skills to print");
@@ -13575,6 +14288,7 @@ fn print_help() {
     println!("  TELEGRAM_BOT_TOKEN      Env var or harness secret used by Telegram adapters");
     println!("  AGENT_HARNESS_TELEGRAM_ACCOUNT_<ID>_BOT_TOKEN Account-specific Telegram token");
     println!("  DISCORD_BOT_TOKEN       Env var or harness secret used by Discord adapters");
+    println!("  AGENT_HARNESS_DISCORD_ACCOUNT_<ID>_BOT_TOKEN Account-specific Discord token");
     println!("  --node-exe <path>       Node executable for plugin sidecar commands");
     println!("  --sidecar-script <path> Plugin sidecar script path");
     println!("  --method <name>         Plugin sidecar JSON-RPC method for plugin-sidecar-call");
@@ -13601,6 +14315,7 @@ fn print_help() {
     );
     println!("  --resume-cron          Release native cron from cutover hold in dry-run");
     println!("  --include-registered-cron Enqueue registered cron entries for a scheduler tick");
+    println!("  --include-cron-scheduler Include cron-scheduler-loop in supervisor-plan");
     println!("  --allow-deterministic-run Release deterministic cron hold in dry-run");
     println!(
         "  --execute-shell        Allow deterministic-cron-enqueue jobs to execute shell scripts"
@@ -13653,6 +14368,20 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&path);
         path
+    }
+
+    #[test]
+    fn discord_gateway_args_preserve_account_selector() {
+        let args = discord_gateway_args_from_args(&[
+            "--discord-account".to_string(),
+            "ops".to_string(),
+            "--max-messages".to_string(),
+            "1".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(args.discord_account.as_deref(), Some("ops"));
+        assert_eq!(args.max_messages, 1);
     }
 
     fn discord_message(

@@ -1,6 +1,6 @@
 # Activation Readiness Plan
 
-Date: 2026-06-11
+Date: 2026-06-13
 
 This is the working checklist for turning the Rust Windows Agent Harness from a local core runtime into the active replacement for the Docker legacy gateway.
 
@@ -9,13 +9,14 @@ This is the working checklist for turning the Rust Windows Agent Harness from a 
 2026-06-12 repo-local harness-home baseline after round3-2 timeout/progress reconciliation:
 
 - Live harness home is now repo-local `.agent-harness`; `.agent-harness/` is ignored by git. `imports/activation-harness` remains only as a pre-rebase backup.
+- Latest channel identity / delivery intent / cron scheduler implementation verification passed `cargo fmt`, `cargo check`, and `cargo test` with 229 core tests, 18 CLI tests, and 0 doctests.
 - `agent-harness.exe` builds; `cargo fmt --all` and full `cargo test --workspace` passed with 207 core tests, 16 CLI tests, and doc-tests. Previous activation also passed `cargo build`.
 - Latest deployment validation passed `cargo build --workspace`, gateway stop/start with direct runners, live `status`, live `enable-check`, and outbox plan.
 - Supervisor scripts were regenerated with `target/debug/agent-harness.exe`, `--source-home`, `--runtime-workspace D:\Warehouse\Research\OpenClaw_WSL`, `tools/agent-discord-gateway/index.mjs`, one bounded-concurrency `runtime-loop.ps1`, and `worker-loop.ps1`.
 - `AgentHarness-*` scheduled task registration returned access-denied in this environment, so the runtime workers, worker, progress delivery, Telegram, Discord outbox, and Discord gateway loops were started manually as hidden PowerShell processes from the generated scripts.
 - Round3-2 timeout/progress reconciliation is implemented: `timeout` is terminal for runtime queue selection, status open-item counts, native typing context, and progress delivery state. A queued pending row with a timeout receipt should no longer be interpreted as open work. See `docs/round3-2-implementation-and-upgrade-plan.md`.
 - Latest live status after restart: `ready=true`, `passed=58`, `warnings=0`, `failed=0`; runtime `queued=123`, `open=0`, `prepared=123`, `completed=120`; outbox `pending=0`, `delivered=186`, `retryable=0`, `invalid=0`.
-- Loop heartbeats are live for runtime, worker, progress delivery, Telegram, Discord outbox, and Discord gateway. The supervisor plan contains 6 task entries: one bounded-concurrency runtime loop plus the non-runtime loops.
+- Loop heartbeats are live for runtime, worker, progress delivery, Telegram, Discord outbox, and Discord gateway. The supervisor plan contains 6 canonical task entries; `supervisor-plan --include-cron-scheduler` intentionally adds a seventh cron scheduler loop only for live scheduler cutover.
 - Worker config is live at global=12, per-agent/group=6, per-agent-per-channel=3, lane limits `llm=6`, `shell=6`, `watchdog=2`, `maintenance=2`, `plugin=2`, with no worker config warnings.
 - Prompt-file loading now falls back from runtime cwd to imported workspace when needed, and injected prompt files include role headers for `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `USER.md`, `IDENTITY.md`, `HEARTBEAT.md`, and `BOOTSTRAP.md`. Skills are dynamic task context, so `Skills: 0 selected` can be normal for command/status turns.
 - Progress rendering now compacts long PowerShell/Codex tool-call previews, suppressed low-value `assistant_stream` deltas, routes assistant narration to the editable `Current step` status under the default `progress_panel` setting, skipped-denied progress delivery advances the cursor to prevent repeated Telegram `Working` messages, and terminal runtime progress cannot be downgraded by later stray events for the same parent queue id.
@@ -66,6 +67,7 @@ These must pass before cutover.
    - Run `memory-credentials-export --include-sensitive` when migrating imported memory search. It writes `AGENT_HARNESS_MEMORY_EMBEDDING_API_KEY`, model, and base URL into `secrets/memory-credentials.env`; receipts disclose env names, source paths, and lengths only.
    - Confirm `OPENROUTER_API_KEY` only when an OpenRouter route or agent is active; default OpenAI/Codex OAuth turns must not inherit OpenRouter provider config.
    - Do not rely on an imported legacy embedding-only `OPENAI_API_KEY` for Codex agent turns.
+   - Run `channel-identity-check` for every enabled platform/account/channel tuple when a channel identity registry is present; missing, disabled, conflicting, or wrong-agent bindings must block ingress.
 
 5. Runtime gate
    - Run `channel-receive` for a normal DM.
@@ -80,6 +82,7 @@ These must pass before cutover.
    - Confirm `state/runtime-queue/loop-last.json`.
    - Confirm `enable-check` reports `runtime-loop` as pass.
    - Run `supervisor-plan` with the intended harness CLI, Codex executable, agent id, and channel loop selection.
+   - Add `--include-cron-scheduler` only when the operator is intentionally enabling live scheduler ticks.
    - Confirm `state/supervisor/windows-scheduled-tasks/supervisor-plan.json`.
    - Confirm generated scripts use absolute paths and do not contain raw tokens.
    - Confirm `enable-check` reports `supervisor-plan` as pass.
@@ -136,6 +139,7 @@ These should be run before stopping the Docker gateway.
    - Confirm agent-turn cron remains held until explicit resume.
    - Run `deterministic-cron-plan`.
    - Confirm `llmAccessAllowed=false`.
+   - Run `cron-scheduler-run-once --dry-run --enable` and confirm scheduler receipts plus `state/cron-scheduler/loop-last.json` or tick readback do not execute jobs directly.
 
 6. Historical state smoke
    - Confirm imported session indexes and transcript files are present.
@@ -165,12 +169,14 @@ These should be run before stopping the Docker gateway.
 
 3. Worker loop
    - Done for CLI handoff/smoke: `runtime-loop` wraps `runtime-run-once`, drains queued work, treats already recorded completions as idle for loop control, supports finite or infinite `--iterations`, sleeps with `--idle-ms`, exits with `--stop-when-idle` or `--stop-file`, writes `state/runtime-queue/loop-last.json`, and logs `runtime.loop-stopped` plus `runtime.loop-error`.
-   - Done for scheduled-task handoff path: `supervisor-plan` writes Task Scheduler install/start/stop/uninstall scripts for runtime, Telegram, and Discord loops, with absolute paths and stop files; it does not register tasks automatically.
-   - Still required for formal service activation: operator execution of generated scheduled-task installer, process supervisor health integration, `/stop` cancellation of already-running model turns, and richer retry/backoff policy.
+   - Done for scheduled-task handoff path: `supervisor-plan` writes Task Scheduler install/start/stop/uninstall scripts for runtime, Telegram, Discord, worker, progress, and optional cron scheduler loops, with absolute paths and stop files; it does not register tasks automatically.
+   - Runtime retry/backoff policy is configurable through `runtimeBackoff`; provider/model fallback remains operator-guided instead of silent automatic switching.
+   - Still required for formal service activation: operator execution of generated scheduled-task installer, process supervisor health integration, and `/stop` cancellation of already-running model turns.
 
 4. Unified worker dispatch for schedulers
    - Native legacy `.openclaw/cron` scheduler ticks enqueue LLM-backed agent/subagent jobs.
    - Extended deterministic crontab/Supercronic-style scheduler ticks enqueue no-LLM shell jobs.
+   - Done for repeated scheduler ticks: `cron-scheduler-run-once`/`cron-scheduler-loop` write durable watermarks and idempotently enqueue due jobs into WorkerStore.
    - Shared worker execution provides durable leases, retries/backoff, audit logs, rate leases, and timeout/cancel semantics.
    - Harness-configured global, per-agent/group, per-agent-per-channel, and lane concurrency limits prevent fan-out or cron bursts from overloading local processes or provider rate limits; excess jobs remain queued.
    - Fan-out work uses deterministic watchdogs to wake the master agent with child status and artifact pointers on completion, failure, timeout, or checkpoint policies.
@@ -210,7 +216,7 @@ As of 2026-06-11 live verification:
 - `.\harness.ps1 gateway status` reports `Ready: yes`, `passed=58`, `warnings=0`, `failed=0`.
 - Runtime queue latest stable readback: `queued=117`, `prepared=117`, `completed=113`, `open=1`. The current `open=1` is not a normal clean-idle state; it is linked to the round3-2 Discord stale timeout/background-task triage.
 - Channel outbox is clean: `pending=0`, `delivered=177`, `retryable=0`, `invalid=0`. The previous stale Telegram retry was manually read back and marked delivered with provider id `manual-readback-20260611`.
-- Supervisor plan has 6 task entries: `runtime-loop`, `worker-loop`, `progress-delivery-loop`, `telegram-loop`, `discord-outbox-loop`, and `discord-gateway-loop`.
+- Supervisor plan has 6 canonical task entries: `runtime-loop`, `worker-loop`, `progress-delivery-loop`, `telegram-loop`, `discord-outbox-loop`, and `discord-gateway-loop`; a seventh `cron-scheduler-loop` entry is present only after explicit scheduler enablement.
 - Canonical status heartbeats are live for runtime, progress delivery, Telegram, Discord outbox, Discord gateway, and worker loops.
 - Runtime queue leasing uses `state/runtime-queue/runtime-leases.json` plus a lock file to let multiple runtime loops run without duplicating queue items.
 - Worker dispatch config is global 12, per-agent/group 6, per-agent-per-channel 3, lane limits `llm=6`, `shell=6`, `watchdog=2`, `maintenance=2`, `plugin=2`.

@@ -20,6 +20,8 @@ pub struct ChannelStep {
     pub source_home: PathBuf,
     pub source_workspace: PathBuf,
     pub platform: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub channel_id: String,
     pub user_id: String,
     pub message_text: String,
@@ -156,13 +158,46 @@ pub struct ChannelAgentTurnDispatch {
 #[serde(rename_all = "camelCase")]
 pub struct ChannelOutboundMessage {
     pub platform: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub channel_id: String,
     pub user_id: String,
     pub session_key: String,
     pub kind: ChannelOutboundMessageKind,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_intent: Option<ChannelDeliveryIntent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ChannelOutboundAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelDeliveryIntent {
+    #[serde(default = "default_delivery_intent_schema")]
+    pub schema: String,
+    pub kind: ChannelDeliveryIntentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote_text: Option<String>,
+    #[serde(default)]
+    pub validated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downgrade_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChannelDeliveryIntentKind {
+    Direct,
+    ReplyToMessage,
+    QuoteReply,
+    ThreadReply,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +275,7 @@ fn build_command_step(
         source_home: turn.source_home.clone(),
         source_workspace: turn.source_workspace.clone(),
         platform: turn.platform.clone(),
+        account_id: None,
         channel_id: turn.channel_id.clone(),
         user_id: turn.user_id.clone(),
         message_text: turn.message_text.clone(),
@@ -276,6 +312,7 @@ fn build_agent_step(turn: &TurnPlan, warnings: Vec<String>) -> ChannelStep {
         source_home: turn.source_home.clone(),
         source_workspace: turn.source_workspace.clone(),
         platform: turn.platform.clone(),
+        account_id: None,
         channel_id: turn.channel_id.clone(),
         user_id: turn.user_id.clone(),
         message_text: turn.message_text.clone(),
@@ -295,6 +332,7 @@ fn error_step(turn: &TurnPlan, warnings: Vec<String>, text: &str) -> ChannelStep
         source_home: turn.source_home.clone(),
         source_workspace: turn.source_workspace.clone(),
         platform: turn.platform.clone(),
+        account_id: None,
         channel_id: turn.channel_id.clone(),
         user_id: turn.user_id.clone(),
         message_text: turn.message_text.clone(),
@@ -783,13 +821,19 @@ fn outbound(
 ) -> ChannelOutboundMessage {
     ChannelOutboundMessage {
         platform: turn.platform.clone(),
+        account_id: None,
         channel_id: turn.channel_id.clone(),
         user_id: turn.user_id.clone(),
         session_key: turn.session_key.clone(),
         kind,
         text,
+        delivery_intent: None,
         attachments: Vec::new(),
     }
+}
+
+fn default_delivery_intent_schema() -> String {
+    "agent-harness.delivery-intent.v1".to_string()
 }
 
 fn prompt_files_present(turn: &TurnPlan) -> usize {

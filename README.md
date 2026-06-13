@@ -28,7 +28,7 @@ Agent Harness Core is a **self-hosted AI agent harness written in Rust**: a runt
 It is **not** another prompt-orchestration library. It is the **operations layer** for personal and small-team AI agents — the part that answers questions frameworks usually leave to you:
 
 - What happens when the process dies mid-turn? *(durable queue + completed-turn recovery — the turn is not lost)*
-- Who is allowed to talk to my agent? *(fail-closed allow-lists per user, chat, channel, and guild)*
+- Who is allowed to talk to my agent? *(fail-closed allow-lists plus platform/account/channel identity bindings)*
 - What exactly did the agent do at 03:12? *(append-only JSONL logs, receipts, transcripts, and trajectories for everything)*
 - How do I stop a runaway turn? *(`/stop` cancel markers honored by the runtime poll loop)*
 
@@ -40,7 +40,7 @@ Born as a ground-up Rust rebuild of a Docker-based legacy agent gateway ("OpenCl
 |---|---|
 | 🧾 **A receipt for everything** | Every ingress, queue write, model turn, delivery, and retry appends to JSONL ledgers. Reconstruct any incident after the fact — no black boxes. |
 | 📨 **Chat-native agents** | First-class Telegram Bot API and Discord (REST + Gateway) adapters: replies, media, attachments, message splitting, edit-in-place progress panels, default-off opt-in final-reply tone, and `/new` `/model` `/think` `/steer` `/stop` `/status` commands. |
-| 🔐 **Fail-closed by default** | DMs require explicit admin allow-lists; groups and guilds get admin / limited / open-limited policy tiers. Unknown senders never reach the model. |
+| 🔐 **Fail-closed by default** | DMs require explicit admin allow-lists, and ingress must resolve a platform/account/channel identity binding before dispatch. Unknown senders or ambiguous channel bindings never reach the model. |
 | ⚙️ **Durable, bounded work** | SQLite-backed worker dispatch with leases, retry/backoff, stale reaping, watchdogs, and concurrency limits per global / agent / channel / lane. A long Telegram turn never blocks a Discord turn. |
 | 🤖 **Model-agnostic routing** | Codex app-server executes turns; OpenRouter routing switches any conversation to e.g. `anthropic/claude-sonnet-4` with one `/model` command. Provider-specific Codex homes keep OpenRouter config out of the default Codex/OAuth path; secrets are checked at preflight, never written to disk. |
 | 🧠 **Memory-aware** | OpenClaw-compatible memory hooks (recall, lifecycle capture, store proposals) with vector recall over imported SQLite embeddings — integrated via adapters, not forks. |
@@ -55,7 +55,7 @@ Born as a ground-up Rust rebuild of a Docker-based legacy agent gateway ("OpenCl
 flowchart LR
     TG[Telegram Bot API] --> IN
     DC[Discord Gateway / REST] --> IN
-    IN[Ingress + fail-closed\nallow-list gate] --> CMD{Command or\nagent turn?}
+    IN[Ingress + fail-closed\nallow-list + identity gate] --> CMD{Command or\nagent turn?}
     CMD -- "/model /status /stop ..." --> ST[Channel state\n+ command reply]
     CMD -- ordinary message --> Q[(Durable runtime queue\npending.jsonl + leases)]
     Q --> PB[Prompt bundle\nprompts + skills + memory]
@@ -83,6 +83,8 @@ cargo run -p agent-harness-cli -- import-execute --source-home C:\path\to\.openc
 
 # Check channel + runtime readiness, then go live
 cargo run -p agent-harness-cli -- telegram-probe --target-home C:\path\to\.agent-harness
+cargo run -p agent-harness-cli -- channel-identity-check --target-home C:\path\to\.agent-harness --platform telegram --account-id default --chat-id <chat-id> --agent main
+cargo run -p agent-harness-cli -- cron-scheduler-run-once --target-home C:\path\to\.agent-harness --dry-run --enable
 cargo run -p agent-harness-cli -- enable-check --target-home C:\path\to\.agent-harness
 cargo run -p agent-harness-cli -- status --target-home C:\path\to\.agent-harness --json
 ```
@@ -98,10 +100,10 @@ One binary, `agent-harness`, grouped into clear families:
 | Family | Commands | What they do |
 |---|---|---|
 | **Import & registry** | `doctor`, `import-plan`, `import-dry-run`, `import-execute`, `registry`, `registry-export`, `channel-credentials-export` | Migrate a legacy agent deployment with dry-run reports, conflict policies, and redacted credential receipts. |
-| **Channels** | `channel-receive`, `channel-run-once`, `channel-outbox-plan`, `telegram-probe`, `telegram-loop`, `discord-gateway-loop`, `discord-outbox-send-once`, … | Telegram/Discord ingress, permission gating, slash commands, outbox delivery with retry ledgers. |
+| **Channels** | `channel-identity-check`, `channel-receive`, `channel-run-once`, `channel-outbox-plan`, `telegram-probe`, `telegram-loop`, `discord-gateway-loop`, `discord-outbox-send-once`, … | Telegram/Discord ingress, identity binding, permission gating, slash commands, outbox delivery with retry ledgers. |
 | **Runtime & queue** | `queue-enqueue`, `queue-prepare`, `runtime-run-once`, `runtime-loop`, `progress-delivery-loop` | Durable agent-turn queue, bounded-concurrency runtime loop, live progress panels, final-reply tone policy. |
 | **Codex pipeline** | `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle` | Plan → preflight → launch → run → record, each stage inspectable and receipt-backed. |
-| **Workers & scheduling** | `worker-enqueue`, `worker-loop`, `worker-status`, `cron-plan`, `native-cron-enqueue`, `deterministic-cron-plan`, `subagent-plan`, … | SQLite-durable jobs: LLM subagents, no-LLM deterministic shell cron, watchdogs, master wakeups. |
+| **Workers & scheduling** | `worker-enqueue`, `worker-loop`, `worker-status`, `cron-plan`, `cron-scheduler-run-once`, `cron-scheduler-loop`, `native-cron-enqueue`, `deterministic-cron-plan`, `subagent-plan`, … | SQLite-durable jobs: LLM subagents, native/deterministic cron scheduler ticks, no-LLM deterministic shell jobs, watchdogs, master wakeups. |
 | **Memory** | `memory-hook`, `memory-search`, `memory-vector-search`, `memory-service-status/recall/propose/store` | OpenClaw-compatible memory hooks and vector recall over imported snapshots. |
 | **Ops & security** | `status`, `enable-check`, `healthz`, `ops-backup`, `ops-control`, `supervisor-plan`, `vault-put`/`vault-get`, `public-hygiene`, `invariants`, `schema-registry` | Health, cutover gates, backups, Windows Task Scheduler supervision plans, encrypted vault, release hygiene. |
 
@@ -109,13 +111,13 @@ One binary, `agent-harness`, grouped into clear families:
 
 1. **Receipts over trust.** Two-phase persistence: intent is written before side effects, results are written after. If it isn't in a ledger, it didn't happen.
 2. **Deterministic before generative.** Slash commands, permission checks, cron planning, and queue mechanics never call a model. Only ordinary agent turns do.
-3. **Fail closed.** No allow-list match, no model access. Missing credentials fail at preflight, not mid-turn.
+3. **Fail closed.** No allow-list match, no channel identity binding, no model access. Missing credentials fail at preflight, not mid-turn.
 4. **Small surface, sync Rust.** No async runtime, no macro-heavy frameworks. Boring code that one person can fully audit.
 5. **The model backend is a contractor, not a roommate.** The harness assembles payloads and records outcomes; Codex keeps its own session, tools, and sandbox. App-server protocol errors and failed turns are terminal runtime failures, not empty successful replies.
 
 ## Project Status
 
-Pre-release, under active development, and **live-validated daily**: the reference deployment runs a single supervised runtime loop (concurrency 12) plus worker, progress, Telegram, and Discord loops, with hundreds of delivered turns on record. Current verification: 224 core tests + 17 CLI tests + doctests, `cargo fmt` clean.
+Pre-release, under active development, and **live-validated daily**: the reference deployment runs a single supervised runtime loop (concurrency 12) plus worker, progress, Telegram, and Discord loops, with hundreds of delivered turns on record. Current verification: 229 core tests + 18 CLI tests + 0 doctests, `cargo fmt` clean.
 
 See the [Changelog](CHANGELOG.md), the [Roadmap & Backlog](docs/agent-harness-core-roadmap-backlog.md), and the [Activation Readiness Plan](docs/activation-readiness-plan.md) for what's done, gated, and next.
 

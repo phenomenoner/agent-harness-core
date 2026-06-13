@@ -31,6 +31,7 @@ pub struct HarnessStatusReport {
     pub channels: HarnessChannelStatus,
     pub loops: HarnessLoopStatus,
     pub workers: WorkerStatusReport,
+    pub cron_scheduler: HarnessCronSchedulerStatus,
     pub memory: HarnessMemoryStatus,
     pub plugins: HarnessPluginStatus,
     pub logs: HarnessOperationalLogStatus,
@@ -98,6 +99,20 @@ pub struct HarnessLoopHeartbeatStatus {
     pub at_ms: Option<i64>,
     pub age_ms: Option<i64>,
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessCronSchedulerStatus {
+    pub state_dir: PathBuf,
+    pub database: PathBuf,
+    pub database_present: bool,
+    pub loop_last_file: PathBuf,
+    pub loop_last_present: bool,
+    pub latest_status: Option<String>,
+    pub latest_enqueued: Option<i64>,
+    pub latest_errors: Option<i64>,
+    pub receipts: HarnessJsonlStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -195,6 +210,7 @@ pub fn collect_harness_status(options: HarnessStatusOptions) -> io::Result<Harne
     let workers = collect_worker_status(WorkerStatusOptions {
         harness_home: options.harness_home.clone(),
     })?;
+    let cron_scheduler = cron_scheduler_status(&options.harness_home)?;
     let memory = memory_status(&options.harness_home)?;
     let plugins = plugin_status(&options.harness_home)?;
 
@@ -207,6 +223,7 @@ pub fn collect_harness_status(options: HarnessStatusOptions) -> io::Result<Harne
         channels,
         loops,
         workers,
+        cron_scheduler,
         memory,
         plugins,
         logs,
@@ -222,6 +239,7 @@ fn loop_status(harness_home: &Path) -> io::Result<HarnessLoopStatus> {
         "discord-outbox-loop",
         "discord-gateway-loop",
         "worker-loop",
+        "cron-scheduler-loop",
     ];
     let heartbeat_dir = harness_home
         .join("state")
@@ -237,6 +255,32 @@ fn loop_status(harness_home: &Path) -> io::Result<HarnessLoopStatus> {
     Ok(HarnessLoopStatus {
         heartbeat_dir,
         heartbeats,
+    })
+}
+
+fn cron_scheduler_status(harness_home: &Path) -> io::Result<HarnessCronSchedulerStatus> {
+    let state_dir = harness_home.join("state").join("cron-scheduler");
+    let database = state_dir.join("watermarks.sqlite");
+    let loop_last_file = state_dir.join("loop-last.json");
+    let latest = fs::read_to_string(&loop_last_file)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    Ok(HarnessCronSchedulerStatus {
+        state_dir: state_dir.clone(),
+        database_present: database.is_file(),
+        database,
+        loop_last_present: loop_last_file.is_file(),
+        latest_status: latest
+            .as_ref()
+            .and_then(|value| string_path(value, &["status"])),
+        latest_enqueued: latest
+            .as_ref()
+            .and_then(|value| i64_path(value, &["summary", "enqueued"])),
+        latest_errors: latest
+            .as_ref()
+            .and_then(|value| i64_path(value, &["summary", "errors"])),
+        loop_last_file,
+        receipts: jsonl_status(state_dir.join("receipts.jsonl"))?,
     })
 }
 

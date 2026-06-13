@@ -59,6 +59,7 @@ pub struct ChannelDeliveryRecordOptions {
     pub delivery_id: String,
     pub status: ChannelDeliveryStatus,
     pub platform: String,
+    pub account_id: Option<String>,
     pub channel_id: String,
     pub user_id: String,
     pub session_key: String,
@@ -74,6 +75,8 @@ pub struct ChannelDeliveryReceipt {
     pub delivery_id: String,
     pub status: ChannelDeliveryStatus,
     pub platform: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub channel_id: String,
     pub user_id: String,
     pub session_key: String,
@@ -200,6 +203,7 @@ pub fn record_channel_delivery(
         delivery_id: options.delivery_id,
         status: options.status,
         platform: options.platform,
+        account_id: options.account_id,
         channel_id: options.channel_id,
         user_id: options.user_id,
         session_key: options.session_key,
@@ -319,6 +323,7 @@ mod tests {
             delivery_id: initial.pending[0].delivery_id.clone(),
             status: ChannelDeliveryStatus::Delivered,
             platform: "telegram".to_string(),
+            account_id: None,
             channel_id: "dm-1".to_string(),
             user_id: "user-1".to_string(),
             session_key: "session-1".to_string(),
@@ -332,6 +337,7 @@ mod tests {
             delivery_id: initial.pending[1].delivery_id.clone(),
             status: ChannelDeliveryStatus::Failed,
             platform: "telegram".to_string(),
+            account_id: None,
             channel_id: "dm-2".to_string(),
             user_id: "user-2".to_string(),
             session_key: "session-2".to_string(),
@@ -378,11 +384,13 @@ mod tests {
     ) -> ChannelOutboundMessage {
         ChannelOutboundMessage {
             platform: platform.to_string(),
+            account_id: None,
             channel_id: channel_id.to_string(),
             user_id: user_id.to_string(),
             session_key: session_key.to_string(),
             kind: ChannelOutboundMessageKind::AgentReply,
             text: text.to_string(),
+            delivery_intent: None,
             attachments: Vec::new(),
         }
     }

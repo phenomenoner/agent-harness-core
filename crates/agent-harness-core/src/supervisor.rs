@@ -22,6 +22,7 @@ pub struct WindowsSupervisorPlanOptions {
     pub include_runtime: bool,
     pub runtime_workers: usize,
     pub include_worker: bool,
+    pub include_cron_scheduler: bool,
     pub include_progress: bool,
     pub include_telegram: bool,
     pub include_discord: bool,
@@ -169,6 +170,46 @@ pub fn write_windows_supervisor_plan(
             "--stop-file".to_string(),
             path_arg(&stop_file),
         ];
+        write_runner_script(&runner_script, &harness_cli, &args, &log_dir, component)?;
+        push_task(
+            &mut scripts,
+            &mut tasks,
+            &options.task_prefix,
+            component,
+            runner_script,
+            stop_file,
+            true,
+        );
+    }
+
+    if options.include_cron_scheduler {
+        let component = "cron-scheduler-loop";
+        let runner_script = scripts_dir.join(format!("{component}.ps1"));
+        let stop_file = stop_dir.join(format!("{component}.stop"));
+        let mut args = vec![
+            "cron-scheduler-loop".to_string(),
+            "--source-home".to_string(),
+            path_arg(&source_home),
+            "--harness-home".to_string(),
+            path_arg(&harness_home),
+            "--iterations".to_string(),
+            "0".to_string(),
+            "--idle-ms".to_string(),
+            options.idle_ms.to_string(),
+            "--max-consecutive-errors".to_string(),
+            options.max_consecutive_errors.to_string(),
+            "--stop-file".to_string(),
+            path_arg(&stop_file),
+        ];
+        if let Some(workspace) = &workspace {
+            args.extend(["--workspace".to_string(), path_arg(workspace)]);
+        }
+        if let Some(runtime_workspace) = &runtime_workspace {
+            args.extend([
+                "--runtime-workspace".to_string(),
+                path_arg(runtime_workspace),
+            ]);
+        }
         write_runner_script(&runner_script, &harness_cli, &args, &log_dir, component)?;
         push_task(
             &mut scripts,
@@ -584,6 +625,7 @@ mod tests {
             include_runtime: true,
             runtime_workers: 2,
             include_worker: true,
+            include_cron_scheduler: false,
             include_progress: true,
             include_telegram: true,
             include_discord: true,
