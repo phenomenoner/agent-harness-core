@@ -23,6 +23,7 @@ This is the working checklist for turning the Rust Windows Agent Harness from a 
 - `ops-cutover-receipt` recorded `status=ready`; the latest activation notes include runtime UX hardening, durable ops activation, assistant narration routing, live-control cutover tokens, and docs sync.
 - `memory-lancedb` is hidden unless the source config explicitly selects LanceDB as the active memory backend.
 - Controlled online testing can proceed by having an allowed Telegram/Discord user send a normal message, then recording transcript and delivery receipt paths here.
+- Round4-2 live cutover on 2026-06-14 used ticket `cutover-1781376947099`, regenerated the 7-loop supervisor plan with live-control guards, synced `agent-windows-harness` v0.1.9, started direct runners, and verified `status --json` with `ready=true`, `passed=59`, `warnings=0`, `failed=0`.
 
 ## Activation Target
 
