@@ -21,7 +21,9 @@ Implemented on 2026-06-11.
   becomes the final assistant reply. Legacy delta-only streams fall back to raw
   assistant text instead of dropping content.
 - `progress_panel` emits `AgentProgressKind::AssistantNarration` and renders the
-  latest item as `Current step: ...` under the editable status panel.
+  latest item as `Current step: ...` under the editable status panel. When no
+  narration item has arrived yet, the status panel falls back to the latest
+  non-completed runtime/tool progress preview.
 - Transcript output stores `assistant_narration` rows before the final
   `assistant` row; completion receipts include selected mode, final character
   count, and narration item count.
@@ -32,7 +34,7 @@ Implemented on 2026-06-11.
 - `emojiAccentMode` was added later as a separate final-reply tone policy. It is
   not part of assistant narration segmentation and is applied only at the
   successful `agent-reply` outbox boundary.
-- Verification: `cargo test -p agent-harness-core` passed with 219 core tests
+- Verification: `cargo test -p agent-harness-core` passed with 221 core tests
   and `cargo test -p agent-harness-cli` passed with 17 CLI tests after the
   round4 response/reconnect update.
 
@@ -57,8 +59,9 @@ Important code points:
   - `latest_assistant_response(...)`
   - `ChannelOutboundMessageKind::AgentReply`
 - `crates/agent-harness-core/src/progress.rs`
-  - progress delivery supports editable Body and Status lanes and now renders
-    assistant narration as the current step.
+  - progress delivery supports editable Body and Status lanes, renders assistant
+    narration as the current step, and falls back to runtime/tool progress when
+    narration is absent.
 
 The leaked prefix is not hidden chain-of-thought. It is user-visible assistant
 narration / progress narration that used to be flattened into the final reply.
@@ -110,7 +113,8 @@ Modes:
 - `progress_panel`
   - Default.
   - Send intermediate assistant narration to progress delivery.
-  - Render as the latest work step under the existing Working/Done status panel.
+  - Render as the latest work step under the existing Working/Done status panel,
+    with runtime/tool progress as a fallback before narration exists.
   - Final channel reply contains only the final assistant answer.
 - `inline_preface`
   - Keep intermediate narration attached before the final answer.
@@ -197,7 +201,11 @@ When `assistantNarrationMode = "progress_panel"`:
    - `assistantNarrationMaxChars`
    - `assistantNarrationProgressMinUpdateMs`
    - existing progress delivery dedupe/rate-limit behavior
-5. Keep final `agent-reply` free of intermediate narration.
+5. If no narration event is available, render `Current step:` from the latest
+   non-completed runtime/tool progress preview. This keeps Telegram/Discord
+   working panels informative during tool-only startup and retry-pending
+   reconnect recovery.
+6. Keep final `agent-reply` free of intermediate narration.
 
 Suggested status rendering:
 
@@ -267,6 +275,7 @@ Unit tests:
    - Output contains clear work/final separators.
 6. Progress rendering.
    - Narration is truncated, sanitized, deduped, and rate-limited.
+   - No-narration working status falls back to runtime/tool progress.
 
 Integration tests:
 

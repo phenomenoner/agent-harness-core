@@ -9,12 +9,12 @@ use crate::{HARNESS_BUILTIN_SKILL_NAMESPACE, SKILL_FILE_NAME};
 const BUILTIN_HARNESS_SKILL_SYNC_SCHEMA: &str = "agent-harness.builtin-skill-sync.v1";
 const BUILTIN_HARNESS_SKILL_MANIFEST_SCHEMA: &str = "agent-harness.builtin-skill-manifest.v1";
 const AGENT_WINDOWS_HARNESS_SKILL_ID: &str = "agent-windows-harness";
-const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.5";
+const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.6";
 
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
 description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, response tone, and Codex prompt continuity policy.
-version: 0.1.5
+version: 0.1.6
 platforms: [windows]
 metadata:
   agent_harness:
@@ -96,6 +96,7 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - Telegram and Discord share the same runtime path after ingress: channel receive, queue, prepare, codex-run, runtime-run-once, outbox. Fix reconnect/session recovery in the runtime/Codex layer, not in one adapter.
 - Known transient Codex app-server stream disconnect protocol errors are retryable: `Reconnecting...`, `stream disconnected before completion`, and `websocket closed by server before response.completed`.
 - Retry-pending runtime failures are non-terminal. They should not write user-visible error replies, and progress should stay resumable for the same queue/session context.
+- Retry-pending receipts must make the same queue id immediately claimable again. If a retry-pending Telegram or Discord turn shows `openItems>0` while `runtime-loop` reports `no-work`, inspect `state/runtime-queue/runtime-leases.json`; stale retry-pending leases are a runtime lease-cleanup bug, not a channel adapter issue.
 - Non-matching protocol/config/preflight/spawn failures stay failed-terminal. Gateway restart alone does not resume failed-terminal or dead-letter queue items.
 - When retry attempts are exhausted, runtime-run-once dead-letters the item and writes an operator-friendly error reply. The original session context is still preserved in receipts and queue data.
 - Use `queue-retry` for manual recovery of a timeout/dead-letter item. It creates a fresh queue id while preserving `sessionKey`, agent, platform/channel/user, provider/model, selected skills, and planned transcript/trajectory paths.
@@ -108,7 +109,7 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - Channel selectors can be platform:channelId:userId, platform:channelId, channelId, or platform. Channel overrides win over agent overrides; agent overrides win over the global mode.
 - The policy must skip command replies, /status, error/failure replies, progress/status panels, fenced code blocks, code-heavy replies, risk/security/status-style replies, and text already ending with an emoji.
 - Do not wrap final Telegram/Discord replies with a mechanical `◆ Agent` header. Send trimmed assistant text as-is unless a future delivery-intent policy explicitly says otherwise.
-- Current-step narration in progress delivery uses a separate longer cap (`--current-step-max-chars`, default 1200). Keep action/error preview caps short.
+- Current-step narration in progress delivery uses a separate longer cap (`--current-step-max-chars`, default 1200). If assistant narration is absent, the status panel should fall back to the latest non-completed runtime/tool progress preview so Telegram and Discord working panels do not look blank.
 - Do not implement tone as blind delivery-layer post-processing. Keep it at the successful agent-reply outbox boundary so audit artifacts and non-agent replies stay unpolluted.
 
 ## Channel Commands

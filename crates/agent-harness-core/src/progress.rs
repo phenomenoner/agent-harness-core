@@ -702,7 +702,7 @@ fn render_agent_progress_status(
         }
     } else {
         let mut status = format!("⏳ Working — {} — {}", elapsed, status_phrase(latest));
-        if let Some(narration) = latest_narration_event(events) {
+        if let Some(narration) = latest_current_step_event(events) {
             status.push_str("\nCurrent step: ");
             status.push_str(&quote_safe_preview(
                 &narration.preview,
@@ -745,6 +745,18 @@ fn latest_narration_event<'a>(events: &[&'a AgentProgressEvent]) -> Option<&'a A
         .rev()
         .copied()
         .find(|event| event.kind == AgentProgressKind::AssistantNarration)
+}
+
+fn latest_current_step_event<'a>(
+    events: &[&'a AgentProgressEvent],
+) -> Option<&'a AgentProgressEvent> {
+    latest_narration_event(events).or_else(|| {
+        events.iter().rev().copied().find(|event| {
+            !event.preview.trim().is_empty()
+                && event.status != AgentProgressStatus::Completed
+                && !matches!(event.kind, AgentProgressKind::AssistantStream)
+        })
+    })
 }
 
 pub fn sanitize_progress_preview(value: &str, max_chars: usize) -> String {
@@ -1001,7 +1013,10 @@ mod tests {
         assert!(actions.contains("💻 terminal: \"cargo test -p agent-harness-core\""));
         assert!(!actions.contains("⏳ Working"));
         assert!(!actions.contains("assistant_stream"));
-        assert_eq!(status, "⏳ Working — 9 min — running tools");
+        assert_eq!(
+            status,
+            "⏳ Working — 9 min — running tools\nCurrent step: cargo test -p agent-harness-core"
+        );
         assert_eq!(panel, format!("{actions}\n\n{status}"));
     }
 
@@ -1068,6 +1083,54 @@ mod tests {
         assert_eq!(
             status,
             "⏳ Working — 1 min — running tools\nCurrent step: verifying skills-index readback"
+        );
+    }
+
+    #[test]
+    fn current_step_falls_back_to_runtime_progress_when_narration_is_absent() {
+        let context = context();
+        let events = vec![
+            AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Terminal,
+                "terminal",
+                "codex.cmd app-server",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+            AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Runtime,
+                "run",
+                "transient runtime failure; preserving session for retry",
+                AgentProgressStatus::Progress,
+                5000,
+            ),
+        ];
+        let refs = events.iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            render_agent_progress_status(&refs, 65_000, 120, 1200),
+            "⏳ Working — 1 min — working\nCurrent step: transient runtime failure; preserving session for retry"
+        );
+    }
+
+    #[test]
+    fn current_step_falls_back_to_latest_tool_when_narration_is_absent() {
+        let context = context();
+        let events = vec![AgentProgressEvent::new(
+            &context,
+            AgentProgressKind::ToolCall,
+            "tool_call",
+            "pwsh: Get-ChildItem .agent-harness",
+            AgentProgressStatus::Started,
+            1000,
+        )];
+        let refs = events.iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            render_agent_progress_status(&refs, 61_000, 120, 1200),
+            "⏳ Working — 1 min — running tools\nCurrent step: pwsh: Get-ChildItem .agent-harness"
         );
     }
 

@@ -2,8 +2,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
 #[cfg(not(windows))]
 use std::time::SystemTime;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,6 +21,8 @@ use crate::{
 const RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA: &str = "agent-harness.runtime-queue-prepare.v1";
 const RUNTIME_QUEUE_LEASES_SCHEMA: &str = "agent-harness.runtime-queue-leases.v1";
 const DEFAULT_RUNTIME_LEASE_MS: i64 = 30 * 60 * 1000;
+const RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS: u64 = 2_000;
+const RUNTIME_LEASE_RELEASE_LOCK_RETRY_SLEEP_MS: u64 = 25;
 #[cfg(not(windows))]
 const RUNTIME_LEASE_LOCK_STALE_MS: i64 = 30_000;
 
@@ -191,10 +195,17 @@ pub fn prepare_runtime_queue_item(
         }
     };
     let prepared_receipts = read_prepared_receipts(&execution_receipts_file, &mut warnings)?;
-    let terminal_run_ids =
-        read_terminal_run_once_ids(&queue_dir.join("run-once-receipts.jsonl"), &mut warnings)?;
+    let run_once_receipts_file = queue_dir.join("run-once-receipts.jsonl");
+    let terminal_run_ids = read_terminal_run_once_ids(&run_once_receipts_file, &mut warnings)?;
+    let retry_pending_run_ids =
+        read_retry_pending_run_once_ids(&run_once_receipts_file, &mut warnings)?;
     let mut lease_state = read_runtime_queue_leases(&queue_dir, &mut warnings)?;
-    purge_runtime_queue_leases(&mut lease_state, now_ms, &terminal_run_ids);
+    purge_runtime_queue_leases(
+        &mut lease_state,
+        now_ms,
+        &terminal_run_ids,
+        &retry_pending_run_ids,
+    );
     let pending_items = read_pending_items(&queue_file, &mut warnings)?;
     let pending_by_id = pending_items
         .iter()
@@ -544,10 +555,17 @@ pub fn inspect_runtime_queue_capacity(
     };
 
     let prepared_receipts = read_prepared_receipts(&execution_receipts_file, &mut warnings)?;
-    let terminal_run_ids =
-        read_terminal_run_once_ids(&queue_dir.join("run-once-receipts.jsonl"), &mut warnings)?;
+    let run_once_receipts_file = queue_dir.join("run-once-receipts.jsonl");
+    let terminal_run_ids = read_terminal_run_once_ids(&run_once_receipts_file, &mut warnings)?;
+    let retry_pending_run_ids =
+        read_retry_pending_run_once_ids(&run_once_receipts_file, &mut warnings)?;
     let mut lease_state = read_runtime_queue_leases(&queue_dir, &mut warnings)?;
-    purge_runtime_queue_leases(&mut lease_state, now_ms, &terminal_run_ids);
+    purge_runtime_queue_leases(
+        &mut lease_state,
+        now_ms,
+        &terminal_run_ids,
+        &retry_pending_run_ids,
+    );
     write_runtime_queue_leases(&queue_dir, &lease_state)?;
     let pending_items = read_pending_items(&queue_file, &mut warnings)?;
     let pending_by_id = pending_items
@@ -667,6 +685,25 @@ fn acquire_runtime_queue_lease_lock(
     }
 }
 
+fn acquire_runtime_queue_lease_lock_with_retry(
+    queue_dir: &Path,
+    timeout: Duration,
+) -> io::Result<Option<RuntimeQueueLeaseLock>> {
+    let started = Instant::now();
+    loop {
+        let now_ms = current_log_time_ms()?;
+        if let Some(lock) = acquire_runtime_queue_lease_lock(queue_dir, now_ms)? {
+            return Ok(Some(lock));
+        }
+        if started.elapsed() >= timeout {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(
+            RUNTIME_LEASE_RELEASE_LOCK_RETRY_SLEEP_MS,
+        ));
+    }
+}
+
 fn runtime_queue_lease_lock_is_busy(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -762,9 +799,12 @@ fn purge_runtime_queue_leases(
     state: &mut RuntimeQueueLeaseState,
     now_ms: i64,
     terminal_run_ids: &HashSet<String>,
+    retry_pending_run_ids: &HashSet<String>,
 ) {
     state.leases.retain(|queue_id, lease| {
-        lease.lease_expires_at_ms > now_ms && !terminal_run_ids.contains(queue_id)
+        lease.lease_expires_at_ms > now_ms
+            && !terminal_run_ids.contains(queue_id)
+            && !retry_pending_run_ids.contains(queue_id)
     });
 }
 
@@ -774,9 +814,17 @@ pub fn release_runtime_queue_lease(
 ) -> io::Result<()> {
     let queue_dir = harness_home.as_ref().join("state").join("runtime-queue");
     fs::create_dir_all(&queue_dir)?;
-    let now_ms = current_log_time_ms()?;
-    let Some(_lease_lock) = acquire_runtime_queue_lease_lock(&queue_dir, now_ms)? else {
-        return Ok(());
+    let Some(_lease_lock) = acquire_runtime_queue_lease_lock_with_retry(
+        &queue_dir,
+        Duration::from_millis(RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS),
+    )?
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "runtime queue lease lock stayed busy while releasing queue lease `{queue_id}`"
+            ),
+        ));
     };
     let mut warnings = Vec::new();
     let mut state = read_runtime_queue_leases(&queue_dir, &mut warnings)?;
@@ -982,9 +1030,27 @@ fn read_terminal_run_once_ids(
     receipts_file: &Path,
     warnings: &mut Vec<String>,
 ) -> io::Result<HashSet<String>> {
-    let mut ids = HashSet::new();
+    read_run_once_ids_by_latest_status(receipts_file, warnings, is_terminal_run_once_status)
+}
+
+fn read_retry_pending_run_once_ids(
+    receipts_file: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<HashSet<String>> {
+    read_run_once_ids_by_latest_status(receipts_file, warnings, |status| status == "retry-pending")
+}
+
+fn read_run_once_ids_by_latest_status<F>(
+    receipts_file: &Path,
+    warnings: &mut Vec<String>,
+    predicate: F,
+) -> io::Result<HashSet<String>>
+where
+    F: Fn(&str) -> bool,
+{
+    let mut latest_status_by_id = HashMap::new();
     if !receipts_file.is_file() {
-        return Ok(ids);
+        return Ok(HashSet::new());
     }
 
     let text = fs::read_to_string(receipts_file)?;
@@ -1005,12 +1071,14 @@ fn read_terminal_run_once_ids(
         };
         if let Some(queue_id) = string_field(&value, &["queueId", "queue_id"])
             && let Some(status) = string_field(&value, &["status"])
-            && is_terminal_run_once_status(status)
         {
-            ids.insert(queue_id.to_string());
+            latest_status_by_id.insert(queue_id.to_string(), status.to_string());
         }
     }
-    Ok(ids)
+    Ok(latest_status_by_id
+        .into_iter()
+        .filter_map(|(queue_id, status)| predicate(&status).then_some(queue_id))
+        .collect())
 }
 
 fn is_terminal_run_once_status(status: &str) -> bool {
@@ -1488,7 +1556,6 @@ mod tests {
             RuntimeExecutionReceiptStatus::AlreadyPrepared
         );
         assert_eq!(resumed.receipt.queue_id.as_deref(), Some(queue_id.as_str()));
-        release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
 
         let run_once_receipts = harness_home
             .join("state")
@@ -1503,7 +1570,41 @@ mod tests {
             run_once_file,
             "{}",
             serde_json::json!({
-                "queueId": queue_id,
+                "queueId": queue_id.clone(),
+                "status": "retry-pending",
+                "reason": "transient reconnect; retry with the same session"
+            })
+        )
+        .unwrap();
+
+        let retry_capacity = inspect_runtime_queue_capacity(RuntimeQueueCapacityOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+        assert_eq!(retry_capacity.claimable_items, 1);
+        assert_eq!(retry_capacity.claimable_queue_ids, vec![queue_id.clone()]);
+        let retry_resumed = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert!(retry_resumed.item.is_none());
+        assert_eq!(
+            retry_resumed.receipt.status,
+            RuntimeExecutionReceiptStatus::AlreadyPrepared
+        );
+        assert_eq!(
+            retry_resumed.receipt.queue_id.as_deref(),
+            Some(queue_id.as_str())
+        );
+        release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
+
+        writeln!(
+            run_once_file,
+            "{}",
+            serde_json::json!({
+                "queueId": queue_id.clone(),
                 "status": "timeout",
                 "reason": "test retryable receipt"
             })

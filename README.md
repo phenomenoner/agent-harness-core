@@ -115,7 +115,7 @@ One binary, `agent-harness`, grouped into clear families:
 
 ## Project Status
 
-Pre-release, under active development, and **live-validated daily**: the reference deployment runs a single supervised runtime loop (concurrency 12) plus worker, progress, Telegram, and Discord loops, with hundreds of delivered turns on record. Current verification: 207 core tests + 16 CLI tests + doctests, `cargo fmt` clean.
+Pre-release, under active development, and **live-validated daily**: the reference deployment runs a single supervised runtime loop (concurrency 12) plus worker, progress, Telegram, and Discord loops, with hundreds of delivered turns on record. Current verification: 221 core tests + 17 CLI tests + doctests, `cargo fmt` clean.
 
 See the [Changelog](CHANGELOG.md), the [Roadmap & Backlog](docs/agent-harness-core-roadmap-backlog.md), and the [Activation Readiness Plan](docs/activation-readiness-plan.md) for what's done, gated, and next.
 

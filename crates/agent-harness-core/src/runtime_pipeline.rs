@@ -196,7 +196,9 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
 
     if plan.receipt.status == CodexRuntimeReceiptStatus::NoPreparedExecution {
         if let Some(queue_id) = prepare.receipt.queue_id.as_deref() {
-            release_runtime_queue_lease(&options.harness_home, queue_id)?;
+            if let Err(error) = release_runtime_queue_lease(&options.harness_home, queue_id) {
+                warnings.push(format!("runtime queue lease release failed: {error}"));
+            }
         }
         let receipt = RuntimeRunOnceReceipt {
             queue_id: prepare.receipt.queue_id.clone(),
@@ -506,7 +508,9 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         )?;
     }
     if let Some(queue_id) = receipt.queue_id.as_deref() {
-        release_runtime_queue_lease(&options.harness_home, queue_id)?;
+        if let Err(error) = release_runtime_queue_lease(&options.harness_home, queue_id) {
+            warnings.push(format!("runtime queue lease release failed: {error}"));
+        }
     }
 
     write_runtime_run_once_report(
@@ -1679,7 +1683,7 @@ mod tests {
 
         let second = run_runtime_queue_once(RuntimeRunOnceOptions {
             harness_home: harness_home.clone(),
-            queue_id: Some(queue_id.clone()),
+            queue_id: None,
             codex_executable: Some(fake_reconnecting_codex_executable(&root)),
             timeout_ms: 5_000,
             idle_timeout_ms: 5_000,
@@ -1690,6 +1694,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(second.receipt.status, RuntimeRunOnceStatus::RetryPending);
+        assert_eq!(second.receipt.queue_id.as_deref(), Some(queue_id.as_str()));
         assert!(second.outbound_message.is_none());
 
         let third = run_runtime_queue_once(RuntimeRunOnceOptions {
