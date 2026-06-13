@@ -510,7 +510,7 @@ mod tests {
               "schema": "agent-harness.config.v1",
               "response": {
                 "assistantNarrationMode": "progress_panel",
-                "assistantNarrationMaxChars": 500,
+                "assistantNarrationMaxChars": 1200,
                 "assistantNarrationProgressMinUpdateMs": 2500,
                 "assistantNarrationFinalPrefix": "Work log",
                 "emojiAccentMode": "subtle",

@@ -51,7 +51,7 @@ Invalid narrower-to-wider settings are capped at runtime with warnings.
 {
   "response": {
     "assistantNarrationMode": "progress_panel",
-    "assistantNarrationMaxChars": 500,
+    "assistantNarrationMaxChars": 1200,
     "assistantNarrationProgressMinUpdateMs": 2500,
     "assistantNarrationFinalPrefix": "Work log",
     "emojiAccentMode": "off",

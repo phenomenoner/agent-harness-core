@@ -361,6 +361,18 @@ impl AgentProgressEvent {
         status: AgentProgressStatus,
         at_ms: i64,
     ) -> Self {
+        Self::new_with_preview_limit(context, kind, label, preview, status, at_ms, 512)
+    }
+
+    pub fn new_with_preview_limit(
+        context: &AgentProgressContext,
+        kind: AgentProgressKind,
+        label: impl Into<String>,
+        preview: impl AsRef<str>,
+        status: AgentProgressStatus,
+        at_ms: i64,
+        max_preview_chars: usize,
+    ) -> Self {
         Self {
             schema: AGENT_PROGRESS_EVENT_SCHEMA.to_string(),
             at_ms,
@@ -372,7 +384,7 @@ impl AgentProgressEvent {
             user_id: context.user_id.clone(),
             kind,
             label: label.into(),
-            preview: sanitize_progress_preview(preview.as_ref(), 512),
+            preview: sanitize_progress_preview(preview.as_ref(), max_preview_chars.max(1)),
             status,
             elapsed_ms: None,
             source: None,
@@ -750,13 +762,7 @@ fn latest_narration_event<'a>(events: &[&'a AgentProgressEvent]) -> Option<&'a A
 fn latest_current_step_event<'a>(
     events: &[&'a AgentProgressEvent],
 ) -> Option<&'a AgentProgressEvent> {
-    latest_narration_event(events).or_else(|| {
-        events.iter().rev().copied().find(|event| {
-            !event.preview.trim().is_empty()
-                && event.status != AgentProgressStatus::Completed
-                && !matches!(event.kind, AgentProgressKind::AssistantStream)
-        })
-    })
+    latest_narration_event(events)
 }
 
 pub fn sanitize_progress_preview(value: &str, max_chars: usize) -> String {
@@ -1013,10 +1019,7 @@ mod tests {
         assert!(actions.contains("💻 terminal: \"cargo test -p agent-harness-core\""));
         assert!(!actions.contains("⏳ Working"));
         assert!(!actions.contains("assistant_stream"));
-        assert_eq!(
-            status,
-            "⏳ Working — 9 min — running tools\nCurrent step: cargo test -p agent-harness-core"
-        );
+        assert_eq!(status, "⏳ Working — 9 min — running tools");
         assert_eq!(panel, format!("{actions}\n\n{status}"));
     }
 
@@ -1087,7 +1090,7 @@ mod tests {
     }
 
     #[test]
-    fn current_step_falls_back_to_runtime_progress_when_narration_is_absent() {
+    fn current_step_does_not_fall_back_to_runtime_progress_when_narration_is_absent() {
         let context = context();
         let events = vec![
             AgentProgressEvent::new(
@@ -1111,12 +1114,12 @@ mod tests {
 
         assert_eq!(
             render_agent_progress_status(&refs, 65_000, 120, 1200),
-            "⏳ Working — 1 min — working\nCurrent step: transient runtime failure; preserving session for retry"
+            "⏳ Working — 1 min — working"
         );
     }
 
     #[test]
-    fn current_step_falls_back_to_latest_tool_when_narration_is_absent() {
+    fn current_step_does_not_fall_back_to_latest_tool_when_narration_is_absent() {
         let context = context();
         let events = vec![AgentProgressEvent::new(
             &context,
@@ -1130,8 +1133,74 @@ mod tests {
 
         assert_eq!(
             render_agent_progress_status(&refs, 61_000, 120, 1200),
-            "⏳ Working — 1 min — running tools\nCurrent step: pwsh: Get-ChildItem .agent-harness"
+            "⏳ Working — 1 min — running tools"
         );
+    }
+
+    #[test]
+    fn current_step_does_not_render_codex_apps_tool_name_without_narration() {
+        let context = context();
+        let events = vec![AgentProgressEvent::new(
+            &context,
+            AgentProgressKind::ToolCall,
+            "tool_call",
+            "codex_apps",
+            AgentProgressStatus::Started,
+            1000,
+        )];
+        let refs = events.iter().collect::<Vec<_>>();
+        let status = render_agent_progress_status(&refs, 61_000, 120, 1200);
+
+        assert_eq!(status, "⏳ Working — 1 min — running tools");
+        assert!(!status.contains("Current step"));
+        assert!(!status.contains("codex_apps"));
+    }
+
+    #[test]
+    fn assistant_narration_preview_can_exceed_general_preview_cap() {
+        let context = context();
+        let long_step = format!("{}complete", "checking reconnect recovery ".repeat(35));
+        let tool_event = AgentProgressEvent::new(
+            &context,
+            AgentProgressKind::Terminal,
+            "terminal",
+            "cargo test -p agent-harness-core",
+            AgentProgressStatus::Started,
+            1000,
+        );
+        let narration_event = AgentProgressEvent::new_with_preview_limit(
+            &context,
+            AgentProgressKind::AssistantNarration,
+            "assistant_narration",
+            &long_step,
+            AgentProgressStatus::Progress,
+            2000,
+            1200,
+        );
+
+        assert_eq!(narration_event.preview, long_step);
+        let refs = vec![&tool_event, &narration_event];
+        let status = render_agent_progress_status(&refs, 61_000, 24, 1200);
+        assert!(status.contains("complete"));
+        assert!(!status.contains("..."));
+    }
+
+    #[test]
+    fn assistant_narration_preview_still_respects_its_own_limit() {
+        let context = context();
+        let long_step = format!("{}complete", "checking reconnect recovery ".repeat(35));
+        let event = AgentProgressEvent::new_with_preview_limit(
+            &context,
+            AgentProgressKind::AssistantNarration,
+            "assistant_narration",
+            &long_step,
+            AgentProgressStatus::Progress,
+            1000,
+            64,
+        );
+
+        assert!(event.preview.ends_with("..."));
+        assert!(!event.preview.contains("complete"));
     }
 
     #[test]

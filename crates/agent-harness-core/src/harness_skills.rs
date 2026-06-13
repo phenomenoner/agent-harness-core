@@ -9,12 +9,12 @@ use crate::{HARNESS_BUILTIN_SKILL_NAMESPACE, SKILL_FILE_NAME};
 const BUILTIN_HARNESS_SKILL_SYNC_SCHEMA: &str = "agent-harness.builtin-skill-sync.v1";
 const BUILTIN_HARNESS_SKILL_MANIFEST_SCHEMA: &str = "agent-harness.builtin-skill-manifest.v1";
 const AGENT_WINDOWS_HARNESS_SKILL_ID: &str = "agent-windows-harness";
-const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.6";
+const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.7";
 
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
 description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, response tone, and Codex prompt continuity policy.
-version: 0.1.6
+version: 0.1.7
 platforms: [windows]
 metadata:
   agent_harness:
@@ -55,6 +55,7 @@ Use it when the user mentions:
 14. Use status --json for operator health checks; it should show runtime openItems=0 and outbox pending=0 before live handoff.
 15. Treat harness-config.json security.codexApprovalPolicy and security.codexSandbox as operator-controlled runtime safety settings. Use codexApprovalPolicy="accept" only for an intentionally unattended trusted channel runtime.
 16. Keep response tone policy scoped to successful final agent replies. The default is off; subtle emoji accenting is opt-in. Do not post-process command replies, /status, error/failure replies, progress/status panels, code-heavy replies, or risk/security/status replies.
+17. For every new functional component or behavior change, add or update a `/docs/` note that records the design rationale and a concise changelog. Do not leave feature history discoverable only through git commits or chat context.
 
 ## Prompt And Tool Schema Policy
 
@@ -109,7 +110,7 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - Channel selectors can be platform:channelId:userId, platform:channelId, channelId, or platform. Channel overrides win over agent overrides; agent overrides win over the global mode.
 - The policy must skip command replies, /status, error/failure replies, progress/status panels, fenced code blocks, code-heavy replies, risk/security/status-style replies, and text already ending with an emoji.
 - Do not wrap final Telegram/Discord replies with a mechanical `◆ Agent` header. Send trimmed assistant text as-is unless a future delivery-intent policy explicitly says otherwise.
-- Current-step narration in progress delivery uses a separate longer cap (`--current-step-max-chars`, default 1200). If assistant narration is absent, the status panel should fall back to the latest non-completed runtime/tool progress preview so Telegram and Discord working panels do not look blank.
+- Current-step narration in progress delivery uses assistant narration only, with a separate longer cap (`--current-step-max-chars`, default 1200). If assistant narration is absent, omit the `Current step:` line; keep runtime/tool operation names in action/status lanes and never relabel them as Codex execution summaries.
 - Do not implement tone as blind delivery-layer post-processing. Keep it at the successful agent-reply outbox boundary so audit artifacts and non-agent replies stay unpolluted.
 
 ## Channel Commands

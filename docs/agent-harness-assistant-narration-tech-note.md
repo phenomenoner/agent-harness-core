@@ -22,8 +22,8 @@ Implemented on 2026-06-11.
   assistant text instead of dropping content.
 - `progress_panel` emits `AgentProgressKind::AssistantNarration` and renders the
   latest item as `Current step: ...` under the editable status panel. When no
-  narration item has arrived yet, the status panel falls back to the latest
-  non-completed runtime/tool progress preview.
+  narration item has arrived yet, the status panel omits `Current step:` rather
+  than substituting runtime/tool operation names.
 - Transcript output stores `assistant_narration` rows before the final
   `assistant` row; completion receipts include selected mode, final character
   count, and narration item count.
@@ -34,9 +34,18 @@ Implemented on 2026-06-11.
 - `emojiAccentMode` was added later as a separate final-reply tone policy. It is
   not part of assistant narration segmentation and is applied only at the
   successful `agent-reply` outbox boundary.
-- Verification: `cargo test -p agent-harness-core` passed with 221 core tests
+- Verification: `cargo test -p agent-harness-core` passed with 224 core tests
   and `cargo test -p agent-harness-cli` passed with 17 CLI tests after the
   round4 response/reconnect update.
+
+## Changelog
+
+- 2026-06-13: Corrected `Current step` rendering to use only Codex assistant
+  narration (`AgentProgressKind::AssistantNarration`). Runtime/tool operation
+  previews such as MCP tool names remain in action/status lanes and are not
+  relabeled as assistant execution summaries. The assistant narration display
+  cap is aligned with the 1200-character current-step cap so the latest summary
+  sentence is not truncated by the general progress preview limit.
 
 ## Pre-Implementation Behavior
 
@@ -60,8 +69,8 @@ Important code points:
   - `ChannelOutboundMessageKind::AgentReply`
 - `crates/agent-harness-core/src/progress.rs`
   - progress delivery supports editable Body and Status lanes, renders assistant
-    narration as the current step, and falls back to runtime/tool progress when
-    narration is absent.
+    narration as the current step, and intentionally keeps runtime/tool progress
+    out of `Current step`.
 
 The leaked prefix is not hidden chain-of-thought. It is user-visible assistant
 narration / progress narration that used to be flattened into the final reply.
@@ -90,7 +99,7 @@ Suggested schema:
 {
   "response": {
     "assistantNarrationMode": "progress_panel",
-    "assistantNarrationMaxChars": 500,
+    "assistantNarrationMaxChars": 1200,
     "assistantNarrationProgressMinUpdateMs": 2500,
     "assistantNarrationFinalPrefix": "Work log",
     "emojiAccentMode": "off",
@@ -201,10 +210,9 @@ When `assistantNarrationMode = "progress_panel"`:
    - `assistantNarrationMaxChars`
    - `assistantNarrationProgressMinUpdateMs`
    - existing progress delivery dedupe/rate-limit behavior
-5. If no narration event is available, render `Current step:` from the latest
-   non-completed runtime/tool progress preview. This keeps Telegram/Discord
-   working panels informative during tool-only startup and retry-pending
-   reconnect recovery.
+5. If no narration event is available, omit `Current step:`. Runtime/tool
+   progress should remain in the action/status lanes and must not be relabeled
+   as assistant narration.
 6. Keep final `agent-reply` free of intermediate narration.
 
 Suggested status rendering:
@@ -274,8 +282,9 @@ Unit tests:
 5. `inline_preface` mode.
    - Output contains clear work/final separators.
 6. Progress rendering.
-   - Narration is truncated, sanitized, deduped, and rate-limited.
-   - No-narration working status falls back to runtime/tool progress.
+   - Narration is sanitized, deduped, and rate-limited.
+   - No-narration working status does not show runtime/tool operation names as
+     `Current step`.
 
 Integration tests:
 
@@ -325,7 +334,7 @@ Regression checks:
 {
   "response": {
     "assistantNarrationMode": "progress_panel",
-    "assistantNarrationMaxChars": 500,
+    "assistantNarrationMaxChars": 1200,
     "assistantNarrationProgressMinUpdateMs": 2500
   }
 }

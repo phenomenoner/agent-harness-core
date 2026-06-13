@@ -42,6 +42,7 @@ const DEFAULT_CODEX_SANDBOX_POLICY: &str = "workspaceWrite";
 const RUNTIME_CANCEL_REQUEST_MAX_AGE_MS: i64 = 60_000;
 const CODEX_CHILD_TERMINATE_TIMEOUT_MS: u64 = 2_000;
 const CODEX_STDOUT_READER_JOIN_TIMEOUT_MS: u64 = 2_000;
+const DEFAULT_ASSISTANT_NARRATION_MAX_CHARS: usize = 1200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRuntimePlanOptions {
@@ -123,7 +124,7 @@ impl Default for AssistantNarrationConfig {
     fn default() -> Self {
         Self {
             mode: AssistantNarrationMode::ProgressPanel,
-            max_chars: 500,
+            max_chars: DEFAULT_ASSISTANT_NARRATION_MAX_CHARS,
             progress_min_update_ms: 2_500,
             final_prefix: "Work log".to_string(),
             source: "default".to_string(),
@@ -3612,13 +3613,14 @@ fn emit_assistant_narration_progress(
             }
         },
     };
-    let event = AgentProgressEvent::new(
+    let event = AgentProgressEvent::new_with_preview_limit(
         &emitter.context,
         AgentProgressKind::AssistantNarration,
         "assistant_narration",
         preview,
         AgentProgressStatus::Progress,
         at_ms,
+        config.max_chars,
     )
     .source("codex-runtime");
     if let Err(error) = emitter.append(event) {

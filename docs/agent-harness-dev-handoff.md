@@ -20,6 +20,15 @@ Start with these files before making changes:
 - `.agent-harness/secrets/channel-credentials.env`: imported Telegram/Discord channel secrets. Do not print or commit values.
 - `.agent-harness/secrets/memory-credentials.env`: imported memory embedding secret. Do not print or commit values.
 
+## Documentation Discipline
+
+Every new functional component and every behavior-changing hotfix must leave a
+durable note under `/docs/`. At minimum, record the component's design rationale,
+operator-facing behavior, important invariants, and a concise changelog entry
+with the implementation date. Do not rely on git history, chat context, or
+temporary `.debug` notes as the only explanation of why a feature works the way
+it does.
+
 Primary topology:
 
 - Active harness state root: `.agent-harness`
