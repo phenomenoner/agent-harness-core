@@ -105,6 +105,7 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
         "runtimeBackoff",
         "cronScheduler",
         "channelIdentity",
+        "liveControlGuard",
     ];
     let has_known_section = object
         .keys()
@@ -128,6 +129,9 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
             "cronScheduler" => validate_cron_scheduler_object("$.cronScheduler", child, errors),
             "channelIdentity" => {
                 validate_channel_identity_object("$.channelIdentity", child, errors)
+            }
+            "liveControlGuard" => {
+                validate_live_control_guard_object("$.liveControlGuard", child, errors)
             }
             other => errors.push(format!("unknown harness-config key `{other}` at $")),
         }
@@ -400,6 +404,27 @@ fn validate_channel_identity_object(path: &str, value: &Value, errors: &mut Vec<
             "bindings" => validate_channel_identity_bindings(path_key(path, key), child, errors),
             other => errors.push(format!(
                 "unknown channelIdentity config key `{other}` at {path}"
+            )),
+        }
+    }
+}
+
+fn validate_live_control_guard_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "enabled" | "allowStatusCommands" => expect_bool(path_key(path, key), child, errors),
+            "liveHarnessHome" | "protectedTaskPrefix" => {
+                expect_string(path_key(path, key), child, errors)
+            }
+            "approvalTtlSeconds" => expect_positive_u64(path_key(path, key), child, errors),
+            "protectedProcessNames" | "protectedPaths" | "stagingHomePrefixes" => {
+                validate_string_array(path_key(path, key), child, errors)
+            }
+            other => errors.push(format!(
+                "unknown liveControlGuard config key `{other}` at {path}"
             )),
         }
     }
@@ -689,6 +714,16 @@ mod tests {
                 "fakeCodexDefault": true,
                 "allowLiveTelegram": false,
                 "allowLiveDiscord": false
+              },
+              "liveControlGuard": {
+                "enabled": true,
+                "liveHarnessHome": ".agent-harness",
+                "allowStatusCommands": true,
+                "protectedTaskPrefix": "AgentHarness",
+                "protectedProcessNames": ["agent-harness.exe"],
+                "protectedPaths": [".agent-harness/state/supervisor/windows-scheduled-tasks"],
+                "stagingHomePrefixes": [".agent-harness-staging", ".debug", "target/staging"],
+                "approvalTtlSeconds": 900
               }
             }"#,
         )

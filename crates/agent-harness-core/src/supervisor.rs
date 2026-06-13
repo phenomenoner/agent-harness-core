@@ -396,7 +396,10 @@ pub fn write_windows_supervisor_plan(
     });
 
     let start_script = scripts_dir.join("start-scheduled-tasks.ps1");
-    fs::write(&start_script, start_script_body(&tasks))?;
+    fs::write(
+        &start_script,
+        start_script_body(&tasks, &harness_cli, &harness_home),
+    )?;
     scripts.push(WindowsSupervisorScript {
         name: "start-scheduled-tasks".to_string(),
         path: start_script,
@@ -404,7 +407,10 @@ pub fn write_windows_supervisor_plan(
     });
 
     let stop_script = scripts_dir.join("stop-scheduled-tasks.ps1");
-    fs::write(&stop_script, stop_script_body(&tasks))?;
+    fs::write(
+        &stop_script,
+        stop_script_body(&tasks, &harness_cli, &harness_home),
+    )?;
     scripts.push(WindowsSupervisorScript {
         name: "stop-scheduled-tasks".to_string(),
         path: stop_script,
@@ -412,7 +418,10 @@ pub fn write_windows_supervisor_plan(
     });
 
     let uninstall_script = scripts_dir.join("uninstall-scheduled-tasks.ps1");
-    fs::write(&uninstall_script, uninstall_script_body(&tasks))?;
+    fs::write(
+        &uninstall_script,
+        uninstall_script_body(&tasks, &harness_cli, &harness_home),
+    )?;
     scripts.push(WindowsSupervisorScript {
         name: "uninstall-scheduled-tasks".to_string(),
         path: uninstall_script,
@@ -515,8 +524,12 @@ fn install_script_body(tasks: &[WindowsSupervisorTask], description: &str) -> St
     body
 }
 
-fn start_script_body(tasks: &[WindowsSupervisorTask]) -> String {
-    let mut body = String::from("$ErrorActionPreference = 'Continue'\n");
+fn start_script_body(
+    tasks: &[WindowsSupervisorTask],
+    harness_cli: &Path,
+    harness_home: &Path,
+) -> String {
+    let mut body = live_control_guard_script(harness_cli, harness_home, "start");
     for task in tasks {
         body.push_str(&format!(
             "Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath {}\n\
@@ -539,8 +552,12 @@ fn start_script_body(tasks: &[WindowsSupervisorTask]) -> String {
     body
 }
 
-fn stop_script_body(tasks: &[WindowsSupervisorTask]) -> String {
-    let mut body = String::from("$ErrorActionPreference = 'Continue'\n");
+fn stop_script_body(
+    tasks: &[WindowsSupervisorTask],
+    harness_cli: &Path,
+    harness_home: &Path,
+) -> String {
+    let mut body = live_control_guard_script(harness_cli, harness_home, "stop");
     for task in tasks {
         body.push_str(&format!(
             "New-Item -ItemType File -Force -Path {} | Out-Null\n",
@@ -557,8 +574,12 @@ fn stop_script_body(tasks: &[WindowsSupervisorTask]) -> String {
     body
 }
 
-fn uninstall_script_body(tasks: &[WindowsSupervisorTask]) -> String {
-    let mut body = String::from("$ErrorActionPreference = 'Continue'\n");
+fn uninstall_script_body(
+    tasks: &[WindowsSupervisorTask],
+    harness_cli: &Path,
+    harness_home: &Path,
+) -> String {
+    let mut body = live_control_guard_script(harness_cli, harness_home, "uninstall");
     for task in tasks {
         body.push_str(&format!(
             "Unregister-ScheduledTask -TaskName {} -Confirm:$false -ErrorAction SilentlyContinue\n",
@@ -566,6 +587,27 @@ fn uninstall_script_body(tasks: &[WindowsSupervisorTask]) -> String {
         ));
     }
     body
+}
+
+fn live_control_guard_script(harness_cli: &Path, harness_home: &Path, action: &str) -> String {
+    format!(
+        "param([string] $LiveControlToken)\n\
+         $ErrorActionPreference = 'Continue'\n\
+         function Test-AgentHarnessLiveFlag([string] $Value) {{\n\
+           if ([string]::IsNullOrWhiteSpace($Value)) {{ return $false }}\n\
+           return @('1', 'true', 'yes', 'on', 'live') -contains $Value.Trim().ToLowerInvariant()\n\
+         }}\n\
+         if (Test-AgentHarnessLiveFlag $env:AGENT_HARNESS_LIVE_SESSION) {{\n\
+           $ResolvedLiveControlToken = if (-not [string]::IsNullOrWhiteSpace($LiveControlToken)) {{ $LiveControlToken }} elseif (-not [string]::IsNullOrWhiteSpace($env:AGENT_HARNESS_LIVE_CONTROL_TOKEN)) {{ $env:AGENT_HARNESS_LIVE_CONTROL_TOKEN }} else {{ $null }}\n\
+           if ([string]::IsNullOrWhiteSpace($ResolvedLiveControlToken)) {{ throw 'live-control token is required for live agent-harness supervisor control' }}\n\
+           $LiveControlStatus = & {} ops-cutover-status --target-home {} --action {} --live-control-token $ResolvedLiveControlToken | ConvertFrom-Json\n\
+           if ($LASTEXITCODE -ne 0 -or $LiveControlStatus.status -ne 'ready') {{ throw 'live-control token validation failed for live agent-harness supervisor control' }}\n\
+           $env:AGENT_HARNESS_LIVE_CONTROL_TOKEN = $ResolvedLiveControlToken\n\
+         }}\n",
+        ps_quote_path(harness_cli),
+        ps_quote_path(harness_home),
+        ps_quote(action)
+    )
 }
 
 fn path_arg(path: &Path) -> String {
@@ -680,11 +722,15 @@ mod tests {
         assert!(start_script.contains("Get-ScheduledTask"));
         assert!(start_script.contains("Start-Process"));
         assert!(start_script.contains("-WindowStyle Hidden"));
+        assert!(start_script.contains("AGENT_HARNESS_LIVE_SESSION"));
+        assert!(start_script.contains("ops-cutover-status"));
         let stop_script =
             fs::read_to_string(output_dir.join("scripts").join("stop-scheduled-tasks.ps1"))
                 .unwrap();
         assert!(stop_script.contains("New-Item -ItemType File"));
         assert!(stop_script.contains("Stop-ScheduledTask"));
+        assert!(stop_script.contains("AGENT_HARNESS_LIVE_SESSION"));
+        assert!(stop_script.contains("ops-cutover-status"));
 
         let _ = fs::remove_dir_all(root);
     }

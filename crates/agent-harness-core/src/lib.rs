@@ -23,6 +23,7 @@ pub mod harness_registry;
 pub mod harness_skills;
 pub mod health;
 pub mod importer;
+pub mod live_control;
 pub mod logging;
 pub mod mcp;
 pub mod memory;
@@ -170,6 +171,12 @@ pub use importer::{
     ImportSemantics, NativeCronSemantics, ReportFiles, SessionSemantics, build_dry_run_report,
     execute_import, write_report_files,
 };
+pub use live_control::{
+    LiveControlAction, LiveControlIntent, LiveControlTokenRecord, LiveControlTokenStatus,
+    LiveControlTokenValidation, classify_approval_request, classify_live_control_command,
+    env_live_control_token, hash_live_control_token, is_live_agent_session_env,
+    is_live_harness_home, live_control_tokens_file, validate_live_control_token,
+};
 pub use logging::{
     HarnessLogEvent, HarnessLogLevel, HarnessLogRotationOptions, HarnessLogRotationReport,
     HarnessLogRotationStatus, HarnessLogWrite, append_harness_log, append_jsonl_value,
@@ -220,8 +227,12 @@ pub use memory_contracts::{
 pub use metrics::{HarnessMetricsOptions, HarnessMetricsReport, collect_harness_metrics};
 pub use ops::{
     OpsBackupEntry, OpsBackupOptions, OpsBackupReport, OpsControlAction, OpsControlOptions,
-    OpsControlReport, OpsCutoverReceiptOptions, OpsCutoverReceiptReport, OpsStopFileStatus,
-    create_ops_backup, record_ops_control, record_ops_cutover_receipt,
+    OpsControlReport, OpsCutoverApplyOptions, OpsCutoverApplyReport, OpsCutoverApproveOptions,
+    OpsCutoverApproveReport, OpsCutoverReceiptOptions, OpsCutoverReceiptReport,
+    OpsCutoverRequestOptions, OpsCutoverRequestReport, OpsCutoverStatusOptions,
+    OpsCutoverStatusReport, OpsStopFileStatus, collect_ops_cutover_status, create_ops_backup,
+    record_ops_control, record_ops_cutover_apply, record_ops_cutover_approval,
+    record_ops_cutover_receipt, record_ops_cutover_request,
 };
 pub use progress::{
     AgentProgressContext, AgentProgressDeliveryAction, AgentProgressDeliveryMessageKind,

@@ -34,33 +34,34 @@ use agent_harness_core::{
     DeterministicCronPlanInput, DeterministicCronWorkerEnqueueOptions, DriftCheckOptions,
     DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel,
     HarnessLogRotationOptions, HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport,
-    HealthzOptions, ImportPhaseStatus, ImportReport, LearningProposalOptions, McpRequestOptions,
-    MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport, MemoryCanvasWorkerStatus,
-    MemoryCredentialsExportOptions, MemoryCredentialsExportReport, MemoryHookAdapterOptions,
-    MemoryHookKind, MemorySearchOptions, MemorySearchReport, MemoryVectorRecallOptions,
-    MemoryVectorRecallReport, MemoryVectorRecallStatus, NativeCronPlan, NativeCronPlanInput,
-    NativeCronWorkerEnqueueOptions, OpenClawMemServiceProposeOptions,
+    HealthzOptions, ImportPhaseStatus, ImportReport, LearningProposalOptions, LiveControlAction,
+    McpRequestOptions, MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport,
+    MemoryCanvasWorkerStatus, MemoryCredentialsExportOptions, MemoryCredentialsExportReport,
+    MemoryHookAdapterOptions, MemoryHookKind, MemorySearchOptions, MemorySearchReport,
+    MemoryVectorRecallOptions, MemoryVectorRecallReport, MemoryVectorRecallStatus, NativeCronPlan,
+    NativeCronPlanInput, NativeCronWorkerEnqueueOptions, OpenClawMemServiceProposeOptions,
     OpenClawMemServiceRecallOptions, OpenClawMemServiceStatus, OpenClawMemServiceStatusOptions,
     OpenClawMemServiceStoreOptions, OpsBackupOptions, OpsControlAction, OpsControlOptions,
-    OpsCutoverReceiptOptions, PromptAssemblyOptions, PromptBundle, PromptReductionOptions,
-    PublicHygieneOptions, QueueShadowCompareOptions, QueueShadowRecordOptions,
-    RuntimeQueueCapacityOptions, RuntimeQueueControlAction, RuntimeQueueControlOptions,
-    RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions,
-    RuntimeQueuePrepareReport, RuntimeRunOnceOptions, RuntimeRunOnceReport, RuntimeRunOnceStatus,
-    ScopedStopOptions, ScopedStopTarget, SecurityScanOptions, SkillIndex, SkillSelectionQuery,
-    SubagentPlan, SubagentPlanInput, SubagentWorkerEnqueueOptions, SuperviseDeployCanaryOptions,
-    SupervisionEvaluateOptions, SupervisorChildState, TaskEntityOptions, TaskStatus,
-    TokenEfficiencyOptions, TraceOptions, TurnPlan, TurnPlanInput, VaultGetOptions,
-    VaultPutOptions, WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport,
-    WorkerCancelOptions, WorkerEnqueueOptions, WorkerJobKind, WorkerReapStaleOptions,
-    WorkerRunOnceOptions, WorkerRunOnceStatus, WorkerStatusOptions, acquire_budget,
-    append_harness_log, append_jsonl_value, apply_channel_command_step, assemble_prompt_bundle,
-    build_channel_step, build_dry_run_report, build_harness_skill_index, build_import_plan,
-    build_runtime_skill_index, build_source_skill_index, build_turn_plan, cancel_worker_job,
-    check_activation_readiness, check_config_drift, check_tool_description_pin,
-    collect_harness_metrics, collect_harness_status, collect_healthz, collect_token_efficiency,
-    collect_worker_status, compare_channel_turn_shadow, control_runtime_queue_item,
-    create_learning_proposal, create_ops_backup, current_log_time_ms,
+    OpsCutoverApplyOptions, OpsCutoverApproveOptions, OpsCutoverReceiptOptions,
+    OpsCutoverRequestOptions, OpsCutoverStatusOptions, PromptAssemblyOptions, PromptBundle,
+    PromptReductionOptions, PublicHygieneOptions, QueueShadowCompareOptions,
+    QueueShadowRecordOptions, RuntimeQueueCapacityOptions, RuntimeQueueControlAction,
+    RuntimeQueueControlOptions, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
+    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeRunOnceOptions,
+    RuntimeRunOnceReport, RuntimeRunOnceStatus, ScopedStopOptions, ScopedStopTarget,
+    SecurityScanOptions, SkillIndex, SkillSelectionQuery, SubagentPlan, SubagentPlanInput,
+    SubagentWorkerEnqueueOptions, SuperviseDeployCanaryOptions, SupervisionEvaluateOptions,
+    SupervisorChildState, TaskEntityOptions, TaskStatus, TokenEfficiencyOptions, TraceOptions,
+    TurnPlan, TurnPlanInput, VaultGetOptions, VaultPutOptions, WindowsSupervisorPlanOptions,
+    WindowsSupervisorPlanReport, WorkerCancelOptions, WorkerEnqueueOptions, WorkerJobKind,
+    WorkerReapStaleOptions, WorkerRunOnceOptions, WorkerRunOnceStatus, WorkerStatusOptions,
+    acquire_budget, append_harness_log, append_jsonl_value, apply_channel_command_step,
+    assemble_prompt_bundle, build_channel_step, build_dry_run_report, build_harness_skill_index,
+    build_import_plan, build_runtime_skill_index, build_source_skill_index, build_turn_plan,
+    cancel_worker_job, check_activation_readiness, check_config_drift, check_tool_description_pin,
+    collect_harness_metrics, collect_harness_status, collect_healthz, collect_ops_cutover_status,
+    collect_token_efficiency, collect_worker_status, compare_channel_turn_shadow,
+    control_runtime_queue_item, create_learning_proposal, create_ops_backup, current_log_time_ms,
     default_supervisor_child_specs, enqueue_channel_step, enqueue_deterministic_cron_workers,
     enqueue_native_cron_workers, enqueue_subagent_workers, enqueue_worker_job, evaluate_admission,
     evaluate_prompt_reduction, evaluate_supervisor_children, execute_import,
@@ -73,7 +74,8 @@ use agent_harness_core::{
     probe_codex_runtime_launch, propose_openclaw_mem_service_memory, put_vault_secret,
     reap_stale_worker_jobs, recall_openclaw_mem_service, receive_channel_message,
     record_agent_progress_delivery, record_channel_delivery, record_channel_turn_shadow,
-    record_codex_runtime_completion, record_ops_control, record_ops_cutover_receipt,
+    record_codex_runtime_completion, record_ops_control, record_ops_cutover_apply,
+    record_ops_cutover_approval, record_ops_cutover_receipt, record_ops_cutover_request,
     record_scoped_stop, record_supervise_deploy_canary, release_checklist,
     resolve_channel_identity, rotate_harness_log_if_needed, run_channel_once, run_codex_runtime,
     run_cron_scheduler_once, run_memory_canvas_worker, run_memory_hook_adapter, run_public_hygiene,
@@ -147,6 +149,10 @@ fn main() {
         "memory-service-propose" => run_memory_service_propose(&rest),
         "memory-service-store" => run_memory_service_store(&rest),
         "ops-backup" => run_ops_backup(&rest),
+        "ops-cutover-request" => run_ops_cutover_request(&rest),
+        "ops-cutover-approve" => run_ops_cutover_approve(&rest),
+        "ops-cutover-apply" => run_ops_cutover_apply(&rest),
+        "ops-cutover-status" => run_ops_cutover_status(&rest),
         "ops-cutover-receipt" => run_ops_cutover_receipt(&rest),
         "ops-control" => run_ops_control(&rest),
         "supervisor-plan" => run_supervisor_plan(&rest),
@@ -1477,6 +1483,62 @@ fn run_ops_backup(args: &[String]) -> Result<(), String> {
     print_json(&report)
 }
 
+fn run_ops_cutover_request(args: &[String]) -> Result<(), String> {
+    let args = ops_cutover_request_args_from_args(args)?;
+    let report = record_ops_cutover_request(OpsCutoverRequestOptions {
+        harness_home: args.target_home,
+        action: args.action,
+        summary: args.summary,
+        candidate_binary: args.candidate_binary,
+        staging_home: args.staging_home,
+        test_notes: args.test_notes,
+        now_ms: current_time_ms()?,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
+}
+
+fn run_ops_cutover_approve(args: &[String]) -> Result<(), String> {
+    let args = ops_cutover_approve_args_from_args(args)?;
+    let report = record_ops_cutover_approval(OpsCutoverApproveOptions {
+        harness_home: args.target_home,
+        ticket_id: args.ticket_id,
+        action: args.action,
+        issued_to: args.issued_to,
+        ttl_seconds: args.ttl_seconds,
+        reason: args.reason,
+        now_ms: current_time_ms()?,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
+}
+
+fn run_ops_cutover_apply(args: &[String]) -> Result<(), String> {
+    let args = ops_cutover_apply_args_from_args(args)?;
+    let report = record_ops_cutover_apply(OpsCutoverApplyOptions {
+        harness_home: args.target_home,
+        ticket_id: args.ticket_id,
+        action: args.action,
+        live_control_token: args.live_control_token,
+        note: args.note,
+        now_ms: current_time_ms()?,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
+}
+
+fn run_ops_cutover_status(args: &[String]) -> Result<(), String> {
+    let args = ops_cutover_status_args_from_args(args)?;
+    let report = collect_ops_cutover_status(OpsCutoverStatusOptions {
+        harness_home: args.target_home,
+        action: args.action,
+        live_control_token: args.live_control_token,
+        now_ms: current_time_ms()?,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
+}
+
 fn run_ops_cutover_receipt(args: &[String]) -> Result<(), String> {
     let args = ops_cutover_receipt_args_from_args(args)?;
     let report = record_ops_cutover_receipt(OpsCutoverReceiptOptions {
@@ -1494,6 +1556,7 @@ fn run_ops_control(args: &[String]) -> Result<(), String> {
         harness_home: args.target_home,
         action: args.action,
         reason: args.reason,
+        live_control_token: args.live_control_token,
         now_ms: current_time_ms()?,
     })
     .map_err(|err| err.to_string())?;
@@ -5826,6 +5889,38 @@ struct OpsBackupArgs {
     max_file_bytes: u64,
 }
 
+struct OpsCutoverRequestArgs {
+    target_home: PathBuf,
+    action: LiveControlAction,
+    summary: Option<String>,
+    candidate_binary: Option<PathBuf>,
+    staging_home: Option<PathBuf>,
+    test_notes: Vec<String>,
+}
+
+struct OpsCutoverApproveArgs {
+    target_home: PathBuf,
+    ticket_id: String,
+    action: LiveControlAction,
+    issued_to: Option<String>,
+    ttl_seconds: Option<i64>,
+    reason: Option<String>,
+}
+
+struct OpsCutoverApplyArgs {
+    target_home: PathBuf,
+    ticket_id: String,
+    action: LiveControlAction,
+    live_control_token: Option<String>,
+    note: Option<String>,
+}
+
+struct OpsCutoverStatusArgs {
+    target_home: PathBuf,
+    action: Option<LiveControlAction>,
+    live_control_token: Option<String>,
+}
+
 struct OpsCutoverReceiptArgs {
     target_home: PathBuf,
     note: Option<String>,
@@ -5835,6 +5930,7 @@ struct OpsControlArgs {
     target_home: PathBuf,
     action: OpsControlAction,
     reason: Option<String>,
+    live_control_token: Option<String>,
 }
 
 struct WorkerAdapterEnqueueArgs {
@@ -7156,6 +7252,205 @@ fn ops_backup_args_from_args(args: &[String]) -> Result<OpsBackupArgs, String> {
     })
 }
 
+fn ops_cutover_request_args_from_args(args: &[String]) -> Result<OpsCutoverRequestArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut action = LiveControlAction::Cutover;
+    let mut summary = None;
+    let mut candidate_binary = None;
+    let mut staging_home = None;
+    let mut test_notes = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--action" => {
+                i += 1;
+                action = required_arg(args, i, "--action")?.parse::<LiveControlAction>()?;
+            }
+            "--summary" => {
+                i += 1;
+                summary = Some(required_arg(args, i, "--summary")?.to_string());
+            }
+            "--candidate-binary" => {
+                i += 1;
+                candidate_binary =
+                    Some(PathBuf::from(required_arg(args, i, "--candidate-binary")?));
+            }
+            "--staging-home" => {
+                i += 1;
+                staging_home = Some(PathBuf::from(required_arg(args, i, "--staging-home")?));
+            }
+            "--test-note" => {
+                i += 1;
+                test_notes.push(required_arg(args, i, "--test-note")?.to_string());
+            }
+            value if !value.starts_with('-') => {
+                action = value.parse::<LiveControlAction>()?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(OpsCutoverRequestArgs {
+        target_home,
+        action,
+        summary,
+        candidate_binary,
+        staging_home,
+        test_notes,
+    })
+}
+
+fn ops_cutover_approve_args_from_args(args: &[String]) -> Result<OpsCutoverApproveArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut ticket_id = None;
+    let mut action = LiveControlAction::Cutover;
+    let mut issued_to = None;
+    let mut ttl_seconds = None;
+    let mut reason = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--ticket-id" | "--ticket" => {
+                i += 1;
+                ticket_id = Some(required_arg(args, i, "--ticket-id")?.to_string());
+            }
+            "--action" => {
+                i += 1;
+                action = required_arg(args, i, "--action")?.parse::<LiveControlAction>()?;
+            }
+            "--issued-to" | "--operator" => {
+                i += 1;
+                issued_to = Some(required_arg(args, i, "--issued-to")?.to_string());
+            }
+            "--ttl-seconds" => {
+                i += 1;
+                let value = parse_i64(required_arg(args, i, "--ttl-seconds")?, "--ttl-seconds")?;
+                ttl_seconds = Some(value.max(1));
+            }
+            "--reason" => {
+                i += 1;
+                reason = Some(required_arg(args, i, "--reason")?.to_string());
+            }
+            value if !value.starts_with('-') && ticket_id.is_none() => {
+                ticket_id = Some(value.to_string());
+            }
+            value if !value.starts_with('-') => {
+                action = value.parse::<LiveControlAction>()?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(OpsCutoverApproveArgs {
+        target_home,
+        ticket_id: ticket_id
+            .ok_or_else(|| "ops-cutover-approve requires --ticket-id".to_string())?,
+        action,
+        issued_to,
+        ttl_seconds,
+        reason,
+    })
+}
+
+fn ops_cutover_apply_args_from_args(args: &[String]) -> Result<OpsCutoverApplyArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut ticket_id = None;
+    let mut action = LiveControlAction::Cutover;
+    let mut live_control_token = None;
+    let mut note = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--ticket-id" | "--ticket" => {
+                i += 1;
+                ticket_id = Some(required_arg(args, i, "--ticket-id")?.to_string());
+            }
+            "--action" => {
+                i += 1;
+                action = required_arg(args, i, "--action")?.parse::<LiveControlAction>()?;
+            }
+            "--live-control-token" => {
+                i += 1;
+                live_control_token =
+                    Some(required_arg(args, i, "--live-control-token")?.to_string());
+            }
+            "--note" => {
+                i += 1;
+                note = Some(required_arg(args, i, "--note")?.to_string());
+            }
+            value if !value.starts_with('-') && ticket_id.is_none() => {
+                ticket_id = Some(value.to_string());
+            }
+            value if !value.starts_with('-') => {
+                action = value.parse::<LiveControlAction>()?;
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(OpsCutoverApplyArgs {
+        target_home,
+        ticket_id: ticket_id.ok_or_else(|| "ops-cutover-apply requires --ticket-id".to_string())?,
+        action,
+        live_control_token,
+        note,
+    })
+}
+
+fn ops_cutover_status_args_from_args(args: &[String]) -> Result<OpsCutoverStatusArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut action = None;
+    let mut live_control_token = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--action" => {
+                i += 1;
+                action = Some(required_arg(args, i, "--action")?.parse::<LiveControlAction>()?);
+            }
+            "--live-control-token" => {
+                i += 1;
+                live_control_token =
+                    Some(required_arg(args, i, "--live-control-token")?.to_string());
+            }
+            value if !value.starts_with('-') && action.is_none() => {
+                action = Some(value.parse::<LiveControlAction>()?);
+            }
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(OpsCutoverStatusArgs {
+        target_home,
+        action,
+        live_control_token,
+    })
+}
+
 fn ops_cutover_receipt_args_from_args(args: &[String]) -> Result<OpsCutoverReceiptArgs, String> {
     let mut target_home = default_harness_home();
     let mut note = None;
@@ -7183,6 +7478,7 @@ fn ops_control_args_from_args(args: &[String]) -> Result<OpsControlArgs, String>
     let mut target_home = default_harness_home();
     let mut action = None;
     let mut reason = None;
+    let mut live_control_token = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -7199,6 +7495,11 @@ fn ops_control_args_from_args(args: &[String]) -> Result<OpsControlArgs, String>
                 i += 1;
                 reason = Some(required_arg(args, i, "--reason")?.to_string());
             }
+            "--live-control-token" => {
+                i += 1;
+                live_control_token =
+                    Some(required_arg(args, i, "--live-control-token")?.to_string());
+            }
             value if !value.starts_with('-') && action.is_none() => {
                 action = Some(value.parse::<OpsControlAction>()?);
             }
@@ -7211,6 +7512,7 @@ fn ops_control_args_from_args(args: &[String]) -> Result<OpsControlArgs, String>
         target_home,
         action: action.ok_or_else(|| "ops-control requires stop, start, or status".to_string())?,
         reason,
+        live_control_token,
     })
 }
 
@@ -14158,6 +14460,10 @@ fn print_help() {
     println!("  memory-service-propose Record a reviewed OpenClaw memory proposal");
     println!("  memory-service-store Store approved OpenClaw memory writeback");
     println!("  ops-backup      Copy non-secret harness state and write a backup manifest");
+    println!("  ops-cutover-request Record an operator cutover request and ticket");
+    println!("  ops-cutover-approve Issue a short-lived live-control token for a ticket");
+    println!("  ops-cutover-apply Validate a live-control token before operator cutover");
+    println!("  ops-cutover-status Inspect cutover tickets and optional token status");
     println!("  ops-cutover-receipt Record readiness summary for cutover audit");
     println!("  ops-control     Create/clear/inspect supervisor stop files");
     println!("  supervisor-plan Generate Windows scheduled-task scripts for harness loops");
@@ -14298,7 +14604,15 @@ fn print_help() {
     );
     println!("  --payload <json>        JSON payload for worker-enqueue or memory-hook");
     println!("  --payload-file <path>   JSON payload file for worker-enqueue or memory-hook");
-    println!("  --action <name>         ops-control action: stop, start, or status");
+    println!("  --action <name>         ops-control or live-control action name");
+    println!("  --ticket-id <id>        Cutover approval/apply ticket id");
+    println!("  --summary <text>        Cutover request summary");
+    println!("  --candidate-binary <path> Staged binary intended for cutover");
+    println!("  --staging-home <path>   Staged harness home used for validation");
+    println!("  --test-note <text>      Test evidence for cutover request; repeatable");
+    println!("  --issued-to <name>      Operator/agent recipient for live-control token");
+    println!("  --ttl-seconds <n>       Live-control token lifetime for cutover approval");
+    println!("  --live-control-token <token> Token required for live gateway stop/start");
     println!("  --label <name>          Backup label for ops-backup");
     println!("  --queue-id <id>         Select one runtime queue item for queue-prepare");
     println!("  --execution-dir <path>  Prepared execution directory for codex-plan");

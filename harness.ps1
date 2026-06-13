@@ -23,6 +23,7 @@ Usage:
   harness gateway ps
   harness gateway logs
   harness gateway tail <component> [lines]
+  harness gateway stop --live-control-token <token>
 
 Components for tail:
   runtime, telegram, discord, discord-gateway, discord-outbox, progress, worker, harness, progress-events
@@ -46,10 +47,62 @@ function Require-File {
 }
 
 function Invoke-SupervisorScript {
-    param([string] $Name)
+    param(
+        [string] $Name,
+        [string] $LiveControlToken
+    )
     $script = Join-Path $SupervisorScripts $Name
     Require-File $script "Run supervisor-plan first or verify .agent-harness exists."
-    & $script
+    $previousToken = $env:AGENT_HARNESS_LIVE_CONTROL_TOKEN
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($LiveControlToken)) {
+            $env:AGENT_HARNESS_LIVE_CONTROL_TOKEN = $LiveControlToken
+        }
+        & $script
+    } finally {
+        $env:AGENT_HARNESS_LIVE_CONTROL_TOKEN = $previousToken
+    }
+}
+
+function Test-LiveFlag {
+    param([string] $Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $false
+    }
+    return @('1', 'true', 'yes', 'on', 'live') -contains $Value.Trim().ToLowerInvariant()
+}
+
+function Get-LiveControlTokenArg {
+    for ($i = 0; $i -lt $CommandArgs.Count; $i++) {
+        if ($CommandArgs[$i] -eq '--live-control-token') {
+            if ($i + 1 -ge $CommandArgs.Count) {
+                throw "--live-control-token requires a value"
+            }
+            return $CommandArgs[$i + 1]
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:AGENT_HARNESS_LIVE_CONTROL_TOKEN)) {
+        return $env:AGENT_HARNESS_LIVE_CONTROL_TOKEN
+    }
+    return $null
+}
+
+function Assert-LiveGatewayControlAllowed {
+    param(
+        [string] $Action,
+        [string] $LiveControlToken
+    )
+    if (-not (Test-LiveFlag $env:AGENT_HARNESS_LIVE_SESSION)) {
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($LiveControlToken)) {
+        throw "live-control token is required for live gateway $Action"
+    }
+    Require-File $HarnessExe "Build or deploy target\debug\agent-harness.exe first."
+    $status = & $HarnessExe ops-cutover-status --harness-home $HarnessHome --action $Action --live-control-token $LiveControlToken | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or $status.status -ne 'ready') {
+        throw "live-control token validation failed for live gateway $Action"
+    }
 }
 
 function Show-Status {
@@ -142,18 +195,22 @@ if ($scope -notin @('gateway', 'gw')) {
 }
 
 $action = if ($CommandArgs.Count -ge 2) { $CommandArgs[1].ToLowerInvariant() } else { 'help' }
+$liveControlToken = Get-LiveControlTokenArg
 
 switch ($action) {
     'start' {
-        Invoke-SupervisorScript 'start-scheduled-tasks.ps1'
+        Assert-LiveGatewayControlAllowed 'start' $liveControlToken
+        Invoke-SupervisorScript 'start-scheduled-tasks.ps1' $liveControlToken
     }
     'stop' {
-        Invoke-SupervisorScript 'stop-scheduled-tasks.ps1'
+        Assert-LiveGatewayControlAllowed 'stop' $liveControlToken
+        Invoke-SupervisorScript 'stop-scheduled-tasks.ps1' $liveControlToken
     }
     'restart' {
-        Invoke-SupervisorScript 'stop-scheduled-tasks.ps1'
+        Assert-LiveGatewayControlAllowed 'restart' $liveControlToken
+        Invoke-SupervisorScript 'stop-scheduled-tasks.ps1' $liveControlToken
         Start-Sleep -Seconds 5
-        Invoke-SupervisorScript 'start-scheduled-tasks.ps1'
+        Invoke-SupervisorScript 'start-scheduled-tasks.ps1' $liveControlToken
     }
     'status' {
         Show-Status
@@ -190,4 +247,3 @@ switch ($action) {
         throw "Unknown gateway action: $action`n$(Show-Help)"
     }
 }
-

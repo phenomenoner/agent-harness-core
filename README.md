@@ -105,7 +105,7 @@ One binary, `agent-harness`, grouped into clear families:
 | **Codex pipeline** | `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle` | Plan → preflight → launch → run → record, each stage inspectable and receipt-backed. |
 | **Workers & scheduling** | `worker-enqueue`, `worker-loop`, `worker-status`, `cron-plan`, `cron-scheduler-run-once`, `cron-scheduler-loop`, `native-cron-enqueue`, `deterministic-cron-plan`, `subagent-plan`, … | SQLite-durable jobs: LLM subagents, native/deterministic cron scheduler ticks, no-LLM deterministic shell jobs, watchdogs, master wakeups. |
 | **Memory** | `memory-hook`, `memory-search`, `memory-vector-search`, `memory-service-status/recall/propose/store` | OpenClaw-compatible memory hooks and vector recall over imported snapshots. |
-| **Ops & security** | `status`, `enable-check`, `healthz`, `ops-backup`, `ops-control`, `supervisor-plan`, `vault-put`/`vault-get`, `public-hygiene`, `invariants`, `schema-registry` | Health, cutover gates, backups, Windows Task Scheduler supervision plans, encrypted vault, release hygiene. |
+| **Ops & security** | `status`, `enable-check`, `healthz`, `ops-backup`, `ops-cutover-request/approve/apply/status`, `ops-control`, `supervisor-plan`, `vault-put`/`vault-get`, `public-hygiene`, `invariants`, `schema-registry` | Health, live-control cutover tokens, backups, Windows Task Scheduler supervision plans, encrypted vault, release hygiene. |
 
 ## Design Principles
 
@@ -117,7 +117,7 @@ One binary, `agent-harness`, grouped into clear families:
 
 ## Project Status
 
-Pre-release, under active development, and **live-validated daily**: the reference deployment runs a single supervised runtime loop (concurrency 12) plus worker, progress, Telegram, and Discord loops, with hundreds of delivered turns on record. Current verification: 229 core tests + 18 CLI tests + 0 doctests, `cargo fmt` clean.
+Pre-release, under active development, and **live-validated daily**: the reference deployment runs a single supervised runtime loop (concurrency 12) plus worker, progress, Telegram, and Discord loops, with hundreds of delivered turns on record. Current verification: 239 core tests + 18 CLI tests, staged workspace check/build, public export hygiene, and `cargo fmt` clean.
 
 See the [Changelog](CHANGELOG.md), the [Roadmap & Backlog](docs/agent-harness-core-roadmap-backlog.md), and the [Activation Readiness Plan](docs/activation-readiness-plan.md) for what's done, gated, and next.
 

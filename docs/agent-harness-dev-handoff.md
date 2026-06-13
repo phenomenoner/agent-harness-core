@@ -55,7 +55,7 @@ Latest local status after the 2026-06-10 repo-local harness-home rebase, round3 
 - Memory: Qdrant edge snapshot present, `openclaw-mem.sqlite` present, active recall via `sqlite-vector`, `qdrantParity=snapshot-preserved; native-recall-not-active`, embedding secret migrated, vector recall ready, prompt context ready, lifecycle receipts present, capture candidates=7, compact canvas written, and `memory-hook` receipt recorded.
 - Plugins: sidecar catalog present, 2 manifest-derived tools visible, sidecar bridge OK, `hooks.invoke` receipt recorded, and `memory.slot` receipt recorded.
 - Workers: SQLite worker store is implemented at `state/workers/worker-jobs.sqlite`; `worker-loop` is generated and running; current worker store totals are `total=0`, `pending=0`, `running=0`, `failedTerminal=0`.
-- Validation: latest local implementation test pass is `cargo fmt`, `cargo check`, and `cargo test` with 229 core tests, 18 CLI tests, and 0 doctests. Deployment validation passed `cargo build --workspace`, gateway restart, live `status`, live `enable-check`, outbox plan, and process listing. Previous round3-1 activation also passed `cargo fmt --check`, `cargo build --target-dir target\codex-build`, supervisor-plan smoke, process command-line verification, and `jsonl-repair` smoke.
+- Validation: latest local implementation test pass is `cargo fmt --all --check`, staged workspace check, 239 core tests, 18 CLI tests, staged build, public export hygiene, and non-live cutover CLI smoke. Earlier deployment validation passed `cargo build --workspace`, gateway restart, live `status`, live `enable-check`, outbox plan, and process listing. Previous round3-1 activation also passed `cargo fmt --check`, `cargo build --target-dir target\codex-build`, supervisor-plan smoke, process command-line verification, and `jsonl-repair` smoke.
 - Live-test readiness: regenerated supervisor scripts point to `target/debug/agent-harness.exe`, `.agent-harness` as `--source-home`, `--runtime-workspace D:\Warehouse\Research\OpenClaw_WSL`, `tools/agent-discord-gateway/index.mjs`, one `runtime-loop.ps1`, and `worker-loop.ps1`; loops were restarted manually as hidden PowerShell processes because `AgentHarness-*` scheduled task registration returned access-denied in this environment; latest `status` and `enable-check` are ready with no warnings.
 
 Current non-blocking warning:
@@ -240,7 +240,7 @@ Current state:
 - The two cron source lanes stay separate for policy and import fidelity: native `.openclaw/cron` may enqueue LLM-backed agent/subagent work; deterministic crontab/Supercronic-style workspace runners enqueue only no-LLM shell jobs.
 - Subagent and deterministic child-job completion must be able to wake the master agent. Fan-out work should create a `job_group_id` and a deterministic watchdog that wakes the master on all-completed, any-failed, timeout, checkpoint, or threshold policies with bounded artifact pointers.
 - Worker leasing enforces harness-configurable concurrency limits before execution: a global limit, a per-agent/group limit, a per-agent-per-channel limit, optional lane limits, and optional rate leases. The current live defaults are global 12, per-agent 6, per-agent-per-channel 3, lane limits `llm=6`, `shell=6`, `watchdog=2`, `maintenance=2`, `plugin=2`. If a limit is reached, extra subagent, deterministic, or cron jobs stay queued instead of starting.
-- `cron-scheduler-run-once` and `cron-scheduler-loop` now provide the repeated scheduler tick. They evaluate native and deterministic cron sources, write durable watermarks under `state/cron-scheduler/watermarks.sqlite`, append scheduler decision receipts, and enqueue due work into the worker store with an idempotency key based on source kind, source id, entry id, and scheduled time.
+- `cron-scheduler-run-once` and `cron-scheduler-loop` now provide the repeated scheduler tick. They evaluate native and deterministic cron sources, including imported native schedules that use `expr` plus `tz`/`timezone` fields, write durable watermarks under `state/cron-scheduler/watermarks.sqlite`, append scheduler decision receipts, and enqueue due work into the worker store with an idempotency key based on source kind, source id, entry id, and scheduled time.
 - The scheduler is opt-in through `cronScheduler.enabled`, `--enable`, or an intentionally generated `cron-scheduler-loop` supervisor task. Dry-run remains the default-safe operator mode for validation.
 
 Implemented MVP:
@@ -277,7 +277,8 @@ Implemented:
 - Loop heartbeats.
 - Stop files.
 - Worker stop file and `worker-loop` supervisor script.
-- `ops-backup`, `ops-cutover-receipt`, and `ops-control stop|start|status`.
+- `ops-backup`, `ops-cutover-request`, `ops-cutover-approve`, `ops-cutover-apply`, `ops-cutover-status`, `ops-cutover-receipt`, and `ops-control stop|start|status`.
+- Live gateway self-protection: live Codex app-server child processes get `AGENT_HARNESS_LIVE_SESSION=1`, live `.agent-harness` app-server approval mode is forced to request approvals, protected gateway/scheduled-task/binary-control approval requests are denied even when general approvals are accepted, generated supervisor scripts and `harness.ps1` require live-control tokens in live-agent context, and live agent sessions cannot self-issue cutover tokens.
 - Compact progress event ledger plus Telegram/Discord action/status progress messages.
 - `progress-delivery-loop` generated with the supervised loop bundle.
 - Windows scheduled-task script generation.
@@ -343,9 +344,10 @@ cargo build -p agent-harness-cli
 
 Current passing results:
 
-- Core tests: 229 passed after channel identity, delivery intent, runtime backoff, cron scheduler, progress, runtime lease, atomic state writes, cancellation, terminal failure, supervisor, runtime UX hardening, and worker concurrency fixes.
+- Core tests: 239 passed after channel identity, delivery intent, runtime backoff, cron scheduler `expr`/`tz`, live-control guard, cutover token flow, progress, runtime lease, atomic state writes, cancellation, terminal failure, supervisor, runtime UX hardening, and worker concurrency fixes.
 - CLI tests: 18 passed.
-- Build: `cargo build -p agent-harness-cli` passed after stopping old live loops that were holding `target/debug/agent-harness.exe`.
+- Build: `cargo build -p agent-harness-cli --target-dir target\staging-build-round4-2-live-guard` passed without touching live `target/debug`.
+- Public hygiene: `.public-export\agent-harness-core` passed. Running public hygiene against repo root is expected to fail because root intentionally contains live `.agent-harness` state.
 
 Important test notes:
 
@@ -353,6 +355,7 @@ Important test notes:
 - Use `.tools/codex-cli/node_modules/.bin/codex.cmd`.
 - Use `tools/agent-fake-codex-app-server` for offline runtime tests where model requests are not desired.
 - Live Telegram/Discord smoke may make real channel sends.
+- Use staging target directories for validation until the intentional live cutover step; do not replace `target\debug\agent-harness.exe` while live loops are using it.
 
 ## Suggested Next Development Order
 

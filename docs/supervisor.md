@@ -22,9 +22,13 @@ One runtime loop owns queue inspection and dispatch. Per-item leases and worker 
 
 The generated `start-scheduled-tasks.ps1` first tries `Start-ScheduledTask`. If a task is not registered, it starts the generated runner script directly as a hidden PowerShell process. This makes local operator handoff work even before Task Scheduler registration succeeds.
 
+When the script is invoked from a live agent session (`AGENT_HARNESS_LIVE_SESSION=1`), it validates `AGENT_HARNESS_LIVE_CONTROL_TOKEN` or `-LiveControlToken` through `ops-cutover-status` before mutating live scheduled tasks or clearing stop files. Local staging scripts are unaffected unless the live-session marker is present.
+
 ## Stop Files
 
 The generated stop script creates stop files for each loop. Long-running loops check those files and stop gracefully after active work reaches a safe point.
+
+The generated stop and uninstall scripts use the same live-control guard as start. A live channel agent turn must not stop/uninstall its own gateway path; it should create an `ops-cutover-request` ticket and wait for operator approval.
 
 ## Log Retention
 

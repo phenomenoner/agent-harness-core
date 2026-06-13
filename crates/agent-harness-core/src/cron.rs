@@ -59,6 +59,7 @@ pub struct NativeCronJobState {
 pub enum NativeCronSchedule {
     Cron {
         expression: String,
+        timezone: Option<String>,
     },
     At {
         text: Option<String>,
@@ -301,7 +302,7 @@ fn plan_schedule_action(job: &NativeCronJob, now_ms: i64) -> (NativeCronPlanActi
             NativeCronPlanAction::UnsupportedSchedule,
             "at schedule has no parseable epoch milliseconds".to_string(),
         ),
-        NativeCronSchedule::Cron { expression } => (
+        NativeCronSchedule::Cron { expression, .. } => (
             NativeCronPlanAction::CronRegistered,
             format!("cron expression registered for scheduler evaluation: {expression}"),
         ),
@@ -455,6 +456,7 @@ fn parse_schedule(job: &Value) -> NativeCronSchedule {
         if looks_like_cron(text) {
             return NativeCronSchedule::Cron {
                 expression: text.to_string(),
+                timezone: None,
             };
         }
         return NativeCronSchedule::Unknown {
@@ -464,10 +466,11 @@ fn parse_schedule(job: &Value) -> NativeCronSchedule {
 
     if let Some(kind) = string_field(schedule, &["type", "kind"]) {
         if kind.eq_ignore_ascii_case("cron")
-            && let Some(expression) = string_field(schedule, &["expression", "cron"])
+            && let Some(expression) = string_field(schedule, &["expression", "cron", "expr"])
         {
             return NativeCronSchedule::Cron {
                 expression: expression.to_string(),
+                timezone: schedule_timezone(schedule),
             };
         }
         if kind.eq_ignore_ascii_case("at") {
@@ -481,9 +484,10 @@ fn parse_schedule(job: &Value) -> NativeCronSchedule {
         }
     }
 
-    if let Some(expression) = string_field(schedule, &["expression", "cron"]) {
+    if let Some(expression) = string_field(schedule, &["expression", "cron", "expr"]) {
         return NativeCronSchedule::Cron {
             expression: expression.to_string(),
+            timezone: schedule_timezone(schedule),
         };
     }
     if schedule.get("at").is_some() || schedule.get("time").is_some() {
@@ -499,6 +503,10 @@ fn parse_schedule(job: &Value) -> NativeCronSchedule {
     NativeCronSchedule::Unknown {
         summary: compact_json_string(schedule).unwrap_or_else(|| "unknown".to_string()),
     }
+}
+
+fn schedule_timezone(schedule: &Value) -> Option<String> {
+    string_field(schedule, &["tz", "timezone", "timeZone"]).map(ToString::to_string)
 }
 
 fn extract_message_text(job: &Value) -> Option<String> {
@@ -677,8 +685,8 @@ mod tests {
 
         let store = load_native_cron_store(&source).unwrap();
 
-        assert_eq!(store.summary.total_jobs, 6);
-        assert_eq!(store.summary.enabled_jobs, 5);
+        assert_eq!(store.summary.total_jobs, 7);
+        assert_eq!(store.summary.enabled_jobs, 6);
         assert_eq!(store.summary.disabled_jobs, 1);
         assert_eq!(store.summary.state_entries, 2);
         let cron_job = store.jobs.iter().find(|job| job.id == "cron-job").unwrap();
@@ -686,7 +694,19 @@ mod tests {
         assert_eq!(cron_job.message_text.as_deref(), Some("Run memory cron"));
         assert!(matches!(
             cron_job.schedule,
-            NativeCronSchedule::Cron { ref expression } if expression == "*/5 * * * *"
+            NativeCronSchedule::Cron { ref expression, .. } if expression == "*/5 * * * *"
+        ));
+        let expr_cron_job = store
+            .jobs
+            .iter()
+            .find(|job| job.id == "expr-cron-job")
+            .unwrap();
+        assert!(matches!(
+            expr_cron_job.schedule,
+            NativeCronSchedule::Cron {
+                ref expression,
+                timezone: Some(ref timezone),
+            } if expression == "10 9 * * *" && timezone == "Asia/Taipei"
         ));
         let at_job = store.jobs.iter().find(|job| job.id == "at-due").unwrap();
         assert!(matches!(
@@ -716,9 +736,9 @@ mod tests {
             },
         );
 
-        assert_eq!(plan.summary.total_jobs, 6);
+        assert_eq!(plan.summary.total_jobs, 7);
         assert_eq!(plan.summary.disabled, 1);
-        assert_eq!(plan.summary.cutover_held, 5);
+        assert_eq!(plan.summary.cutover_held, 6);
         assert_eq!(plan.summary.enqueue_agent_turns, 0);
         assert!(
             plan.warnings
@@ -748,7 +768,7 @@ mod tests {
         assert_eq!(plan.summary.disabled, 1);
         assert_eq!(plan.summary.enqueue_agent_turns, 1);
         assert_eq!(plan.summary.waiting_schedule, 1);
-        assert_eq!(plan.summary.cron_registered, 1);
+        assert_eq!(plan.summary.cron_registered, 2);
         assert_eq!(plan.summary.missing_agent, 1);
         assert_eq!(plan.summary.unsupported_schedule, 1);
 
@@ -799,7 +819,7 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_slice(&fs::read(file.json).unwrap()).unwrap();
         assert_eq!(json["schema"], NATIVE_CRON_PLAN_SCHEMA);
-        assert_eq!(json["summary"]["totalJobs"], 6);
+        assert_eq!(json["summary"]["totalJobs"], 7);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -834,6 +854,13 @@ mod tests {
                   "schedule": { "type": "cron", "expression": "*/5 * * * *" },
                   "wakeMode": "now",
                   "payload": { "message": "Run memory cron" }
+                },
+                {
+                  "id": "expr-cron-job",
+                  "enabled": true,
+                  "agentId": "main",
+                  "schedule": { "kind": "cron", "expr": "10 9 * * *", "tz": "Asia/Taipei" },
+                  "payload": { "message": "Run expr cron" }
                 },
                 {
                   "id": "at-due",

@@ -9,9 +9,9 @@ This is the working checklist for turning the Rust Windows Agent Harness from a 
 2026-06-12 repo-local harness-home baseline after round3-2 timeout/progress reconciliation:
 
 - Live harness home is now repo-local `.agent-harness`; `.agent-harness/` is ignored by git. `imports/activation-harness` remains only as a pre-rebase backup.
-- Latest channel identity / delivery intent / cron scheduler implementation verification passed `cargo fmt`, `cargo check`, and `cargo test` with 229 core tests, 18 CLI tests, and 0 doctests.
+- Latest channel identity / delivery intent / cron scheduler / live-control implementation verification passed `cargo fmt --all --check`, staged workspace check, 239 core tests, 18 CLI tests, staged build, public export hygiene, and non-live cutover CLI smoke.
 - `agent-harness.exe` builds; `cargo fmt --all` and full `cargo test --workspace` passed with 207 core tests, 16 CLI tests, and doc-tests. Previous activation also passed `cargo build`.
-- Latest deployment validation passed `cargo build --workspace`, gateway stop/start with direct runners, live `status`, live `enable-check`, and outbox plan.
+- Earlier deployment validation passed `cargo build --workspace`, gateway stop/start with direct runners, live `status`, live `enable-check`, and outbox plan. Current Round4-2 live cutovers should use `ops-cutover-request`/`approve`/`apply` plus `harness.ps1 gateway start|stop|restart --live-control-token <token>` instead of direct self-stop from a live channel turn.
 - Supervisor scripts were regenerated with `target/debug/agent-harness.exe`, `--source-home`, `--runtime-workspace D:\Warehouse\Research\OpenClaw_WSL`, `tools/agent-discord-gateway/index.mjs`, one bounded-concurrency `runtime-loop.ps1`, and `worker-loop.ps1`.
 - `AgentHarness-*` scheduled task registration returned access-denied in this environment, so the runtime workers, worker, progress delivery, Telegram, Discord outbox, and Discord gateway loops were started manually as hidden PowerShell processes from the generated scripts.
 - Round3-2 timeout/progress reconciliation is implemented: `timeout` is terminal for runtime queue selection, status open-item counts, native typing context, and progress delivery state. A queued pending row with a timeout receipt should no longer be interpreted as open work. See `docs/round3-2-implementation-and-upgrade-plan.md`.
@@ -20,7 +20,7 @@ This is the working checklist for turning the Rust Windows Agent Harness from a 
 - Worker config is live at global=12, per-agent/group=6, per-agent-per-channel=3, lane limits `llm=6`, `shell=6`, `watchdog=2`, `maintenance=2`, `plugin=2`, with no worker config warnings.
 - Prompt-file loading now falls back from runtime cwd to imported workspace when needed, and injected prompt files include role headers for `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `USER.md`, `IDENTITY.md`, `HEARTBEAT.md`, and `BOOTSTRAP.md`. Skills are dynamic task context, so `Skills: 0 selected` can be normal for command/status turns.
 - Progress rendering now compacts long PowerShell/Codex tool-call previews, suppressed low-value `assistant_stream` deltas, routes assistant narration to the editable `Current step` status under the default `progress_panel` setting, skipped-denied progress delivery advances the cursor to prevent repeated Telegram `Working` messages, and terminal runtime progress cannot be downgraded by later stray events for the same parent queue id.
-- `ops-cutover-receipt` recorded `status=ready`; the latest activation notes include runtime UX hardening, durable ops activation, assistant narration routing, and docs sync.
+- `ops-cutover-receipt` recorded `status=ready`; the latest activation notes include runtime UX hardening, durable ops activation, assistant narration routing, live-control cutover tokens, and docs sync.
 - `memory-lancedb` is hidden unless the source config explicitly selects LanceDB as the active memory backend.
 - Controlled online testing can proceed by having an allowed Telegram/Discord user send a normal message, then recording transcript and delivery receipt paths here.
 
@@ -204,8 +204,8 @@ These should be run before stopping the Docker gateway.
    - Done for scheduled-task install path: `supervisor-plan` generates user-logon scheduled task scripts and stop/start/uninstall helpers under `state/supervisor/windows-scheduled-tasks`.
    - Done for CLI health/status: `status` summarizes readiness, runtime queue, channel outbox, memory, plugins, and logs; `--json` is monitor-friendly.
    - Still required: operator-run task registration/start smoke, process supervisor health endpoint or scheduled-task monitor integration.
-   - Backup/export command.
-   - Explicit cutover command that records operator intent.
+   - Done for backup/export command: `ops-backup`.
+   - Done for explicit cutover intent: `ops-cutover-request`, `ops-cutover-approve`, `ops-cutover-apply`, and `ops-cutover-status` record ticket/token/apply/status receipts.
 
 ## Current Activation Snapshot
 

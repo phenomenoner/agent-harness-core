@@ -9,12 +9,12 @@ use crate::{HARNESS_BUILTIN_SKILL_NAMESPACE, SKILL_FILE_NAME};
 const BUILTIN_HARNESS_SKILL_SYNC_SCHEMA: &str = "agent-harness.builtin-skill-sync.v1";
 const BUILTIN_HARNESS_SKILL_MANIFEST_SCHEMA: &str = "agent-harness.builtin-skill-manifest.v1";
 const AGENT_WINDOWS_HARNESS_SKILL_ID: &str = "agent-windows-harness";
-const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.8";
+const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.9";
 
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
 description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, response tone, and Codex prompt continuity policy.
-version: 0.1.8
+version: 0.1.9
 platforms: [windows]
 metadata:
   agent_harness:
@@ -60,6 +60,8 @@ Use it when the user mentions:
 17. For every new functional component or behavior change, add or update a `/docs/` note that records the design rationale and a concise changelog. Do not leave feature history discoverable only through git commits or chat context.
 18. Treat channel identity registry misses, disabled bindings, ambiguous bindings, and agent mismatches as fail-closed ingress stops. Allow-lists are necessary but not sufficient when a channel identity registry is present.
 19. Treat cron-scheduler-loop as a scheduler/enqueue loop only. Worker-loop owns job execution, retry, leases, and recovery.
+20. Treat live gateway control as a protected control plane. A live channel agent turn must not stop, start, restart, uninstall, kill, mutate supervisor stop files, or replace the gateway binary that carries the current session unless it is following an operator-approved live-control token/cutover flow.
+21. If the current task requires changing Agent Harness itself, live gateway behavior, supervisor scripts, channel adapters, runtime loops, or the binary/config carrying this live session, write a concise tech note with the observed bug, user scenario, evidence, suggested fix, validation plan, and risks; tell the user the tech note path; and pause the original task until the user continues from a local/dev session or operator-approved patch flow.
 
 ## Prompt And Tool Schema Policy
 
@@ -86,13 +88,13 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - Treat `skills\legacy-imports` and `skills\openclaw-imports` as valid imported skill namespaces.
 - Current OpenClaw workspace skills are expected under `skills\openclaw-imports\workspace`; legacy backup imports may still use `skills\legacy-imports`.
 - When a live prompt bundle is missing an imported guardrail or specialist skill, first compare the source tree with `agent-harness skills --harness-home <harness> --limit <n>`.
-- If an isolated build sees imported skills but `target\debug\agent-harness.exe` does not, schedule a controlled live stop, rebuild the canonical binary, restart through the supervisor path, then re-run canonical skill-index and local smoke tests.
+- If an isolated build sees imported skills but `target\debug\agent-harness.exe` does not, create an `ops-cutover-request`, obtain an operator-issued live-control token, perform the controlled live cutover through the supervisor path, then re-run canonical skill-index and local smoke tests.
 
 ## JSONL Ledger Hygiene
 
 - Use the shared harness JSONL append path for new receipt/log writers; do not add ad hoc `OpenOptions::append(true)` plus `writeln!` JSONL writers.
 - `jsonl-repair --path <ledger>` is the dry-run validation path. It writes repaired and invalid sidecars and reports `valid`, `output`, `recoveredLines`, `recoveredValues`, and `invalid`.
-- For live ledger repair, stop the gateway first, build the canonical binary, run `jsonl-repair --path <ledger> --apply`, then restart the gateway. `--apply` writes a `.bak-<timestamp>.jsonl` backup before replacing the ledger.
+- For live ledger repair, use the cutover token flow before stopping the gateway. Build the canonical binary from staging, validate the token/ticket with `ops-cutover-apply`, run `jsonl-repair --path <ledger> --apply` during the operator-controlled window, then restart the gateway through the supervisor path. `--apply` writes a `.bak-<timestamp>.jsonl` backup before replacing the ledger.
 - Treat `recoveredLines>0` with `invalid=0` as successful recovery of concatenated JSON values such as `}{`; treat `invalid>0` as quarantine that needs manual inspection before claiming the ledger is clean.
 - After repair, run `healthz --require-writable-state` and `status --json`; affected ledgers should report `invalidLines=0`.
 

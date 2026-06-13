@@ -16,7 +16,9 @@ use crate::{
     config::{
         HarnessConfigValidationReport, HarnessConfigValidationStatus, validate_harness_config,
     },
-    current_log_time_ms, write_json_atomic,
+    current_log_time_ms,
+    live_control::{classify_approval_request, is_live_harness_home},
+    write_json_atomic,
 };
 
 const CODEX_RUNTIME_PLAN_SCHEMA: &str = "agent-harness.codex-runtime-plan.v1";
@@ -32,7 +34,12 @@ This Codex app-server thread backs an imported agent harness session. Codex owns
 the backend system prompt, tool schemas, MCP/tool inventory, sandbox, approvals, \
 and thread continuity. The chat-facing agent identity and operating context come \
 from the Agent prompt bundle passed as turn input. Do not treat the Rust harness \
-development repository as the chat user's agent identity.";
+development repository as the chat user's agent identity.\n\n\
+If you discover an agent-harness-core or live gateway bug while working for a \
+chat user, do not patch or restart the live gateway from inside this session. \
+Write a technical note describing the problem, user scenario, evidence, and \
+recommended change, notify the user that an operator patch is needed, and pause \
+the original task until the user gives further instructions.";
 const HARNESS_CONFIG_FILE_NAME: &str = "harness-config.json";
 pub(crate) const CODEX_APPROVAL_POLICY_ENV: &str = "AGENT_HARNESS_CODEX_APPROVAL_POLICY";
 pub(crate) const CODEX_SANDBOX_ENV: &str = "AGENT_HARNESS_CODEX_SANDBOX";
@@ -608,7 +615,11 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
         .codex_executable
         .unwrap_or_else(|| PathBuf::from("codex"));
     let approval_policy = resolve_codex_approval_policy(&options.harness_home, &mut warnings);
-    let app_server_approval_policy = codex_app_server_approval_policy(approval_policy).to_string();
+    let app_server_approval_policy = if is_live_harness_home(&options.harness_home) {
+        "on-request".to_string()
+    } else {
+        codex_app_server_approval_policy(approval_policy).to_string()
+    };
     let app_server_sandbox = resolve_codex_sandbox_policy(&options.harness_home, &mut warnings);
     let provider_config = codex_provider_config(provider.as_deref());
     let codex_home = harness_codex_home(&options.harness_home, provider_config.as_ref());
@@ -1805,7 +1816,10 @@ impl RuntimeCancelCheck {
     }
 }
 
-fn app_server_approval_policy_for_plan(plan: &CodexRuntimePlanFile) -> String {
+fn app_server_approval_policy_for_plan(harness_home: &Path, plan: &CodexRuntimePlanFile) -> String {
+    if is_live_harness_home(harness_home) {
+        return "on-request".to_string();
+    }
     let configured = plan.invocation.app_server_approval_policy.trim();
     if configured.is_empty() {
         codex_app_server_approval_policy(plan.invocation.approval_policy).to_string()
@@ -1885,6 +1899,7 @@ fn drive_codex_app_server(
         &plan.invocation.env_requirements,
     );
     apply_codex_home_env(&mut command, plan);
+    apply_live_agent_session_env(&mut command, harness_home);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -1971,7 +1986,7 @@ fn drive_codex_app_server(
         }),
     )?;
     let mut thread_params = json!({});
-    let app_server_approval_policy = app_server_approval_policy_for_plan(plan);
+    let app_server_approval_policy = app_server_approval_policy_for_plan(harness_home, plan);
     let app_server_sandbox = app_server_sandbox_for_plan(plan);
     let runtime_workspace_root = plan
         .invocation
@@ -3284,6 +3299,27 @@ fn answer_unattended_server_request(
     let Some(id) = value.get("id").cloned() else {
         return Ok(false);
     };
+    if let Some(intent) = classify_approval_request(value) {
+        if intent.action.destructive() {
+            let Some(result) = unattended_approval_result(value, CodexApprovalPolicy::Deny) else {
+                return Ok(false);
+            };
+            write_json_rpc(
+                stdin,
+                &json!({
+                    "id": id,
+                    "result": result
+                }),
+            )?;
+            let summary = approval_request_summary(value);
+            state.denied_approval_requests.push(summary);
+            state.warnings.push(format!(
+                "blocked protected live gateway control request {method}: {}",
+                intent.reason
+            ));
+            return Ok(true);
+        }
+    }
     let Some(result) = unattended_approval_result(value, approval_policy) else {
         return Ok(false);
     };
@@ -4009,6 +4045,7 @@ fn spawn_launch_probe(
         &plan.invocation.env_requirements,
     );
     apply_codex_home_env(&mut command, plan);
+    apply_live_agent_session_env(&mut command, harness_home);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -5375,6 +5412,12 @@ fn apply_codex_home_env(command: &mut Command, plan: &CodexRuntimePlanFile) {
     }
 }
 
+fn apply_live_agent_session_env(command: &mut Command, harness_home: &Path) {
+    if is_live_harness_home(harness_home) {
+        command.env("AGENT_HARNESS_LIVE_SESSION", "1");
+    }
+}
+
 fn string_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
     for key in keys {
         if let Some(text) = value.get(*key).and_then(Value::as_str) {
@@ -5729,7 +5772,7 @@ mod tests {
 
         let plan = report.plan.unwrap();
         assert_eq!(plan.invocation.approval_policy, CodexApprovalPolicy::Accept);
-        assert_eq!(plan.invocation.app_server_approval_policy, "never");
+        assert_eq!(plan.invocation.app_server_approval_policy, "on-request");
         assert_eq!(plan.invocation.app_server_sandbox, "dangerFullAccess");
 
         let plan_file = report.plan_file.unwrap();
@@ -5740,7 +5783,7 @@ mod tests {
         );
         assert_eq!(
             plan_json["invocation"]["appServerApprovalPolicy"],
-            serde_json::json!("never")
+            serde_json::json!("on-request")
         );
         assert_eq!(
             plan_json["invocation"]["appServerSandbox"],
@@ -6572,6 +6615,40 @@ mod tests {
             serde_json::from_slice(String::from_utf8(out).unwrap().trim().as_bytes()).unwrap();
         assert_eq!(response["id"], 8);
         assert_eq!(response["result"]["decision"], "accept");
+    }
+
+    #[test]
+    fn answer_unattended_server_request_blocks_live_gateway_control_even_when_policy_allows() {
+        let mut state = CodexProtocolState::default();
+        let mut out = Vec::new();
+
+        let handled = answer_unattended_server_request(
+            &serde_json::json!({
+                "id": 88,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "command": ".\\harness.ps1 gateway restart",
+                    "cwd": "D:\\Warehouse\\Rust-OpenClaw-Core"
+                }
+            }),
+            &mut out,
+            &mut state,
+            CodexApprovalPolicy::Accept,
+        )
+        .unwrap();
+
+        assert!(handled);
+        let response: Value =
+            serde_json::from_slice(String::from_utf8(out).unwrap().trim().as_bytes()).unwrap();
+        assert_eq!(response["id"], 88);
+        assert_eq!(response["result"]["decision"], "cancel");
+        assert_eq!(state.denied_approval_requests.len(), 1);
+        assert!(
+            state
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("blocked protected live gateway control request"))
+        );
     }
 
     #[test]

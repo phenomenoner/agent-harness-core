@@ -1067,7 +1067,10 @@ fn native_due_slot(schedule: &NativeCronSchedule, now_ms: i64) -> Result<Option<
         NativeCronSchedule::At { epoch_ms: None, .. } => {
             Err("at schedule has no epoch milliseconds".to_string())
         }
-        NativeCronSchedule::Cron { expression } => cron_expression_due_slot(expression, now_ms),
+        NativeCronSchedule::Cron {
+            expression,
+            timezone,
+        } => cron_expression_due_slot_with_timezone(expression, timezone.as_deref(), now_ms),
         NativeCronSchedule::Unknown { summary } => {
             Err(format!("unsupported native cron schedule: {summary}"))
         }
@@ -1090,6 +1093,14 @@ fn deterministic_due_slot(
 }
 
 fn cron_expression_due_slot(expression: &str, now_ms: i64) -> Result<Option<i64>, String> {
+    cron_expression_due_slot_with_timezone(expression, None, now_ms)
+}
+
+fn cron_expression_due_slot_with_timezone(
+    expression: &str,
+    timezone: Option<&str>,
+    now_ms: i64,
+) -> Result<Option<i64>, String> {
     let fields = expression.split_whitespace().collect::<Vec<_>>();
     if fields.len() != 5 {
         return Err(format!(
@@ -1097,9 +1108,11 @@ fn cron_expression_due_slot(expression: &str, now_ms: i64) -> Result<Option<i64>
         ));
     }
     let minute_slot = floor_to_minute(now_ms);
-    let minute = ((minute_slot / 60_000) % 60) as i64;
-    let hour = ((minute_slot / 3_600_000) % 24) as i64;
-    let days = minute_slot / 86_400_000;
+    let offset_minutes = timezone_offset_minutes(timezone)?;
+    let local_slot = minute_slot + offset_minutes * 60_000;
+    let minute = ((local_slot / 60_000) % 60) as i64;
+    let hour = ((local_slot / 3_600_000) % 24) as i64;
+    let days = local_slot / 86_400_000;
     let dow = (days + 4).rem_euclid(7);
     if !matches_cron_field(fields[0], minute, 0, 59)? {
         return Ok(None);
@@ -1117,6 +1130,45 @@ fn cron_expression_due_slot(expression: &str, now_ms: i64) -> Result<Option<i64>
         return Ok(None);
     }
     Ok(Some(minute_slot))
+}
+
+fn timezone_offset_minutes(timezone: Option<&str>) -> Result<i64, String> {
+    let Some(timezone) = timezone else {
+        return Ok(0);
+    };
+    let normalized = timezone.trim();
+    if normalized.is_empty()
+        || normalized.eq_ignore_ascii_case("utc")
+        || normalized.eq_ignore_ascii_case("z")
+    {
+        return Ok(0);
+    }
+    if normalized.eq_ignore_ascii_case("Asia/Taipei") {
+        return Ok(8 * 60);
+    }
+    parse_numeric_timezone_offset(normalized)
+        .ok_or_else(|| format!("unsupported cron timezone `{normalized}`"))
+}
+
+fn parse_numeric_timezone_offset(value: &str) -> Option<i64> {
+    let (sign, rest) = match value.as_bytes().first().copied()? {
+        b'+' => (1, &value[1..]),
+        b'-' => (-1, &value[1..]),
+        _ => return None,
+    };
+    let (hours, minutes) = match rest.split_once(':') {
+        Some((hours, minutes)) => (hours.parse::<i64>().ok()?, minutes.parse::<i64>().ok()?),
+        None if rest.len() == 2 => (rest.parse::<i64>().ok()?, 0),
+        None if rest.len() == 4 => (
+            rest[0..2].parse::<i64>().ok()?,
+            rest[2..4].parse::<i64>().ok()?,
+        ),
+        None => return None,
+    };
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    Some(sign * (hours * 60 + minutes))
 }
 
 fn macro_due_slot(name: &str, now_ms: i64) -> Result<Option<i64>, String> {
@@ -1267,6 +1319,29 @@ mod tests {
     }
 
     #[test]
+    fn cron_expression_uses_native_timezone_offset() {
+        let taipei_09_10_utc_slot = (1 * 3_600_000) + (10 * 60_000);
+        assert_eq!(
+            cron_expression_due_slot_with_timezone(
+                "10 9 * * *",
+                Some("Asia/Taipei"),
+                taipei_09_10_utc_slot + 1234,
+            )
+            .unwrap(),
+            Some(taipei_09_10_utc_slot)
+        );
+        assert!(
+            cron_expression_due_slot_with_timezone(
+                "10 9 * * *",
+                Some("Asia/Taipei"),
+                9 * 3_600_000 + 10 * 60_000,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
     fn run_once_enqueues_native_due_at_once_and_dedupes() {
         let root = temp_root("run_once_enqueues_native_due_at_once_and_dedupes");
         let source = write_source(&root);
@@ -1304,6 +1379,45 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn run_once_enqueues_imported_expr_cron_with_native_timezone() {
+        let root = temp_root("run_once_enqueues_imported_expr_cron_with_native_timezone");
+        let source = write_expr_cron_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        let taipei_09_10_utc_slot = (1 * 3_600_000) + (10 * 60_000);
+
+        let report = run_cron_scheduler_once(CronSchedulerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            source,
+            runtime_workspace: None,
+            now_ms: taipei_09_10_utc_slot + 1234,
+            dry_run: false,
+            enabled_override: Some(true),
+            native_enabled_override: Some(true),
+            deterministic_enabled_override: Some(false),
+            resume_cron_override: Some(true),
+            include_registered_cron_override: Some(true),
+            allow_deterministic_run_override: None,
+            execute_shell_override: None,
+            max_catchup_per_tick_override: None,
+            max_enqueue_per_tick_override: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, CronSchedulerTickStatus::Completed);
+        assert_eq!(report.summary.enqueued, 1);
+        assert_eq!(report.decisions.len(), 1);
+        assert_eq!(report.decisions[0].entry_id, "expr-cron-job");
+        assert_eq!(report.decisions[0].scheduled_for_ms, taipei_09_10_utc_slot);
+        assert_eq!(
+            report.decisions[0].decision,
+            CronSchedulerJobDecisionStatus::Enqueued
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn write_source(root: &Path) -> AgentSource {
         let home = root.join(".openclaw");
         let workspace = home.join("workspace");
@@ -1329,6 +1443,39 @@ mod tests {
                   "agentId": "main",
                   "schedule": { "kind": "at", "epochMs": 1000 },
                   "messageText": "run due job"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        AgentSource::with_workspace(home, workspace)
+    }
+
+    fn write_expr_cron_source(root: &Path) -> AgentSource {
+        let home = root.join(".openclaw");
+        let workspace = home.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(home.join("agents").join("main").join("sessions")).unwrap();
+        fs::create_dir_all(home.join("cron")).unwrap();
+        fs::write(workspace.join("AGENTS.md"), "# Agent").unwrap();
+        fs::write(
+            home.join("openclaw.json"),
+            r#"{
+              "agents": { "list": [{ "id": "main", "enabled": true }] },
+              "models": { "providers": { "openai": {} } }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join("cron").join("jobs.json"),
+            r#"{
+              "jobs": [
+                {
+                  "id": "expr-cron-job",
+                  "enabled": true,
+                  "agentId": "main",
+                  "schedule": { "kind": "cron", "expr": "10 9 * * *", "tz": "Asia/Taipei" },
+                  "payload": { "message": "Run expr cron" }
                 }
               ]
             }"#,
