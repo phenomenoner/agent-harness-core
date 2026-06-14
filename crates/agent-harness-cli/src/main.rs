@@ -4039,49 +4039,19 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
                 }) {
                     Ok(capacity) => {
                         if capacity.lease_lock_busy {
-                            errors += 1;
-                            consecutive_errors += 1;
                             let reason =
                                 "runtime queue lease lock is busy during capacity inspection";
-                            last_status = None;
+                            consecutive_errors = 0;
+                            last_status = Some(RuntimeRunOnceStatus::LeaseBusy);
                             last_queue_id = None;
                             last_reason = Some(reason.to_string());
                             write_loop_heartbeat(
                                 &args.target_home,
                                 &args.loop_name,
-                                "error",
+                                "lease-busy",
                                 iterations,
-                                &format!(
-                                    "consecutiveErrors={consecutive_errors}/{} error={reason}",
-                                    args.max_consecutive_errors
-                                ),
-                            )?;
-                            append_runtime_loop_error_log(
-                                &args.target_home,
-                                iterations,
-                                consecutive_errors,
-                                args.max_consecutive_errors,
                                 reason,
                             )?;
-                            if consecutive_errors >= args.max_consecutive_errors {
-                                if enter_runtime_loop_safe_mode(
-                                    &args,
-                                    iterations,
-                                    &mut consecutive_errors,
-                                    &mut safe_mode_restarts,
-                                    &mut runtime_concurrency,
-                                )? {
-                                    stop_requested = false;
-                                    stop_reason = None;
-                                } else {
-                                    failed = true;
-                                    stop_requested = true;
-                                    stop_reason = Some(format!(
-                                        "stopped after {} consecutive runtime errors",
-                                        args.max_consecutive_errors
-                                    ));
-                                }
-                            }
                         } else {
                             let queue_ids = capacity
                                 .claimable_queue_ids
@@ -4361,7 +4331,9 @@ fn handle_runtime_loop_task_result(
                 report.receipt.reason
             );
 
-            if runtime_run_once_report_is_idle(&report) {
+            if status == RuntimeRunOnceStatus::LeaseBusy {
+                *consecutive_errors = 0;
+            } else if runtime_run_once_report_is_idle(&report) {
                 *idle += 1;
                 *consecutive_errors = 0;
             } else if matches!(
@@ -14912,6 +14884,94 @@ mod tests {
         assert_eq!(cron_scheduler_loop_sleep_ms(Some(1_000), 60_000), 60_000);
         assert_eq!(cron_scheduler_loop_sleep_ms(Some(120_000), 60_000), 120_000);
         assert_eq!(cron_scheduler_loop_sleep_ms(None, 5_000), 10_000);
+    }
+
+    #[test]
+    fn runtime_loop_lease_busy_does_not_count_as_error() {
+        let root = cli_temp_root("runtime_loop_lease_busy_does_not_count_as_error");
+        fs::create_dir_all(
+            root.join("state")
+                .join("supervisor")
+                .join("loop-heartbeats"),
+        )
+        .unwrap();
+        let args = RuntimeLoopArgs {
+            target_home: root.clone(),
+            loop_name: "runtime-loop".to_string(),
+            codex_exe: None,
+            timeout_ms: 1_000,
+            idle_timeout_ms: 1_000,
+            max_prompt_file_bytes: PromptAssemblyOptions::default().max_prompt_file_bytes,
+            max_skill_file_bytes: PromptAssemblyOptions::default().max_skill_file_bytes,
+            runtime_concurrency: 12,
+            iterations: 0,
+            idle_ms: 1,
+            max_consecutive_errors: 5,
+            safe_mode_restart_ms: Some(60_000),
+            stop_when_idle: false,
+            stop_file: None,
+        };
+        let queue_id = "queue:lease-busy".to_string();
+        let task = RuntimeLoopTaskResult {
+            queue_id: queue_id.clone(),
+            result: Ok(RuntimeRunOnceReport {
+                schema: "agent-harness.runtime-run-once.v1",
+                harness_home: root.clone(),
+                report_file: root
+                    .join("state")
+                    .join("runtime-queue")
+                    .join("run-once.json"),
+                receipts_file: root
+                    .join("state")
+                    .join("runtime-queue")
+                    .join("run-once-receipts.jsonl"),
+                receipt: agent_harness_core::RuntimeRunOnceReceipt {
+                    queue_id: Some(queue_id.clone()),
+                    status: RuntimeRunOnceStatus::LeaseBusy,
+                    execution_dir: None,
+                    transcript_file: None,
+                    outbox_file: None,
+                    reason: "runtime queue lease lock is busy; retrying later".to_string(),
+                },
+                prepare: None,
+                plan: None,
+                run: None,
+                outbox_file: None,
+                outbound_message: None,
+                warnings: Vec::new(),
+            }),
+        };
+        let mut completed = 0;
+        let mut idle = 0;
+        let mut errors = 0;
+        let mut consecutive_errors = 0;
+        let mut last_status = None;
+        let mut last_queue_id = None;
+        let mut last_reason = None;
+
+        let should_enter_safe_mode = handle_runtime_loop_task_result(
+            &args,
+            1,
+            task,
+            &mut completed,
+            &mut idle,
+            &mut errors,
+            &mut consecutive_errors,
+            &mut last_status,
+            &mut last_queue_id,
+            &mut last_reason,
+        )
+        .unwrap();
+
+        assert!(!should_enter_safe_mode);
+        assert_eq!(completed, 0);
+        assert_eq!(idle, 0);
+        assert_eq!(errors, 0);
+        assert_eq!(consecutive_errors, 0);
+        assert_eq!(last_status, Some(RuntimeRunOnceStatus::LeaseBusy));
+        assert_eq!(last_queue_id.as_deref(), Some(queue_id.as_str()));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

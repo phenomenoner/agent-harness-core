@@ -692,26 +692,33 @@ fn check_runtime_loop(harness_home: &Path, checks: &mut Vec<ActivationReadinessC
                     ),
                 )),
                 Some(errors) => {
-                    if stop_reason.contains("stop file") {
-                        if let Some(heartbeat_detail) =
-                            live_loop_heartbeat_detail(harness_home, "runtime-loop")
-                        {
-                            checks.push(pass(
-                                "runtime-loop",
-                                format!(
-                                    "latest runtime loop report at {} was a prior stop-file shutdown with errors={errors}; {heartbeat_detail}",
-                                    path.display()
-                                ),
-                            ));
+                    if let Some(heartbeat_detail) =
+                        live_loop_heartbeat_detail(harness_home, "runtime-loop")
+                    {
+                        let detail = if stop_reason.contains("stop file") {
+                            format!(
+                                "latest runtime loop report at {} was a prior stop-file shutdown with errors={errors}; {heartbeat_detail}",
+                                path.display()
+                            )
                         } else {
-                            checks.push(fail(
-                                "runtime-loop",
-                                format!(
-                                    "latest runtime loop recorded errors={errors} at {}: {stop_reason}",
-                                    path.display()
-                                ),
-                            ));
+                            format!(
+                                "latest runtime loop report at {} recorded errors={errors}: {stop_reason}; superseded by live heartbeat; {heartbeat_detail}",
+                                path.display()
+                            )
+                        };
+                        if stop_reason.contains("stop file") {
+                            checks.push(pass("runtime-loop", detail));
+                        } else {
+                            checks.push(warn("runtime-loop", detail));
                         }
+                    } else if stop_reason.contains("stop file") {
+                        checks.push(fail(
+                            "runtime-loop",
+                            format!(
+                                "latest runtime loop recorded errors={errors} at {}: {stop_reason}",
+                                path.display()
+                            ),
+                        ));
                     } else {
                         checks.push(fail(
                             "runtime-loop",
@@ -761,7 +768,7 @@ fn live_loop_heartbeat_detail(harness_home: &Path, name: &str) -> Option<String>
         .unwrap_or("unknown");
     if !matches!(
         status,
-        "running" | "ok" | "no-work" | "ready" | "heartbeat" | "connected"
+        "running" | "ok" | "no-work" | "ready" | "heartbeat" | "connected" | "safe-mode"
     ) {
         return None;
     }
@@ -986,6 +993,25 @@ fn check_loop_heartbeat(
                             path.display()
                         ),
                     ));
+                }
+            } else if status == "safe-mode" {
+                let detail = if age_ms.is_some_and(|age_ms| age_ms > LOOP_HEARTBEAT_STALE_MS) {
+                    format!(
+                        "{name} heartbeat is stale in safe-mode at {}: status={status}, {age_detail}, detail={detail}",
+                        path.display()
+                    )
+                } else {
+                    format!(
+                        "{name} heartbeat is in safe-mode at {}: status={status}, {age_detail}, detail={detail}",
+                        path.display()
+                    )
+                };
+                if name == "runtime-loop"
+                    && age_ms.is_some_and(|age_ms| age_ms > LOOP_HEARTBEAT_STALE_MS)
+                {
+                    checks.push(fail(check_name, detail));
+                } else {
+                    checks.push(warn(check_name, detail));
                 }
             } else if status == "stopped"
                 || status.contains("error")
@@ -2665,6 +2691,31 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
         let heartbeat_dir = state.join("supervisor").join("loop-heartbeats");
         fs::create_dir_all(&heartbeat_dir).unwrap();
         let now_ms = current_log_time_ms().unwrap();
+        fs::write(
+            heartbeat_dir.join("runtime-loop.json"),
+            format!(
+                r#"{{"status":"safe-mode","iteration":4,"processId":42,"atMs":{now_ms},"detail":"safeModeRestart=1 after consecutiveErrors=5/5; runtimeConcurrency=1"}}"#
+            ),
+        )
+        .unwrap();
+
+        let live_safe_mode_report = check_activation_readiness(ActivationReadinessOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+
+        assert!(live_safe_mode_report.checks.iter().any(|check| {
+            check.name == "runtime-loop"
+                && check.status == ActivationReadinessStatus::Warn
+                && check.detail.contains("superseded by live heartbeat")
+                && check.detail.contains("status=safe-mode")
+        }));
+        assert!(live_safe_mode_report.checks.iter().any(|check| {
+            check.name == "runtime-loop-heartbeat"
+                && check.status == ActivationReadinessStatus::Warn
+                && check.detail.contains("safe-mode")
+        }));
+
         fs::write(
             runtime_queue.join("loop-last.json"),
             r#"{
