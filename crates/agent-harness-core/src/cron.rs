@@ -530,6 +530,8 @@ fn extract_message_text(job: &Value) -> Option<String> {
             first_text_for_keys(
                 job,
                 &[
+                    "messageText",
+                    "message_text",
                     "message",
                     "text",
                     "prompt",

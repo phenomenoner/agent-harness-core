@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,11 +9,12 @@ use serde_json::Value;
 
 use crate::{
     ActivationReadinessOptions, ActivationReadinessReport, ActivationReadinessStatus,
-    ChannelOutboxPlanOptions, ChannelOutboxPlanSummary, WorkerStatusOptions, WorkerStatusReport,
-    check_activation_readiness, collect_worker_status, harness_log_file, plan_channel_outbox,
+    ChannelOutboxPlanSummary, WorkerStatusOptions, WorkerStatusReport, check_activation_readiness,
+    collect_worker_status, harness_log_file,
 };
 
 const HARNESS_STATUS_SCHEMA: &str = "agent-harness.status.v1";
+const STATUS_JSONL_SAMPLE_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessStatusOptions {
@@ -169,6 +170,9 @@ pub struct HarnessPluginStatus {
 pub struct HarnessOperationalLogStatus {
     pub log_file: PathBuf,
     pub exists: bool,
+    pub bytes: u64,
+    pub sampled: bool,
+    pub sampled_bytes: u64,
     pub lines: usize,
     pub invalid_lines: usize,
     pub latest_event: Option<String>,
@@ -180,6 +184,9 @@ pub struct HarnessOperationalLogStatus {
 pub struct HarnessJsonlStatus {
     pub path: PathBuf,
     pub exists: bool,
+    pub bytes: u64,
+    pub sampled: bool,
+    pub sampled_bytes: u64,
     pub lines: usize,
     pub invalid_lines: usize,
     pub latest_status: Option<String>,
@@ -205,7 +212,7 @@ pub fn collect_harness_status(options: HarnessStatusOptions) -> io::Result<Harne
     let mut warnings = Vec::new();
     let channels = channel_status(&options.harness_home, &readiness, &mut warnings)?;
     let logs = log_status(&options.harness_home)?;
-    let runtime = runtime_status(&options.harness_home)?;
+    let runtime = runtime_status(&options.harness_home, &mut warnings)?;
     let loops = loop_status(&options.harness_home)?;
     let workers = collect_worker_status(WorkerStatusOptions {
         harness_home: options.harness_home.clone(),
@@ -321,17 +328,24 @@ fn read_loop_heartbeat(
     })
 }
 
-fn runtime_status(harness_home: &Path) -> io::Result<HarnessRuntimeStatus> {
+fn runtime_status(
+    harness_home: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<HarnessRuntimeStatus> {
     let queue_dir = harness_home.join("state").join("runtime-queue");
     let pending_file = queue_dir.join("pending.jsonl");
-    let pending = read_queue_ids(&pending_file)?;
+    let pending = read_queue_ids(&pending_file, warnings, "runtime pending queue")?;
     let prepared_ids = read_receipt_queue_ids_with_status(
         &queue_dir.join("execution-receipts.jsonl"),
         &["prepared", "already-prepared"],
+        warnings,
+        "runtime execution receipts",
     )?;
     let completed_ids = read_receipt_queue_ids_with_status(
         &queue_dir.join("codex-runtime-completion-receipts.jsonl"),
         &["recorded", "already-recorded"],
+        warnings,
+        "runtime completion receipts",
     )?;
     let terminal_run_ids = read_receipt_queue_ids_with_status(
         &queue_dir.join("run-once-receipts.jsonl"),
@@ -343,6 +357,8 @@ fn runtime_status(harness_home: &Path) -> io::Result<HarnessRuntimeStatus> {
             "skipped",
             "dead-letter",
         ],
+        warnings,
+        "runtime run-once receipts",
     )?;
     let open_items = pending.queue_ids.difference(&terminal_run_ids).count();
     Ok(HarnessRuntimeStatus {
@@ -373,35 +389,25 @@ fn channel_status(
     readiness: &ActivationReadinessReport,
     warnings: &mut Vec<String>,
 ) -> io::Result<HarnessChannelStatus> {
-    let all = plan_channel_outbox(ChannelOutboxPlanOptions {
-        harness_home: harness_home.to_path_buf(),
-        platform: None,
-        limit: usize::MAX,
-    })?;
-    warnings.extend(all.warnings.clone());
-    let telegram = plan_channel_outbox(ChannelOutboxPlanOptions {
-        harness_home: harness_home.to_path_buf(),
-        platform: Some("telegram".to_string()),
-        limit: usize::MAX,
-    })?;
-    warnings.extend(telegram.warnings.clone());
-    let discord = plan_channel_outbox(ChannelOutboxPlanOptions {
-        harness_home: harness_home.to_path_buf(),
-        platform: Some("discord".to_string()),
-        limit: usize::MAX,
-    })?;
-    warnings.extend(discord.warnings.clone());
     let telegram_offset_file = harness_home
         .join("state")
         .join("channels")
         .join("telegram-offset.json");
     let channel_dir = harness_home.join("state").join("channels");
+    let outbox_file = channel_dir.join("outbox.jsonl");
+    let delivery_receipts =
+        read_delivery_status_tail(&channel_dir.join("delivery-receipts.jsonl"), warnings)?;
+    let all = bounded_outbox_summary(&outbox_file, None, &delivery_receipts, warnings)?;
+    let telegram =
+        bounded_outbox_summary(&outbox_file, Some("telegram"), &delivery_receipts, warnings)?;
+    let discord =
+        bounded_outbox_summary(&outbox_file, Some("discord"), &delivery_receipts, warnings)?;
 
     Ok(HarnessChannelStatus {
         outbox: HarnessOutboxStatus {
-            all: all.summary,
-            telegram: telegram.summary,
-            discord: discord.summary,
+            all,
+            telegram,
+            discord,
         },
         telegram_offset_present: telegram_offset_file.is_file(),
         telegram_offset_file,
@@ -562,14 +568,22 @@ fn log_status(harness_home: &Path) -> io::Result<HarnessOperationalLogStatus> {
     let mut lines = 0;
     let mut invalid_lines = 0;
     let mut latest_event = None;
+    let mut exists = false;
+    let mut bytes = 0;
+    let mut sampled = false;
+    let mut sampled_bytes = 0;
     let mut event_present = EVENTS
         .iter()
         .map(|event| ((*event).to_string(), false))
         .collect::<BTreeMap<_, _>>();
 
-    match fs::read_to_string(&log_file) {
-        Ok(text) => {
-            for line in text.lines() {
+    match read_tail_sample(&log_file, STATUS_JSONL_SAMPLE_BYTES) {
+        Ok(Some(sample)) => {
+            exists = true;
+            bytes = sample.bytes;
+            sampled = sample.sampled;
+            sampled_bytes = sample.sampled_bytes;
+            for line in sample.text.lines() {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -588,13 +602,17 @@ fn log_status(harness_home: &Path) -> io::Result<HarnessOperationalLogStatus> {
                 }
             }
         }
+        Ok(None) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
 
     Ok(HarnessOperationalLogStatus {
-        exists: log_file.is_file(),
+        exists,
         log_file,
+        bytes,
+        sampled,
+        sampled_bytes,
         lines,
         invalid_lines,
         latest_event,
@@ -603,13 +621,11 @@ fn log_status(harness_home: &Path) -> io::Result<HarnessOperationalLogStatus> {
 }
 
 fn latest_non_idle_runtime_receipt(path: &Path) -> io::Result<Option<HarnessRuntimeReceiptStatus>> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+    let Some(sample) = read_tail_sample(path, STATUS_JSONL_SAMPLE_BYTES)? else {
+        return Ok(None);
     };
     let mut latest = None;
-    for (index, line) in text.lines().enumerate() {
+    for (index, line) in sample.text.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -640,15 +656,14 @@ fn jsonl_status(path: PathBuf) -> io::Result<HarnessJsonlStatus> {
         path,
         ..HarnessJsonlStatus::default()
     };
-    let text = match fs::read_to_string(&status.path) {
-        Ok(text) => {
-            status.exists = true;
-            text
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(status),
-        Err(error) => return Err(error),
+    let Some(sample) = read_tail_sample(&status.path, STATUS_JSONL_SAMPLE_BYTES)? else {
+        return Ok(status);
     };
-    for line in text.lines() {
+    status.exists = true;
+    status.bytes = sample.bytes;
+    status.sampled = sample.sampled;
+    status.sampled_bytes = sample.sampled_bytes;
+    for line in sample.text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -667,20 +682,67 @@ fn jsonl_status(path: PathBuf) -> io::Result<HarnessJsonlStatus> {
     Ok(status)
 }
 
+struct TailSample {
+    text: String,
+    bytes: u64,
+    sampled: bool,
+    sampled_bytes: u64,
+}
+
+fn read_tail_sample(path: &Path, max_bytes: u64) -> io::Result<Option<TailSample>> {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let bytes = file.metadata()?.len();
+    if bytes <= max_bytes {
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
+        return Ok(Some(TailSample {
+            text,
+            bytes,
+            sampled: false,
+            sampled_bytes: bytes,
+        }));
+    }
+
+    let start = bytes.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start))?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+    let sampled_bytes = buffer.len() as u64;
+    let mut text = String::from_utf8_lossy(&buffer).into_owned();
+    if let Some(newline) = text.find('\n') {
+        text = text[newline + 1..].to_string();
+    }
+    Ok(Some(TailSample {
+        text,
+        bytes,
+        sampled: true,
+        sampled_bytes,
+    }))
+}
+
 #[derive(Default)]
 struct QueueIdRead {
     queue_ids: BTreeSet<String>,
     invalid_lines: usize,
 }
 
-fn read_queue_ids(path: &Path) -> io::Result<QueueIdRead> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(QueueIdRead::default()),
-        Err(error) => return Err(error),
+fn read_queue_ids(path: &Path, warnings: &mut Vec<String>, label: &str) -> io::Result<QueueIdRead> {
+    let Some(sample) = read_tail_sample(path, STATUS_JSONL_SAMPLE_BYTES)? else {
+        return Ok(QueueIdRead::default());
     };
+    if sample.sampled {
+        warnings.push(format!(
+            "{label} is sampled from the last {} bytes of {}",
+            sample.sampled_bytes,
+            path.display()
+        ));
+    }
     let mut read = QueueIdRead::default();
-    for line in text.lines() {
+    for line in sample.text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -699,17 +761,116 @@ fn read_queue_ids(path: &Path) -> io::Result<QueueIdRead> {
     Ok(read)
 }
 
+fn read_delivery_status_tail(
+    path: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<BTreeMap<String, String>> {
+    let Some(sample) = read_tail_sample(path, STATUS_JSONL_SAMPLE_BYTES)? else {
+        return Ok(BTreeMap::new());
+    };
+    if sample.sampled {
+        warnings.push(format!(
+            "delivery receipt status is sampled from the last {} bytes of {}",
+            sample.sampled_bytes,
+            path.display()
+        ));
+    }
+    let mut statuses = BTreeMap::new();
+    for line in sample.text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let Some(delivery_id) = string_path_any(&value, &["deliveryId", "delivery_id"]) else {
+            continue;
+        };
+        let Some(status) = string_path_any(&value, &["status"]) else {
+            continue;
+        };
+        statuses.insert(delivery_id, status);
+    }
+    Ok(statuses)
+}
+
+fn bounded_outbox_summary(
+    path: &Path,
+    platform: Option<&str>,
+    delivery_statuses: &BTreeMap<String, String>,
+    warnings: &mut Vec<String>,
+) -> io::Result<ChannelOutboxPlanSummary> {
+    let Some(sample) = read_tail_sample(path, STATUS_JSONL_SAMPLE_BYTES)? else {
+        return Ok(ChannelOutboxPlanSummary::default());
+    };
+    if sample.sampled {
+        warnings.push(format!(
+            "channel outbox status is sampled from the last {} bytes of {}",
+            sample.sampled_bytes,
+            path.display()
+        ));
+    }
+    let mut summary = ChannelOutboxPlanSummary::default();
+    for (index, line) in sample.text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        summary.total_outbox_lines += 1;
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            summary.invalid_lines += 1;
+            continue;
+        };
+        let message_platform = value.get("platform").and_then(Value::as_str);
+        if platform.is_some_and(|platform| message_platform != Some(platform)) {
+            summary.skipped_platform += 1;
+            continue;
+        }
+        let delivery_id = delivery_id_for_status(index + 1, trimmed);
+        match delivery_statuses.get(&delivery_id).map(String::as_str) {
+            Some("delivered") => summary.delivered += 1,
+            Some("failed") => {
+                summary.failed_retryable += 1;
+                summary.pending += 1;
+            }
+            _ => summary.pending += 1,
+        }
+    }
+    Ok(summary)
+}
+
+fn delivery_id_for_status(line_number: usize, line: &str) -> String {
+    format!("delivery:{line_number}:{}", fnv1a_64_hex(line))
+}
+
+fn fnv1a_64_hex(value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
 fn read_receipt_queue_ids_with_status(
     path: &Path,
     statuses: &[&str],
+    warnings: &mut Vec<String>,
+    label: &str,
 ) -> io::Result<BTreeSet<String>> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(error) => return Err(error),
+    let Some(sample) = read_tail_sample(path, STATUS_JSONL_SAMPLE_BYTES)? else {
+        return Ok(BTreeSet::new());
     };
+    if sample.sampled {
+        warnings.push(format!(
+            "{label} is sampled from the last {} bytes of {}",
+            sample.sampled_bytes,
+            path.display()
+        ));
+    }
     let mut queue_ids = BTreeSet::new();
-    for line in text.lines() {
+    for line in sample.text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -765,6 +926,12 @@ fn string_path(value: &Value, path: &[&str]) -> Option<String> {
         current = current.get(*key)?;
     }
     current.as_str().map(ToString::to_string)
+}
+
+fn string_path_any(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(ToString::to_string)
 }
 
 fn i64_path(value: &Value, path: &[&str]) -> Option<i64> {

@@ -1,6 +1,6 @@
 # Agent Harness Test Handoff
 
-Date: 2026-06-11
+Date: 2026-06-15
 
 This handoff is for a new session that will guide the operator step by step through live testing of the Rust Windows Agent Harness. It includes project context pointers, current baseline, test order, expected results, and recovery commands.
 
@@ -35,10 +35,10 @@ Important local paths:
 Latest known state:
 
 - `Ready: yes`
-- `passed=58`, `warnings=0`, `failed=0`
+- `failed=0`; exact passed/warning counts may drift as readiness checks are added.
 - Runtime: after the round3-2 patch and live restart, latest readback is `queued=123`, `open=0`, `prepared=123`, `completed=120`. Queued rows with `timeout` run-once receipts are terminal for status, typing, and progress. If `openItems>0`, inspect whether it is a fresh runtime turn or an untracked background job/service.
 - Outbox: `pending=0`, `delivered=186`, `retryable=0`, `invalid=0`. The previous stale Telegram retry was manually read back and marked delivered as `manual-readback-20260611`.
-- Live loops: one bounded-concurrency runtime loop, worker, progress delivery, Telegram, Discord outbox, Discord gateway
+- Live loops: one bounded-concurrency runtime loop, worker, progress delivery, Telegram, Discord outbox, Discord gateway, and cron scheduler after scheduler cutover. Runtime-loop missing/stale/error/stopped/stopping is a failed live state; runtime-loop `safe-mode` is degraded/warn.
 - Telegram probe: ready
 - Discord gateway probe: ready
 - Memory vector recall: ready
@@ -71,6 +71,8 @@ Run:
 ```powershell
 .\target\debug\agent-harness.exe status --harness-home .\.agent-harness
 .\target\debug\agent-harness.exe enable-check --harness-home .\.agent-harness
+.\target\debug\agent-harness.exe healthz --target-home .\.agent-harness --require-writable-state
+.\target\debug\agent-harness.exe cron-scheduler-lint --harness-home .\.agent-harness --source-home .\.agent-harness --workspace .\.agent-harness\workspace --dry-run --enable
 .\target\debug\agent-harness.exe channel-outbox-plan --target-home .\.agent-harness --limit 20
 ```
 
@@ -85,14 +87,19 @@ Expected:
 - Telegram loop heartbeat live.
 - Discord outbox loop heartbeat live.
 - Discord gateway loop heartbeat live.
+- Cron scheduler loop heartbeat live when scheduler is enabled.
+- `cron-scheduler-lint` status is ok or warnings are understood; errors block scheduler cutover.
 
 If loops are stopped, start them:
 
 ```powershell
-$scripts = @('runtime-loop.ps1','worker-loop.ps1','progress-delivery-loop.ps1','telegram-loop.ps1','discord-outbox-loop.ps1','discord-gateway-loop.ps1')
+$scripts = @('runtime-loop.ps1','worker-loop.ps1','progress-delivery-loop.ps1','telegram-loop.ps1','discord-outbox-loop.ps1','discord-gateway-loop.ps1','cron-scheduler-loop.ps1')
 $dir = Resolve-Path .\.agent-harness\state\supervisor\windows-scheduled-tasks\scripts
 foreach ($script in $scripts) {
-  Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $dir $script)) -WindowStyle Hidden
+  $path = Join-Path $dir $script
+  if (Test-Path -LiteralPath $path) {
+    Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$path) -WindowStyle Hidden
+  }
 }
 ```
 

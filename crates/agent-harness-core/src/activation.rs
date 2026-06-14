@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -20,6 +20,7 @@ use crate::{
 
 const ACTIVATION_READINESS_SCHEMA: &str = "agent-harness.activation-readiness.v1";
 const LOOP_HEARTBEAT_STALE_MS: i64 = 120_000;
+const ACTIVATION_JSONL_SAMPLE_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationReadinessOptions {
@@ -968,13 +969,15 @@ fn check_loop_heartbeat(
                 "running" | "ok" | "no-work" | "ready" | "heartbeat" | "connected"
             ) {
                 if age_ms.is_some_and(|age_ms| age_ms > LOOP_HEARTBEAT_STALE_MS) {
-                    checks.push(warn(
-                        check_name,
-                        format!(
-                            "{name} heartbeat is stale at {}: status={status}, {age_detail}, detail={detail}",
-                            path.display()
-                        ),
-                    ));
+                    let detail = format!(
+                        "{name} heartbeat is stale at {}: status={status}, {age_detail}, detail={detail}",
+                        path.display()
+                    );
+                    if name == "runtime-loop" {
+                        checks.push(fail(check_name, detail));
+                    } else {
+                        checks.push(warn(check_name, detail));
+                    }
                 } else {
                     checks.push(pass(
                         check_name,
@@ -1006,10 +1009,15 @@ fn check_loop_heartbeat(
                 ));
             }
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
-            format!("{name}-heartbeat"),
-            format!("no live {name} heartbeat found yet at {}", path.display()),
-        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let check_name = format!("{name}-heartbeat");
+            let detail = format!("no live {name} heartbeat found yet at {}", path.display());
+            if name == "runtime-loop" {
+                checks.push(fail(check_name, detail));
+            } else {
+                checks.push(warn(check_name, detail));
+            }
+        }
         Err(error) => checks.push(warn(
             format!("{name}-heartbeat"),
             format!("could not read {}: {error}", path.display()),
@@ -1349,15 +1357,12 @@ fn check_log_event(
         .join("state")
         .join("logs")
         .join("harness.jsonl");
-    match fs::read_to_string(&log_file) {
-        Ok(text) if text.contains(&format!(r#""event":"{event}""#)) => checks.push(pass(
+    match read_tail_text(&log_file, ACTIVATION_JSONL_SAMPLE_BYTES) {
+        Ok(Some(text)) if text.contains(&format!(r#""event":"{event}""#)) => checks.push(pass(
             name,
             format!("found event {event} in {}", log_file.display()),
         )),
-        Ok(_) => checks.push(warn(name, missing_detail)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            checks.push(warn(name, missing_detail));
-        }
+        Ok(Some(_)) | Ok(None) => checks.push(warn(name, missing_detail)),
         Err(error) => checks.push(warn(
             name,
             format!("could not read {}: {error}", log_file.display()),
@@ -1370,25 +1375,18 @@ fn check_discord_real_inbound(harness_home: &Path, checks: &mut Vec<ActivationRe
         .join("state")
         .join("channels")
         .join("discord-gateway-events.jsonl");
-    match fs::read_to_string(&path) {
-        Ok(text) if text.contains(r#""event":"message-create""#) => checks.push(pass(
+    match read_tail_text(&path, ACTIVATION_JSONL_SAMPLE_BYTES) {
+        Ok(Some(text)) if text.contains(r#""event":"message-create""#) => checks.push(pass(
             "discord-real-inbound",
             format!(
                 "Discord Gateway has received a real MESSAGE_CREATE event at {}",
                 path.display()
             ),
         )),
-        Ok(_) => checks.push(warn(
+        Ok(Some(_)) | Ok(None) => checks.push(warn(
             "discord-real-inbound",
             format!(
                 "Discord Gateway is connected but no real MESSAGE_CREATE event is recorded at {}; ask an allowed Discord user to DM the bot",
-                path.display()
-            ),
-        )),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(warn(
-            "discord-real-inbound",
-            format!(
-                "Discord gateway event log is not present at {}; start discord-gateway-loop and DM the bot",
                 path.display()
             ),
         )),
@@ -2351,7 +2349,9 @@ fn codex_auth_candidates() -> Vec<PathBuf> {
 }
 
 fn latest_jsonl_value(path: &Path) -> io::Result<Option<Value>> {
-    let text = fs::read_to_string(path)?;
+    let Some(text) = read_tail_text(path, ACTIVATION_JSONL_SAMPLE_BYTES)? else {
+        return Ok(None);
+    };
     for line in text.lines().rev() {
         let line = line.trim();
         if line.is_empty() {
@@ -2362,6 +2362,28 @@ fn latest_jsonl_value(path: &Path) -> io::Result<Option<Value>> {
             .map_err(io::Error::other);
     }
     Ok(None)
+}
+
+fn read_tail_text(path: &Path, max_bytes: u64) -> io::Result<Option<String>> {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let bytes = file.metadata()?.len();
+    if bytes <= max_bytes {
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
+        return Ok(Some(text));
+    }
+    file.seek(SeekFrom::Start(bytes.saturating_sub(max_bytes)))?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+    let mut text = String::from_utf8_lossy(&buffer).into_owned();
+    if let Some(newline) = text.find('\n') {
+        text = text[newline + 1..].to_string();
+    }
+    Ok(Some(text))
 }
 
 fn read_json_value(path: &Path) -> io::Result<Value> {

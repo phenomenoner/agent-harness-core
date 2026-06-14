@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,6 +12,10 @@ const HARNESS_LOG_SCHEMA: &str = "agent-harness.log-event.v1";
 const HARNESS_LOG_ROTATION_SCHEMA: &str = "agent-harness.log-rotation.v1";
 const JSONL_APPEND_LOCK_STALE_MS: u128 = 30_000;
 const JSONL_APPEND_LOCK_TIMEOUT_MS: u128 = 10_000;
+const JSON_ATOMIC_WRITE_LOCK_STALE_MS: u128 = 30_000;
+const JSON_ATOMIC_WRITE_LOCK_TIMEOUT_MS: u128 = 10_000;
+
+static JSON_ATOMIC_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -217,14 +222,17 @@ pub fn write_json_atomic(path: &Path, value: &impl Serialize) -> io::Result<()> 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let _guard = JsonAtomicWriteLock::acquire(path)?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("state.json");
+    let tmp_counter = JSON_ATOMIC_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp_name = format!(
-        ".{file_name}.{}.{}.tmp",
+        ".{file_name}.{}.{}.{}.tmp",
         std::process::id(),
-        current_log_time_ms().unwrap_or(0)
+        current_log_time_ms().unwrap_or(0),
+        tmp_counter
     );
     let tmp_path = path.with_file_name(tmp_name);
     {
@@ -233,22 +241,7 @@ pub fn write_json_atomic(path: &Path, value: &impl Serialize) -> io::Result<()> 
         file.write_all(b"\n")?;
         file.sync_all()?;
     }
-    match fs::rename(&tmp_path, path) {
-        Ok(()) => Ok(()),
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            let _ = fs::remove_file(path);
-            fs::rename(&tmp_path, path)
-        }
-        Err(error) => {
-            let _ = fs::remove_file(&tmp_path);
-            Err(error)
-        }
-    }
+    replace_json_atomic_target(&tmp_path, path)
 }
 
 pub fn append_jsonl_value(path: &Path, value: &impl Serialize) -> io::Result<()> {
@@ -291,10 +284,7 @@ impl JsonlAppendLock {
                     let _ = writeln!(file, "pid={}", std::process::id());
                     return Ok(Self { path: lock_path });
                 }
-                Err(error)
-                    if error.kind() == io::ErrorKind::AlreadyExists
-                        || error.kind() == io::ErrorKind::PermissionDenied =>
-                {
+                Err(error) if lock_acquire_error_is_busy(&error) => {
                     remove_stale_jsonl_lock(&lock_path)?;
                     let elapsed = start.elapsed().map_err(io::Error::other)?.as_millis();
                     if elapsed >= JSONL_APPEND_LOCK_TIMEOUT_MS {
@@ -328,6 +318,129 @@ fn jsonl_append_lock_path(jsonl_path: &Path) -> PathBuf {
     jsonl_path.with_file_name(format!(".{file_name}.append.lock"))
 }
 
+struct JsonAtomicWriteLock {
+    path: PathBuf,
+}
+
+impl JsonAtomicWriteLock {
+    fn acquire(json_path: &Path) -> io::Result<Self> {
+        let lock_path = json_atomic_write_lock_path(json_path);
+        let start = SystemTime::now();
+        loop {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut file) => {
+                    let _ = writeln!(file, "pid={}", std::process::id());
+                    return Ok(Self { path: lock_path });
+                }
+                Err(error) if lock_acquire_error_is_busy(&error) => {
+                    remove_stale_lock(&lock_path, JSON_ATOMIC_WRITE_LOCK_STALE_MS)?;
+                    let elapsed = start.elapsed().map_err(io::Error::other)?.as_millis();
+                    if elapsed >= JSON_ATOMIC_WRITE_LOCK_TIMEOUT_MS {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "timed out waiting for JSON atomic write lock {}",
+                                lock_path.display()
+                            ),
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl Drop for JsonAtomicWriteLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn json_atomic_write_lock_path(json_path: &Path) -> PathBuf {
+    let file_name = json_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state.json");
+    json_path.with_file_name(format!(".{file_name}.atomic.lock"))
+}
+
+fn replace_json_atomic_target(tmp_path: &Path, path: &Path) -> io::Result<()> {
+    let start = SystemTime::now();
+    loop {
+        match fs::rename(tmp_path, path) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied
+                ) || windows_sharing_violation(&error) =>
+            {
+                match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error)
+                        if (error.kind() == io::ErrorKind::PermissionDenied
+                            || windows_sharing_violation(&error))
+                            && start.elapsed().map_err(io::Error::other)?.as_millis()
+                                < JSON_ATOMIC_WRITE_LOCK_TIMEOUT_MS =>
+                    {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => {
+                        let _ = fs::remove_file(tmp_path);
+                        return Err(error);
+                    }
+                }
+                match fs::rename(tmp_path, path) {
+                    Ok(()) => return Ok(()),
+                    Err(error)
+                        if (error.kind() == io::ErrorKind::PermissionDenied
+                            || windows_sharing_violation(&error))
+                            && start.elapsed().map_err(io::Error::other)?.as_millis()
+                                < JSON_ATOMIC_WRITE_LOCK_TIMEOUT_MS =>
+                    {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => {
+                        let _ = fs::remove_file(tmp_path);
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = fs::remove_file(tmp_path);
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn windows_sharing_violation(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        error.raw_os_error() == Some(32)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+fn lock_acquire_error_is_busy(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied | io::ErrorKind::WouldBlock
+    ) || windows_sharing_violation(error)
+}
+
 fn jsonl_needs_leading_newline(path: &Path) -> io::Result<bool> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -345,6 +458,10 @@ fn jsonl_needs_leading_newline(path: &Path) -> io::Result<bool> {
 }
 
 fn remove_stale_jsonl_lock(lock_path: &Path) -> io::Result<()> {
+    remove_stale_lock(lock_path, JSONL_APPEND_LOCK_STALE_MS)
+}
+
+fn remove_stale_lock(lock_path: &Path, stale_ms: u128) -> io::Result<()> {
     let Ok(metadata) = fs::metadata(lock_path) else {
         return Ok(());
     };
@@ -354,10 +471,11 @@ fn remove_stale_jsonl_lock(lock_path: &Path) -> io::Result<()> {
     let Ok(age) = modified.elapsed() else {
         return Ok(());
     };
-    if age.as_millis() >= JSONL_APPEND_LOCK_STALE_MS {
+    if age.as_millis() >= stale_ms {
         match fs::remove_file(lock_path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if lock_acquire_error_is_busy(&error) => {}
             Err(error) => return Err(error),
         }
     }
@@ -518,6 +636,44 @@ mod tests {
                 .to_string_lossy()
                 .ends_with(".tmp")
         }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_json_atomic_serializes_concurrent_replacements() {
+        let root = temp_root("write_json_atomic_serializes_concurrent_replacements");
+        let path = root
+            .join("state")
+            .join("runtime-queue")
+            .join("run-once-last.json");
+        let mut handles = Vec::new();
+
+        for writer in 0..12 {
+            let path = path.clone();
+            handles.push(thread::spawn(move || {
+                for entry in 0..50 {
+                    write_json_atomic(
+                        &path,
+                        &json!({
+                            "writer": writer,
+                            "entry": entry,
+                            "payload": "atomic json regression"
+                        }),
+                    )
+                    .unwrap();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let text = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["payload"], "atomic json regression");
+        assert!(!json_atomic_write_lock_path(&path).exists());
 
         let _ = fs::remove_dir_all(root);
     }

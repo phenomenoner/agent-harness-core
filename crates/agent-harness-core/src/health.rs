@@ -81,10 +81,17 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
         .heartbeats
         .iter()
         .map(|loop_status| {
+            let unhealthy_status = loop_status.status.as_deref().is_some_and(|status| {
+                status == "stopped"
+                    || status == "closed"
+                    || status.contains("error")
+                    || status.contains("fail")
+            });
             let stale = !loop_status.present
                 || loop_status
                     .age_ms
-                    .is_some_and(|age_ms| age_ms > options.loop_stale_ms);
+                    .is_some_and(|age_ms| age_ms > options.loop_stale_ms)
+                || unhealthy_status;
             HealthzLoop {
                 name: loop_status.name.clone(),
                 present: loop_status.present,
@@ -94,7 +101,26 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
             }
         })
         .collect();
-    let live = loops.iter().all(|item| !item.stale);
+    let runtime_loop_unhealthy = loops.iter().any(|item| {
+        item.name == "runtime-loop"
+            && (item.stale
+                || item
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| matches!(status, "error" | "stopped" | "stopping")))
+    });
+    if loops
+        .iter()
+        .any(|item| item.name == "runtime-loop" && item.status.as_deref() == Some("safe-mode"))
+    {
+        warnings.push("runtime-loop is in safe-mode with reduced concurrency".to_string());
+    }
+    if runtime_loop_unhealthy {
+        warnings.push(
+            "runtime-loop is not ready; channel ingress may queue without replies".to_string(),
+        );
+    }
+    let live = loops.iter().all(|item| !item.stale) && !runtime_loop_unhealthy;
     let ready = status.ready && live && (!options.require_writable_state || state.writable);
     Ok(HealthzReport {
         schema: HEALTHZ_SCHEMA,
@@ -191,6 +217,52 @@ mod tests {
         assert!(!report.live);
         assert_eq!(report.queue.queued, 1);
         assert!(report.state.writable);
+        assert!(
+            report
+                .loops
+                .iter()
+                .any(|item| item.name == "runtime-loop" && item.stale)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn healthz_reports_error_loop_as_not_live_even_when_fresh() {
+        let root = temp_root("healthz_reports_error_loop_as_not_live_even_when_fresh");
+        let harness_home = root.join(".agent-harness");
+        let state = harness_home.join("state");
+        fs::create_dir_all(state.join("runtime-queue")).unwrap();
+        fs::create_dir_all(state.join("channels")).unwrap();
+        fs::create_dir_all(state.join("logs")).unwrap();
+        fs::create_dir_all(state.join("plugin-sidecar")).unwrap();
+        fs::create_dir_all(state.join("memory")).unwrap();
+        fs::create_dir_all(state.join("supervisor").join("loop-heartbeats")).unwrap();
+        write_json_atomic(
+            &state
+                .join("supervisor")
+                .join("loop-heartbeats")
+                .join("runtime-loop.json"),
+            &serde_json::json!({
+                "status": "error",
+                "iteration": 3,
+                "processId": 42,
+                "atMs": 10_000,
+                "detail": "consecutiveErrors=5/5"
+            }),
+        )
+        .unwrap();
+
+        let report = collect_healthz(HealthzOptions {
+            harness_home,
+            now_ms: 10_500,
+            loop_stale_ms: 120_000,
+            require_writable_state: false,
+        })
+        .unwrap();
+
+        assert!(!report.live);
+        assert!(!report.ready);
         assert!(
             report
                 .loops

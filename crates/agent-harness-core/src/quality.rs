@@ -121,6 +121,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "additive fields only in v1; dry-run must not enqueue or write watermarks",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.cron-scheduler.lint.v1",
+            owner_module: "cron_scheduler",
+            compatibility: "additive diagnostics only in v1; error status remains fail-closed",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.cron-scheduler.tick.v1",
             owner_module: "cron_scheduler",
             compatibility: "append-only receipts; additive fields only in v1",

@@ -1,6 +1,6 @@
 # Agent Harness TG/Discord DM Self-Check Guide
 
-Date: 2026-06-13
+Date: 2026-06-15
 
 This guide is the operator handoff for asking the `main` agent to verify the live Telegram DM and Discord DM channel paths from inside Agent Harness. It is designed for a single normal-message turn in each DM channel, with the agent doing as much read-only verification as it can and returning artifact pointers for operator follow-up.
 
@@ -12,11 +12,13 @@ Current activation baseline:
 - Source snapshot archive: `D:\Warehouse\Rust-OpenClaw-Core\imports\openclaw-core-snapshot`
 - Runtime workspace/Codex cwd: `D:\Warehouse\Research\OpenClaw_WSL`
 - Active agent: `main`
-- Latest readiness target: `ready=true`, `passed=58`, `warnings=0`, `failed=0`
+- Latest readiness target: `ready=true`, no failed checks, and no unexpected warnings. Exact pass counts may drift as new readiness checks are added.
 - Latest channel outbox target: `pending=0`, `retryable=0`; any new test backlog should drain after delivery settles.
-- Live loops currently running in status: `runtime-loop`, `worker-loop`, `progress-delivery-loop`, `telegram-loop`, `discord-outbox-loop`, `discord-gateway-loop`
-- Supervisor plan: 6 canonical task entries: `runtime-loop`, `worker-loop`, `progress-delivery-loop`, `telegram-loop`, `discord-outbox-loop`, and `discord-gateway-loop`; `cron-scheduler-loop` appears only after explicit scheduler cutover. `runtime-loop` is a single process with bounded in-process runtime concurrency via `--runtime-concurrency 12`.
+- Live loops currently expected in status after the scheduler cutover: `runtime-loop`, `worker-loop`, `progress-delivery-loop`, `telegram-loop`, `discord-outbox-loop`, `discord-gateway-loop`, and `cron-scheduler-loop`.
+- Supervisor plan: 6 always-on task entries plus `cron-scheduler-loop` when scheduling is enabled. `runtime-loop` is a single process with bounded in-process runtime concurrency via `--runtime-concurrency 12`; in supervised infinite mode it should keep safe-mode restart enabled.
 - Channel identity: when a binding registry is configured, the platform/account/channel tuple must resolve to `main` before the DM reaches the model.
+- Runtime-loop liveness rule: missing/stale/error/stopped/stopping runtime-loop heartbeat is FAIL for live readiness. `safe-mode` is WARN/degraded because the loop is still alive but has reduced runtime concurrency to 1.
+- Large-ledger rule: `status`, `healthz`, and readiness may report sampled log/outbox/runtime counts after tail-sampling large JSONL files. Treat sampled counts as an operational window and check the warning text before comparing historical totals.
 
 ## Safety Rules
 
@@ -47,15 +49,19 @@ Run this before sending the DM prompts if you want an external baseline:
 ```powershell
 Set-Location D:\Warehouse\Rust-OpenClaw-Core
 .\target\debug\agent-harness.exe enable-check --harness-home .\.agent-harness
+.\target\debug\agent-harness.exe healthz --target-home .\.agent-harness --require-writable-state
 .\target\debug\agent-harness.exe status --harness-home .\.agent-harness --json
 .\target\debug\agent-harness.exe worker-status --harness-home .\.agent-harness
+.\target\debug\agent-harness.exe cron-scheduler-lint --harness-home .\.agent-harness --source-home .\.agent-harness --workspace .\.agent-harness\workspace --enable
 ```
 
 Expected baseline:
 
-- `enable-check`: `Ready: yes`, `passed=58`, `warnings=0`, `failed=0`
-- `status`: `ready=true`, `runtime.openItems=0`, and `runtime.latestNonIdleRunOnce` should show the last real runtime event instead of an idle `no-work` tick.
-- `loops.heartbeats`: all six canonical loop heartbeats present and fresh; `cron-scheduler-loop` is optional and only expected after explicit scheduler activation
+- `enable-check`: `Ready: yes`, `failed=0`, and only understood warnings.
+- `healthz`: `ready=true`, `live=true`, writable state when `--require-writable-state` is used, and no runtime-loop missing/stale/error/stopped/stopping state. `runtime-loop safe-mode` is degraded WARN, not a silent pass.
+- `status`: `ready=true`, `runtime.openItems=0`, and `runtime.latestNonIdleRunOnce` should show the last real runtime event instead of an idle `no-work` tick or retryable `lease-busy`.
+- `loops.heartbeats`: all active loop heartbeats present and fresh; current live scheduler deployments include `cron-scheduler-loop`.
+- `cron-scheduler-lint`: `status=ok` or understood warnings before enabling scheduler changes; errors block scheduler cutover.
 - `workers.totals.failedTerminal=0`
 - channel outbox has no unexpected retryable backlog
 
@@ -78,7 +84,7 @@ mode=read-only-self-check
    - .\target\debug\agent-harness.exe enable-check --harness-home .\.agent-harness
    - .\target\debug\agent-harness.exe status --harness-home .\.agent-harness --json
    - .\target\debug\agent-harness.exe worker-status --harness-home .\.agent-harness
-3. 檢查或摘要：runtime queue 是否沒有 open backlog、status 是否有 latest non-idle runtime event、loop heartbeats 是否包含 runtime/worker/progress/telegram/discord-outbox/discord-gateway、runtime-loop 是否是單 loop bounded concurrency 而不是多個 runtime-loop-N 互搶 queue、worker failedTerminal 是否為 0、worker config 是否是 global=12/per-agent=6/per-agent-channel=3、memory hook/prompt-context 是否可用、plugin hooks/memory-slot receipts 是否存在。
+3. 檢查或摘要：runtime queue 是否沒有 open backlog、status 是否有 latest non-idle runtime event、loop heartbeats 是否包含 runtime/worker/progress/telegram/discord-outbox/discord-gateway/cron-scheduler（若 scheduler 已啟用）、runtime-loop 是否是單 loop bounded concurrency 而不是多個 runtime-loop-N 互搶 queue、runtime-loop 是否沒有 missing/stale/error/stopped/stopping（safe-mode 只能算 WARN）、worker failedTerminal 是否為 0、worker config 是否是 global=12/per-agent=6/per-agent-channel=3、memory hook/prompt-context 是否可用、plugin hooks/memory-slot receipts 是否存在。
 4. 檢查 prompt context：Prompt files 不應是 0/7；目前 `.agent-harness/workspace` 若沒有 `BOOTSTRAP.md`，`6/7` 是可接受 baseline。每個 prompt file 應有明確作用說明並要求 agent 遵守，例如 AGENTS.md 是 workspace instructions、SOUL.md 是 persona/voice、TOOLS.md 是 tool policy、USER.md 是 user preferences、IDENTITY.md 是 identity、HEARTBEAT.md 是 cadence/liveness、BOOTSTRAP.md 是 startup context。Skills 是 dynamic task context；若本 turn 沒選到 skill，應說明這可能正常，而不是當成 prompt-file loading failure。
 5. 確認本 turn 可作為 Telegram inbound allowed-user routing、main agent dispatch、Codex runtime、prompt/memory context、transcript/trajectory write 的 live smoke。
 6. 回覆時必須包含 sentinel：TG-DM-SELF-CHECK:tg-main-selfcheck-YYYYMMDD-HHMM
@@ -129,7 +135,7 @@ mode=read-only-self-check
    - .\target\debug\agent-harness.exe enable-check --harness-home .\.agent-harness
    - .\target\debug\agent-harness.exe status --harness-home .\.agent-harness --json
    - .\target\debug\agent-harness.exe worker-status --harness-home .\.agent-harness
-3. 檢查或摘要：Discord gateway heartbeat 是否 live、discord-outbox-loop 是否 live、runtime queue 是否沒有 open backlog、status 是否有 latest non-idle runtime event、runtime-loop 是否是單 loop bounded concurrency 而不是多個 runtime-loop-N 互搶 queue、worker failedTerminal 是否為 0、worker config 是否是 global=12/per-agent=6/per-agent-channel=3、memory hook/prompt-context 是否可用、plugin hooks/memory-slot receipts 是否存在。
+3. 檢查或摘要：Discord gateway heartbeat 是否 live、discord-outbox-loop 是否 live、runtime queue 是否沒有 open backlog、status 是否有 latest non-idle runtime event、runtime-loop 是否是單 loop bounded concurrency 而不是多個 runtime-loop-N 互搶 queue、runtime-loop 是否沒有 missing/stale/error/stopped/stopping（safe-mode 只能算 WARN）、cron-scheduler-loop 是否在 scheduler 已啟用時 live、worker failedTerminal 是否為 0、worker config 是否是 global=12/per-agent=6/per-agent-channel=3、memory hook/prompt-context 是否可用、plugin hooks/memory-slot receipts 是否存在。
 4. 檢查 prompt context：Prompt files 不應是 0/7；目前 `.agent-harness/workspace` 若沒有 `BOOTSTRAP.md`，`6/7` 是可接受 baseline。每個 prompt file 應有明確作用說明並要求 agent 遵守，例如 AGENTS.md 是 workspace instructions、SOUL.md 是 persona/voice、TOOLS.md 是 tool policy、USER.md 是 user preferences、IDENTITY.md 是 identity、HEARTBEAT.md 是 cadence/liveness、BOOTSTRAP.md 是 startup context。Skills 是 dynamic task context；若本 turn 沒選到 skill，應說明這可能正常，而不是當成 prompt-file loading failure。
 5. 確認本 turn 可作為 Discord DM inbound Gateway routing、main agent dispatch、Codex runtime、prompt/memory context、transcript/trajectory write 的 live smoke。
 6. 回覆時必須包含 sentinel：DISCORD-DM-SELF-CHECK:discord-main-selfcheck-YYYYMMDD-HHMM
@@ -172,6 +178,7 @@ After the agent replies in each channel, run:
 Set-Location D:\Warehouse\Rust-OpenClaw-Core
 .\target\debug\agent-harness.exe status --harness-home .\.agent-harness --json
 .\target\debug\agent-harness.exe enable-check --harness-home .\.agent-harness
+.\target\debug\agent-harness.exe healthz --target-home .\.agent-harness --require-writable-state
 .\target\debug\agent-harness.exe channel-outbox-plan --harness-home .\.agent-harness --platform telegram --limit 10
 .\target\debug\agent-harness.exe channel-outbox-plan --harness-home .\.agent-harness --platform discord --limit 10
 ```
@@ -179,8 +186,8 @@ Set-Location D:\Warehouse\Rust-OpenClaw-Core
 Pass criteria:
 
 - Both DM replies are visible to the operator and contain the expected sentinel.
-- `enable-check` remains `ready=true` with no failed checks.
-- `status --json` shows all six canonical loop heartbeats fresh.
+- `enable-check` and `healthz` remain `ready=true` with no failed checks.
+- `status --json` shows all active loop heartbeats fresh, including `cron-scheduler-loop` when scheduler is enabled.
 - `runtime.openItems=0`.
 - `channels.outbox.all.pending=0` after delivery settles.
 - `delivery-receipts.jsonl` has delivered entries for the new Telegram and Discord self-check replies.

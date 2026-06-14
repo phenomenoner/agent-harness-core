@@ -21,6 +21,7 @@ use crate::{
 const RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA: &str = "agent-harness.runtime-queue-prepare.v1";
 const RUNTIME_QUEUE_LEASES_SCHEMA: &str = "agent-harness.runtime-queue-leases.v1";
 const DEFAULT_RUNTIME_LEASE_MS: i64 = 30 * 60 * 1000;
+const RUNTIME_LEASE_ACQUIRE_LOCK_RETRY_MS: u64 = 2_000;
 const RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS: u64 = 2_000;
 const RUNTIME_LEASE_RELEASE_LOCK_RETRY_SLEEP_MS: u64 = 25;
 #[cfg(not(windows))]
@@ -51,6 +52,7 @@ pub struct RuntimeQueueCapacityReport {
     pub global_limit: usize,
     pub agent_limit: usize,
     pub agent_channel_limit: usize,
+    pub lease_lock_busy: bool,
     pub warnings: Vec<String>,
 }
 
@@ -155,11 +157,12 @@ struct RuntimeQueueLease {
 
 struct RuntimeQueueLeaseLock {
     path: PathBuf,
-    _file: fs::File,
+    file: Option<fs::File>,
 }
 
 impl Drop for RuntimeQueueLeaseLock {
     fn drop(&mut self) {
+        let _ = self.file.take();
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -175,7 +178,10 @@ pub fn prepare_runtime_queue_item(
     let mut warnings = Vec::new();
     let now_ms = current_log_time_ms()?;
     let lease_owner = format!("pid:{}", std::process::id());
-    let _lease_lock = match acquire_runtime_queue_lease_lock(&queue_dir, now_ms)? {
+    let _lease_lock = match acquire_runtime_queue_lease_lock_with_retry(
+        &queue_dir,
+        Duration::from_millis(RUNTIME_LEASE_ACQUIRE_LOCK_RETRY_MS),
+    )? {
         Some(lock) => lock,
         None => {
             let receipt = RuntimeExecutionReceipt {
@@ -544,7 +550,11 @@ pub fn inspect_runtime_queue_capacity(
     let config = load_worker_dispatch_config(&options.harness_home)?;
     let mut warnings = Vec::new();
     let now_ms = current_log_time_ms()?;
-    let Some(_lease_lock) = acquire_runtime_queue_lease_lock(&queue_dir, now_ms)? else {
+    let Some(_lease_lock) = acquire_runtime_queue_lease_lock_with_retry(
+        &queue_dir,
+        Duration::from_millis(RUNTIME_LEASE_ACQUIRE_LOCK_RETRY_MS),
+    )?
+    else {
         warnings.push("runtime queue lease lock is busy; capacity assumed zero".to_string());
         return Ok(RuntimeQueueCapacityReport {
             schema: "agent-harness.runtime-queue-capacity.v1",
@@ -557,6 +567,7 @@ pub fn inspect_runtime_queue_capacity(
             global_limit: config.global_concurrency_limit,
             agent_limit: config.group_concurrency_limit,
             agent_channel_limit: config.channel_concurrency_limit,
+            lease_lock_busy: true,
             warnings,
         });
     };
@@ -627,6 +638,7 @@ pub fn inspect_runtime_queue_capacity(
         global_limit: config.global_concurrency_limit,
         agent_limit: config.group_concurrency_limit,
         agent_channel_limit: config.channel_concurrency_limit,
+        lease_lock_busy: false,
         warnings,
     })
 }
@@ -747,7 +759,7 @@ fn create_runtime_queue_lease_lock(
     writeln!(file, "{now_ms}")?;
     Ok(RuntimeQueueLeaseLock {
         path: lock_file.to_path_buf(),
-        _file: file,
+        file: Some(file),
     })
 }
 

@@ -131,10 +131,10 @@ pub fn write_windows_supervisor_plan(
             options.runtime_idle_timeout_ms.to_string(),
             "--iterations".to_string(),
             "0".to_string(),
-            "--idle-ms".to_string(),
-            options.idle_ms.to_string(),
             "--max-consecutive-errors".to_string(),
             options.max_consecutive_errors.to_string(),
+            "--safe-mode-restart-ms".to_string(),
+            "60000".to_string(),
             "--stop-file".to_string(),
             path_arg(&stop_file),
         ];
@@ -163,8 +163,6 @@ pub fn write_windows_supervisor_plan(
             path_arg(&harness_home),
             "--iterations".to_string(),
             "0".to_string(),
-            "--idle-ms".to_string(),
-            options.idle_ms.to_string(),
             "--max-consecutive-errors".to_string(),
             options.max_consecutive_errors.to_string(),
             "--stop-file".to_string(),
@@ -474,19 +472,45 @@ fn write_runner_script(
     log_name: &str,
 ) -> io::Result<()> {
     let invocation = command_invocation(executable, args);
-    let body = format!(
-        "$ErrorActionPreference = 'Continue'\n\
-         $LogDir = {}\n\
-         New-Item -ItemType Directory -Force -Path $LogDir | Out-Null\n\
-         Get-ChildItem -LiteralPath $LogDir -Filter '{}-*.log' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 20 | Remove-Item -Force -ErrorAction SilentlyContinue\n\
-         $LogFile = Join-Path $LogDir (\"{}-$(Get-Date -Format yyyyMMdd-HHmmss).log\")\n\
-         {} *>&1 | Tee-Object -FilePath $LogFile\n\
-         exit $LASTEXITCODE\n",
-        ps_quote_path(log_dir),
-        ps_escape_single(log_name),
-        ps_escape_single(log_name),
-        invocation
-    );
+    let body = if log_name == "runtime-loop" {
+        format!(
+            "$ErrorActionPreference = 'Continue'\n\
+             $LogDir = {}\n\
+             New-Item -ItemType Directory -Force -Path $LogDir | Out-Null\n\
+             $SafeModeState = Join-Path $LogDir '{}-runner-safe-mode.json'\n\
+             $SafeModeRestarts = 0\n\
+             while ($true) {{\n\
+               Get-ChildItem -LiteralPath $LogDir -Filter '{}-*.log' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 20 | Remove-Item -Force -ErrorAction SilentlyContinue\n\
+               $LogFile = Join-Path $LogDir (\"{}-$(Get-Date -Format yyyyMMdd-HHmmss).log\")\n\
+               {} *>&1 | Tee-Object -FilePath $LogFile\n\
+               $ExitCode = $LASTEXITCODE\n\
+               if ($ExitCode -eq 0) {{ exit 0 }}\n\
+               $SafeModeRestarts += 1\n\
+               @{{ schema = 'agent-harness.runtime-loop-runner-safe-mode.v1'; component = '{}'; exitCode = $ExitCode; restarts = $SafeModeRestarts; logFile = $LogFile; at = (Get-Date).ToString('o'); restartAfterSeconds = 60 }} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $SafeModeState -Encoding UTF8\n\
+               Start-Sleep -Seconds 60\n\
+             }}\n",
+            ps_quote_path(log_dir),
+            ps_escape_single(log_name),
+            ps_escape_single(log_name),
+            ps_escape_single(log_name),
+            invocation,
+            ps_escape_single(log_name)
+        )
+    } else {
+        format!(
+            "$ErrorActionPreference = 'Continue'\n\
+             $LogDir = {}\n\
+             New-Item -ItemType Directory -Force -Path $LogDir | Out-Null\n\
+             Get-ChildItem -LiteralPath $LogDir -Filter '{}-*.log' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 20 | Remove-Item -Force -ErrorAction SilentlyContinue\n\
+             $LogFile = Join-Path $LogDir (\"{}-$(Get-Date -Format yyyyMMdd-HHmmss).log\")\n\
+             {} *>&1 | Tee-Object -FilePath $LogFile\n\
+             exit $LASTEXITCODE\n",
+            ps_quote_path(log_dir),
+            ps_escape_single(log_name),
+            ps_escape_single(log_name),
+            invocation
+        )
+    };
     fs::write(script, body)
 }
 
@@ -699,6 +723,7 @@ mod tests {
         assert!(runtime_script.contains("'1800000'"));
         assert!(runtime_script.contains("--idle-timeout-ms"));
         assert!(runtime_script.contains("'300000'"));
+        assert!(runtime_script.contains("--safe-mode-restart-ms"));
         assert!(runtime_script.contains("'2'"));
         let worker_script =
             fs::read_to_string(output_dir.join("scripts").join("worker-loop.ps1")).unwrap();

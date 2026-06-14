@@ -254,6 +254,7 @@ Cron/subagent adapter commands:
 
 ```powershell
 agent-harness native-cron-enqueue --harness-home .\.agent-harness --source-home .\imports\openclaw-core-snapshot --resume-cron --master-agent main
+agent-harness cron-scheduler-lint --harness-home .\.agent-harness --source-home .\imports\openclaw-core-snapshot --dry-run --enable --resume-cron --allow-deterministic-run
 agent-harness cron-scheduler-run-once --harness-home .\.agent-harness --source-home .\imports\openclaw-core-snapshot --dry-run --enable --resume-cron --allow-deterministic-run
 agent-harness cron-scheduler-loop --harness-home .\.agent-harness --source-home .\imports\openclaw-core-snapshot --iterations 0 --idle-ms 60000 --max-consecutive-errors 5
 agent-harness deterministic-cron-enqueue --harness-home .\.agent-harness --workspace D:\path\to\workspace --allow-deterministic-run --dry-run-shell --master-agent main

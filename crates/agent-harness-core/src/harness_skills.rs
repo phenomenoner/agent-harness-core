@@ -9,17 +9,17 @@ use crate::{HARNESS_BUILTIN_SKILL_NAMESPACE, SKILL_FILE_NAME};
 const BUILTIN_HARNESS_SKILL_SYNC_SCHEMA: &str = "agent-harness.builtin-skill-sync.v1";
 const BUILTIN_HARNESS_SKILL_MANIFEST_SCHEMA: &str = "agent-harness.builtin-skill-manifest.v1";
 const AGENT_WINDOWS_HARNESS_SKILL_ID: &str = "agent-windows-harness";
-const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.9";
+const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.10";
 
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
 description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, response tone, and Codex prompt continuity policy.
-version: 0.1.9
+version: 0.1.10
 platforms: [windows]
 metadata:
   agent_harness:
     category: operations
-    tags: [legacy-import, codex, openrouter, telegram, discord, migration, activation, response-tone, reconnect, channel-identity, cron-scheduler]
+    tags: [legacy-import, codex, openrouter, telegram, discord, migration, activation, response-tone, reconnect, channel-identity, cron-scheduler, scheduler-lint, safe-mode]
 ---
 
 # Agent Windows Harness
@@ -104,6 +104,8 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - Known transient Codex app-server stream disconnect protocol errors are retryable: `Reconnecting...`, `stream disconnected before completion`, and `websocket closed by server before response.completed`.
 - Retry-pending runtime failures are non-terminal. They should not write user-visible error replies, and progress should stay resumable for the same queue/session context.
 - Retry-pending receipts must make the same queue id immediately claimable again. If a retry-pending Telegram or Discord turn shows `openItems>0` while `runtime-loop` reports `no-work`, inspect `state/runtime-queue/runtime-leases.json`; stale retry-pending leases are a runtime lease-cleanup bug, not a channel adapter issue.
+- `lease-busy` is a retryable non-idle runtime status. Do not report it as idle/no-work; inspect competing runtime-loop processes or a recently active queue lease.
+- In supervised infinite mode, keep runtime-loop safe-mode restart enabled. After repeated errors, `safe-mode` keeps the process alive with reduced concurrency and writes heartbeat/log evidence; missing/stale/error/stopped/stopping runtime-loop heartbeats are live readiness failures.
 - Non-matching protocol/config/preflight/spawn failures stay failed-terminal. Gateway restart alone does not resume failed-terminal or dead-letter queue items.
 - `runtimeBackoff` config controls retry caps and delay hints for retryable runtime failures. When retry attempts are exhausted, runtime-run-once dead-letters the item and writes an operator-friendly error reply. Provider/model fallback is operator-guided; the harness should not silently switch providers on behalf of a user turn.
 - Use `queue-retry` for manual recovery of a timeout/dead-letter item. It creates a fresh queue id while preserving `sessionKey`, agent, platform/channel/user, provider/model, selected skills, and planned transcript/trajectory paths.
@@ -150,8 +152,10 @@ Commands should update channel state and receipts before enqueueing agent turns.
 ## Cron Scheduler
 
 - `cron-scheduler-run-once` evaluates imported native agent-turn cron and deterministic crontab/Supercronic-style cron, then enqueues due work into WorkerStore with durable watermarks under `state/cron-scheduler/watermarks.sqlite`.
+- Run `cron-scheduler-lint` before enabling or changing live scheduler ticks. Lint is read-only and should fail cutover when status is `error`.
 - Use `--dry-run` for readback and `--enable` plus explicit `--resume-cron` or `--allow-deterministic-run` gates for intentional enqueue. A scheduler tick should write job-decision receipts even when entries are skipped by policy.
-- `cron-scheduler-loop` repeats the tick with heartbeat, stop-file, consecutive-error, and `loop-last.json` status support. Generate it through `supervisor-plan --include-cron-scheduler` only after operator approval to activate live scheduling.
+- `cron-scheduler-loop` repeats the tick with heartbeat, stop-file, consecutive-error, and `loop-last.json` status support. It sleeps at least `cronScheduler.intervalMs` even if `--idle-ms` is smaller. Generate it through `supervisor-plan --include-cron-scheduler` only after operator approval to activate live scheduling.
+- On Windows, Linux absolute paths such as `/root/...` in native cron message text are lint/runtime errors because they indicate an imported job would not run in the active environment.
 
 ## Activation Checklist
 
@@ -162,20 +166,21 @@ Before replacing the Docker legacy gateway:
 3. Export or confirm the harness registry.
 4. Sync builtin harness skills.
 5. Run activation readiness checks.
-6. Run status --json and confirm runtime openItems=0, channel outbox pending=0, and log evidence is present.
-7. Confirm logs are written to state/logs/harness.jsonl.
-8. Confirm enable-check reports telegram-access-policy and discord-access-policy as pass when importing existing legacy channel IDs.
-9. Run telegram-probe when TELEGRAM_BOT_TOKEN is configured to prove Telegram token/API reachability without consuming updates.
-10. Smoke-test a Telegram command message with telegram-poll-once when the old gateway is offline, or with channel-run-once when testing offline.
-11. Confirm enable-check reports telegram-probe before live handoff, then telegram-offset, telegram-poll-log, and discord-send-log after channel adapter smoke tests.
-12. Confirm memory-qdrant-edge is present when the current legacy source uses Qdrant edge as primary memory backend.
-13. Run memory-search --harness-home <harness> --query <known term> to prove imported markdown/text memory files are readable. This is a read-only recall probe and does not replace the Qdrant edge vector adapter.
-14. Confirm /status security, enable-check codex-approval-policy, and enable-check codex-sandbox show the intended unattended safety posture.
-15. Confirm codex-runtime-launch-probe passes with the intended --codex-exe before any real runtime handoff. For OpenRouter smoke, confirm the plan uses codex-home-providers/openrouter; for default Codex/OAuth smoke, confirm shared codex-home/config.toml has no OpenRouter model_provider override.
-16. Run plugin-sidecar-probe and plugin-sidecar-call for sidecar.status/plugins.list/tools.probe; set AGENT_HARNESS_PLUGIN_SOURCE_ROOTS when imported manifests live outside the harness home. Confirm plugin-sidecar, plugin-sidecar-probe, and plugin-sidecar-bridge are pass in enable-check. This proves manifest catalog and JSON-RPC bridge readiness; plugin-specific tool executors still need dedicated adapters.
-17. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt. Use tools/agent-fake-codex-app-server/fake-codex-app-server.cmd for offline smoke; use the intended Codex CLI only for operator-run model smoke.
-18. Run runtime-loop --stop-when-idle for idle/drain smoke and confirm state/runtime-queue/loop-last.json plus runtime.loop-stopped log evidence.
-19. Run supervisor-plan with the intended harness CLI, Codex executable, channel loop selection, and task prefix. Confirm state/supervisor/windows-scheduled-tasks/supervisor-plan.json, absolute paths in generated scripts, no raw token/key/secret strings in scripts, and enable-check supervisor-plan pass.
+6. Run healthz --require-writable-state and status --json; confirm runtime openItems=0, channel outbox pending=0, and log evidence is present.
+7. If live scheduler ticks are enabled, run cron-scheduler-lint and cron-scheduler-run-once --dry-run --enable before supervisor cutover.
+8. Confirm logs are written to state/logs/harness.jsonl.
+9. Confirm enable-check reports telegram-access-policy and discord-access-policy as pass when importing existing legacy channel IDs.
+10. Run telegram-probe when TELEGRAM_BOT_TOKEN is configured to prove Telegram token/API reachability without consuming updates.
+11. Smoke-test a Telegram command message with telegram-poll-once when the old gateway is offline, or with channel-run-once when testing offline.
+12. Confirm enable-check reports telegram-probe before live handoff, then telegram-offset, telegram-poll-log, and discord-send-log after channel adapter smoke tests.
+13. Confirm memory-qdrant-edge is present when the current legacy source uses Qdrant edge as primary memory backend.
+14. Run memory-search --harness-home <harness> --query <known term> to prove imported markdown/text memory files are readable. This is a read-only recall probe and does not replace the Qdrant edge vector adapter.
+15. Confirm /status security, enable-check codex-approval-policy, and enable-check codex-sandbox show the intended unattended safety posture.
+16. Confirm codex-runtime-launch-probe passes with the intended --codex-exe before any real runtime handoff. For OpenRouter smoke, confirm the plan uses codex-home-providers/openrouter; for default Codex/OAuth smoke, confirm shared codex-home/config.toml has no OpenRouter model_provider override.
+17. Run plugin-sidecar-probe and plugin-sidecar-call for sidecar.status/plugins.list/tools.probe; set AGENT_HARNESS_PLUGIN_SOURCE_ROOTS when imported manifests live outside the harness home. Confirm plugin-sidecar, plugin-sidecar-probe, and plugin-sidecar-bridge are pass in enable-check. This proves manifest catalog and JSON-RPC bridge readiness; plugin-specific tool executors still need dedicated adapters.
+18. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt. Use tools/agent-fake-codex-app-server/fake-codex-app-server.cmd for offline smoke; use the intended Codex CLI only for operator-run model smoke.
+19. Run runtime-loop --stop-when-idle for idle/drain smoke and confirm state/runtime-queue/loop-last.json plus runtime.loop-stopped log evidence.
+20. Run supervisor-plan with the intended harness CLI, Codex executable, channel loop selection, and task prefix. Confirm state/supervisor/windows-scheduled-tasks/supervisor-plan.json, absolute paths in generated scripts, no raw token/key/secret strings in scripts, and enable-check supervisor-plan pass.
 
 ## Codex Runtime Flow
 
@@ -221,7 +226,9 @@ Use status for operator-facing health checks before and after handoff:
 - status summarizes readiness, runtime queued/open/prepared/completed items, outbox pending/delivered/retryable counts, Telegram/Discord smoke evidence, memory backend presence, plugin sidecar receipts, and operational log coverage.
 - status includes memory-search receipts when the imported markdown/text memory probe has been run.
 - status --json is the monitor-friendly form for scheduled tasks or service wrappers.
-- runtime-loop writes loop-last.json for the most recent worker-loop stop reason, iteration count, idle count, and error count.
+- healthz --require-writable-state is the live/readiness gate for loops, writable state, runtime backlog, and channel backlog.
+- Large ledgers are tail-sampled by status/health/readiness. When sampled is true, counts are an operational window rather than full historical totals.
+- runtime-loop writes loop-last.json for the most recent runtime-loop stop/degraded reason, iteration count, idle count, error count, and safe-mode restarts.
 - supervisor-plan readiness is checked through enable-check, not status-specific process liveness; installed task health still needs monitor integration.
 - Before live channel handoff, openItems should be 0 and outbox pending should be 0 unless the operator intentionally wants the adapter to deliver those pending messages.
 

@@ -134,9 +134,11 @@ pub use cron::{
 };
 pub use cron_scheduler::{
     CronSchedulerConfig, CronSchedulerDeterministicConfig, CronSchedulerJobDecision,
-    CronSchedulerJobDecisionStatus, CronSchedulerLoopOptions, CronSchedulerNativeConfig,
-    CronSchedulerRunOnceOptions, CronSchedulerRunOnceReport, CronSchedulerTickReceipt,
-    CronSchedulerTickStatus, CronSchedulerTickSummary, run_cron_scheduler_once,
+    CronSchedulerJobDecisionStatus, CronSchedulerLintFinding, CronSchedulerLintReport,
+    CronSchedulerLintSeverity, CronSchedulerLintStatus, CronSchedulerLintSummary,
+    CronSchedulerLoopOptions, CronSchedulerNativeConfig, CronSchedulerRunOnceOptions,
+    CronSchedulerRunOnceReport, CronSchedulerTickReceipt, CronSchedulerTickStatus,
+    CronSchedulerTickSummary, lint_cron_scheduler, run_cron_scheduler_once,
 };
 pub use deploy::{
     SuperviseDeployCanaryOptions, SuperviseDeployCanaryReport, SuperviseDeployDecision,

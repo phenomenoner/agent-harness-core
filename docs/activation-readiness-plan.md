@@ -1,6 +1,6 @@
 # Activation Readiness Plan
 
-Date: 2026-06-13
+Date: 2026-06-15
 
 This is the working checklist for turning the Rust Windows Agent Harness from a local core runtime into the active replacement for the Docker legacy gateway.
 
@@ -8,6 +8,8 @@ This is the working checklist for turning the Rust Windows Agent Harness from a 
 
 2026-06-12 repo-local harness-home baseline after round3-2 timeout/progress reconciliation:
 
+- Round4-3 live robustness implementation is staged on 2026-06-15: runtime-loop Windows lock/JSON sharing-violation paths retry instead of failing silently, runtime queue `lease-busy` is a retryable non-idle status, supervised infinite runtime loops enter `safe-mode` with reduced concurrency instead of exiting after repeated errors, cron scheduler has read-only lint plus interval-floor/stale-lock hardening, and status/readiness/log scans tail-sample large JSONL ledgers.
+- Round4-3 staged verification passed fmt, workspace check, 243 core tests, 19 CLI tests, staging build, public hygiene, and `git diff --check` with line-ending warnings only. The first live `cron-scheduler-lint` run found existing imported cron content blockers (`errors=65`, `warnings=26`); those scheduler entries need operator review before scheduler cleanliness can be claimed.
 - Live harness home is now repo-local `.agent-harness`; `.agent-harness/` is ignored by git. `imports/activation-harness` remains only as a pre-rebase backup.
 - Latest channel identity / delivery intent / cron scheduler / live-control implementation verification passed `cargo fmt --all --check`, staged workspace check, 239 core tests, 18 CLI tests, staged build, public export hygiene, and non-live cutover CLI smoke.
 - `agent-harness.exe` builds; `cargo fmt --all` and full `cargo test --workspace` passed with 207 core tests, 16 CLI tests, and doc-tests. Previous activation also passed `cargo build`.
@@ -16,7 +18,7 @@ This is the working checklist for turning the Rust Windows Agent Harness from a 
 - `AgentHarness-*` scheduled task registration returned access-denied in this environment, so the runtime workers, worker, progress delivery, Telegram, Discord outbox, and Discord gateway loops were started manually as hidden PowerShell processes from the generated scripts.
 - Round3-2 timeout/progress reconciliation is implemented: `timeout` is terminal for runtime queue selection, status open-item counts, native typing context, and progress delivery state. A queued pending row with a timeout receipt should no longer be interpreted as open work. See `docs/round3-2-implementation-and-upgrade-plan.md`.
 - Latest live status after restart: `ready=true`, `passed=58`, `warnings=0`, `failed=0`; runtime `queued=123`, `open=0`, `prepared=123`, `completed=120`; outbox `pending=0`, `delivered=186`, `retryable=0`, `invalid=0`.
-- Loop heartbeats are live for runtime, worker, progress delivery, Telegram, Discord outbox, and Discord gateway. The supervisor plan contains 6 canonical task entries; `supervisor-plan --include-cron-scheduler` intentionally adds a seventh cron scheduler loop only for live scheduler cutover.
+- Loop heartbeats are live for runtime, worker, progress delivery, Telegram, Discord outbox, Discord gateway, and cron scheduler after the Round4-2 scheduler cutover. Deployments that have not enabled scheduler ticks still have the six always-on channel/runtime loops; `supervisor-plan --include-cron-scheduler` intentionally adds the scheduler loop only for live scheduler cutover.
 - Worker config is live at global=12, per-agent/group=6, per-agent-per-channel=3, lane limits `llm=6`, `shell=6`, `watchdog=2`, `maintenance=2`, `plugin=2`, with no worker config warnings.
 - Prompt-file loading now falls back from runtime cwd to imported workspace when needed, and injected prompt files include role headers for `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `USER.md`, `IDENTITY.md`, `HEARTBEAT.md`, and `BOOTSTRAP.md`. Skills are dynamic task context, so `Skills: 0 selected` can be normal for command/status turns.
 - Progress rendering now compacts long PowerShell/Codex tool-call previews, suppressed low-value `assistant_stream` deltas, routes assistant narration to the editable `Current step` status under the default `progress_panel` setting, skipped-denied progress delivery advances the cursor to prevent repeated Telegram `Working` messages, and terminal runtime progress cannot be downgraded by later stray events for the same parent queue id.
@@ -24,6 +26,8 @@ This is the working checklist for turning the Rust Windows Agent Harness from a 
 - `memory-lancedb` is hidden unless the source config explicitly selects LanceDB as the active memory backend.
 - Controlled online testing can proceed by having an allowed Telegram/Discord user send a normal message, then recording transcript and delivery receipt paths here.
 - Round4-2 live cutover on 2026-06-14 used ticket `cutover-1781376947099`, regenerated the 7-loop supervisor plan with live-control guards, synced `agent-windows-harness` v0.1.9, started direct runners, and verified `status --json` with `ready=true`, `passed=59`, `warnings=0`, `failed=0`.
+- Runtime-loop missing/stale/error/stopped/stopping is now a readiness failure for live operation. Runtime-loop `safe-mode` is a degraded warning that should trigger operator inspection but preserves the communication path.
+- Current status/readiness counts over very large logs may be sampled tail windows. Treat sampled warnings as a signal to inspect focused ledgers instead of comparing them with full historical totals.
 
 ## Activation Target
 
@@ -80,10 +84,12 @@ These must pass before cutover.
    - Confirm `state/runtime-queue/run-once-receipts.jsonl`.
    - Confirm a `timeout` run-once receipt closes the parent queue id for status/typing/progress; retry should be represented by a new queue id.
    - Run `runtime-loop --stop-when-idle --iterations 1` for idle/drain smoke, or `runtime-loop --iterations 0` only under an operator/supervisor after handoff.
+   - For supervised infinite loops, keep safe-mode restart enabled. `--no-safe-mode-restart` is only for finite/debug runs where the operator wants immediate process exit.
    - Confirm `state/runtime-queue/loop-last.json`.
-   - Confirm `enable-check` reports `runtime-loop` as pass.
+   - Confirm `enable-check` and `healthz --require-writable-state` report runtime-loop as live/ready. Missing/stale/error/stopped/stopping runtime-loop heartbeat blocks cutover; `safe-mode` is a degraded warning that requires inspection.
    - Run `supervisor-plan` with the intended harness CLI, Codex executable, agent id, and channel loop selection.
    - Add `--include-cron-scheduler` only when the operator is intentionally enabling live scheduler ticks.
+   - Before enabling or changing live scheduler ticks, run `cron-scheduler-lint --dry-run --enable` and `cron-scheduler-run-once --dry-run --enable` against the intended harness/source/workspace paths. Lint errors block scheduler cutover.
    - Confirm `state/supervisor/windows-scheduled-tasks/supervisor-plan.json`.
    - Confirm generated scripts use absolute paths and do not contain raw tokens.
    - Confirm `enable-check` reports `supervisor-plan` as pass.
@@ -102,11 +108,13 @@ These must pass before cutover.
 
 7. Logging gate
    - Run `enable-check`.
+   - Run `healthz --require-writable-state`.
    - Run `status --json`.
    - Confirm `state/logs/harness.jsonl` is writable.
    - Confirm logs include activation, Telegram probe, Telegram poll-once or loop, Discord outbox send, channel receive, runtime run-once, runtime loop, Codex run, completion, and delivery events.
    - Confirm `enable-check` reports `telegram-probe` as pass after token/API smoke and reports `telegram-offset`, `telegram-poll-log`, and `discord-send-log` as pass after adapter smoke tests.
    - Confirm `status` reports runtime `openItems=0` and outbox `pending=0` before live adapter handoff.
+   - If `status`, `healthz`, or `enable-check` warns that a JSONL/log ledger was sampled, treat the affected counts as a tail-window summary and use targeted receipt inspection for full historical evidence.
 
 ## Smoke Gates
 
@@ -283,7 +291,10 @@ cargo run -p agent-harness-cli -- help
 cargo run -p agent-harness-cli -- channel-credentials-export --source-home C:\path\to\.openclaw --harness-home C:\path\to\.agent-harness --include-sensitive
 cargo run -p agent-harness-cli -- telegram-probe --harness-home C:\path\to\.agent-harness
 cargo run -p agent-harness-cli -- enable-check --harness-home C:\path\to\.agent-harness
+cargo run -p agent-harness-cli -- healthz --target-home C:\path\to\.agent-harness --require-writable-state
 cargo run -p agent-harness-cli -- status --harness-home C:\path\to\.agent-harness --json
+cargo run -p agent-harness-cli -- cron-scheduler-lint --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.agent-harness --workspace C:\path\to\.agent-harness\workspace --dry-run --enable
+cargo run -p agent-harness-cli -- cron-scheduler-run-once --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.agent-harness --workspace C:\path\to\.agent-harness\workspace --dry-run --enable
 cargo run -p agent-harness-cli -- supervisor-plan --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.openclaw --workspace C:\path\to\workspace --harness-cli C:\path\to\agent-harness.exe --codex-exe C:\path\to\codex.cmd --agent main
 cargo run -p agent-harness-cli -- channel-run-once --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.openclaw --platform telegram --channel-id smoke --user-id operator --message /status
 cargo run -p agent-harness-cli -- channel-run-once --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.openclaw --platform telegram --channel-id offline-runtime-smoke --user-id operator --message "offline runtime smoke" --agent main --codex-exe tools\agent-fake-codex-app-server\fake-codex-app-server.cmd --timeout-ms 5000

@@ -8,14 +8,15 @@ use serde_json::{Value, json};
 
 use crate::{
     AgentSource, DeterministicCronPlanAction, DeterministicCronPlanInput,
-    DeterministicCronSchedule, NativeCronPlanAction, NativeCronPlanInput, NativeCronSchedule,
-    WorkerEnqueueOptions, WorkerEnqueueReport, WorkerJobKind, append_harness_log,
-    append_jsonl_value, config::harness_config_candidates, current_log_time_ms, enqueue_worker_job,
-    load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
+    DeterministicCronSchedule, NativeCronPlanAction, NativeCronPlanEntry, NativeCronPlanInput,
+    NativeCronSchedule, WorkerEnqueueOptions, WorkerEnqueueReport, WorkerJobKind,
+    append_harness_log, append_jsonl_value, config::harness_config_candidates, current_log_time_ms,
+    enqueue_worker_job, load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
     plan_deterministic_cron, plan_native_cron, write_json_atomic,
 };
 
 const CRON_SCHEDULER_RUN_ONCE_SCHEMA: &str = "agent-harness.cron-scheduler.run-once.v1";
+const CRON_SCHEDULER_LINT_SCHEMA: &str = "agent-harness.cron-scheduler.lint.v1";
 const CRON_SCHEDULER_TICK_SCHEMA: &str = "agent-harness.cron-scheduler.tick.v1";
 const CRON_SCHEDULER_JOB_DECISION_SCHEMA: &str = "agent-harness.cron-scheduler.job-decision.v1";
 const DEFAULT_INTERVAL_MS: i64 = 60_000;
@@ -23,6 +24,9 @@ const DEFAULT_MAX_CATCHUP_PER_TICK: usize = 10;
 const DEFAULT_MAX_ENQUEUE_PER_TICK: usize = 20;
 const DEFAULT_WORKER_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_WATCHDOG_TIMEOUT_MS: u64 = 900_000;
+const SCHEDULER_LOCK_STALE_MS: i64 = 30_000;
+const CRON_RECEIPTS_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const CRON_RECEIPTS_MAX_ARCHIVES: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronSchedulerRunOnceOptions {
@@ -89,6 +93,59 @@ pub enum CronSchedulerTickStatus {
     Completed,
     LockBusy,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CronSchedulerLintStatus {
+    Pass,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CronSchedulerLintSeverity {
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CronSchedulerLintFinding {
+    pub severity: CronSchedulerLintSeverity,
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CronSchedulerLintSummary {
+    pub findings: usize,
+    pub errors: usize,
+    pub warnings: usize,
+    pub native_entries: usize,
+    pub deterministic_entries: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CronSchedulerLintReport {
+    pub schema: &'static str,
+    pub harness_home: PathBuf,
+    pub source_home: PathBuf,
+    pub source_workspace: PathBuf,
+    pub status: CronSchedulerLintStatus,
+    pub config_file: Option<PathBuf>,
+    pub config: CronSchedulerConfig,
+    pub findings: Vec<CronSchedulerLintFinding>,
+    pub summary: CronSchedulerLintSummary,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -206,11 +263,12 @@ impl Default for CronSchedulerDeterministicConfig {
 
 struct SchedulerLock {
     path: PathBuf,
-    _file: fs::File,
+    file: Option<fs::File>,
 }
 
 impl Drop for SchedulerLock {
     fn drop(&mut self) {
+        let _ = self.file.take();
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -244,7 +302,7 @@ pub fn run_cron_scheduler_once(
             summary: CronSchedulerTickSummary::default(),
             warnings,
         };
-        append_tick_receipt(&report, options.now_ms, options.dry_run)?;
+        append_cron_scheduler_receipts(&report, options.now_ms, options.dry_run)?;
         return write_loop_last_report(report);
     };
 
@@ -270,7 +328,7 @@ pub fn run_cron_scheduler_once(
         report.warnings.push(
             "cronScheduler.enabled is false; scheduler tick did not enqueue work".to_string(),
         );
-        append_tick_receipt(&report, options.now_ms, options.dry_run)?;
+        append_cron_scheduler_receipts(&report, options.now_ms, options.dry_run)?;
         return write_loop_last_report(report);
     }
 
@@ -305,10 +363,7 @@ pub fn run_cron_scheduler_once(
             .push("cronScheduler has no enabled source lanes".to_string());
     }
 
-    for decision in &report.decisions {
-        append_jsonl_value(&receipts_file, decision)?;
-    }
-    append_tick_receipt(&report, options.now_ms, options.dry_run)?;
+    append_cron_scheduler_receipts(&report, options.now_ms, options.dry_run)?;
     append_harness_log(
         &options.harness_home,
         &crate::HarnessLogEvent::new(
@@ -331,6 +386,236 @@ pub fn run_cron_scheduler_once(
         ),
     )?;
     write_loop_last_report(report)
+}
+
+pub fn lint_cron_scheduler(
+    options: CronSchedulerRunOnceOptions,
+) -> io::Result<CronSchedulerLintReport> {
+    let mut warnings = Vec::new();
+    let (mut config, config_file) =
+        load_cron_scheduler_config(&options.harness_home, &mut warnings)?;
+    apply_overrides(&mut config, &options);
+
+    let mut findings = Vec::new();
+    if config.enabled {
+        if config.interval_ms < 10_000 {
+            push_lint_finding(
+                &mut findings,
+                CronSchedulerLintSeverity::Error,
+                "interval-too-short",
+                format!(
+                    "cronScheduler.intervalMs={} is below the 10000 ms runtime guard",
+                    config.interval_ms
+                ),
+                None,
+                None,
+            );
+        } else if config.interval_ms < DEFAULT_INTERVAL_MS {
+            push_lint_finding(
+                &mut findings,
+                CronSchedulerLintSeverity::Warn,
+                "interval-below-default",
+                format!(
+                    "cronScheduler.intervalMs={} is below the default {} ms",
+                    config.interval_ms, DEFAULT_INTERVAL_MS
+                ),
+                None,
+                None,
+            );
+        }
+    }
+    if config.max_catchup_per_tick > 50 {
+        push_lint_finding(
+            &mut findings,
+            CronSchedulerLintSeverity::Warn,
+            "max-catchup-high",
+            format!(
+                "cronScheduler.maxCatchupPerTick={} can create bursty catch-up work",
+                config.max_catchup_per_tick
+            ),
+            None,
+            None,
+        );
+    }
+    if config.max_enqueue_per_tick > 100 {
+        push_lint_finding(
+            &mut findings,
+            CronSchedulerLintSeverity::Warn,
+            "max-enqueue-high",
+            format!(
+                "cronScheduler.maxEnqueuePerTick={} can flood the worker/runtime queues",
+                config.max_enqueue_per_tick
+            ),
+            None,
+            None,
+        );
+    }
+
+    let mut native_entries = 0usize;
+    let mut deterministic_entries = 0usize;
+    if config.native_cron.enabled {
+        let store = load_native_cron_store(&options.source)?;
+        let registry = load_agent_registry(&options.source)?;
+        let plan = plan_native_cron(
+            &store,
+            &registry,
+            NativeCronPlanInput {
+                now_ms: options.now_ms,
+                resume_enabled: config.native_cron.resume_cron,
+            },
+        );
+        native_entries = plan.entries.len();
+        for warning in plan.warnings {
+            push_lint_finding(
+                &mut findings,
+                CronSchedulerLintSeverity::Warn,
+                "native-plan-warning",
+                warning,
+                Some("native-cron"),
+                None,
+            );
+        }
+        for entry in plan.entries {
+            match entry.action {
+                NativeCronPlanAction::MissingAgent => push_lint_finding(
+                    &mut findings,
+                    CronSchedulerLintSeverity::Error,
+                    "native-missing-agent",
+                    entry.reason.clone(),
+                    Some("native-cron"),
+                    Some(entry.job_id.clone()),
+                ),
+                NativeCronPlanAction::UnsupportedSchedule => push_lint_finding(
+                    &mut findings,
+                    CronSchedulerLintSeverity::Error,
+                    "native-unsupported-schedule",
+                    entry.reason.clone(),
+                    Some("native-cron"),
+                    Some(entry.job_id.clone()),
+                ),
+                NativeCronPlanAction::EnqueueAgentTurn | NativeCronPlanAction::CronRegistered => {
+                    if let Some(reason) = native_cron_entry_runtime_path_blocker(&entry) {
+                        push_lint_finding(
+                            &mut findings,
+                            CronSchedulerLintSeverity::Error,
+                            "native-runtime-path-mismatch",
+                            reason,
+                            Some("native-cron"),
+                            Some(entry.job_id.clone()),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if config.deterministic_cron.enabled {
+        let store = load_deterministic_cron_store(&options.source)?;
+        let plan = plan_deterministic_cron(
+            &store,
+            DeterministicCronPlanInput {
+                allow_deterministic_run: config.deterministic_cron.allow_deterministic_run,
+            },
+        );
+        deterministic_entries = plan.entries.len();
+        for warning in plan.warnings {
+            push_lint_finding(
+                &mut findings,
+                CronSchedulerLintSeverity::Warn,
+                "deterministic-plan-warning",
+                warning,
+                Some("deterministic-cron"),
+                None,
+            );
+        }
+        for entry in plan.entries {
+            let (severity, code) = match entry.action {
+                DeterministicCronPlanAction::MissingScript => (
+                    CronSchedulerLintSeverity::Error,
+                    "deterministic-missing-script",
+                ),
+                DeterministicCronPlanAction::UnsupportedEntry => (
+                    CronSchedulerLintSeverity::Error,
+                    "deterministic-unsupported-entry",
+                ),
+                DeterministicCronPlanAction::ExternalCommandReview => (
+                    CronSchedulerLintSeverity::Warn,
+                    "deterministic-external-command-review",
+                ),
+                DeterministicCronPlanAction::ShellCompatibilityRequired => (
+                    CronSchedulerLintSeverity::Warn,
+                    "deterministic-shell-compatibility-required",
+                ),
+                _ => continue,
+            };
+            push_lint_finding(
+                &mut findings,
+                severity,
+                code,
+                entry.reason.clone(),
+                Some("deterministic-cron"),
+                Some(entry.entry_id.clone()),
+            );
+        }
+        if config.deterministic_cron.allow_deterministic_run
+            && config.deterministic_cron.execute_shell
+        {
+            push_lint_finding(
+                &mut findings,
+                CronSchedulerLintSeverity::Warn,
+                "deterministic-shell-execution-enabled",
+                "deterministic cron shell execution is enabled; use dry-run-shell unless this was explicitly reviewed",
+                Some("deterministic-cron"),
+                None,
+            );
+        }
+    }
+
+    if config.enabled && !config.native_cron.enabled && !config.deterministic_cron.enabled {
+        push_lint_finding(
+            &mut findings,
+            CronSchedulerLintSeverity::Warn,
+            "no-enabled-source-lanes",
+            "cronScheduler.enabled is true but no cron source lane is enabled",
+            None,
+            None,
+        );
+    }
+
+    let errors = findings
+        .iter()
+        .filter(|finding| finding.severity == CronSchedulerLintSeverity::Error)
+        .count();
+    let warnings_count = findings
+        .iter()
+        .filter(|finding| finding.severity == CronSchedulerLintSeverity::Warn)
+        .count();
+    let status = if errors > 0 {
+        CronSchedulerLintStatus::Error
+    } else if warnings_count > 0 {
+        CronSchedulerLintStatus::Warn
+    } else {
+        CronSchedulerLintStatus::Pass
+    };
+    Ok(CronSchedulerLintReport {
+        schema: CRON_SCHEDULER_LINT_SCHEMA,
+        harness_home: options.harness_home,
+        source_home: options.source.home,
+        source_workspace: options.source.workspace,
+        status,
+        config_file,
+        config,
+        summary: CronSchedulerLintSummary {
+            findings: findings.len(),
+            errors,
+            warnings: warnings_count,
+            native_entries,
+            deterministic_entries,
+        },
+        findings,
+        warnings,
+    })
 }
 
 fn collect_native_cron_decisions(
@@ -409,6 +694,19 @@ fn collect_native_cron_decisions(
                         options.now_ms,
                         CronSchedulerJobDecisionStatus::SkippedPolicy,
                         "includeRegisteredCron is false",
+                        None,
+                    );
+                    continue;
+                }
+                if let Some(reason) = native_cron_entry_runtime_path_blocker(entry) {
+                    push_decision(
+                        report,
+                        "native-cron",
+                        &source_id,
+                        &entry.job_id,
+                        options.now_ms,
+                        CronSchedulerJobDecisionStatus::SkippedPolicy,
+                        &reason,
                         None,
                     );
                     continue;
@@ -845,6 +1143,109 @@ fn push_decision(
     });
 }
 
+fn cron_scheduler_decision_should_persist(decision: &CronSchedulerJobDecision) -> bool {
+    !matches!(
+        decision.decision,
+        CronSchedulerJobDecisionStatus::SkippedPolicy
+    ) || decision.reason != "schedule is not due in the current scheduler slot"
+}
+
+fn append_cron_scheduler_receipts(
+    report: &CronSchedulerRunOnceReport,
+    now_ms: i64,
+    dry_run: bool,
+) -> io::Result<()> {
+    rotate_cron_scheduler_receipts_if_needed(&report.receipts_file, now_ms)?;
+    for decision in report
+        .decisions
+        .iter()
+        .filter(|decision| cron_scheduler_decision_should_persist(decision))
+    {
+        append_jsonl_value(&report.receipts_file, decision)?;
+    }
+    if cron_scheduler_tick_should_persist(report, dry_run) {
+        append_tick_receipt(report, now_ms, dry_run)?;
+    }
+    Ok(())
+}
+
+fn cron_scheduler_tick_should_persist(report: &CronSchedulerRunOnceReport, dry_run: bool) -> bool {
+    dry_run
+        || matches!(report.status, CronSchedulerTickStatus::Error)
+        || report.summary.enqueued > 0
+        || report.summary.errors > 0
+        || report.summary.skipped_held > 0
+        || report.summary.due_candidates > 0
+}
+
+fn rotate_cron_scheduler_receipts_if_needed(receipts_file: &Path, now_ms: i64) -> io::Result<()> {
+    let Ok(metadata) = fs::metadata(receipts_file) else {
+        return Ok(());
+    };
+    if metadata.len() < CRON_RECEIPTS_MAX_BYTES {
+        return Ok(());
+    }
+    let archive = receipts_file.with_file_name(format!("receipts-{now_ms}.jsonl"));
+    fs::rename(receipts_file, archive)?;
+    prune_cron_receipt_archives(receipts_file.parent().unwrap_or(Path::new(".")))
+}
+
+fn prune_cron_receipt_archives(state_dir: &Path) -> io::Result<()> {
+    let mut archives = Vec::new();
+    for entry in fs::read_dir(state_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("receipts-") && name.ends_with(".jsonl") {
+            archives.push((path, entry.metadata()?.modified().ok()));
+        }
+    }
+    archives.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0)));
+    for (path, _) in archives.into_iter().skip(CRON_RECEIPTS_MAX_ARCHIVES) {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn push_lint_finding(
+    findings: &mut Vec<CronSchedulerLintFinding>,
+    severity: CronSchedulerLintSeverity,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    source_kind: Option<&str>,
+    entry_id: Option<String>,
+) {
+    findings.push(CronSchedulerLintFinding {
+        severity,
+        code: code.into(),
+        message: message.into(),
+        source_kind: source_kind.map(ToString::to_string),
+        entry_id,
+    });
+}
+
+fn native_cron_entry_runtime_path_blocker(entry: &NativeCronPlanEntry) -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let text = entry.message_text.as_deref()?;
+    let lowered = text.to_ascii_lowercase();
+    let has_linux_absolute_path = lowered.contains("/root/")
+        || lowered.contains("/home/")
+        || lowered.contains("/mnt/")
+        || lowered.contains("/var/")
+        || lowered.contains("/etc/");
+    if has_linux_absolute_path {
+        return Some(
+            "native cron message references Linux-style absolute paths while the live runtime is Windows; review or rewrite the job before enqueue"
+                .to_string(),
+        );
+    }
+    None
+}
+
 fn load_cron_scheduler_config(
     harness_home: &Path,
     warnings: &mut Vec<String>,
@@ -1038,21 +1439,55 @@ fn acquire_scheduler_lock(scheduler_dir: &Path, now_ms: i64) -> io::Result<Optio
             writeln!(file, "{now_ms}")?;
             Ok(Some(SchedulerLock {
                 path: lock_file,
-                _file: file,
+                file: Some(file),
             }))
         }
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::AlreadyExists
-                    | io::ErrorKind::PermissionDenied
-                    | io::ErrorKind::WouldBlock
-            ) =>
-        {
+        Err(error) if scheduler_lock_is_busy(&error) => {
+            if scheduler_lock_is_stale(&lock_file, now_ms) {
+                match fs::remove_file(&lock_file) {
+                    Ok(()) => return acquire_scheduler_lock(scheduler_dir, now_ms),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        return acquire_scheduler_lock(scheduler_dir, now_ms);
+                    }
+                    Err(error) if scheduler_lock_is_busy(&error) => return Ok(None),
+                    Err(error) => return Err(error),
+                }
+            }
             Ok(None)
         }
         Err(error) => Err(error),
     }
+}
+
+fn scheduler_lock_is_busy(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied | io::ErrorKind::WouldBlock
+    ) || {
+        #[cfg(windows)]
+        {
+            error.raw_os_error() == Some(32)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = error;
+            false
+        }
+    }
+}
+
+fn scheduler_lock_is_stale(lock_file: &Path, now_ms: i64) -> bool {
+    if let Ok(text) = fs::read_to_string(lock_file)
+        && let Ok(created_at_ms) = text.trim().parse::<i64>()
+    {
+        return now_ms.saturating_sub(created_at_ms) > SCHEDULER_LOCK_STALE_MS;
+    }
+    lock_file
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age.as_millis() > u128::from(SCHEDULER_LOCK_STALE_MS as u64))
 }
 
 fn native_due_slot(schedule: &NativeCronSchedule, now_ms: i64) -> Result<Option<i64>, String> {
@@ -1414,6 +1849,100 @@ mod tests {
             report.decisions[0].decision,
             CronSchedulerJobDecisionStatus::Enqueued
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lint_reports_too_short_interval() {
+        let root = temp_root("lint_reports_too_short_interval");
+        let source = write_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"cronScheduler":{"enabled":true,"intervalMs":1000,"nativeCron":{"enabled":true,"resumeCron":true}}}"#,
+        )
+        .unwrap();
+
+        let report = lint_cron_scheduler(CronSchedulerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            source,
+            runtime_workspace: None,
+            now_ms: 10_000,
+            dry_run: true,
+            enabled_override: None,
+            native_enabled_override: None,
+            deterministic_enabled_override: None,
+            resume_cron_override: None,
+            include_registered_cron_override: None,
+            allow_deterministic_run_override: None,
+            execute_shell_override: None,
+            max_catchup_per_tick_override: None,
+            max_enqueue_per_tick_override: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, CronSchedulerLintStatus::Error);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.code == "interval-too-short")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_once_and_lint_block_linux_absolute_paths_on_windows() {
+        let root = temp_root("run_once_and_lint_block_linux_absolute_paths_on_windows");
+        let source = write_source(&root);
+        fs::write(
+            source.home.join("cron").join("jobs.json"),
+            r#"{
+              "jobs": [
+                {
+                  "id": "linux-path",
+                  "enabled": true,
+                  "agentId": "main",
+                  "schedule": { "kind": "at", "epochMs": 1000 },
+                  "messageText": "read /root/.openclaw/cron/jobs.json"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        let options = CronSchedulerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            source,
+            runtime_workspace: None,
+            now_ms: 10_000,
+            dry_run: false,
+            enabled_override: Some(true),
+            native_enabled_override: Some(true),
+            deterministic_enabled_override: Some(false),
+            resume_cron_override: Some(true),
+            include_registered_cron_override: Some(false),
+            allow_deterministic_run_override: None,
+            execute_shell_override: None,
+            max_catchup_per_tick_override: None,
+            max_enqueue_per_tick_override: None,
+        };
+
+        let lint = lint_cron_scheduler(options.clone()).unwrap();
+        assert_eq!(lint.status, CronSchedulerLintStatus::Error);
+        assert!(
+            lint.findings
+                .iter()
+                .any(|finding| finding.code == "native-runtime-path-mismatch")
+        );
+        let tick = run_cron_scheduler_once(options).unwrap();
+        assert_eq!(tick.summary.enqueued, 0);
+        assert_eq!(tick.summary.skipped_policy, 1);
 
         let _ = fs::remove_dir_all(root);
     }

@@ -30,9 +30,9 @@ use agent_harness_core::{
     CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReport, CodexRuntimePlanOptions,
     CodexRuntimePlanReport, CodexRuntimePreflightOptions, CodexRuntimePreflightReport,
     CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy, ContextPackParseOptions,
-    CronSchedulerRunOnceOptions, CronSchedulerTickStatus, DeterministicCronPlan,
-    DeterministicCronPlanInput, DeterministicCronWorkerEnqueueOptions, DriftCheckOptions,
-    DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel,
+    CronSchedulerLintStatus, CronSchedulerRunOnceOptions, CronSchedulerTickStatus,
+    DeterministicCronPlan, DeterministicCronPlanInput, DeterministicCronWorkerEnqueueOptions,
+    DriftCheckOptions, DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel,
     HarnessLogRotationOptions, HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport,
     HealthzOptions, ImportPhaseStatus, ImportReport, LearningProposalOptions, LiveControlAction,
     McpRequestOptions, MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport,
@@ -67,7 +67,7 @@ use agent_harness_core::{
     evaluate_prompt_reduction, evaluate_supervisor_children, execute_import,
     export_harness_registry_files, export_memory_credentials, get_vault_secret, handle_mcp_request,
     inspect_openclaw_mem_service, inspect_runtime_queue_capacity, invariant_catalog, inventory,
-    list_background_tasks, load_agent_registry, load_deterministic_cron_store,
+    lint_cron_scheduler, list_background_tasks, load_agent_registry, load_deterministic_cron_store,
     load_native_cron_store, load_subagent_ledger, parse_channel_command, parse_context_pack,
     plan_agent_progress_delivery, plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron,
     plan_native_cron, plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
@@ -90,6 +90,7 @@ use agent_harness_core::{
 
 const DEFAULT_CODEX_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 const DEFAULT_CODEX_IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
+const DEFAULT_RUNTIME_SAFE_MODE_RESTART_MS: u64 = 60_000;
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -200,6 +201,7 @@ fn main() {
         "native-cron-enqueue" => run_native_cron_enqueue(&rest),
         "deterministic-cron-plan" => run_deterministic_cron_plan(&rest),
         "deterministic-cron-enqueue" => run_deterministic_cron_enqueue(&rest),
+        "cron-scheduler-lint" => run_cron_scheduler_lint(&rest),
         "cron-scheduler-run-once" => run_cron_scheduler_run_once(&rest),
         "cron-scheduler-loop" => run_cron_scheduler_loop(&rest),
         "subagent-plan" => run_subagent_plan(&rest),
@@ -3943,6 +3945,7 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
     let mut idle = 0usize;
     let mut errors = 0usize;
     let mut consecutive_errors = 0usize;
+    let mut safe_mode_restarts = 0usize;
     let mut last_status: Option<RuntimeRunOnceStatus> = None;
     let mut last_queue_id: Option<String> = None;
     let mut last_reason: Option<String> = None;
@@ -3950,6 +3953,7 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
     let mut stop_reason: Option<String> = None;
     let mut stop_requested = false;
     let mut active = 0usize;
+    let mut runtime_concurrency = args.runtime_concurrency.max(1);
     let mut active_queue_ids = HashSet::new();
     let (task_tx, task_rx) = mpsc::channel::<RuntimeLoopTaskResult>();
 
@@ -3969,12 +3973,23 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
                 &mut last_queue_id,
                 &mut last_reason,
             )? {
-                failed = true;
-                stop_requested = true;
-                stop_reason = Some(format!(
-                    "stopped after {} consecutive runtime errors",
-                    args.max_consecutive_errors
-                ));
+                if enter_runtime_loop_safe_mode(
+                    &args,
+                    iterations,
+                    &mut consecutive_errors,
+                    &mut safe_mode_restarts,
+                    &mut runtime_concurrency,
+                )? {
+                    stop_requested = false;
+                    stop_reason = None;
+                } else {
+                    failed = true;
+                    stop_requested = true;
+                    stop_reason = Some(format!(
+                        "stopped after {} consecutive runtime errors",
+                        args.max_consecutive_errors
+                    ));
+                }
             }
         }
         if failed && active == 0 {
@@ -4012,49 +4027,96 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
                 iterations,
                 &format!(
                     "checking runtime queue active={active}/{}",
-                    args.runtime_concurrency
+                    runtime_concurrency
                 ),
             )?;
 
-            let slots = args.runtime_concurrency.saturating_sub(active);
+            let slots = runtime_concurrency.saturating_sub(active);
             let mut spawned = 0usize;
             if slots > 0 {
                 match inspect_runtime_queue_capacity(RuntimeQueueCapacityOptions {
                     harness_home: args.target_home.clone(),
                 }) {
                     Ok(capacity) => {
-                        let queue_ids = capacity
-                            .claimable_queue_ids
-                            .into_iter()
-                            .filter(|queue_id| !active_queue_ids.contains(queue_id))
-                            .take(slots)
-                            .collect::<Vec<_>>();
-                        for queue_id in queue_ids {
-                            active_queue_ids.insert(queue_id.clone());
-                            spawn_runtime_loop_task(&args, queue_id, &task_tx);
-                            active += 1;
-                            spawned += 1;
-                        }
-                        if spawned == 0 && active == 0 {
-                            idle += 1;
-                            consecutive_errors = 0;
-                            last_status = Some(RuntimeRunOnceStatus::NoWork);
+                        if capacity.lease_lock_busy {
+                            errors += 1;
+                            consecutive_errors += 1;
+                            let reason =
+                                "runtime queue lease lock is busy during capacity inspection";
+                            last_status = None;
                             last_queue_id = None;
-                            last_reason = Some(
-                                "no pending or prepared runtime queue item is available"
-                                    .to_string(),
-                            );
+                            last_reason = Some(reason.to_string());
                             write_loop_heartbeat(
                                 &args.target_home,
                                 &args.loop_name,
-                                "no-work",
+                                "error",
                                 iterations,
-                                "no pending or prepared runtime queue item is available",
+                                &format!(
+                                    "consecutiveErrors={consecutive_errors}/{} error={reason}",
+                                    args.max_consecutive_errors
+                                ),
                             )?;
-                            if args.stop_when_idle {
-                                stop_reason =
-                                    Some("stopped after idle runtime result no-work".to_string());
-                                break;
+                            append_runtime_loop_error_log(
+                                &args.target_home,
+                                iterations,
+                                consecutive_errors,
+                                args.max_consecutive_errors,
+                                reason,
+                            )?;
+                            if consecutive_errors >= args.max_consecutive_errors {
+                                if enter_runtime_loop_safe_mode(
+                                    &args,
+                                    iterations,
+                                    &mut consecutive_errors,
+                                    &mut safe_mode_restarts,
+                                    &mut runtime_concurrency,
+                                )? {
+                                    stop_requested = false;
+                                    stop_reason = None;
+                                } else {
+                                    failed = true;
+                                    stop_requested = true;
+                                    stop_reason = Some(format!(
+                                        "stopped after {} consecutive runtime errors",
+                                        args.max_consecutive_errors
+                                    ));
+                                }
+                            }
+                        } else {
+                            let queue_ids = capacity
+                                .claimable_queue_ids
+                                .into_iter()
+                                .filter(|queue_id| !active_queue_ids.contains(queue_id))
+                                .take(slots)
+                                .collect::<Vec<_>>();
+                            for queue_id in queue_ids {
+                                active_queue_ids.insert(queue_id.clone());
+                                spawn_runtime_loop_task(&args, queue_id, &task_tx);
+                                active += 1;
+                                spawned += 1;
+                            }
+                            if spawned == 0 && active == 0 {
+                                idle += 1;
+                                consecutive_errors = 0;
+                                last_status = Some(RuntimeRunOnceStatus::NoWork);
+                                last_queue_id = None;
+                                last_reason = Some(
+                                    "no pending or prepared runtime queue item is available"
+                                        .to_string(),
+                                );
+                                write_loop_heartbeat(
+                                    &args.target_home,
+                                    &args.loop_name,
+                                    "no-work",
+                                    iterations,
+                                    "no pending or prepared runtime queue item is available",
+                                )?;
+                                if args.stop_when_idle {
+                                    stop_reason = Some(
+                                        "stopped after idle runtime result no-work".to_string(),
+                                    );
+                                    break;
+                                }
                             }
                         }
                     }
@@ -4084,12 +4146,23 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
                             &error,
                         )?;
                         if consecutive_errors >= args.max_consecutive_errors {
-                            failed = true;
-                            stop_requested = true;
-                            stop_reason = Some(format!(
-                                "stopped after {} consecutive runtime errors",
-                                args.max_consecutive_errors
-                            ));
+                            if enter_runtime_loop_safe_mode(
+                                &args,
+                                iterations,
+                                &mut consecutive_errors,
+                                &mut safe_mode_restarts,
+                                &mut runtime_concurrency,
+                            )? {
+                                stop_requested = false;
+                                stop_reason = None;
+                            } else {
+                                failed = true;
+                                stop_requested = true;
+                                stop_reason = Some(format!(
+                                    "stopped after {} consecutive runtime errors",
+                                    args.max_consecutive_errors
+                                ));
+                            }
                         }
                     }
                 }
@@ -4124,12 +4197,23 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
                         &mut last_queue_id,
                         &mut last_reason,
                     )? {
-                        failed = true;
-                        stop_requested = true;
-                        stop_reason = Some(format!(
-                            "stopped after {} consecutive runtime errors",
-                            args.max_consecutive_errors
-                        ));
+                        if enter_runtime_loop_safe_mode(
+                            &args,
+                            iterations,
+                            &mut consecutive_errors,
+                            &mut safe_mode_restarts,
+                            &mut runtime_concurrency,
+                        )? {
+                            stop_requested = false;
+                            stop_reason = None;
+                        } else {
+                            failed = true;
+                            stop_requested = true;
+                            stop_reason = Some(format!(
+                                "stopped after {} consecutive runtime errors",
+                                args.max_consecutive_errors
+                            ));
+                        }
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -4158,11 +4242,12 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
         idle,
         errors,
         consecutive_errors,
+        safe_mode_restarts,
         stop_reason: stop_reason.unwrap_or_else(|| "runtime loop stopped".to_string()),
         last_status,
         last_queue_id,
         last_reason,
-        runtime_concurrency: args.runtime_concurrency,
+        runtime_concurrency,
         report_file: args
             .target_home
             .join("state")
@@ -4177,6 +4262,43 @@ fn run_runtime_loop(args: &[String]) -> Result<(), String> {
         return Err(summary.stop_reason);
     }
     Ok(())
+}
+
+fn enter_runtime_loop_safe_mode(
+    args: &RuntimeLoopArgs,
+    iteration: usize,
+    consecutive_errors: &mut usize,
+    safe_mode_restarts: &mut usize,
+    runtime_concurrency: &mut usize,
+) -> Result<bool, String> {
+    let Some(restart_ms) = args.safe_mode_restart_ms else {
+        return Ok(false);
+    };
+    *safe_mode_restarts += 1;
+    *runtime_concurrency = 1;
+    let detail = format!(
+        "safeModeRestart={} after consecutiveErrors={}/{}; runtimeConcurrency=1; retrying in {} ms",
+        *safe_mode_restarts, *consecutive_errors, args.max_consecutive_errors, restart_ms
+    );
+    write_loop_heartbeat(
+        &args.target_home,
+        &args.loop_name,
+        "safe-mode",
+        iteration,
+        &detail,
+    )?;
+    append_runtime_loop_safe_mode_log(
+        &args.target_home,
+        iteration,
+        *safe_mode_restarts,
+        *consecutive_errors,
+        args.max_consecutive_errors,
+        *runtime_concurrency,
+        restart_ms,
+    )?;
+    thread::sleep(Duration::from_millis(restart_ms));
+    *consecutive_errors = 0;
+    Ok(true)
 }
 
 fn spawn_runtime_loop_task(
@@ -4691,6 +4813,34 @@ fn run_deterministic_cron_enqueue(args: &[String]) -> Result<(), String> {
     print_json(&report)
 }
 
+fn run_cron_scheduler_lint(args: &[String]) -> Result<(), String> {
+    let args = cron_scheduler_run_once_args_from_args(args)?;
+    let report = lint_cron_scheduler(CronSchedulerRunOnceOptions {
+        harness_home: args.target_home,
+        source: args.source,
+        runtime_workspace: args.runtime_workspace,
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+        dry_run: true,
+        enabled_override: args.enabled_override,
+        native_enabled_override: args.native_enabled_override,
+        deterministic_enabled_override: args.deterministic_enabled_override,
+        resume_cron_override: args.resume_cron_override,
+        include_registered_cron_override: args.include_registered_cron_override,
+        allow_deterministic_run_override: args.allow_deterministic_run_override,
+        execute_shell_override: args.execute_shell_override,
+        max_catchup_per_tick_override: args.max_catchup_per_tick_override,
+        max_enqueue_per_tick_override: args.max_enqueue_per_tick_override,
+    })
+    .map_err(|err| err.to_string())?;
+    let status = report.status;
+    print_json(&report)?;
+    if status == CronSchedulerLintStatus::Error {
+        Err("cron scheduler lint failed".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 fn run_cron_scheduler_run_once(args: &[String]) -> Result<(), String> {
     let args = cron_scheduler_run_once_args_from_args(args)?;
     let report = run_cron_scheduler_once(CronSchedulerRunOnceOptions {
@@ -4762,11 +4912,15 @@ fn run_cron_scheduler_loop(args: &[String]) -> Result<(), String> {
             max_catchup_per_tick_override: args.run_once.max_catchup_per_tick_override,
             max_enqueue_per_tick_override: args.run_once.max_enqueue_per_tick_override,
         });
-        match report {
+        let next_sleep_ms = match report {
             Ok(report) => {
+                let next_sleep_ms =
+                    cron_scheduler_loop_sleep_ms(args.idle_ms, report.config.interval_ms);
                 let detail = format!(
-                    "status={:?} enqueued={} duplicate={} errors={}",
+                    "status={:?} intervalMs={} sleepMs={} enqueued={} duplicate={} errors={}",
                     report.status,
+                    report.config.interval_ms,
+                    next_sleep_ms,
                     report.summary.enqueued,
                     report.summary.skipped_duplicate,
                     report.summary.errors
@@ -4788,6 +4942,7 @@ fn run_cron_scheduler_loop(args: &[String]) -> Result<(), String> {
                     iterations,
                     &detail,
                 )?;
+                next_sleep_ms
             }
             Err(error) => {
                 let detail = error.to_string();
@@ -4810,16 +4965,24 @@ fn run_cron_scheduler_loop(args: &[String]) -> Result<(), String> {
                     iterations,
                     &detail,
                 )?;
+                cron_scheduler_loop_sleep_ms(args.idle_ms, 60_000)
             }
-        }
+        };
         if consecutive_errors >= args.max_consecutive_errors {
             return Err(format!(
                 "cron scheduler loop stopped after {consecutive_errors} consecutive errors"
             ));
         }
-        thread::sleep(Duration::from_millis(args.idle_ms));
+        thread::sleep(Duration::from_millis(next_sleep_ms));
     }
     Ok(())
+}
+
+fn cron_scheduler_loop_sleep_ms(idle_ms: Option<u64>, config_interval_ms: i64) -> u64 {
+    let interval_ms = u64::try_from(config_interval_ms)
+        .unwrap_or(60_000)
+        .clamp(10_000, 3_600_000);
+    idle_ms.unwrap_or(0).clamp(0, 3_600_000).max(interval_ms)
 }
 
 fn run_subagent_plan(args: &[String]) -> Result<(), String> {
@@ -5105,7 +5268,7 @@ fn cron_scheduler_loop_args_from_args(args: &[String]) -> Result<CronSchedulerLo
 
     let run_once = cron_scheduler_run_once_args_from_args(&run_once_args)?;
     let mut iterations = 0usize;
-    let mut idle_ms = 60_000u64;
+    let mut idle_ms = None;
     let mut max_consecutive_errors = 5usize;
     let mut stop_file = None;
     let mut i = 0;
@@ -5120,10 +5283,12 @@ fn cron_scheduler_loop_args_from_args(args: &[String]) -> Result<CronSchedulerLo
             }
             "--idle-ms" => {
                 i += 1;
-                idle_ms = loop_only
-                    .get(i)
-                    .ok_or_else(|| "--idle-ms requires a value".to_string())
-                    .and_then(|value| parse_u64(value, "--idle-ms"))?;
+                idle_ms = Some(
+                    loop_only
+                        .get(i)
+                        .ok_or_else(|| "--idle-ms requires a value".to_string())
+                        .and_then(|value| parse_u64(value, "--idle-ms"))?,
+                );
             }
             "--max-consecutive-errors" => {
                 i += 1;
@@ -5305,7 +5470,7 @@ struct CronSchedulerRunOnceArgs {
 struct CronSchedulerLoopArgs {
     run_once: CronSchedulerRunOnceArgs,
     iterations: usize,
-    idle_ms: u64,
+    idle_ms: Option<u64>,
     max_consecutive_errors: usize,
     stop_file: Option<PathBuf>,
 }
@@ -5788,6 +5953,7 @@ struct RuntimeLoopArgs {
     iterations: usize,
     idle_ms: u64,
     max_consecutive_errors: usize,
+    safe_mode_restart_ms: Option<u64>,
     stop_when_idle: bool,
     stop_file: Option<PathBuf>,
 }
@@ -5801,6 +5967,7 @@ struct RuntimeLoopSummary {
     idle: usize,
     errors: usize,
     consecutive_errors: usize,
+    safe_mode_restarts: usize,
     runtime_concurrency: usize,
     stop_reason: String,
     last_status: Option<RuntimeRunOnceStatus>,
@@ -9521,6 +9688,8 @@ fn runtime_loop_args_from_args(args: &[String]) -> Result<RuntimeLoopArgs, Strin
     let mut iterations = 0usize;
     let mut idle_ms = 1_000u64;
     let mut max_consecutive_errors = 5usize;
+    let mut safe_mode_restart_ms = None;
+    let mut safe_mode_restart_overridden = false;
     let mut stop_when_idle = false;
     let mut stop_file = None;
     let mut i = 0;
@@ -9607,6 +9776,21 @@ fn runtime_loop_args_from_args(args: &[String]) -> Result<RuntimeLoopArgs, Strin
                     })
                     .and_then(|value| parse_limit(value))?;
             }
+            "--safe-mode-restart-ms" => {
+                i += 1;
+                safe_mode_restart_ms = Some(
+                    args.get(i)
+                        .ok_or_else(|| {
+                            "--safe-mode-restart-ms requires a positive integer".to_string()
+                        })
+                        .and_then(|value| parse_u64(value, "--safe-mode-restart-ms"))?,
+                );
+                safe_mode_restart_overridden = true;
+            }
+            "--no-safe-mode-restart" => {
+                safe_mode_restart_ms = None;
+                safe_mode_restart_overridden = true;
+            }
             "--stop-when-idle" => {
                 stop_when_idle = true;
             }
@@ -9623,6 +9807,10 @@ fn runtime_loop_args_from_args(args: &[String]) -> Result<RuntimeLoopArgs, Strin
         i += 1;
     }
 
+    if !safe_mode_restart_overridden && iterations == 0 && !stop_when_idle {
+        safe_mode_restart_ms = Some(DEFAULT_RUNTIME_SAFE_MODE_RESTART_MS);
+    }
+
     Ok(RuntimeLoopArgs {
         target_home,
         loop_name,
@@ -9635,6 +9823,7 @@ fn runtime_loop_args_from_args(args: &[String]) -> Result<RuntimeLoopArgs, Strin
         iterations,
         idle_ms,
         max_consecutive_errors,
+        safe_mode_restart_ms,
         stop_when_idle,
         stop_file,
     })
@@ -13885,6 +14074,7 @@ fn print_runtime_loop_summary(summary: &RuntimeLoopSummary) {
     println!("Idle: {}", summary.idle);
     println!("Errors: {}", summary.errors);
     println!("Consecutive errors: {}", summary.consecutive_errors);
+    println!("Safe-mode restarts: {}", summary.safe_mode_restarts);
     println!("Runtime concurrency: {}", summary.runtime_concurrency);
     println!("Stop reason: {}", summary.stop_reason);
     if let Some(status) = summary.last_status {
@@ -13913,6 +14103,7 @@ fn write_runtime_loop_summary(summary: &RuntimeLoopSummary) -> Result<(), String
         "idle": summary.idle,
         "errors": summary.errors,
         "consecutiveErrors": summary.consecutive_errors,
+        "safeModeRestarts": summary.safe_mode_restarts,
         "runtimeConcurrency": summary.runtime_concurrency,
         "stopReason": &summary.stop_reason,
         "lastStatus": summary.last_status.map(runtime_run_once_status_label),
@@ -13946,6 +14137,31 @@ fn append_runtime_loop_error_log(
     .map_err(|err| err.to_string())
 }
 
+fn append_runtime_loop_safe_mode_log(
+    harness_home: &Path,
+    iteration: usize,
+    safe_mode_restarts: usize,
+    consecutive_errors: usize,
+    max_consecutive_errors: usize,
+    runtime_concurrency: usize,
+    restart_ms: u64,
+) -> Result<(), String> {
+    append_harness_log(
+        harness_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            HarnessLogLevel::Warn,
+            "runtime",
+            "runtime.loop-safe-mode",
+            format!(
+                "iteration={iteration} safeModeRestarts={safe_mode_restarts} consecutiveErrors={consecutive_errors}/{max_consecutive_errors} runtimeConcurrency={runtime_concurrency} restartMs={restart_ms}"
+            ),
+        ),
+    )
+    .map(|_| ())
+    .map_err(|err| err.to_string())
+}
+
 fn append_runtime_loop_stopped_log(
     summary: &RuntimeLoopSummary,
     failed: bool,
@@ -13964,11 +14180,12 @@ fn append_runtime_loop_stopped_log(
             "runtime",
             "runtime.loop-stopped",
             format!(
-                "iterations={} completed={} idle={} errors={} concurrency={} stopReason={}",
+                "iterations={} completed={} idle={} errors={} safeModeRestarts={} concurrency={} stopReason={}",
                 summary.iterations,
                 summary.completed,
                 summary.idle,
                 summary.errors,
+                summary.safe_mode_restarts,
                 summary.runtime_concurrency,
                 summary.stop_reason
             ),
@@ -13994,6 +14211,7 @@ fn runtime_run_once_report_is_idle(report: &RuntimeRunOnceReport) -> bool {
 fn runtime_run_once_status_label(status: RuntimeRunOnceStatus) -> &'static str {
     match status {
         RuntimeRunOnceStatus::Completed => "completed",
+        RuntimeRunOnceStatus::LeaseBusy => "lease-busy",
         RuntimeRunOnceStatus::NoWork => "no-work",
         RuntimeRunOnceStatus::NoPreparedExecution => "no-prepared-execution",
         RuntimeRunOnceStatus::NoRuntimePlan => "no-runtime-plan",
@@ -14509,6 +14727,7 @@ fn print_help() {
     println!("  prompt-bundle   Assemble prompt files, selected skills, and message");
     println!("  cron-plan       Dry-run legacy native agent-turn cron dispatch");
     println!("  native-cron-enqueue Persist native cron work into worker dispatch");
+    println!("  cron-scheduler-lint Read-only scheduler config/source lint before enabling cron");
     println!("  cron-scheduler-run-once Tick cron registries/crontabs into worker jobs");
     println!("  cron-scheduler-loop Run the cron scheduler tick loop until stopped");
     println!("  deterministic-cron-plan Dry-run deterministic cron without LLM access");
@@ -14585,8 +14804,12 @@ fn print_help() {
     println!(
         "  --iterations <n>        Loop iterations for telegram-loop/runtime-loop; 0 means forever"
     );
-    println!("  --idle-ms <n>           Loop sleep after each poll or runtime run");
+    println!(
+        "  --idle-ms <n>           Loop sleep override; cron scheduler defaults to cronScheduler.intervalMs"
+    );
     println!("  --max-consecutive-errors <n> Loop failure threshold");
+    println!("  --safe-mode-restart-ms <n> Runtime-loop cooldown before service-mode retry");
+    println!("  --no-safe-mode-restart Disable runtime-loop service-mode retry");
     println!("  --loop-name <name>      Heartbeat component name for a runtime-loop instance");
     println!("  --runtime-concurrency <n> Bounded in-process runtime tasks for runtime-loop");
     println!("  --stop-when-idle        Stop runtime-loop when the runtime queue is idle");
@@ -14682,6 +14905,13 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&path);
         path
+    }
+
+    #[test]
+    fn cron_scheduler_sleep_respects_config_interval_floor() {
+        assert_eq!(cron_scheduler_loop_sleep_ms(Some(1_000), 60_000), 60_000);
+        assert_eq!(cron_scheduler_loop_sleep_ms(Some(120_000), 60_000), 120_000);
+        assert_eq!(cron_scheduler_loop_sleep_ms(None, 5_000), 10_000);
     }
 
     #[test]

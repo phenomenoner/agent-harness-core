@@ -1,6 +1,6 @@
 # Agent Harness Development Handoff
 
-Date: 2026-06-13
+Date: 2026-06-15
 
 This handoff is for a developer or a new Codex session continuing implementation of the Rust Windows Agent Harness. It summarizes the project context, current architecture, verified state, important files, and next development priorities.
 
@@ -42,20 +42,21 @@ Primary topology:
 
 ## Current Baseline
 
-Latest local status after the 2026-06-10 repo-local harness-home rebase, round3 fixes, review remediation, round3-1 runtime/channel fixes, runtime UX hardening, durable supervisor fallback/log retention, assistant narration routing, supervisor regeneration, and live activation:
+Latest local status after the 2026-06-10 repo-local harness-home rebase, round3 fixes, review remediation, round3-1 runtime/channel fixes, runtime UX hardening, durable supervisor fallback/log retention, assistant narration routing, supervisor regeneration, Round4 live-control, and Round4-3 live robustness work:
 
-- Readiness after the round3-2 rebuild/restart: `ready=true`, `passed=58`, `warnings=0`, `failed=0`.
+- Round4-3 staged implementation adds runtime-loop Windows sharing-violation retry/serialization, runtime queue lease lock close-before-remove, retryable `lease-busy`, supervised safe-mode restart, cron scheduler lint/interval-floor/stale-lock handling, and bounded tail-sampled status/readiness scans.
+- Readiness after the Round4-2 cutover was `ready=true`, `passed=59`, `warnings=0`, `failed=0`. Exact pass counts may drift as checks are added; runtime-loop missing/stale/error/stopped/stopping is now a failed live/readiness state, while runtime-loop `safe-mode` is a degraded warning.
 - Latest `ops-cutover-receipt` recorded `status=ready` with note `runtime UX hardening and durable ops activation: assistant_stream progress suppressed; adaptive Codex JSONL idle timeout with max turn cap; supervisor direct-start fallback and log retention; docs synced`.
 - Runtime timeout/progress reconciliation is implemented after the round3-2 triage: `timeout` is terminal for queue selection, status open-item counts, native typing context, and progress delivery state. Latest live readback after restart is `queued=123`, `open=0`, `prepared=123`, `completed=120`. A queued row with a timeout receipt should no longer appear as normal open work; retry requires a new queue id. See `docs/round3-2-implementation-and-upgrade-plan.md` for the full disposition and background-task upgrade plan.
 - Outbox: `pending=0`, `delivered=186`, `retryable=0`, `invalid=0`; the old Telegram retry from the pre-narration-routing reply format was manually read back and marked delivered with provider id `manual-readback-20260611`.
 - Channels: Telegram and Discord are enabled; Telegram probe ready; Discord gateway probe ready; Discord real inbound evidence is present; Discord reply-context receipt file is now tracked by status and will appear after the next handled Discord reply event.
-- Loops: one runtime loop plus worker, progress delivery, Telegram, Discord outbox, and Discord gateway loops are running. The runtime loop owns bounded in-process runtime concurrency via `--runtime-concurrency 12`; regenerated scripts also pass configurable `--timeout-ms` and `--idle-timeout-ms` for Codex app-server turns. `supervisor-plan --runtime-workers <n>` maps to that flag instead of producing `runtime-loop-2` style task scripts. The status surface tracks the 6 canonical loop heartbeats, with `cron-scheduler-loop` added when `supervisor-plan --include-cron-scheduler` is used.
+- Loops: one runtime loop plus worker, progress delivery, Telegram, Discord outbox, Discord gateway, and current live cron scheduler loops are running after scheduler cutover. The runtime loop owns bounded in-process runtime concurrency via `--runtime-concurrency 12`; regenerated scripts also pass configurable `--timeout-ms`, `--idle-timeout-ms`, and supervised `--safe-mode-restart-ms` for Codex app-server turns. `supervisor-plan --runtime-workers <n>` maps to that flag instead of producing `runtime-loop-2` style task scripts. The status surface tracks active loop heartbeats and fails runtime-loop missing/stale/error/stopped/stopping.
 - Runtime UX hardening: low-value `assistant_stream` progress previews are no longer emitted/rendered, Codex `agentMessage` items are split by protocol phase into `assistant_narration` versus final assistant replies, `response.assistantNarrationMode` defaults to `progress_panel`, and the Codex protocol idle timeout renews on each JSONL event while a separate max-turn timeout prevents infinite runs.
 - Durable ops: generated `start-scheduled-tasks.ps1` falls back to hidden direct `Start-Process` runner launches when `AgentHarness-*` scheduled tasks are not registered; generated runner scripts retain the newest 20 supervisor logs per component.
 - Memory: Qdrant edge snapshot present, `openclaw-mem.sqlite` present, active recall via `sqlite-vector`, `qdrantParity=snapshot-preserved; native-recall-not-active`, embedding secret migrated, vector recall ready, prompt context ready, lifecycle receipts present, capture candidates=7, compact canvas written, and `memory-hook` receipt recorded.
 - Plugins: sidecar catalog present, 2 manifest-derived tools visible, sidecar bridge OK, `hooks.invoke` receipt recorded, and `memory.slot` receipt recorded.
 - Workers: SQLite worker store is implemented at `state/workers/worker-jobs.sqlite`; `worker-loop` is generated and running; current worker store totals are `total=0`, `pending=0`, `running=0`, `failedTerminal=0`.
-- Validation: latest local implementation test pass is `cargo fmt --all --check`, staged workspace check, 239 core tests, 18 CLI tests, staged build, public export hygiene, and non-live cutover CLI smoke. Earlier deployment validation passed `cargo build --workspace`, gateway restart, live `status`, live `enable-check`, outbox plan, and process listing. Previous round3-1 activation also passed `cargo fmt --check`, `cargo build --target-dir target\codex-build`, supervisor-plan smoke, process command-line verification, and `jsonl-repair` smoke.
+- Validation: Round4-3 staged verification passed `cargo fmt --all --check`, `cargo check --workspace --target-dir target\staging-check-round4-3`, `cargo test -p agent-harness-core --target-dir target\staging-test-round4-3-core -- --test-threads=1` with 243 core tests, `cargo test -p agent-harness-cli --target-dir target\staging-test-round4-3-cli` with 19 CLI tests, `cargo build -p agent-harness-cli --target-dir target\staging-build-round4-3`, `git diff --check` with line-ending warnings only, and public export hygiene with `forbiddenHits=[]`. Live `cron-scheduler-lint` now reports existing imported scheduler content errors (`errors=65`, `warnings=26`); see `.debug\round4-2\cron-scheduler-live-lint-findings-20260615.md`. Earlier deployment validation passed `cargo build --workspace`, gateway restart, live `status`, live `enable-check`, outbox plan, and process listing. Previous round3-1 activation also passed `cargo fmt --check`, `cargo build --target-dir target\codex-build`, supervisor-plan smoke, process command-line verification, and `jsonl-repair` smoke.
 - Live-test readiness: regenerated supervisor scripts point to `target/debug/agent-harness.exe`, `.agent-harness` as `--source-home`, `--runtime-workspace D:\Warehouse\Research\OpenClaw_WSL`, `tools/agent-discord-gateway/index.mjs`, one `runtime-loop.ps1`, and `worker-loop.ps1`; loops were restarted manually as hidden PowerShell processes because `AgentHarness-*` scheduled task registration returned access-denied in this environment; latest `status` and `enable-check` are ready with no warnings.
 
 Current non-blocking warning:
@@ -99,11 +100,11 @@ Important core modules:
 - `memory.rs`: imported memory search, vector recall, credentials export, lifecycle, canvas worker.
 - `workers.rs`: durable worker store, lease/run/reap/cancel/status, deterministic shell audit, LLM runtime-queue handoff, watchdog and master-wakeup jobs, concurrency and rate-lease gates.
 - `worker_adapters.rs`: native cron, deterministic cron, and subagent plan-to-worker enqueue adapters.
-- `cron_scheduler.rs`: long-running scheduler tick that watermarks imported cron sources and enqueues due worker jobs.
+- `cron_scheduler.rs`: read-only scheduler lint plus long-running scheduler tick/loop that watermarks imported cron sources and enqueues due worker jobs.
 - `ops.rs`: non-secret backup, cutover receipt, and supervisor stop-file control.
-- `status.rs`: `status` report aggregation.
-- `activation.rs`: `enable-check` readiness checks.
-- `supervisor.rs`: Windows scheduled task script generation.
+- `status.rs`: `status` report aggregation with bounded tail-sampling for large JSONL/log ledgers.
+- `activation.rs`: `enable-check` readiness checks, including runtime-loop failed/degraded heartbeat handling.
+- `supervisor.rs`: Windows scheduled task script generation with runtime-loop safe-mode restart flags.
 - `cron.rs`, `deterministic_cron.rs`, `subagents.rs`: import/dry-run planning lanes.
 
 Auxiliary tooling:
@@ -119,7 +120,7 @@ Channel normal message flow:
 2. The adapter enforces admin/limited/open-limited access policy and then resolves the platform/account/channel identity binding before runtime dispatch.
 3. `channel-receive` normalizes it with the resolved account/agent and carries bounded inbound reply/media context when available.
 4. Slash commands are handled immediately; ordinary messages enqueue a runtime item.
-5. `runtime-loop` inspects runtime capacity and runs claimable queue ids through bounded in-process runtime tasks.
+5. `runtime-loop` inspects runtime capacity and runs claimable queue ids through bounded in-process runtime tasks. A busy queue lease records retryable `lease-busy` rather than idle `no-work`; supervised infinite loops enter `safe-mode` after repeated errors instead of exiting silently.
 6. `queue-prepare` builds a turn plan and prompt bundle.
 7. `codex-plan` and `codex-run` start Codex app-server.
 8. Runtime/Codex writes compact action/status events to `state/runtime-queue/progress-events.jsonl`.
@@ -240,8 +241,8 @@ Current state:
 - The two cron source lanes stay separate for policy and import fidelity: native `.openclaw/cron` may enqueue LLM-backed agent/subagent work; deterministic crontab/Supercronic-style workspace runners enqueue only no-LLM shell jobs.
 - Subagent and deterministic child-job completion must be able to wake the master agent. Fan-out work should create a `job_group_id` and a deterministic watchdog that wakes the master on all-completed, any-failed, timeout, checkpoint, or threshold policies with bounded artifact pointers.
 - Worker leasing enforces harness-configurable concurrency limits before execution: a global limit, a per-agent/group limit, a per-agent-per-channel limit, optional lane limits, and optional rate leases. The current live defaults are global 12, per-agent 6, per-agent-per-channel 3, lane limits `llm=6`, `shell=6`, `watchdog=2`, `maintenance=2`, `plugin=2`. If a limit is reached, extra subagent, deterministic, or cron jobs stay queued instead of starting.
-- `cron-scheduler-run-once` and `cron-scheduler-loop` now provide the repeated scheduler tick. They evaluate native and deterministic cron sources, including imported native schedules that use `expr` plus `tz`/`timezone` fields, write durable watermarks under `state/cron-scheduler/watermarks.sqlite`, append scheduler decision receipts, and enqueue due work into the worker store with an idempotency key based on source kind, source id, entry id, and scheduled time.
-- The scheduler is opt-in through `cronScheduler.enabled`, `--enable`, or an intentionally generated `cron-scheduler-loop` supervisor task. Dry-run remains the default-safe operator mode for validation.
+- `cron-scheduler-lint`, `cron-scheduler-run-once`, and `cron-scheduler-loop` now provide scheduler preflight and repeated ticks. They evaluate native and deterministic cron sources, including imported native schedules that use `expr` plus `tz`/`timezone` fields, write durable watermarks under `state/cron-scheduler/watermarks.sqlite`, append scheduler decision receipts, and enqueue due work into the worker store with an idempotency key based on source kind, source id, entry id, and scheduled time.
+- The scheduler is opt-in through `cronScheduler.enabled`, `--enable`, or an intentionally generated `cron-scheduler-loop` supervisor task. Dry-run remains the default-safe operator mode for validation. On Windows, run lint before enabling scheduler changes; Linux absolute paths in native cron messages are errors, and the loop sleep interval respects `cronScheduler.intervalMs`.
 
 Implemented MVP:
 
@@ -284,7 +285,7 @@ Implemented:
 - Windows scheduled-task script generation.
 - Optional `cron-scheduler-loop` supervisor script generation through `supervisor-plan --include-cron-scheduler`.
 - Channel identity smoke checks through `channel-identity-check`.
-- Atomic JSON writes for mutable state files such as channel state, runtime lease state, run-once reports, delivery cursors, Codex run reports, and execution receipts.
+- Atomic JSON writes for mutable state files such as channel state, runtime lease state, run-once reports, delivery cursors, Codex run reports, and execution receipts, with Windows sharing-violation retry around replace/lock paths.
 - Runtime failure policy records `failed-terminal` for non-retryable protocol/preflight/spawn/no-plan failures and stops retrying retryable failures at the configured `runtimeBackoff.maxAttempts` cap. Canceled runs are terminal and reply with `Stopped.`.
 
 Progress UI notes:
@@ -306,10 +307,12 @@ Useful commands:
 ```powershell
 .\target\debug\agent-harness.exe status --harness-home .\.agent-harness
 .\target\debug\agent-harness.exe enable-check --harness-home .\.agent-harness
+.\target\debug\agent-harness.exe healthz --target-home .\.agent-harness --require-writable-state
 .\target\debug\agent-harness.exe channel-outbox-plan --harness-home .\.agent-harness --limit 20
 .\target\debug\agent-harness.exe progress-delivery-once --harness-home .\.agent-harness
 .\target\debug\agent-harness.exe worker-status --harness-home .\.agent-harness
 .\target\debug\agent-harness.exe channel-identity-check --harness-home .\.agent-harness --platform telegram --account-id default --chat-id <chat-id> --agent main
+.\target\debug\agent-harness.exe cron-scheduler-lint --harness-home .\.agent-harness --source-home .\.agent-harness --workspace .\.agent-harness\workspace --enable
 .\target\debug\agent-harness.exe cron-scheduler-run-once --harness-home .\.agent-harness --dry-run --enable
 .\target\debug\agent-harness.exe ops-backup --harness-home .\.agent-harness --label pre-cutover
 .\target\debug\agent-harness.exe ops-cutover-receipt --harness-home .\.agent-harness --note "pre-cutover"

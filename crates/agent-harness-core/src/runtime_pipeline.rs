@@ -65,6 +65,7 @@ pub struct RuntimeRunOnceReceipt {
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeRunOnceStatus {
     Completed,
+    LeaseBusy,
     NoWork,
     NoPreparedExecution,
     NoRuntimePlan,
@@ -119,8 +120,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
 
     if prepare.receipt.status == RuntimeExecutionReceiptStatus::LeaseBusy {
         let receipt = RuntimeRunOnceReceipt {
-            queue_id: None,
-            status: RuntimeRunOnceStatus::NoWork,
+            queue_id: prepare.receipt.queue_id.clone(),
+            status: RuntimeRunOnceStatus::LeaseBusy,
             execution_dir: None,
             transcript_file: None,
             outbox_file: None,
@@ -129,7 +130,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         append_runtime_run_once_log(
             &options.harness_home,
             HarnessLogLevel::Info,
-            "runtime.run-once.no-work",
+            "runtime.run-once.lease-busy",
             &receipt,
         )?;
         return write_runtime_run_once_report(
@@ -517,9 +518,9 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         | RuntimeRunOnceStatus::SpawnFailed
         | RuntimeRunOnceStatus::DeadLetter
         | RuntimeRunOnceStatus::FailedTerminal => HarnessLogLevel::Error,
-        RuntimeRunOnceStatus::Canceled | RuntimeRunOnceStatus::RetryPending => {
-            HarnessLogLevel::Warn
-        }
+        RuntimeRunOnceStatus::Canceled
+        | RuntimeRunOnceStatus::RetryPending
+        | RuntimeRunOnceStatus::LeaseBusy => HarnessLogLevel::Warn,
         RuntimeRunOnceStatus::NoWork
         | RuntimeRunOnceStatus::NoPreparedExecution
         | RuntimeRunOnceStatus::NoRuntimePlan
@@ -527,6 +528,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
     };
     let log_event = match receipt.status {
         RuntimeRunOnceStatus::Completed => "runtime.run-once.completed",
+        RuntimeRunOnceStatus::LeaseBusy => "runtime.run-once.lease-busy",
         RuntimeRunOnceStatus::NoWork => "runtime.run-once.no-work",
         RuntimeRunOnceStatus::NoPreparedExecution => "runtime.run-once.no-prepared-execution",
         RuntimeRunOnceStatus::NoRuntimePlan => "runtime.run-once.no-runtime-plan",
@@ -1572,8 +1574,8 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::NoWork);
-        assert_eq!(report.receipt.queue_id, None);
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::LeaseBusy);
+        assert_eq!(report.receipt.queue_id.as_deref(), Some(queue_id.as_str()));
         assert!(report.receipt.reason.contains("lease lock is busy"));
         assert_eq!(
             report.prepare.as_ref().unwrap().receipt.status,
