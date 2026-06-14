@@ -768,7 +768,14 @@ fn live_loop_heartbeat_detail(harness_home: &Path, name: &str) -> Option<String>
         .unwrap_or("unknown");
     if !matches!(
         status,
-        "running" | "ok" | "no-work" | "ready" | "heartbeat" | "connected" | "safe-mode"
+        "running"
+            | "ok"
+            | "no-work"
+            | "ready"
+            | "heartbeat"
+            | "connected"
+            | "safe-mode"
+            | "lease-busy"
     ) {
         return None;
     }
@@ -994,15 +1001,15 @@ fn check_loop_heartbeat(
                         ),
                     ));
                 }
-            } else if status == "safe-mode" {
+            } else if status == "safe-mode" || status == "lease-busy" {
                 let detail = if age_ms.is_some_and(|age_ms| age_ms > LOOP_HEARTBEAT_STALE_MS) {
                     format!(
-                        "{name} heartbeat is stale in safe-mode at {}: status={status}, {age_detail}, detail={detail}",
+                        "{name} heartbeat is stale in degraded mode at {}: status={status}, {age_detail}, detail={detail}",
                         path.display()
                     )
                 } else {
                     format!(
-                        "{name} heartbeat is in safe-mode at {}: status={status}, {age_detail}, detail={detail}",
+                        "{name} heartbeat is in degraded mode at {}: status={status}, {age_detail}, detail={detail}",
                         path.display()
                     )
                 };
@@ -2714,6 +2721,31 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
             check.name == "runtime-loop-heartbeat"
                 && check.status == ActivationReadinessStatus::Warn
                 && check.detail.contains("safe-mode")
+        }));
+
+        fs::write(
+            heartbeat_dir.join("runtime-loop.json"),
+            format!(
+                r#"{{"status":"lease-busy","iteration":5,"processId":42,"atMs":{now_ms},"detail":"runtime queue lease lock is busy during capacity inspection"}}"#
+            ),
+        )
+        .unwrap();
+
+        let live_lease_busy_report = check_activation_readiness(ActivationReadinessOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+
+        assert!(live_lease_busy_report.checks.iter().any(|check| {
+            check.name == "runtime-loop"
+                && check.status == ActivationReadinessStatus::Warn
+                && check.detail.contains("superseded by live heartbeat")
+                && check.detail.contains("status=lease-busy")
+        }));
+        assert!(live_lease_busy_report.checks.iter().any(|check| {
+            check.name == "runtime-loop-heartbeat"
+                && check.status == ActivationReadinessStatus::Warn
+                && check.detail.contains("lease-busy")
         }));
 
         fs::write(
