@@ -21,6 +21,7 @@
 - Completed the Round5 live cutover with ticket `cutover-1781524146730`, backup label `pre-round5-cron-runtime-isolation-cutover`, regenerated 7-loop supervisor plan, bundled skill sync, direct runner start, and post-cutover `healthz`/`status --json` readiness `passed=59 warnings=0 failed=0`.
 - Default `supervisor-plan` source-home to the active harness home instead of the retired `.openclaw` import path, and default the standalone Discord gateway wrapper to the selected harness home when no `AGENT_SOURCE_HOME` or `--source-home` is provided.
 - Mark `.openclaw`, Docker gateway names, imported snapshots, and Linux/container internal paths as retired import/rollback labels across operations docs, activation docs, development handoff, CLI help, and the builtin harness skill.
+- Completed the source-home routing hotfix live cutover with ticket `cutover-1781537737517`, backup label `pre-sourcehome-routing-hotfix-cutover`, bundled skill sync v0.1.12, regenerated 7-loop supervisor plan with `.agent-harness` source-home, and post-cutover Discord DM diagnostic `turn-plan` dispatching `AgentTurn` to `main`.
 
 ### Added
 
