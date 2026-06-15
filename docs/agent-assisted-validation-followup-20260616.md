@@ -542,3 +542,23 @@ Still requires operator decision:
 - Deterministic shell cron policy: native Windows port vs WSL/Git Bash wrapper.
 - Ownership migration for the remaining `main` native cron entries.
 - Whether stale local-smoke/native-cron pending outbox artifacts should be delivered, archived, or skipped through a future safe operator surface.
+
+### Live Cutover Result
+
+The follow-up operator-surface build was cut over live after staging validation:
+
+- Ticket: `cutover-1781543670554`
+- Backup label: `pre-followup-operator-surfaces-cutover`
+- Previous binary backup: `target\debug\agent-harness.pre-followup-operator-surfaces-20260616011809.exe`
+- New live binary source: `target\staging-build-followup\debug\agent-harness.exe`
+- Bundled skill sync: already current
+- Supervisor plan: regenerated with 7 tasks, including `cron-scheduler-loop`
+- Direct runners: restarted because scheduled tasks are not registered in this environment
+
+Post-cutover readback:
+
+- `healthz --harness-home .\.agent-harness --require-writable-state`: `ready=true`, `live=true`, all 7 loop heartbeats non-stale.
+- `status --harness-home .\.agent-harness --json`: `ready=true`, readiness `passed=59`, `warnings=0`, `failed=0`.
+- `worker-status --harness-home .\.agent-harness --json`: totals `pending=0`, `leased=0`, `running=0`, `failedRetryable=0`, `failedTerminal=0`.
+- `channel-outbox-plan --harness-home .\.agent-harness --outbox-limit 100`: accepted and reports full summary counters (`lines=370`, `pending=81`, `delivered=289`, `failed_retryable=0`, `invalid=0`).
+- `cron-scheduler-lint --harness-home .\.agent-harness --source-home .\.agent-harness --workspace .\.agent-harness\workspace --dry-run --enable --resume-cron --allow-deterministic-run`: still returns expected error for imported cron blockers, and now includes `agentId` plus `proposedAction` in findings.
