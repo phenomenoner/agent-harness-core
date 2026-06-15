@@ -14,7 +14,7 @@ Cron and subagents should land as one unified worker dispatch system instead of 
 
 The imported container deployment has two cron families that must stay distinct at the source level:
 
-- Native agent-turn cron from `.openclaw/cron`, which is allowed to create LLM-backed agent or subagent work.
+- Imported native agent-turn cron, historically stored under `.openclaw/cron`, which is allowed to create LLM-backed agent or subagent work.
 - Extended deterministic crontab/Supercronic-style cron from workspace runner directories, which must stay on a no-LLM deterministic shell path.
 
 Both cron families, plus imported subagent ledgers, converge at the worker execution layer, but cron LLM turns no longer share the same runtime capacity lane as interactive channel turns. Worker dispatch remains the durable submit/lease/retry layer. Runtime dispatch now has class-scoped lanes so `interactive`, `cron`, `worker`, and `maintenance` turns can be capped independently.
@@ -261,7 +261,7 @@ agent-harness cron-run-control --harness-home .\.agent-harness --action retry --
 agent-harness cron-run-control --harness-home .\.agent-harness --action quarantine --agent-id <agent> --entry-id <entry> --reason "bad cron"
 ```
 
-Cron/subagent adapter commands:
+Cron/subagent adapter commands. `native-cron-enqueue` is retained for manual/import compatibility; normal live scheduler operation should use `cron-scheduler-run-once` or `cron-scheduler-loop`.
 
 ```powershell
 agent-harness native-cron-enqueue --harness-home .\.agent-harness --source-home .\.agent-harness --resume-cron --master-agent main

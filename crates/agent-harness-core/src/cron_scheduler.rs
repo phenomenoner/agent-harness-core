@@ -124,6 +124,10 @@ pub struct CronSchedulerLintFinding {
     pub source_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposed_action: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -489,37 +493,40 @@ pub fn lint_cron_scheduler(
         }
         for entry in plan.entries {
             match entry.action {
-                NativeCronPlanAction::MissingAgent => push_lint_finding(
+                NativeCronPlanAction::MissingAgent => push_lint_finding_with_agent(
                     &mut findings,
                     CronSchedulerLintSeverity::Error,
                     "native-missing-agent",
                     entry.reason.clone(),
                     Some("native-cron"),
                     Some(entry.job_id.clone()),
+                    entry.agent_id.clone(),
                 ),
-                NativeCronPlanAction::UnsupportedSchedule => push_lint_finding(
+                NativeCronPlanAction::UnsupportedSchedule => push_lint_finding_with_agent(
                     &mut findings,
                     CronSchedulerLintSeverity::Error,
                     "native-unsupported-schedule",
                     entry.reason.clone(),
                     Some("native-cron"),
                     Some(entry.job_id.clone()),
+                    entry.agent_id.clone(),
                 ),
                 NativeCronPlanAction::EnqueueAgentTurn | NativeCronPlanAction::CronRegistered => {
                     if entry.agent_id.as_deref() == Some("main") {
-                        push_lint_finding(
+                        push_lint_finding_with_agent(
                             &mut findings,
                             CronSchedulerLintSeverity::Warn,
                             "native-main-agent-cron",
                             "native cron targets interactive agent `main`; prefer a cron-specific runtime identity or rely on runtimeClass=cron isolation",
                             Some("native-cron"),
                             Some(entry.job_id.clone()),
+                            entry.agent_id.clone(),
                         );
                     }
                     if let Some(policy) = entry.session_policy.as_deref()
                         && !matches!(policy, "one-shot" | "sticky")
                     {
-                        push_lint_finding(
+                        push_lint_finding_with_agent(
                             &mut findings,
                             CronSchedulerLintSeverity::Warn,
                             "native-unknown-session-policy",
@@ -528,6 +535,7 @@ pub fn lint_cron_scheduler(
                             ),
                             Some("native-cron"),
                             Some(entry.job_id.clone()),
+                            entry.agent_id.clone(),
                         );
                     }
                     if entry
@@ -541,23 +549,25 @@ pub fn lint_cron_scheduler(
                             .map(|key| !key.starts_with("cron:"))
                             .unwrap_or(false)
                     {
-                        push_lint_finding(
+                        push_lint_finding_with_agent(
                             &mut findings,
                             CronSchedulerLintSeverity::Warn,
                             "native-sticky-session-outside-cron-namespace",
                             "native cron sticky sessionKey is not in the `cron:` namespace; scheduler will rewrite it into an isolated cron session key",
                             Some("native-cron"),
                             Some(entry.job_id.clone()),
+                            entry.agent_id.clone(),
                         );
                     }
                     if let Some(reason) = native_cron_entry_runtime_path_blocker(&entry) {
-                        push_lint_finding(
+                        push_lint_finding_with_agent(
                             &mut findings,
                             CronSchedulerLintSeverity::Error,
                             "native-runtime-path-mismatch",
                             reason,
                             Some("native-cron"),
                             Some(entry.job_id.clone()),
+                            entry.agent_id.clone(),
                         );
                     }
                 }
@@ -1385,13 +1395,61 @@ fn push_lint_finding(
     source_kind: Option<&str>,
     entry_id: Option<String>,
 ) {
+    push_lint_finding_with_agent(
+        findings,
+        severity,
+        code,
+        message,
+        source_kind,
+        entry_id,
+        None,
+    );
+}
+
+fn push_lint_finding_with_agent(
+    findings: &mut Vec<CronSchedulerLintFinding>,
+    severity: CronSchedulerLintSeverity,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    source_kind: Option<&str>,
+    entry_id: Option<String>,
+    agent_id: Option<String>,
+) {
+    let code = code.into();
+    let proposed_action = cron_lint_proposed_action(&code).map(ToString::to_string);
     findings.push(CronSchedulerLintFinding {
         severity,
-        code: code.into(),
+        code,
         message: message.into(),
         source_kind: source_kind.map(ToString::to_string),
         entry_id,
+        agent_id,
+        proposed_action,
     });
+}
+
+fn cron_lint_proposed_action(code: &str) -> Option<&'static str> {
+    match code {
+        "interval-too-short"
+        | "interval-below-default"
+        | "max-catchup-high"
+        | "max-enqueue-high"
+        | "no-enabled-source-lanes" => Some("review-config"),
+        "native-main-agent-cron" => Some("review-owner"),
+        "native-runtime-path-mismatch" => Some("rewrite-path-or-native-port"),
+        "native-missing-agent" => Some("assign-agent-or-disable"),
+        "native-unsupported-schedule" => Some("rewrite-schedule-or-disable"),
+        "native-unknown-session-policy" => Some("rewrite-session-policy"),
+        "native-sticky-session-outside-cron-namespace" => Some("accept-cron-namespace-rewrite"),
+        "native-plan-warning" => Some("review-native-plan-warning"),
+        "deterministic-shell-compatibility-required" => Some("native-port-or-wrapper-policy"),
+        "deterministic-external-command-review" => Some("operator-review"),
+        "deterministic-missing-script" => Some("restore-script-or-disable"),
+        "deterministic-unsupported-entry" => Some("rewrite-entry-or-disable"),
+        "deterministic-shell-execution-enabled" => Some("review-shell-execution-policy"),
+        "deterministic-plan-warning" => Some("review-deterministic-plan-warning"),
+        _ => None,
+    }
 }
 
 fn native_cron_entry_runtime_path_blocker(entry: &NativeCronPlanEntry) -> Option<String> {
@@ -2252,6 +2310,22 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn lint_proposed_actions_cover_operator_migration_ledgers() {
+        assert_eq!(
+            cron_lint_proposed_action("native-main-agent-cron"),
+            Some("review-owner")
+        );
+        assert_eq!(
+            cron_lint_proposed_action("native-runtime-path-mismatch"),
+            Some("rewrite-path-or-native-port")
+        );
+        assert_eq!(
+            cron_lint_proposed_action("deterministic-shell-compatibility-required"),
+            Some("native-port-or-wrapper-policy")
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn run_once_and_lint_block_linux_absolute_paths_on_windows() {
@@ -2297,6 +2371,16 @@ mod tests {
             lint.findings
                 .iter()
                 .any(|finding| finding.code == "native-runtime-path-mismatch")
+        );
+        let path_finding = lint
+            .findings
+            .iter()
+            .find(|finding| finding.code == "native-runtime-path-mismatch")
+            .unwrap();
+        assert_eq!(path_finding.agent_id.as_deref(), Some("main"));
+        assert_eq!(
+            path_finding.proposed_action.as_deref(),
+            Some("rewrite-path-or-native-port")
         );
         let tick = run_cron_scheduler_once(options).unwrap();
         assert_eq!(tick.summary.enqueued, 0);

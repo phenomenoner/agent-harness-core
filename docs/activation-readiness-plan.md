@@ -183,7 +183,7 @@ These should be run before any handoff from a retired gateway or before enabling
    - Still required for formal service activation: operator execution of generated scheduled-task installer, process supervisor health integration, and `/stop` cancellation of already-running model turns.
 
 4. Unified worker dispatch for schedulers
-   - Native legacy `.openclaw/cron` scheduler ticks enqueue LLM-backed agent/subagent jobs.
+   - Imported native cron entries are evaluated from the active `.agent-harness` source/config authority and enqueue LLM-backed agent/subagent jobs; `.openclaw/cron` is legacy import history, not live authority.
    - Extended deterministic crontab/Supercronic-style scheduler ticks enqueue no-LLM shell jobs.
    - Done for repeated scheduler ticks: `cron-scheduler-run-once`/`cron-scheduler-loop` write durable watermarks and idempotently enqueue due jobs into WorkerStore.
    - Shared worker execution provides durable leases, retries/backoff, audit logs, rate leases, and timeout/cancel semantics.
@@ -227,7 +227,7 @@ As of 2026-06-11 live verification:
 - Channel outbox is clean: `pending=0`, `delivered=177`, `retryable=0`, `invalid=0`. The previous stale Telegram retry was manually read back and marked delivered with provider id `manual-readback-20260611`.
 - Supervisor plan has 6 canonical task entries: `runtime-loop`, `worker-loop`, `progress-delivery-loop`, `telegram-loop`, `discord-outbox-loop`, and `discord-gateway-loop`; a seventh `cron-scheduler-loop` entry is present only after explicit scheduler enablement.
 - Canonical status heartbeats are live for runtime, progress delivery, Telegram, Discord outbox, Discord gateway, and worker loops.
-- Runtime queue leasing uses `state/runtime-queue/runtime-leases.json` plus a lock file to let multiple runtime loops run without duplicating queue items.
+- Runtime queue leasing is class-scoped under `state/runtime-queue/classes/<runtimeClass>/runtime-leases.json` with an exclusive lock per class; the old root `state/runtime-queue/runtime-leases.json` readback exists only for upgrade compatibility.
 - Worker dispatch config is global 12, per-agent/group 6, per-agent-per-channel 3, lane limits `llm=6`, `shell=6`, `watchdog=2`, `maintenance=2`, `plugin=2`.
 - Prompt files are resolved from the imported workspace when the runtime workspace is only Codex cwd, so a live `/status` should not show `Prompt files 0/7` for the imported agent. Skills are selected dynamically and may be 0 for status-only turns.
 - Progress events use compact tool-call previews, assistant narration current-step status, and permission-skipped progress cursors, preventing repeated Telegram `Working` status spam while keeping final replies clean.

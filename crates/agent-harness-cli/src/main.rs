@@ -8338,11 +8338,12 @@ fn channel_outbox_plan_args_from_args(args: &[String]) -> Result<ChannelOutboxPl
                         .ok_or_else(|| "--platform requires a name".to_string())?,
                 );
             }
-            "--limit" => {
+            "--limit" | "--outbox-limit" => {
+                let flag = args[i].clone();
                 i += 1;
                 limit = args
                     .get(i)
-                    .ok_or_else(|| "--limit requires a positive integer".to_string())
+                    .ok_or_else(|| format!("{flag} requires a positive integer"))
                     .and_then(|value| parse_limit(value))?;
             }
             flag => return Err(format!("unknown argument: {flag}")),
@@ -14882,7 +14883,9 @@ fn print_help() {
     println!("  --status <value>        Delivery status: delivered or failed");
     println!("  --provider-message-id <id> Telegram/Discord message id after delivery");
     println!("  --error <text>          Delivery failure reason");
-    println!("  --outbox-limit <n>      Maximum pending outbox items for channel-run-once");
+    println!(
+        "  --outbox-limit <n>      Maximum pending outbox details for channel-run-once/outbox-plan"
+    );
     println!("  --min-update-interval-ms <n> Minimum progress panel edit interval");
     println!("  --max-events <n>        Maximum action lines shown in a progress panel");
     println!("  --max-preview-chars <n> Maximum preview characters per progress action");

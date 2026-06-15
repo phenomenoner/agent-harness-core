@@ -294,3 +294,58 @@ Pass evidence:
 - `worker-status` lane/blocker summary
 - `cron-runs` active/quarantine summary
 - Clean git worktree after evidence commit
+
+## Validation Results - 2026-06-15
+
+Validation mode: live read-only plus local build/test checks. No live gateway stop/start/restart, binary replacement, supervisor control, or live cron config mutation was performed.
+
+### Command Receipts
+
+Live/read-only:
+
+- `target\debug\agent-harness.exe healthz --harness-home .\.agent-harness --require-writable-state` -> `ready=true`, `live=true`, writable state, all seven loop heartbeats present/non-stale.
+- `target\debug\agent-harness.exe status --harness-home .\.agent-harness --json` -> `ready=true`, readiness `passed=59`, `warnings=0`, `failed=0`; runtime class summaries present.
+- `target\debug\agent-harness.exe worker-status --harness-home .\.agent-harness --json` -> worker pending/leased/running `0`, failedRetryable/failedTerminal `0`, lane caps include `cron=3`; by-lane `cron` has `1` succeeded, `llm` has `76` succeeded.
+- `target\debug\agent-harness.exe cron-runs --harness-home .\.agent-harness --limit 50` -> total `1`, active `0`, terminal `1`, quarantined `0`; the run for `2fcf6fd4-e483-4649-8a6f-e6a34988cfe3` succeeded with `runtimeClass=cron` and one-shot session key.
+- `target\debug\agent-harness.exe cron-scheduler-run-once --harness-home .\.agent-harness --source-home .\.agent-harness --workspace .\.agent-harness\workspace --dry-run --enable --resume-cron --allow-deterministic-run` -> status `dry-run`, nativeEntries `114`, deterministicEntries `26`, dueCandidates `0`, enqueued `0`, skippedPolicy `140`, errors `0`, warnings `0`.
+- `target\debug\agent-harness.exe channel-outbox-plan --harness-home .\.agent-harness` -> outbox invalid `0`, failed_retryable `0`; pending `20` includes local smoke leftovers and native-cron BLOCKED/NO_REPLY items.
+- `target\debug\agent-harness.exe release-checklist` -> emitted `agent-harness.quality-report.v1`.
+- `target\debug\agent-harness.exe schema-registry` -> includes `agent-harness.cron-scheduler.*`, `agent-harness.cron-runs.v1`, and runtime queue schemas.
+- `target\debug\agent-harness.exe public-hygiene --root .public-export\agent-harness-core` -> passed, `forbiddenHits=[]`.
+
+Build/test:
+
+- `cargo fmt --all --check` -> passed.
+- `cargo check --workspace --target-dir target\validation-agent-assisted-20260615` -> passed.
+- `git diff --check` -> passed before this result append.
+- `cargo test -p agent-harness-core prepare_runtime_queue_item_tombstones_skipped_cron_run -- --test-threads=1` -> passed.
+- `cargo test -p agent-harness-core cron_worker_skips_operator_controlled_run_without_runtime_enqueue -- --test-threads=1` -> passed.
+- `cargo test -p agent-harness-core native_cron_sticky_session_key_is_forced_into_cron_namespace -- --test-threads=1` -> passed.
+- `cargo test -p agent-harness-core run_once_enqueues_native_due_at_once_and_dedupes -- --test-threads=1` -> passed.
+- `cargo test -p agent-harness-core cron_runtime_selection_interleaves_agents -- --test-threads=1` -> passed.
+- `cargo test -p agent-harness-core cron_llm_worker -- --test-threads=1` -> passed (`2` tests).
+
+### Item Results
+
+| Item | Result | Evidence / Notes |
+| --- | --- | --- |
+| 1. Runtime Class Isolation | PASS | `status.runtime.classLeases` reports `cron`, `interactive`, `legacy`, `maintenance`, and `worker`; `queuedByRuntimeClass` separates `cron=77` from `interactive=203`; `openByRuntimeClass` has only `interactive=72`; cron class active leases `0`. |
+| 2. Cron Worker Lane Isolation | PASS | `worker-status.config.laneConcurrencyLimits.cron=3`; by-lane `cron` has one succeeded job; `cron-runs` shows the succeeded native cron run reached `runtimeClass=cron`; worker blockers are all `0`. |
+| 3. CronRunStore Control And Recovery | PASS | `cron-runs` shows durable terminal state; targeted tests for skipped cron runtime tombstone and worker skip without runtime enqueue passed. No manual `cron-run-control` mutation was performed during this live validation. |
+| 4. Cron Session Isolation | PASS | Live CronRun session key is `cron:main:2fcf6fd4-e483-4649-8a6f-e6a34988cfe3:1781538300000`; sticky namespace and one-shot/dedupe tests passed. |
+| 5. Multi-Agent Fairness | PASS | `cron_runtime_selection_interleaves_agents` passed; worker config exposes global/group/channel/lane limits; live status separates cron from interactive open work. |
+| 6. Stuck Dispatch Reclaim And Retry | PASS WITH LIMIT | Retry/dead-letter/completed outcomes are visible in `status.runtime.latestNonIdleRunOnce` and receipt summaries; worker blockers are visible and zero. `worker-reap-stale` was not run because it mutates live lease state. |
+| 7. Channel And Progress Safety | PASS WITH NOTE | Channel replies remain interactive-originated in status; progress/Telegram/Discord loops are non-stale; outbox invalid `0`. Note: `channel-outbox-plan` still has `20` pending items, including native-cron BLOCKED/NO_REPLY outputs from legacy path jobs. |
+| 8. Observability And Operator Surfaces | PASS | `status`, `worker-status`, and `cron-runs` expose runtime class, origin, CronRun summary, lane caps, blockers, class leases, and scheduler summaries without direct SQLite/JSONL reads. |
+| 9. Documentation And Skill Drift | NEEDS CLEANUP | Current bundled `agent-windows-harness` skill is aligned with cron runtime isolation. Static search found stale guidance candidates in `docs\activation-readiness-plan.md` and `docs\agent-harness-operations-handbook.md`, including older root lease wording and old `native-cron-enqueue` guidance. |
+| 10. Public Hygiene | PASS | `public-hygiene --root .public-export\agent-harness-core` passed with `forbiddenHits=[]`. |
+
+### Remaining Blockers
+
+- Legacy cron payload migration is still incomplete. `cron-scheduler-lint --enable` remains `status=error` with old Linux/container path findings; this is outside the runtime isolation validation but blocks full cron activation.
+- Documentation drift cleanup is still needed for older root lease/native cron guidance.
+- Full `cargo test --workspace` was not run in this pass; targeted runtime/worker/cron tests plus `cargo check --workspace` passed.
+
+### Operator Conclusion
+
+The harness has recovered to a runnable, isolated state for the cron/runtime control plane. Full cron activation should wait for the existing Priority A legacy-job isolation package and follow-up path migration.

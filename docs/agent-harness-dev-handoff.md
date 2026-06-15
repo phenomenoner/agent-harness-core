@@ -233,13 +233,13 @@ Prioritize:
 
 Current state:
 
-- Native agent-turn cron is imported/planned and can be converted into durable `llm_subagent` worker jobs with `native-cron-enqueue --resume-cron`.
+- Native agent-turn cron is imported/planned and live scheduler ticks should use `cron-scheduler-run-once` or `cron-scheduler-loop`; `native-cron-enqueue --resume-cron` remains a manual/import compatibility adapter, not the preferred live scheduler path.
 - Extended deterministic crontab/Supercronic-style cron is imported/planned with `llmAccessAllowed=false` and can be converted into durable `deterministic_shell` worker jobs with `deterministic-cron-enqueue --allow-deterministic-run`. The enqueue path defaults to dry-run shell audit unless `--execute-shell` is explicit.
 - Subagent ledgers are imported/planned and resumable queued/running entries can be converted into durable `llm_subagent` worker jobs with `subagent-enqueue --resume-subagents`.
 - P4 direction is now implemented as an MVP unified worker dispatch, not separate legacy-style cron and subagent runners.
 - The design borrows durable job-queue semantics from gbrain Minions: two-phase persistence, leases, retries/backoff, shell audit, rate leases, child jobs, and watchdog/master wakeup orchestration.
 - The design does not borrow gbrain's memory strategy; memory remains the harness adapter roadmap.
-- The two cron source lanes stay separate for policy and import fidelity: native `.openclaw/cron` may enqueue LLM-backed agent/subagent work; deterministic crontab/Supercronic-style workspace runners enqueue only no-LLM shell jobs.
+- The two cron source lanes stay separate for policy and import fidelity: the imported native cron lane, historically stored under `.openclaw/cron`, may enqueue LLM-backed agent/subagent work; deterministic crontab/Supercronic-style workspace runners enqueue only no-LLM shell jobs.
 - Subagent and deterministic child-job completion must be able to wake the master agent. Fan-out work should create a `job_group_id` and a deterministic watchdog that wakes the master on all-completed, any-failed, timeout, checkpoint, or threshold policies with bounded artifact pointers.
 - Worker leasing enforces harness-configurable concurrency limits before execution: a global limit, a per-agent/group limit, a per-agent-per-channel limit, optional lane limits, and optional rate leases. The current live defaults are global 12, per-agent 6, per-agent-per-channel 3, lane limits `llm=6`, `shell=6`, `watchdog=2`, `maintenance=2`, `plugin=2`. If a limit is reached, extra subagent, deterministic, or cron jobs stay queued instead of starting.
 - `cron-scheduler-lint`, `cron-scheduler-run-once`, and `cron-scheduler-loop` now provide scheduler preflight and repeated ticks. They evaluate native and deterministic cron sources, including imported native schedules that use `expr` plus `tz`/`timezone` fields, write durable watermarks under `state/cron-scheduler/watermarks.sqlite`, append scheduler decision receipts, and enqueue due work into the worker store with an idempotency key based on source kind, source id, entry id, and scheduled time.

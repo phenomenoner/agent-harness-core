@@ -153,12 +153,20 @@ pub fn plan_channel_outbox(
             .get(&delivery_id)
             .and_then(|records| records.last())
             .map(|receipt| receipt.status);
-        match last_status {
+        let pending_status = match last_status {
             Some(ChannelDeliveryStatus::Delivered) => {
                 summary.delivered += 1;
+                false
             }
             Some(ChannelDeliveryStatus::Failed) => {
                 summary.failed_retryable += 1;
+                true
+            }
+            None => true,
+        };
+        if pending_status {
+            summary.pending += 1;
+            if pending.len() < options.limit {
                 pending.push(ChannelDeliveryPending {
                     delivery_id,
                     line_number,
@@ -167,19 +175,8 @@ pub fn plan_channel_outbox(
                     message,
                 });
             }
-            None => pending.push(ChannelDeliveryPending {
-                delivery_id,
-                line_number,
-                attempts,
-                last_status,
-                message,
-            }),
-        }
-        if pending.len() >= options.limit {
-            break;
         }
     }
-    summary.pending = pending.len();
 
     Ok(ChannelOutboxPlanReport {
         schema: CHANNEL_OUTBOX_PLAN_SCHEMA,
@@ -371,6 +368,65 @@ mod tests {
         .unwrap();
         assert!(log.contains("channel.delivery.delivered"));
         assert!(log.contains("channel.delivery.failed"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn outbox_plan_limit_only_caps_pending_details() {
+        let root = temp_root("outbox_plan_limit_only_caps_pending_details");
+        let harness_home = root.join(".agent-harness");
+        let outbox_file = harness_home
+            .join("state")
+            .join("channels")
+            .join("outbox.jsonl");
+        for index in 1..=5 {
+            append_json_line(
+                &outbox_file,
+                &message(
+                    "discord",
+                    &format!("dm-{index}"),
+                    &format!("user-{index}"),
+                    &format!("session-{index}"),
+                    &format!("message {index}"),
+                ),
+            )
+            .unwrap();
+        }
+
+        let initial = plan_channel_outbox(ChannelOutboxPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("discord".to_string()),
+            limit: 10,
+        })
+        .unwrap();
+        record_channel_delivery(ChannelDeliveryRecordOptions {
+            harness_home: harness_home.clone(),
+            delivery_id: initial.pending[0].delivery_id.clone(),
+            status: ChannelDeliveryStatus::Delivered,
+            platform: "discord".to_string(),
+            account_id: None,
+            channel_id: "dm-1".to_string(),
+            user_id: "user-1".to_string(),
+            session_key: "session-1".to_string(),
+            provider_message_id: Some("dc-1".to_string()),
+            error: None,
+            now_ms: 1234,
+        })
+        .unwrap();
+
+        let limited = plan_channel_outbox(ChannelOutboxPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("discord".to_string()),
+            limit: 2,
+        })
+        .unwrap();
+        assert_eq!(limited.pending.len(), 2);
+        assert_eq!(limited.summary.total_outbox_lines, 5);
+        assert_eq!(limited.summary.delivered, 1);
+        assert_eq!(limited.summary.pending, 4);
+        assert_eq!(limited.pending[0].message.text, "message 2");
+        assert_eq!(limited.pending[1].message.text, "message 3");
 
         let _ = fs::remove_dir_all(root);
     }
