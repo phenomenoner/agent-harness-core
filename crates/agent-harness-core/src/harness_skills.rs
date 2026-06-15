@@ -9,17 +9,17 @@ use crate::{HARNESS_BUILTIN_SKILL_NAMESPACE, SKILL_FILE_NAME};
 const BUILTIN_HARNESS_SKILL_SYNC_SCHEMA: &str = "agent-harness.builtin-skill-sync.v1";
 const BUILTIN_HARNESS_SKILL_MANIFEST_SCHEMA: &str = "agent-harness.builtin-skill-manifest.v1";
 const AGENT_WINDOWS_HARNESS_SKILL_ID: &str = "agent-windows-harness";
-const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.10";
+const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.11";
 
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
 description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, response tone, and Codex prompt continuity policy.
-version: 0.1.10
+version: 0.1.11
 platforms: [windows]
 metadata:
   agent_harness:
     category: operations
-    tags: [legacy-import, codex, openrouter, telegram, discord, migration, activation, response-tone, reconnect, channel-identity, cron-scheduler, scheduler-lint, safe-mode]
+    tags: [legacy-import, codex, openrouter, telegram, discord, migration, activation, response-tone, reconnect, channel-identity, cron-scheduler, cron-runs, runtime-classes, scheduler-lint, safe-mode]
 ---
 
 # Agent Windows Harness
@@ -36,8 +36,8 @@ Use it when the user mentions:
 - slash commands such as /new, /think, /stop, /steer, /btw, /model, or /status
 - Codex CLI, Codex OAuth, app-server, OpenRouter provider routing, prompt injection, tool schema, or session continuity
 - response tone, emoji accent, assistant narration, progress panel, or final reply formatting
-- activation readiness, runtime queue, operational logs, or gateway handoff
-- cron scheduler ticks, worker enqueue watermarks, or cron-scheduler-loop supervision
+- activation readiness, runtime queue, runtime class leases, operational logs, or gateway handoff
+- cron scheduler ticks, worker enqueue watermarks, CronRunStore recovery, or cron-scheduler-loop supervision
 
 ## Operating Lead
 
@@ -45,7 +45,7 @@ Use it when the user mentions:
 2. Treat the harness as the orchestrator and Codex CLI as the model/tool runtime.
 3. Preserve legacy source state shape where possible: source workspace, prompt files, agent registry, sessions, memory files, cron state, plugin state, and receipts.
 4. Prefer dry-run, receipt, and append-only JSONL records before irreversible handoff.
-5. Keep deterministic cron off the LLM path. Agent-turn cron may enqueue runtime work.
+5. Keep deterministic cron off the LLM path. Agent-turn cron may enqueue isolated runtime work only through CronRunStore admission, the `cron` worker lane, and the `cron` runtime class.
 6. Keep Telegram and Discord session keys stable: platform, channel id, user id, and agent id determine continuity unless /new changes it.
 7. Keep multi-agent readiness intact. Do not collapse imported agents into a single default agent.
 8. Treat credentials as best-effort imports. Codex OAuth is preferred for default Codex/OpenAI models; API keys may be provider-specific and model-limited. Do not apply OpenRouter credentials or provider config to the default Codex/OAuth route.
@@ -60,8 +60,9 @@ Use it when the user mentions:
 17. For every new functional component or behavior change, add or update a `/docs/` note that records the design rationale and a concise changelog. Do not leave feature history discoverable only through git commits or chat context.
 18. Treat channel identity registry misses, disabled bindings, ambiguous bindings, and agent mismatches as fail-closed ingress stops. Allow-lists are necessary but not sufficient when a channel identity registry is present.
 19. Treat cron-scheduler-loop as a scheduler/enqueue loop only. Worker-loop owns job execution, retry, leases, and recovery.
-20. Treat live gateway control as a protected control plane. A live channel agent turn must not stop, start, restart, uninstall, kill, mutate supervisor stop files, or replace the gateway binary that carries the current session unless it is following an operator-approved live-control token/cutover flow.
-21. If the current task requires changing Agent Harness itself, live gateway behavior, supervisor scripts, channel adapters, runtime loops, or the binary/config carrying this live session, write a concise tech note with the observed bug, user scenario, evidence, suggested fix, validation plan, and risks; tell the user the tech note path; and pause the original task until the user continues from a local/dev session or operator-approved patch flow.
+20. Treat cron runtime execution as a separate lane from interactive/user turns. Native LLM cron defaults to one-shot `sessionPolicy`, writes transcripts under `agents/<agent>/cron-sessions/`, and dispatches runtime queue items with `runtimeClass=cron` and `origin=cron-scheduler`.
+21. Treat live gateway control as a protected control plane. A live channel agent turn must not stop, start, restart, uninstall, kill, mutate supervisor stop files, or replace the gateway binary that carries the current session unless it is following an operator-approved live-control token/cutover flow.
+22. If the current task requires changing Agent Harness itself, live gateway behavior, supervisor scripts, channel adapters, runtime loops, or the binary/config carrying this live session, write a concise tech note with the observed bug, user scenario, evidence, suggested fix, validation plan, and risks; tell the user the tech note path; and pause the original task until the user continues from a local/dev session or operator-approved patch flow.
 
 ## Prompt And Tool Schema Policy
 
@@ -103,8 +104,8 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - Telegram and Discord share the same runtime path after ingress: channel receive, queue, prepare, codex-run, runtime-run-once, outbox. Fix reconnect/session recovery in the runtime/Codex layer, not in one adapter.
 - Known transient Codex app-server stream disconnect protocol errors are retryable: `Reconnecting...`, `stream disconnected before completion`, and `websocket closed by server before response.completed`.
 - Retry-pending runtime failures are non-terminal. They should not write user-visible error replies, and progress should stay resumable for the same queue/session context.
-- Retry-pending receipts must make the same queue id immediately claimable again. If a retry-pending Telegram or Discord turn shows `openItems>0` while `runtime-loop` reports `no-work`, inspect `state/runtime-queue/runtime-leases.json`; stale retry-pending leases are a runtime lease-cleanup bug, not a channel adapter issue.
-- `lease-busy` is a retryable non-idle runtime status. Do not report it as idle/no-work; inspect competing runtime-loop processes or a recently active queue lease.
+- Retry-pending receipts must make the same queue id immediately claimable again. If a retry-pending Telegram or Discord turn shows `openItems>0` while `runtime-loop` reports `no-work`, inspect the class-scoped lease file under `state/runtime-queue/classes/<runtimeClass>/runtime-leases.json`; legacy root leases may still appear at `state/runtime-queue/runtime-leases.json` during migration. Stale retry-pending leases are a runtime lease-cleanup bug, not a channel adapter issue.
+- `lease-busy` is a retryable non-idle runtime status. Do not report it as idle/no-work; inspect competing runtime-loop processes, the relevant runtime class lease file, or a recently active queue lease.
 - In supervised infinite mode, keep runtime-loop safe-mode restart enabled. After repeated errors, `safe-mode` keeps the process alive with reduced concurrency and writes heartbeat/log evidence; missing/stale/error/stopped/stopping runtime-loop heartbeats are live readiness failures.
 - Non-matching protocol/config/preflight/spawn failures stay failed-terminal. Gateway restart alone does not resume failed-terminal or dead-letter queue items.
 - `runtimeBackoff` config controls retry caps and delay hints for retryable runtime failures. When retry attempts are exhausted, runtime-run-once dead-letters the item and writes an operator-friendly error reply. Provider/model fallback is operator-guided; the harness should not silently switch providers on behalf of a user turn.
@@ -152,6 +153,11 @@ Commands should update channel state and receipts before enqueueing agent turns.
 ## Cron Scheduler
 
 - `cron-scheduler-run-once` evaluates imported native agent-turn cron and deterministic crontab/Supercronic-style cron, then enqueues due work into WorkerStore with durable watermarks under `state/cron-scheduler/watermarks.sqlite`.
+- Native LLM cron also admits a CronRun record under `state/cron-runs/cron-runs.sqlite` before worker enqueue. This is the control plane for active caps, retry, quarantine, and operator listing.
+- Native LLM cron worker jobs run on the `cron` worker lane. Their runtime queue payloads carry `runtimeClass=cron`, `origin=cron-scheduler`, `cronRunId`, `scheduledForMs`, and `sessionPolicy`; the worker must preserve that metadata when appending the runtime queue item.
+- One-shot cron sessions are the default. They use deterministic per-run session keys and transcript files under `agents/<agent>/cron-sessions/`, so cron context does not pollute the main interactive session or another cron run. Sticky cron sessions are also forced into the `cron:<agent>:<entry>:sticky:<suffix>` namespace.
+- Runtime dispatch capacity is class scoped. Cron class leases live separately from interactive class leases; configure `runtimeDispatch.classes.cron` caps and per-agent/per-job caps so a large cron burst cannot starve normal agent turns. Worker and runtime dispatch paths both re-check CronRunStore controls, tombstone skipped cron runtime items, and avoid overwriting operator skip/quarantine state.
+- Use `cron-runs` for operator readback and `cron-run-control --action skip|retry|quarantine|unquarantine` for manual recovery. Retry clears the failed run back to retry-pending so the next scheduler tick can enqueue a new worker job without treating the old watermark as a permanent duplicate.
 - Run `cron-scheduler-lint` before enabling or changing live scheduler ticks. Lint is read-only and should fail cutover when status is `error`.
 - Use `--dry-run` for readback and `--enable` plus explicit `--resume-cron` or `--allow-deterministic-run` gates for intentional enqueue. A scheduler tick should write job-decision receipts even when entries are skipped by policy.
 - `cron-scheduler-loop` repeats the tick with heartbeat, stop-file, consecutive-error, and `loop-last.json` status support. It sleeps at least `cronScheduler.intervalMs` even if `--idle-ms` is smaller. Generate it through `supervisor-plan --include-cron-scheduler` only after operator approval to activate live scheduling.
@@ -224,13 +230,14 @@ For offline activation smoke, --codex-exe may point at tools/agent-fake-codex-ap
 Use status for operator-facing health checks before and after handoff:
 
 - status summarizes readiness, runtime queued/open/prepared/completed items, outbox pending/delivered/retryable counts, Telegram/Discord smoke evidence, memory backend presence, plugin sidecar receipts, and operational log coverage.
+- status reports runtime class queued/open counts, class lease counts, CronRun summary counts, and recent cron scheduler decisions. Check the interactive class separately from the cron class when diagnosing a stalled user turn.
 - status includes memory-search receipts when the imported markdown/text memory probe has been run.
 - status --json is the monitor-friendly form for scheduled tasks or service wrappers.
 - healthz --require-writable-state is the live/readiness gate for loops, writable state, runtime backlog, and channel backlog.
 - Large ledgers are tail-sampled by status/health/readiness. When sampled is true, counts are an operational window rather than full historical totals.
 - runtime-loop writes loop-last.json for the most recent runtime-loop stop/degraded reason, iteration count, idle count, error count, and safe-mode restarts.
 - supervisor-plan readiness is checked through enable-check, not status-specific process liveness; installed task health still needs monitor integration.
-- Before live channel handoff, openItems should be 0 and outbox pending should be 0 unless the operator intentionally wants the adapter to deliver those pending messages.
+- Before live channel handoff, interactive openItems should be 0 and outbox pending should be 0 unless the operator intentionally wants the adapter to deliver those pending messages. Cron openItems or active CronRuns should be reviewed separately and either drained, skipped, retried, or quarantined before cutover.
 
 ## Skill Maintenance Loop
 

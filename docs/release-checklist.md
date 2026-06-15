@@ -1,6 +1,6 @@
 # Agent Harness Release Checklist
 
-Date: 2026-06-13
+Date: 2026-06-15
 
 This checklist is mirrored by `agent-harness release-checklist`. It is intentionally review-oriented: passing it should leave evidence that maps to the external review dimensions.
 
@@ -13,6 +13,9 @@ This checklist is mirrored by `agent-harness release-checklist`. It is intention
 - `agent-harness metrics --target-home <staging-home>`
 - `agent-harness schema-registry`
 - `agent-harness invariants`
+- `agent-harness cron-runs --target-home <staging-home> --limit 20`
+- `agent-harness status --target-home <staging-home> --json` reviewed for runtime class queues/open counts, class leases, CronRun summary, and cron scheduler tick summaries.
+- For cron/runtime changes, targeted tests must cover native cron admission, retry watermark recovery, worker pre-runtime failure sync, worker/runtime CronRun control blockers, skipped cron runtime tombstones, one-shot/sticky cron namespace isolation, dedicated cron worker/runtime lanes, and legacy root runtime lease compatibility.
 - `agent-harness public-hygiene --root <public-export-root>`
 - Changelog entry updated.
 - Schema registry updated for every new receipt/state schema.
@@ -44,3 +47,4 @@ This checklist is mirrored by `agent-harness release-checklist`. It is intention
 - 2026-06-13: Channel identity / delivery intent / cron scheduler pass completed `cargo fmt`, `cargo check`, `cargo test` (18 CLI tests, 229 core tests, 0 doc-tests), `git diff --check`, and tracked-file public export `public-hygiene` with `forbiddenHits=[]`; schema registry, README, operations handbook, feature parity Markdown/HTML, builtin skill, CLI help, and changelog were updated for the new contracts.
 - 2026-06-14: Round4-2 live-control/native cron pass completed `cargo fmt --all --check`, `cargo check --workspace --target-dir target\staging-check-round4-2-live-guard`, `cargo test -p agent-harness-core --target-dir target\staging-test-round4-2-core` (239 tests), `cargo test -p agent-harness-cli --target-dir target\staging-test-round4-2-cli` (18 tests), `cargo build -p agent-harness-cli --target-dir target\staging-build-round4-2-live-guard`, public export hygiene with `forbiddenHits=[]`, and non-live cutover CLI smoke. Repo-root public hygiene is expected to fail because root intentionally contains live `.agent-harness` state.
 - 2026-06-14: Round4-2 live cutover completed with ticket `cutover-1781376947099`; canonical build, supervisor-plan regeneration, bundled skill sync v0.1.9, direct runner start, `healthz ready=true`, and `status --json ready=true` passed with 7 live loop heartbeats and readiness `passed=59 warnings=0 failed=0`.
+- 2026-06-15: Round5 cron/runtime isolation staged coverage passed for native cron CronRun admission/retry watermark recovery, dedicated cron worker lane, cron LLM worker runtime isolation, malformed cron worker recovery to retry-pending, worker/runtime CronRun control blockers, skipped runtime tombstones, namespaced sticky cron sessions, runtime class lock isolation, status cron/runtime summaries, and legacy root runtime lease compatibility. Verification passed `cargo fmt --all --check`, `cargo check --workspace --target-dir target\staging-check-round5-resume2`, full core/CLI/workspace tests, `cargo build -p agent-harness-cli --target-dir target\staging-build-round5-resume2`, `git diff --check` with CRLF warnings only, and public hygiene with `forbiddenHits=[]`. Live cutover evidence must be appended before release completion.

@@ -35,6 +35,12 @@ pub struct RuntimeQueueItem {
     pub schema: &'static str,
     pub queue_id: String,
     pub status: RuntimeQueueItemStatus,
+    pub runtime_class: String,
+    pub origin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduled_for_ms: Option<i64>,
     pub source: RuntimeQueueSource,
     pub created_at_ms: i64,
     pub agent_id: String,
@@ -296,6 +302,10 @@ fn build_queue_item(
         schema: "agent-harness.runtime-queue-item.v1",
         queue_id: queue_id(step, &agent_turn.agent_id, options.now_ms),
         status: RuntimeQueueItemStatus::Queued,
+        runtime_class: "interactive".to_string(),
+        origin: "channel".to_string(),
+        cron_run_id: None,
+        scheduled_for_ms: None,
         source: RuntimeQueueSource {
             kind: RuntimeQueueSourceKind::Channel,
             source_home: step.source_home.clone(),

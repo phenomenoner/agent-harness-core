@@ -43,6 +43,7 @@ pub struct NativeCronJob {
     pub schedule: NativeCronSchedule,
     pub wake_mode: Option<String>,
     pub session_target: Option<String>,
+    pub session_policy: Option<String>,
     pub message_text: Option<String>,
 }
 
@@ -113,6 +114,7 @@ pub struct NativeCronPlanEntry {
     pub schedule: NativeCronSchedule,
     pub wake_mode: Option<String>,
     pub session_key: Option<String>,
+    pub session_policy: Option<String>,
     pub message_text: Option<String>,
     pub last_run_at_ms: Option<i64>,
     pub next_run_at_ms: Option<i64>,
@@ -276,6 +278,7 @@ fn plan_job(
         schedule: job.schedule.clone(),
         wake_mode: job.wake_mode.clone(),
         session_key: agent_id.map(|agent_id| cron_session_key(&job.id, &agent_id)),
+        session_policy: job.session_policy.clone(),
         message_text: job.message_text.clone(),
         last_run_at_ms: state.and_then(|state| state.last_run_at_ms),
         next_run_at_ms: state.and_then(|state| state.next_run_at_ms),
@@ -365,6 +368,8 @@ fn parse_job(
         .get("sessionTarget")
         .or_else(|| value.get("session_target"))
         .and_then(compact_json_string);
+    let session_policy = string_field(value, &["sessionPolicy", "session_policy"])
+        .map(|policy| policy.to_ascii_lowercase());
     let message_text = extract_message_text(value)
         .or_else(|| description.clone())
         .or_else(|| name.clone());
@@ -378,6 +383,7 @@ fn parse_job(
         schedule,
         wake_mode,
         session_target,
+        session_policy,
         message_text,
     })
 }

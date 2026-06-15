@@ -136,6 +136,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "append-only receipts; idempotency key semantics are stable in v1",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.cron-runs.v1",
+            owner_module: "cron_runs",
+            compatibility: "SQLite state table; additive columns only in v1; status enum changes require migration",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.config-validation.v1",
             owner_module: "config",
             compatibility: "additive diagnostics only in v1; invalid config remains fail-closed",

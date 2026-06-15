@@ -6,7 +6,7 @@ The authoritative in-code registry is `agent_harness_core::quality::schema_regis
 
 | Schema | Owner module | Compatibility rule | Current status |
 |---|---|---|---|
-| `agent-harness.runtime-run-once.v1` | `runtime_pipeline` | Append-only JSONL; additive fields only in v1. | Existing reader accepts legacy `timeout`; v1 adds `retry-pending` and `dead-letter`. |
+| `agent-harness.runtime-run-once.v1` | `runtime_pipeline` | Append-only JSONL; additive fields only in v1. | Existing reader accepts legacy `timeout`; v1 adds `retry-pending`, `dead-letter`, Round5 runtime metadata fields (`runtimeClass`, `origin`, `cronRunId`, `scheduledForMs`), and skipped cron tombstones emitted when CronRunStore control blocks stale runtime dispatch. |
 | `agent-harness.runtime-dead-letter.v1` | `runtime_pipeline` | Additive fields only in v1; terminal receipt semantics are immutable. | Implemented in staging. |
 | `agent-harness.runtime-queue-control.v1` | `runtime_queue` | Retry/skip receipts are append-only; terminal source ids are never mutated. | Implemented in staging. |
 | `agent-harness.channel-identity-check.v1` | `channel_identity` | Additive fields only in v1; non-bound statuses remain fail-closed. | Implemented. |
@@ -15,7 +15,8 @@ The authoritative in-code registry is `agent_harness_core::quality::schema_regis
 | `agent-harness.cron-scheduler.run-once.v1` | `cron_scheduler` | Additive fields only in v1; dry-run must not enqueue or write watermarks. | Implemented. |
 | `agent-harness.cron-scheduler.lint.v1` | `cron_scheduler` | Additive diagnostics only in v1; error status remains fail-closed. | Implemented in staging. |
 | `agent-harness.cron-scheduler.tick.v1` | `cron_scheduler` | Append-only receipts; additive fields only in v1. | Implemented. |
-| `agent-harness.cron-scheduler.job-decision.v1` | `cron_scheduler` | Append-only receipts; idempotency key semantics are stable in v1. | Implemented. |
+| `agent-harness.cron-scheduler.job-decision.v1` | `cron_scheduler` | Append-only receipts; idempotency key semantics are stable in v1; retry attempts may add an `:attempt:<n>` suffix. | Implemented. |
+| `agent-harness.cron-runs.v1` | `cron_runs` | SQLite state table; additive columns only in v1; status enum changes require migration. | Implemented in staging. |
 | `agent-harness.config-validation.v1` | `config` | Additive diagnostics only in v1; invalid config remains fail-closed. | Implemented in staging. |
 | `agent-harness.log-rotation.v1` | `logging` | Additive fields only in v1; rotation receipts are append-only. | Implemented in staging. |
 | `agent-harness.supervision-evaluation.v1` | `supervision` | Additive child fields only in v1. | Implemented in staging. |

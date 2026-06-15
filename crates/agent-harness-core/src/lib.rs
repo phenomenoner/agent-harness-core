@@ -16,6 +16,7 @@ pub mod channel_state;
 pub mod codex_runtime;
 pub mod config;
 pub mod cron;
+pub mod cron_runs;
 pub mod cron_scheduler;
 pub mod deploy;
 pub mod deterministic_cron;
@@ -131,6 +132,16 @@ pub use cron::{
     NativeCronPlanFile, NativeCronPlanInput, NativeCronPlanSummary, NativeCronSchedule,
     NativeCronStore, NativeCronStoreSummary, load_native_cron_store, plan_native_cron,
     write_native_cron_plan,
+};
+pub use cron_runs::{
+    CronRun, CronRunAdmitOptions, CronRunControlAction, CronRunControlOptions,
+    CronRunControlReport, CronRunListOptions, CronRunListReport, CronRunStatus, CronRunSummary,
+    admit_cron_run, collect_cron_run_summary, control_cron_run, cron_run_active_count_for_agent,
+    cron_run_active_count_for_job, cron_run_id, cron_run_is_quarantined,
+    cron_run_runtime_dispatch_blocker, cron_run_worker_dispatch_blocker, cron_runs_db_file,
+    get_cron_run_by_slot, init_cron_run_store, list_cron_runs, mark_cron_run_runtime_enqueued,
+    mark_cron_run_runtime_status_by_queue_id, mark_cron_run_worker_enqueued,
+    mark_cron_run_worker_status,
 };
 pub use cron_scheduler::{
     CronSchedulerConfig, CronSchedulerDeterministicConfig, CronSchedulerJobDecision,
@@ -283,10 +294,11 @@ pub use runtime_queue::{
     RuntimeQueueSource, RuntimeQueueSourceKind, control_runtime_queue_item, enqueue_channel_step,
 };
 pub use runtime_worker::{
-    RuntimeExecutionReceipt, RuntimeExecutionReceiptStatus, RuntimeQueueCapacityOptions,
-    RuntimeQueueCapacityReport, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
-    RuntimeQueuePreparedItem, inspect_runtime_queue_capacity, prepare_runtime_queue_item,
-    release_runtime_queue_lease,
+    RuntimeDispatchClassConfig, RuntimeDispatchConfig, RuntimeExecutionReceipt,
+    RuntimeExecutionReceiptStatus, RuntimeQueueCapacityOptions, RuntimeQueueCapacityReport,
+    RuntimeQueueClassCapacity, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
+    RuntimeQueuePreparedItem, inspect_runtime_queue_capacity, load_runtime_dispatch_config,
+    prepare_runtime_queue_item, release_runtime_queue_lease,
 };
 pub use security::{SecurityScanOptions, SecurityScanReport, scan_security_boundaries};
 pub use skills::{
@@ -336,12 +348,12 @@ pub use worker_adapters::{
 };
 pub use workers::{
     WorkerCancelOptions, WorkerCancelReport, WorkerCapacityBlockedSummary, WorkerDispatchConfig,
-    WorkerEnqueueOptions, WorkerEnqueueReport, WorkerJob, WorkerJobExecutionResult, WorkerJobKind,
-    WorkerJobStatus, WorkerLaneStatus, WorkerReapStaleOptions, WorkerReapStaleReport,
-    WorkerRunOnceOptions, WorkerRunOnceReport, WorkerRunOnceStatus, WorkerStatusOptions,
-    WorkerStatusReport, WorkerStatusTotals, cancel_worker_job, collect_worker_status,
-    enqueue_worker_job, init_worker_store, load_worker_dispatch_config, reap_stale_worker_jobs,
-    run_worker_once, worker_db_file,
+    WorkerDownstreamRuntimeStatus, WorkerEnqueueOptions, WorkerEnqueueReport, WorkerJob,
+    WorkerJobExecutionResult, WorkerJobKind, WorkerJobStatus, WorkerLaneStatus,
+    WorkerReapStaleOptions, WorkerReapStaleReport, WorkerRunOnceOptions, WorkerRunOnceReport,
+    WorkerRunOnceStatus, WorkerStatusOptions, WorkerStatusReport, WorkerStatusTotals,
+    cancel_worker_job, collect_worker_status, enqueue_worker_job, init_worker_store,
+    load_worker_dispatch_config, reap_stale_worker_jobs, run_worker_once, worker_db_file,
 };
 
 pub const PROMPT_FILE_NAMES: &[&str] = &[

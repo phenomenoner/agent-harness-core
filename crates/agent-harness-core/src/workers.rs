@@ -11,12 +11,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    HarnessLogEvent, HarnessLogLevel, RuntimeQueueItem, RuntimeQueueItemStatus, RuntimeQueueSource,
-    RuntimeQueueSourceKind, append_harness_log,
+    CronRunSummary, HarnessLogEvent, HarnessLogLevel, RuntimeQueueItem, RuntimeQueueItemStatus,
+    RuntimeQueueSource, RuntimeQueueSourceKind, append_harness_log, collect_cron_run_summary,
     config::{
         HarnessConfigValidationReport, HarnessConfigValidationStatus, validate_harness_config,
     },
-    current_log_time_ms,
+    cron_run_worker_dispatch_blocker, current_log_time_ms, mark_cron_run_runtime_enqueued,
+    mark_cron_run_worker_status,
 };
 
 const WORKER_STORE_SCHEMA: &str = "agent-harness.worker-store.v1";
@@ -109,6 +110,7 @@ pub struct WorkerStatusReport {
     pub totals: WorkerStatusTotals,
     pub by_lane: Vec<WorkerLaneStatus>,
     pub blocked: WorkerCapacityBlockedSummary,
+    pub downstream_runtime: WorkerDownstreamRuntimeStatus,
     pub warnings: Vec<String>,
 }
 
@@ -141,6 +143,17 @@ pub struct WorkerCapacityBlockedSummary {
     pub blocked_by_channel_limit: usize,
     pub blocked_by_lane_limit: usize,
     pub blocked_by_rate_lease: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerDownstreamRuntimeStatus {
+    pub runtime_queue_file: PathBuf,
+    pub open_runtime_items: usize,
+    pub open_cron_runtime_items: usize,
+    pub open_by_runtime_class: BTreeMap<String, usize>,
+    pub open_by_origin: BTreeMap<String, usize>,
+    pub cron_runs: CronRunSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -470,6 +483,43 @@ pub fn run_worker_once(options: WorkerRunOnceOptions) -> io::Result<WorkerRunOnc
         });
     };
 
+    if let Some(blocker) = cron_worker_dispatch_blocker_for_job(&options.harness_home, &job)? {
+        let result = WorkerJobExecutionResult {
+            status: WorkerJobStatus::Canceled,
+            reason: format!("worker job skipped because {blocker}"),
+            audit_path: None,
+            artifact_refs: Some(json!({
+                "cronRunBlocked": true,
+                "reason": blocker,
+            })),
+            result: Some(json!({"skipped": true})),
+        };
+        persist_execution_result(&conn, &job, &result, options.now_ms)?;
+        sync_cron_run_after_worker_result(&options.harness_home, &job, &result, options.now_ms)?;
+        append_harness_log(
+            &options.harness_home,
+            &HarnessLogEvent::new(
+                current_log_time_ms().unwrap_or(options.now_ms),
+                HarnessLogLevel::Warn,
+                "workers",
+                "worker.run-once.cron-run-blocked",
+                result.reason.clone(),
+            ),
+        )?;
+        let persisted_job = find_job_by_id(&conn, &job.job_id)?;
+        return Ok(WorkerRunOnceReport {
+            schema: WORKER_RUN_ONCE_SCHEMA,
+            harness_home: options.harness_home,
+            database: db_file,
+            status: WorkerRunOnceStatus::Failed,
+            job: persisted_job,
+            result: Some(result),
+            blocked,
+            reason: "worker job blocked by cron run control".to_string(),
+            warnings: config.warnings,
+        });
+    }
+
     set_job_status(
         &conn,
         &job.job_id,
@@ -479,10 +529,21 @@ pub fn run_worker_once(options: WorkerRunOnceOptions) -> io::Result<WorkerRunOnc
         None,
         None,
     )?;
-    let result = execute_worker_job(&options.harness_home, &conn, &job, &config, options.now_ms)?;
+    let result =
+        match execute_worker_job(&options.harness_home, &conn, &job, &config, options.now_ms) {
+            Ok(result) => result,
+            Err(error) => WorkerJobExecutionResult {
+                status: WorkerJobStatus::FailedRetryable,
+                reason: format!("worker job execution failed before result: {error}"),
+                audit_path: None,
+                artifact_refs: Some(json!({"error": error.to_string()})),
+                result: None,
+            },
+        };
     let terminal = result.status.is_terminal();
     let rescheduled = result.status == WorkerJobStatus::Pending;
     persist_execution_result(&conn, &job, &result, options.now_ms)?;
+    sync_cron_run_after_worker_result(&options.harness_home, &job, &result, options.now_ms)?;
     append_harness_log(
         &options.harness_home,
         &HarnessLogEvent::new(
@@ -521,6 +582,34 @@ pub fn run_worker_once(options: WorkerRunOnceOptions) -> io::Result<WorkerRunOnc
     })
 }
 
+fn cron_worker_dispatch_blocker_for_job(
+    harness_home: &Path,
+    job: &WorkerJob,
+) -> io::Result<Option<String>> {
+    let Some(cron_run_id) = string_path_any(&job.payload, &["cronRunId", "cron_run_id"]) else {
+        return Ok(None);
+    };
+    cron_run_worker_dispatch_blocker(harness_home, cron_run_id, &job.job_id)
+}
+
+fn sync_cron_run_after_worker_result(
+    harness_home: &Path,
+    job: &WorkerJob,
+    result: &WorkerJobExecutionResult,
+    now_ms: i64,
+) -> io::Result<()> {
+    let Some(cron_run_id) = string_path_any(&job.payload, &["cronRunId", "cron_run_id"]) else {
+        return Ok(());
+    };
+    mark_cron_run_worker_status(
+        harness_home,
+        cron_run_id,
+        result.status.as_str(),
+        &result.reason,
+        now_ms,
+    )
+}
+
 pub fn collect_worker_status(options: WorkerStatusOptions) -> io::Result<WorkerStatusReport> {
     let db_file = init_worker_store(&options.harness_home)?;
     let conn = Connection::open(&db_file).map_err(io::Error::other)?;
@@ -535,6 +624,7 @@ pub fn collect_worker_status(options: WorkerStatusOptions) -> io::Result<WorkerS
         });
     }
     let blocked = blocked_summary(&conn, &config, None, epoch_ms()?)?;
+    let downstream_runtime = collect_downstream_runtime_status(&options.harness_home)?;
     let warnings = config.warnings.clone();
     Ok(WorkerStatusReport {
         schema: WORKER_STATUS_SCHEMA,
@@ -544,8 +634,105 @@ pub fn collect_worker_status(options: WorkerStatusOptions) -> io::Result<WorkerS
         totals,
         by_lane,
         blocked,
+        downstream_runtime,
         warnings,
     })
+}
+
+fn collect_downstream_runtime_status(
+    harness_home: &Path,
+) -> io::Result<WorkerDownstreamRuntimeStatus> {
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let runtime_queue_file = queue_dir.join("pending.jsonl");
+    let terminal_ids = read_runtime_terminal_ids(&queue_dir.join("run-once-receipts.jsonl"))?;
+    let mut open_runtime_items = 0usize;
+    let mut open_cron_runtime_items = 0usize;
+    let mut open_by_runtime_class = BTreeMap::new();
+    let mut open_by_origin = BTreeMap::new();
+    if runtime_queue_file.is_file() {
+        let text = fs::read_to_string(&runtime_queue_file)?;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+            let Some(queue_id) = string_path_any(&value, &["queueId", "queue_id"]) else {
+                continue;
+            };
+            if terminal_ids.contains(queue_id) {
+                continue;
+            }
+            let platform = string_path_any(&value, &["platform"]).unwrap_or("worker");
+            let runtime_class = string_path_any(&value, &["runtimeClass", "runtime_class"])
+                .map(ToString::to_string)
+                .unwrap_or_else(|| {
+                    if platform == "native-cron" {
+                        "cron".to_string()
+                    } else {
+                        "interactive".to_string()
+                    }
+                });
+            let origin = string_path_any(&value, &["origin"])
+                .unwrap_or(if platform == "native-cron" {
+                    "cron-scheduler"
+                } else {
+                    "unknown"
+                })
+                .to_string();
+            open_runtime_items += 1;
+            if runtime_class == "cron" {
+                open_cron_runtime_items += 1;
+            }
+            *open_by_runtime_class.entry(runtime_class).or_insert(0) += 1;
+            *open_by_origin.entry(origin).or_insert(0) += 1;
+        }
+    }
+    let cron_runs = collect_cron_run_summary(harness_home)
+        .map(|report| report.summary)
+        .unwrap_or_default();
+    Ok(WorkerDownstreamRuntimeStatus {
+        runtime_queue_file,
+        open_runtime_items,
+        open_cron_runtime_items,
+        open_by_runtime_class,
+        open_by_origin,
+        cron_runs,
+    })
+}
+
+fn read_runtime_terminal_ids(path: &Path) -> io::Result<std::collections::BTreeSet<String>> {
+    let mut terminal = std::collections::BTreeSet::new();
+    if !path.is_file() {
+        return Ok(terminal);
+    }
+    let text = fs::read_to_string(path)?;
+    let mut latest = BTreeMap::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if let Some(queue_id) = string_path_any(&value, &["queueId", "queue_id"])
+            && let Some(status) = string_path_any(&value, &["status"])
+        {
+            latest.insert(queue_id.to_string(), status.to_string());
+        }
+    }
+    for (queue_id, status) in latest {
+        if matches!(
+            status.as_str(),
+            "completed" | "timeout" | "failed-terminal" | "canceled" | "skipped" | "dead-letter"
+        ) {
+            terminal.insert(queue_id);
+        }
+    }
+    Ok(terminal)
 }
 
 pub fn reap_stale_worker_jobs(
@@ -637,6 +824,7 @@ pub fn load_worker_dispatch_config(
         group_concurrency_limit: 6,
         channel_concurrency_limit: 3,
         lane_concurrency_limits: BTreeMap::from([
+            ("cron".to_string(), 3),
             ("llm".to_string(), 6),
             ("shell".to_string(), 6),
             ("watchdog".to_string(), 2),
@@ -1271,13 +1459,39 @@ fn queue_llm_worker_turn(
     let source_workspace = required_payload_path(&job.payload, "sourceWorkspace")?;
     let runtime_workspace = string_path(&job.payload, "runtimeWorkspace").map(PathBuf::from);
     let platform = string_path(&job.payload, "platform").unwrap_or("worker");
+    let runtime_class = string_path(&job.payload, "runtimeClass")
+        .or_else(|| string_path(&job.payload, "runtime_class"))
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            if platform == "native-cron" {
+                "cron".to_string()
+            } else {
+                "worker".to_string()
+            }
+        });
+    let origin = string_path(&job.payload, "origin")
+        .or_else(|| string_path(&job.payload, "adapter"))
+        .unwrap_or("worker")
+        .to_string();
+    let cron_run_id = string_path(&job.payload, "cronRunId")
+        .or_else(|| string_path(&job.payload, "cron_run_id"))
+        .map(ToString::to_string);
+    let scheduled_for_ms = int_path(&job.payload, "scheduledForMs")
+        .or_else(|| int_path(&job.payload, "scheduled_for_ms"));
     let channel_id = string_path(&job.payload, "channelId").unwrap_or("worker");
     let user_id = string_path(&job.payload, "userId").unwrap_or("worker-dispatch");
     let queue_dir = harness_home.join("state").join("runtime-queue");
     fs::create_dir_all(&queue_dir)?;
     let queue_file = queue_dir.join("pending.jsonl");
-    let file_safe_session = safe_file_part(session_key);
-    let sessions_dir = harness_home.join("agents").join(agent_id).join("sessions");
+    let file_safe_session = normalize_key_part(session_key);
+    let sessions_dir = if runtime_class == "cron" {
+        harness_home
+            .join("agents")
+            .join(agent_id)
+            .join("cron-sessions")
+    } else {
+        harness_home.join("agents").join(agent_id).join("sessions")
+    };
     fs::create_dir_all(&sessions_dir)?;
     let queue_id = format!(
         "worker:{}:{}:{}",
@@ -1289,6 +1503,10 @@ fn queue_llm_worker_turn(
         schema: "agent-harness.runtime-queue-item.v1",
         queue_id: queue_id.clone(),
         status: RuntimeQueueItemStatus::Queued,
+        runtime_class: runtime_class.clone(),
+        origin,
+        cron_run_id: cron_run_id.clone(),
+        scheduled_for_ms,
         source: RuntimeQueueSource {
             kind: RuntimeQueueSourceKind::Channel,
             source_home,
@@ -1313,6 +1531,9 @@ fn queue_llm_worker_turn(
         planned_trajectory_file: sessions_dir.join(format!("{file_safe_session}.trajectory.jsonl")),
     };
     append_json_line(&queue_file, &item)?;
+    if let Some(cron_run_id) = cron_run_id.as_deref() {
+        mark_cron_run_runtime_enqueued(harness_home, cron_run_id, &queue_id, now_ms)?;
+    }
     Ok(WorkerJobExecutionResult {
         status: WorkerJobStatus::Succeeded,
         reason: "LLM worker job queued as durable runtime turn".to_string(),
@@ -1320,6 +1541,8 @@ fn queue_llm_worker_turn(
         artifact_refs: Some(json!({
             "runtimeQueueFile": queue_file,
             "runtimeQueueId": queue_id,
+            "runtimeClass": runtime_class,
+            "cronRunId": cron_run_id,
             "transcriptFile": item.planned_transcript_file,
             "trajectoryFile": item.planned_trajectory_file
         })),
@@ -1672,6 +1895,19 @@ fn string_path<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
 
+fn string_path_any<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    for key in keys {
+        if let Some(text) = value.get(*key).and_then(Value::as_str) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn int_path(value: &Value, key: &str) -> Option<i64> {
+    value.get(key).and_then(Value::as_i64)
+}
+
 fn string_array_path(value: &Value, key: &str) -> Vec<String> {
     value
         .get(key)
@@ -1997,6 +2233,259 @@ mod tests {
         })
         .unwrap();
         assert_eq!(later.status, WorkerRunOnceStatus::Completed);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cron_llm_worker_queues_isolated_runtime_turn_and_updates_cron_run() {
+        let root = temp_root("cron_llm_worker_queues_isolated_runtime_turn_and_updates_cron_run");
+        let harness_home = root.join(".agent-harness");
+        let source = root.join("source");
+        let workspace = source.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let cron_run = crate::admit_cron_run(crate::CronRunAdmitOptions {
+            harness_home: harness_home.clone(),
+            source_kind: "native-cron".to_string(),
+            source_id: "source-1".to_string(),
+            entry_id: "daily".to_string(),
+            agent_id: "agent-a".to_string(),
+            scheduled_for_ms: 42,
+            runtime_class: "cron".to_string(),
+            session_key: "cron:agent-a:daily:42".to_string(),
+            session_policy: "one-shot".to_string(),
+            max_attempts: 3,
+            now_ms: 1000,
+        })
+        .unwrap();
+        let mut options = llm_options(&harness_home, &source, &workspace, "cron-worker", 1002);
+        options.payload = json!({
+            "sourceHome": source,
+            "sourceWorkspace": workspace,
+            "agentId": "agent-a",
+            "sessionKey": "cron:agent-a:daily:42",
+            "messageText": "run daily cron",
+            "runtimeClass": "cron",
+            "origin": "cron-scheduler",
+            "cronRunId": &cron_run.run_id,
+            "scheduledForMs": 42,
+            "platform": "native-cron",
+            "sessionPolicy": "one-shot",
+            "channelId": "daily",
+            "userId": "cron-scheduler"
+        });
+        let enqueue = enqueue_worker_job(options).unwrap();
+        crate::mark_cron_run_worker_enqueued(
+            &harness_home,
+            &cron_run.run_id,
+            &enqueue.job.job_id,
+            1001,
+        )
+        .unwrap();
+
+        let run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("llm".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1003,
+        })
+        .unwrap();
+
+        assert_eq!(run.status, WorkerRunOnceStatus::Completed);
+        let queue_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("pending.jsonl");
+        let queue_text = fs::read_to_string(&queue_file).unwrap();
+        let item: Value = serde_json::from_str(queue_text.lines().next().unwrap()).unwrap();
+        assert_eq!(item["runtimeClass"], "cron");
+        assert_eq!(item["origin"], "cron-scheduler");
+        assert_eq!(item["cronRunId"], cron_run.run_id.as_str());
+        let planned_transcript_file: PathBuf =
+            serde_json::from_value(item["plannedTranscriptFile"].clone()).unwrap();
+        assert_eq!(
+            planned_transcript_file,
+            harness_home
+                .join("agents")
+                .join("agent-a")
+                .join("cron-sessions")
+                .join("cron_agent-a_daily_42.jsonl")
+        );
+        let runs = crate::collect_cron_run_summary(&harness_home).unwrap();
+        let updated = runs.runs.first().unwrap();
+        assert_eq!(updated.status, crate::CronRunStatus::RuntimeEnqueued);
+        assert!(updated.runtime_queue_id.is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cron_worker_skips_operator_controlled_run_without_runtime_enqueue() {
+        let root = temp_root("cron_worker_skips_operator_controlled_run_without_runtime_enqueue");
+        let harness_home = root.join(".agent-harness");
+        let source = root.join("source");
+        let workspace = source.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let cron_run = crate::admit_cron_run(crate::CronRunAdmitOptions {
+            harness_home: harness_home.clone(),
+            source_kind: "native-cron".to_string(),
+            source_id: "source-1".to_string(),
+            entry_id: "daily".to_string(),
+            agent_id: "agent-a".to_string(),
+            scheduled_for_ms: 42,
+            runtime_class: "cron".to_string(),
+            session_key: "cron:agent-a:daily:42".to_string(),
+            session_policy: "one-shot".to_string(),
+            max_attempts: 3,
+            now_ms: 1000,
+        })
+        .unwrap();
+        let mut options = llm_options(&harness_home, &source, &workspace, "cron-worker-skip", 1002);
+        options.lane = Some("cron".to_string());
+        options.payload = json!({
+            "sourceHome": source,
+            "sourceWorkspace": workspace,
+            "agentId": "agent-a",
+            "sessionKey": "cron:agent-a:daily:42",
+            "messageText": "run daily cron",
+            "runtimeClass": "cron",
+            "origin": "cron-scheduler",
+            "cronRunId": &cron_run.run_id,
+            "scheduledForMs": 42,
+            "platform": "native-cron",
+            "sessionPolicy": "one-shot",
+            "channelId": "daily",
+            "userId": "cron-scheduler"
+        });
+        let enqueue = enqueue_worker_job(options).unwrap();
+        crate::mark_cron_run_worker_enqueued(
+            &harness_home,
+            &cron_run.run_id,
+            &enqueue.job.job_id,
+            1001,
+        )
+        .unwrap();
+        crate::control_cron_run(crate::CronRunControlOptions {
+            harness_home: harness_home.clone(),
+            action: crate::CronRunControlAction::Skip,
+            run_id: Some(cron_run.run_id.clone()),
+            agent_id: None,
+            entry_id: None,
+            reason: "operator skip before worker dispatch".to_string(),
+            now_ms: 1002,
+        })
+        .unwrap();
+
+        let run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("cron".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1003,
+        })
+        .unwrap();
+
+        assert_eq!(run.status, WorkerRunOnceStatus::Failed);
+        assert_eq!(
+            run.result.as_ref().unwrap().status,
+            WorkerJobStatus::Canceled
+        );
+        assert_eq!(run.job.as_ref().unwrap().status, WorkerJobStatus::Canceled);
+        assert!(
+            !harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl")
+                .is_file()
+        );
+        let runs = crate::collect_cron_run_summary(&harness_home).unwrap();
+        let updated = runs.runs.first().unwrap();
+        assert_eq!(updated.status, crate::CronRunStatus::Skipped);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cron_llm_worker_failure_marks_cron_run_retry_pending() {
+        let root = temp_root("cron_llm_worker_failure_marks_cron_run_retry_pending");
+        let harness_home = root.join(".agent-harness");
+        let cron_run = crate::admit_cron_run(crate::CronRunAdmitOptions {
+            harness_home: harness_home.clone(),
+            source_kind: "native-cron".to_string(),
+            source_id: "source-1".to_string(),
+            entry_id: "bad-dispatch".to_string(),
+            agent_id: "agent-a".to_string(),
+            scheduled_for_ms: 42,
+            runtime_class: "cron".to_string(),
+            session_key: "cron:agent-a:bad-dispatch:42".to_string(),
+            session_policy: "one-shot".to_string(),
+            max_attempts: 3,
+            now_ms: 1000,
+        })
+        .unwrap();
+        let enqueue = enqueue_worker_job(WorkerEnqueueOptions {
+            harness_home: harness_home.clone(),
+            kind: WorkerJobKind::LlmSubagent,
+            lane: Some("llm".to_string()),
+            payload: json!({
+                "agentId": "agent-a",
+                "sessionKey": "cron:agent-a:bad-dispatch:42",
+                "messageText": "missing source paths",
+                "runtimeClass": "cron",
+                "origin": "cron-scheduler",
+                "cronRunId": &cron_run.run_id,
+                "platform": "native-cron"
+            }),
+            idempotency_key: Some("bad-dispatch".to_string()),
+            parent_job_id: None,
+            job_group_id: None,
+            master_agent_id: Some("main".to_string()),
+            master_session_key: Some("master".to_string()),
+            wake_policy: None,
+            source: Some("test".to_string()),
+            priority: 0,
+            available_at_ms: Some(1002),
+            max_attempts: 3,
+            timeout_ms: Some(DEFAULT_TIMEOUT_MS),
+            cascade_timeout_ms: None,
+            rate_key: None,
+            concurrency_group_key: None,
+            now_ms: 1002,
+        })
+        .unwrap();
+        crate::mark_cron_run_worker_enqueued(
+            &harness_home,
+            &cron_run.run_id,
+            &enqueue.job.job_id,
+            1001,
+        )
+        .unwrap();
+
+        let run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("llm".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1003,
+        })
+        .unwrap();
+
+        assert_eq!(run.status, WorkerRunOnceStatus::Rescheduled);
+        assert_eq!(
+            run.result.as_ref().unwrap().status,
+            WorkerJobStatus::FailedRetryable
+        );
+        let runs = crate::collect_cron_run_summary(&harness_home).unwrap();
+        let updated = runs.runs.first().unwrap();
+        assert_eq!(updated.status, crate::CronRunStatus::RetryPending);
+        assert!(
+            updated
+                .failure_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("worker job execution failed before result")
+        );
 
         let _ = fs::remove_dir_all(root);
     }

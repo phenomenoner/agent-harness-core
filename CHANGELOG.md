@@ -17,6 +17,7 @@
 - Split progress current-step narration length from short action/error preview length; current-step status now uses a longer default cap while redaction and platform-safe truncation stay in place.
 - Route Telegram/Discord ingress through channel identity bindings after allow-list checks, preserving explicit account ids through queue, outbox, delivery receipts, and gateway callbacks.
 - Make runtime retry caps and operator fallback hints configurable through `runtimeBackoff` instead of a fixed hard-coded attempt count.
+- Isolate native cron LLM turns from interactive runtime turns with a dedicated `cron` worker lane, `runtimeClass=cron`, class-scoped runtime leases, one-shot and namespaced sticky cron sessions under `cron-sessions`, CronRunStore dispatch guards, skipped runtime tombstones, and legacy root lease compatibility during upgrade.
 
 ### Added
 
@@ -43,11 +44,21 @@
 - `channel-identity-check` for platform/account/channel binding smoke checks.
 - Harness-validated outbound `deliveryIntent` for provider-native reply references, constructed from captured inbound provider ids rather than model text.
 - `cron-scheduler-run-once` and `cron-scheduler-loop`, with scheduler locks, SQLite watermarks, decision receipts, idempotent worker enqueue, status readback, and optional supervisor-plan integration.
+- CronRunStore (`state/cron-runs/cron-runs.sqlite`) for native cron admission, active caps, status summaries, skip/retry/quarantine controls, worker/runtime linkage, stale dispatch recovery, and operator-control-safe status writeback.
+- `cron-runs` and `cron-run-control` CLI commands, plus status/worker-status summaries for runtime classes, origins, class leases, CronRun totals, and scheduler tick health.
 - Account-specific Discord gateway selector support through `--discord-account`, matching the existing event and outbox account selectors.
-- Schema registry entries and docs for channel identity, delivery intent, and cron scheduler receipts.
+- Schema registry entries and docs for channel identity, delivery intent, cron scheduler receipts, and CronRunStore.
 
 ### Verification
 
+- Round5 staged verification: `cargo fmt --all --check`
+- Round5 staged verification: `cargo check --workspace --target-dir target\staging-check-round5-resume2`
+- Round5 staged verification: `cargo test -p agent-harness-core --target-dir target\staging-test-round5-core-resume2 -- --test-threads=1` (255 tests)
+- Round5 staged verification: `cargo test -p agent-harness-cli --target-dir target\staging-test-round5-cli-resume2` (20 tests)
+- Round5 staged verification: `cargo test --workspace --target-dir target\staging-test-round5-workspace-resume2 -- --test-threads=1` (20 CLI tests, 255 core tests, 0 doctests)
+- Round5 staged verification: `cargo build -p agent-harness-cli --target-dir target\staging-build-round5-resume2`
+- Round5 staged verification: `git diff --check` (CRLF warnings only)
+- Round5 staged verification: `target\staging-build-round5-resume2\debug\agent-harness.exe public-hygiene --root .public-export\agent-harness-core` (`forbiddenHits=[]`)
 - `cargo fmt --all`
 - `cargo test -p agent-harness-cli --target-dir target\staging-test-cli`
 - `cargo test --workspace --target-dir target\staging-test-workspace`

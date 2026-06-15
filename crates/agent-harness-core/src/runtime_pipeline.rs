@@ -16,9 +16,9 @@ use crate::{
     RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
     RuntimeQueuePreparedItem, append_agent_progress_event, append_harness_log, apply_response_tone,
     current_log_time_ms, inspect_runtime_backoff_policy, load_assistant_narration_config,
-    load_response_tone_config, plan_codex_runtime, prepare_runtime_queue_item,
-    read_channel_session_state, record_memory_lifecycle_turn, release_runtime_queue_lease,
-    run_codex_runtime, write_json_atomic,
+    load_response_tone_config, mark_cron_run_runtime_status_by_queue_id, plan_codex_runtime,
+    prepare_runtime_queue_item, read_channel_session_state, record_memory_lifecycle_turn,
+    release_runtime_queue_lease, run_codex_runtime, write_json_atomic,
 };
 
 const RUNTIME_RUN_ONCE_SCHEMA: &str = "agent-harness.runtime-run-once.v1";
@@ -55,6 +55,14 @@ pub struct RuntimeRunOnceReport {
 pub struct RuntimeRunOnceReceipt {
     pub queue_id: Option<String>,
     pub status: RuntimeRunOnceStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduled_for_ms: Option<i64>,
     pub execution_dir: Option<PathBuf>,
     pub transcript_file: Option<PathBuf>,
     pub outbox_file: Option<PathBuf>,
@@ -79,6 +87,26 @@ pub enum RuntimeRunOnceStatus {
     Canceled,
 }
 
+impl RuntimeRunOnceStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::LeaseBusy => "lease-busy",
+            Self::NoWork => "no-work",
+            Self::NoPreparedExecution => "no-prepared-execution",
+            Self::NoRuntimePlan => "no-runtime-plan",
+            Self::PreflightBlocked => "preflight-blocked",
+            Self::SpawnFailed => "spawn-failed",
+            Self::ProtocolError => "protocol-error",
+            Self::Timeout => "timeout",
+            Self::RetryPending => "retry-pending",
+            Self::DeadLetter => "dead-letter",
+            Self::FailedTerminal => "failed-terminal",
+            Self::Canceled => "canceled",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RuntimeDeadLetterReceipt {
@@ -101,6 +129,31 @@ struct QueueChannelContext {
     inbound_context: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct RuntimeRunMetadata {
+    runtime_class: Option<String>,
+    origin: Option<String>,
+    cron_run_id: Option<String>,
+    scheduled_for_ms: Option<i64>,
+}
+
+fn runtime_run_metadata(prepare: &RuntimeQueuePrepareReport) -> RuntimeRunMetadata {
+    if let Some(item) = prepare.item.as_ref() {
+        return RuntimeRunMetadata {
+            runtime_class: Some(item.runtime_class.clone()),
+            origin: Some(item.origin.clone()),
+            cron_run_id: item.cron_run_id.clone(),
+            scheduled_for_ms: item.scheduled_for_ms,
+        };
+    }
+    RuntimeRunMetadata {
+        runtime_class: prepare.receipt.runtime_class.clone(),
+        origin: prepare.receipt.origin.clone(),
+        cron_run_id: prepare.receipt.cron_run_id.clone(),
+        scheduled_for_ms: prepare.receipt.scheduled_for_ms,
+    }
+}
+
 pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<RuntimeRunOnceReport> {
     let queue_dir = options.harness_home.join("state").join("runtime-queue");
     let report_file = queue_dir.join("run-once-last.json");
@@ -119,9 +172,14 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         .map(channel_context_from_prepared_item);
 
     if prepare.receipt.status == RuntimeExecutionReceiptStatus::LeaseBusy {
+        let metadata = runtime_run_metadata(&prepare);
         let receipt = RuntimeRunOnceReceipt {
             queue_id: prepare.receipt.queue_id.clone(),
             status: RuntimeRunOnceStatus::LeaseBusy,
+            runtime_class: metadata.runtime_class,
+            origin: metadata.origin,
+            cron_run_id: metadata.cron_run_id,
+            scheduled_for_ms: metadata.scheduled_for_ms,
             execution_dir: None,
             transcript_file: None,
             outbox_file: None,
@@ -152,11 +210,16 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
     }
 
     if prepare.receipt.status == RuntimeExecutionReceiptStatus::NoPendingItem {
+        let metadata = runtime_run_metadata(&prepare);
         let requested_queue = options.queue_id;
         let requested_specific_queue = requested_queue.is_some();
         let receipt = RuntimeRunOnceReceipt {
             queue_id: requested_queue,
             status: RuntimeRunOnceStatus::NoWork,
+            runtime_class: metadata.runtime_class,
+            origin: metadata.origin,
+            cron_run_id: metadata.cron_run_id,
+            scheduled_for_ms: metadata.scheduled_for_ms,
             execution_dir: None,
             transcript_file: None,
             outbox_file: None,
@@ -206,6 +269,10 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         let receipt = RuntimeRunOnceReceipt {
             queue_id: prepare.receipt.queue_id.clone(),
             status: RuntimeRunOnceStatus::NoPreparedExecution,
+            runtime_class: prepare.receipt.runtime_class.clone(),
+            origin: prepare.receipt.origin.clone(),
+            cron_run_id: prepare.receipt.cron_run_id.clone(),
+            scheduled_for_ms: prepare.receipt.scheduled_for_ms,
             execution_dir: plan.execution_dir.clone(),
             transcript_file: None,
             outbox_file: None,
@@ -423,6 +490,10 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                             let receipt = RuntimeRunOnceReceipt {
                                 queue_id: run.receipt.queue_id.clone(),
                                 status: map_run_once_status(run.receipt.status),
+                                runtime_class: prepare.receipt.runtime_class.clone(),
+                                origin: prepare.receipt.origin.clone(),
+                                cron_run_id: prepare.receipt.cron_run_id.clone(),
+                                scheduled_for_ms: prepare.receipt.scheduled_for_ms,
                                 execution_dir: run.receipt.execution_dir.clone(),
                                 transcript_file: run.receipt.transcript_file.clone(),
                                 outbox_file: None,
@@ -479,6 +550,10 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             let receipt = RuntimeRunOnceReceipt {
                 queue_id: run.receipt.queue_id.clone(),
                 status,
+                runtime_class: prepare.receipt.runtime_class.clone(),
+                origin: prepare.receipt.origin.clone(),
+                cron_run_id: prepare.receipt.cron_run_id.clone(),
+                scheduled_for_ms: prepare.receipt.scheduled_for_ms,
                 execution_dir: run.receipt.execution_dir.clone(),
                 transcript_file: run.receipt.transcript_file.clone(),
                 outbox_file: None,
@@ -506,6 +581,10 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
     let receipt = RuntimeRunOnceReceipt {
         queue_id: run.receipt.queue_id.clone(),
         status: receipt_status,
+        runtime_class: prepare.receipt.runtime_class.clone(),
+        origin: prepare.receipt.origin.clone(),
+        cron_run_id: prepare.receipt.cron_run_id.clone(),
+        scheduled_for_ms: prepare.receipt.scheduled_for_ms,
         execution_dir: run.receipt.execution_dir.clone(),
         transcript_file: run.receipt.transcript_file.clone(),
         outbox_file: outbox_file.clone(),
@@ -877,6 +956,15 @@ fn write_runtime_run_once_report(
     write_json_atomic(&report.report_file, &report)?;
     if append_receipt {
         append_json_line(&report.receipts_file, &report.receipt)?;
+        if let Some(queue_id) = report.receipt.queue_id.as_deref() {
+            mark_cron_run_runtime_status_by_queue_id(
+                &report.harness_home,
+                queue_id,
+                report.receipt.status.as_str(),
+                &report.receipt.reason,
+                current_log_time_ms().unwrap_or(0),
+            )?;
+        }
     }
     Ok(report)
 }
@@ -1558,8 +1646,10 @@ mod tests {
         .unwrap();
         assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
         let queue_id = receive.queue_id.unwrap();
-        let _held_lock =
-            hold_runtime_queue_lease_lock(&harness_home.join("state").join("runtime-queue"));
+        let _held_lock = hold_runtime_queue_lease_lock(
+            &harness_home.join("state").join("runtime-queue"),
+            "interactive",
+        );
 
         let report = run_runtime_queue_once(RuntimeRunOnceOptions {
             harness_home: harness_home.clone(),
@@ -2338,9 +2428,14 @@ done
         ))
     }
 
-    fn hold_runtime_queue_lease_lock(queue_dir: &Path) -> fs::File {
-        fs::create_dir_all(queue_dir).unwrap();
-        let lock_file = queue_dir.join("runtime-leases.lock");
+    fn hold_runtime_queue_lease_lock(queue_dir: &Path, runtime_class: &str) -> fs::File {
+        let lock_dir = if runtime_class == "legacy" {
+            queue_dir.to_path_buf()
+        } else {
+            queue_dir.join("classes").join(runtime_class)
+        };
+        fs::create_dir_all(&lock_dir).unwrap();
+        let lock_file = lock_dir.join("runtime-leases.lock");
         let mut options = OpenOptions::new();
         options.create(true).write(true).truncate(true);
         #[cfg(not(windows))]

@@ -41,7 +41,7 @@ Born as a ground-up Rust rebuild of a Docker-based legacy agent gateway ("OpenCl
 | 🧾 **A receipt for everything** | Every ingress, queue write, model turn, delivery, and retry appends to JSONL ledgers. Reconstruct any incident after the fact — no black boxes. |
 | 📨 **Chat-native agents** | First-class Telegram Bot API and Discord (REST + Gateway) adapters: replies, media, attachments, message splitting, edit-in-place progress panels, default-off opt-in final-reply tone, and `/new` `/model` `/think` `/steer` `/stop` `/status` commands. |
 | 🔐 **Fail-closed by default** | DMs require explicit admin allow-lists, and ingress must resolve a platform/account/channel identity binding before dispatch. Unknown senders or ambiguous channel bindings never reach the model. |
-| ⚙️ **Durable, bounded work** | SQLite-backed worker dispatch with leases, retry/backoff, stale reaping, watchdogs, and concurrency limits per global / agent / channel / lane. A long Telegram turn never blocks a Discord turn. |
+| ⚙️ **Durable, bounded work** | SQLite-backed worker dispatch with leases, retry/backoff, stale reaping, watchdogs, and concurrency limits per global / agent / channel / lane. Runtime dispatch classes isolate interactive, cron, worker, and maintenance turns so noisy cron work does not block channel agents. |
 | 🤖 **Model-agnostic routing** | Codex app-server executes turns; OpenRouter routing switches any conversation to e.g. `anthropic/claude-sonnet-4` with one `/model` command. Provider-specific Codex homes keep OpenRouter config out of the default Codex/OAuth path; secrets are checked at preflight, never written to disk. |
 | 🧠 **Memory-aware** | OpenClaw-compatible memory hooks (recall, lifecycle capture, store proposals) with vector recall over imported SQLite embeddings — integrated via adapters, not forks. |
 | 📦 **Skills as runtime state** | Versioned, indexed `SKILL.md` runbooks are matched per turn and injected once per session via an injection ledger — no prompt bloat, no stale docs. Imported skill indexes cover both legacy and current OpenClaw namespace layouts. |
@@ -64,7 +64,8 @@ flowchart LR
     OUT --> TG2[Telegram reply + media]
     OUT --> DC2[Discord reply + attachments]
     CX -.progress events.-> PR[Progress panel\nedit-in-place status]
-    W[(SQLite worker dispatch\ncron / subagents / watchdogs)] --> Q
+    W[(SQLite worker dispatch\ncron / subagents / watchdogs)] --> CR[(CronRunStore\nretry / quarantine)]
+    CR --> Q
     ALL[every stage] -.appends.-> LOG[(JSONL logs, receipts,\ntranscripts, trajectories)]
 ```
 
@@ -104,7 +105,7 @@ One binary, `agent-harness`, grouped into clear families:
 | **Channels** | `channel-identity-check`, `channel-receive`, `channel-run-once`, `channel-outbox-plan`, `telegram-probe`, `telegram-loop`, `discord-gateway-loop`, `discord-outbox-send-once`, … | Telegram/Discord ingress, identity binding, permission gating, slash commands, outbox delivery with retry ledgers. |
 | **Runtime & queue** | `queue-enqueue`, `queue-prepare`, `runtime-run-once`, `runtime-loop`, `progress-delivery-loop` | Durable agent-turn queue, bounded-concurrency runtime loop, live progress panels, final-reply tone policy. |
 | **Codex pipeline** | `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle` | Plan → preflight → launch → run → record, each stage inspectable and receipt-backed. |
-| **Workers & scheduling** | `worker-enqueue`, `worker-loop`, `worker-status`, `cron-plan`, `cron-scheduler-lint`, `cron-scheduler-run-once`, `cron-scheduler-loop`, `native-cron-enqueue`, `deterministic-cron-plan`, `subagent-plan`, … | SQLite-durable jobs: LLM subagents, native/deterministic cron scheduler ticks, no-LLM deterministic shell jobs, watchdogs, master wakeups. |
+| **Workers & scheduling** | `worker-enqueue`, `worker-loop`, `worker-status`, `cron-runs`, `cron-run-control`, `cron-plan`, `cron-scheduler-lint`, `cron-scheduler-run-once`, `cron-scheduler-loop`, `native-cron-enqueue`, `deterministic-cron-plan`, `subagent-plan`, … | SQLite-durable jobs: LLM subagents, native/deterministic cron scheduler ticks, no-LLM deterministic shell jobs, watchdogs, master wakeups, dedicated cron worker/runtime lanes, and cron skip/retry/quarantine controls. |
 | **Memory** | `memory-hook`, `memory-search`, `memory-vector-search`, `memory-service-status/recall/propose/store` | OpenClaw-compatible memory hooks and vector recall over imported snapshots. |
 | **Ops & security** | `status`, `enable-check`, `healthz`, `ops-backup`, `ops-cutover-request/approve/apply/status`, `ops-control`, `supervisor-plan`, `vault-put`/`vault-get`, `public-hygiene`, `invariants`, `schema-registry` | Health, live-control cutover tokens, backups, Windows Task Scheduler supervision plans, encrypted vault, release hygiene. |
 
@@ -118,7 +119,7 @@ One binary, `agent-harness`, grouped into clear families:
 
 ## Project Status
 
-Pre-release, under active development, and **live-validated daily**: the reference deployment runs a single supervised runtime loop (concurrency 12) plus worker, progress, Telegram, Discord, and scheduler loops, with hundreds of delivered turns on record. Current verification: 243 core tests + 19 CLI tests, staged workspace check/build, public export hygiene, and `cargo fmt` clean.
+Pre-release, under active development, and **live-validated daily**: the reference deployment runs a single supervised runtime loop (concurrency 12) plus worker, progress, Telegram, Discord, and scheduler loops, with hundreds of delivered turns on record. Current staged work adds CronRunStore, dedicated cron worker/runtime lanes, one-shot and namespaced sticky cron sessions, and dispatch guards so cron LLM turns are observable, retryable, recoverable, and isolated from interactive channel turns.
 
 See the [Changelog](CHANGELOG.md), the [Roadmap & Backlog](docs/agent-harness-core-roadmap-backlog.md), and the [Activation Readiness Plan](docs/activation-readiness-plan.md) for what's done, gated, and next.
 

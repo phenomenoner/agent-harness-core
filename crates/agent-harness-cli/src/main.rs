@@ -30,9 +30,10 @@ use agent_harness_core::{
     CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReport, CodexRuntimePlanOptions,
     CodexRuntimePlanReport, CodexRuntimePreflightOptions, CodexRuntimePreflightReport,
     CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy, ContextPackParseOptions,
-    CronSchedulerLintStatus, CronSchedulerRunOnceOptions, CronSchedulerTickStatus,
-    DeterministicCronPlan, DeterministicCronPlanInput, DeterministicCronWorkerEnqueueOptions,
-    DriftCheckOptions, DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel,
+    CronRunControlAction, CronRunControlOptions, CronRunListOptions, CronSchedulerLintStatus,
+    CronSchedulerRunOnceOptions, CronSchedulerTickStatus, DeterministicCronPlan,
+    DeterministicCronPlanInput, DeterministicCronWorkerEnqueueOptions, DriftCheckOptions,
+    DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel,
     HarnessLogRotationOptions, HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport,
     HealthzOptions, ImportPhaseStatus, ImportReport, LearningProposalOptions, LiveControlAction,
     McpRequestOptions, MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport,
@@ -60,29 +61,30 @@ use agent_harness_core::{
     build_import_plan, build_runtime_skill_index, build_source_skill_index, build_turn_plan,
     cancel_worker_job, check_activation_readiness, check_config_drift, check_tool_description_pin,
     collect_harness_metrics, collect_harness_status, collect_healthz, collect_ops_cutover_status,
-    collect_token_efficiency, collect_worker_status, compare_channel_turn_shadow,
+    collect_token_efficiency, collect_worker_status, compare_channel_turn_shadow, control_cron_run,
     control_runtime_queue_item, create_learning_proposal, create_ops_backup, current_log_time_ms,
     default_supervisor_child_specs, enqueue_channel_step, enqueue_deterministic_cron_workers,
     enqueue_native_cron_workers, enqueue_subagent_workers, enqueue_worker_job, evaluate_admission,
     evaluate_prompt_reduction, evaluate_supervisor_children, execute_import,
     export_harness_registry_files, export_memory_credentials, get_vault_secret, handle_mcp_request,
     inspect_openclaw_mem_service, inspect_runtime_queue_capacity, invariant_catalog, inventory,
-    lint_cron_scheduler, list_background_tasks, load_agent_registry, load_deterministic_cron_store,
-    load_native_cron_store, load_subagent_ledger, parse_channel_command, parse_context_pack,
-    plan_agent_progress_delivery, plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron,
-    plan_native_cron, plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
-    probe_codex_runtime_launch, propose_openclaw_mem_service_memory, put_vault_secret,
-    reap_stale_worker_jobs, recall_openclaw_mem_service, receive_channel_message,
-    record_agent_progress_delivery, record_channel_delivery, record_channel_turn_shadow,
-    record_codex_runtime_completion, record_ops_control, record_ops_cutover_apply,
-    record_ops_cutover_approval, record_ops_cutover_receipt, record_ops_cutover_request,
-    record_scoped_stop, record_supervise_deploy_canary, release_checklist,
-    resolve_channel_identity, rotate_harness_log_if_needed, run_channel_once, run_codex_runtime,
-    run_cron_scheduler_once, run_memory_canvas_worker, run_memory_hook_adapter, run_public_hygiene,
-    run_runtime_queue_once, run_worker_once, scan_security_boundaries, schema_registry_entries,
-    search_imported_memory, search_imported_vector_memory, select_skills,
-    store_openclaw_mem_service_memory, sync_builtin_harness_skills, tool_description_hash,
-    trace_harness_event, upsert_background_task, validate_harness_config, write_channel_step,
+    lint_cron_scheduler, list_background_tasks, list_cron_runs, load_agent_registry,
+    load_deterministic_cron_store, load_native_cron_store, load_subagent_ledger,
+    parse_channel_command, parse_context_pack, plan_agent_progress_delivery, plan_channel_outbox,
+    plan_codex_runtime, plan_deterministic_cron, plan_native_cron, plan_subagents,
+    preflight_codex_runtime, prepare_runtime_queue_item, probe_codex_runtime_launch,
+    propose_openclaw_mem_service_memory, put_vault_secret, reap_stale_worker_jobs,
+    recall_openclaw_mem_service, receive_channel_message, record_agent_progress_delivery,
+    record_channel_delivery, record_channel_turn_shadow, record_codex_runtime_completion,
+    record_ops_control, record_ops_cutover_apply, record_ops_cutover_approval,
+    record_ops_cutover_receipt, record_ops_cutover_request, record_scoped_stop,
+    record_supervise_deploy_canary, release_checklist, resolve_channel_identity,
+    rotate_harness_log_if_needed, run_channel_once, run_codex_runtime, run_cron_scheduler_once,
+    run_memory_canvas_worker, run_memory_hook_adapter, run_public_hygiene, run_runtime_queue_once,
+    run_worker_once, scan_security_boundaries, schema_registry_entries, search_imported_memory,
+    search_imported_vector_memory, select_skills, store_openclaw_mem_service_memory,
+    sync_builtin_harness_skills, tool_description_hash, trace_harness_event,
+    upsert_background_task, validate_harness_config, write_channel_step,
     write_deterministic_cron_plan, write_memory_search_receipt, write_memory_vector_recall_receipt,
     write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
     write_subagent_plan, write_task_entity, write_turn_plan, write_windows_supervisor_plan,
@@ -107,6 +109,8 @@ fn main() {
         "registry-export" => run_registry_export(&rest),
         "enable-check" => run_enable_check(&rest),
         "status" | "harness-status" => run_harness_status(&rest),
+        "cron-runs" | "cron-run-list" => run_cron_runs(&rest),
+        "cron-run-control" => run_cron_run_control(&rest),
         "config-validate" => run_config_validate(&rest),
         "log-rotate" => run_log_rotate(&rest),
         "queue-retry" => run_runtime_queue_control(&rest, RuntimeQueueControlAction::Retry),
@@ -449,6 +453,57 @@ fn run_harness_status(args: &[String]) -> Result<(), String> {
         print_harness_status_report(&report);
     }
     Ok(())
+}
+
+fn run_cron_runs(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(
+        args,
+        "cron-runs",
+        &["--agent-id", "--entry-id", "--status", "--limit"],
+        &[],
+    )?;
+    let report = list_cron_runs(CronRunListOptions {
+        harness_home: options.target_home.clone(),
+        agent_id: options.optional("--agent-id").map(ToString::to_string),
+        entry_id: options.optional("--entry-id").map(ToString::to_string),
+        status: options.optional("--status").map(ToString::to_string),
+        limit: options.optional_usize("--limit")?.unwrap_or(50),
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
+}
+
+fn run_cron_run_control(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(
+        args,
+        "cron-run-control",
+        &[
+            "--action",
+            "--run-id",
+            "--agent-id",
+            "--entry-id",
+            "--reason",
+        ],
+        &[],
+    )?;
+    let action = options
+        .required("--action")?
+        .parse::<CronRunControlAction>()?;
+    let reason = options
+        .optional("--reason")
+        .unwrap_or("manual operator request")
+        .to_string();
+    let report = control_cron_run(CronRunControlOptions {
+        harness_home: options.target_home.clone(),
+        action,
+        run_id: options.optional("--run-id").map(ToString::to_string),
+        agent_id: options.optional("--agent-id").map(ToString::to_string),
+        entry_id: options.optional("--entry-id").map(ToString::to_string),
+        reason,
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
 }
 
 fn run_config_validate(args: &[String]) -> Result<(), String> {
@@ -12898,6 +12953,22 @@ fn optional_bool(value: Option<bool>) -> &'static str {
     }
 }
 
+fn fmt_optional_i64(value: Option<i64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn count_summary(map: &BTreeMap<String, usize>) -> String {
+    if map.is_empty() {
+        return "-".to_string();
+    }
+    map.iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn print_dry_run_summary(report: &ImportReport) {
     println!("Agent source import dry run");
     println!("Source home: {}", report.source_home.display());
@@ -13199,9 +13270,11 @@ fn print_harness_status_report(report: &HarnessStatusReport) {
         report.readiness.summary.failed
     );
     println!(
-        "Runtime: queued={} open={} prepared={} completed={} invalid={} runOnce={} codexRun={} completion={}",
+        "Runtime: queued={} open={} cronQueued={} cronOpen={} prepared={} completed={} invalid={} runOnce={} codexRun={} completion={}",
         report.runtime.queued_items,
         report.runtime.open_items,
+        report.runtime.cron_queued_items,
+        report.runtime.cron_open_items,
         report.runtime.prepared_items,
         report.runtime.completed_items,
         report.runtime.pending_invalid_lines,
@@ -13209,15 +13282,65 @@ fn print_harness_status_report(report: &HarnessStatusReport) {
         receipt_summary(&report.runtime.codex_run_receipts),
         receipt_summary(&report.runtime.codex_completion_receipts)
     );
+    println!(
+        "Runtime classes: queued=[{}] open=[{}] origins=[{}]",
+        count_summary(&report.runtime.queued_by_runtime_class),
+        count_summary(&report.runtime.open_by_runtime_class),
+        count_summary(&report.runtime.open_by_origin)
+    );
+    let lease_parts = report
+        .runtime
+        .class_leases
+        .iter()
+        .filter(|status| status.leased_items > 0 || status.expired_leases > 0)
+        .map(|status| {
+            format!(
+                "{} active={} expired={} cron={}",
+                status.runtime_class,
+                status.active_leases,
+                status.expired_leases,
+                status.cron_run_leases
+            )
+        })
+        .collect::<Vec<_>>();
+    if !lease_parts.is_empty() {
+        println!("Runtime leases: {}", lease_parts.join("; "));
+    }
     if let Some(latest) = &report.runtime.latest_non_idle_run_once {
         println!(
-            "Runtime latest non-idle: line={} queue={} status={} reason={}",
+            "Runtime latest non-idle: line={} queue={} class={} origin={} cronRun={} status={} reason={}",
             latest.line_number,
             latest.queue_id.as_deref().unwrap_or("-"),
+            latest.runtime_class.as_deref().unwrap_or("-"),
+            latest.origin.as_deref().unwrap_or("-"),
+            latest.cron_run_id.as_deref().unwrap_or("-"),
             latest.status.as_deref().unwrap_or("-"),
             latest.reason.as_deref().unwrap_or("-")
         );
     }
+    println!(
+        "Cron scheduler: status={} due={} enqueued={} held={} duplicate={} policy={} errors={} receipts={}",
+        report
+            .cron_scheduler
+            .latest_status
+            .as_deref()
+            .unwrap_or("-"),
+        fmt_optional_i64(report.cron_scheduler.latest_due_candidates),
+        fmt_optional_i64(report.cron_scheduler.latest_enqueued),
+        fmt_optional_i64(report.cron_scheduler.latest_skipped_held),
+        fmt_optional_i64(report.cron_scheduler.latest_skipped_duplicate),
+        fmt_optional_i64(report.cron_scheduler.latest_skipped_policy),
+        fmt_optional_i64(report.cron_scheduler.latest_errors),
+        receipt_summary(&report.cron_scheduler.receipts)
+    );
+    println!(
+        "Cron runs: active={} terminal={} quarantined={} status=[{}] activeAgents=[{}]",
+        report.cron_runs.summary.active,
+        report.cron_runs.summary.terminal,
+        report.cron_runs.summary.quarantined,
+        count_summary(&report.cron_runs.summary.by_status),
+        count_summary(&report.cron_runs.summary.by_agent_active)
+    );
     println!(
         "Outbox: pending={} delivered={} retryable={} invalid={}",
         report.channels.outbox.all.pending,
@@ -14702,6 +14825,8 @@ fn print_help() {
     println!("  cron-scheduler-lint Read-only scheduler config/source lint before enabling cron");
     println!("  cron-scheduler-run-once Tick cron registries/crontabs into worker jobs");
     println!("  cron-scheduler-loop Run the cron scheduler tick loop until stopped");
+    println!("  cron-runs       List CronRun active/terminal/quarantine state");
+    println!("  cron-run-control Skip, retry, quarantine, or unquarantine CronRun state");
     println!("  deterministic-cron-plan Dry-run deterministic cron without LLM access");
     println!("  deterministic-cron-enqueue Persist deterministic cron into worker dispatch");
     println!("  subagent-plan   Dry-run subagent ledger cutover/resume planning");
@@ -14720,6 +14845,9 @@ fn print_help() {
     println!("  --output <path>         Write report.json and summary.md");
     println!("  --include-sensitive     Copy/write sensitive import or credential values");
     println!("  --json                  Print machine-readable JSON for status");
+    println!("  --run-id <id>           CronRun id for list/control filters");
+    println!("  --entry-id <id>         Cron job entry id for list/control filters");
+    println!("  --status <name>         CronRun status filter for cron-runs");
     println!("  --path <file>           JSONL ledger path for jsonl-repair");
     println!("  --apply                 Apply jsonl-repair after writing backup/repaired files");
     println!("  --invalid-output <file> Invalid-line quarantine output for jsonl-repair");
@@ -14799,7 +14927,7 @@ fn print_help() {
     );
     println!("  --payload <json>        JSON payload for worker-enqueue or memory-hook");
     println!("  --payload-file <path>   JSON payload file for worker-enqueue or memory-hook");
-    println!("  --action <name>         ops-control or live-control action name");
+    println!("  --action <name>         CronRun, ops-control, or live-control action name");
     println!("  --ticket-id <id>        Cutover approval/apply ticket id");
     println!("  --summary <text>        Cutover request summary");
     println!("  --candidate-binary <path> Staged binary intended for cutover");
@@ -14928,6 +15056,10 @@ mod tests {
                 receipt: agent_harness_core::RuntimeRunOnceReceipt {
                     queue_id: Some(queue_id.clone()),
                     status: RuntimeRunOnceStatus::LeaseBusy,
+                    runtime_class: Some("interactive".to_string()),
+                    origin: Some("channel".to_string()),
+                    cron_run_id: None,
+                    scheduled_for_ms: None,
                     execution_dir: None,
                     transcript_file: None,
                     outbox_file: None,

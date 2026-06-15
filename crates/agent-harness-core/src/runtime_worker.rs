@@ -14,8 +14,9 @@ use std::os::windows::fs::OpenOptionsExt;
 
 use crate::{
     AgentSource, HarnessLogEvent, HarnessLogLevel, PromptAssemblyOptions, append_harness_log,
-    assemble_prompt_bundle, build_runtime_skill_index, build_turn_plan, current_log_time_ms,
-    load_agent_registry, load_worker_dispatch_config, write_json_atomic, write_prompt_bundle,
+    assemble_prompt_bundle, build_runtime_skill_index, build_turn_plan,
+    cron_run_runtime_dispatch_blocker, current_log_time_ms, load_agent_registry,
+    load_worker_dispatch_config, write_json_atomic, write_prompt_bundle,
 };
 
 const RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA: &str = "agent-harness.runtime-queue-prepare.v1";
@@ -46,6 +47,7 @@ pub struct RuntimeQueueCapacityReport {
     pub harness_home: PathBuf,
     pub queue_file: PathBuf,
     pub leases_file: PathBuf,
+    pub classes: Vec<RuntimeQueueClassCapacity>,
     pub claimable_items: usize,
     pub claimable_queue_ids: Vec<String>,
     pub leased_items: usize,
@@ -54,6 +56,36 @@ pub struct RuntimeQueueCapacityReport {
     pub agent_channel_limit: usize,
     pub lease_lock_busy: bool,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeDispatchConfig {
+    pub global_concurrency_limit: usize,
+    pub interactive_reserve: usize,
+    pub classes: BTreeMap<String, RuntimeDispatchClassConfig>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeDispatchClassConfig {
+    pub max_active: usize,
+    pub per_agent_max_active: usize,
+    pub per_channel_max_active: usize,
+    pub per_job_max_active: usize,
+    pub max_queued_per_agent: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeQueueClassCapacity {
+    pub runtime_class: String,
+    pub leases_file: PathBuf,
+    pub lock_file: PathBuf,
+    pub leased_items: usize,
+    pub claimable_items: usize,
+    pub lock_busy: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -74,6 +106,12 @@ pub struct RuntimeQueuePreparedItem {
     pub queue_id: String,
     pub agent_id: String,
     pub session_key: String,
+    pub runtime_class: String,
+    pub origin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduled_for_ms: Option<i64>,
     pub platform: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
@@ -97,6 +135,14 @@ pub struct RuntimeQueuePreparedItem {
 pub struct RuntimeExecutionReceipt {
     pub queue_id: Option<String>,
     pub status: RuntimeExecutionReceiptStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_for_ms: Option<i64>,
     pub execution_dir: Option<PathBuf>,
     pub prompt_bundle_json: Option<PathBuf>,
     pub prompt_markdown: Option<PathBuf>,
@@ -114,11 +160,32 @@ pub enum RuntimeExecutionReceiptStatus {
     NoPendingItem,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeRunOnceSkipReceipt {
+    schema: &'static str,
+    queue_id: Option<String>,
+    status: &'static str,
+    runtime_class: Option<String>,
+    origin: Option<String>,
+    cron_run_id: Option<String>,
+    scheduled_for_ms: Option<i64>,
+    execution_dir: Option<PathBuf>,
+    transcript_file: Option<PathBuf>,
+    outbox_file: Option<PathBuf>,
+    reason: String,
+}
+
 #[derive(Debug, Clone)]
 struct PendingQueueItem {
     queue_id: String,
+    created_at_ms: i64,
     agent_id: String,
     session_key: String,
+    runtime_class: String,
+    origin: String,
+    cron_run_id: Option<String>,
+    scheduled_for_ms: Option<i64>,
     platform: String,
     account_id: Option<String>,
     channel_id: String,
@@ -147,6 +214,12 @@ struct RuntimeQueueLeaseState {
 struct RuntimeQueueLease {
     queue_id: String,
     agent_id: String,
+    #[serde(default = "default_interactive_runtime_class")]
+    runtime_class: String,
+    #[serde(default = "default_channel_origin")]
+    origin: String,
+    #[serde(default)]
+    cron_run_id: Option<String>,
     platform: String,
     channel_id: String,
     session_key: String,
@@ -177,9 +250,22 @@ pub fn prepare_runtime_queue_item(
 
     let mut warnings = Vec::new();
     let now_ms = current_log_time_ms()?;
+    let preliminary_pending_items = read_pending_items(&queue_file, &mut warnings)?;
+    let prepared_receipts = read_prepared_receipts(&execution_receipts_file, &mut warnings)?;
+    let run_once_receipts_file = queue_dir.join("run-once-receipts.jsonl");
+    let terminal_run_ids = read_terminal_run_once_ids(&run_once_receipts_file, &mut warnings)?;
+    let retry_pending_run_ids =
+        read_retry_pending_run_once_ids(&run_once_receipts_file, &mut warnings)?;
+    let lock_runtime_class = select_lock_runtime_class(
+        options.queue_id.as_deref(),
+        &preliminary_pending_items,
+        &prepared_receipts,
+        &terminal_run_ids,
+    );
     let lease_owner = format!("pid:{}", std::process::id());
     let _lease_lock = match acquire_runtime_queue_lease_lock_with_retry(
         &queue_dir,
+        &lock_runtime_class,
         Duration::from_millis(RUNTIME_LEASE_ACQUIRE_LOCK_RETRY_MS),
     )? {
         Some(lock) => lock,
@@ -187,11 +273,17 @@ pub fn prepare_runtime_queue_item(
             let receipt = RuntimeExecutionReceipt {
                 queue_id: options.queue_id,
                 status: RuntimeExecutionReceiptStatus::LeaseBusy,
+                runtime_class: Some(lock_runtime_class.clone()),
+                origin: None,
+                cron_run_id: None,
+                scheduled_for_ms: None,
                 execution_dir: None,
                 prompt_bundle_json: None,
                 prompt_markdown: None,
                 runtime_workspace: None,
-                reason: "runtime queue lease lock is busy".to_string(),
+                reason: format!(
+                    "runtime queue lease lock is busy for class `{lock_runtime_class}`"
+                ),
             };
             append_json_line(&execution_receipts_file, &receipt)?;
             return Ok(RuntimeQueuePrepareReport {
@@ -205,12 +297,8 @@ pub fn prepare_runtime_queue_item(
             });
         }
     };
-    let prepared_receipts = read_prepared_receipts(&execution_receipts_file, &mut warnings)?;
-    let run_once_receipts_file = queue_dir.join("run-once-receipts.jsonl");
-    let terminal_run_ids = read_terminal_run_once_ids(&run_once_receipts_file, &mut warnings)?;
-    let retry_pending_run_ids =
-        read_retry_pending_run_once_ids(&run_once_receipts_file, &mut warnings)?;
-    let mut lease_state = read_runtime_queue_leases(&queue_dir, &mut warnings)?;
+    let mut lease_state =
+        read_runtime_queue_leases(&queue_dir, &lock_runtime_class, &mut warnings)?;
     purge_runtime_queue_leases(
         &mut lease_state,
         now_ms,
@@ -226,10 +314,22 @@ pub fn prepare_runtime_queue_item(
     if let Some(requested_queue_id) = options.queue_id.as_deref()
         && terminal_run_ids.contains(requested_queue_id)
     {
-        write_runtime_queue_leases(&queue_dir, &lease_state)?;
+        write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
         let receipt = RuntimeExecutionReceipt {
             queue_id: Some(requested_queue_id.to_string()),
             status: RuntimeExecutionReceiptStatus::NoPendingItem,
+            runtime_class: pending_by_id
+                .get(requested_queue_id)
+                .map(|item| item.runtime_class.clone()),
+            origin: pending_by_id
+                .get(requested_queue_id)
+                .map(|item| item.origin.clone()),
+            cron_run_id: pending_by_id
+                .get(requested_queue_id)
+                .and_then(|item| item.cron_run_id.clone()),
+            scheduled_for_ms: pending_by_id
+                .get(requested_queue_id)
+                .and_then(|item| item.scheduled_for_ms),
             execution_dir: None,
             prompt_bundle_json: None,
             prompt_markdown: None,
@@ -254,13 +354,17 @@ pub fn prepare_runtime_queue_item(
             let receipt = RuntimeExecutionReceipt {
                 queue_id: Some(requested_queue_id.to_string()),
                 status: RuntimeExecutionReceiptStatus::NoPendingItem,
+                runtime_class: prepared.runtime_class.clone(),
+                origin: prepared.origin.clone(),
+                cron_run_id: prepared.cron_run_id.clone(),
+                scheduled_for_ms: prepared.scheduled_for_ms,
                 execution_dir: None,
                 prompt_bundle_json: None,
                 prompt_markdown: None,
                 runtime_workspace: None,
                 reason: "requested runtime queue item is already leased".to_string(),
             };
-            write_runtime_queue_leases(&queue_dir, &lease_state)?;
+            write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
             append_json_line(&execution_receipts_file, &receipt)?;
             return Ok(RuntimeQueuePrepareReport {
                 schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
@@ -274,18 +378,51 @@ pub fn prepare_runtime_queue_item(
         }
         if let Some(pending) = pending_by_id.get(requested_queue_id) {
             if let Some(blocker) =
+                cron_runtime_dispatch_blocker_for_item(&options.harness_home, pending, now_ms)?
+            {
+                tombstone_runtime_queue_item_skipped(&queue_dir, pending, &blocker)?;
+                let receipt = RuntimeExecutionReceipt {
+                    queue_id: Some(requested_queue_id.to_string()),
+                    status: RuntimeExecutionReceiptStatus::NoPendingItem,
+                    runtime_class: Some(pending.runtime_class.clone()),
+                    origin: Some(pending.origin.clone()),
+                    cron_run_id: pending.cron_run_id.clone(),
+                    scheduled_for_ms: pending.scheduled_for_ms,
+                    execution_dir: None,
+                    prompt_bundle_json: None,
+                    prompt_markdown: None,
+                    runtime_workspace: None,
+                    reason: format!("runtime queue item blocked by {blocker}"),
+                };
+                write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+                append_json_line(&execution_receipts_file, &receipt)?;
+                return Ok(RuntimeQueuePrepareReport {
+                    schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
+                    harness_home: options.harness_home,
+                    queue_file,
+                    execution_receipts_file,
+                    item: None,
+                    receipt,
+                    warnings,
+                });
+            }
+            if let Some(blocker) =
                 runtime_capacity_blocker(&options.harness_home, &lease_state, pending)?
             {
                 let receipt = RuntimeExecutionReceipt {
                     queue_id: Some(requested_queue_id.to_string()),
                     status: RuntimeExecutionReceiptStatus::NoPendingItem,
+                    runtime_class: Some(pending.runtime_class.clone()),
+                    origin: Some(pending.origin.clone()),
+                    cron_run_id: pending.cron_run_id.clone(),
+                    scheduled_for_ms: pending.scheduled_for_ms,
                     execution_dir: None,
                     prompt_bundle_json: None,
                     prompt_markdown: None,
                     runtime_workspace: None,
                     reason: format!("runtime queue capacity blocked by {blocker}"),
                 };
-                write_runtime_queue_leases(&queue_dir, &lease_state)?;
+                write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
                 append_json_line(&execution_receipts_file, &receipt)?;
                 return Ok(RuntimeQueuePrepareReport {
                     schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
@@ -299,10 +436,14 @@ pub fn prepare_runtime_queue_item(
             }
             lease_runtime_queue_item(&mut lease_state, pending, &lease_owner, now_ms);
         }
-        write_runtime_queue_leases(&queue_dir, &lease_state)?;
+        write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
         let receipt = RuntimeExecutionReceipt {
             queue_id: Some(requested_queue_id.to_string()),
             status: RuntimeExecutionReceiptStatus::AlreadyPrepared,
+            runtime_class: prepared.runtime_class.clone(),
+            origin: prepared.origin.clone(),
+            cron_run_id: prepared.cron_run_id.clone(),
+            scheduled_for_ms: prepared.scheduled_for_ms,
             execution_dir: prepared.execution_dir.clone(),
             prompt_bundle_json: prepared.prompt_bundle_json.clone(),
             prompt_markdown: prepared.prompt_markdown.clone(),
@@ -337,6 +478,18 @@ pub fn prepare_runtime_queue_item(
             !terminal_run_ids.contains(*queue_id) && !lease_state.leases.contains_key(*queue_id)
         }) {
             if let Some(pending) = pending_by_id.get(queue_id) {
+                if pending.runtime_class != lock_runtime_class {
+                    continue;
+                }
+                if let Some(blocker) =
+                    cron_runtime_dispatch_blocker_for_item(&options.harness_home, pending, now_ms)?
+                {
+                    warnings.push(format!(
+                        "prepared runtime queue item `{queue_id}` blocked by {blocker}; tombstoning"
+                    ));
+                    tombstone_runtime_queue_item_skipped(&queue_dir, pending, &blocker)?;
+                    continue;
+                }
                 if let Some(blocker) =
                     runtime_capacity_blocker(&options.harness_home, &lease_state, pending)?
                 {
@@ -345,10 +498,14 @@ pub fn prepare_runtime_queue_item(
                 ));
                 } else {
                     lease_runtime_queue_item(&mut lease_state, pending, &lease_owner, now_ms);
-                    write_runtime_queue_leases(&queue_dir, &lease_state)?;
+                    write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
                     let receipt = RuntimeExecutionReceipt {
                     queue_id: Some(queue_id.clone()),
                     status: RuntimeExecutionReceiptStatus::AlreadyPrepared,
+                    runtime_class: prepared.runtime_class.clone(),
+                    origin: prepared.origin.clone(),
+                    cron_run_id: prepared.cron_run_id.clone(),
+                    scheduled_for_ms: prepared.scheduled_for_ms,
                     execution_dir: prepared.execution_dir.clone(),
                     prompt_bundle_json: prepared.prompt_bundle_json.clone(),
                     prompt_markdown: prepared.prompt_markdown.clone(),
@@ -394,14 +551,21 @@ pub fn prepare_runtime_queue_item(
         &prepared_ids,
         &terminal_run_ids,
         &lease_state,
+        &lock_runtime_class,
         &options.harness_home,
+        &queue_dir,
+        now_ms,
         &mut warnings,
     )?
     else {
-        write_runtime_queue_leases(&queue_dir, &lease_state)?;
+        write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
         let receipt = RuntimeExecutionReceipt {
             queue_id: options.queue_id,
             status: RuntimeExecutionReceiptStatus::NoPendingItem,
+            runtime_class: None,
+            origin: None,
+            cron_run_id: None,
+            scheduled_for_ms: None,
             execution_dir: None,
             prompt_bundle_json: None,
             prompt_markdown: None,
@@ -431,7 +595,7 @@ pub fn prepare_runtime_queue_item(
         });
     };
     lease_runtime_queue_item(&mut lease_state, &pending, &lease_owner, now_ms);
-    write_runtime_queue_leases(&queue_dir, &lease_state)?;
+    write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
 
     let prompt_workspace = prompt_source_workspace(&pending.source_home, &pending.source_workspace);
     if !paths_equivalent(&prompt_workspace, &pending.source_workspace) {
@@ -483,10 +647,18 @@ pub fn prepare_runtime_queue_item(
     fs::create_dir_all(&execution_dir)?;
     let prompt_files = write_prompt_bundle(&bundle, &execution_dir)?;
     let receipt_file = execution_dir.join("execution-receipt.json");
+    let receipt_runtime_class = pending.runtime_class.clone();
+    let receipt_origin = pending.origin.clone();
+    let receipt_cron_run_id = pending.cron_run_id.clone();
+    let receipt_scheduled_for_ms = pending.scheduled_for_ms;
     let item = RuntimeQueuePreparedItem {
         queue_id: pending.queue_id.clone(),
         agent_id: pending.agent_id.clone(),
         session_key: pending.session_key.clone(),
+        runtime_class: pending.runtime_class.clone(),
+        origin: pending.origin.clone(),
+        cron_run_id: pending.cron_run_id.clone(),
+        scheduled_for_ms: pending.scheduled_for_ms,
         platform: pending.platform.clone(),
         account_id: pending.account_id.clone(),
         channel_id: pending.channel_id.clone(),
@@ -505,6 +677,10 @@ pub fn prepare_runtime_queue_item(
     let receipt = RuntimeExecutionReceipt {
         queue_id: Some(pending.queue_id),
         status: RuntimeExecutionReceiptStatus::Prepared,
+        runtime_class: Some(receipt_runtime_class),
+        origin: Some(receipt_origin),
+        cron_run_id: receipt_cron_run_id,
+        scheduled_for_ms: receipt_scheduled_for_ms,
         execution_dir: Some(execution_dir),
         prompt_bundle_json: Some(prompt_files.json),
         prompt_markdown: Some(prompt_files.markdown),
@@ -547,100 +723,285 @@ pub fn inspect_runtime_queue_capacity(
     let execution_receipts_file = queue_dir.join("execution-receipts.jsonl");
     fs::create_dir_all(&queue_dir)?;
 
-    let config = load_worker_dispatch_config(&options.harness_home)?;
+    let config = load_runtime_dispatch_config(&options.harness_home)?;
     let mut warnings = Vec::new();
     let now_ms = current_log_time_ms()?;
-    let Some(_lease_lock) = acquire_runtime_queue_lease_lock_with_retry(
-        &queue_dir,
-        Duration::from_millis(RUNTIME_LEASE_ACQUIRE_LOCK_RETRY_MS),
-    )?
-    else {
-        warnings.push("runtime queue lease lock is busy; capacity assumed zero".to_string());
-        return Ok(RuntimeQueueCapacityReport {
-            schema: "agent-harness.runtime-queue-capacity.v1",
-            harness_home: options.harness_home,
-            queue_file,
-            leases_file: runtime_queue_leases_file(&queue_dir),
-            claimable_items: 0,
-            claimable_queue_ids: Vec::new(),
-            leased_items: 0,
-            global_limit: config.global_concurrency_limit,
-            agent_limit: config.group_concurrency_limit,
-            agent_channel_limit: config.channel_concurrency_limit,
-            lease_lock_busy: true,
-            warnings,
-        });
-    };
-
     let prepared_receipts = read_prepared_receipts(&execution_receipts_file, &mut warnings)?;
     let run_once_receipts_file = queue_dir.join("run-once-receipts.jsonl");
     let terminal_run_ids = read_terminal_run_once_ids(&run_once_receipts_file, &mut warnings)?;
     let retry_pending_run_ids =
         read_retry_pending_run_once_ids(&run_once_receipts_file, &mut warnings)?;
-    let mut lease_state = read_runtime_queue_leases(&queue_dir, &mut warnings)?;
-    purge_runtime_queue_leases(
-        &mut lease_state,
-        now_ms,
-        &terminal_run_ids,
-        &retry_pending_run_ids,
-    );
-    write_runtime_queue_leases(&queue_dir, &lease_state)?;
     let pending_items = read_pending_items(&queue_file, &mut warnings)?;
     let pending_by_id = pending_items
         .iter()
         .cloned()
         .map(|item| (item.queue_id.clone(), item))
         .collect::<HashMap<_, _>>();
-
-    let mut simulated = lease_state.clone();
     let mut claimable_items = 0usize;
     let mut claimable_queue_ids = Vec::new();
-    let prepared_candidates = prepared_receipts
-        .keys()
-        .filter(|queue_id| {
-            !terminal_run_ids.contains(*queue_id) && !lease_state.leases.contains_key(*queue_id)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    for queue_id in prepared_candidates {
-        if let Some(pending) = pending_by_id.get(&queue_id)
-            && runtime_capacity_blocker(&options.harness_home, &simulated, pending)?.is_none()
-        {
-            claimable_items += 1;
-            claimable_queue_ids.push(queue_id);
-            lease_runtime_queue_item(&mut simulated, pending, "capacity-inspect", now_ms);
-        }
-    }
-
-    let prepared_ids = prepared_receipts.keys().cloned().collect::<HashSet<_>>();
-    for pending in pending_items {
-        if prepared_ids.contains(&pending.queue_id)
-            || terminal_run_ids.contains(&pending.queue_id)
-            || simulated.leases.contains_key(&pending.queue_id)
-        {
+    let mut leased_items = 0usize;
+    let mut classes = Vec::new();
+    let mut any_lock_busy = false;
+    let runtime_classes = runtime_classes_for_capacity(&pending_items);
+    for runtime_class in runtime_classes {
+        let Some(_lease_lock) = acquire_runtime_queue_lease_lock_with_retry(
+            &queue_dir,
+            &runtime_class,
+            Duration::from_millis(RUNTIME_LEASE_ACQUIRE_LOCK_RETRY_MS),
+        )?
+        else {
+            any_lock_busy = true;
+            warnings.push(format!(
+                "runtime queue lease lock is busy for class `{runtime_class}`; class capacity assumed zero"
+            ));
+            classes.push(RuntimeQueueClassCapacity {
+                leases_file: runtime_queue_leases_file(&queue_dir, &runtime_class),
+                lock_file: runtime_queue_lease_lock_file(&queue_dir, &runtime_class),
+                runtime_class,
+                leased_items: 0,
+                claimable_items: 0,
+                lock_busy: true,
+            });
             continue;
+        };
+        let mut lease_state = read_runtime_queue_leases(&queue_dir, &runtime_class, &mut warnings)?;
+        purge_runtime_queue_leases(
+            &mut lease_state,
+            now_ms,
+            &terminal_run_ids,
+            &retry_pending_run_ids,
+        );
+        write_runtime_queue_leases(&queue_dir, &runtime_class, &lease_state)?;
+        leased_items += lease_state.leases.len();
+        let mut simulated = lease_state.clone();
+        let mut class_claimable = 0usize;
+        let prepared_candidates = prepared_receipts
+            .keys()
+            .filter(|queue_id| {
+                !terminal_run_ids.contains(*queue_id) && !lease_state.leases.contains_key(*queue_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for queue_id in prepared_candidates {
+            if let Some(pending) = pending_by_id.get(&queue_id)
+                && pending.runtime_class == runtime_class
+                && runtime_capacity_blocker(&options.harness_home, &simulated, pending)?.is_none()
+            {
+                if let Some(blocker) =
+                    cron_runtime_dispatch_blocker_for_item(&options.harness_home, pending, now_ms)?
+                {
+                    warnings.push(format!(
+                        "prepared runtime queue item `{queue_id}` blocked by {blocker}; capacity excludes it"
+                    ));
+                    continue;
+                }
+                claimable_items += 1;
+                class_claimable += 1;
+                claimable_queue_ids.push(queue_id);
+                lease_runtime_queue_item(&mut simulated, pending, "capacity-inspect", now_ms);
+            }
         }
-        if runtime_capacity_blocker(&options.harness_home, &simulated, &pending)?.is_none() {
-            claimable_items += 1;
-            claimable_queue_ids.push(pending.queue_id.clone());
-            lease_runtime_queue_item(&mut simulated, &pending, "capacity-inspect", now_ms);
+
+        let prepared_ids = prepared_receipts.keys().cloned().collect::<HashSet<_>>();
+        for pending in pending_items
+            .iter()
+            .filter(|pending| pending.runtime_class == runtime_class)
+        {
+            if prepared_ids.contains(&pending.queue_id)
+                || terminal_run_ids.contains(&pending.queue_id)
+                || simulated.leases.contains_key(&pending.queue_id)
+            {
+                continue;
+            }
+            if let Some(blocker) =
+                cron_runtime_dispatch_blocker_for_item(&options.harness_home, pending, now_ms)?
+            {
+                warnings.push(format!(
+                    "runtime queue item `{}` blocked by {}; capacity excludes it",
+                    pending.queue_id, blocker
+                ));
+                continue;
+            }
+            if runtime_capacity_blocker(&options.harness_home, &simulated, pending)?.is_none() {
+                claimable_items += 1;
+                class_claimable += 1;
+                claimable_queue_ids.push(pending.queue_id.clone());
+                lease_runtime_queue_item(&mut simulated, pending, "capacity-inspect", now_ms);
+            }
         }
+        classes.push(RuntimeQueueClassCapacity {
+            leases_file: runtime_queue_leases_file(&queue_dir, &runtime_class),
+            lock_file: runtime_queue_lease_lock_file(&queue_dir, &runtime_class),
+            runtime_class,
+            leased_items: lease_state.leases.len(),
+            claimable_items: class_claimable,
+            lock_busy: false,
+        });
     }
 
     Ok(RuntimeQueueCapacityReport {
         schema: "agent-harness.runtime-queue-capacity.v1",
         harness_home: options.harness_home,
         queue_file,
-        leases_file: runtime_queue_leases_file(&queue_dir),
+        leases_file: runtime_queue_leases_file(&queue_dir, "interactive"),
+        classes,
         claimable_items,
         claimable_queue_ids,
-        leased_items: lease_state.leases.len(),
+        leased_items,
         global_limit: config.global_concurrency_limit,
-        agent_limit: config.group_concurrency_limit,
-        agent_channel_limit: config.channel_concurrency_limit,
-        lease_lock_busy: false,
+        agent_limit: config
+            .classes
+            .get("interactive")
+            .map(|class| class.per_agent_max_active)
+            .unwrap_or(config.global_concurrency_limit),
+        agent_channel_limit: config
+            .classes
+            .get("interactive")
+            .map(|class| class.per_channel_max_active)
+            .unwrap_or(config.global_concurrency_limit),
+        lease_lock_busy: any_lock_busy,
         warnings,
     })
+}
+
+pub fn load_runtime_dispatch_config(
+    harness_home: impl AsRef<Path>,
+) -> io::Result<RuntimeDispatchConfig> {
+    let harness_home = harness_home.as_ref();
+    let worker = load_worker_dispatch_config(harness_home)?;
+    let mut config = RuntimeDispatchConfig {
+        global_concurrency_limit: worker.global_concurrency_limit,
+        interactive_reserve: worker.global_concurrency_limit.min(2),
+        classes: BTreeMap::from([
+            (
+                "interactive".to_string(),
+                RuntimeDispatchClassConfig {
+                    max_active: worker.global_concurrency_limit,
+                    per_agent_max_active: worker.group_concurrency_limit,
+                    per_channel_max_active: worker.channel_concurrency_limit,
+                    per_job_max_active: usize::MAX,
+                    max_queued_per_agent: usize::MAX,
+                },
+            ),
+            (
+                "cron".to_string(),
+                RuntimeDispatchClassConfig {
+                    max_active: worker.global_concurrency_limit.min(4),
+                    per_agent_max_active: 1,
+                    per_channel_max_active: 1,
+                    per_job_max_active: 1,
+                    max_queued_per_agent: 20,
+                },
+            ),
+            (
+                "worker".to_string(),
+                RuntimeDispatchClassConfig {
+                    max_active: worker.global_concurrency_limit.min(2),
+                    per_agent_max_active: worker.group_concurrency_limit.min(2),
+                    per_channel_max_active: worker.channel_concurrency_limit.min(2),
+                    per_job_max_active: usize::MAX,
+                    max_queued_per_agent: usize::MAX,
+                },
+            ),
+            (
+                "maintenance".to_string(),
+                RuntimeDispatchClassConfig {
+                    max_active: worker.global_concurrency_limit.min(1),
+                    per_agent_max_active: 1,
+                    per_channel_max_active: 1,
+                    per_job_max_active: usize::MAX,
+                    max_queued_per_agent: usize::MAX,
+                },
+            ),
+        ]),
+        warnings: worker.warnings.clone(),
+    };
+
+    for path in crate::config::harness_config_candidates(harness_home) {
+        if !path.is_file() {
+            continue;
+        }
+        let text = fs::read_to_string(&path)?;
+        let value = serde_json::from_str::<Value>(&text).map_err(io::Error::other)?;
+        let Some(dispatch) = value.get("runtimeDispatch") else {
+            continue;
+        };
+        if let Some(limit) = dispatch
+            .get("globalConcurrencyLimit")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        {
+            config.global_concurrency_limit = limit;
+        }
+        if let Some(reserve) = dispatch
+            .get("interactiveReserve")
+            .or_else(|| dispatch.get("interactiveReserved"))
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        {
+            config.interactive_reserve = reserve;
+        }
+        if let Some(classes) = dispatch.get("classes").and_then(Value::as_object) {
+            for (runtime_class, class_value) in classes {
+                let mut class_config = config.classes.get(runtime_class).cloned().unwrap_or(
+                    RuntimeDispatchClassConfig {
+                        max_active: config.global_concurrency_limit,
+                        per_agent_max_active: config.global_concurrency_limit,
+                        per_channel_max_active: config.global_concurrency_limit,
+                        per_job_max_active: usize::MAX,
+                        max_queued_per_agent: usize::MAX,
+                    },
+                );
+                if let Some(max_active) = class_value
+                    .get("maxActive")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                {
+                    class_config.max_active = max_active;
+                }
+                if let Some(max_active) = class_value
+                    .get("perAgentMaxActive")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                {
+                    class_config.per_agent_max_active = max_active;
+                }
+                if let Some(max_active) = class_value
+                    .get("perChannelMaxActive")
+                    .or_else(|| class_value.get("perAgentChannelMaxActive"))
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                {
+                    class_config.per_channel_max_active = max_active;
+                }
+                if let Some(max_active) = class_value
+                    .get("perJobMaxActive")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                {
+                    class_config.per_job_max_active = max_active;
+                }
+                if let Some(max_queued) = class_value
+                    .get("maxQueuedPerAgent")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                {
+                    class_config.max_queued_per_agent = max_queued;
+                }
+                config.classes.insert(runtime_class.clone(), class_config);
+            }
+        }
+        break;
+    }
+
+    if config.interactive_reserve > config.global_concurrency_limit {
+        config.warnings.push(format!(
+            "runtimeDispatch.interactiveReserve ({}) exceeds globalConcurrencyLimit ({}); reserve is capped",
+            config.interactive_reserve, config.global_concurrency_limit
+        ));
+        config.interactive_reserve = config.global_concurrency_limit;
+    }
+    Ok(config)
 }
 
 fn prompt_source_workspace(source_home: &Path, queued_source_workspace: &Path) -> PathBuf {
@@ -666,19 +1027,103 @@ fn runtime_queue_leases_schema() -> String {
     RUNTIME_QUEUE_LEASES_SCHEMA.to_string()
 }
 
-fn runtime_queue_leases_file(queue_dir: &Path) -> PathBuf {
-    queue_dir.join("runtime-leases.json")
+fn default_interactive_runtime_class() -> String {
+    "interactive".to_string()
 }
 
-fn runtime_queue_lease_lock_file(queue_dir: &Path) -> PathBuf {
-    queue_dir.join("runtime-leases.lock")
+fn default_channel_origin() -> String {
+    "channel".to_string()
+}
+
+fn select_lock_runtime_class(
+    requested_queue_id: Option<&str>,
+    pending_items: &[PendingQueueItem],
+    prepared_receipts: &HashMap<String, RuntimeExecutionReceipt>,
+    terminal_run_ids: &HashSet<String>,
+) -> String {
+    if let Some(requested_queue_id) = requested_queue_id
+        && let Some(item) = pending_items
+            .iter()
+            .find(|item| item.queue_id == requested_queue_id)
+    {
+        return item.runtime_class.clone();
+    }
+    if let Some(requested_queue_id) = requested_queue_id
+        && let Some(prepared) = prepared_receipts.get(requested_queue_id)
+        && let Some(runtime_class) = prepared.runtime_class.as_ref()
+    {
+        return runtime_class.clone();
+    }
+
+    let prepared_ids = prepared_receipts.keys().cloned().collect::<HashSet<_>>();
+    let mut prepared_candidates = pending_items
+        .iter()
+        .filter(|item| {
+            prepared_ids.contains(&item.queue_id) && !terminal_run_ids.contains(&item.queue_id)
+        })
+        .collect::<Vec<_>>();
+    prepared_candidates.sort_by(|left, right| {
+        runtime_selection_key(left)
+            .cmp(&runtime_selection_key(right))
+            .then_with(|| left.queue_id.cmp(&right.queue_id))
+    });
+    if let Some(item) = prepared_candidates.first() {
+        return item.runtime_class.clone();
+    }
+
+    let mut queued_candidates = pending_items
+        .iter()
+        .filter(|item| {
+            !prepared_ids.contains(&item.queue_id) && !terminal_run_ids.contains(&item.queue_id)
+        })
+        .collect::<Vec<_>>();
+    queued_candidates.sort_by(|left, right| {
+        runtime_selection_key(left)
+            .cmp(&runtime_selection_key(right))
+            .then_with(|| left.queue_id.cmp(&right.queue_id))
+    });
+    if let Some(item) = queued_candidates.first() {
+        return item.runtime_class.clone();
+    }
+    "interactive".to_string()
+}
+
+fn runtime_classes_for_capacity(pending_items: &[PendingQueueItem]) -> Vec<String> {
+    let mut classes = vec!["interactive".to_string(), "cron".to_string()];
+    for item in pending_items {
+        if !classes.contains(&item.runtime_class) {
+            classes.push(item.runtime_class.clone());
+        }
+    }
+    classes
+}
+
+fn runtime_class_state_dir(queue_dir: &Path, runtime_class: &str) -> PathBuf {
+    queue_dir
+        .join("classes")
+        .join(normalize_key_part(runtime_class))
+}
+
+fn runtime_queue_leases_file(queue_dir: &Path, runtime_class: &str) -> PathBuf {
+    if runtime_class == "legacy" {
+        return queue_dir.join("runtime-leases.json");
+    }
+    runtime_class_state_dir(queue_dir, runtime_class).join("runtime-leases.json")
+}
+
+fn runtime_queue_lease_lock_file(queue_dir: &Path, runtime_class: &str) -> PathBuf {
+    if runtime_class == "legacy" {
+        return queue_dir.join("runtime-leases.lock");
+    }
+    runtime_class_state_dir(queue_dir, runtime_class).join("runtime-leases.lock")
 }
 
 fn acquire_runtime_queue_lease_lock(
     queue_dir: &Path,
+    runtime_class: &str,
     now_ms: i64,
 ) -> io::Result<Option<RuntimeQueueLeaseLock>> {
-    let lock_file = runtime_queue_lease_lock_file(queue_dir);
+    let lock_file = runtime_queue_lease_lock_file(queue_dir, runtime_class);
     match create_runtime_queue_lease_lock(&lock_file, now_ms) {
         Ok(lock) => return Ok(Some(lock)),
         Err(error) if runtime_queue_lease_lock_is_busy(&error) => {}
@@ -706,12 +1151,13 @@ fn acquire_runtime_queue_lease_lock(
 
 fn acquire_runtime_queue_lease_lock_with_retry(
     queue_dir: &Path,
+    runtime_class: &str,
     timeout: Duration,
 ) -> io::Result<Option<RuntimeQueueLeaseLock>> {
     let started = Instant::now();
     loop {
         let now_ms = current_log_time_ms()?;
-        if let Some(lock) = acquire_runtime_queue_lease_lock(queue_dir, now_ms)? {
+        if let Some(lock) = acquire_runtime_queue_lease_lock(queue_dir, runtime_class, now_ms)? {
             return Ok(Some(lock));
         }
         if started.elapsed() >= timeout {
@@ -745,6 +1191,9 @@ fn create_runtime_queue_lease_lock(
     lock_file: &Path,
     now_ms: i64,
 ) -> io::Result<RuntimeQueueLeaseLock> {
+    if let Some(parent) = lock_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let mut options = OpenOptions::new();
     options.create(true).write(true).truncate(true);
     #[cfg(not(windows))]
@@ -780,9 +1229,10 @@ fn runtime_queue_lease_lock_is_stale(lock_file: &Path, now_ms: i64) -> bool {
 
 fn read_runtime_queue_leases(
     queue_dir: &Path,
+    runtime_class: &str,
     warnings: &mut Vec<String>,
 ) -> io::Result<RuntimeQueueLeaseState> {
-    let leases_file = runtime_queue_leases_file(queue_dir);
+    let leases_file = runtime_queue_leases_file(queue_dir, runtime_class);
     if !leases_file.is_file() {
         return Ok(RuntimeQueueLeaseState {
             schema: runtime_queue_leases_schema(),
@@ -810,8 +1260,12 @@ fn read_runtime_queue_leases(
     }
 }
 
-fn write_runtime_queue_leases(queue_dir: &Path, state: &RuntimeQueueLeaseState) -> io::Result<()> {
-    write_json_atomic(&runtime_queue_leases_file(queue_dir), state)
+fn write_runtime_queue_leases(
+    queue_dir: &Path,
+    runtime_class: &str,
+    state: &RuntimeQueueLeaseState,
+) -> io::Result<()> {
+    write_json_atomic(&runtime_queue_leases_file(queue_dir, runtime_class), state)
 }
 
 fn purge_runtime_queue_leases(
@@ -833,22 +1287,62 @@ pub fn release_runtime_queue_lease(
 ) -> io::Result<()> {
     let queue_dir = harness_home.as_ref().join("state").join("runtime-queue");
     fs::create_dir_all(&queue_dir)?;
-    let Some(_lease_lock) = acquire_runtime_queue_lease_lock_with_retry(
-        &queue_dir,
-        Duration::from_millis(RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS),
-    )?
-    else {
+    let mut last_busy = None;
+    for runtime_class in runtime_classes_for_release(&queue_dir) {
+        let Some(_lease_lock) = acquire_runtime_queue_lease_lock_with_retry(
+            &queue_dir,
+            &runtime_class,
+            Duration::from_millis(RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS),
+        )?
+        else {
+            last_busy = Some(runtime_class);
+            continue;
+        };
+        let mut warnings = Vec::new();
+        let mut state = read_runtime_queue_leases(&queue_dir, &runtime_class, &mut warnings)?;
+        if state.leases.remove(queue_id).is_some() {
+            write_runtime_queue_leases(&queue_dir, &runtime_class, &state)?;
+            return Ok(());
+        }
+    }
+    if let Some(runtime_class) = last_busy {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             format!(
-                "runtime queue lease lock stayed busy while releasing queue lease `{queue_id}`"
+                "runtime queue lease lock stayed busy for class `{runtime_class}` while releasing queue lease `{queue_id}`"
             ),
         ));
-    };
-    let mut warnings = Vec::new();
-    let mut state = read_runtime_queue_leases(&queue_dir, &mut warnings)?;
-    state.leases.remove(queue_id);
-    write_runtime_queue_leases(&queue_dir, &state)
+    }
+    Ok(())
+}
+
+fn runtime_classes_for_release(queue_dir: &Path) -> Vec<String> {
+    let mut classes = vec![
+        "interactive".to_string(),
+        "cron".to_string(),
+        "worker".to_string(),
+        "maintenance".to_string(),
+    ];
+    if queue_dir.join("runtime-leases.json").is_file() {
+        classes.push("legacy".to_string());
+    }
+    let classes_dir = queue_dir.join("classes");
+    if let Ok(entries) = fs::read_dir(classes_dir) {
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str()
+                && !classes.iter().any(|class| class == name)
+            {
+                classes.push(name.to_string());
+            }
+        }
+    }
+    classes
 }
 
 fn runtime_capacity_blocker(
@@ -856,34 +1350,118 @@ fn runtime_capacity_blocker(
     state: &RuntimeQueueLeaseState,
     item: &PendingQueueItem,
 ) -> io::Result<Option<String>> {
-    let config = load_worker_dispatch_config(harness_home)?;
-    let executing_global = state.leases.len();
+    let config = load_runtime_dispatch_config(harness_home)?;
+    let all_leases =
+        read_all_runtime_queue_leases_with_override(harness_home, state, &item.runtime_class)?;
+    let executing_global = all_leases.len();
     if executing_global >= config.global_concurrency_limit {
-        return Ok(Some("global limit".to_string()));
+        return Ok(Some("global runtime limit".to_string()));
     }
 
-    let executing_agent = state
-        .leases
-        .values()
-        .filter(|lease| lease.agent_id == item.agent_id)
+    if item.runtime_class != "interactive" {
+        let non_reserved_limit = config
+            .global_concurrency_limit
+            .saturating_sub(config.interactive_reserve);
+        if executing_global >= non_reserved_limit {
+            return Ok(Some("interactive reserve".to_string()));
+        }
+    }
+
+    let class_config =
+        config
+            .classes
+            .get(&item.runtime_class)
+            .cloned()
+            .unwrap_or(RuntimeDispatchClassConfig {
+                max_active: config.global_concurrency_limit,
+                per_agent_max_active: config.global_concurrency_limit,
+                per_channel_max_active: config.global_concurrency_limit,
+                per_job_max_active: usize::MAX,
+                max_queued_per_agent: usize::MAX,
+            });
+
+    let executing_class = all_leases
+        .iter()
+        .filter(|lease| lease.runtime_class == item.runtime_class)
         .count();
-    if executing_agent >= config.group_concurrency_limit {
-        return Ok(Some(format!("agent limit for `{}`", item.agent_id)));
+    if executing_class >= class_config.max_active {
+        return Ok(Some(format!(
+            "runtime class `{}` limit",
+            item.runtime_class
+        )));
+    }
+
+    let executing_agent = all_leases
+        .iter()
+        .filter(|lease| {
+            lease.runtime_class == item.runtime_class && lease.agent_id == item.agent_id
+        })
+        .count();
+    if executing_agent >= class_config.per_agent_max_active {
+        return Ok(Some(format!(
+            "runtime class `{}` agent limit for `{}`",
+            item.runtime_class, item.agent_id
+        )));
+    }
+
+    if let Some(cron_run_id) = item.cron_run_id.as_deref() {
+        let executing_job = all_leases
+            .iter()
+            .filter(|lease| lease.cron_run_id.as_deref() == Some(cron_run_id))
+            .count();
+        if executing_job >= class_config.per_job_max_active {
+            return Ok(Some(format!("cron job active limit for `{cron_run_id}`")));
+        }
     }
 
     let channel_key = runtime_channel_key(&item.agent_id, &item.platform, &item.channel_id);
-    let executing_channel = state
-        .leases
-        .values()
+    let executing_channel = all_leases
+        .iter()
         .filter(|lease| {
             runtime_channel_key(&lease.agent_id, &lease.platform, &lease.channel_id) == channel_key
         })
         .count();
-    if executing_channel >= config.channel_concurrency_limit {
+    if executing_channel >= class_config.per_channel_max_active {
         return Ok(Some(format!("agent-channel limit for `{}`", channel_key)));
     }
 
     Ok(None)
+}
+
+fn read_all_runtime_queue_leases_with_override(
+    harness_home: &Path,
+    override_state: &RuntimeQueueLeaseState,
+    override_class: &str,
+) -> io::Result<Vec<RuntimeQueueLease>> {
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let mut classes = runtime_classes_for_release(&queue_dir);
+    if !classes.iter().any(|class| class == override_class) {
+        classes.push(override_class.to_string());
+    }
+    let mut warnings = Vec::new();
+    let mut leases = Vec::new();
+    let now_ms = current_log_time_ms().unwrap_or(0);
+    for runtime_class in classes {
+        if runtime_class == override_class {
+            leases.extend(
+                override_state
+                    .leases
+                    .values()
+                    .filter(|lease| lease.lease_expires_at_ms > now_ms)
+                    .cloned(),
+            );
+            continue;
+        }
+        let state = read_runtime_queue_leases(&queue_dir, &runtime_class, &mut warnings)?;
+        leases.extend(
+            state
+                .leases
+                .values()
+                .filter(|lease| lease.lease_expires_at_ms > now_ms)
+                .cloned(),
+        );
+    }
+    Ok(leases)
 }
 
 fn lease_runtime_queue_item(
@@ -897,6 +1475,9 @@ fn lease_runtime_queue_item(
         RuntimeQueueLease {
             queue_id: item.queue_id.clone(),
             agent_id: item.agent_id.clone(),
+            runtime_class: item.runtime_class.clone(),
+            origin: item.origin.clone(),
+            cron_run_id: item.cron_run_id.clone(),
             platform: item.platform.clone(),
             channel_id: item.channel_id.clone(),
             session_key: item.session_key.clone(),
@@ -916,15 +1497,51 @@ fn runtime_channel_key(agent_id: &str, platform: &str, channel_id: &str) -> Stri
     )
 }
 
+fn cron_runtime_dispatch_blocker_for_item(
+    harness_home: &Path,
+    item: &PendingQueueItem,
+    now_ms: i64,
+) -> io::Result<Option<String>> {
+    let Some(run_id) = item.cron_run_id.as_deref() else {
+        return Ok(None);
+    };
+    cron_run_runtime_dispatch_blocker(harness_home, run_id, &item.queue_id, now_ms)
+}
+
 fn select_pending_item(
     pending_items: Vec<PendingQueueItem>,
     requested_queue_id: Option<&str>,
     prepared_ids: &HashSet<String>,
     terminal_run_ids: &HashSet<String>,
     lease_state: &RuntimeQueueLeaseState,
+    runtime_class: &str,
     harness_home: &Path,
+    queue_dir: &Path,
+    now_ms: i64,
     warnings: &mut Vec<String>,
 ) -> io::Result<Option<PendingQueueItem>> {
+    let mut pending_items = pending_items
+        .into_iter()
+        .filter(|item| item.runtime_class == runtime_class)
+        .collect::<Vec<_>>();
+    if runtime_class == "cron" {
+        let round_by_queue_id = cron_agent_rounds(&pending_items);
+        pending_items.sort_by(|left, right| {
+            let left_round = round_by_queue_id.get(&left.queue_id).copied().unwrap_or(0);
+            let right_round = round_by_queue_id.get(&right.queue_id).copied().unwrap_or(0);
+            left_round
+                .cmp(&right_round)
+                .then_with(|| left.created_at_ms.cmp(&right.created_at_ms))
+                .then_with(|| left.agent_id.cmp(&right.agent_id))
+                .then_with(|| left.queue_id.cmp(&right.queue_id))
+        });
+    } else {
+        pending_items.sort_by(|left, right| {
+            runtime_selection_key(left)
+                .cmp(&runtime_selection_key(right))
+                .then_with(|| left.queue_id.cmp(&right.queue_id))
+        });
+    }
     for item in pending_items {
         if requested_queue_id.is_some_and(|requested| requested != item.queue_id) {
             continue;
@@ -950,6 +1567,15 @@ fn select_pending_item(
             ));
             continue;
         }
+        if let Some(blocker) = cron_runtime_dispatch_blocker_for_item(harness_home, &item, now_ms)?
+        {
+            warnings.push(format!(
+                "runtime queue item `{}` blocked by {}; tombstoning",
+                item.queue_id, blocker
+            ));
+            tombstone_runtime_queue_item_skipped(queue_dir, &item, &blocker)?;
+            continue;
+        }
         if let Some(blocker) = runtime_capacity_blocker(harness_home, lease_state, &item)? {
             warnings.push(format!(
                 "runtime queue item `{}` blocked by {}; skipping",
@@ -960,6 +1586,35 @@ fn select_pending_item(
         return Ok(Some(item));
     }
     Ok(None)
+}
+
+fn runtime_selection_key(item: &PendingQueueItem) -> (usize, String, i64) {
+    let class_rank = match item.runtime_class.as_str() {
+        "interactive" => 0,
+        "cron" => 1,
+        "worker" => 2,
+        _ => 3,
+    };
+    (class_rank, item.agent_id.clone(), item.created_at_ms)
+}
+
+fn cron_agent_rounds(pending_items: &[PendingQueueItem]) -> HashMap<String, usize> {
+    let mut ordered = pending_items.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        left.created_at_ms
+            .cmp(&right.created_at_ms)
+            .then_with(|| left.queue_id.cmp(&right.queue_id))
+    });
+    let mut next_round_by_agent = HashMap::<String, usize>::new();
+    let mut round_by_queue_id = HashMap::<String, usize>::new();
+    for item in ordered {
+        let round = next_round_by_agent
+            .entry(item.agent_id.clone())
+            .or_insert(0);
+        round_by_queue_id.insert(item.queue_id.clone(), *round);
+        *round += 1;
+    }
+    round_by_queue_id
 }
 
 fn read_pending_items(
@@ -1109,11 +1764,28 @@ fn is_terminal_run_once_status(status: &str) -> bool {
 
 fn parse_pending_item(value: &Value) -> Option<PendingQueueItem> {
     let source = value.get("source")?;
+    let platform = string_field(value, &["platform"])?.to_string();
+    let runtime_class = string_field(value, &["runtimeClass", "runtime_class"])
+        .map(ToString::to_string)
+        .unwrap_or_else(|| default_runtime_class_for(&platform));
     Some(PendingQueueItem {
         queue_id: string_field(value, &["queueId", "queue_id"])?.to_string(),
+        created_at_ms: i64_field(value, &["createdAtMs", "created_at_ms"]).unwrap_or(0),
         agent_id: string_field(value, &["agentId", "agent_id"])?.to_string(),
         session_key: string_field(value, &["sessionKey", "session_key"])?.to_string(),
-        platform: string_field(value, &["platform"])?.to_string(),
+        runtime_class,
+        origin: string_field(value, &["origin"])
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                if platform == "native-cron" {
+                    "cron-scheduler".to_string()
+                } else {
+                    "channel".to_string()
+                }
+            }),
+        cron_run_id: string_field(value, &["cronRunId", "cron_run_id"]).map(ToString::to_string),
+        scheduled_for_ms: i64_field(value, &["scheduledForMs", "scheduled_for_ms"]),
+        platform,
         account_id: string_field(value, &["accountId", "account_id"]).map(ToString::to_string),
         channel_id: string_field(value, &["channelId", "channel_id"])?.to_string(),
         user_id: string_field(value, &["userId", "user_id"])?.to_string(),
@@ -1135,6 +1807,14 @@ fn parse_pending_item(value: &Value) -> Option<PendingQueueItem> {
     })
 }
 
+fn default_runtime_class_for(platform: &str) -> String {
+    match platform {
+        "native-cron" => "cron".to_string(),
+        "worker" | "worker-watchdog" => "worker".to_string(),
+        _ => "interactive".to_string(),
+    }
+}
+
 fn queue_execution_dir(harness_home: &Path, queue_id: &str) -> PathBuf {
     harness_home
         .join("state")
@@ -1145,6 +1825,29 @@ fn queue_execution_dir(harness_home: &Path, queue_id: &str) -> PathBuf {
 
 fn append_json_line(path: &Path, value: &impl Serialize) -> io::Result<()> {
     crate::append_jsonl_value(path, value)
+}
+
+fn tombstone_runtime_queue_item_skipped(
+    queue_dir: &Path,
+    item: &PendingQueueItem,
+    reason: &str,
+) -> io::Result<()> {
+    append_json_line(
+        &queue_dir.join("run-once-receipts.jsonl"),
+        &RuntimeRunOnceSkipReceipt {
+            schema: "agent-harness.runtime-run-once.v1",
+            queue_id: Some(item.queue_id.clone()),
+            status: "skipped",
+            runtime_class: Some(item.runtime_class.clone()),
+            origin: Some(item.origin.clone()),
+            cron_run_id: item.cron_run_id.clone(),
+            scheduled_for_ms: item.scheduled_for_ms,
+            execution_dir: None,
+            transcript_file: None,
+            outbox_file: None,
+            reason: reason.to_string(),
+        },
+    )
 }
 
 fn string_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -1158,6 +1861,15 @@ fn string_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
 
 fn path_field(value: &Value, keys: &[&str]) -> Option<PathBuf> {
     string_field(value, keys).map(PathBuf::from)
+}
+
+fn i64_field(value: &Value, keys: &[&str]) -> Option<i64> {
+    for key in keys {
+        if let Some(number) = value.get(*key).and_then(Value::as_i64) {
+            return Some(number);
+        }
+    }
+    None
 }
 
 fn string_array_field(value: &Value, keys: &[&str]) -> Vec<String> {
@@ -1412,6 +2124,137 @@ mod tests {
     }
 
     #[test]
+    fn prepare_runtime_queue_item_selects_cron_when_old_interactive_is_terminal() {
+        let root =
+            temp_root("prepare_runtime_queue_item_selects_cron_when_old_interactive_is_terminal");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_fixture_turn_with_text(&source, &harness_home, "old interactive turn", 1000);
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        let pending_text = fs::read_to_string(queue_dir.join("pending.jsonl")).unwrap();
+        let interactive_item: Value =
+            serde_json::from_str(pending_text.lines().next().unwrap()).unwrap();
+        let interactive_queue_id = interactive_item["queueId"].as_str().unwrap().to_string();
+        append_json_line(
+            &queue_dir.join("run-once-receipts.jsonl"),
+            &serde_json::json!({
+                "queueId": interactive_queue_id,
+                "status": "completed",
+                "reason": "old interactive turn completed"
+            }),
+        )
+        .unwrap();
+
+        let cron_queue_id = "turn:cron:daily:1001";
+        let cron_run = crate::admit_cron_run(crate::CronRunAdmitOptions {
+            harness_home: harness_home.clone(),
+            source_kind: "native-cron".to_string(),
+            source_id: "source-1".to_string(),
+            entry_id: "daily".to_string(),
+            agent_id: "main".to_string(),
+            scheduled_for_ms: 1001,
+            runtime_class: "cron".to_string(),
+            session_key: "cron:main:daily:1001".to_string(),
+            session_policy: "one-shot".to_string(),
+            max_attempts: 3,
+            now_ms: 1001,
+        })
+        .unwrap();
+        crate::mark_cron_run_runtime_enqueued(&harness_home, &cron_run.run_id, cron_queue_id, 1002)
+            .unwrap();
+        append_cron_pending_runtime_item(
+            &source,
+            &harness_home,
+            cron_queue_id,
+            &cron_run.run_id,
+            "main",
+            1001,
+        );
+
+        let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+        assert_eq!(report.receipt.queue_id.as_deref(), Some(cron_queue_id));
+        assert_eq!(report.receipt.runtime_class.as_deref(), Some("cron"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_runtime_queue_item_tombstones_skipped_cron_run() {
+        let root = temp_root("prepare_runtime_queue_item_tombstones_skipped_cron_run");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let cron_queue_id = "turn:cron:daily:1001";
+        let cron_run = crate::admit_cron_run(crate::CronRunAdmitOptions {
+            harness_home: harness_home.clone(),
+            source_kind: "native-cron".to_string(),
+            source_id: "source-1".to_string(),
+            entry_id: "daily".to_string(),
+            agent_id: "main".to_string(),
+            scheduled_for_ms: 1001,
+            runtime_class: "cron".to_string(),
+            session_key: "cron:main:daily:1001".to_string(),
+            session_policy: "one-shot".to_string(),
+            max_attempts: 3,
+            now_ms: 1001,
+        })
+        .unwrap();
+        crate::mark_cron_run_runtime_enqueued(&harness_home, &cron_run.run_id, cron_queue_id, 1002)
+            .unwrap();
+        append_cron_pending_runtime_item(
+            &source,
+            &harness_home,
+            cron_queue_id,
+            &cron_run.run_id,
+            "main",
+            1001,
+        );
+        crate::control_cron_run(crate::CronRunControlOptions {
+            harness_home: harness_home.clone(),
+            action: crate::CronRunControlAction::Skip,
+            run_id: Some(cron_run.run_id.clone()),
+            agent_id: None,
+            entry_id: None,
+            reason: "operator skip before runtime dispatch".to_string(),
+            now_ms: 1003,
+        })
+        .unwrap();
+
+        let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(cron_queue_id.to_string()),
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+
+        assert!(report.item.is_none());
+        assert_eq!(
+            report.receipt.status,
+            RuntimeExecutionReceiptStatus::NoPendingItem
+        );
+        let run_once_receipts =
+            fs::read_to_string(queue_dir(&harness_home).join("run-once-receipts.jsonl")).unwrap();
+        assert!(run_once_receipts.contains("\"queueId\":\"turn:cron:daily:1001\""));
+        assert!(run_once_receipts.contains("\"status\":\"skipped\""));
+        let runs = crate::collect_cron_run_summary(&harness_home).unwrap();
+        assert_eq!(
+            runs.runs.first().unwrap().status,
+            crate::CronRunStatus::Skipped
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn inspect_runtime_queue_capacity_returns_channel_aware_claimable_ids() {
         let root = temp_root("inspect_runtime_queue_capacity_returns_channel_aware_claimable_ids");
         let source = write_worker_source(&root);
@@ -1474,15 +2317,135 @@ mod tests {
     }
 
     #[test]
+    fn prepare_runtime_queue_item_counts_legacy_root_leases() {
+        let root = temp_root("prepare_runtime_queue_item_counts_legacy_root_leases");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"workerDispatch":{"globalConcurrencyLimit":3,"groupConcurrencyLimit":3,"channelConcurrencyLimit":1,"laneConcurrencyLimits":{"llm":3}}}"#,
+        )
+        .unwrap();
+        enqueue_fixture_turn_with_platform_channel(
+            &source,
+            &harness_home,
+            "telegram",
+            "tg-dm",
+            "user-7",
+            "pending tg",
+            1234,
+        );
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        let now_ms = current_log_time_ms().unwrap();
+        let mut legacy_state = RuntimeQueueLeaseState {
+            schema: runtime_queue_leases_schema(),
+            leases: BTreeMap::new(),
+        };
+        legacy_state.leases.insert(
+            "legacy-active".to_string(),
+            RuntimeQueueLease {
+                queue_id: "legacy-active".to_string(),
+                agent_id: "main".to_string(),
+                runtime_class: "interactive".to_string(),
+                origin: "channel".to_string(),
+                cron_run_id: None,
+                platform: "telegram".to_string(),
+                channel_id: "tg-dm".to_string(),
+                session_key: "main:telegram:tg-dm".to_string(),
+                owner: "legacy-worker".to_string(),
+                started_at_ms: now_ms,
+                lease_expires_at_ms: now_ms.saturating_add(60_000),
+            },
+        );
+        write_runtime_queue_leases(&queue_dir, "legacy", &legacy_state).unwrap();
+
+        let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+
+        assert!(report.item.is_none());
+        assert_eq!(
+            report.receipt.status,
+            RuntimeExecutionReceiptStatus::NoPendingItem
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("agent-channel limit"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cron_runtime_selection_interleaves_agents() {
+        let root = temp_root("cron_runtime_selection_interleaves_agents");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let pending = vec![
+            pending_cron_item("cron-a-1", "agent-a", 1000),
+            pending_cron_item("cron-a-2", "agent-a", 1001),
+            pending_cron_item("cron-b-1", "agent-b", 1002),
+        ];
+        let lease_state = RuntimeQueueLeaseState::default();
+        let terminal_ids = HashSet::new();
+        let mut prepared_ids = HashSet::new();
+        let mut warnings = Vec::new();
+
+        let first = select_pending_item(
+            pending.clone(),
+            None,
+            &prepared_ids,
+            &terminal_ids,
+            &lease_state,
+            "cron",
+            &harness_home,
+            &queue_dir,
+            2000,
+            &mut warnings,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.queue_id, "cron-a-1");
+        prepared_ids.insert(first.queue_id);
+
+        let second = select_pending_item(
+            pending,
+            None,
+            &prepared_ids,
+            &terminal_ids,
+            &lease_state,
+            "cron",
+            &harness_home,
+            &queue_dir,
+            2001,
+            &mut warnings,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(second.queue_id, "cron-b-1");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn inspect_runtime_queue_capacity_treats_busy_lease_lock_as_zero_capacity() {
         let root = temp_root("inspect_runtime_queue_capacity_treats_busy_lease_lock_as_zero");
         let harness_home = root.join(".agent-harness");
         let queue_dir = harness_home.join("state").join("runtime-queue");
         fs::create_dir_all(&queue_dir).unwrap();
         let now_ms = current_log_time_ms().unwrap();
-        let _held_lock =
-            create_runtime_queue_lease_lock(&runtime_queue_lease_lock_file(&queue_dir), now_ms)
-                .unwrap();
+        let _held_lock = create_runtime_queue_lease_lock(
+            &runtime_queue_lease_lock_file(&queue_dir, "interactive"),
+            now_ms,
+        )
+        .unwrap();
 
         let report = inspect_runtime_queue_capacity(RuntimeQueueCapacityOptions {
             harness_home: harness_home.clone(),
@@ -1508,9 +2471,11 @@ mod tests {
         let queue_dir = harness_home.join("state").join("runtime-queue");
         fs::create_dir_all(&queue_dir).unwrap();
         let now_ms = current_log_time_ms().unwrap();
-        let _held_lock =
-            create_runtime_queue_lease_lock(&runtime_queue_lease_lock_file(&queue_dir), now_ms)
-                .unwrap();
+        let _held_lock = create_runtime_queue_lease_lock(
+            &runtime_queue_lease_lock_file(&queue_dir, "interactive"),
+            now_ms,
+        )
+        .unwrap();
 
         let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
             harness_home: harness_home.clone(),
@@ -1527,6 +2492,82 @@ mod tests {
         assert_eq!(report.receipt.queue_id.as_deref(), Some("turn:busy"));
         let receipts = fs::read_to_string(report.execution_receipts_file).unwrap();
         assert!(receipts.contains("\"status\":\"lease-busy\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_runtime_queue_item_does_not_let_cron_class_lock_block_interactive() {
+        let root =
+            temp_root("prepare_runtime_queue_item_does_not_let_cron_class_lock_block_interactive");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_fixture_turn_with_platform_channel(
+            &source,
+            &harness_home,
+            "telegram",
+            "tg-dm",
+            "user-7",
+            "interactive turn",
+            1234,
+        );
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        let mut pending = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(queue_dir.join("pending.jsonl"))
+            .unwrap();
+        writeln!(
+            pending,
+            "{}",
+            serde_json::json!({
+                "queueId": "turn:cron:blocked",
+                "createdAtMs": 1233,
+                "agentId": "main@cron",
+                "sessionKey": "cron:main:hourly:1233",
+                "runtimeClass": "cron",
+                "origin": "cron-scheduler",
+                "cronRunId": "cronrun:native-cron:main:hourly:1233",
+                "scheduledForMs": 1233,
+                "platform": "native-cron",
+                "channelId": "cron",
+                "userId": "scheduler",
+                "messageText": "cron turn",
+                "source": {
+                    "sourceHome": source.home.clone(),
+                    "sourceWorkspace": source.workspace.clone(),
+                    "runtimeWorkspace": source.workspace.clone()
+                },
+                "plannedTranscriptFile": harness_home.join("agents").join("main").join("cron-sessions").join("hourly").join("transcript.jsonl"),
+                "plannedTrajectoryFile": harness_home.join("agents").join("main").join("cron-sessions").join("hourly").join("trajectory.jsonl"),
+                "selectedSkillIds": []
+            })
+        )
+        .unwrap();
+        let now_ms = current_log_time_ms().unwrap();
+        let _cron_lock = create_runtime_queue_lease_lock(
+            &runtime_queue_lease_lock_file(&queue_dir, "cron"),
+            now_ms,
+        )
+        .unwrap();
+
+        let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+        assert_eq!(report.receipt.runtime_class.as_deref(), Some("interactive"));
+        assert_eq!(report.item.as_ref().unwrap().runtime_class, "interactive");
+        assert_ne!(
+            report.receipt.queue_id.as_deref(),
+            Some("turn:cron:blocked")
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1743,6 +2784,80 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    fn append_cron_pending_runtime_item(
+        source: &AgentSource,
+        harness_home: &Path,
+        queue_id: &str,
+        cron_run_id: &str,
+        agent_id: &str,
+        scheduled_for_ms: i64,
+    ) {
+        append_json_line(
+            &queue_dir(harness_home).join("pending.jsonl"),
+            &serde_json::json!({
+                "queueId": queue_id,
+                "status": "queued",
+                "createdAtMs": scheduled_for_ms,
+                "agentId": agent_id,
+                "sessionKey": format!("cron:{agent_id}:daily:{scheduled_for_ms}"),
+                "runtimeClass": "cron",
+                "origin": "cron-scheduler",
+                "cronRunId": cron_run_id,
+                "scheduledForMs": scheduled_for_ms,
+                "platform": "native-cron",
+                "channelId": "daily",
+                "userId": "cron-scheduler",
+                "messageText": "run daily cron",
+                "source": {
+                    "sourceHome": source.home.clone(),
+                    "sourceWorkspace": source.workspace.clone(),
+                    "runtimeWorkspace": source.workspace.clone()
+                },
+                "plannedTranscriptFile": harness_home
+                    .join("agents")
+                    .join(agent_id)
+                    .join("cron-sessions")
+                    .join(format!("{}.jsonl", normalize_key_part(queue_id))),
+                "plannedTrajectoryFile": harness_home
+                    .join("agents")
+                    .join(agent_id)
+                    .join("cron-sessions")
+                    .join(format!("{}.trajectory.jsonl", normalize_key_part(queue_id))),
+                "selectedSkillIds": []
+            }),
+        )
+        .unwrap();
+    }
+
+    fn queue_dir(harness_home: &Path) -> PathBuf {
+        harness_home.join("state").join("runtime-queue")
+    }
+
+    fn pending_cron_item(queue_id: &str, agent_id: &str, created_at_ms: i64) -> PendingQueueItem {
+        PendingQueueItem {
+            queue_id: queue_id.to_string(),
+            created_at_ms,
+            agent_id: agent_id.to_string(),
+            session_key: format!("cron:{agent_id}:{queue_id}:{created_at_ms}"),
+            runtime_class: "cron".to_string(),
+            origin: "cron-scheduler".to_string(),
+            cron_run_id: None,
+            scheduled_for_ms: Some(created_at_ms),
+            platform: "native-cron".to_string(),
+            account_id: None,
+            channel_id: queue_id.to_string(),
+            user_id: "cron-scheduler".to_string(),
+            message_text: format!("run {queue_id}"),
+            inbound_context: None,
+            source_home: PathBuf::from("source"),
+            source_workspace: PathBuf::from("workspace"),
+            runtime_workspace: None,
+            planned_transcript_file: PathBuf::from(format!("{queue_id}.jsonl")),
+            planned_trajectory_file: PathBuf::from(format!("{queue_id}.trajectory.jsonl")),
+            selected_skill_ids: Vec::new(),
+        }
     }
 
     fn write_worker_source(root: &Path) -> AgentSource {

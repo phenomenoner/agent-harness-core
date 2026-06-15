@@ -4988,10 +4988,15 @@ fn fail_check(name: impl Into<String>, detail: impl Into<String>) -> CodexRuntim
 }
 
 fn transcript_file(harness_home: &Path, agent_id: Option<&str>, session_key: &str) -> PathBuf {
+    let session_dir = if session_key.starts_with("cron:") {
+        "cron-sessions"
+    } else {
+        "sessions"
+    };
     harness_home
         .join("agents")
         .join(agent_id.unwrap_or("unknown"))
-        .join("sessions")
+        .join(session_dir)
         .join(format!("{}.jsonl", normalize_key_part(session_key)))
 }
 

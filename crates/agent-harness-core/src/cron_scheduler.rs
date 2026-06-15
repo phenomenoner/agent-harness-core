@@ -7,12 +7,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    AgentSource, DeterministicCronPlanAction, DeterministicCronPlanInput,
-    DeterministicCronSchedule, NativeCronPlanAction, NativeCronPlanEntry, NativeCronPlanInput,
-    NativeCronSchedule, WorkerEnqueueOptions, WorkerEnqueueReport, WorkerJobKind,
-    append_harness_log, append_jsonl_value, config::harness_config_candidates, current_log_time_ms,
-    enqueue_worker_job, load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
-    plan_deterministic_cron, plan_native_cron, write_json_atomic,
+    AgentSource, CronRunAdmitOptions, CronRunStatus, DeterministicCronPlanAction,
+    DeterministicCronPlanInput, DeterministicCronSchedule, NativeCronPlanAction,
+    NativeCronPlanEntry, NativeCronPlanInput, NativeCronSchedule, WorkerEnqueueOptions,
+    WorkerEnqueueReport, WorkerJobKind, admit_cron_run, append_harness_log, append_jsonl_value,
+    config::harness_config_candidates, cron_run_active_count_for_agent,
+    cron_run_active_count_for_job, cron_run_id, cron_run_is_quarantined, current_log_time_ms,
+    enqueue_worker_job, get_cron_run_by_slot, load_agent_registry, load_deterministic_cron_store,
+    load_native_cron_store, mark_cron_run_worker_enqueued, plan_deterministic_cron,
+    plan_native_cron, write_json_atomic,
 };
 
 const CRON_SCHEDULER_RUN_ONCE_SCHEMA: &str = "agent-harness.cron-scheduler.run-once.v1";
@@ -204,6 +207,12 @@ pub struct CronSchedulerConfig {
     pub max_catchup_per_tick: usize,
     #[serde(default = "default_max_enqueue_per_tick")]
     pub max_enqueue_per_tick: usize,
+    #[serde(default = "default_cron_max_active_runs_per_job")]
+    pub max_active_runs_per_job: usize,
+    #[serde(default = "default_cron_max_active_runs_per_agent")]
+    pub max_active_runs_per_agent: usize,
+    #[serde(default = "default_cron_max_queued_per_agent")]
+    pub max_queued_per_agent: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +246,9 @@ impl Default for CronSchedulerConfig {
             deterministic_cron: CronSchedulerDeterministicConfig::default(),
             max_catchup_per_tick: DEFAULT_MAX_CATCHUP_PER_TICK,
             max_enqueue_per_tick: DEFAULT_MAX_ENQUEUE_PER_TICK,
+            max_active_runs_per_job: default_cron_max_active_runs_per_job(),
+            max_active_runs_per_agent: default_cron_max_active_runs_per_agent(),
+            max_queued_per_agent: default_cron_max_queued_per_agent(),
         }
     }
 }
@@ -494,6 +506,50 @@ pub fn lint_cron_scheduler(
                     Some(entry.job_id.clone()),
                 ),
                 NativeCronPlanAction::EnqueueAgentTurn | NativeCronPlanAction::CronRegistered => {
+                    if entry.agent_id.as_deref() == Some("main") {
+                        push_lint_finding(
+                            &mut findings,
+                            CronSchedulerLintSeverity::Warn,
+                            "native-main-agent-cron",
+                            "native cron targets interactive agent `main`; prefer a cron-specific runtime identity or rely on runtimeClass=cron isolation",
+                            Some("native-cron"),
+                            Some(entry.job_id.clone()),
+                        );
+                    }
+                    if let Some(policy) = entry.session_policy.as_deref()
+                        && !matches!(policy, "one-shot" | "sticky")
+                    {
+                        push_lint_finding(
+                            &mut findings,
+                            CronSchedulerLintSeverity::Warn,
+                            "native-unknown-session-policy",
+                            format!(
+                                "native cron sessionPolicy `{policy}` is not recognized; scheduler will use one-shot"
+                            ),
+                            Some("native-cron"),
+                            Some(entry.job_id.clone()),
+                        );
+                    }
+                    if entry
+                        .session_policy
+                        .as_deref()
+                        .map(|policy| policy.eq_ignore_ascii_case("sticky"))
+                        .unwrap_or(false)
+                        && entry
+                            .session_key
+                            .as_deref()
+                            .map(|key| !key.starts_with("cron:"))
+                            .unwrap_or(false)
+                    {
+                        push_lint_finding(
+                            &mut findings,
+                            CronSchedulerLintSeverity::Warn,
+                            "native-sticky-session-outside-cron-namespace",
+                            "native cron sticky sessionKey is not in the `cron:` namespace; scheduler will rewrite it into an isolated cron session key",
+                            Some("native-cron"),
+                            Some(entry.job_id.clone()),
+                        );
+                    }
                     if let Some(reason) = native_cron_entry_runtime_path_blocker(&entry) {
                         push_lint_finding(
                             &mut findings,
@@ -754,6 +810,29 @@ fn collect_native_cron_decisions(
                     );
                     continue;
                 }
+                let retry_pending_run = get_cron_run_by_slot(
+                    &options.harness_home,
+                    "native-cron",
+                    &source_id,
+                    &entry.job_id,
+                    scheduled_for_ms,
+                )?
+                .filter(|run| run.status == CronRunStatus::RetryPending && !run.quarantined);
+                if retry_pending_run.is_some() {
+                    let cleared = delete_watermark(
+                        database,
+                        "native-cron",
+                        &source_id,
+                        &entry.job_id,
+                        scheduled_for_ms,
+                    )?;
+                    if cleared > 0 {
+                        report.warnings.push(format!(
+                            "cleared {cleared} cron scheduler watermark(s) for retry-pending native cron slot `{}`",
+                            entry.job_id
+                        ));
+                    }
+                }
                 if watermark_exists(
                     database,
                     "native-cron",
@@ -790,18 +869,96 @@ fn collect_native_cron_decisions(
                     .message_text
                     .clone()
                     .unwrap_or_else(|| format!("Run native cron job {}", entry.job_id));
-                let session_key = entry.session_key.clone().unwrap_or_else(|| {
-                    format!(
-                        "cron:{}:{}",
-                        normalize_key_part(&entry.job_id),
-                        normalize_key_part(&agent_id)
-                    )
-                });
+                if let Some(reason) =
+                    cron_run_is_quarantined(&options.harness_home, &agent_id, &entry.job_id)?
+                {
+                    push_decision(
+                        report,
+                        "native-cron",
+                        &source_id,
+                        &entry.job_id,
+                        scheduled_for_ms,
+                        CronSchedulerJobDecisionStatus::SkippedPolicy,
+                        &format!("cron job quarantined: {reason}"),
+                        None,
+                    );
+                    continue;
+                }
+                let retrying_same_run = retry_pending_run
+                    .as_ref()
+                    .is_some_and(|run| run.agent_id == agent_id && run.entry_id == entry.job_id);
+                let retry_self_discount = if retrying_same_run { 1 } else { 0 };
+                let active_job =
+                    cron_run_active_count_for_job(&options.harness_home, &agent_id, &entry.job_id)?;
+                if active_job.saturating_sub(retry_self_discount) >= config.max_active_runs_per_job
+                {
+                    push_decision(
+                        report,
+                        "native-cron",
+                        &source_id,
+                        &entry.job_id,
+                        scheduled_for_ms,
+                        CronSchedulerJobDecisionStatus::SkippedPolicy,
+                        &format!("cron active run cap reached for job `{}`", entry.job_id),
+                        None,
+                    );
+                    continue;
+                }
+                let active_agent =
+                    cron_run_active_count_for_agent(&options.harness_home, &agent_id)?;
+                if active_agent.saturating_sub(retry_self_discount) >= config.max_queued_per_agent {
+                    push_decision(
+                        report,
+                        "native-cron",
+                        &source_id,
+                        &entry.job_id,
+                        scheduled_for_ms,
+                        CronSchedulerJobDecisionStatus::SkippedPolicy,
+                        &format!("cron queued run cap reached for agent `{agent_id}`"),
+                        None,
+                    );
+                    continue;
+                }
+                if active_agent.saturating_sub(retry_self_discount)
+                    >= config.max_active_runs_per_agent
+                {
+                    push_decision(
+                        report,
+                        "native-cron",
+                        &source_id,
+                        &entry.job_id,
+                        scheduled_for_ms,
+                        CronSchedulerJobDecisionStatus::SkippedPolicy,
+                        &format!("cron active run cap reached for agent `{agent_id}`"),
+                        None,
+                    );
+                    continue;
+                }
+                let session_policy =
+                    normalized_cron_session_policy(entry.session_policy.as_deref());
+                let session_key =
+                    native_cron_session_key(entry, &agent_id, scheduled_for_ms, session_policy);
+                let run_id =
+                    cron_run_id("native-cron", &source_id, &entry.job_id, scheduled_for_ms);
+                let cron_run = admit_cron_run(CronRunAdmitOptions {
+                    harness_home: options.harness_home.clone(),
+                    source_kind: "native-cron".to_string(),
+                    source_id: source_id.clone(),
+                    entry_id: entry.job_id.clone(),
+                    agent_id: agent_id.clone(),
+                    scheduled_for_ms,
+                    runtime_class: "cron".to_string(),
+                    session_key: session_key.clone(),
+                    session_policy: session_policy.to_string(),
+                    max_attempts: 3,
+                    now_ms: options.now_ms,
+                })?;
                 let idempotency_key = scheduler_idempotency_key(
                     "native-cron",
                     &source_id,
                     &entry.job_id,
                     scheduled_for_ms,
+                    cron_run.attempt,
                 );
                 let payload = json!({
                     "adapter": "cron-scheduler",
@@ -812,18 +969,22 @@ fn collect_native_cron_decisions(
                     "sourceHome": &options.source.home,
                     "sourceWorkspace": &options.source.workspace,
                     "runtimeWorkspace": &options.runtime_workspace,
-                    "agentId": agent_id,
-                    "sessionKey": session_key,
+                    "agentId": &agent_id,
+                    "sessionKey": &session_key,
+                    "sessionPolicy": session_policy,
+                    "runtimeClass": "cron",
+                    "origin": "cron-scheduler",
+                    "cronRunId": &run_id,
                     "platform": "native-cron",
-                    "channelId": entry.job_id,
+                    "channelId": &entry.job_id,
                     "userId": "cron-scheduler",
-                    "messageText": message_text,
+                    "messageText": &message_text,
                     "inboundContext": serde_json::to_string(entry).unwrap_or_default()
                 });
                 let enqueue = enqueue_worker_job(WorkerEnqueueOptions {
                     harness_home: options.harness_home.clone(),
                     kind: WorkerJobKind::LlmSubagent,
-                    lane: Some("llm".to_string()),
+                    lane: Some("cron".to_string()),
                     payload,
                     idempotency_key: Some(idempotency_key.clone()),
                     parent_job_id: None,
@@ -837,7 +998,7 @@ fn collect_native_cron_decisions(
                     max_attempts: 3,
                     timeout_ms: Some(DEFAULT_WORKER_TIMEOUT_MS),
                     cascade_timeout_ms: Some(DEFAULT_WATCHDOG_TIMEOUT_MS),
-                    rate_key: Some(format!("llm:{agent_id}")),
+                    rate_key: Some(format!("cron:{agent_id}")),
                     concurrency_group_key: Some(format!(
                         "{}:{}",
                         normalize_key_part(&master_agent),
@@ -845,6 +1006,12 @@ fn collect_native_cron_decisions(
                     )),
                     now_ms: options.now_ms,
                 })?;
+                mark_cron_run_worker_enqueued(
+                    &options.harness_home,
+                    &cron_run.run_id,
+                    &enqueue.job.job_id,
+                    options.now_ms,
+                )?;
                 insert_watermark(
                     database,
                     "native-cron",
@@ -1023,6 +1190,7 @@ fn collect_deterministic_cron_decisions(
             &source_id,
             &entry.entry_id,
             scheduled_for_ms,
+            0,
         );
         let cwd = script_path.parent().unwrap_or(Path::new(".")).to_path_buf();
         let payload = json!({
@@ -1246,6 +1414,40 @@ fn native_cron_entry_runtime_path_blocker(entry: &NativeCronPlanEntry) -> Option
     None
 }
 
+fn normalized_cron_session_policy(value: Option<&str>) -> &'static str {
+    match value.unwrap_or("one-shot").to_ascii_lowercase().as_str() {
+        "sticky" => "sticky",
+        _ => "one-shot",
+    }
+}
+
+fn native_cron_session_key(
+    entry: &NativeCronPlanEntry,
+    agent_id: &str,
+    scheduled_for_ms: i64,
+    session_policy: &str,
+) -> String {
+    if session_policy == "sticky" {
+        let suffix = entry
+            .session_key
+            .as_deref()
+            .map(normalize_key_part)
+            .unwrap_or_else(|| "sticky".to_string());
+        return format!(
+            "cron:{}:{}:sticky:{}",
+            normalize_key_part(agent_id),
+            normalize_key_part(&entry.job_id),
+            suffix
+        );
+    }
+    format!(
+        "cron:{}:{}:{}",
+        normalize_key_part(agent_id),
+        normalize_key_part(&entry.job_id),
+        scheduled_for_ms
+    )
+}
+
 fn load_cron_scheduler_config(
     harness_home: &Path,
     warnings: &mut Vec<String>,
@@ -1287,6 +1489,22 @@ fn load_cron_scheduler_config(
                 warnings
                     .push("cronScheduler.maxEnqueuePerTick was zero; using default".to_string());
                 config.max_enqueue_per_tick = DEFAULT_MAX_ENQUEUE_PER_TICK;
+            }
+            if config.max_active_runs_per_job == 0 {
+                warnings
+                    .push("cronScheduler.maxActiveRunsPerJob was zero; using default".to_string());
+                config.max_active_runs_per_job = default_cron_max_active_runs_per_job();
+            }
+            if config.max_active_runs_per_agent == 0 {
+                warnings.push(
+                    "cronScheduler.maxActiveRunsPerAgent was zero; using default".to_string(),
+                );
+                config.max_active_runs_per_agent = default_cron_max_active_runs_per_agent();
+            }
+            if config.max_queued_per_agent == 0 {
+                warnings
+                    .push("cronScheduler.maxQueuedPerAgent was zero; using default".to_string());
+                config.max_queued_per_agent = default_cron_max_queued_per_agent();
             }
             Ok((config, Some(config_file)))
         }
@@ -1365,6 +1583,22 @@ fn watermark_exists(
         )
         .map_err(io::Error::other)?;
     Ok(count > 0)
+}
+
+fn delete_watermark(
+    database: &Path,
+    source_kind: &str,
+    source_id: &str,
+    entry_id: &str,
+    scheduled_for_ms: i64,
+) -> io::Result<usize> {
+    let conn = Connection::open(database).map_err(io::Error::other)?;
+    conn.execute(
+        "DELETE FROM cron_scheduler_watermarks
+         WHERE source_kind = ?1 AND source_id = ?2 AND entry_id = ?3 AND scheduled_for_ms = ?4",
+        params![source_kind, source_id, entry_id, scheduled_for_ms],
+    )
+    .map_err(io::Error::other)
 }
 
 fn insert_watermark(
@@ -1683,8 +1917,14 @@ fn scheduler_idempotency_key(
     source_id: &str,
     entry_id: &str,
     scheduled_for_ms: i64,
+    attempt: i64,
 ) -> String {
-    format!("cron-scheduler:{source_kind}:{source_id}:{entry_id}:{scheduled_for_ms}")
+    let base = format!("cron-scheduler:{source_kind}:{source_id}:{entry_id}:{scheduled_for_ms}");
+    if attempt > 0 {
+        format!("{base}:attempt:{attempt}")
+    } else {
+        base
+    }
 }
 
 fn stable_source_id(kind: &str, path: &Path) -> String {
@@ -1732,6 +1972,18 @@ fn default_max_enqueue_per_tick() -> usize {
     DEFAULT_MAX_ENQUEUE_PER_TICK
 }
 
+fn default_cron_max_active_runs_per_job() -> usize {
+    1
+}
+
+fn default_cron_max_active_runs_per_agent() -> usize {
+    4
+}
+
+fn default_cron_max_queued_per_agent() -> usize {
+    20
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1777,6 +2029,33 @@ mod tests {
     }
 
     #[test]
+    fn native_cron_sticky_session_key_is_forced_into_cron_namespace() {
+        let entry = NativeCronPlanEntry {
+            job_id: "daily-report".to_string(),
+            name: None,
+            enabled: true,
+            agent_id: Some("main".to_string()),
+            action: NativeCronPlanAction::EnqueueAgentTurn,
+            reason: "due".to_string(),
+            schedule: NativeCronSchedule::At {
+                text: None,
+                epoch_ms: Some(1000),
+            },
+            wake_mode: None,
+            session_key: Some("main-session".to_string()),
+            session_policy: Some("sticky".to_string()),
+            message_text: Some("run daily report".to_string()),
+            last_run_at_ms: None,
+            next_run_at_ms: Some(1000),
+        };
+
+        assert_eq!(
+            native_cron_session_key(&entry, "main", 1000, "sticky"),
+            "cron:main:daily-report:sticky:main-session"
+        );
+    }
+
+    #[test]
     fn run_once_enqueues_native_due_at_once_and_dedupes() {
         let root = temp_root("run_once_enqueues_native_due_at_once_and_dedupes");
         let source = write_source(&root);
@@ -1807,9 +2086,88 @@ mod tests {
             first.decisions[0].decision,
             CronSchedulerJobDecisionStatus::Enqueued
         );
+        let cron_runs = crate::collect_cron_run_summary(&harness_home).unwrap();
+        assert_eq!(cron_runs.summary.active, 1);
+        let cron_run = cron_runs.runs.first().unwrap();
+        assert_eq!(cron_run.status, CronRunStatus::WorkerEnqueued);
+        assert_eq!(cron_run.agent_id, "main");
+        assert_eq!(cron_run.entry_id, "due");
+        assert_eq!(cron_run.scheduled_for_ms, 1000);
+        assert_eq!(cron_run.runtime_class, "cron");
+        assert_eq!(cron_run.session_policy, "one-shot");
+        assert_eq!(cron_run.session_key, "cron:main:due:1000");
+        assert_eq!(cron_run.attempt, 0);
 
-        let second = run_cron_scheduler_once(options).unwrap();
+        let worker_conn = Connection::open(crate::worker_db_file(&harness_home)).unwrap();
+        let (first_payload_json, first_idempotency_key, first_lane): (String, String, String) = worker_conn
+            .query_row(
+                "SELECT payload_json, idempotency_key, lane FROM jobs ORDER BY created_at_ms ASC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let first_payload: Value = serde_json::from_str(&first_payload_json).unwrap();
+        assert_eq!(first_lane, "cron");
+        assert_eq!(first_payload["runtimeClass"], "cron");
+        assert_eq!(first_payload["origin"], "cron-scheduler");
+        assert_eq!(first_payload["sessionPolicy"], "one-shot");
+        assert_eq!(first_payload["cronRunId"], cron_run.run_id.as_str());
+        assert!(!first_idempotency_key.contains(":attempt:"));
+
+        let second = run_cron_scheduler_once(options.clone()).unwrap();
         assert_eq!(second.summary.skipped_duplicate, 1);
+
+        worker_conn
+            .execute(
+                "UPDATE jobs SET status='failed-terminal', finished_at_ms=?1 WHERE idempotency_key=?2",
+                params![15_000, first_idempotency_key],
+            )
+            .unwrap();
+        crate::mark_cron_run_worker_status(
+            &harness_home,
+            &cron_run.run_id,
+            "failed-terminal",
+            "test retry path",
+            15_000,
+        )
+        .unwrap();
+        let control = crate::control_cron_run(crate::CronRunControlOptions {
+            harness_home: harness_home.clone(),
+            action: crate::CronRunControlAction::Retry,
+            run_id: Some(cron_run.run_id.clone()),
+            agent_id: None,
+            entry_id: None,
+            reason: "operator retry test".to_string(),
+            now_ms: 16_000,
+        })
+        .unwrap();
+        assert_eq!(control.affected, 1);
+
+        let retry = run_cron_scheduler_once(CronSchedulerRunOnceOptions {
+            now_ms: 17_000,
+            ..options.clone()
+        })
+        .unwrap();
+        assert_eq!(retry.summary.enqueued, 1);
+        assert!(
+            retry
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cleared 1 cron scheduler watermark"))
+        );
+        let retried_runs = crate::collect_cron_run_summary(&harness_home).unwrap();
+        let retried_run = retried_runs.runs.first().unwrap();
+        assert_eq!(retried_run.status, CronRunStatus::WorkerEnqueued);
+        assert_eq!(retried_run.attempt, 1);
+        let (job_count, retry_idempotency_key): (i64, String) = worker_conn
+            .query_row(
+                "SELECT COUNT(*), (SELECT idempotency_key FROM jobs ORDER BY created_at_ms DESC LIMIT 1) FROM jobs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(job_count, 2);
+        assert!(retry_idempotency_key.ends_with(":attempt:1"));
 
         let _ = fs::remove_dir_all(root);
     }

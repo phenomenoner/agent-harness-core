@@ -6,6 +6,7 @@ Agent Harness Core reads most operator state from a harness home directory suppl
 
 - `harness-config.json`: harness runtime and security settings.
 - `state/`: receipts, queues, logs, supervisor files, worker database, and channel state.
+- `state/cron-runs/cron-runs.sqlite`: native cron LLM run admission, retry, quarantine, and operator control state.
 - `secrets/`: optional local env files for channel/provider/memory credentials.
 - `skills/`: bundled and imported skill indexes used by prompt assembly.
 
@@ -30,10 +31,20 @@ Long-running jobs or local services that intentionally outlive the chat turn sho
   "workerDispatch": {
     "globalConcurrencyLimit": 12,
     "groupConcurrencyLimit": 6,
-    "channelConcurrencyLimit": 3
+    "channelConcurrencyLimit": 3,
+    "laneConcurrencyLimits": {
+      "cron": 3,
+      "llm": 6,
+      "shell": 6,
+      "watchdog": 2,
+      "maintenance": 2,
+      "plugin": 2
+    }
   }
 }
 ```
+
+Native LLM cron jobs use the `cron` worker lane before they hand off to the `cron` runtime class. This keeps scheduler-originated LLM work from filling the general `llm` worker lane.
 
 The invariant is:
 
@@ -42,6 +53,50 @@ global limit >= per-agent limit >= per-agent-per-channel limit
 ```
 
 Invalid narrower-to-wider settings are capped at runtime with warnings.
+
+## Runtime Dispatch Classes
+
+Runtime queue items now carry `runtimeClass` and `origin` metadata. Channel ingress defaults to `interactive`, native LLM cron defaults to `cron`, worker-originated turns default to `worker`, and operational lanes may use `maintenance`.
+
+`harness-config.json` can define class-specific runtime capacity independently from worker job leasing:
+
+```json
+{
+  "runtimeDispatch": {
+    "globalConcurrencyLimit": 12,
+    "interactiveReserve": 1,
+    "classes": {
+      "interactive": {
+        "maxActive": 12,
+        "perAgentMaxActive": 6,
+        "perChannelMaxActive": 3,
+        "perJobMaxActive": 999999,
+        "maxQueuedPerAgent": 999999
+      },
+      "cron": {
+        "maxActive": 2,
+        "perAgentMaxActive": 1,
+        "perChannelMaxActive": 1,
+        "perJobMaxActive": 1,
+        "maxQueuedPerAgent": 4
+      }
+    }
+  }
+}
+```
+
+The runtime loop uses class-scoped lease files under `state/runtime-queue/classes/<class>/runtime-leases.json`. Legacy root `state/runtime-queue/runtime-leases.json` is still read during capacity checks so an upgrade does not ignore active pre-Round5 leases.
+
+## Cron Run Isolation
+
+Native cron LLM turns use CronRunStore before worker enqueue:
+
+- `sessionPolicy=one-shot` is the default and produces a scheduled-slot session key such as `cron:<agent>:<entry>:<scheduled_ms>`.
+- `sessionPolicy=sticky` keeps continuity for that cron entry, but the scheduler forces the key into `cron:<agent>:<entry>:sticky:<suffix>` so it cannot collide with interactive session keys.
+- Cron transcript and trajectory paths live under `agents/<agent>/cron-sessions/`, not the normal interactive `sessions/` directory.
+- `cron-runs` lists admitted, worker-enqueued, runtime-enqueued, running, terminal, retry-pending, and quarantined cron runs.
+- `cron-run-control --action retry --run-id <id>` resets the run to retry-pending, clears stale worker/runtime refs, and lets the scheduler clear the matching watermark and enqueue a new worker job with an attempt-specific idempotency key.
+- `cron-run-control --action skip|quarantine|unquarantine` can stop or isolate bad cron work without blocking unrelated agents. Worker and runtime dispatch re-check CronRunStore controls and tombstone skipped runtime queue items instead of running stale work.
 
 ## Response Formatting
 

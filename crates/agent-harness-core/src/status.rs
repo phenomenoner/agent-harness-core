@@ -9,8 +9,9 @@ use serde_json::Value;
 
 use crate::{
     ActivationReadinessOptions, ActivationReadinessReport, ActivationReadinessStatus,
-    ChannelOutboxPlanSummary, WorkerStatusOptions, WorkerStatusReport, check_activation_readiness,
-    collect_worker_status, harness_log_file,
+    ChannelOutboxPlanSummary, CronRunSummary, WorkerStatusOptions, WorkerStatusReport,
+    check_activation_readiness, collect_cron_run_summary, collect_worker_status, cron_runs_db_file,
+    harness_log_file,
 };
 
 const HARNESS_STATUS_SCHEMA: &str = "agent-harness.status.v1";
@@ -33,6 +34,7 @@ pub struct HarnessStatusReport {
     pub loops: HarnessLoopStatus,
     pub workers: WorkerStatusReport,
     pub cron_scheduler: HarnessCronSchedulerStatus,
+    pub cron_runs: HarnessCronRunStatus,
     pub memory: HarnessMemoryStatus,
     pub plugins: HarnessPluginStatus,
     pub logs: HarnessOperationalLogStatus,
@@ -47,6 +49,13 @@ pub struct HarnessRuntimeStatus {
     pub prepared_items: usize,
     pub completed_items: usize,
     pub open_items: usize,
+    pub cron_queued_items: usize,
+    pub cron_open_items: usize,
+    pub queued_by_runtime_class: BTreeMap<String, usize>,
+    pub queued_by_origin: BTreeMap<String, usize>,
+    pub open_by_runtime_class: BTreeMap<String, usize>,
+    pub open_by_origin: BTreeMap<String, usize>,
+    pub class_leases: Vec<HarnessRuntimeClassLeaseStatus>,
     pub pending_invalid_lines: usize,
     pub latest_non_idle_run_once: Option<HarnessRuntimeReceiptStatus>,
     pub execution_receipts: HarnessJsonlStatus,
@@ -57,6 +66,20 @@ pub struct HarnessRuntimeStatus {
     pub codex_launch_receipts: HarnessJsonlStatus,
     pub control_receipts: HarnessJsonlStatus,
     pub dead_letter_receipts: HarnessJsonlStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessRuntimeClassLeaseStatus {
+    pub runtime_class: String,
+    pub leases_file: PathBuf,
+    pub exists: bool,
+    pub leased_items: usize,
+    pub active_leases: usize,
+    pub expired_leases: usize,
+    pub cron_run_leases: usize,
+    pub by_agent: BTreeMap<String, usize>,
+    pub by_origin: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -111,9 +134,24 @@ pub struct HarnessCronSchedulerStatus {
     pub loop_last_file: PathBuf,
     pub loop_last_present: bool,
     pub latest_status: Option<String>,
+    pub latest_native_entries: Option<i64>,
+    pub latest_deterministic_entries: Option<i64>,
+    pub latest_due_candidates: Option<i64>,
     pub latest_enqueued: Option<i64>,
+    pub latest_skipped_held: Option<i64>,
+    pub latest_skipped_duplicate: Option<i64>,
+    pub latest_skipped_policy: Option<i64>,
     pub latest_errors: Option<i64>,
     pub receipts: HarnessJsonlStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessCronRunStatus {
+    pub database: PathBuf,
+    pub database_present: bool,
+    pub summary: CronRunSummary,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -203,6 +241,10 @@ pub struct HarnessRuntimeReceiptStatus {
     pub queue_id: Option<String>,
     pub status: Option<String>,
     pub reason: Option<String>,
+    pub runtime_class: Option<String>,
+    pub origin: Option<String>,
+    pub cron_run_id: Option<String>,
+    pub scheduled_for_ms: Option<i64>,
 }
 
 pub fn collect_harness_status(options: HarnessStatusOptions) -> io::Result<HarnessStatusReport> {
@@ -218,6 +260,7 @@ pub fn collect_harness_status(options: HarnessStatusOptions) -> io::Result<Harne
         harness_home: options.harness_home.clone(),
     })?;
     let cron_scheduler = cron_scheduler_status(&options.harness_home)?;
+    let cron_runs = cron_runs_status(&options.harness_home)?;
     let memory = memory_status(&options.harness_home)?;
     let plugins = plugin_status(&options.harness_home)?;
 
@@ -231,6 +274,7 @@ pub fn collect_harness_status(options: HarnessStatusOptions) -> io::Result<Harne
         loops,
         workers,
         cron_scheduler,
+        cron_runs,
         memory,
         plugins,
         logs,
@@ -280,14 +324,51 @@ fn cron_scheduler_status(harness_home: &Path) -> io::Result<HarnessCronScheduler
         latest_status: latest
             .as_ref()
             .and_then(|value| string_path(value, &["status"])),
+        latest_native_entries: latest
+            .as_ref()
+            .and_then(|value| i64_path(value, &["summary", "nativeEntries"])),
+        latest_deterministic_entries: latest
+            .as_ref()
+            .and_then(|value| i64_path(value, &["summary", "deterministicEntries"])),
+        latest_due_candidates: latest
+            .as_ref()
+            .and_then(|value| i64_path(value, &["summary", "dueCandidates"])),
         latest_enqueued: latest
             .as_ref()
             .and_then(|value| i64_path(value, &["summary", "enqueued"])),
+        latest_skipped_held: latest
+            .as_ref()
+            .and_then(|value| i64_path(value, &["summary", "skippedHeld"])),
+        latest_skipped_duplicate: latest
+            .as_ref()
+            .and_then(|value| i64_path(value, &["summary", "skippedDuplicate"])),
+        latest_skipped_policy: latest
+            .as_ref()
+            .and_then(|value| i64_path(value, &["summary", "skippedPolicy"])),
         latest_errors: latest
             .as_ref()
             .and_then(|value| i64_path(value, &["summary", "errors"])),
         loop_last_file,
         receipts: jsonl_status(state_dir.join("receipts.jsonl"))?,
+    })
+}
+
+fn cron_runs_status(harness_home: &Path) -> io::Result<HarnessCronRunStatus> {
+    let database = cron_runs_db_file(harness_home);
+    if !database.is_file() {
+        return Ok(HarnessCronRunStatus {
+            database,
+            database_present: false,
+            summary: CronRunSummary::default(),
+            warnings: Vec::new(),
+        });
+    }
+    let report = collect_cron_run_summary(harness_home)?;
+    Ok(HarnessCronRunStatus {
+        database: report.database,
+        database_present: true,
+        summary: report.summary,
+        warnings: report.warnings,
     })
 }
 
@@ -334,7 +415,7 @@ fn runtime_status(
 ) -> io::Result<HarnessRuntimeStatus> {
     let queue_dir = harness_home.join("state").join("runtime-queue");
     let pending_file = queue_dir.join("pending.jsonl");
-    let pending = read_queue_ids(&pending_file, warnings, "runtime pending queue")?;
+    let pending = read_runtime_pending_queue(&pending_file, warnings)?;
     let prepared_ids = read_receipt_queue_ids_with_status(
         &queue_dir.join("execution-receipts.jsonl"),
         &["prepared", "already-prepared"],
@@ -360,13 +441,37 @@ fn runtime_status(
         warnings,
         "runtime run-once receipts",
     )?;
-    let open_items = pending.queue_ids.difference(&terminal_run_ids).count();
+    let mut open_by_runtime_class = BTreeMap::new();
+    let mut open_by_origin = BTreeMap::new();
+    let mut cron_open_items = 0;
+    for item in &pending.items {
+        if terminal_run_ids.contains(&item.queue_id) {
+            continue;
+        }
+        *open_by_runtime_class
+            .entry(item.runtime_class.clone())
+            .or_insert(0) += 1;
+        *open_by_origin.entry(item.origin.clone()).or_insert(0) += 1;
+        if item.runtime_class == "cron" || item.cron_run_id.is_some() {
+            cron_open_items += 1;
+        }
+    }
+    let open_items: usize = open_by_runtime_class.values().copied().sum();
+    let class_leases =
+        runtime_class_lease_statuses(&queue_dir, pending.queued_by_runtime_class.keys(), warnings)?;
     Ok(HarnessRuntimeStatus {
         pending_file,
         queued_items: pending.queue_ids.len(),
         prepared_items: pending.queue_ids.intersection(&prepared_ids).count(),
         completed_items: pending.queue_ids.intersection(&completed_ids).count(),
         open_items,
+        cron_queued_items: pending.cron_queued_items,
+        cron_open_items,
+        queued_by_runtime_class: pending.queued_by_runtime_class,
+        queued_by_origin: pending.queued_by_origin,
+        open_by_runtime_class,
+        open_by_origin,
+        class_leases,
         pending_invalid_lines: pending.invalid_lines,
         latest_non_idle_run_once: latest_non_idle_runtime_receipt(
             &queue_dir.join("run-once-receipts.jsonl"),
@@ -646,6 +751,11 @@ fn latest_non_idle_runtime_receipt(path: &Path) -> io::Result<Option<HarnessRunt
             queue_id: queue_id_from_value(&value),
             status,
             reason: string_path(&value, &["reason"]),
+            runtime_class: string_path_any(&value, &["runtimeClass", "runtime_class"]),
+            origin: string_path_any(&value, &["origin"]),
+            cron_run_id: string_path_any(&value, &["cronRunId", "cron_run_id"]),
+            scheduled_for_ms: i64_path(&value, &["scheduledForMs"])
+                .or_else(|| i64_path(&value, &["scheduled_for_ms"])),
         });
     }
     Ok(latest)
@@ -725,23 +835,37 @@ fn read_tail_sample(path: &Path, max_bytes: u64) -> io::Result<Option<TailSample
 }
 
 #[derive(Default)]
-struct QueueIdRead {
+struct RuntimePendingQueueRead {
     queue_ids: BTreeSet<String>,
+    items: Vec<RuntimePendingQueueItem>,
+    queued_by_runtime_class: BTreeMap<String, usize>,
+    queued_by_origin: BTreeMap<String, usize>,
+    cron_queued_items: usize,
     invalid_lines: usize,
 }
 
-fn read_queue_ids(path: &Path, warnings: &mut Vec<String>, label: &str) -> io::Result<QueueIdRead> {
+struct RuntimePendingQueueItem {
+    queue_id: String,
+    runtime_class: String,
+    origin: String,
+    cron_run_id: Option<String>,
+}
+
+fn read_runtime_pending_queue(
+    path: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<RuntimePendingQueueRead> {
     let Some(sample) = read_tail_sample(path, STATUS_JSONL_SAMPLE_BYTES)? else {
-        return Ok(QueueIdRead::default());
+        return Ok(RuntimePendingQueueRead::default());
     };
     if sample.sampled {
         warnings.push(format!(
-            "{label} is sampled from the last {} bytes of {}",
+            "runtime pending queue is sampled from the last {} bytes of {}",
             sample.sampled_bytes,
             path.display()
         ));
     }
-    let mut read = QueueIdRead::default();
+    let mut read = RuntimePendingQueueRead::default();
     for line in sample.text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -749,16 +873,156 @@ fn read_queue_ids(path: &Path, warnings: &mut Vec<String>, label: &str) -> io::R
         }
         match serde_json::from_str::<Value>(trimmed) {
             Ok(value) => {
-                if let Some(queue_id) = queue_id_from_value(&value) {
-                    read.queue_ids.insert(queue_id);
-                } else {
+                let Some(queue_id) = queue_id_from_value(&value) else {
                     read.invalid_lines += 1;
+                    continue;
+                };
+                let platform = string_path_any(&value, &["platform"]).unwrap_or_default();
+                let runtime_class = string_path_any(&value, &["runtimeClass", "runtime_class"])
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| default_runtime_class_for_platform(&platform));
+                let origin = string_path_any(&value, &["origin", "adapter"])
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| default_origin_for_platform(&platform));
+                let cron_run_id = string_path_any(&value, &["cronRunId", "cron_run_id"]);
+                read.queue_ids.insert(queue_id.clone());
+                *read
+                    .queued_by_runtime_class
+                    .entry(runtime_class.clone())
+                    .or_insert(0) += 1;
+                *read.queued_by_origin.entry(origin.clone()).or_insert(0) += 1;
+                if runtime_class == "cron" || cron_run_id.is_some() {
+                    read.cron_queued_items += 1;
                 }
+                read.items.push(RuntimePendingQueueItem {
+                    queue_id,
+                    runtime_class,
+                    origin,
+                    cron_run_id,
+                });
             }
             Err(_) => read.invalid_lines += 1,
         }
     }
     Ok(read)
+}
+
+fn runtime_class_lease_statuses<'a>(
+    queue_dir: &Path,
+    queued_classes: impl Iterator<Item = &'a String>,
+    warnings: &mut Vec<String>,
+) -> io::Result<Vec<HarnessRuntimeClassLeaseStatus>> {
+    let mut classes = ["interactive", "cron", "worker", "maintenance"]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    classes.extend(queued_classes.cloned());
+    let classes_dir = queue_dir.join("classes");
+    if let Ok(entries) = fs::read_dir(&classes_dir) {
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_dir()
+                && let Some(name) = entry.file_name().to_str()
+            {
+                classes.insert(name.to_string());
+            }
+        }
+    }
+    if queue_dir.join("runtime-leases.json").is_file() {
+        classes.insert("legacy".to_string());
+    }
+
+    let now_ms = epoch_ms().unwrap_or(0);
+    let mut statuses = Vec::new();
+    for runtime_class in classes {
+        let leases_file = if runtime_class == "legacy" {
+            queue_dir.join("runtime-leases.json")
+        } else {
+            classes_dir.join(&runtime_class).join("runtime-leases.json")
+        };
+        statuses.push(read_runtime_class_lease_status(
+            &runtime_class,
+            leases_file,
+            now_ms,
+            warnings,
+        )?);
+    }
+    Ok(statuses)
+}
+
+fn read_runtime_class_lease_status(
+    runtime_class: &str,
+    leases_file: PathBuf,
+    now_ms: i64,
+    warnings: &mut Vec<String>,
+) -> io::Result<HarnessRuntimeClassLeaseStatus> {
+    let mut status = HarnessRuntimeClassLeaseStatus {
+        runtime_class: runtime_class.to_string(),
+        leases_file: leases_file.clone(),
+        ..HarnessRuntimeClassLeaseStatus::default()
+    };
+    let text = match fs::read_to_string(&leases_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(status),
+        Err(error) => return Err(error),
+    };
+    status.exists = true;
+    let value = match serde_json::from_str::<Value>(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            warnings.push(format!(
+                "runtime class lease file {} is invalid JSON: {error}",
+                leases_file.display()
+            ));
+            return Ok(status);
+        }
+    };
+    let Some(leases) = value.get("leases").and_then(Value::as_object) else {
+        return Ok(status);
+    };
+    for lease in leases.values() {
+        status.leased_items += 1;
+        let lease_runtime_class = string_path_any(lease, &["runtimeClass", "runtime_class"])
+            .unwrap_or_else(|| runtime_class.to_string());
+        let origin = string_path_any(lease, &["origin"])
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        let agent_id = string_path_any(lease, &["agentId", "agent_id"])
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        if string_path_any(lease, &["cronRunId", "cron_run_id"]).is_some()
+            || lease_runtime_class == "cron"
+        {
+            status.cron_run_leases += 1;
+        }
+        let expired = i64_path(lease, &["leaseExpiresAtMs"])
+            .or_else(|| i64_path(lease, &["lease_expires_at_ms"]))
+            .is_some_and(|expires_at| expires_at <= now_ms);
+        if expired {
+            status.expired_leases += 1;
+        } else {
+            status.active_leases += 1;
+        }
+        *status.by_agent.entry(agent_id).or_insert(0) += 1;
+        *status.by_origin.entry(origin).or_insert(0) += 1;
+    }
+    Ok(status)
+}
+
+fn default_runtime_class_for_platform(platform: &str) -> String {
+    match platform {
+        "native-cron" => "cron".to_string(),
+        "worker" | "worker-watchdog" => "worker".to_string(),
+        _ => "interactive".to_string(),
+    }
+}
+
+fn default_origin_for_platform(platform: &str) -> String {
+    if platform == "native-cron" {
+        "cron-scheduler".to_string()
+    } else {
+        "channel".to_string()
+    }
 }
 
 fn read_delivery_status_tail(
@@ -1220,6 +1484,161 @@ mod tests {
                 .and_then(|receipt| receipt.status.as_deref()),
             Some("timeout")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collect_status_summarizes_cron_runtime_class_and_leases() {
+        let root = temp_root("collect_status_summarizes_cron_runtime_class_and_leases");
+        let harness_home = root.join(".agent-harness");
+        let runtime_queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&runtime_queue_dir).unwrap();
+        fs::create_dir_all(harness_home.join("state").join("channels")).unwrap();
+        fs::create_dir_all(harness_home.join("state").join("logs")).unwrap();
+        fs::create_dir_all(harness_home.join("state").join("plugin-sidecar")).unwrap();
+        fs::create_dir_all(harness_home.join("state").join("memory")).unwrap();
+        fs::create_dir_all(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("loop-heartbeats"),
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join("state").join("harness-registry.json"),
+            r#"{
+              "agents": [{"id":"main","enabled":true}],
+              "providers": [],
+              "channels": {"telegram": false, "discord": false},
+              "plugins": []
+            }"#,
+        )
+        .unwrap();
+
+        let cron_run = crate::admit_cron_run(crate::CronRunAdmitOptions {
+            harness_home: harness_home.clone(),
+            source_kind: "native-cron".to_string(),
+            source_id: "main".to_string(),
+            entry_id: "hourly".to_string(),
+            agent_id: "main@cron".to_string(),
+            scheduled_for_ms: 1_000,
+            runtime_class: "cron".to_string(),
+            session_key: "cron:main:hourly:1000".to_string(),
+            session_policy: "one-shot".to_string(),
+            max_attempts: 3,
+            now_ms: 1_100,
+        })
+        .unwrap();
+
+        fs::write(
+            runtime_queue_dir.join("pending.jsonl"),
+            format!(
+                "{}\n{}",
+                serde_json::json!({
+                    "queueId": "q-cron",
+                    "agentId": "main@cron",
+                    "sessionKey": "cron:main:hourly:1000",
+                    "platform": "native-cron",
+                    "runtimeClass": "cron",
+                    "origin": "cron-scheduler",
+                    "cronRunId": cron_run.run_id.clone(),
+                    "scheduledForMs": 1000
+                }),
+                serde_json::json!({
+                    "queueId": "q-main",
+                    "agentId": "main",
+                    "sessionKey": "telegram:dm:user:main",
+                    "platform": "telegram",
+                    "runtimeClass": "interactive",
+                    "origin": "channel"
+                })
+            ),
+        )
+        .unwrap();
+        fs::write(
+            runtime_queue_dir.join("run-once-receipts.jsonl"),
+            serde_json::json!({
+                "queueId": "q-cron",
+                "status": "retry-pending",
+                "reason": "lease busy",
+                "runtimeClass": "cron",
+                "origin": "cron-scheduler",
+                "cronRunId": cron_run.run_id.clone(),
+                "scheduledForMs": 1000
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cron_class_dir = runtime_queue_dir.join("classes").join("cron");
+        fs::create_dir_all(&cron_class_dir).unwrap();
+        fs::write(
+            cron_class_dir.join("runtime-leases.json"),
+            serde_json::json!({
+                "schema": "agent-harness.runtime-queue-leases.v1",
+                "leases": {
+                    "q-cron": {
+                        "queueId": "q-cron",
+                        "agentId": "main@cron",
+                        "runtimeClass": "cron",
+                        "origin": "cron-scheduler",
+                        "cronRunId": cron_run.run_id.clone(),
+                        "platform": "native-cron",
+                        "channelId": "cron",
+                        "sessionKey": "cron:main:hourly:1000",
+                        "owner": "test",
+                        "startedAtMs": 1000,
+                        "leaseExpiresAtMs": i64::MAX
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let report = collect_harness_status(HarnessStatusOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+
+        assert_eq!(report.runtime.queued_items, 2);
+        assert_eq!(report.runtime.open_items, 2);
+        assert_eq!(report.runtime.cron_queued_items, 1);
+        assert_eq!(report.runtime.cron_open_items, 1);
+        assert_eq!(
+            report.runtime.queued_by_runtime_class.get("cron").copied(),
+            Some(1)
+        );
+        assert_eq!(
+            report.runtime.open_by_origin.get("cron-scheduler").copied(),
+            Some(1)
+        );
+        let cron_leases = report
+            .runtime
+            .class_leases
+            .iter()
+            .find(|status| status.runtime_class == "cron")
+            .unwrap();
+        assert_eq!(cron_leases.active_leases, 1);
+        assert_eq!(cron_leases.cron_run_leases, 1);
+        assert_eq!(report.cron_runs.summary.active, 1);
+        assert_eq!(
+            report
+                .cron_runs
+                .summary
+                .by_agent_active
+                .get("main@cron")
+                .copied(),
+            Some(1)
+        );
+        let latest = report.runtime.latest_non_idle_run_once.unwrap();
+        assert_eq!(latest.runtime_class.as_deref(), Some("cron"));
+        assert_eq!(latest.origin.as_deref(), Some("cron-scheduler"));
+        assert_eq!(
+            latest.cron_run_id.as_deref(),
+            Some(cron_run.run_id.as_str())
+        );
+        assert_eq!(latest.scheduled_for_ms, Some(1000));
 
         let _ = fs::remove_dir_all(root);
     }

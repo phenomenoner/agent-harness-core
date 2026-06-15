@@ -1,8 +1,8 @@
 # Agent Worker Dispatch Strategy
 
-Date: 2026-06-10
+Date: 2026-06-15
 
-Status: P4 MVP implemented; remaining items are hardening and live smoke coverage.
+Status: Round5 cron/runtime isolation implemented in staging; remaining items are live smoke coverage and external-provider hardening.
 
 This document defines the next cron/subagent direction for Agent Harness. The design is inspired by gbrain Minions as a durable background-work model, but the harness does not borrow gbrain's memory strategy or require its storage stack.
 
@@ -17,7 +17,7 @@ The imported container deployment has two cron families that must stay distinct 
 - Native agent-turn cron from `.openclaw/cron`, which is allowed to create LLM-backed agent or subagent work.
 - Extended deterministic crontab/Supercronic-style cron from workspace runner directories, which must stay on a no-LLM deterministic shell path.
 
-Both cron families, plus imported subagent ledgers, should converge at the execution layer. The harness already has a durable runtime queue for normal channel turns. P4 should extend that operating model into a general worker queue that can manage deterministic shell work, scheduled work, and LLM-backed subagent work with the same lease, retry, timeout, audit, and status semantics.
+Both cron families, plus imported subagent ledgers, converge at the worker execution layer, but cron LLM turns no longer share the same runtime capacity lane as interactive channel turns. Worker dispatch remains the durable submit/lease/retry layer. Runtime dispatch now has class-scoped lanes so `interactive`, `cron`, `worker`, and `maintenance` turns can be capped independently.
 
 ## Goals
 
@@ -25,6 +25,8 @@ Both cron families, plus imported subagent ledgers, should converge at the execu
 - Survive process crashes, Windows reboots, transient network failures, and worker restarts through recoverable pending/running state.
 - Route heavy non-reasoning work such as scraping, API calls, token refreshes, sync jobs, backups, and maintenance scripts away from LLM turns.
 - Manage deterministic shell jobs and LLM subagent jobs through one queue, status surface, and receipt model.
+- Keep cron LLM runs observable and recoverable through a dedicated CronRunStore, including skip, retry, quarantine, and per-agent/per-job active caps.
+- Keep cron LLM sessions isolated from interactive sessions by defaulting to one-shot `cron:<agent>:<entry>:<scheduled_ms>` session keys and `agents/<agent>/cron-sessions/` transcripts.
 - Support child jobs, cascading timeout/cancel behavior, exponential backoff, rate leases for external providers, and shell-command audit logging.
 - Wake the master agent when delegated work reaches a meaningful boundary, such as all child jobs completed, any child failed, a group timeout fired, or an operator-requested checkpoint is reached.
 - Enforce global, per-agent/group, and per-agent-per-channel concurrency limits from harness config so fan-out, cron bursts, simultaneous Telegram/Discord work, and retries queue instead of overloading local resources or LLM/API rate limits.
@@ -54,8 +56,10 @@ Both cron families, plus imported subagent ledgers, should converge at the execu
 MVP storage uses the Rust/SQLite direction:
 
 - `state/workers/worker-jobs.sqlite` for job state, attempts, leases, dependency links, and rate leases.
+- `state/cron-runs/cron-runs.sqlite` for native cron LLM admission, active counts, retry/quarantine controls, runtime queue linkage, and failure summaries.
 - `state/workers/audit/*.json` for shell audit and capped stdout/stderr summaries.
 - `state/logs/harness.jsonl` for compact operator events.
+- `state/runtime-queue/classes/<runtimeClass>/runtime-leases.json` for class-scoped runtime execution leases. The old root `state/runtime-queue/runtime-leases.json` is still read for upgrade compatibility.
 
 Postgres can be added later behind a `WorkerStore` trait when multi-host or shared worker pools are required. The first implementation should not block P4 on that migration.
 
@@ -106,7 +110,7 @@ Two-phase persistence:
 
 Cron schedulers enqueue jobs, not execute work directly. The two cron source lanes share worker management while preserving different policies:
 
-- Native agent-turn cron enqueues `llm_subagent` jobs with explicit `--resume-cron`.
+- Native agent-turn cron admits a CronRun, then enqueues `llm_subagent` jobs on the `cron` worker lane with `runtimeClass=cron`, `origin=cron-scheduler`, `cronRunId`, `scheduledForMs`, and `sessionPolicy`.
 - Extended deterministic crontab/Supercronic-style cron enqueues `deterministic_shell` jobs with `llmAccessAllowed=false` and defaults to shell dry-run unless `--execute-shell` is explicit.
 - Imported subagent ledgers map to `llm_subagent` jobs with explicit `--resume-subagents`.
 - Parent agent flows may enqueue child jobs and wait, poll, or detach according to an explicit parent policy.
@@ -138,6 +142,7 @@ Suggested `harness-config.json` shape:
     "groupConcurrencyLimit": 6,
     "channelConcurrencyLimit": 3,
     "laneConcurrencyLimits": {
+      "cron": 3,
       "llm": 6,
       "shell": 6,
       "watchdog": 2,
@@ -156,6 +161,8 @@ Lease policy:
 - A worker can lease a job only when global capacity, lane capacity, per-agent/group capacity, and per-agent-per-channel capacity are all available.
 - If capacity is exhausted, eligible jobs stay `Pending` with their original `available_at` and are retried by later scheduler ticks or worker-loop iterations.
 - Cron bursts must enqueue and wait like any other jobs. Cron must not bypass concurrency limits.
+- Cron LLM worker jobs are isolated first by the `cron` worker lane and then by cron runtime capacity. A cron job can be accepted into the worker queue but still wait behind `runtimeDispatch.classes.cron` when Codex runtime slots are full.
+- A stuck or noisy cron job can be skipped or quarantined through `cron-run-control` without consuming the interactive runtime class. Manual retry clears the scheduler watermark for that run's slot and uses the CronRun attempt number in the worker idempotency key. Worker and runtime dispatch both re-check CronRunStore controls, tombstone skipped runtime items, and avoid overwriting operator skip/quarantine state.
 - Fan-out children share a `concurrency_group_key`, usually derived from `job_group_id` or the master agent/session group.
 - Deterministic shell jobs and LLM subagent jobs both count against global concurrency; lane limits prevent one lane from starving the other.
 - Watchdog jobs should have their own small lane limit and should not be permanently starved by full child lanes, because they are responsible for waking the master agent on timeout/failure/checkpoint boundaries.
@@ -183,6 +190,7 @@ Deterministic shell jobs need a stricter contract than free-form command strings
 LLM subagent jobs should use the same prompt-bundle/Codex runtime foundations as normal turns, but with separate worker identity and parent linkage:
 
 - Each subagent gets a stable session key and transcript/trajectory path.
+- Native cron LLM subagents default to one-shot session keys and `cron-sessions` transcript paths so cron turns do not contaminate the main interactive session context. Sticky cron is opt-in and still forced under the `cron:<agent>:<entry>:sticky:<suffix>` namespace.
 - Parent job id and parent session metadata are stored in the job payload.
 - Child completion writes a result reference, not a raw unbounded transcript, back to the parent.
 - Cancellation and timeout cascade from parent to child unless the child was explicitly detached.
@@ -248,6 +256,9 @@ agent-harness worker-loop --harness-home .\.agent-harness --iterations 0 --idle-
 agent-harness worker-status --harness-home .\.agent-harness --json
 agent-harness worker-cancel --harness-home .\.agent-harness --job-id <id>
 agent-harness worker-reap-stale --harness-home .\.agent-harness
+agent-harness cron-runs --harness-home .\.agent-harness --limit 20
+agent-harness cron-run-control --harness-home .\.agent-harness --action retry --run-id <cronrun-id> --reason "operator retry"
+agent-harness cron-run-control --harness-home .\.agent-harness --action quarantine --agent-id <agent> --entry-id <entry> --reason "bad cron"
 ```
 
 Cron/subagent adapter commands:
@@ -272,4 +283,5 @@ agent-harness subagent-enqueue --harness-home .\.agent-harness --source-home .\i
 7. Done: native agent-turn cron and imported subagent resume can enqueue worker jobs.
 8. Done: child job linkage, job groups, group concurrency keys, parent refs, rate leases, deterministic watchdog jobs, and idempotent `master_wakeup` jobs for all-completed, any-failed, timeout, and all-succeeded policies.
 9. Done: repeated cron scheduler ticks write durable watermarks and idempotently enqueue due native/deterministic cron jobs through WorkerStore.
-10. Remaining: cascading timeout/cancel for active child processes, external-provider rate profiles, fairness across busy master groups, and live smoke tests for global-limit queueing, deterministic cron, native cron-to-agent, parent-to-subagent, and mixed fan-out/watchdog/master-wakeup flows.
+10. Done: Round5 CronRunStore admission/status/control, native cron `cron` worker lane plus `runtimeClass=cron`, isolated one-shot and namespaced sticky cron sessions, runtime queue metadata propagation, class-scoped runtime leases, status/CLI reporting, worker/runtime control blockers, skipped runtime tombstones, worker failure sync, and retry watermark/idempotency recovery.
+11. Remaining: cascading timeout/cancel for active child processes, external-provider rate profiles, fairness across busy master groups, and live smoke tests for global-limit queueing, deterministic cron, native cron-to-agent, parent-to-subagent, and mixed fan-out/watchdog/master-wakeup flows.
