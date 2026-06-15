@@ -34,8 +34,9 @@ Primary topology:
 
 - Active harness state root: `.agent-harness`
 - Active prompt/config authority: `.agent-harness/workspace`, `.agent-harness/openclaw.json`, and `.agent-harness/harness-config.json`
-- Legacy source snapshot archive: `imports/openclaw-core-snapshot`
-- Previous activation harness backup: `imports/activation-harness`
+- Retired legacy source snapshot archive: `imports/openclaw-core-snapshot`
+- Retired previous activation harness backup: `imports/activation-harness`
+- Retired labels only: `.openclaw`, Docker gateway names, `/root/.openclaw`, `/home/agent/.openclaw`, and `/workspace`
 - Runtime workspace/Codex cwd for live loops: `D:\Warehouse\Research\OpenClaw_WSL`
 - Harness CLI: `target/debug/agent-harness.exe`
 - Codex CLI used by loops: `.tools/codex-cli/node_modules/.bin/codex.cmd`
@@ -389,7 +390,7 @@ Important test notes:
 ## Safety Rules for Future Work
 
 - Do not print raw tokens, keys, auth files, or `.env` values.
-- Do not stop or restart Docker legacy unless the operator explicitly asks.
+- Do not stop or restart any retired Docker/OpenClaw gateway process unless the operator explicitly asks.
 - Do not assume scheduled tasks are installed; check `Get-ScheduledTask -TaskName 'AgentHarness-*'`.
 - Before modifying runtime/channel code, check whether live loops are running.
 - If live loops are running and code is rebuilt, restart loops so they use the new binary.

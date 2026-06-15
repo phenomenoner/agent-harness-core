@@ -2,12 +2,12 @@
 
 Date: 2026-06-13
 
-This document compares the Rust Windows Agent Harness against the legacy feature families being replaced from the imported Docker/container deployment. Keep this markdown file and `docs/agent-harness-feature-parity.html` synchronized. The canonical follow-up roadmap and development backlog is `docs/agent-harness-core-roadmap-backlog.md`.
+This document compares the Rust Windows Agent Harness against the legacy feature families imported from the retired Docker/container deployment. Keep this markdown file and `docs/agent-harness-feature-parity.html` synchronized. The canonical follow-up roadmap and development backlog is `docs/agent-harness-core-roadmap-backlog.md`.
 
 Current activation state after the repo-local harness-home rebase, round3/round3-1 runtime/channel fixes, assistant narration routing, public-facing hygiened export, round3-2 timeout/progress reconciliation, the OpenRouter/per-agent memory upgrade, the Codex terminal cleanup/recovery fix, the provider-isolation hotfix, ledger hygiene, the guarded response tone policy, channel identity bindings, delivery intent, runtime backoff hints, and the cron scheduler tick/loop:
 
 - Readiness after response tone deploy: `ready=true`, `passed=59`, `warnings=0`, `failed=0`.
-- Harness home: `.agent-harness` under the repo root; `imports/activation-harness` is retained as a pre-rebase backup.
+- Harness home and active source/config authority: `.agent-harness` under the repo root. `imports/activation-harness`, `imports/openclaw-core-snapshot`, `.openclaw`, Docker gateway names, and container paths are retained only as retired import/rollback context.
 - Runtime queue after round4 reconnect/tone live deployment: `queued=175`, `open=0`, `prepared=175`, `completed=168`. Timeout and known Codex stream-disconnect protocol failures retry before dead-lettering; non-retryable provider protocol failures remain terminal for queue selection, status open-item counts, native typing context, and progress delivery state.
 - Channel outbox after round4 reconnect/tone live deployment: `pending=11`, `delivered=245`, `retryable=0`, `invalid=0`; platform-specific Telegram and Discord pending counts are both 0 in the deployment status report.
 - Channels: Telegram and Discord enabled; Telegram probe ready; Discord gateway probe ready; Discord real inbound evidence present.

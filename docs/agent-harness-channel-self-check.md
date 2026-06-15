@@ -9,7 +9,7 @@ Current activation baseline:
 - Harness home: `D:\Warehouse\Rust-OpenClaw-Core\.agent-harness`
 - Active prompt/config authority: `D:\Warehouse\Rust-OpenClaw-Core\.agent-harness\workspace`, `.agent-harness\openclaw.json`, and `.agent-harness\harness-config.json`
 - Harness CLI: `D:\Warehouse\Rust-OpenClaw-Core\target\debug\agent-harness.exe`
-- Source snapshot archive: `D:\Warehouse\Rust-OpenClaw-Core\imports\openclaw-core-snapshot`
+- Retired source snapshot archive: `D:\Warehouse\Rust-OpenClaw-Core\imports\openclaw-core-snapshot`
 - Runtime workspace/Codex cwd: `D:\Warehouse\Research\OpenClaw_WSL`
 - Active agent: `main`
 - Latest readiness target: `ready=true`, no failed checks, and no unexpected warnings. Exact pass counts may drift as new readiness checks are added.

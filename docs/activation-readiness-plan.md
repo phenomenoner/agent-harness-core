@@ -2,7 +2,7 @@
 
 Date: 2026-06-15
 
-This is the working checklist for turning the Rust Windows Agent Harness from a local core runtime into the active replacement for the Docker legacy gateway.
+This is the working checklist for operating the Rust Windows Agent Harness as the active live gateway. Older Docker/OpenClaw gateway names and container paths are retired historical labels kept only for import and rollback context.
 
 ## Latest Verified State
 
@@ -10,11 +10,11 @@ This is the working checklist for turning the Rust Windows Agent Harness from a 
 
 - Round4-3 live robustness implementation is staged on 2026-06-15: runtime-loop Windows lock/JSON sharing-violation paths retry instead of failing silently, runtime queue `lease-busy` is a retryable non-idle status, supervised infinite runtime loops enter `safe-mode` with reduced concurrency instead of exiting after repeated errors, cron scheduler has read-only lint plus interval-floor/stale-lock hardening, and status/readiness/log scans tail-sample large JSONL ledgers.
 - Round4-3 staged verification passed fmt, workspace check, 243 core tests, 19 CLI tests, staging build, public hygiene, and `git diff --check` with line-ending warnings only. The first live `cron-scheduler-lint` run found existing imported cron content blockers (`errors=65`, `warnings=26`); those scheduler entries need operator review before scheduler cleanliness can be claimed.
-- Live harness home is now repo-local `.agent-harness`; `.agent-harness/` is ignored by git. `imports/activation-harness` remains only as a pre-rebase backup.
+- Live harness home and source/config authority are now repo-local `.agent-harness`; `.agent-harness/` is ignored by git. `imports/activation-harness`, `imports/openclaw-core-snapshot`, `.openclaw`, Docker gateway paths, and Linux/container paths such as `/root/.openclaw`, `/home/agent/.openclaw`, and `/workspace` are retired import/rollback context only.
 - Latest channel identity / delivery intent / cron scheduler / live-control implementation verification passed `cargo fmt --all --check`, staged workspace check, 239 core tests, 18 CLI tests, staged build, public export hygiene, and non-live cutover CLI smoke.
 - `agent-harness.exe` builds; `cargo fmt --all` and full `cargo test --workspace` passed with 207 core tests, 16 CLI tests, and doc-tests. Previous activation also passed `cargo build`.
 - Earlier deployment validation passed `cargo build --workspace`, gateway stop/start with direct runners, live `status`, live `enable-check`, and outbox plan. Current Round4-2 live cutovers should use `ops-cutover-request`/`approve`/`apply` plus `harness.ps1 gateway start|stop|restart --live-control-token <token>` instead of direct self-stop from a live channel turn.
-- Supervisor scripts were regenerated with `target/debug/agent-harness.exe`, `--source-home`, `--runtime-workspace D:\Warehouse\Research\OpenClaw_WSL`, `tools/agent-discord-gateway/index.mjs`, one bounded-concurrency `runtime-loop.ps1`, and `worker-loop.ps1`.
+- Supervisor scripts are regenerated with `target/debug/agent-harness.exe`, `.agent-harness` as `--source-home`, `--runtime-workspace D:\Warehouse\Research\OpenClaw_WSL`, `tools/agent-discord-gateway/index.mjs`, one bounded-concurrency `runtime-loop.ps1`, and `worker-loop.ps1`.
 - `AgentHarness-*` scheduled task registration returned access-denied in this environment, so the runtime workers, worker, progress delivery, Telegram, Discord outbox, and Discord gateway loops were started manually as hidden PowerShell processes from the generated scripts.
 - Round3-2 timeout/progress reconciliation is implemented: `timeout` is terminal for runtime queue selection, status open-item counts, native typing context, and progress delivery state. A queued pending row with a timeout receipt should no longer be interpreted as open work. See `docs/round3-2-implementation-and-upgrade-plan.md`.
 - Latest live status after restart: `ready=true`, `passed=58`, `warnings=0`, `failed=0`; runtime `queued=123`, `open=0`, `prepared=123`, `completed=120`; outbox `pending=0`, `delivered=186`, `retryable=0`, `invalid=0`.
@@ -33,7 +33,7 @@ This is the working checklist for turning the Rust Windows Agent Harness from a 
 
 The target state is:
 
-- Docker legacy gateway can be stopped, not deleted.
+- Retired Docker/OpenClaw gateway artifacts remain available for rollback inspection, but active live operation must not route through them.
 - Rust harness can receive Telegram/Discord DM input.
 - Slash commands work consistently across Telegram/Discord.
 - Ordinary DM input can route to the right imported agent/session, run Codex through app-server, write transcript/trajectory/Codex binding files, and deliver the assistant reply.
@@ -102,9 +102,9 @@ These must pass before cutover.
    - Run `channel-delivery-record --status delivered`.
    - Confirm future `channel-outbox-plan` skips delivered messages and retries failed messages.
    - For Telegram smoke, set or import `TELEGRAM_BOT_TOKEN` and the imported Telegram user/chat allow-lists, then run `telegram-poll-once` against a controlled DM; confirm denied updates are skipped and allowed command/agent replies are delivered by the Bot API.
-   - For Telegram handoff rehearsal, run `telegram-loop --iterations 0` only after confirming the old Docker gateway is not also consuming Telegram updates.
+   - For Telegram handoff rehearsal, run `telegram-loop --iterations 0` only after confirming no retired Docker/OpenClaw gateway process is also consuming Telegram updates.
    - For Discord outbound smoke, set or import `DISCORD_BOT_TOKEN`, create a Discord outbox item with `channel-run-once --platform discord ...`, then run `discord-outbox-send-once`.
-   - For Discord inbound handoff rehearsal, import Discord user/channel/guild allow-lists, run `discord-gateway-probe`, then run `discord-gateway-loop` only after confirming the old Docker gateway is not also connected.
+   - For Discord inbound handoff rehearsal, import Discord user/channel/guild allow-lists, run `discord-gateway-probe`, then run `discord-gateway-loop` only after confirming no retired Docker/OpenClaw gateway process is also connected.
 
 7. Logging gate
    - Run `enable-check`.
@@ -118,7 +118,7 @@ These must pass before cutover.
 
 ## Smoke Gates
 
-These should be run before stopping the Docker gateway.
+These should be run before any handoff from a retired gateway or before enabling a freshly regenerated live gateway plan.
 
 1. Command smoke
    - Telegram DM: `/status`, `/model`, `/new`, `/think`, `/steer`, `/btw`, `/stop`.
@@ -246,7 +246,7 @@ As of 2026-06-08 local verification:
 - `telegram-probe` is implemented and passes against `imports/activation-harness` as the non-consuming Telegram `getMe` readiness check, separating token/API failures from update consumption before live `telegram-poll-once` handoff.
 - `discord-gateway-probe` passes with the imported Discord token and Node 24 global WebSocket support.
 - `discord-outbox-send-once` passes with an empty pending outbox, writes `discord.outbox-send-once`, and does not send any message when `pending=0`.
-- `supervisor-plan` generated three Windows scheduled-task plans (`runtime-loop`, `telegram-loop`, `discord-gateway-loop`) plus install/start/stop/uninstall scripts under `imports/activation-harness/state/supervisor/windows-scheduled-tasks`; generated scripts use absolute paths, point at the local `imports/openclaw-core-snapshot` source because the mounted `D:\Warehouse\Research\OpenClaw_WSL\.openclaw` path is absent, and contain no raw token/key/secret strings.
+- Historical 2026-06-08 import smoke: `supervisor-plan` generated three Windows scheduled-task plans (`runtime-loop`, `telegram-loop`, `discord-gateway-loop`) plus install/start/stop/uninstall scripts under `imports/activation-harness/state/supervisor/windows-scheduled-tasks`; those generated scripts pointed at the local `imports/openclaw-core-snapshot` source because the mounted legacy path was absent. This is retired import evidence, not the active live plan. Current live plans must point `--source-home` at `.agent-harness` and keep the Codex cwd in `--runtime-workspace`.
 - The Codex Desktop MSIX `codex.exe` path is not spawnable from this harness environment and should not be used for service runtime.
 - Offline normal-turn smoke passes through `channel-run-once` with `tools/agent-fake-codex-app-server/fake-codex-app-server.cmd`, producing runtime-run-once, Codex run, Codex completion, transcript, outbox, delivery receipt, and operational log evidence without a model request or channel send.
 - Runtime loop idle/drain smoke passes with `runtime-loop --stop-when-idle` and writes `state/runtime-queue/loop-last.json` without a model request when no pending queue items remain.
@@ -295,9 +295,9 @@ cargo run -p agent-harness-cli -- healthz --target-home C:\path\to\.agent-harnes
 cargo run -p agent-harness-cli -- status --harness-home C:\path\to\.agent-harness --json
 cargo run -p agent-harness-cli -- cron-scheduler-lint --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.agent-harness --workspace C:\path\to\.agent-harness\workspace --dry-run --enable
 cargo run -p agent-harness-cli -- cron-scheduler-run-once --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.agent-harness --workspace C:\path\to\.agent-harness\workspace --dry-run --enable
-cargo run -p agent-harness-cli -- supervisor-plan --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.openclaw --workspace C:\path\to\workspace --harness-cli C:\path\to\agent-harness.exe --codex-exe C:\path\to\codex.cmd --agent main
-cargo run -p agent-harness-cli -- channel-run-once --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.openclaw --platform telegram --channel-id smoke --user-id operator --message /status
-cargo run -p agent-harness-cli -- channel-run-once --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.openclaw --platform telegram --channel-id offline-runtime-smoke --user-id operator --message "offline runtime smoke" --agent main --codex-exe tools\agent-fake-codex-app-server\fake-codex-app-server.cmd --timeout-ms 5000
+cargo run -p agent-harness-cli -- supervisor-plan --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.agent-harness --workspace C:\path\to\.agent-harness\workspace --harness-cli C:\path\to\agent-harness.exe --codex-exe C:\path\to\codex.cmd --agent main
+cargo run -p agent-harness-cli -- channel-run-once --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.agent-harness --platform telegram --channel-id smoke --user-id operator --message /status
+cargo run -p agent-harness-cli -- channel-run-once --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.agent-harness --platform telegram --channel-id offline-runtime-smoke --user-id operator --message "offline runtime smoke" --agent main --codex-exe tools\agent-fake-codex-app-server\fake-codex-app-server.cmd --timeout-ms 5000
 cargo run -p agent-harness-cli -- runtime-loop --harness-home C:\path\to\.agent-harness --codex-exe tools\agent-fake-codex-app-server\fake-codex-app-server.cmd --iterations 1 --idle-ms 1 --stop-when-idle
 cargo run -p agent-harness-cli -- codex-launch-probe --harness-home C:\path\to\.agent-harness --execution-dir C:\path\to\prepared-execution --startup-probe-ms 750
 cargo run -p agent-harness-cli -- plugin-sidecar-probe --harness-home C:\path\to\.agent-harness
@@ -305,10 +305,10 @@ cargo run -p agent-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\
 cargo run -p agent-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\.agent-harness --method plugins.list
 $env:AGENT_HARNESS_PLUGIN_SOURCE_ROOTS='C:\path\to\openclaw-src\extensions;C:\path\to\openclaw-mem-src\extensions'
 cargo run -p agent-harness-cli -- plugin-sidecar-call --harness-home C:\path\to\.agent-harness --method tools.probe
-cargo run -p agent-harness-cli -- discord-event-run-once --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.openclaw --event-file C:\path\to\discord-message-create.json
-cargo run -p agent-harness-cli -- discord-gateway-probe --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.openclaw
-cargo run -p agent-harness-cli -- telegram-poll-once --source-home C:\path\to\.openclaw --harness-home C:\path\to\.agent-harness --agent main --codex-exe C:\path\to\codex.cmd --poll-timeout-seconds 1 --max-updates 10
-cargo run -p agent-harness-cli -- telegram-loop --source-home C:\path\to\.openclaw --harness-home C:\path\to\.agent-harness --agent main --codex-exe C:\path\to\codex.cmd --iterations 1 --idle-ms 1000
+cargo run -p agent-harness-cli -- discord-event-run-once --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.agent-harness --event-file C:\path\to\discord-message-create.json
+cargo run -p agent-harness-cli -- discord-gateway-probe --harness-home C:\path\to\.agent-harness --source-home C:\path\to\.agent-harness
+cargo run -p agent-harness-cli -- telegram-poll-once --source-home C:\path\to\.agent-harness --harness-home C:\path\to\.agent-harness --agent main --codex-exe C:\path\to\codex.cmd --poll-timeout-seconds 1 --max-updates 10
+cargo run -p agent-harness-cli -- telegram-loop --source-home C:\path\to\.agent-harness --harness-home C:\path\to\.agent-harness --agent main --codex-exe C:\path\to\codex.cmd --iterations 1 --idle-ms 1000
 cargo run -p agent-harness-cli -- discord-outbox-send-once --harness-home C:\path\to\.agent-harness --outbox-limit 20
 ```
 

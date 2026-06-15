@@ -26,7 +26,7 @@ Follow-up Discord typing triage on 2026-06-12 found a completed `codex app-serve
 
 Follow-up provider-isolation triage on 2026-06-12 found a new-agent/OpenRouter setup had written `model_provider = "openrouter"` into the shared live Codex home, causing default Telegram and Discord `main` turns to fail with a missing `OPENROUTER_API_KEY` and then emit placeholder channel text. The hotfix keeps explicit OpenRouter turns in `codex-home-providers/openrouter`, rewrites stale generated shared config for the default Codex/OAuth route, passes required provider secrets from harness env files into app-server children, and records app-server `method=error` or failed `turn/completed` events as terminal `ProtocolError` receipts instead of successful empty replies.
 
-The old `imports/activation-harness` tree is retained only as a pre-rebase backup. The old `imports/openclaw-core-snapshot` tree is retained as a legacy source archive and rollback reference. New runtime settings, state, receipts, databases, logs, prompt injection ledgers, secrets, and supervisor artifacts should live under `.agent-harness`.
+The old `imports/activation-harness` tree is retained only as a pre-rebase backup. The old `imports/openclaw-core-snapshot` tree is retained as a legacy source archive and rollback reference. `.openclaw`, Docker gateway names, and Linux/container internal paths such as `/root/.openclaw`, `/home/agent/.openclaw`, and `/workspace` are retired labels from the imported environment; they are not live source/config authority. New runtime settings, state, receipts, databases, logs, prompt injection ledgers, secrets, and supervisor artifacts should live under `.agent-harness`.
 
 ## Start Here: Topology And Docs
 
@@ -37,6 +37,7 @@ Live topology:
 - Runtime state: `.agent-harness/state`, including runtime queue, channel outbox, delivery receipts, progress events, worker SQLite store, logs, and supervisor artifacts.
 - Secrets: `.agent-harness/secrets`; never print or commit these files.
 - Legacy archives: `imports/openclaw-core-snapshot` and `imports/activation-harness`; treat them as historical/rollback inputs, not active authority.
+- Retired legacy labels: `.openclaw`, Docker gateway paths, and Linux/container paths such as `/root/.openclaw`, `/home/agent/.openclaw`, and `/workspace`; use them only in historical import/inspection notes, never for live supervisor/channel/cron routing.
 - Codex runtime cwd for live loops: `D:\Warehouse\Research\OpenClaw_WSL`; this is the Codex working directory, not the prompt-file authority.
 - Live process set: one bounded-concurrency `runtime-loop` plus `worker-loop`, `progress-delivery-loop`, `telegram-loop`, `discord-outbox-loop`, and `discord-gateway-loop`; the current live scheduler cutover also includes `cron-scheduler-loop`.
 - Runtime capacity policy: global 12, per-agent/group 6, per-agent-per-channel 3; Round5 adds runtime dispatch classes so interactive, cron, worker, and maintenance turns have independent lease domains and caps. The live runtime loop uses `--runtime-concurrency 12` and keeps `--safe-mode-restart-ms` enabled for supervised infinite loops.
@@ -139,6 +140,8 @@ The project starts with a small, testable foundation:
 
 ## Full Command Walkthrough
 
+The first import commands intentionally reference a retired `.openclaw` source when migrating or inspecting old state. Active live supervisor, channel, Telegram/Discord, worker, and cron scheduler commands must use `.agent-harness` as both harness home and source/config authority; the Codex cwd belongs in `--runtime-workspace`, not `--source-home`.
+
 ```powershell
 cargo test
 cargo run -p agent-harness-cli -- doctor
@@ -157,21 +160,21 @@ cargo run -p agent-harness-cli -- memory-hook --target-home C:\path\to\.agent-ha
 cargo run -p agent-harness-cli -- ops-backup --target-home C:\path\to\.agent-harness --label pre-cutover
 cargo run -p agent-harness-cli -- ops-cutover-receipt --target-home C:\path\to\.agent-harness --note "pre-cutover readiness"
 cargo run -p agent-harness-cli -- worker-status --target-home C:\path\to\.agent-harness
-cargo run -p agent-harness-cli -- supervisor-plan --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --harness-cli C:\path\to\agent-harness.exe --codex-exe C:\path\to\codex.cmd --agent main
-cargo run -p agent-harness-cli -- skills --source-home C:\path\to\.openclaw --query "repair memory cron" --agent mem-cron --limit 3
+cargo run -p agent-harness-cli -- supervisor-plan --source-home C:\path\to\.agent-harness --target-home C:\path\to\.agent-harness --harness-cli C:\path\to\agent-harness.exe --codex-exe C:\path\to\codex.cmd --agent main
+cargo run -p agent-harness-cli -- skills --source-home C:\path\to\.agent-harness --query "repair memory cron" --agent mem-cron --limit 3
 cargo run -p agent-harness-cli -- skills --harness-home C:\path\to\.agent-harness --output imports\skills
-cargo run -p agent-harness-cli -- turn-plan --source-home C:\path\to\.openclaw --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron"
-cargo run -p agent-harness-cli -- channel-step --source-home C:\path\to\.openclaw --platform discord --channel-id dm-123 --user-id user-456 --agent main --message "/status channels" --output imports\channel
-cargo run -p agent-harness-cli -- channel-apply --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "/model openrouter/anthropic/claude-sonnet-4"
-cargo run -p agent-harness-cli -- channel-receive --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "continue with the selected model"
-cargo run -p agent-harness-cli -- channel-run-once --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "continue with the selected model" --codex-exe C:\path\to\codex.exe
+cargo run -p agent-harness-cli -- turn-plan --source-home C:\path\to\.agent-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron"
+cargo run -p agent-harness-cli -- channel-step --source-home C:\path\to\.agent-harness --platform discord --channel-id dm-123 --user-id user-456 --agent main --message "/status channels" --output imports\channel
+cargo run -p agent-harness-cli -- channel-apply --source-home C:\path\to\.agent-harness --target-home C:\path\to\.agent-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "/model openrouter/anthropic/claude-sonnet-4"
+cargo run -p agent-harness-cli -- channel-receive --source-home C:\path\to\.agent-harness --target-home C:\path\to\.agent-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "continue with the selected model"
+cargo run -p agent-harness-cli -- channel-run-once --source-home C:\path\to\.agent-harness --target-home C:\path\to\.agent-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "continue with the selected model" --codex-exe C:\path\to\codex.exe
 cargo run -p agent-harness-cli -- channel-outbox-plan --target-home C:\path\to\.agent-harness --platform telegram --limit 20
 cargo run -p agent-harness-cli -- channel-identity-check --target-home C:\path\to\.agent-harness --platform telegram --account-id default --chat-id dm-123 --agent main
-cargo run -p agent-harness-cli -- telegram-poll-once --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --agent main --codex-exe C:\path\to\codex.exe --poll-timeout-seconds 1 --max-updates 10
-cargo run -p agent-harness-cli -- telegram-loop --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --agent main --codex-exe C:\path\to\codex.exe --iterations 0 --idle-ms 1000 --max-consecutive-errors 5
+cargo run -p agent-harness-cli -- telegram-poll-once --source-home C:\path\to\.agent-harness --target-home C:\path\to\.agent-harness --agent main --codex-exe C:\path\to\codex.exe --poll-timeout-seconds 1 --max-updates 10
+cargo run -p agent-harness-cli -- telegram-loop --source-home C:\path\to\.agent-harness --target-home C:\path\to\.agent-harness --agent main --codex-exe C:\path\to\codex.exe --iterations 0 --idle-ms 1000 --max-consecutive-errors 5
 cargo run -p agent-harness-cli -- discord-outbox-send-once --target-home C:\path\to\.agent-harness --outbox-limit 20
-cargo run -p agent-harness-cli -- turn-plan --source-home C:\path\to\.openclaw --harness-home C:\path\to\.agent-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "continue with the selected model"
-cargo run -p agent-harness-cli -- queue-enqueue --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron"
+cargo run -p agent-harness-cli -- turn-plan --source-home C:\path\to\.agent-harness --harness-home C:\path\to\.agent-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "continue with the selected model"
+cargo run -p agent-harness-cli -- queue-enqueue --source-home C:\path\to\.agent-harness --target-home C:\path\to\.agent-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron"
 cargo run -p agent-harness-cli -- queue-prepare --target-home C:\path\to\.agent-harness
 cargo run -p agent-harness-cli -- runtime-run-once --target-home C:\path\to\.agent-harness --codex-exe C:\path\to\codex.exe --timeout-ms 300000
 cargo run -p agent-harness-cli -- runtime-loop --target-home C:\path\to\.agent-harness --codex-exe C:\path\to\codex.exe --runtime-concurrency 3 --iterations 0 --idle-ms 1000 --max-consecutive-errors 5
@@ -181,19 +184,19 @@ cargo run -p agent-harness-cli -- codex-preflight --target-home C:\path\to\.agen
 cargo run -p agent-harness-cli -- codex-launch-probe --target-home C:\path\to\.agent-harness --startup-probe-ms 750
 cargo run -p agent-harness-cli -- codex-run --target-home C:\path\to\.agent-harness --timeout-ms 300000
 cargo run -p agent-harness-cli -- codex-complete --target-home C:\path\to\.agent-harness --assistant-message "Smoke completion recorded."
-cargo run -p agent-harness-cli -- prompt-bundle --source-home C:\path\to\.openclaw --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron" --output imports\prompt
+cargo run -p agent-harness-cli -- prompt-bundle --source-home C:\path\to\.agent-harness --platform telegram --channel-id dm-123 --user-id user-456 --agent main --message "repair memory cron" --output imports\prompt
 cargo run -p agent-harness-cli -- cron-plan --source-home C:\path\to\.openclaw --output imports\cron
-cargo run -p agent-harness-cli -- cron-scheduler-lint --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --dry-run --enable --resume-cron --allow-deterministic-run
-cargo run -p agent-harness-cli -- cron-scheduler-run-once --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --dry-run --enable --resume-cron --allow-deterministic-run
-cargo run -p agent-harness-cli -- cron-scheduler-loop --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --iterations 0 --idle-ms 60000 --max-consecutive-errors 5
+cargo run -p agent-harness-cli -- cron-scheduler-lint --source-home C:\path\to\.agent-harness --target-home C:\path\to\.agent-harness --workspace C:\path\to\.agent-harness\workspace --dry-run --enable --resume-cron --allow-deterministic-run
+cargo run -p agent-harness-cli -- cron-scheduler-run-once --source-home C:\path\to\.agent-harness --target-home C:\path\to\.agent-harness --workspace C:\path\to\.agent-harness\workspace --dry-run --enable --resume-cron --allow-deterministic-run
+cargo run -p agent-harness-cli -- cron-scheduler-loop --source-home C:\path\to\.agent-harness --target-home C:\path\to\.agent-harness --workspace C:\path\to\.agent-harness\workspace --iterations 0 --idle-ms 60000 --max-consecutive-errors 5
 cargo run -p agent-harness-cli -- cron-runs --target-home C:\path\to\.agent-harness --limit 20
 cargo run -p agent-harness-cli -- cron-run-control --target-home C:\path\to\.agent-harness --action retry --run-id <cronrun-id> --reason "operator retry"
 cargo run -p agent-harness-cli -- cron-run-control --target-home C:\path\to\.agent-harness --action quarantine --agent-id <agent> --entry-id <entry> --reason "bad cron"
-cargo run -p agent-harness-cli -- native-cron-enqueue --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --resume-cron --master-agent main
+cargo run -p agent-harness-cli -- native-cron-enqueue --source-home C:\path\to\.agent-harness --target-home C:\path\to\.agent-harness --resume-cron --master-agent main
 cargo run -p agent-harness-cli -- deterministic-cron-plan --workspace C:\path\to\workspace --output imports\deterministic-cron
 cargo run -p agent-harness-cli -- deterministic-cron-enqueue --workspace C:\path\to\workspace --target-home C:\path\to\.agent-harness --allow-deterministic-run --dry-run-shell --master-agent main
 cargo run -p agent-harness-cli -- subagent-plan --source-home C:\path\to\.openclaw --output imports\subagents
-cargo run -p agent-harness-cli -- subagent-enqueue --source-home C:\path\to\.openclaw --target-home C:\path\to\.agent-harness --resume-subagents --master-agent main
+cargo run -p agent-harness-cli -- subagent-enqueue --source-home C:\path\to\.agent-harness --target-home C:\path\to\.agent-harness --resume-subagents --master-agent main
 ```
 
 If `cargo` is not visible in a newly opened terminal, restart the terminal or use:

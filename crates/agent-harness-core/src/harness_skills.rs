@@ -9,12 +9,12 @@ use crate::{HARNESS_BUILTIN_SKILL_NAMESPACE, SKILL_FILE_NAME};
 const BUILTIN_HARNESS_SKILL_SYNC_SCHEMA: &str = "agent-harness.builtin-skill-sync.v1";
 const BUILTIN_HARNESS_SKILL_MANIFEST_SCHEMA: &str = "agent-harness.builtin-skill-manifest.v1";
 const AGENT_WINDOWS_HARNESS_SKILL_ID: &str = "agent-windows-harness";
-const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.11";
+const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.12";
 
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
 description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, response tone, and Codex prompt continuity policy.
-version: 0.1.11
+version: 0.1.12
 platforms: [windows]
 metadata:
   agent_harness:
@@ -43,7 +43,8 @@ Use it when the user mentions:
 
 1. Treat this skill as the versioned harness runbook. Check it before relying on older docs or session memory.
 2. Treat the harness as the orchestrator and Codex CLI as the model/tool runtime.
-3. Preserve legacy source state shape where possible: source workspace, prompt files, agent registry, sessions, memory files, cron state, plugin state, and receipts.
+3. Active live source/config authority is `.agent-harness`: use `.agent-harness/workspace`, `.agent-harness/openclaw.json`, and `.agent-harness/harness-config.json` for live supervisor, channel, and scheduler routing. Treat `.openclaw`, Docker gateway names, `imports/openclaw-core-snapshot`, and container paths such as `/root/.openclaw`, `/home/agent/.openclaw`, and `/workspace` as retired import/rollback labels only.
+4. Preserve legacy source state shape where possible: source workspace, prompt files, agent registry, sessions, memory files, cron state, plugin state, and receipts.
 4. Prefer dry-run, receipt, and append-only JSONL records before irreversible handoff.
 5. Keep deterministic cron off the LLM path. Agent-turn cron may enqueue isolated runtime work only through CronRunStore admission, the `cron` worker lane, and the `cron` runtime class.
 6. Keep Telegram and Discord session keys stable: platform, channel id, user id, and agent id determine continuity unless /new changes it.
@@ -144,7 +145,7 @@ Commands should update channel state and receipts before enqueueing agent turns.
 - Use channel-identity-check before live handoff for every enabled platform/account/channel tuple. A bound result identifies the owning agent; missing/disabled/conflicting bindings are fail-closed and must be fixed in config rather than bypassed at runtime.
 - Use telegram-probe before live Telegram handoff to validate Bot API getMe without consuming updates or sending messages. It writes state/channels/telegram-probe.json, appends telegram-probe-receipts.jsonl, and logs telegram.probe.
 - Use telegram-poll-once for Telegram Bot API smoke tests. It reads TELEGRAM_BOT_TOKEN or AGENT_HARNESS_TELEGRAM_ACCOUNT_<ID>_BOT_TOKEN plus imported Telegram chat/user allow-lists from the environment or secrets/channel-credentials.env, stores account-specific offset state after every successful poll, denies non-allowed/unbound updates before runtime dispatch, runs channel-run-once for allowed text updates, sends matching-account pending replies, records delivery receipts, and writes a telegram.poll-once operational log.
-- Use telegram-loop for operator-run Telegram handoff. It repeats the same poll-once path with --telegram-account, --iterations, --idle-ms, --max-consecutive-errors, and optional --stop-file. Use finite iterations for tests and --iterations 0 only when the old gateway is not also consuming Telegram updates.
+- Use telegram-loop for operator-run Telegram handoff. It repeats the same poll-once path with --telegram-account, --iterations, --idle-ms, --max-consecutive-errors, and optional --stop-file. Use finite iterations for tests and --iterations 0 only when no retired Docker/OpenClaw gateway process is also consuming Telegram updates.
 - Use discord-outbox-send-once for Discord outbound smoke. It reads DISCORD_BOT_TOKEN or AGENT_HARNESS_DISCORD_ACCOUNT_<ID>_BOT_TOKEN from the environment or secrets/channel-credentials.env, sends pending platform=discord outbox messages for the selected account through Discord REST, records delivery receipts, and writes a discord.outbox-send-once operational log.
 - Use discord-event-run-once for Discord inbound normalization smoke. It accepts a Discord Gateway MESSAGE_CREATE event from --event-file or --event-json, skips bot/empty/duplicate messages, enforces imported Discord user/channel/guild allow-lists, resolves channel identity, calls channel-run-once for allowed text, writes discord-event receipts, and logs discord.event-run-once. Use discord-gateway-probe before discord-gateway-loop for live WebSocket handoff. The gateway loop accepts --discord-account and --stop-file, passes the account selector to event-run-once, and closes the WebSocket when the stop file appears. INTERACTION_CREATE application commands are acknowledged by the Node gateway, translated to slash-command text, and routed through the same Discord event pipeline; real DM text readiness still requires a MESSAGE_CREATE receipt.
 - Failed receipts stay retryable; delivered receipts are skipped by future outbox plans.
@@ -165,7 +166,7 @@ Commands should update channel state and receipts before enqueueing agent turns.
 
 ## Activation Checklist
 
-Before replacing the Docker legacy gateway:
+Before a live gateway cutover or a handoff from retired Docker/OpenClaw gateway artifacts:
 
 1. Run import dry-run and review skipped or sensitive items.
 2. Execute import with an explicit conflict policy.
@@ -186,7 +187,7 @@ Before replacing the Docker legacy gateway:
 17. Run plugin-sidecar-probe and plugin-sidecar-call for sidecar.status/plugins.list/tools.probe; set AGENT_HARNESS_PLUGIN_SOURCE_ROOTS when imported manifests live outside the harness home. Confirm plugin-sidecar, plugin-sidecar-probe, and plugin-sidecar-bridge are pass in enable-check. This proves manifest catalog and JSON-RPC bridge readiness; plugin-specific tool executors still need dedicated adapters.
 18. Smoke-test a normal DM turn through channel receive, queue prepare, Codex plan/preflight, launch probe, codex-run, and completion receipt. Use tools/agent-fake-codex-app-server/fake-codex-app-server.cmd for offline smoke; use the intended Codex CLI only for operator-run model smoke.
 19. Run runtime-loop --stop-when-idle for idle/drain smoke and confirm state/runtime-queue/loop-last.json plus runtime.loop-stopped log evidence.
-20. Run supervisor-plan with the intended harness CLI, Codex executable, channel loop selection, and task prefix. Confirm state/supervisor/windows-scheduled-tasks/supervisor-plan.json, absolute paths in generated scripts, no raw token/key/secret strings in scripts, and enable-check supervisor-plan pass.
+20. Run supervisor-plan with the intended harness CLI, Codex executable, channel loop selection, task prefix, and `.agent-harness` as source-home. Confirm state/supervisor/windows-scheduled-tasks/supervisor-plan.json, absolute paths in generated scripts, no raw token/key/secret strings in scripts, and enable-check supervisor-plan pass.
 
 ## Codex Runtime Flow
 
@@ -207,8 +208,9 @@ For Windows supervisor handoff, use supervisor-plan:
 - It writes runner scripts for runtime-loop, telegram-loop, and discord-gateway-loop under state/supervisor/windows-scheduled-tasks/scripts.
 - It writes install-scheduled-tasks.ps1, start-scheduled-tasks.ps1, stop-scheduled-tasks.ps1, uninstall-scheduled-tasks.ps1, and supervisor-plan.json.
 - It uses absolute paths because Task Scheduler does not run from the repo directory by default.
+- Its channel and scheduler runner scripts must point `--source-home` at the active `.agent-harness`, not retired `.openclaw` or imported snapshot paths.
 - It uses stop files for graceful loop shutdown and never embeds raw bot tokens or API keys.
-- The operator must explicitly run the generated installer/start scripts after the old gateway is offline.
+- The operator must explicitly run the generated installer/start scripts after confirming no retired gateway process is consuming the same channels.
 
 For manual debugging of one prepared turn, the expanded path is:
 

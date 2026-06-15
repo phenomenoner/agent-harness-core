@@ -28,5 +28,8 @@
 ## Sub-Agent Delegation Preference
 
 - When sub-agent tooling is available, use sub-agents by default to accelerate bounded sidecar tasks such as read-only codebase inspection, plan/diff review, documentation gap checks, and test matrix review, unless the user explicitly asks not to use sub-agents.
+- Every sub-agent assignment must have a bounded scope and an expected output. When waiting for a sub-agent, always use an explicit `timeout_ms` instead of an unbounded wait.
+- If a sub-agent wait times out, inspect whether the result is needed on the critical path. If it is not critical, continue locally; if it is critical, retry at most once with a shorter, clearer prompt and timeout.
+- Close completed, timed-out, irrelevant, or invalid-dispatch sub-agents promptly so stalled side work does not consume worker capacity or hide the actual blocker.
 - Keep live gateway control, destructive shell actions, final cutover, and any operation that can interrupt the active communication channel on the main agent path.
 - For sub-agents that edit code, assign disjoint file ownership, tell them they are not alone in the codebase, and require them to work with existing changes instead of reverting unrelated edits.

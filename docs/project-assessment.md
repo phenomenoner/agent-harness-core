@@ -2,7 +2,7 @@
 
 Date: 2026-06-08
 
-Status note, 2026-06-11: this file is a historical assessment and architecture baseline. For current live topology, readiness counts, command shortcuts, and documentation pointers, start with `README.md`, then use `docs/agent-harness-dev-handoff.md`, `docs/agent-harness-test-handoff.md`, `docs/activation-readiness-plan.md`, and `docs/agent-harness-feature-parity.md`.
+Status note, 2026-06-15: this file is a historical assessment and architecture baseline, not live routing guidance. Current live source/config authority is `.agent-harness`; `.openclaw`, Docker gateway names, and container-internal paths such as `/root/.openclaw`, `/home/agent/.openclaw`, and `/workspace` are retired import labels. For current live topology, readiness counts, command shortcuts, and documentation pointers, start with `README.md`, then use `docs/agent-harness-operations-handbook.md`, `docs/agent-harness-dev-handoff.md`, `docs/agent-harness-test-handoff.md`, `docs/activation-readiness-plan.md`, and `docs/agent-harness-feature-parity.md`.
 
 ## Executive Summary
 

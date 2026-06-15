@@ -19,6 +19,8 @@
 - Make runtime retry caps and operator fallback hints configurable through `runtimeBackoff` instead of a fixed hard-coded attempt count.
 - Isolate native cron LLM turns from interactive runtime turns with a dedicated `cron` worker lane, `runtimeClass=cron`, class-scoped runtime leases, one-shot and namespaced sticky cron sessions under `cron-sessions`, CronRunStore dispatch guards, skipped runtime tombstones, and legacy root lease compatibility during upgrade.
 - Completed the Round5 live cutover with ticket `cutover-1781524146730`, backup label `pre-round5-cron-runtime-isolation-cutover`, regenerated 7-loop supervisor plan, bundled skill sync, direct runner start, and post-cutover `healthz`/`status --json` readiness `passed=59 warnings=0 failed=0`.
+- Default `supervisor-plan` source-home to the active harness home instead of the retired `.openclaw` import path, and default the standalone Discord gateway wrapper to the selected harness home when no `AGENT_SOURCE_HOME` or `--source-home` is provided.
+- Mark `.openclaw`, Docker gateway names, imported snapshots, and Linux/container internal paths as retired import/rollback labels across operations docs, activation docs, development handoff, CLI help, and the builtin harness skill.
 
 ### Added
 
@@ -52,6 +54,16 @@
 
 ### Verification
 
+- Source-home hotfix verification: `cargo fmt --all --check`
+- Source-home hotfix verification: `cargo test -p agent-harness-cli --target-dir target\staging-test-sourcehome-cli -- --test-threads=1` (23 tests)
+- Source-home hotfix verification: `cargo test -p agent-harness-core warns_when_source_home_is_retired_openclaw --target-dir target\staging-test-sourcehome-core -- --test-threads=1`
+- Source-home hotfix verification: `cargo test -p agent-harness-core --target-dir target\staging-test-sourcehome-core -- --test-threads=1` (257 tests)
+- Source-home hotfix verification: `node --check tools\agent-discord-gateway\index.mjs`
+- Source-home hotfix verification: `cargo check --workspace --target-dir target\staging-check-sourcehome`
+- Source-home hotfix verification: `cargo build -p agent-harness-cli --target-dir target\staging-build-sourcehome`
+- Source-home hotfix verification: `git diff --check` (CRLF warnings only)
+- Source-home hotfix verification: `target\staging-build-sourcehome\debug\agent-harness.exe public-hygiene --root .public-export\agent-harness-core` (`forbiddenHits=[]`)
+- Source-home hotfix verification: staging `supervisor-plan` without `--source-home` generated channel/scheduler scripts with `--source-home` equal to the target harness home.
 - Round5 staged verification: `cargo fmt --all --check`
 - Round5 staged verification: `cargo check --workspace --target-dir target\staging-check-round5-resume2`
 - Round5 staged verification: `cargo test -p agent-harness-core --target-dir target\staging-test-round5-core-resume2 -- --test-threads=1` (255 tests)

@@ -14,7 +14,7 @@ const DEFAULT_DISCORD_INTENTS = (1 << 0) | (1 << 9) | (1 << 12);
 function parseArgs(argv) {
   const args = {
     harnessHome: process.env.AGENT_HARNESS_HOME || ".agent-harness",
-    sourceHome: process.env.AGENT_SOURCE_HOME || ".openclaw",
+    sourceHome: process.env.AGENT_SOURCE_HOME || null,
     workspace: null,
     runtimeWorkspace: null,
     harnessCli: process.env.AGENT_HARNESS_CLI || defaultHarnessCli(),
@@ -80,6 +80,9 @@ function parseArgs(argv) {
     } else {
       throw new Error(`unknown argument: ${flag}`);
     }
+  }
+  if (!args.sourceHome) {
+    args.sourceHome = args.harnessHome;
   }
   return args;
 }

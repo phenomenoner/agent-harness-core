@@ -7712,7 +7712,7 @@ fn ops_control_args_from_args(args: &[String]) -> Result<OpsControlArgs, String>
 
 fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs, String> {
     let mut target_home = default_harness_home();
-    let mut source_home = default_source_home();
+    let mut source_home = None;
     let mut workspace = None;
     let mut runtime_workspace = None;
     let mut harness_cli = default_harness_cli();
@@ -7744,10 +7744,11 @@ fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs,
         match args[i].as_str() {
             "--source-home" => {
                 i += 1;
-                source_home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--source-home requires a path".to_string())?;
+                source_home = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--source-home requires a path".to_string())?,
+                );
             }
             "--workspace" => {
                 i += 1;
@@ -7893,6 +7894,8 @@ fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs,
         }
         i += 1;
     }
+
+    let source_home = source_home.unwrap_or_else(|| target_home.clone());
 
     Ok(SupervisorPlanArgs {
         target_home,
@@ -9202,7 +9205,7 @@ fn discord_dm_history_probe_args_from_args(
 fn discord_event_run_once_args_from_args(
     args: &[String],
 ) -> Result<DiscordEventRunOnceArgs, String> {
-    let mut home = default_source_home();
+    let mut home = None;
     let mut workspace = None;
     let mut runtime_workspace = None;
     let mut target_home = default_harness_home();
@@ -9221,10 +9224,11 @@ fn discord_event_run_once_args_from_args(
         match args[i].as_str() {
             "--source-home" => {
                 i += 1;
-                home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--source-home requires a path".to_string())?;
+                home = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--source-home requires a path".to_string())?,
+                );
             }
             "--workspace" => {
                 i += 1;
@@ -9323,6 +9327,7 @@ fn discord_event_run_once_args_from_args(
         return Err("provide exactly one of --event-file or --event-json".to_string());
     }
 
+    let home = home.unwrap_or_else(|| target_home.clone());
     let source = match workspace {
         Some(workspace) => AgentSource::with_workspace(home, workspace),
         None => AgentSource::new(home),
@@ -9344,7 +9349,7 @@ fn discord_event_run_once_args_from_args(
 }
 
 fn discord_gateway_args_from_args(args: &[String]) -> Result<DiscordGatewayArgs, String> {
-    let mut home = default_source_home();
+    let mut home = None;
     let mut workspace = None;
     let mut runtime_workspace = None;
     let mut target_home = default_harness_home();
@@ -9364,10 +9369,11 @@ fn discord_gateway_args_from_args(args: &[String]) -> Result<DiscordGatewayArgs,
         match args[i].as_str() {
             "--source-home" => {
                 i += 1;
-                home = args
-                    .get(i)
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--source-home requires a path".to_string())?;
+                home = Some(
+                    args.get(i)
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--source-home requires a path".to_string())?,
+                );
             }
             "--workspace" => {
                 i += 1;
@@ -9454,6 +9460,7 @@ fn discord_gateway_args_from_args(args: &[String]) -> Result<DiscordGatewayArgs,
         i += 1;
     }
 
+    let home = home.unwrap_or_else(|| target_home.clone());
     let source = match workspace {
         Some(workspace) => AgentSource::with_workspace(home, workspace),
         None => AgentSource::new(home),
@@ -14833,7 +14840,9 @@ fn print_help() {
     println!("  subagent-enqueue Persist resumable subagent work into worker dispatch");
     println!();
     println!("Options:");
-    println!("  --source-home <path>  Legacy source home directory");
+    println!(
+        "  --source-home <path>  Source/config authority; live uses .agent-harness, .openclaw is retired/import-only"
+    );
     println!("  --workspace <path>      Override workspace directory");
     println!(
         "  --runtime-workspace <path> Codex cwd; prompt files still come from --workspace/source"
@@ -15015,6 +15024,29 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_plan_defaults_source_home_to_target_home() {
+        let args = supervisor_plan_args_from_args(&[
+            "--harness-home".to_string(),
+            "live-home".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(args.target_home, PathBuf::from("live-home"));
+        assert_eq!(args.source_home, PathBuf::from("live-home"));
+
+        let args = supervisor_plan_args_from_args(&[
+            "--source-home".to_string(),
+            "legacy-home".to_string(),
+            "--harness-home".to_string(),
+            "live-home".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(args.target_home, PathBuf::from("live-home"));
+        assert_eq!(args.source_home, PathBuf::from("legacy-home"));
+    }
+
+    #[test]
     fn runtime_loop_lease_busy_does_not_count_as_error() {
         let root = cli_temp_root("runtime_loop_lease_busy_does_not_count_as_error");
         fs::create_dir_all(
@@ -15118,6 +15150,56 @@ mod tests {
 
         assert_eq!(args.discord_account.as_deref(), Some("ops"));
         assert_eq!(args.max_messages, 1);
+    }
+
+    #[test]
+    fn discord_gateway_defaults_source_home_to_target_home() {
+        let args = discord_gateway_args_from_args(&[
+            "--harness-home".to_string(),
+            "live-home".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(args.target_home, PathBuf::from("live-home"));
+        assert_eq!(args.source.home, PathBuf::from("live-home"));
+
+        let args = discord_gateway_args_from_args(&[
+            "--source-home".to_string(),
+            "legacy-home".to_string(),
+            "--harness-home".to_string(),
+            "live-home".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(args.target_home, PathBuf::from("live-home"));
+        assert_eq!(args.source.home, PathBuf::from("legacy-home"));
+    }
+
+    #[test]
+    fn discord_event_defaults_source_home_to_target_home() {
+        let args = discord_event_run_once_args_from_args(&[
+            "--harness-home".to_string(),
+            "live-home".to_string(),
+            "--event-json".to_string(),
+            "{}".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(args.target_home, PathBuf::from("live-home"));
+        assert_eq!(args.source.home, PathBuf::from("live-home"));
+
+        let args = discord_event_run_once_args_from_args(&[
+            "--source-home".to_string(),
+            "legacy-home".to_string(),
+            "--harness-home".to_string(),
+            "live-home".to_string(),
+            "--event-json".to_string(),
+            "{}".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(args.target_home, PathBuf::from("live-home"));
+        assert_eq!(args.source.home, PathBuf::from("legacy-home"));
     }
 
     fn discord_message(

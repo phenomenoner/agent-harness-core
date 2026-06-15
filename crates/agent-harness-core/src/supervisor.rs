@@ -112,6 +112,12 @@ pub fn write_windows_supervisor_plan(
                 .to_string(),
         );
     }
+    if is_retired_legacy_source_home(&source_home, &harness_home) {
+        warnings.push(format!(
+            "source-home {} points at retired legacy .openclaw/import routing; live supervisor plans should use the active harness home as source-home",
+            source_home.display()
+        ));
+    }
 
     if options.include_runtime {
         let component = "runtime-loop";
@@ -654,6 +660,17 @@ fn absolutize_command_path(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
+fn is_retired_legacy_source_home(source_home: &Path, harness_home: &Path) -> bool {
+    if source_home == harness_home {
+        return false;
+    }
+    source_home
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.eq_ignore_ascii_case(".openclaw"))
+        .unwrap_or(false)
+}
+
 fn ps_quote_path(path: &Path) -> String {
     ps_quote(&path.display().to_string())
 }
@@ -756,6 +773,92 @@ mod tests {
         assert!(stop_script.contains("Stop-ScheduledTask"));
         assert!(stop_script.contains("AGENT_HARNESS_LIVE_SESSION"));
         assert!(stop_script.contains("ops-cutover-status"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn warns_when_source_home_is_retired_openclaw() {
+        let root = temp_root("warns_when_source_home_is_retired_openclaw");
+        let harness_home = root.join(".agent-harness");
+        let report = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
+            harness_home: harness_home.clone(),
+            source_home: root.join(".openclaw"),
+            workspace: None,
+            runtime_workspace: None,
+            harness_cli: root.join("agent-harness.exe"),
+            codex_executable: Some(root.join("codex.cmd")),
+            node_executable: PathBuf::from("node"),
+            discord_gateway_script: root.join("tools").join("discord").join("index.mjs"),
+            agent_id: None,
+            output_dir: Some(root.join("supervisor")),
+            task_prefix: "AgentHarness".to_string(),
+            include_runtime: false,
+            runtime_workers: 1,
+            include_worker: false,
+            include_cron_scheduler: true,
+            include_progress: false,
+            include_telegram: false,
+            include_discord: false,
+            idle_ms: 1000,
+            runtime_timeout_ms: 1_800_000,
+            runtime_idle_timeout_ms: 300_000,
+            max_consecutive_errors: 5,
+            telegram_poll_timeout_seconds: 1,
+            telegram_max_updates: 10,
+            telegram_outbox_limit: 20,
+        })
+        .unwrap();
+
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("retired legacy .openclaw/import routing"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn harness_home_named_openclaw_is_not_warned_as_external_legacy_source() {
+        let root = temp_root("harness_home_named_openclaw_is_not_warned");
+        let harness_home = root.join(".openclaw");
+        let report = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
+            harness_home: harness_home.clone(),
+            source_home: harness_home,
+            workspace: None,
+            runtime_workspace: None,
+            harness_cli: root.join("agent-harness.exe"),
+            codex_executable: Some(root.join("codex.cmd")),
+            node_executable: PathBuf::from("node"),
+            discord_gateway_script: root.join("tools").join("discord").join("index.mjs"),
+            agent_id: None,
+            output_dir: Some(root.join("supervisor")),
+            task_prefix: "AgentHarness".to_string(),
+            include_runtime: false,
+            runtime_workers: 1,
+            include_worker: false,
+            include_cron_scheduler: true,
+            include_progress: false,
+            include_telegram: false,
+            include_discord: false,
+            idle_ms: 1000,
+            runtime_timeout_ms: 1_800_000,
+            runtime_idle_timeout_ms: 300_000,
+            max_consecutive_errors: 5,
+            telegram_poll_timeout_seconds: 1,
+            telegram_max_updates: 10,
+            telegram_outbox_limit: 20,
+        })
+        .unwrap();
+
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("retired legacy .openclaw/import routing"))
+        );
 
         let _ = fs::remove_dir_all(root);
     }

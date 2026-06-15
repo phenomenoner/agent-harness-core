@@ -19,8 +19,9 @@ Important local paths:
 
 - Harness home: `.agent-harness`
 - Active prompt/config authority: `.agent-harness/workspace`, `.agent-harness/openclaw.json`, `.agent-harness/harness-config.json`
-- Previous activation backup: `imports/activation-harness`
-- Source snapshot archive: `imports/openclaw-core-snapshot`
+- Retired previous activation backup: `imports/activation-harness`
+- Retired source snapshot archive: `imports/openclaw-core-snapshot`
+- Retired labels only: `.openclaw`, Docker gateway names, `/root/.openclaw`, `/home/agent/.openclaw`, and `/workspace`
 - Runtime workspace/Codex cwd: `D:\Warehouse\Research\OpenClaw_WSL`
 - Harness CLI: `target/debug/agent-harness.exe`
 - Codex CLI: `.tools/codex-cli/node_modules/.bin/codex.cmd`
@@ -57,7 +58,7 @@ Remaining expected warnings:
 ## Test Session Rules
 
 - Do not paste or print raw tokens or API keys.
-- Keep the old Docker gateway stopped while testing Telegram/Discord, otherwise both systems can consume the same messages.
+- Keep any retired Docker/OpenClaw gateway process stopped while testing Telegram/Discord, otherwise both systems can consume the same messages.
 - Prefer one message at a time and wait for receipts before sending the next.
 - After every failed or suspicious behavior, collect `status`, `enable-check`, relevant outbox plan, and recent logs before changing code.
 - For background-service symptoms, also inspect `docs/round3-2-implementation-and-upgrade-plan.md`; `/stop` currently cancels the active runtime turn, not detached local servers or arbitrary process trees.
@@ -284,7 +285,7 @@ Pick one non-main imported agent from registry, for example an enabled agent wit
 Run an offline command first:
 
 ```powershell
-.\target\debug\agent-harness.exe turn-plan --source-home .\imports\openclaw-core-snapshot --harness-home .\.agent-harness --platform local --channel-id multi-agent-smoke --user-id operator --agent main --message "status check"
+.\target\debug\agent-harness.exe turn-plan --source-home .\.agent-harness --harness-home .\.agent-harness --platform local --channel-id multi-agent-smoke --user-id operator --agent main --message "status check"
 ```
 
 Then in Telegram or Discord, route a message to the intended agent if the channel routing syntax/config supports it. If no explicit route syntax is available, use the current default agent and only verify that `main` remains stable.

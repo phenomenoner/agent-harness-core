@@ -264,13 +264,15 @@ agent-harness cron-run-control --harness-home .\.agent-harness --action quaranti
 Cron/subagent adapter commands:
 
 ```powershell
-agent-harness native-cron-enqueue --harness-home .\.agent-harness --source-home .\imports\openclaw-core-snapshot --resume-cron --master-agent main
-agent-harness cron-scheduler-lint --harness-home .\.agent-harness --source-home .\imports\openclaw-core-snapshot --dry-run --enable --resume-cron --allow-deterministic-run
-agent-harness cron-scheduler-run-once --harness-home .\.agent-harness --source-home .\imports\openclaw-core-snapshot --dry-run --enable --resume-cron --allow-deterministic-run
-agent-harness cron-scheduler-loop --harness-home .\.agent-harness --source-home .\imports\openclaw-core-snapshot --iterations 0 --idle-ms 60000 --max-consecutive-errors 5
+agent-harness native-cron-enqueue --harness-home .\.agent-harness --source-home .\.agent-harness --resume-cron --master-agent main
+agent-harness cron-scheduler-lint --harness-home .\.agent-harness --source-home .\.agent-harness --workspace .\.agent-harness\workspace --dry-run --enable --resume-cron --allow-deterministic-run
+agent-harness cron-scheduler-run-once --harness-home .\.agent-harness --source-home .\.agent-harness --workspace .\.agent-harness\workspace --dry-run --enable --resume-cron --allow-deterministic-run
+agent-harness cron-scheduler-loop --harness-home .\.agent-harness --source-home .\.agent-harness --workspace .\.agent-harness\workspace --iterations 0 --idle-ms 60000 --max-consecutive-errors 5
 agent-harness deterministic-cron-enqueue --harness-home .\.agent-harness --workspace D:\path\to\workspace --allow-deterministic-run --dry-run-shell --master-agent main
-agent-harness subagent-enqueue --harness-home .\.agent-harness --source-home .\imports\openclaw-core-snapshot --resume-subagents --master-agent main
+agent-harness subagent-enqueue --harness-home .\.agent-harness --source-home .\.agent-harness --resume-subagents --master-agent main
 ```
+
+Use `imports\openclaw-core-snapshot`, `.openclaw`, or container paths only for historical import validation. Active scheduler and worker dispatch examples use `.agent-harness` as source/config authority.
 
 ## P4 Implementation Order
 
