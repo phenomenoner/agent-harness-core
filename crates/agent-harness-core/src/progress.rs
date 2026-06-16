@@ -20,6 +20,10 @@ const SENSITIVE_PREVIEW: &str = "[redacted sensitive preview]";
 pub struct AgentProgressContext {
     pub queue_id: String,
     pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     pub session_key: String,
     pub platform: String,
     pub channel_id: String,
@@ -35,6 +39,10 @@ pub struct AgentProgressEvent {
     pub queue_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     pub session_key: String,
     pub platform: String,
     pub channel_id: String,
@@ -129,8 +137,14 @@ pub struct AgentProgressDeliveryPlanSummary {
 #[serde(rename_all = "camelCase")]
 pub struct AgentProgressDeliveryPending {
     pub queue_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     pub platform: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub channel_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     pub user_id: String,
     pub session_key: String,
     pub message_kind: AgentProgressDeliveryMessageKind,
@@ -163,7 +177,9 @@ pub struct AgentProgressDeliveryRecordOptions {
     pub harness_home: PathBuf,
     pub queue_id: String,
     pub platform: String,
+    pub account_id: Option<String>,
     pub channel_id: String,
+    pub thread_id: Option<String>,
     pub user_id: String,
     pub session_key: String,
     pub message_kind: AgentProgressDeliveryMessageKind,
@@ -173,6 +189,7 @@ pub struct AgentProgressDeliveryRecordOptions {
     pub event_line: usize,
     pub text_hash: String,
     pub terminal: bool,
+    pub policy_decision: Option<String>,
     pub error: Option<String>,
     pub now_ms: i64,
 }
@@ -184,7 +201,11 @@ pub struct AgentProgressDeliveryReceipt {
     pub at_ms: i64,
     pub queue_id: String,
     pub platform: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub channel_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     pub user_id: String,
     pub session_key: String,
     pub message_kind: AgentProgressDeliveryMessageKind,
@@ -194,6 +215,8 @@ pub struct AgentProgressDeliveryReceipt {
     pub event_line: usize,
     pub text_hash: String,
     pub terminal: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_decision: Option<String>,
     pub error: Option<String>,
 }
 
@@ -203,6 +226,7 @@ pub enum AgentProgressDeliveryStatus {
     Delivered,
     Failed,
     SkippedDenied,
+    SkippedPermanent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,7 +250,11 @@ impl Default for AgentProgressDeliveryState {
 #[serde(rename_all = "camelCase")]
 struct AgentProgressDeliveryCursor {
     platform: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
     channel_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread_id: Option<String>,
     user_id: String,
     session_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -261,7 +289,9 @@ impl AgentProgressDeliveryCursor {
     fn new(platform: String, channel_id: String, user_id: String, session_key: String) -> Self {
         Self {
             platform,
+            account_id: None,
             channel_id,
+            thread_id: None,
             user_id,
             session_key,
             body_provider_message_id: None,
@@ -378,6 +408,8 @@ impl AgentProgressEvent {
             at_ms,
             queue_id: context.queue_id.clone(),
             agent_id: context.agent_id.clone(),
+            account_id: context.account_id.clone(),
+            thread_id: context.thread_id.clone(),
             session_key: context.session_key.clone(),
             platform: context.platform.clone(),
             channel_id: context.channel_id.clone(),
@@ -535,8 +567,11 @@ pub fn plan_agent_progress_delivery(
             };
             pending.push(AgentProgressDeliveryPending {
                 queue_id: queue_id.clone(),
+                agent_id: latest.event.agent_id.clone(),
                 platform: latest.event.platform.clone(),
+                account_id: latest.event.account_id.clone(),
                 channel_id: latest.event.channel_id.clone(),
+                thread_id: latest.event.thread_id.clone(),
                 user_id: latest.event.user_id.clone(),
                 session_key: latest.event.session_key.clone(),
                 message_kind,
@@ -577,7 +612,9 @@ pub fn record_agent_progress_delivery(
         at_ms: options.now_ms,
         queue_id: options.queue_id,
         platform: options.platform,
+        account_id: options.account_id,
         channel_id: options.channel_id,
+        thread_id: options.thread_id,
         user_id: options.user_id,
         session_key: options.session_key,
         message_kind: options.message_kind,
@@ -587,12 +624,15 @@ pub fn record_agent_progress_delivery(
         event_line: options.event_line,
         text_hash: options.text_hash,
         terminal: options.terminal,
+        policy_decision: options.policy_decision,
         error: options.error,
     };
 
     if matches!(
         receipt.status,
-        AgentProgressDeliveryStatus::Delivered | AgentProgressDeliveryStatus::SkippedDenied
+        AgentProgressDeliveryStatus::Delivered
+            | AgentProgressDeliveryStatus::SkippedDenied
+            | AgentProgressDeliveryStatus::SkippedPermanent
     ) {
         let cursor = state
             .queues
@@ -606,7 +646,9 @@ pub fn record_agent_progress_delivery(
                 )
             });
         cursor.platform = receipt.platform.clone();
+        cursor.account_id = receipt.account_id.clone();
         cursor.channel_id = receipt.channel_id.clone();
+        cursor.thread_id = receipt.thread_id.clone();
         cursor.user_id = receipt.user_id.clone();
         cursor.session_key = receipt.session_key.clone();
         receipt.terminal = cursor.terminal || receipt.terminal;
@@ -649,6 +691,9 @@ fn render_agent_progress_actions(
     max_events: usize,
     max_preview_chars: usize,
 ) -> String {
+    if !user_visible_action_stream_enabled(events) {
+        return String::new();
+    }
     let mut actions = Vec::<RenderedAction>::new();
     let start = events.len().saturating_sub(max_events.max(1));
     for event in events.iter().skip(start) {
@@ -726,12 +771,13 @@ fn render_agent_progress_status(
 }
 
 fn is_rendered_action_event(event: &AgentProgressEvent) -> bool {
-    !matches!(
-        event.kind,
-        AgentProgressKind::Runtime
-            | AgentProgressKind::AssistantStream
-            | AgentProgressKind::AssistantNarration
-    )
+    matches!(event.kind, AgentProgressKind::Delivery)
+}
+
+fn user_visible_action_stream_enabled(events: &[&AgentProgressEvent]) -> bool {
+    events
+        .iter()
+        .any(|event| event.kind == AgentProgressKind::Delivery)
 }
 
 fn latest_status_event<'a>(events: &[&'a AgentProgressEvent]) -> Option<&'a AgentProgressEvent> {
@@ -982,7 +1028,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn renders_actions_and_status_as_separate_messages() {
+    fn renders_status_without_raw_internal_action_stream_by_default() {
         let context = context();
         let events = vec![
             AgentProgressEvent::new(
@@ -1015,12 +1061,12 @@ mod tests {
         let status = render_agent_progress_status(&refs, 9 * 60_000 + 1000, 120, 1200);
         let panel = render_agent_progress_panel(&refs, 9 * 60_000 + 1000, 8, 120);
 
-        assert!(actions.contains("📚 skill_view: \"codebase-inspection\""));
-        assert!(actions.contains("💻 terminal: \"cargo test -p agent-harness-core\""));
-        assert!(!actions.contains("⏳ Working"));
+        assert!(actions.is_empty());
+        assert!(!actions.contains("skill_view"));
+        assert!(!actions.contains("cargo test"));
         assert!(!actions.contains("assistant_stream"));
         assert_eq!(status, "⏳ Working — 9 min — running tools");
-        assert_eq!(panel, format!("{actions}\n\n{status}"));
+        assert_eq!(panel, status);
     }
 
     #[test]
@@ -1081,7 +1127,7 @@ mod tests {
         let actions = render_agent_progress_actions(&refs, 8, 120);
         let status = render_agent_progress_status(&refs, 61_000, 120, 1200);
 
-        assert!(actions.contains("pwsh: agent-harness status"));
+        assert!(actions.is_empty());
         assert!(!actions.contains("verifying skills-index"));
         assert_eq!(
             status,
@@ -1258,24 +1304,21 @@ mod tests {
             ..AgentProgressDeliveryPlanOptions::default()
         })
         .unwrap();
-        assert_eq!(plan.pending.len(), 2);
+        assert_eq!(plan.pending.len(), 1);
         assert_eq!(
             plan.pending[0].message_kind,
-            AgentProgressDeliveryMessageKind::Body
-        );
-        assert_eq!(
-            plan.pending[1].message_kind,
             AgentProgressDeliveryMessageKind::Status
         );
         assert_eq!(plan.pending[0].action, AgentProgressDeliveryAction::Send);
-        assert_eq!(plan.pending[1].action, AgentProgressDeliveryAction::Send);
 
         for (index, pending) in plan.pending.iter().cloned().enumerate() {
             record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
                 harness_home: harness_home.clone(),
                 queue_id: pending.queue_id,
                 platform: pending.platform,
+                account_id: pending.account_id,
                 channel_id: pending.channel_id,
+                thread_id: pending.thread_id,
                 user_id: pending.user_id,
                 session_key: pending.session_key,
                 message_kind: pending.message_kind,
@@ -1285,6 +1328,7 @@ mod tests {
                 event_line: pending.event_line,
                 text_hash: pending.text_hash,
                 terminal: pending.terminal,
+                policy_decision: Some("test".to_string()),
                 error: None,
                 now_ms: 2000,
             })
@@ -1312,7 +1356,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(rate_limited.pending.len(), 0);
-        assert_eq!(rate_limited.summary.rate_limited, 2);
+        assert_eq!(rate_limited.summary.rate_limited, 1);
 
         let edit = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
             harness_home,
@@ -1322,16 +1366,11 @@ mod tests {
             ..AgentProgressDeliveryPlanOptions::default()
         })
         .unwrap();
-        assert_eq!(edit.pending.len(), 2);
+        assert_eq!(edit.pending.len(), 1);
         assert_eq!(edit.pending[0].action, AgentProgressDeliveryAction::Edit);
-        assert_eq!(edit.pending[1].action, AgentProgressDeliveryAction::Edit);
         assert_eq!(
             edit.pending[0].provider_message_id.as_deref(),
             Some("provider-1")
-        );
-        assert_eq!(
-            edit.pending[1].provider_message_id.as_deref(),
-            Some("provider-2")
         );
 
         let _ = fs::remove_dir_all(root);
@@ -1362,14 +1401,16 @@ mod tests {
             ..AgentProgressDeliveryPlanOptions::default()
         })
         .unwrap();
-        assert_eq!(plan.pending.len(), 2);
+        assert_eq!(plan.pending.len(), 1);
 
         for pending in plan.pending {
             record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
                 harness_home: harness_home.clone(),
                 queue_id: pending.queue_id,
                 platform: pending.platform,
+                account_id: pending.account_id,
                 channel_id: pending.channel_id,
+                thread_id: pending.thread_id,
                 user_id: pending.user_id,
                 session_key: pending.session_key,
                 message_kind: pending.message_kind,
@@ -1379,6 +1420,7 @@ mod tests {
                 event_line: pending.event_line,
                 text_hash: pending.text_hash,
                 terminal: pending.terminal,
+                policy_decision: Some("test".to_string()),
                 error: Some("local/offline progress event".to_string()),
                 now_ms: 2000,
             })
@@ -1393,7 +1435,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(next.pending.len(), 0);
-        assert_eq!(next.summary.delivered_current, 2);
+        assert_eq!(next.summary.delivered_current, 1);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1436,7 +1478,9 @@ mod tests {
                 harness_home: harness_home.clone(),
                 queue_id: pending.queue_id,
                 platform: pending.platform,
+                account_id: pending.account_id,
                 channel_id: pending.channel_id,
+                thread_id: pending.thread_id,
                 user_id: pending.user_id,
                 session_key: pending.session_key,
                 message_kind: pending.message_kind,
@@ -1446,6 +1490,7 @@ mod tests {
                 event_line: pending.event_line,
                 text_hash: pending.text_hash,
                 terminal: pending.terminal,
+                policy_decision: Some("test".to_string()),
                 error: None,
                 now_ms: 2000,
             })
@@ -1473,13 +1518,8 @@ mod tests {
             ..AgentProgressDeliveryPlanOptions::default()
         })
         .unwrap();
-        assert!(!after_late_event.pending.is_empty());
-        assert!(
-            after_late_event
-                .pending
-                .iter()
-                .all(|pending| pending.terminal)
-        );
+        assert!(after_late_event.pending.is_empty());
+        assert_eq!(after_late_event.summary.delivered_current, 1);
         let mut warnings = Vec::new();
         let stored_events =
             read_progress_events(&agent_progress_events_file(&harness_home), &mut warnings)
@@ -1506,6 +1546,8 @@ mod tests {
         AgentProgressContext {
             queue_id: "turn:1".to_string(),
             agent_id: Some("main".to_string()),
+            account_id: Some("default".to_string()),
+            thread_id: None,
             session_key: "telegram:dm:user:main".to_string(),
             platform: "telegram".to_string(),
             channel_id: "dm".to_string(),

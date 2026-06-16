@@ -40,26 +40,27 @@ use agent_harness_core::{
     MemoryCanvasWorkerStatus, MemoryCredentialsExportOptions, MemoryCredentialsExportReport,
     MemoryHookAdapterOptions, MemoryHookKind, MemorySearchOptions, MemorySearchReport,
     MemoryVectorRecallOptions, MemoryVectorRecallReport, MemoryVectorRecallStatus, NativeCronPlan,
-    NativeCronPlanInput, NativeCronWorkerEnqueueOptions, OpenClawMemServiceProposeOptions,
-    OpenClawMemServiceRecallOptions, OpenClawMemServiceStatus, OpenClawMemServiceStatusOptions,
-    OpenClawMemServiceStoreOptions, OpsBackupOptions, OpsControlAction, OpsControlOptions,
-    OpsCutoverApplyOptions, OpsCutoverApproveOptions, OpsCutoverReceiptOptions,
-    OpsCutoverRequestOptions, OpsCutoverStatusOptions, PromptAssemblyOptions, PromptBundle,
-    PromptReductionOptions, PublicHygieneOptions, QueueShadowCompareOptions,
-    QueueShadowRecordOptions, RuntimeQueueCapacityOptions, RuntimeQueueControlAction,
-    RuntimeQueueControlOptions, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
-    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeRunOnceOptions,
-    RuntimeRunOnceReport, RuntimeRunOnceStatus, ScopedStopOptions, ScopedStopTarget,
-    SecurityScanOptions, SkillIndex, SkillSelectionQuery, SubagentPlan, SubagentPlanInput,
-    SubagentWorkerEnqueueOptions, SuperviseDeployCanaryOptions, SupervisionEvaluateOptions,
-    SupervisorChildState, TaskEntityOptions, TaskStatus, TokenEfficiencyOptions, TraceOptions,
-    TurnPlan, TurnPlanInput, VaultGetOptions, VaultPutOptions, WindowsSupervisorPlanOptions,
-    WindowsSupervisorPlanReport, WorkerCancelOptions, WorkerEnqueueOptions, WorkerJobKind,
-    WorkerReapStaleOptions, WorkerRunOnceOptions, WorkerRunOnceStatus, WorkerStatusOptions,
-    acquire_budget, append_harness_log, append_jsonl_value, apply_channel_command_step,
-    assemble_prompt_bundle, build_channel_step, build_dry_run_report, build_harness_skill_index,
-    build_import_plan, build_runtime_skill_index, build_source_skill_index, build_turn_plan,
-    cancel_worker_job, check_activation_readiness, check_config_drift, check_tool_description_pin,
+    NativeCronPlanInput, NativeCronWorkerEnqueueOptions, OpenClawMemReadPathSmokeOptions,
+    OpenClawMemServiceProposeOptions, OpenClawMemServiceRecallOptions, OpenClawMemServiceStatus,
+    OpenClawMemServiceStatusOptions, OpenClawMemServiceStoreOptions, OpsBackupOptions,
+    OpsControlAction, OpsControlOptions, OpsCutoverApplyOptions, OpsCutoverApproveOptions,
+    OpsCutoverReceiptOptions, OpsCutoverRequestOptions, OpsCutoverStatusOptions,
+    PromptAssemblyOptions, PromptBundle, PromptReductionOptions, PublicHygieneOptions,
+    QueueShadowCompareOptions, QueueShadowRecordOptions, RuntimeQueueCapacityOptions,
+    RuntimeQueueControlAction, RuntimeQueueControlOptions, RuntimeQueueEnqueueOptions,
+    RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
+    RuntimeRunOnceOptions, RuntimeRunOnceReport, RuntimeRunOnceStatus, ScopedStopOptions,
+    ScopedStopTarget, SecurityScanOptions, SkillIndex, SkillSelectionQuery, SubagentPlan,
+    SubagentPlanInput, SubagentWorkerEnqueueOptions, SuperviseDeployCanaryOptions,
+    SupervisionEvaluateOptions, SupervisorChildState, TaskEntityOptions, TaskStatus,
+    TokenEfficiencyOptions, TraceOptions, TurnPlan, TurnPlanInput, VaultGetOptions,
+    VaultPutOptions, WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport,
+    WorkerCancelOptions, WorkerEnqueueOptions, WorkerJobKind, WorkerReapStaleOptions,
+    WorkerRunOnceOptions, WorkerRunOnceStatus, WorkerStatusOptions, acquire_budget,
+    append_harness_log, append_jsonl_value, apply_channel_command_step, assemble_prompt_bundle,
+    build_channel_step, build_dry_run_report, build_harness_skill_index, build_import_plan,
+    build_runtime_skill_index, build_source_skill_index, build_turn_plan, cancel_worker_job,
+    check_activation_readiness, check_config_drift, check_tool_description_pin,
     collect_harness_metrics, collect_harness_status, collect_healthz, collect_ops_cutover_status,
     collect_token_efficiency, collect_worker_status, compare_channel_turn_shadow, control_cron_run,
     control_runtime_queue_item, create_learning_proposal, create_ops_backup, current_log_time_ms,
@@ -80,11 +81,11 @@ use agent_harness_core::{
     record_ops_cutover_receipt, record_ops_cutover_request, record_scoped_stop,
     record_supervise_deploy_canary, release_checklist, resolve_channel_identity,
     rotate_harness_log_if_needed, run_channel_once, run_codex_runtime, run_cron_scheduler_once,
-    run_memory_canvas_worker, run_memory_hook_adapter, run_public_hygiene, run_runtime_queue_once,
-    run_worker_once, scan_security_boundaries, schema_registry_entries, search_imported_memory,
-    search_imported_vector_memory, select_skills, store_openclaw_mem_service_memory,
-    sync_builtin_harness_skills, tool_description_hash, trace_harness_event,
-    upsert_background_task, validate_harness_config, write_channel_step,
+    run_memory_canvas_worker, run_memory_hook_adapter, run_openclaw_mem_read_path_smoke,
+    run_public_hygiene, run_runtime_queue_once, run_worker_once, scan_security_boundaries,
+    schema_registry_entries, search_imported_memory, search_imported_vector_memory, select_skills,
+    store_openclaw_mem_service_memory, sync_builtin_harness_skills, tool_description_hash,
+    trace_harness_event, upsert_background_task, validate_harness_config, write_channel_step,
     write_deterministic_cron_plan, write_memory_search_receipt, write_memory_vector_recall_receipt,
     write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
     write_subagent_plan, write_task_entity, write_turn_plan, write_windows_supervisor_plan,
@@ -153,6 +154,7 @@ fn main() {
         "memory-service-recall" => run_memory_service_recall(&rest),
         "memory-service-propose" => run_memory_service_propose(&rest),
         "memory-service-store" => run_memory_service_store(&rest),
+        "memory-read-path-smoke" => run_memory_read_path_smoke(&rest),
         "ops-backup" => run_ops_backup(&rest),
         "ops-cutover-request" => run_ops_cutover_request(&rest),
         "ops-cutover-approve" => run_ops_cutover_approve(&rest),
@@ -1373,7 +1375,35 @@ fn run_memory_service_status(args: &[String]) -> Result<(), String> {
         );
         println!("Status: {:?}", report.status);
         println!("Mode: {}", report.service_mode);
+        println!("Active slot owner: {}", report.active_slot_owner);
         println!("Qdrant edge mode: {}", report.qdrant_edge_mode);
+        println!(
+            "Credential bridge: apiKeyPresent={} model={} baseUrl={} keyLength={}",
+            report.credential_bridge.api_key_present,
+            report.credential_bridge.model,
+            report.credential_bridge.base_url,
+            report.credential_bridge.api_key_length
+        );
+        println!(
+            "Embedding coverage: observations={}/{} episodic={}/{} docs={}/{}",
+            display_opt_u64(report.embedding_coverage.observation_embeddings),
+            display_opt_u64(report.embedding_coverage.observations),
+            display_opt_u64(report.embedding_coverage.episodic_event_embeddings),
+            display_opt_u64(report.embedding_coverage.episodic_events),
+            display_opt_u64(report.embedding_coverage.docs_embeddings),
+            display_opt_u64(report.embedding_coverage.docs_chunks)
+        );
+        println!(
+            "Scope policy: {} crossAgentPrivateRecallAllowed={}",
+            report.scope_policy.default_scope,
+            report.scope_policy.cross_agent_private_recall_allowed
+        );
+        println!("Trust policy: {}", report.trust_policy.mode);
+        println!(
+            "Graph readiness: {} readyForAutonomousMatch={}",
+            report.graph_readiness.verdict, report.graph_readiness.ready_for_autonomous_match
+        );
+        println!("Mem-engine canary: {}", report.mem_engine_canary.status);
         if let Some(path) = &report.qdrant_edge_dir {
             println!("Qdrant edge: {}", path.display());
         }
@@ -1945,6 +1975,66 @@ fn run_channel_identity_check(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn run_memory_read_path_smoke(args: &[String]) -> Result<(), String> {
+    let args = memory_read_path_smoke_args_from_args(args)?;
+    let report = run_openclaw_mem_read_path_smoke(OpenClawMemReadPathSmokeOptions {
+        harness_home: args.target_home.clone(),
+        agent_id: args.agent_id,
+        query: args.query,
+        limit: args.limit,
+    })
+    .map_err(|err| err.to_string())?;
+    append_harness_log(
+        &args.target_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            if report.status == OpenClawMemServiceStatus::Blocked {
+                HarnessLogLevel::Warn
+            } else {
+                HarnessLogLevel::Info
+            },
+            "memory",
+            "memory.openclaw-mem-read-path-smoke",
+            format!(
+                "status={:?} recall={:?} bom={} noBom={} embedding={}",
+                report.status,
+                report.recall_report.status,
+                report.bom_jsonl_smoke_ok,
+                report.no_bom_jsonl_smoke_ok,
+                report.embedding_smoke_status
+            ),
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    if args.json {
+        print_json(&report)
+    } else {
+        println!("OpenClaw memory read-path smoke");
+        println!("Harness home: {}", report.harness_home.display());
+        println!(
+            "Agent: {}",
+            report.agent_id.as_deref().unwrap_or("(global)")
+        );
+        println!("Status: {:?}", report.status);
+        println!("Recall: {:?}", report.recall_report.status);
+        println!("Embedding smoke: {}", report.embedding_smoke_status);
+        println!("BOM JSONL smoke: {}", report.bom_jsonl_smoke_ok);
+        println!("No-BOM JSONL smoke: {}", report.no_bom_jsonl_smoke_ok);
+        println!(
+            "Graph verdict: {}",
+            report.status_report.graph_readiness.verdict
+        );
+        println!(
+            "Mem-engine canary: {}",
+            report.status_report.mem_engine_canary.status
+        );
+        for warning in &report.warnings {
+            println!("Warning: {warning}");
+        }
+        Ok(())
+    }
+}
+
 fn run_progress_delivery_once(args: &[String]) -> Result<(), String> {
     let args = progress_delivery_once_args_from_args(args)?;
     let report = execute_progress_delivery_once(&args)?;
@@ -2066,25 +2156,30 @@ fn execute_progress_delivery_once(
     let mut sent_messages = 0usize;
     let mut edited_messages = 0usize;
     let mut skipped_denied = 0usize;
+    let mut skipped_permanent = 0usize;
     let mut failed_deliveries = 0usize;
 
     for pending in plan.pending {
-        if let Err(reason) = progress_delivery_allowed(&policy, &pending) {
-            record_progress_delivery(
-                args,
-                &pending,
-                pending.action,
-                AgentProgressDeliveryStatus::SkippedDenied,
-                pending.provider_message_id.clone(),
-                Some(reason.clone()),
-            )?;
-            warnings.push(format!(
-                "progress delivery for {} denied by channel access policy: {}",
-                pending.queue_id, reason
-            ));
-            skipped_denied += 1;
-            continue;
-        }
+        let policy_decision = match progress_delivery_allowed(&policy, &pending, args) {
+            Ok(decision) => decision,
+            Err(reason) => {
+                record_progress_delivery(
+                    args,
+                    &pending,
+                    pending.action,
+                    AgentProgressDeliveryStatus::SkippedDenied,
+                    pending.provider_message_id.clone(),
+                    Some("channel-access-denied".to_string()),
+                    Some(reason.clone()),
+                )?;
+                warnings.push(format!(
+                    "progress delivery for {} denied by channel access policy: {}",
+                    pending.queue_id, reason
+                ));
+                skipped_denied += 1;
+                continue;
+            }
+        };
 
         match deliver_progress_pending(args, &pending) {
             Ok((actual_action, provider_message_id)) => {
@@ -2094,6 +2189,7 @@ fn execute_progress_delivery_once(
                     actual_action,
                     AgentProgressDeliveryStatus::Delivered,
                     provider_message_id,
+                    Some(policy_decision.clone()),
                     None,
                 )?;
                 match actual_action {
@@ -2102,16 +2198,23 @@ fn execute_progress_delivery_once(
                 }
             }
             Err(error) => {
+                let status = if progress_delivery_error_is_permanent(&error) {
+                    skipped_permanent += 1;
+                    AgentProgressDeliveryStatus::SkippedPermanent
+                } else {
+                    failed_deliveries += 1;
+                    AgentProgressDeliveryStatus::Failed
+                };
                 record_progress_delivery(
                     args,
                     &pending,
                     pending.action,
-                    AgentProgressDeliveryStatus::Failed,
+                    status,
                     pending.provider_message_id.clone(),
+                    Some(policy_decision.clone()),
                     Some(error.clone()),
                 )?;
                 warnings.push(error);
-                failed_deliveries += 1;
             }
         }
     }
@@ -2121,6 +2224,7 @@ fn execute_progress_delivery_once(
         sent_messages,
         edited_messages,
         skipped_denied,
+        skipped_permanent,
         failed_deliveries,
         warnings,
     };
@@ -2136,11 +2240,12 @@ fn execute_progress_delivery_once(
             "progress",
             "progress.delivery-once",
             format!(
-                "pending={} sent={} edited={} denied={} failed={}",
+                "pending={} sent={} edited={} denied={} permanent={} failed={}",
                 report.pending_count,
                 report.sent_messages,
                 report.edited_messages,
                 report.skipped_denied,
+                report.skipped_permanent,
                 report.failed_deliveries
             ),
         ),
@@ -2149,25 +2254,54 @@ fn execute_progress_delivery_once(
     Ok(report)
 }
 
+fn progress_delivery_account_id<'a>(
+    args: &'a ProgressDeliveryOnceArgs,
+    pending: &'a AgentProgressDeliveryPending,
+) -> Option<&'a str> {
+    pending
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|account_id| !account_id.is_empty())
+        .or_else(|| {
+            args.telegram_account
+                .as_deref()
+                .map(str::trim)
+                .filter(|account_id| !account_id.is_empty())
+        })
+}
+
 fn deliver_progress_pending(
     args: &ProgressDeliveryOnceArgs,
     pending: &AgentProgressDeliveryPending,
 ) -> Result<(AgentProgressDeliveryAction, Option<String>), String> {
     match pending.platform.as_str() {
         "telegram" => {
-            let token = telegram_bot_token(&args.target_home, args.telegram_account.as_deref())?;
+            let token = telegram_bot_token(
+                &args.target_home,
+                progress_delivery_account_id(args, pending),
+            )?;
             match pending.action {
-                AgentProgressDeliveryAction::Send => {
-                    telegram_send_message(&token, &pending.channel_id, &pending.text, None)
-                        .map(|id| (AgentProgressDeliveryAction::Send, id))
-                }
+                AgentProgressDeliveryAction::Send => telegram_send_message(
+                    &token,
+                    &pending.channel_id,
+                    &pending.text,
+                    TelegramSendOptions {
+                        message_thread_id: pending.thread_id.as_deref(),
+                        ..TelegramSendOptions::default()
+                    },
+                )
+                .map(|id| (AgentProgressDeliveryAction::Send, id)),
                 AgentProgressDeliveryAction::Edit => {
                     let Some(message_id) = pending.provider_message_id.as_deref() else {
                         return telegram_send_message(
                             &token,
                             &pending.channel_id,
                             &pending.text,
-                            None,
+                            TelegramSendOptions {
+                                message_thread_id: pending.thread_id.as_deref(),
+                                ..TelegramSendOptions::default()
+                            },
                         )
                         .map(|id| (AgentProgressDeliveryAction::Send, id));
                     };
@@ -2179,7 +2313,15 @@ fn deliver_progress_pending(
                     )
                     .map(|id| (AgentProgressDeliveryAction::Edit, id.or(Some(message_id.to_string()))))
                     .or_else(|edit_error| {
-                    telegram_send_message(&token, &pending.channel_id, &pending.text, None)
+                    telegram_send_message(
+                        &token,
+                        &pending.channel_id,
+                        &pending.text,
+                        TelegramSendOptions {
+                            message_thread_id: pending.thread_id.as_deref(),
+                            ..TelegramSendOptions::default()
+                        },
+                    )
                             .and_then(|id| {
                                 id.map(|id| (AgentProgressDeliveryAction::Send, Some(id)))
                                     .ok_or_else(|| {
@@ -2198,7 +2340,7 @@ fn deliver_progress_pending(
             }
         }
         "discord" => {
-            let token = discord_bot_token(&args.target_home, None)?;
+            let token = discord_bot_token(&args.target_home, pending.account_id.as_deref())?;
             match pending.action {
                 AgentProgressDeliveryAction::Send => {
                     discord_send_message(&token, &pending.channel_id, &pending.text, None)
@@ -2245,13 +2387,16 @@ fn record_progress_delivery(
     action: AgentProgressDeliveryAction,
     status: AgentProgressDeliveryStatus,
     provider_message_id: Option<String>,
+    policy_decision: Option<String>,
     error: Option<String>,
 ) -> Result<(), String> {
     record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
         harness_home: args.target_home.clone(),
         queue_id: pending.queue_id.clone(),
         platform: pending.platform.clone(),
+        account_id: pending.account_id.clone(),
         channel_id: pending.channel_id.clone(),
+        thread_id: pending.thread_id.clone(),
         user_id: pending.user_id.clone(),
         session_key: pending.session_key.clone(),
         message_kind: pending.message_kind,
@@ -2261,6 +2406,7 @@ fn record_progress_delivery(
         event_line: pending.event_line,
         text_hash: pending.text_hash.clone(),
         terminal: pending.terminal,
+        policy_decision,
         error,
         now_ms: current_time_ms()?,
     })
@@ -2271,9 +2417,17 @@ fn record_progress_delivery(
 fn progress_delivery_allowed(
     policy: &ChannelAccessPolicy,
     pending: &AgentProgressDeliveryPending,
-) -> Result<(), String> {
+    args: &ProgressDeliveryOnceArgs,
+) -> Result<String, String> {
     match pending.platform.as_str() {
         "telegram" => {
+            if pending.channel_id.starts_with('-')
+                && progress_delivery_account_id(args, pending).is_none()
+            {
+                return Err(
+                    "Telegram group/topic progress target has no resolved account id".to_string(),
+                );
+            }
             if policy.telegram_group_chat_ids.contains(&pending.channel_id) {
                 if telegram_user_is_admin(policy, &pending.user_id)
                     || policy
@@ -2287,14 +2441,14 @@ fn progress_delivery_allowed(
                         && policy.telegram_group_admin_user_ids.is_empty()
                         && !policy.telegram_group_chat_ids.is_empty())
                 {
-                    return Ok(());
+                    return Ok(progress_policy_decision("telegram-group", pending, args));
                 }
                 return Err(
                     "Telegram group progress target is not authorized for this user id".to_string(),
                 );
             }
             if telegram_user_is_admin(policy, &pending.user_id) {
-                Ok(())
+                Ok(progress_policy_decision("telegram-dm", pending, args))
             } else {
                 Err("Telegram DM progress target user id is not an admin/allowed user".to_string())
             }
@@ -2309,7 +2463,7 @@ fn progress_delivery_allowed(
                     || (policy.discord_group_allowed_user_ids.is_empty()
                         && !policy.discord_channel_ids.is_empty())
                 {
-                    return Ok(());
+                    return Ok(progress_policy_decision("discord-channel", pending, args));
                 }
                 return Err(
                     "Discord channel progress target is not authorized for this user id"
@@ -2317,7 +2471,7 @@ fn progress_delivery_allowed(
                 );
             }
             if discord_user_is_admin(policy, &pending.user_id) {
-                Ok(())
+                Ok(progress_policy_decision("discord-dm", pending, args))
             } else {
                 Err("Discord DM progress target user id is not an admin/allowed user".to_string())
             }
@@ -2326,6 +2480,27 @@ fn progress_delivery_allowed(
             "progress delivery does not know access policy for platform `{other}`"
         )),
     }
+}
+
+fn progress_policy_decision(
+    scope: &str,
+    pending: &AgentProgressDeliveryPending,
+    args: &ProgressDeliveryOnceArgs,
+) -> String {
+    let account = progress_delivery_account_id(args, pending).unwrap_or("default");
+    let thread = pending.thread_id.as_deref().unwrap_or("-");
+    format!(
+        "allowed:{scope}:account={account}:thread={thread}:messageKind={:?}",
+        pending.message_kind
+    )
+}
+
+fn progress_delivery_error_is_permanent(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("telegram http status 400")
+        && (lower.contains("chat not found")
+            || lower.contains("message thread not found")
+            || lower.contains("message to edit not found"))
 }
 
 fn run_telegram_probe(args: &[String]) -> Result<(), String> {
@@ -2692,7 +2867,7 @@ fn execute_telegram_poll_once(
         {
             continue;
         }
-        match telegram_send_outbound_message(token, &pending.message) {
+        match telegram_send_outbound_message(&args.target_home, token, &pending.message) {
             Ok(provider_message_id) => {
                 record_channel_delivery(ChannelDeliveryRecordOptions {
                     harness_home: args.target_home.clone(),
@@ -2794,6 +2969,14 @@ struct BoundedText {
 
 fn telegram_inbound_context(message: &serde_json::Value) -> Option<String> {
     let mut sections = Vec::new();
+    if let Some(thread_id) = message
+        .get("message_thread_id")
+        .and_then(telegram_id_string)
+    {
+        sections.push(format!(
+            "## InboundMessage: Telegram topic context\n- messageThreadId: {thread_id}"
+        ));
+    }
     if let Some(reply) = message.get("reply_to_message") {
         let mut lines = Vec::new();
         lines.push("## ReferencedMessage: Telegram reply context".to_string());
@@ -5570,6 +5753,14 @@ struct MemoryServiceRecallArgs {
     json: bool,
 }
 
+struct MemoryReadPathSmokeArgs {
+    target_home: PathBuf,
+    agent_id: Option<String>,
+    query: String,
+    limit: usize,
+    json: bool,
+}
+
 struct MemoryServiceProposeArgs {
     target_home: PathBuf,
     agent_id: Option<String>,
@@ -5710,6 +5901,7 @@ struct ProgressDeliveryOnceReport {
     sent_messages: usize,
     edited_messages: usize,
     skipped_denied: usize,
+    skipped_permanent: usize,
     failed_deliveries: usize,
     warnings: Vec<String>,
 }
@@ -7288,6 +7480,52 @@ fn memory_service_recall_args_from_args(
         query,
         limit,
         max_file_bytes,
+        json,
+    })
+}
+
+fn memory_read_path_smoke_args_from_args(
+    args: &[String],
+) -> Result<MemoryReadPathSmokeArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut agent_id = None;
+    let mut query = "operator memory smoke".to_string();
+    let mut limit = 3usize;
+    let mut json = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--agent" | "--agent-id" => {
+                i += 1;
+                agent_id = Some(required_arg(args, i, "--agent")?.to_string());
+            }
+            "--query" | "-q" => {
+                i += 1;
+                query = required_arg(args, i, "--query")?.to_string();
+            }
+            "--limit" => {
+                i += 1;
+                limit = parse_limit(required_arg(args, i, "--limit")?)?;
+            }
+            "--json" => json = true,
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    if query.trim().is_empty() {
+        return Err("--query must not be empty".to_string());
+    }
+    Ok(MemoryReadPathSmokeArgs {
+        target_home,
+        agent_id,
+        query,
+        limit,
         json,
     })
 }
@@ -9514,6 +9752,7 @@ fn plugin_sidecar_probe_args_from_args(args: &[String]) -> Result<PluginSidecarP
         i += 1;
     }
 
+    let sidecar_script = resolve_sidecar_script_path(&target_home, &sidecar_script);
     Ok(PluginSidecarProbeArgs {
         target_home,
         node_exe,
@@ -9574,6 +9813,7 @@ fn plugin_sidecar_call_args_from_args(args: &[String]) -> Result<PluginSidecarCa
         i += 1;
     }
 
+    let sidecar_script = resolve_sidecar_script_path(&target_home, &sidecar_script);
     Ok(PluginSidecarCallArgs {
         target_home,
         node_exe,
@@ -9581,6 +9821,34 @@ fn plugin_sidecar_call_args_from_args(args: &[String]) -> Result<PluginSidecarCa
         method,
         params,
     })
+}
+
+fn resolve_sidecar_script_path(target_home: &Path, sidecar_script: &Path) -> PathBuf {
+    if sidecar_script.is_absolute() {
+        return sidecar_script.to_path_buf();
+    }
+    let mut candidates = Vec::new();
+    if let Some(parent) = target_home.parent() {
+        candidates.push(parent.join(sidecar_script));
+    }
+    candidates.push(target_home.join("workspace").join(sidecar_script));
+    if let Ok(cwd) = env::current_dir() {
+        candidates.push(cwd.join(sidecar_script));
+    }
+    if let Ok(exe) = env::current_exe() {
+        for ancestor in exe.ancestors().take(6) {
+            candidates.push(ancestor.join(sidecar_script));
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| {
+            target_home
+                .parent()
+                .map(|parent| parent.join(sidecar_script))
+                .unwrap_or_else(|| sidecar_script.to_path_buf())
+        })
 }
 
 fn queue_prepare_args_from_args(args: &[String]) -> Result<QueuePrepareArgs, String> {
@@ -11852,23 +12120,38 @@ fn telegram_get_updates(
         .unwrap_or_default())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TelegramFormattingMode {
+    Plain,
+    Html,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TelegramSendOptions<'a> {
+    reply_to_message_id: Option<i64>,
+    message_thread_id: Option<&'a str>,
+    formatting_mode: TelegramFormattingMode,
+}
+
+impl Default for TelegramSendOptions<'_> {
+    fn default() -> Self {
+        Self {
+            reply_to_message_id: None,
+            message_thread_id: None,
+            formatting_mode: TelegramFormattingMode::Plain,
+        }
+    }
+}
+
 fn telegram_send_message(
     token: &str,
     chat_id: &str,
     text: &str,
-    reply_to_message_id: Option<i64>,
+    options: TelegramSendOptions<'_>,
 ) -> Result<Option<String>, String> {
     let url = format!("https://api.telegram.org/bot{token}/sendMessage");
     let agent = channel_http_short_agent();
-    let mut payload = serde_json::json!({
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": true
-    });
-    if let Some(reply_to_message_id) = reply_to_message_id {
-        payload["reply_to_message_id"] = serde_json::json!(reply_to_message_id);
-        payload["allow_sending_without_reply"] = serde_json::json!(true);
-    }
+    let payload = telegram_message_payload(chat_id, text, options);
     let response = agent
         .post(&url)
         .send_json(payload)
@@ -11885,7 +12168,44 @@ fn telegram_send_message(
         .and_then(telegram_id_string))
 }
 
+fn telegram_message_payload(
+    chat_id: &str,
+    text: &str,
+    options: TelegramSendOptions<'_>,
+) -> serde_json::Value {
+    let mut payload = match options.formatting_mode {
+        TelegramFormattingMode::Plain => serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": true
+        }),
+        TelegramFormattingMode::Html => serde_json::json!({
+            "chat_id": chat_id,
+            "text": render_telegram_safe_html(text),
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+            "link_preview_options": {
+                "is_disabled": true
+            }
+        }),
+    };
+    if let Some(reply_to_message_id) = options.reply_to_message_id {
+        payload["reply_to_message_id"] = serde_json::json!(reply_to_message_id);
+        payload["allow_sending_without_reply"] = serde_json::json!(true);
+    }
+    if let Some(thread_id) = options
+        .message_thread_id
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty())
+        && let Ok(thread_id) = thread_id.parse::<i64>()
+    {
+        payload["message_thread_id"] = serde_json::json!(thread_id);
+    }
+    payload
+}
+
 fn telegram_send_outbound_message(
+    harness_home: &Path,
     token: &str,
     message: &ChannelOutboundMessage,
 ) -> Result<Option<String>, String> {
@@ -11896,7 +12216,11 @@ fn telegram_send_outbound_message(
             token,
             &message.channel_id,
             &text,
-            telegram_reply_to_message_id(message),
+            TelegramSendOptions {
+                reply_to_message_id: telegram_reply_to_message_id(message),
+                message_thread_id: telegram_message_thread_id(message),
+                formatting_mode: telegram_formatting_mode_for_message(harness_home, message),
+            },
         )? {
             provider_message_ids.push(provider_message_id);
         }
@@ -11927,6 +12251,251 @@ fn telegram_reply_to_message_id(message: &ChannelOutboundMessage) -> Option<i64>
         .platform_message_id
         .as_deref()
         .and_then(|value| value.parse::<i64>().ok())
+}
+
+fn telegram_message_thread_id(message: &ChannelOutboundMessage) -> Option<&str> {
+    let intent = message.delivery_intent.as_ref()?;
+    if !intent.validated {
+        return None;
+    }
+    if !matches!(
+        intent.kind,
+        ChannelDeliveryIntentKind::ReplyToMessage | ChannelDeliveryIntentKind::ThreadReply
+    ) {
+        return None;
+    }
+    if intent
+        .platform_channel_id
+        .as_deref()
+        .is_some_and(|channel_id| channel_id != message.channel_id)
+    {
+        return None;
+    }
+    intent
+        .platform_thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty())
+}
+
+fn telegram_formatting_mode_for_message(
+    harness_home: &Path,
+    message: &ChannelOutboundMessage,
+) -> TelegramFormattingMode {
+    if message.kind != agent_harness_core::ChannelOutboundMessageKind::AgentReply {
+        return TelegramFormattingMode::Plain;
+    }
+    let config = load_telegram_formatting_config(harness_home);
+    let agent_id = agent_id_from_session_key(&message.session_key);
+    let channel_selectors = [
+        format!(
+            "{}:{}:{}",
+            message.platform, message.channel_id, message.user_id
+        ),
+        format!("{}:{}", message.platform, message.channel_id),
+        message.channel_id.clone(),
+        message.platform.clone(),
+    ];
+    for selector in channel_selectors {
+        if let Some(mode) = config.channel_modes.get(&selector) {
+            return *mode;
+        }
+    }
+    if let Some(account_id) = message.account_id.as_deref()
+        && let Some(mode) = config
+            .account_modes
+            .get(&telegram_account_id(Some(account_id)))
+    {
+        return *mode;
+    }
+    if let Some(agent_id) = agent_id
+        && let Some(mode) = config.agent_modes.get(agent_id)
+    {
+        return *mode;
+    }
+    config.global
+}
+
+#[derive(Debug, Clone)]
+struct TelegramFormattingConfig {
+    global: TelegramFormattingMode,
+    agent_modes: BTreeMap<String, TelegramFormattingMode>,
+    account_modes: BTreeMap<String, TelegramFormattingMode>,
+    channel_modes: BTreeMap<String, TelegramFormattingMode>,
+}
+
+impl Default for TelegramFormattingConfig {
+    fn default() -> Self {
+        Self {
+            global: TelegramFormattingMode::Plain,
+            agent_modes: BTreeMap::new(),
+            account_modes: BTreeMap::new(),
+            channel_modes: BTreeMap::new(),
+        }
+    }
+}
+
+fn load_telegram_formatting_config(harness_home: &Path) -> TelegramFormattingConfig {
+    let config_file = harness_home.join("harness-config.json");
+    let Ok(text) = fs::read_to_string(config_file) else {
+        return TelegramFormattingConfig::default();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return TelegramFormattingConfig::default();
+    };
+    let Some(response) = value.get("response").and_then(serde_json::Value::as_object) else {
+        return TelegramFormattingConfig::default();
+    };
+    let mut config = TelegramFormattingConfig::default();
+    if let Some(mode) = response
+        .get("telegramFormattingMode")
+        .or_else(|| response.get("telegram_formatting_mode"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_telegram_formatting_mode)
+    {
+        config.global = mode;
+    }
+    config.agent_modes = parse_telegram_formatting_mode_map(
+        response
+            .get("telegramFormattingAgentModes")
+            .or_else(|| response.get("telegram_formatting_agent_modes")),
+        false,
+    );
+    config.account_modes = parse_telegram_formatting_mode_map(
+        response
+            .get("telegramFormattingAccountModes")
+            .or_else(|| response.get("telegram_formatting_account_modes")),
+        true,
+    );
+    config.channel_modes = parse_telegram_formatting_mode_map(
+        response
+            .get("telegramFormattingChannelModes")
+            .or_else(|| response.get("telegram_formatting_channel_modes")),
+        false,
+    );
+    config
+}
+
+fn parse_telegram_formatting_mode_map(
+    value: Option<&serde_json::Value>,
+    normalize_account: bool,
+) -> BTreeMap<String, TelegramFormattingMode> {
+    let Some(object) = value.and_then(serde_json::Value::as_object) else {
+        return BTreeMap::new();
+    };
+    object
+        .iter()
+        .filter_map(|(key, value)| {
+            let mode = value.as_str().and_then(parse_telegram_formatting_mode)?;
+            let key = if normalize_account {
+                telegram_account_id(Some(key))
+            } else {
+                key.to_string()
+            };
+            Some((key, mode))
+        })
+        .collect()
+}
+
+fn parse_telegram_formatting_mode(value: &str) -> Option<TelegramFormattingMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "plain" | "text" | "off" | "disabled" | "false" => Some(TelegramFormattingMode::Plain),
+        "html" | "telegram-html" | "on" | "enabled" | "true" => Some(TelegramFormattingMode::Html),
+        _ => None,
+    }
+}
+
+fn agent_id_from_session_key(session_key: &str) -> Option<&str> {
+    session_key
+        .rsplit(':')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn render_telegram_safe_html(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_pre = false;
+    let mut pre = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            if in_pre {
+                out.push_str("<pre>");
+                out.push_str(&html_escape_text(pre.trim_end_matches('\n')));
+                out.push_str("</pre>");
+                pre.clear();
+                in_pre = false;
+            } else {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                in_pre = true;
+            }
+            continue;
+        }
+        if in_pre {
+            pre.push_str(line);
+            pre.push('\n');
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        if let Some(heading) = line.strip_prefix("# ") {
+            out.push_str("<b>");
+            out.push_str(&html_escape_text(heading.trim()));
+            out.push_str("</b>");
+        } else {
+            out.push_str(&render_inline_telegram_html(line));
+        }
+    }
+    if in_pre {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("<pre>");
+        out.push_str(&html_escape_text(pre.trim_end_matches('\n')));
+        out.push_str("</pre>");
+    }
+    out
+}
+
+fn render_inline_telegram_html(line: &str) -> String {
+    let mut out = String::new();
+    let mut remaining = line;
+    let mut code = false;
+    while let Some(index) = remaining.find('`') {
+        let (plain, rest) = remaining.split_at(index);
+        out.push_str(&html_escape_text(plain));
+        remaining = &rest[1..];
+        if code {
+            out.push_str("</code>");
+        } else {
+            out.push_str("<code>");
+        }
+        code = !code;
+    }
+    out.push_str(&html_escape_text(remaining));
+    if code {
+        out.push_str("</code>");
+    }
+    out
+}
+
+fn html_escape_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn telegram_send_attachment(
@@ -12961,6 +13530,12 @@ fn optional_bool(value: Option<bool>) -> &'static str {
     }
 }
 
+fn display_opt_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
 fn fmt_optional_i64(value: Option<i64>) -> String {
     value
         .map(|value| value.to_string())
@@ -13881,6 +14456,7 @@ fn print_progress_delivery_once_report(report: &ProgressDeliveryOnceReport) {
     println!("Sent panels: {}", report.sent_messages);
     println!("Edited panels: {}", report.edited_messages);
     println!("Denied panels: {}", report.skipped_denied);
+    println!("Permanent-skip panels: {}", report.skipped_permanent);
     println!("Failed deliveries: {}", report.failed_deliveries);
     if !report.warnings.is_empty() {
         println!("Warnings:");
@@ -14781,6 +15357,7 @@ fn print_help() {
     println!("  memory-service-recall Recall through OpenClaw memory service adapter");
     println!("  memory-service-propose Record a reviewed OpenClaw memory proposal");
     println!("  memory-service-store Store approved OpenClaw memory writeback");
+    println!("  memory-read-path-smoke Run read-only memory bridge/coverage/scope smoke");
     println!("  ops-backup      Copy non-secret harness state and write a backup manifest");
     println!("  ops-cutover-request Record an operator cutover request and ticket");
     println!("  ops-cutover-approve Issue a short-lived live-control token for a ticket");
@@ -14991,8 +15568,11 @@ mod tests {
     ) -> AgentProgressDeliveryPending {
         AgentProgressDeliveryPending {
             queue_id: "queue-1".to_string(),
+            agent_id: Some("main".to_string()),
             platform: platform.to_string(),
+            account_id: None,
             channel_id: channel_id.to_string(),
+            thread_id: None,
             user_id: user_id.to_string(),
             session_key: "session-1".to_string(),
             message_kind: agent_harness_core::AgentProgressDeliveryMessageKind::Body,
@@ -15004,6 +15584,18 @@ mod tests {
             text_hash: "hash".to_string(),
             started_at_ms: 1,
             latest_at_ms: 1,
+        }
+    }
+
+    fn progress_args() -> ProgressDeliveryOnceArgs {
+        ProgressDeliveryOnceArgs {
+            target_home: PathBuf::new(),
+            platform: Some("telegram".to_string()),
+            telegram_account: Some("default".to_string()),
+            min_update_interval_ms: 0,
+            max_events_per_panel: 8,
+            max_preview_chars: 120,
+            current_step_max_chars: 1200,
         }
     }
 
@@ -15290,14 +15882,23 @@ mod tests {
             telegram_group_chat_ids: set(&["group-1"]),
             ..ChannelAccessPolicy::default()
         };
+        let args = progress_args();
 
         assert!(
-            progress_delivery_allowed(&policy, &progress_pending("telegram", "group-1", "admin-1"))
-                .is_ok()
+            progress_delivery_allowed(
+                &policy,
+                &progress_pending("telegram", "group-1", "admin-1"),
+                &args
+            )
+            .is_ok()
         );
         assert!(
-            progress_delivery_allowed(&policy, &progress_pending("telegram", "group-1", "user-2"))
-                .is_err()
+            progress_delivery_allowed(
+                &policy,
+                &progress_pending("telegram", "group-1", "user-2"),
+                &args
+            )
+            .is_err()
         );
     }
 
@@ -15337,6 +15938,7 @@ mod tests {
     fn telegram_inbound_context_extracts_reply_and_media_without_file_ids() {
         let message = serde_json::json!({
             "message_id": 10,
+            "message_thread_id": 3,
             "caption": "see attached",
             "reply_to_message": {
                 "message_id": 9,
@@ -15365,6 +15967,7 @@ mod tests {
             Some("see attached".to_string())
         );
         let context = telegram_inbound_context(&message).unwrap();
+        assert!(context.contains("messageThreadId: 3"));
         assert!(context.contains("ReferencedMessage"));
         assert!(context.contains("messageId: 9"));
         assert!(context.contains("textPreview: previous message"));
@@ -15378,6 +15981,43 @@ mod tests {
         assert!(context.contains("fileIdPresent=yes"));
         assert!(!context.contains("raw-photo-file-id"));
         assert!(!context.contains("raw-doc-file-id"));
+    }
+
+    #[test]
+    fn telegram_inbound_context_keeps_topic_without_reply_or_media() {
+        let message = serde_json::json!({
+            "message_id": 10,
+            "message_thread_id": 7,
+            "text": "topic hello"
+        });
+
+        let context = telegram_inbound_context(&message).unwrap();
+
+        assert!(context.contains("InboundMessage"));
+        assert!(context.contains("messageThreadId: 7"));
+    }
+
+    #[test]
+    fn telegram_html_payload_escapes_dynamic_text_and_sets_thread() {
+        let payload = telegram_message_payload(
+            "-1001",
+            "# Status\n\nDetails: `<ok>`\n```rust\nlet x = \"<&>\";\n```",
+            TelegramSendOptions {
+                reply_to_message_id: Some(12),
+                message_thread_id: Some("3"),
+                formatting_mode: TelegramFormattingMode::Html,
+            },
+        );
+
+        assert_eq!(payload["parse_mode"], "HTML");
+        assert_eq!(payload["message_thread_id"], 3);
+        assert_eq!(payload["reply_to_message_id"], 12);
+        assert_eq!(payload["link_preview_options"]["is_disabled"], true);
+        let text = payload["text"].as_str().unwrap();
+        assert!(text.contains("<b>Status</b>"));
+        assert!(text.contains("<code>&lt;ok&gt;</code>"));
+        assert!(text.contains("<pre>let x = &quot;&lt;&amp;&gt;&quot;;</pre>"));
+        assert!(!text.contains("<ok>"));
     }
 
     #[test]

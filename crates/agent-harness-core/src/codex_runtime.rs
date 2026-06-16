@@ -7097,6 +7097,8 @@ mod tests {
         AgentProgressContext {
             queue_id: "queue-1".to_string(),
             agent_id: Some("main".to_string()),
+            account_id: Some("default".to_string()),
+            thread_id: None,
             session_key: "telegram:dm:user:main".to_string(),
             platform: "telegram".to_string(),
             channel_id: "dm".to_string(),

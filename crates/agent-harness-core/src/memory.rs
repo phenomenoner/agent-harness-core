@@ -22,6 +22,7 @@ const OPENCLAW_MEM_SERVICE_STATUS_SCHEMA: &str = "agent-harness.openclaw-mem-ser
 const OPENCLAW_MEM_SERVICE_RECALL_SCHEMA: &str = "agent-harness.openclaw-mem-service-recall.v1";
 const OPENCLAW_MEM_SERVICE_PROPOSAL_SCHEMA: &str = "agent-harness.openclaw-mem-service-proposal.v1";
 const OPENCLAW_MEM_SERVICE_STORE_SCHEMA: &str = "agent-harness.openclaw-mem-service-store.v1";
+const OPENCLAW_MEM_READ_PATH_SMOKE_SCHEMA: &str = "agent-harness.openclaw-mem-read-path-smoke.v1";
 const DEFAULT_MAX_FILE_BYTES: u64 = 1_000_000;
 const DEFAULT_CONTEXT_MAX_FILE_BYTES: u64 = 4_000_000;
 const DEFAULT_SNIPPET_CHARS: usize = 240;
@@ -172,6 +173,7 @@ pub struct OpenClawMemServiceStatusReport {
     pub status: OpenClawMemServiceStatus,
     pub reason: String,
     pub service_mode: String,
+    pub active_slot_owner: String,
     pub service_endpoint: Option<String>,
     pub qdrant_edge_dir: Option<PathBuf>,
     pub qdrant_edge_mode: String,
@@ -179,7 +181,108 @@ pub struct OpenClawMemServiceStatusReport {
     pub observations_file: Option<PathBuf>,
     pub episodes_file: Option<PathBuf>,
     pub agent_store_file: PathBuf,
+    pub credential_bridge: MemoryCredentialBridgeReport,
+    pub embedding_coverage: MemoryEmbeddingCoverageReport,
+    pub scope_policy: MemoryScopePolicyReport,
+    pub trust_policy: MemoryTrustPolicyReport,
+    pub graph_readiness: MemoryGraphReadinessReport,
+    pub mem_engine_canary: MemoryMemEngineCanaryReport,
     pub capabilities: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryCredentialBridgeReport {
+    pub api_key_present: bool,
+    pub api_key_length: usize,
+    pub model: String,
+    pub base_url: String,
+    pub subprocess_env_keys: Vec<String>,
+    pub windows_utf8_env: BTreeMap<String, String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryEmbeddingCoverageReport {
+    pub sqlite_database: Option<PathBuf>,
+    pub observations: Option<u64>,
+    pub observation_embeddings: Option<u64>,
+    pub observation_coverage_bps: Option<u64>,
+    pub episodic_events: Option<u64>,
+    pub episodic_event_embeddings: Option<u64>,
+    pub episodic_coverage_bps: Option<u64>,
+    pub docs_chunks: Option<u64>,
+    pub docs_embeddings: Option<u64>,
+    pub docs_coverage_bps: Option<u64>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryScopePolicyReport {
+    pub default_scope: String,
+    pub agent_id: Option<String>,
+    pub global_imported_snapshot_allowed: bool,
+    pub per_agent_writeback_required: bool,
+    pub cross_agent_private_recall_allowed: bool,
+    pub receipts_include_scope: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryTrustPolicyReport {
+    pub mode: String,
+    pub unknown_trust_action: String,
+    pub noisy_tool_output_action: String,
+    pub receipts_include_decisions: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryGraphReadinessReport {
+    pub verdict: String,
+    pub ready_for_autonomous_match: bool,
+    pub topology_source: PathBuf,
+    pub topology_source_present: bool,
+    pub graph_nodes: Option<u64>,
+    pub graph_edges: Option<u64>,
+    pub blockers: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryMemEngineCanaryReport {
+    pub status: String,
+    pub active_slot_owner: String,
+    pub engine_state_file: Option<PathBuf>,
+    pub rollback_slot_owner: String,
+    pub qdrant_edge_mode: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenClawMemReadPathSmokeOptions {
+    pub harness_home: PathBuf,
+    pub agent_id: Option<String>,
+    pub query: String,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenClawMemReadPathSmokeReport {
+    pub schema: &'static str,
+    pub harness_home: PathBuf,
+    pub agent_id: Option<String>,
+    pub status: OpenClawMemServiceStatus,
+    pub status_report: OpenClawMemServiceStatusReport,
+    pub recall_report: OpenClawMemServiceRecallReport,
+    pub bom_jsonl_smoke_ok: bool,
+    pub no_bom_jsonl_smoke_ok: bool,
+    pub embedding_smoke_status: String,
     pub warnings: Vec<String>,
 }
 
@@ -211,6 +314,8 @@ pub struct OpenClawMemServiceRecallReport {
     pub backend: String,
     pub service_mode: String,
     pub query_length: usize,
+    pub scope_policy: MemoryScopePolicyReport,
+    pub trust_policy: MemoryTrustPolicyReport,
     pub hit_count: usize,
     pub searched_files: usize,
     pub skipped_files: usize,
@@ -756,6 +861,208 @@ fn memory_path_for_agent(
     }
 }
 
+fn inspect_memory_credential_bridge(harness_home: &Path) -> MemoryCredentialBridgeReport {
+    let mut warnings = Vec::new();
+    let config =
+        load_memory_embedding_config(harness_home, &mut warnings).unwrap_or_else(|error| {
+            warnings.push(format!(
+                "memory embedding config could not be loaded: {error}"
+            ));
+            MemoryEmbeddingConfig {
+                api_key: None,
+                model: DEFAULT_EMBEDDING_MODEL.to_string(),
+                base_url: DEFAULT_EMBEDDING_BASE_URL.to_string(),
+            }
+        });
+    let mut windows_utf8_env = BTreeMap::new();
+    windows_utf8_env.insert("PYTHONUTF8".to_string(), "1".to_string());
+    windows_utf8_env.insert("PYTHONIOENCODING".to_string(), "utf-8".to_string());
+    MemoryCredentialBridgeReport {
+        api_key_present: config.api_key.is_some(),
+        api_key_length: config.api_key.as_ref().map(|key| key.len()).unwrap_or(0),
+        model: config.model,
+        base_url: config.base_url,
+        subprocess_env_keys: vec![
+            "OPENAI_API_KEY".to_string(),
+            "OPENAI_BASE_URL".to_string(),
+            "OPENAI_API_BASE".to_string(),
+            MEMORY_EMBEDDING_MODEL_ENV.to_string(),
+        ],
+        windows_utf8_env,
+        warnings,
+    }
+}
+
+fn memory_embedding_coverage(harness_home: &Path) -> MemoryEmbeddingCoverageReport {
+    let sqlite = legacy_mem_sqlite_file(harness_home);
+    if !sqlite.is_file() {
+        return MemoryEmbeddingCoverageReport {
+            sqlite_database: None,
+            warnings: vec![format!(
+                "openclaw-mem SQLite snapshot not found at {}",
+                sqlite.display()
+            )],
+            ..MemoryEmbeddingCoverageReport::default()
+        };
+    }
+    let mut report = MemoryEmbeddingCoverageReport {
+        sqlite_database: Some(sqlite.clone()),
+        ..MemoryEmbeddingCoverageReport::default()
+    };
+    let Ok(conn) = Connection::open_with_flags(&sqlite, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        report.warnings.push(format!(
+            "could not open SQLite snapshot at {}",
+            sqlite.display()
+        ));
+        return report;
+    };
+    report.observations = sqlite_count(&conn, "observations", &mut report.warnings);
+    report.observation_embeddings =
+        sqlite_count(&conn, "observation_embeddings", &mut report.warnings);
+    report.observation_coverage_bps =
+        coverage_bps(report.observation_embeddings, report.observations);
+    report.episodic_events = sqlite_count(&conn, "episodic_events", &mut report.warnings);
+    report.episodic_event_embeddings =
+        sqlite_count(&conn, "episodic_event_embeddings", &mut report.warnings);
+    report.episodic_coverage_bps =
+        coverage_bps(report.episodic_event_embeddings, report.episodic_events);
+    report.docs_chunks = sqlite_count(&conn, "docs_chunks", &mut report.warnings);
+    report.docs_embeddings = sqlite_count(&conn, "docs_embeddings", &mut report.warnings);
+    report.docs_coverage_bps = coverage_bps(report.docs_embeddings, report.docs_chunks);
+    report
+}
+
+fn sqlite_count(conn: &Connection, table: &str, warnings: &mut Vec<String>) -> Option<u64> {
+    let sql = format!("SELECT count(*) FROM {table}");
+    match conn.query_row(&sql, [], |row| row.get::<_, i64>(0)) {
+        Ok(count) => u64::try_from(count).ok(),
+        Err(error) => {
+            warnings.push(format!("SQLite count for table `{table}` failed: {error}"));
+            None
+        }
+    }
+}
+
+fn coverage_bps(numerator: Option<u64>, denominator: Option<u64>) -> Option<u64> {
+    let numerator = numerator?;
+    let denominator = denominator?;
+    if denominator == 0 {
+        return Some(0);
+    }
+    Some(numerator.saturating_mul(10_000) / denominator)
+}
+
+fn parse_lenient_jsonl_value(line: &str) -> Option<Value> {
+    let trimmed = line.trim().trim_start_matches('\u{feff}');
+    if trimmed.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Value>(trimmed).ok()
+}
+
+fn memory_scope_policy(agent_id: Option<String>) -> MemoryScopePolicyReport {
+    MemoryScopePolicyReport {
+        default_scope: if agent_id.is_some() {
+            "agent-plus-global-imported".to_string()
+        } else {
+            "global-imported".to_string()
+        },
+        agent_id,
+        global_imported_snapshot_allowed: true,
+        per_agent_writeback_required: true,
+        cross_agent_private_recall_allowed: false,
+        receipts_include_scope: true,
+    }
+}
+
+fn memory_trust_policy() -> MemoryTrustPolicyReport {
+    MemoryTrustPolicyReport {
+        mode: "conservative-snapshot-default".to_string(),
+        unknown_trust_action: "allow-global-imported-with-trace".to_string(),
+        noisy_tool_output_action: "demote-unless-explicit-match".to_string(),
+        receipts_include_decisions: true,
+    }
+}
+
+fn memory_graph_readiness(harness_home: &Path) -> MemoryGraphReadinessReport {
+    let topology_source = harness_home
+        .join("state")
+        .join("memory")
+        .join("graph")
+        .join("topology-extract-full.json");
+    let coverage = memory_embedding_coverage(harness_home);
+    let sqlite = legacy_mem_sqlite_file(harness_home);
+    let mut warnings = Vec::new();
+    let (graph_nodes, graph_edges) = if sqlite.is_file() {
+        match Connection::open_with_flags(&sqlite, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(conn) => (
+                sqlite_count(&conn, "graph_nodes", &mut warnings),
+                sqlite_count(&conn, "graph_edges", &mut warnings),
+            ),
+            Err(error) => {
+                warnings.push(format!("could not open graph SQLite snapshot: {error}"));
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+    warnings.extend(coverage.warnings);
+    let topology_source_present = topology_source.is_file();
+    let mut blockers = Vec::new();
+    if !topology_source_present {
+        blockers.push("topology_source_missing".to_string());
+    }
+    if graph_nodes.unwrap_or(0) == 0 || graph_edges.unwrap_or(0) == 0 {
+        blockers.push("graph_cache_empty_or_unreadable".to_string());
+    }
+    let ready_for_autonomous_match = blockers.is_empty();
+    MemoryGraphReadinessReport {
+        verdict: if ready_for_autonomous_match {
+            "green".to_string()
+        } else {
+            "red".to_string()
+        },
+        ready_for_autonomous_match,
+        topology_source,
+        topology_source_present,
+        graph_nodes,
+        graph_edges,
+        blockers,
+        warnings,
+    }
+}
+
+fn memory_mem_engine_canary(
+    harness_home: &Path,
+    qdrant_edge_mode: &str,
+) -> MemoryMemEngineCanaryReport {
+    let engine_state = harness_home
+        .join("memory")
+        .join("openclaw-mem-engine")
+        .join("sunrise_state.json");
+    let engine_state_file = engine_state.is_file().then_some(engine_state);
+    let mut warnings = Vec::new();
+    if engine_state_file.is_some() {
+        warnings.push(
+            "openclaw-mem-engine state is imported but not promoted; snapshot adapter remains rollback"
+                .to_string(),
+        );
+    }
+    MemoryMemEngineCanaryReport {
+        status: if engine_state_file.is_some() {
+            "available-not-promoted".to_string()
+        } else {
+            "not-available".to_string()
+        },
+        active_slot_owner: "snapshot-adapter".to_string(),
+        engine_state_file,
+        rollback_slot_owner: "snapshot-adapter".to_string(),
+        qdrant_edge_mode: qdrant_edge_mode.to_string(),
+        warnings,
+    }
+}
+
 pub fn inspect_openclaw_mem_service(
     options: OpenClawMemServiceStatusOptions,
 ) -> io::Result<OpenClawMemServiceStatusReport> {
@@ -801,6 +1108,21 @@ pub fn inspect_openclaw_mem_service(
                 .to_string(),
         );
     }
+    let credential_bridge = inspect_memory_credential_bridge(&options.harness_home);
+    warnings.extend(credential_bridge.warnings.clone());
+    let embedding_coverage = memory_embedding_coverage(&options.harness_home);
+    warnings.extend(embedding_coverage.warnings.clone());
+    let scope_policy = memory_scope_policy(options.agent_id.clone());
+    let trust_policy = memory_trust_policy();
+    let graph_readiness = memory_graph_readiness(&options.harness_home);
+    if !graph_readiness.ready_for_autonomous_match {
+        warnings.push(format!(
+            "memory graph autonomous matching remains gated: {}",
+            graph_readiness.blockers.join(", ")
+        ));
+    }
+    let mem_engine_canary = memory_mem_engine_canary(&options.harness_home, &qdrant_edge_mode);
+    warnings.extend(mem_engine_canary.warnings.clone());
     let has_local_backend =
         sqlite.is_file() || observations.is_file() || episodes.is_file() || agent_store.is_file();
     let has_any_backend = has_local_backend || qdrant_edge.is_some();
@@ -832,6 +1154,7 @@ pub fn inspect_openclaw_mem_service(
         status,
         reason,
         service_mode,
+        active_slot_owner: "snapshot-adapter".to_string(),
         service_endpoint,
         qdrant_edge_dir: qdrant_edge,
         qdrant_edge_mode,
@@ -839,16 +1162,71 @@ pub fn inspect_openclaw_mem_service(
         observations_file: observations.is_file().then_some(observations),
         episodes_file: episodes.is_file().then_some(episodes),
         agent_store_file: agent_store,
+        credential_bridge,
+        embedding_coverage,
+        scope_policy,
+        trust_policy,
+        graph_readiness,
+        mem_engine_canary,
         capabilities: vec![
             "status".to_string(),
             "recall".to_string(),
             "propose".to_string(),
             "store-approved".to_string(),
             "canvas-maintenance".to_string(),
+            "read-path-smoke".to_string(),
+            "embedding-coverage".to_string(),
+            "graph-readiness-gate".to_string(),
+            "mem-engine-canary-report".to_string(),
         ],
         warnings,
     };
     write_openclaw_mem_service_status_receipt(&report)?;
+    Ok(report)
+}
+
+pub fn run_openclaw_mem_read_path_smoke(
+    options: OpenClawMemReadPathSmokeOptions,
+) -> io::Result<OpenClawMemReadPathSmokeReport> {
+    let status_report = inspect_openclaw_mem_service(OpenClawMemServiceStatusOptions {
+        harness_home: options.harness_home.clone(),
+        agent_id: options.agent_id.clone(),
+    })?;
+    let recall_report = recall_openclaw_mem_service(OpenClawMemServiceRecallOptions {
+        harness_home: options.harness_home.clone(),
+        agent_id: options.agent_id.clone(),
+        query: options.query,
+        limit: options.limit,
+        max_file_bytes: DEFAULT_CONTEXT_MAX_FILE_BYTES,
+    })?;
+    let no_bom_jsonl_smoke_ok = parse_lenient_jsonl_value("{\"ok\":true}\n").is_some();
+    let bom_jsonl_smoke_ok = parse_lenient_jsonl_value("\u{feff}{\"ok\":true}\n").is_some();
+    let mut warnings = Vec::new();
+    warnings.extend(status_report.warnings.clone());
+    warnings.extend(recall_report.warnings.clone());
+    let embedding_smoke_status = if status_report.credential_bridge.api_key_present {
+        "credential-bridge-ready-offline-smoke-not-run".to_string()
+    } else {
+        "credential-missing".to_string()
+    };
+    let report = OpenClawMemReadPathSmokeReport {
+        schema: OPENCLAW_MEM_READ_PATH_SMOKE_SCHEMA,
+        harness_home: options.harness_home,
+        agent_id: options.agent_id,
+        status: status_report.status,
+        status_report,
+        recall_report,
+        bom_jsonl_smoke_ok,
+        no_bom_jsonl_smoke_ok,
+        embedding_smoke_status,
+        warnings,
+    };
+    let file = report
+        .harness_home
+        .join("state")
+        .join("memory")
+        .join("openclaw-mem-read-path-smoke-receipts.jsonl");
+    append_json_line(&file, &report)?;
     Ok(report)
 }
 
@@ -862,12 +1240,14 @@ pub fn recall_openclaw_mem_service(
         return Ok(OpenClawMemServiceRecallReport {
             schema: OPENCLAW_MEM_SERVICE_RECALL_SCHEMA,
             harness_home: options.harness_home,
-            agent_id,
+            agent_id: agent_id.clone(),
             status: OpenClawMemServiceRecallStatus::Skipped,
             reason: "openclaw-mem service recall skipped because query was empty".to_string(),
             backend: "none".to_string(),
             service_mode: "snapshot-adapter".to_string(),
             query_length,
+            scope_policy: memory_scope_policy(agent_id.clone()),
+            trust_policy: memory_trust_policy(),
             hit_count: 0,
             searched_files: 0,
             skipped_files: 0,
@@ -965,7 +1345,7 @@ pub fn recall_openclaw_mem_service(
     let report = OpenClawMemServiceRecallReport {
         schema: OPENCLAW_MEM_SERVICE_RECALL_SCHEMA,
         harness_home: options.harness_home,
-        agent_id,
+        agent_id: agent_id.clone(),
         status,
         reason: match status {
             OpenClawMemServiceRecallStatus::Ready => format!(
@@ -985,6 +1365,8 @@ pub fn recall_openclaw_mem_service(
         backend,
         service_mode: "snapshot-adapter".to_string(),
         query_length,
+        scope_policy: memory_scope_policy(agent_id.clone()),
+        trust_policy: memory_trust_policy(),
         hit_count: hits.len(),
         searched_files,
         skipped_files,

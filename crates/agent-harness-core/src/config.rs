@@ -182,6 +182,18 @@ fn validate_response_object(path: &str, value: &Value, errors: &mut Vec<String>)
             "emojiAccentChannelModes" | "emoji_accent_channel_modes" => {
                 validate_emoji_accent_mode_map(path_key(path, key), child, errors)
             }
+            "telegramFormattingMode" | "telegram_formatting_mode" => {
+                expect_telegram_formatting_mode(path_key(path, key), child, errors)
+            }
+            "telegramFormattingAgentModes" | "telegram_formatting_agent_modes" => {
+                validate_telegram_formatting_mode_map(path_key(path, key), child, errors)
+            }
+            "telegramFormattingAccountModes" | "telegram_formatting_account_modes" => {
+                validate_telegram_formatting_mode_map(path_key(path, key), child, errors)
+            }
+            "telegramFormattingChannelModes" | "telegram_formatting_channel_modes" => {
+                validate_telegram_formatting_mode_map(path_key(path, key), child, errors)
+            }
             other => errors.push(format!("unknown response config key `{other}` at {path}")),
         }
     }
@@ -202,6 +214,39 @@ fn expect_emoji_accent_mode(path: impl Into<String>, value: &Value, errors: &mut
         value,
         &[
             "off", "none", "disabled", "disable", "false", "subtle", "on", "enabled", "enable",
+            "true",
+        ],
+        errors,
+    );
+}
+
+fn validate_telegram_formatting_mode_map(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(&path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        expect_telegram_formatting_mode(path_key(&path, key), child, errors);
+    }
+}
+
+fn expect_telegram_formatting_mode(
+    path: impl Into<String>,
+    value: &Value,
+    errors: &mut Vec<String>,
+) {
+    expect_enum(
+        path,
+        value,
+        &[
+            "plain",
+            "text",
+            "off",
+            "disabled",
+            "false",
+            "html",
+            "telegram-html",
+            "on",
+            "enabled",
             "true",
         ],
         errors,
@@ -796,7 +841,11 @@ mod tests {
                 "assistantNarrationFinalPrefix": "Work log",
                 "emojiAccentMode": "subtle",
                 "emojiAccentAgentModes": { "main": "on", "ops": "off" },
-                "emojiAccentChannelModes": { "telegram:dm-42": "enabled" }
+                "emojiAccentChannelModes": { "telegram:dm-42": "enabled" },
+                "telegramFormattingMode": "plain",
+                "telegramFormattingAgentModes": { "main": "html" },
+                "telegramFormattingAccountModes": { "xiaoxiaoli": "html" },
+                "telegramFormattingChannelModes": { "telegram:dm-42": "plain" }
               },
               "security": {
                 "codexApprovalPolicy": "accept",

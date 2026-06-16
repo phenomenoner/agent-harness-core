@@ -682,6 +682,11 @@ fn progress_context_from(
     Some(AgentProgressContext {
         queue_id,
         agent_id,
+        account_id: channel_context.account_id.clone(),
+        thread_id: channel_context
+            .inbound_context
+            .as_deref()
+            .and_then(|context| context_value(context, "messageThreadId")),
         session_key: channel_context.session_key.clone(),
         platform: channel_context.platform.clone(),
         channel_id: channel_context.channel_id.clone(),
@@ -1160,21 +1165,37 @@ fn delivery_intent_from_inbound_context(
     channel_id: &str,
     inbound_context: Option<&str>,
 ) -> Option<ChannelDeliveryIntent> {
-    let inbound_context = inbound_context?;
     let platform = platform.to_ascii_lowercase();
     if platform == "telegram" {
-        let message_id = context_value(inbound_context, "messageId")?;
+        let thread_id =
+            inbound_context.and_then(|context| context_value(context, "messageThreadId"));
+        let Some(inbound_context) = inbound_context else {
+            return None;
+        };
+        let Some(message_id) = context_value(inbound_context, "messageId") else {
+            return thread_id.map(|thread_id| ChannelDeliveryIntent {
+                schema: "agent-harness.delivery-intent.v1".to_string(),
+                kind: ChannelDeliveryIntentKind::ThreadReply,
+                platform_message_id: None,
+                platform_channel_id: Some(channel_id.to_string()),
+                platform_thread_id: Some(thread_id),
+                quote_text: None,
+                validated: true,
+                downgrade_reason: None,
+            });
+        };
         return Some(ChannelDeliveryIntent {
             schema: "agent-harness.delivery-intent.v1".to_string(),
             kind: ChannelDeliveryIntentKind::ReplyToMessage,
             platform_message_id: Some(message_id),
             platform_channel_id: Some(channel_id.to_string()),
-            platform_thread_id: None,
+            platform_thread_id: thread_id,
             quote_text: context_text_block(inbound_context),
             validated: true,
             downgrade_reason: None,
         });
     }
+    let inbound_context = inbound_context?;
     if platform == "discord" {
         let message_id = context_value(inbound_context, "referencedMessageId")?;
         let referenced_channel = context_value(inbound_context, "referencedChannelId")
