@@ -54,6 +54,7 @@ pub struct RuntimeQueueCapacityReport {
     pub global_limit: usize,
     pub agent_limit: usize,
     pub agent_channel_limit: usize,
+    pub session_limit: usize,
     pub lease_lock_busy: bool,
     pub warnings: Vec<String>,
 }
@@ -73,6 +74,9 @@ pub struct RuntimeDispatchClassConfig {
     pub max_active: usize,
     pub per_agent_max_active: usize,
     pub per_channel_max_active: usize,
+    pub per_session_max_active: usize,
+    pub session_fifo: bool,
+    pub same_session_main_agent_serialization: bool,
     pub per_job_max_active: usize,
     pub max_queued_per_agent: usize,
 }
@@ -221,8 +225,14 @@ struct RuntimeQueueLease {
     #[serde(default)]
     cron_run_id: Option<String>,
     platform: String,
+    #[serde(default)]
+    account_id: Option<String>,
     channel_id: String,
+    #[serde(default)]
+    user_id: Option<String>,
     session_key: String,
+    #[serde(default)]
+    session_lane_key: Option<String>,
     owner: String,
     started_at_ms: i64,
     lease_expires_at_ms: i64,
@@ -434,6 +444,37 @@ pub fn prepare_runtime_queue_item(
                     warnings,
                 });
             }
+            if let Some(blocker) = same_session_fifo_blocker(
+                &pending_items,
+                pending,
+                &terminal_run_ids,
+                &load_runtime_dispatch_config(&options.harness_home)?,
+            ) {
+                let receipt = RuntimeExecutionReceipt {
+                    queue_id: Some(requested_queue_id.to_string()),
+                    status: RuntimeExecutionReceiptStatus::NoPendingItem,
+                    runtime_class: Some(pending.runtime_class.clone()),
+                    origin: Some(pending.origin.clone()),
+                    cron_run_id: pending.cron_run_id.clone(),
+                    scheduled_for_ms: pending.scheduled_for_ms,
+                    execution_dir: None,
+                    prompt_bundle_json: None,
+                    prompt_markdown: None,
+                    runtime_workspace: None,
+                    reason: format!("runtime queue item blocked by {blocker}"),
+                };
+                write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+                append_json_line(&execution_receipts_file, &receipt)?;
+                return Ok(RuntimeQueuePrepareReport {
+                    schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
+                    harness_home: options.harness_home,
+                    queue_file,
+                    execution_receipts_file,
+                    item: None,
+                    receipt,
+                    warnings,
+                });
+            }
             lease_runtime_queue_item(&mut lease_state, pending, &lease_owner, now_ms);
         }
         write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
@@ -497,6 +538,17 @@ pub fn prepare_runtime_queue_item(
                     "prepared runtime queue item `{queue_id}` blocked by {blocker}; checking queued items"
                 ));
                 } else {
+                    if let Some(blocker) = same_session_fifo_blocker(
+                        &pending_items,
+                        pending,
+                        &terminal_run_ids,
+                        &load_runtime_dispatch_config(&options.harness_home)?,
+                    ) {
+                        warnings.push(format!(
+                            "prepared runtime queue item `{queue_id}` blocked by {blocker}; checking queued items"
+                        ));
+                        continue;
+                    }
                     lease_runtime_queue_item(&mut lease_state, pending, &lease_owner, now_ms);
                     write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
                     let receipt = RuntimeExecutionReceipt {
@@ -783,23 +835,40 @@ pub fn inspect_runtime_queue_capacity(
             .cloned()
             .collect::<Vec<_>>();
         for queue_id in prepared_candidates {
-            if let Some(pending) = pending_by_id.get(&queue_id)
-                && pending.runtime_class == runtime_class
-                && runtime_capacity_blocker(&options.harness_home, &simulated, pending)?.is_none()
-            {
-                if let Some(blocker) =
-                    cron_runtime_dispatch_blocker_for_item(&options.harness_home, pending, now_ms)?
-                {
-                    warnings.push(format!(
-                        "prepared runtime queue item `{queue_id}` blocked by {blocker}; capacity excludes it"
-                    ));
-                    continue;
-                }
-                claimable_items += 1;
-                class_claimable += 1;
-                claimable_queue_ids.push(queue_id);
-                lease_runtime_queue_item(&mut simulated, pending, "capacity-inspect", now_ms);
+            let Some(pending) = pending_by_id.get(&queue_id) else {
+                continue;
+            };
+            if pending.runtime_class != runtime_class {
+                continue;
             }
+            if let Some(blocker) =
+                same_session_fifo_blocker(&pending_items, pending, &terminal_run_ids, &config)
+            {
+                warnings.push(format!(
+                    "prepared runtime queue item `{queue_id}` blocked by {blocker}; capacity excludes it"
+                ));
+                continue;
+            }
+            if let Some(blocker) =
+                cron_runtime_dispatch_blocker_for_item(&options.harness_home, pending, now_ms)?
+            {
+                warnings.push(format!(
+                    "prepared runtime queue item `{queue_id}` blocked by {blocker}; capacity excludes it"
+                ));
+                continue;
+            }
+            if let Some(blocker) =
+                runtime_capacity_blocker(&options.harness_home, &simulated, pending)?
+            {
+                warnings.push(format!(
+                    "prepared runtime queue item `{queue_id}` blocked by {blocker}; capacity excludes it"
+                ));
+                continue;
+            }
+            claimable_items += 1;
+            class_claimable += 1;
+            claimable_queue_ids.push(queue_id);
+            lease_runtime_queue_item(&mut simulated, pending, "capacity-inspect", now_ms);
         }
 
         let prepared_ids = prepared_receipts.keys().cloned().collect::<HashSet<_>>();
@@ -822,12 +891,28 @@ pub fn inspect_runtime_queue_capacity(
                 ));
                 continue;
             }
-            if runtime_capacity_blocker(&options.harness_home, &simulated, pending)?.is_none() {
-                claimable_items += 1;
-                class_claimable += 1;
-                claimable_queue_ids.push(pending.queue_id.clone());
-                lease_runtime_queue_item(&mut simulated, pending, "capacity-inspect", now_ms);
+            if let Some(blocker) =
+                same_session_fifo_blocker(&pending_items, pending, &terminal_run_ids, &config)
+            {
+                warnings.push(format!(
+                    "runtime queue item `{}` blocked by {}; capacity excludes it",
+                    pending.queue_id, blocker
+                ));
+                continue;
             }
+            if let Some(blocker) =
+                runtime_capacity_blocker(&options.harness_home, &simulated, pending)?
+            {
+                warnings.push(format!(
+                    "runtime queue item `{}` blocked by {}; capacity excludes it",
+                    pending.queue_id, blocker
+                ));
+                continue;
+            }
+            claimable_items += 1;
+            class_claimable += 1;
+            claimable_queue_ids.push(pending.queue_id.clone());
+            lease_runtime_queue_item(&mut simulated, pending, "capacity-inspect", now_ms);
         }
         classes.push(RuntimeQueueClassCapacity {
             leases_file: runtime_queue_leases_file(&queue_dir, &runtime_class),
@@ -859,6 +944,11 @@ pub fn inspect_runtime_queue_capacity(
             .get("interactive")
             .map(|class| class.per_channel_max_active)
             .unwrap_or(config.global_concurrency_limit),
+        session_limit: config
+            .classes
+            .get("interactive")
+            .map(|class| class.per_session_max_active)
+            .unwrap_or(1),
         lease_lock_busy: any_lock_busy,
         warnings,
     })
@@ -879,6 +969,9 @@ pub fn load_runtime_dispatch_config(
                     max_active: worker.global_concurrency_limit,
                     per_agent_max_active: worker.group_concurrency_limit,
                     per_channel_max_active: worker.channel_concurrency_limit,
+                    per_session_max_active: 1,
+                    session_fifo: true,
+                    same_session_main_agent_serialization: true,
                     per_job_max_active: usize::MAX,
                     max_queued_per_agent: usize::MAX,
                 },
@@ -889,6 +982,9 @@ pub fn load_runtime_dispatch_config(
                     max_active: worker.global_concurrency_limit.min(4),
                     per_agent_max_active: 1,
                     per_channel_max_active: 1,
+                    per_session_max_active: 1,
+                    session_fifo: true,
+                    same_session_main_agent_serialization: false,
                     per_job_max_active: 1,
                     max_queued_per_agent: 20,
                 },
@@ -899,6 +995,9 @@ pub fn load_runtime_dispatch_config(
                     max_active: worker.global_concurrency_limit.min(2),
                     per_agent_max_active: worker.group_concurrency_limit.min(2),
                     per_channel_max_active: worker.channel_concurrency_limit.min(2),
+                    per_session_max_active: usize::MAX,
+                    session_fifo: false,
+                    same_session_main_agent_serialization: false,
                     per_job_max_active: usize::MAX,
                     max_queued_per_agent: usize::MAX,
                 },
@@ -909,6 +1008,9 @@ pub fn load_runtime_dispatch_config(
                     max_active: worker.global_concurrency_limit.min(1),
                     per_agent_max_active: 1,
                     per_channel_max_active: 1,
+                    per_session_max_active: 1,
+                    session_fifo: true,
+                    same_session_main_agent_serialization: false,
                     per_job_max_active: usize::MAX,
                     max_queued_per_agent: usize::MAX,
                 },
@@ -948,6 +1050,9 @@ pub fn load_runtime_dispatch_config(
                         max_active: config.global_concurrency_limit,
                         per_agent_max_active: config.global_concurrency_limit,
                         per_channel_max_active: config.global_concurrency_limit,
+                        per_session_max_active: usize::MAX,
+                        session_fifo: false,
+                        same_session_main_agent_serialization: false,
                         per_job_max_active: usize::MAX,
                         max_queued_per_agent: usize::MAX,
                     },
@@ -973,6 +1078,24 @@ pub fn load_runtime_dispatch_config(
                     .and_then(|value| usize::try_from(value).ok())
                 {
                     class_config.per_channel_max_active = max_active;
+                }
+                if let Some(max_active) = class_value
+                    .get("perSessionMaxActive")
+                    .or_else(|| class_value.get("perSessionLaneMaxActive"))
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                {
+                    class_config.per_session_max_active = max_active;
+                }
+                if let Some(session_fifo) = class_value.get("sessionFifo").and_then(Value::as_bool)
+                {
+                    class_config.session_fifo = session_fifo;
+                }
+                if let Some(enabled) = class_value
+                    .get("sameSessionMainAgentSerialization")
+                    .and_then(Value::as_bool)
+                {
+                    class_config.same_session_main_agent_serialization = enabled;
                 }
                 if let Some(max_active) = class_value
                     .get("perJobMaxActive")
@@ -1376,6 +1499,9 @@ fn runtime_capacity_blocker(
                 max_active: config.global_concurrency_limit,
                 per_agent_max_active: config.global_concurrency_limit,
                 per_channel_max_active: config.global_concurrency_limit,
+                per_session_max_active: usize::MAX,
+                session_fifo: false,
+                same_session_main_agent_serialization: false,
                 per_job_max_active: usize::MAX,
                 max_queued_per_agent: usize::MAX,
             });
@@ -1415,6 +1541,21 @@ fn runtime_capacity_blocker(
     }
 
     let channel_key = runtime_channel_key(&item.agent_id, &item.platform, &item.channel_id);
+    if let Some(session_lane_key) = item_session_lane_key(item, &class_config) {
+        let executing_session = all_leases
+            .iter()
+            .filter(|lease| {
+                lease_session_lane_key(lease, &class_config).as_deref()
+                    == Some(session_lane_key.as_str())
+            })
+            .count();
+        if executing_session >= class_config.per_session_max_active {
+            return Ok(Some(format!(
+                "session-active limit for `{session_lane_key}`"
+            )));
+        }
+    }
+
     let executing_channel = all_leases
         .iter()
         .filter(|lease| {
@@ -1470,6 +1611,8 @@ fn lease_runtime_queue_item(
     owner: &str,
     now_ms: i64,
 ) {
+    let session_lane_key = default_runtime_class_config_for_item(item)
+        .and_then(|class_config| item_session_lane_key(item, &class_config));
     state.leases.insert(
         item.queue_id.clone(),
         RuntimeQueueLease {
@@ -1479,8 +1622,11 @@ fn lease_runtime_queue_item(
             origin: item.origin.clone(),
             cron_run_id: item.cron_run_id.clone(),
             platform: item.platform.clone(),
+            account_id: item.account_id.clone(),
             channel_id: item.channel_id.clone(),
+            user_id: Some(item.user_id.clone()),
             session_key: item.session_key.clone(),
+            session_lane_key,
             owner: owner.to_string(),
             started_at_ms: now_ms,
             lease_expires_at_ms: now_ms.saturating_add(DEFAULT_RUNTIME_LEASE_MS),
@@ -1495,6 +1641,152 @@ fn runtime_channel_key(agent_id: &str, platform: &str, channel_id: &str) -> Stri
         normalize_key_part(platform),
         normalize_key_part(channel_id)
     )
+}
+
+fn runtime_session_lane_key(
+    runtime_class: &str,
+    agent_id: &str,
+    platform: &str,
+    channel_id: &str,
+    user_id: &str,
+    session_key: &str,
+) -> String {
+    [
+        normalize_key_part(runtime_class),
+        normalize_key_part(agent_id),
+        normalize_key_part(platform),
+        normalize_key_part(channel_id),
+        normalize_key_part(user_id),
+        normalize_key_part(session_key),
+    ]
+    .join(":")
+}
+
+fn default_runtime_class_config_for_item(
+    item: &PendingQueueItem,
+) -> Option<RuntimeDispatchClassConfig> {
+    Some(match item.runtime_class.as_str() {
+        "interactive" => RuntimeDispatchClassConfig {
+            max_active: usize::MAX,
+            per_agent_max_active: usize::MAX,
+            per_channel_max_active: usize::MAX,
+            per_session_max_active: 1,
+            session_fifo: true,
+            same_session_main_agent_serialization: true,
+            per_job_max_active: usize::MAX,
+            max_queued_per_agent: usize::MAX,
+        },
+        _ => RuntimeDispatchClassConfig {
+            max_active: usize::MAX,
+            per_agent_max_active: usize::MAX,
+            per_channel_max_active: usize::MAX,
+            per_session_max_active: usize::MAX,
+            session_fifo: false,
+            same_session_main_agent_serialization: false,
+            per_job_max_active: usize::MAX,
+            max_queued_per_agent: usize::MAX,
+        },
+    })
+}
+
+fn is_interactive_channel_main_lane(
+    runtime_class: &str,
+    origin: &str,
+    cron_run_id: Option<&str>,
+    class_config: &RuntimeDispatchClassConfig,
+) -> bool {
+    class_config.same_session_main_agent_serialization
+        && runtime_class == "interactive"
+        && origin == "channel"
+        && cron_run_id.is_none()
+        && class_config.per_session_max_active > 0
+}
+
+fn item_session_lane_key(
+    item: &PendingQueueItem,
+    class_config: &RuntimeDispatchClassConfig,
+) -> Option<String> {
+    is_interactive_channel_main_lane(
+        &item.runtime_class,
+        &item.origin,
+        item.cron_run_id.as_deref(),
+        class_config,
+    )
+    .then(|| {
+        runtime_session_lane_key(
+            &item.runtime_class,
+            &item.agent_id,
+            &item.platform,
+            &item.channel_id,
+            &item.user_id,
+            &item.session_key,
+        )
+    })
+}
+
+fn lease_session_lane_key(
+    lease: &RuntimeQueueLease,
+    class_config: &RuntimeDispatchClassConfig,
+) -> Option<String> {
+    if !is_interactive_channel_main_lane(
+        &lease.runtime_class,
+        &lease.origin,
+        lease.cron_run_id.as_deref(),
+        class_config,
+    ) {
+        return None;
+    }
+    if let Some(key) = lease
+        .session_lane_key
+        .as_ref()
+        .filter(|key| !key.trim().is_empty())
+    {
+        return Some(key.clone());
+    }
+    Some(runtime_session_lane_key(
+        &lease.runtime_class,
+        &lease.agent_id,
+        &lease.platform,
+        &lease.channel_id,
+        lease.user_id.as_deref().unwrap_or(""),
+        &lease.session_key,
+    ))
+}
+
+fn same_session_fifo_blocker(
+    pending_items: &[PendingQueueItem],
+    item: &PendingQueueItem,
+    terminal_run_ids: &HashSet<String>,
+    config: &RuntimeDispatchConfig,
+) -> Option<String> {
+    let class_config = config.classes.get(&item.runtime_class)?;
+    if !class_config.session_fifo {
+        return None;
+    }
+    let lane_key = item_session_lane_key(item, class_config)?;
+    pending_items
+        .iter()
+        .filter(|candidate| candidate.queue_id != item.queue_id)
+        .filter(|candidate| !terminal_run_ids.contains(&candidate.queue_id))
+        .filter(|candidate| {
+            candidate.created_at_ms < item.created_at_ms
+                || (candidate.created_at_ms == item.created_at_ms
+                    && candidate.queue_id < item.queue_id)
+        })
+        .find(|candidate| {
+            config
+                .classes
+                .get(&candidate.runtime_class)
+                .and_then(|candidate_config| item_session_lane_key(candidate, candidate_config))
+                .as_deref()
+                == Some(lane_key.as_str())
+        })
+        .map(|candidate| {
+            format!(
+                "session-fifo for `{lane_key}` waiting on older queue item `{}`",
+                candidate.queue_id
+            )
+        })
 }
 
 fn cron_runtime_dispatch_blocker_for_item(
@@ -1542,7 +1834,8 @@ fn select_pending_item(
                 .then_with(|| left.queue_id.cmp(&right.queue_id))
         });
     }
-    for item in pending_items {
+    let config = load_runtime_dispatch_config(harness_home)?;
+    for item in pending_items.iter() {
         if requested_queue_id.is_some_and(|requested| requested != item.queue_id) {
             continue;
         }
@@ -1567,8 +1860,7 @@ fn select_pending_item(
             ));
             continue;
         }
-        if let Some(blocker) = cron_runtime_dispatch_blocker_for_item(harness_home, &item, now_ms)?
-        {
+        if let Some(blocker) = cron_runtime_dispatch_blocker_for_item(harness_home, item, now_ms)? {
             warnings.push(format!(
                 "runtime queue item `{}` blocked by {}; tombstoning",
                 item.queue_id, blocker
@@ -1576,14 +1868,23 @@ fn select_pending_item(
             tombstone_runtime_queue_item_skipped(queue_dir, &item, &blocker)?;
             continue;
         }
-        if let Some(blocker) = runtime_capacity_blocker(harness_home, lease_state, &item)? {
+        if let Some(blocker) = runtime_capacity_blocker(harness_home, lease_state, item)? {
             warnings.push(format!(
                 "runtime queue item `{}` blocked by {}; skipping",
                 item.queue_id, blocker
             ));
             continue;
         }
-        return Ok(Some(item));
+        if let Some(blocker) =
+            same_session_fifo_blocker(&pending_items, item, terminal_run_ids, &config)
+        {
+            warnings.push(format!(
+                "runtime queue item `{}` blocked by {}; skipping",
+                item.queue_id, blocker
+            ));
+            continue;
+        }
+        return Ok(Some(item.clone()));
     }
     Ok(None)
 }
@@ -2056,8 +2357,26 @@ mod tests {
             r#"{"workerDispatch":{"globalConcurrencyLimit":2,"groupConcurrencyLimit":2,"channelConcurrencyLimit":1,"laneConcurrencyLimits":{"llm":2}}}"#,
         )
         .unwrap();
-        enqueue_fixture_turn_with_text(&source, &harness_home, "first turn", 1234);
-        enqueue_fixture_turn_with_text(&source, &harness_home, "second turn", 1235);
+        enqueue_fixture_turn_with_session(
+            &source,
+            &harness_home,
+            "telegram",
+            "dm-42",
+            "user-7",
+            "session-a",
+            "first turn",
+            1234,
+        );
+        enqueue_fixture_turn_with_session(
+            &source,
+            &harness_home,
+            "telegram",
+            "dm-42",
+            "user-7",
+            "session-b",
+            "second turn",
+            1235,
+        );
 
         let first = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
             harness_home: harness_home.clone(),
@@ -2119,6 +2438,235 @@ mod tests {
             RuntimeExecutionReceiptStatus::Prepared
         );
         assert_ne!(second.receipt.queue_id, Some(first_queue_id));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_runtime_queue_item_serializes_same_channel_session_even_with_channel_capacity() {
+        let root = temp_root(
+            "prepare_runtime_queue_item_serializes_same_channel_session_even_with_channel_capacity",
+        );
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"workerDispatch":{"globalConcurrencyLimit":3,"groupConcurrencyLimit":3,"channelConcurrencyLimit":3,"laneConcurrencyLimits":{"llm":3}}}"#,
+        )
+        .unwrap();
+        enqueue_fixture_turn_with_text(&source, &harness_home, "first turn", 1234);
+        enqueue_fixture_turn_with_text(&source, &harness_home, "second turn", 1235);
+
+        let first = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert_eq!(
+            first.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+        let first_queue_id = first.receipt.queue_id.clone().unwrap();
+
+        let blocked = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert_eq!(
+            blocked.receipt.status,
+            RuntimeExecutionReceiptStatus::NoPendingItem
+        );
+        assert!(
+            blocked
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("session-active"))
+        );
+
+        append_json_line(
+            &queue_dir(&harness_home).join("run-once-receipts.jsonl"),
+            &serde_json::json!({
+                "queueId": first_queue_id,
+                "status": "completed",
+                "reason": "test terminal receipt"
+            }),
+        )
+        .unwrap();
+        release_runtime_queue_lease(&harness_home, &first_queue_id).unwrap();
+
+        let second = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert_eq!(
+            second.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+        assert_ne!(
+            second.receipt.queue_id.as_deref(),
+            Some(first_queue_id.as_str())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_runtime_queue_item_allows_different_sessions_when_channel_capacity_allows() {
+        let root = temp_root(
+            "prepare_runtime_queue_item_allows_different_sessions_when_channel_capacity_allows",
+        );
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"workerDispatch":{"globalConcurrencyLimit":3,"groupConcurrencyLimit":3,"channelConcurrencyLimit":3,"laneConcurrencyLimits":{"llm":3}}}"#,
+        )
+        .unwrap();
+        enqueue_fixture_turn_with_session(
+            &source,
+            &harness_home,
+            "telegram",
+            "dm-42",
+            "user-7",
+            "session-a",
+            "first turn",
+            1234,
+        );
+        enqueue_fixture_turn_with_session(
+            &source,
+            &harness_home,
+            "telegram",
+            "dm-42",
+            "user-7",
+            "session-b",
+            "second turn",
+            1235,
+        );
+
+        let first = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        let second = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            first.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+        assert_eq!(
+            second.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+        assert_ne!(first.receipt.queue_id, second.receipt.queue_id);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_runtime_queue_id_cannot_overtake_older_same_session_turn() {
+        let root = temp_root("explicit_runtime_queue_id_cannot_overtake_older_same_session_turn");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"workerDispatch":{"globalConcurrencyLimit":3,"groupConcurrencyLimit":3,"channelConcurrencyLimit":3,"laneConcurrencyLimits":{"llm":3}}}"#,
+        )
+        .unwrap();
+        enqueue_fixture_turn_with_text(&source, &harness_home, "first turn", 1234);
+        enqueue_fixture_turn_with_text(&source, &harness_home, "second turn", 1235);
+        let pending_text =
+            fs::read_to_string(queue_dir(&harness_home).join("pending.jsonl")).unwrap();
+        let queue_ids = pending_text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .map(|value| value["queueId"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(queue_ids.len(), 2);
+
+        let blocked = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_ids[1].clone()),
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert!(blocked.item.is_none());
+        assert_eq!(
+            blocked.receipt.status,
+            RuntimeExecutionReceiptStatus::NoPendingItem
+        );
+        assert!(
+            blocked
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("session-fifo"))
+        );
+
+        let first = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert_eq!(
+            first.receipt.queue_id.as_deref(),
+            Some(queue_ids[0].as_str())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn worker_lane_is_not_collapsed_by_interactive_session_mutex() {
+        let root = temp_root("worker_lane_is_not_collapsed_by_interactive_session_mutex");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"workerDispatch":{"globalConcurrencyLimit":3,"groupConcurrencyLimit":3,"channelConcurrencyLimit":3,"laneConcurrencyLimits":{"llm":3}},"runtimeDispatch":{"interactiveReserve":0}}"#,
+        )
+        .unwrap();
+        append_worker_pending_runtime_item(&source, &harness_home, "turn:worker:one", 1234);
+        append_worker_pending_runtime_item(&source, &harness_home, "turn:worker:two", 1235);
+
+        let first = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        let second = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+
+        assert_eq!(first.receipt.runtime_class.as_deref(), Some("worker"));
+        assert_eq!(second.receipt.runtime_class.as_deref(), Some("worker"));
+        assert_eq!(
+            first.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+        assert_eq!(
+            second.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2351,8 +2899,11 @@ mod tests {
                 origin: "channel".to_string(),
                 cron_run_id: None,
                 platform: "telegram".to_string(),
+                account_id: None,
                 channel_id: "tg-dm".to_string(),
+                user_id: Some("user-7".to_string()),
                 session_key: "main:telegram:tg-dm".to_string(),
+                session_lane_key: None,
                 owner: "legacy-worker".to_string(),
                 started_at_ms: now_ms,
                 lease_expires_at_ms: now_ms.saturating_add(60_000),
@@ -2755,6 +3306,50 @@ mod tests {
         text: &str,
         now_ms: i64,
     ) {
+        enqueue_fixture_turn_with_optional_session(
+            source,
+            harness_home,
+            platform,
+            channel_id,
+            user_id,
+            None,
+            text,
+            now_ms,
+        );
+    }
+
+    fn enqueue_fixture_turn_with_session(
+        source: &AgentSource,
+        harness_home: &Path,
+        platform: &str,
+        channel_id: &str,
+        user_id: &str,
+        session_key: &str,
+        text: &str,
+        now_ms: i64,
+    ) {
+        enqueue_fixture_turn_with_optional_session(
+            source,
+            harness_home,
+            platform,
+            channel_id,
+            user_id,
+            Some(session_key),
+            text,
+            now_ms,
+        );
+    }
+
+    fn enqueue_fixture_turn_with_optional_session(
+        source: &AgentSource,
+        harness_home: &Path,
+        platform: &str,
+        channel_id: &str,
+        user_id: &str,
+        session_key: Option<&str>,
+        text: &str,
+        now_ms: i64,
+    ) {
         let registry = load_agent_registry(source).unwrap();
         let skills = build_source_skill_index(source).unwrap();
         let turn = build_turn_plan(
@@ -2769,7 +3364,7 @@ mod tests {
                 text: text.to_string(),
                 inbound_context: None,
                 requested_agent_id: Some("main".to_string()),
-                session_hint: None,
+                session_hint: session_key.map(ToString::to_string),
                 skill_limit: 3,
             },
         )
@@ -2782,6 +3377,47 @@ mod tests {
                 runtime_workspace: None,
                 now_ms,
             },
+        )
+        .unwrap();
+    }
+
+    fn append_worker_pending_runtime_item(
+        source: &AgentSource,
+        harness_home: &Path,
+        queue_id: &str,
+        created_at_ms: i64,
+    ) {
+        append_json_line(
+            &queue_dir(harness_home).join("pending.jsonl"),
+            &serde_json::json!({
+                "queueId": queue_id,
+                "status": "queued",
+                "createdAtMs": created_at_ms,
+                "agentId": "main",
+                "sessionKey": "shared-worker-session",
+                "runtimeClass": "worker",
+                "origin": "worker-dispatch",
+                "platform": "worker",
+                "channelId": "worker-channel",
+                "userId": "worker-user",
+                "messageText": "run worker turn",
+                "source": {
+                    "sourceHome": source.home.clone(),
+                    "sourceWorkspace": source.workspace.clone(),
+                    "runtimeWorkspace": source.workspace.clone()
+                },
+                "plannedTranscriptFile": harness_home
+                    .join("agents")
+                    .join("main")
+                    .join("worker-sessions")
+                    .join(format!("{}.jsonl", normalize_key_part(queue_id))),
+                "plannedTrajectoryFile": harness_home
+                    .join("agents")
+                    .join("main")
+                    .join("worker-sessions")
+                    .join(format!("{}.trajectory.jsonl", normalize_key_part(queue_id))),
+                "selectedSkillIds": []
+            }),
         )
         .unwrap();
     }

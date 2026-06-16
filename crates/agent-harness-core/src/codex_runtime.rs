@@ -26,6 +26,9 @@ const CODEX_RUNTIME_PREFLIGHT_SCHEMA: &str = "agent-harness.codex-runtime-prefli
 const CODEX_RUNTIME_LAUNCH_PROBE_SCHEMA: &str = "agent-harness.codex-runtime-launch-probe.v1";
 const CODEX_RUNTIME_RUN_SCHEMA: &str = "agent-harness.codex-runtime-run.v1";
 const CODEX_RUNTIME_COMPLETION_SCHEMA: &str = "agent-harness.codex-runtime-completion.v1";
+const CODEX_CONTEXT_PREFLIGHT_SCHEMA: &str = "agent-harness.codex-context-preflight.v1";
+const CODEX_CONTEXT_CHECKPOINT_SCHEMA: &str = "agent-harness.codex-context-checkpoint.v1";
+const CODEX_CONTEXT_ROLLOVER_SCHEMA: &str = "agent-harness.codex-context-rollover.v1";
 const CODEX_TRANSCRIPT_MESSAGE_SCHEMA: &str = "agent-harness.transcript-message.v1";
 const CODEX_TRAJECTORY_EVENT_SCHEMA: &str = "agent-harness.trajectory-event.v1";
 const CODEX_BINDING_SCHEMA: &str = "agent-harness.codex-binding.v1";
@@ -429,7 +432,7 @@ pub struct CodexRuntimeLaunchProcess {
     pub stderr_log: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexRuntimeRunReceipt {
     pub queue_id: Option<String>,
@@ -446,9 +449,11 @@ pub struct CodexRuntimeRunReceipt {
     pub event_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<CodexRuntimeUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_recovery: Option<CodexContextRecoveryReceipt>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexRuntimeUsage {
     pub input_tokens: Option<u64>,
@@ -459,7 +464,141 @@ pub struct CodexRuntimeUsage {
     pub raw: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexContextRecoveryReceipt {
+    pub status: String,
+    pub queue_id: Option<String>,
+    pub session_key: String,
+    pub original_thread_id: Option<String>,
+    pub recovered_thread_id: Option<String>,
+    pub official_compact_attempts: usize,
+    pub retry_attempted: bool,
+    pub fallback_policy: String,
+    pub fresh_thread_attempted: bool,
+    pub fresh_thread_succeeded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollover_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_backup_file: Option<PathBuf>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexContextPolicy {
+    enabled: bool,
+    prefer_official_compact: bool,
+    auto_compact_before_turn: bool,
+    retry_once_after_compact: bool,
+    fallback_on_compact_failure: String,
+    warn_at_active_context_ratio: f64,
+    compact_at_active_context_ratio: f64,
+    manual_recovery_allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_auto_compact_token_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_auto_compact_token_limit_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_output_token_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compact_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    experimental_compact_prompt_file: Option<PathBuf>,
+    source: String,
+    configured: bool,
+}
+
+impl Default for CodexContextPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            prefer_official_compact: true,
+            auto_compact_before_turn: true,
+            retry_once_after_compact: true,
+            fallback_on_compact_failure: "checkpoint-and-new-thread".to_string(),
+            warn_at_active_context_ratio: 0.75,
+            compact_at_active_context_ratio: 0.85,
+            manual_recovery_allowed: true,
+            model_context_window: None,
+            model_auto_compact_token_limit: None,
+            model_auto_compact_token_limit_scope: None,
+            tool_output_token_limit: None,
+            compact_prompt: None,
+            experimental_compact_prompt_file: None,
+            source: "default".to_string(),
+            configured: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexContextPreflightReceipt {
+    schema: &'static str,
+    queue_id: Option<String>,
+    session_key: String,
+    agent_id: Option<String>,
+    execution_dir: Option<PathBuf>,
+    plan_file: PathBuf,
+    preflight_file: Option<PathBuf>,
+    prompt_markdown_bytes: u64,
+    prompt_bundle_bytes: u64,
+    transcript_lines: usize,
+    transcript_bytes: u64,
+    codex_binding_file: PathBuf,
+    thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_usage: Option<CodexRuntimeUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_context_ratio: Option<f64>,
+    compact_before_turn: bool,
+    reason: String,
+    policy: CodexContextPolicy,
+}
+
+struct CodexContextPreflightRun {
+    receipt: CodexContextPreflightReceipt,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexContextCheckpoint {
+    schema: &'static str,
+    queue_id: Option<String>,
+    session_key: String,
+    agent_id: Option<String>,
+    previous_thread_id: Option<String>,
+    codex_binding_file: PathBuf,
+    transcript_file: PathBuf,
+    trajectory_file: PathBuf,
+    prompt_bundle_json: PathBuf,
+    prompt_markdown: PathBuf,
+    reason: String,
+    created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexContextRolloverReceipt {
+    schema: &'static str,
+    queue_id: Option<String>,
+    session_key: String,
+    previous_thread_id: Option<String>,
+    codex_binding_file: PathBuf,
+    binding_backup_file: Option<PathBuf>,
+    reason: String,
+    created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CodexRuntimeRunStatus {
     Completed,
@@ -467,6 +606,7 @@ pub enum CodexRuntimeRunStatus {
     NoRuntimePlan,
     SpawnFailed,
     ProtocolError,
+    ContextExhausted,
     Timeout,
     Canceled,
 }
@@ -991,6 +1131,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 elapsed_ms: 0,
                 event_count: 0,
                 usage: None,
+                context_recovery: None,
             };
             append_codex_run_log(
                 &options.harness_home,
@@ -1032,6 +1173,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 elapsed_ms: 0,
                 event_count: 0,
                 usage: None,
+                context_recovery: None,
             };
             append_codex_run_log(
                 &options.harness_home,
@@ -1077,6 +1219,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             elapsed_ms: 0,
             event_count: 0,
             usage: None,
+            context_recovery: None,
         };
         append_codex_run_log(
             &options.harness_home,
@@ -1126,6 +1269,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             elapsed_ms: 0,
             event_count: 0,
             usage: None,
+            context_recovery: None,
         };
         append_codex_run_log(
             &options.harness_home,
@@ -1153,6 +1297,20 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
         );
     }
 
+    let context_preflight = preflight_codex_context(
+        &options.harness_home,
+        &plan,
+        &plan_file,
+        execution_dir.as_deref(),
+    )?;
+    warnings.extend(context_preflight.warnings.clone());
+    if context_preflight.receipt.compact_before_turn {
+        warnings.push(format!(
+            "Codex context preflight requested official compact before turn/start: {}",
+            context_preflight.receipt.reason
+        ));
+    }
+    let context_policy = context_preflight.receipt.policy.clone();
     let narration_config = load_assistant_narration_config(&options.harness_home)?;
     warnings.extend(narration_config.warnings.clone());
     if let Some(stdout_log_path) = stdout_log.as_ref()
@@ -1182,14 +1340,28 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
         );
     }
     let started = Instant::now();
-    let run_result = drive_codex_app_server(
+    let mut run_result = drive_codex_app_server(
         &options.harness_home,
         &plan,
         options.timeout_ms,
         options.idle_timeout_ms,
-        options.progress_context,
+        options.progress_context.clone(),
         &narration_config,
+        &context_policy,
+        context_preflight.receipt.compact_before_turn,
     )?;
+    if run_result.status == CodexRuntimeRunStatus::ContextExhausted {
+        run_result = recover_codex_context_exhaustion(
+            &options.harness_home,
+            &plan,
+            run_result,
+            options.timeout_ms,
+            options.idle_timeout_ms,
+            options.progress_context.clone(),
+            &narration_config,
+            &context_policy,
+        )?;
+    }
     let elapsed_ms = started.elapsed().as_millis();
     let finished_at_ms = current_log_time_ms()?;
     finish_codex_runtime_run(
@@ -1274,12 +1446,13 @@ fn finish_codex_runtime_run(
         elapsed_ms,
         event_count: run_result.event_count,
         usage: run_result.usage,
+        context_recovery: run_result.context_recovery,
     };
     let log_level = match receipt.status {
         CodexRuntimeRunStatus::Completed => HarnessLogLevel::Info,
-        CodexRuntimeRunStatus::Timeout | CodexRuntimeRunStatus::ProtocolError => {
-            HarnessLogLevel::Error
-        }
+        CodexRuntimeRunStatus::Timeout
+        | CodexRuntimeRunStatus::ProtocolError
+        | CodexRuntimeRunStatus::ContextExhausted => HarnessLogLevel::Error,
         CodexRuntimeRunStatus::Canceled => HarnessLogLevel::Warn,
         CodexRuntimeRunStatus::SpawnFailed
         | CodexRuntimeRunStatus::PreflightBlocked
@@ -1289,6 +1462,7 @@ fn finish_codex_runtime_run(
         CodexRuntimeRunStatus::Completed => "codex.run.completed",
         CodexRuntimeRunStatus::Timeout => "codex.run.timeout",
         CodexRuntimeRunStatus::ProtocolError => "codex.run.protocol-error",
+        CodexRuntimeRunStatus::ContextExhausted => "codex.run.context-exhausted",
         CodexRuntimeRunStatus::SpawnFailed => "codex.run.spawn-failed",
         CodexRuntimeRunStatus::PreflightBlocked => "codex.run.preflight-blocked",
         CodexRuntimeRunStatus::NoRuntimePlan => "codex.run.no-plan",
@@ -1338,6 +1512,7 @@ fn recover_completed_codex_run_from_stdout_log(
     let mut event_count = 0usize;
     let mut completed = false;
     let mut terminal_error = None;
+    let mut terminal_failure_reason = None;
     let mut thread_id = plan.invocation.thread_id.clone();
 
     for line in reader.lines() {
@@ -1355,24 +1530,14 @@ fn recover_completed_codex_run_from_stdout_log(
                 if is_turn_completed(&value) {
                     record_turn_usage(&value, &mut state);
                     if let Some(reason) =
-                        turn_completed_failure_reason(&value).or_else(|| terminal_error.clone())
+                        turn_completed_failure_reason(&value).or_else(|| terminal_error.take())
                     {
-                        return Ok(Some(CodexAppServerRunResult {
-                            status: CodexRuntimeRunStatus::ProtocolError,
-                            reason,
-                            assistant_message: state.assistant_message_with_harness_notices(),
-                            assistant_narration: state.assistant_narration_records(),
-                            assistant_raw_message: state.assistant_raw_message(),
-                            assistant_final_found: state.assistant_final_found(),
-                            thread_id,
-                            event_count,
-                            usage: state.usage,
-                            stdout_log: Some(stdout_log.to_path_buf()),
-                            stderr_log,
-                            warnings: state.warnings,
-                        }));
+                        completed = false;
+                        terminal_failure_reason = Some(reason);
+                    } else {
+                        completed = true;
+                        terminal_failure_reason = None;
                     }
-                    completed = true;
                 }
             }
             Err(error) => state.warnings.push(format!(
@@ -1382,6 +1547,23 @@ fn recover_completed_codex_run_from_stdout_log(
     }
 
     if !completed {
+        if let Some(reason) = terminal_failure_reason {
+            return Ok(Some(CodexAppServerRunResult {
+                status: codex_status_for_protocol_failure(&reason),
+                reason,
+                assistant_message: state.assistant_message_with_harness_notices(),
+                assistant_narration: state.assistant_narration_records(),
+                assistant_raw_message: state.assistant_raw_message(),
+                assistant_final_found: state.assistant_final_found(),
+                thread_id,
+                event_count,
+                usage: state.usage,
+                stdout_log: Some(stdout_log.to_path_buf()),
+                stderr_log,
+                context_recovery: None,
+                warnings: state.warnings,
+            }));
+        }
         return Ok(None);
     }
 
@@ -1397,6 +1579,7 @@ fn recover_completed_codex_run_from_stdout_log(
         usage: state.usage,
         stdout_log: Some(stdout_log.to_path_buf()),
         stderr_log,
+        context_recovery: None,
         warnings: state.warnings,
     }))
 }
@@ -1627,6 +1810,204 @@ fn plan_completion_recorded(plan: &CodexRuntimePlanFile) -> io::Result<bool> {
     Ok(receipt.status == CodexRuntimeCompletionStatus::Recorded)
 }
 
+fn preflight_codex_context(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    plan_file: &Path,
+    execution_dir: Option<&Path>,
+) -> io::Result<CodexContextPreflightRun> {
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let receipts_file = queue_dir.join("codex-context-preflight-receipts.jsonl");
+    fs::create_dir_all(&queue_dir)?;
+    let mut warnings = Vec::new();
+    let policy = match load_codex_context_policy(harness_home) {
+        Ok(policy) => policy,
+        Err(error) => {
+            warnings.push(format!(
+                "failed to load codexContext policy: {error}; using defaults"
+            ));
+            CodexContextPolicy::default()
+        }
+    };
+    let prompt_markdown_bytes = file_len_or_zero(&plan.prompt_markdown);
+    let prompt_bundle_bytes = file_len_or_zero(&plan.prompt_bundle_json);
+    let (transcript_lines, transcript_bytes) = transcript_stats(&plan.outputs.transcript_file);
+    let latest_usage = latest_codex_runtime_usage(
+        harness_home,
+        &plan.outputs.codex_binding_file,
+        &mut warnings,
+    );
+    let latest_tokens = latest_usage.as_ref().and_then(codex_usage_total_tokens);
+    let model_context_window = policy.model_context_window;
+    let active_context_ratio = latest_tokens.and_then(|tokens| {
+        model_context_window
+            .filter(|window| *window > 0)
+            .map(|window| tokens as f64 / window as f64)
+    });
+    let has_existing_thread = plan.invocation.thread_id.is_some();
+    let (compact_before_turn, reason) = if !policy.enabled {
+        (false, "codexContext policy disabled".to_string())
+    } else if !policy.prefer_official_compact {
+        (
+            false,
+            "codexContext policy does not prefer official compact".to_string(),
+        )
+    } else if !policy.auto_compact_before_turn {
+        (
+            false,
+            "codexContext autoCompactBeforeTurn disabled".to_string(),
+        )
+    } else if !has_existing_thread {
+        (
+            false,
+            "no existing Codex thread is bound to this harness session".to_string(),
+        )
+    } else if let (Some(tokens), Some(limit)) =
+        (latest_tokens, policy.model_auto_compact_token_limit)
+        && tokens >= limit
+    {
+        (
+            true,
+            format!(
+                "latest usage {tokens} token(s) is at or above model_auto_compact_token_limit {limit}"
+            ),
+        )
+    } else if let Some(ratio) = active_context_ratio
+        && ratio >= policy.compact_at_active_context_ratio
+    {
+        (
+            true,
+            format!(
+                "latest usage ratio {:.3} is at or above compactAtActiveContextRatio {:.3}",
+                ratio, policy.compact_at_active_context_ratio
+            ),
+        )
+    } else if let Some(ratio) = active_context_ratio
+        && ratio >= policy.warn_at_active_context_ratio
+    {
+        warnings.push(format!(
+            "latest usage ratio {:.3} is at or above warnAtActiveContextRatio {:.3}",
+            ratio, policy.warn_at_active_context_ratio
+        ));
+        (
+            false,
+            "known usage is above warning threshold but below compact threshold".to_string(),
+        )
+    } else {
+        (
+            false,
+            "no known context usage threshold requires official compact before turn".to_string(),
+        )
+    };
+    let preflight_file = execution_dir.map(|dir| dir.join("codex-context-preflight.json"));
+    let receipt = CodexContextPreflightReceipt {
+        schema: CODEX_CONTEXT_PREFLIGHT_SCHEMA,
+        queue_id: plan.queue_id.clone(),
+        session_key: plan.session_key.clone(),
+        agent_id: plan.agent_id.clone(),
+        execution_dir: execution_dir.map(Path::to_path_buf),
+        plan_file: plan_file.to_path_buf(),
+        preflight_file: preflight_file.clone(),
+        prompt_markdown_bytes,
+        prompt_bundle_bytes,
+        transcript_lines,
+        transcript_bytes,
+        codex_binding_file: plan.outputs.codex_binding_file.clone(),
+        thread_id: plan.invocation.thread_id.clone(),
+        latest_usage,
+        model_context_window,
+        active_context_ratio,
+        compact_before_turn,
+        reason,
+        policy,
+    };
+    if let Some(preflight_file) = &preflight_file {
+        write_json_atomic(preflight_file, &receipt)?;
+    }
+    append_json_line(&receipts_file, &receipt)?;
+    Ok(CodexContextPreflightRun { receipt, warnings })
+}
+
+fn file_len_or_zero(path: &Path) -> u64 {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn transcript_stats(path: &Path) -> (usize, u64) {
+    let bytes = file_len_or_zero(path);
+    let lines = fs::read_to_string(path)
+        .map(|text| text.lines().count())
+        .unwrap_or(0);
+    (lines, bytes)
+}
+
+fn codex_usage_total_tokens(usage: &CodexRuntimeUsage) -> Option<u64> {
+    usage
+        .total_tokens
+        .or_else(|| match (usage.input_tokens, usage.output_tokens) {
+            (Some(input), Some(output)) => Some(input.saturating_add(output)),
+            (Some(input), None) => Some(input),
+            (None, Some(output)) => Some(output),
+            (None, None) => None,
+        })
+}
+
+fn latest_codex_runtime_usage(
+    harness_home: &Path,
+    codex_binding_file: &Path,
+    warnings: &mut Vec<String>,
+) -> Option<CodexRuntimeUsage> {
+    let receipts_file = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("codex-runtime-run-receipts.jsonl");
+    let text = match fs::read_to_string(&receipts_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            warnings.push(format!(
+                "failed to read {} for context usage preflight: {error}",
+                receipts_file.display()
+            ));
+            return None;
+        }
+    };
+    let target_binding = normalize_path_text_for_match(&codex_binding_file.to_string_lossy());
+    let mut fallback = None;
+    for line in text.lines().rev() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(usage) = value
+            .get("usage")
+            .and_then(|usage| serde_json::from_value::<CodexRuntimeUsage>(usage.clone()).ok())
+        else {
+            continue;
+        };
+        if fallback.is_none() {
+            fallback = Some(usage.clone());
+        }
+        let matches_binding = value
+            .get("codexBindingFile")
+            .and_then(Value::as_str)
+            .map(normalize_path_text_for_match)
+            .as_deref()
+            == Some(target_binding.as_str());
+        if matches_binding {
+            return Some(usage);
+        }
+    }
+    fallback
+}
+
+fn normalize_path_text_for_match(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
+}
+
 pub fn load_assistant_narration_config(
     harness_home: impl AsRef<Path>,
 ) -> io::Result<AssistantNarrationConfig> {
@@ -1704,6 +2085,151 @@ pub fn load_assistant_narration_config(
     Ok(config)
 }
 
+fn load_codex_context_policy(harness_home: &Path) -> io::Result<CodexContextPolicy> {
+    ensure_harness_config_valid(harness_home)?;
+    let mut policy = CodexContextPolicy::default();
+    for path in [
+        harness_home.join(HARNESS_CONFIG_FILE_NAME),
+        harness_home.join("config").join(HARNESS_CONFIG_FILE_NAME),
+    ] {
+        if !path.is_file() {
+            continue;
+        }
+        let text = fs::read_to_string(&path)?;
+        let value = serde_json::from_str::<Value>(&text).map_err(io::Error::other)?;
+        let Some(context) = value
+            .get("codexContext")
+            .or_else(|| value.get("codex_context"))
+            .and_then(Value::as_object)
+        else {
+            break;
+        };
+        policy.configured = true;
+        policy.source = format!("config:{}", path.display());
+        if let Some(value) = context_bool(context, &["enabled"]) {
+            policy.enabled = value;
+        }
+        if let Some(value) = context_bool(
+            context,
+            &["preferOfficialCompact", "prefer_official_compact"],
+        ) {
+            policy.prefer_official_compact = value;
+        }
+        if let Some(value) = context_bool(
+            context,
+            &["autoCompactBeforeTurn", "auto_compact_before_turn"],
+        ) {
+            policy.auto_compact_before_turn = value;
+        }
+        if let Some(value) = context_bool(
+            context,
+            &["retryOnceAfterCompact", "retry_once_after_compact"],
+        ) {
+            policy.retry_once_after_compact = value;
+        }
+        if let Some(value) = context_bool(
+            context,
+            &["manualRecoveryAllowed", "manual_recovery_allowed"],
+        ) {
+            policy.manual_recovery_allowed = value;
+        }
+        if let Some(value) = context_string(
+            context,
+            &["fallbackOnCompactFailure", "fallback_on_compact_failure"],
+        ) {
+            policy.fallback_on_compact_failure = normalize_context_fallback_policy(&value);
+        }
+        if let Some(value) = context_f64(
+            context,
+            &["warnAtActiveContextRatio", "warn_at_active_context_ratio"],
+        )
+        .filter(|value| *value > 0.0 && *value <= 1.0)
+        {
+            policy.warn_at_active_context_ratio = value;
+        }
+        if let Some(value) = context_f64(
+            context,
+            &[
+                "compactAtActiveContextRatio",
+                "compact_at_active_context_ratio",
+            ],
+        )
+        .filter(|value| *value > 0.0 && *value <= 1.0)
+        {
+            policy.compact_at_active_context_ratio = value;
+        }
+        policy.model_context_window =
+            context_u64(context, &["modelContextWindow", "model_context_window"])
+                .filter(|value| *value > 0);
+        policy.model_auto_compact_token_limit = context_u64(
+            context,
+            &[
+                "modelAutoCompactTokenLimit",
+                "model_auto_compact_token_limit",
+            ],
+        )
+        .filter(|value| *value > 0);
+        policy.model_auto_compact_token_limit_scope = context_string(
+            context,
+            &[
+                "modelAutoCompactTokenLimitScope",
+                "model_auto_compact_token_limit_scope",
+            ],
+        );
+        policy.tool_output_token_limit = context_u64(
+            context,
+            &["toolOutputTokenLimit", "tool_output_token_limit"],
+        )
+        .filter(|value| *value > 0);
+        policy.compact_prompt = context_string(context, &["compactPrompt", "compact_prompt"]);
+        policy.experimental_compact_prompt_file = context_string(
+            context,
+            &[
+                "experimentalCompactPromptFile",
+                "experimental_compact_prompt_file",
+            ],
+        )
+        .map(PathBuf::from);
+        break;
+    }
+    Ok(policy)
+}
+
+fn context_bool(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_bool))
+}
+
+fn context_u64(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_u64))
+}
+
+fn context_f64(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_f64))
+}
+
+fn context_string(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn normalize_context_fallback_policy(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "checkpoint-and-new-thread" | "manual" | "disabled" => {
+            value.trim().to_ascii_lowercase().replace('_', "-")
+        }
+        _ => "checkpoint-and-new-thread".to_string(),
+    }
+}
+
 fn ensure_harness_config_valid(harness_home: &Path) -> io::Result<()> {
     let validation = validate_harness_config(harness_home)?;
     if validation.status == HarnessConfigValidationStatus::Invalid {
@@ -1750,6 +2276,7 @@ struct CodexAppServerRunResult {
     usage: Option<CodexRuntimeUsage>,
     stdout_log: Option<PathBuf>,
     stderr_log: Option<PathBuf>,
+    context_recovery: Option<CodexContextRecoveryReceipt>,
     warnings: Vec<String>,
 }
 
@@ -1876,6 +2403,8 @@ fn drive_codex_app_server(
     idle_timeout_ms: u64,
     progress_context: Option<AgentProgressContext>,
     narration_config: &AssistantNarrationConfig,
+    context_policy: &CodexContextPolicy,
+    compact_before_turn: bool,
 ) -> io::Result<CodexAppServerRunResult> {
     let execution_dir = runtime_execution_dir(plan);
     fs::create_dir_all(&execution_dir)?;
@@ -1916,6 +2445,7 @@ fn drive_codex_app_server(
                 usage: None,
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
+                context_recovery: None,
                 warnings: Vec::new(),
             });
         }
@@ -1934,6 +2464,7 @@ fn drive_codex_app_server(
             usage: None,
             stdout_log: Some(stdout_log),
             stderr_log: Some(stderr_log),
+            context_recovery: None,
             warnings: Vec::new(),
         });
     };
@@ -1951,6 +2482,7 @@ fn drive_codex_app_server(
             usage: None,
             stdout_log: Some(stdout_log),
             stderr_log: Some(stderr_log),
+            context_recovery: None,
             warnings: Vec::new(),
         });
     };
@@ -2050,6 +2582,7 @@ fn drive_codex_app_server(
                 usage: state.usage.clone(),
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
+                context_recovery: None,
                 warnings: state.warnings,
             });
         }
@@ -2061,7 +2594,7 @@ fn drive_codex_app_server(
                 "thread start failed",
             );
             return Ok(CodexAppServerRunResult {
-                status: CodexRuntimeRunStatus::ProtocolError,
+                status: codex_status_for_protocol_failure(&reason),
                 reason,
                 assistant_message: state.assistant_message_with_harness_notices(),
                 assistant_narration: state.assistant_narration_records(),
@@ -2072,6 +2605,7 @@ fn drive_codex_app_server(
                 usage: state.usage.clone(),
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
+                context_recovery: None,
                 warnings: state.warnings,
             });
         }
@@ -2094,6 +2628,31 @@ fn drive_codex_app_server(
                 usage: state.usage.clone(),
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
+                context_recovery: None,
+                warnings: state.warnings,
+            });
+        }
+        ProtocolWait::CompactCompleted => {
+            finish_codex_child_and_stdout_reader(
+                &mut child,
+                &mut reader_handle,
+                &mut state.warnings,
+                "compact completed before thread start",
+            );
+            return Ok(CodexAppServerRunResult {
+                status: CodexRuntimeRunStatus::ProtocolError,
+                reason: "codex app-server reported context compaction before thread start"
+                    .to_string(),
+                assistant_message: state.assistant_message_with_harness_notices(),
+                assistant_narration: state.assistant_narration_records(),
+                assistant_raw_message: state.assistant_raw_message(),
+                assistant_final_found: state.assistant_final_found(),
+                thread_id: None,
+                event_count: state.event_count,
+                usage: state.usage.clone(),
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                context_recovery: None,
                 warnings: state.warnings,
             });
         }
@@ -2116,10 +2675,183 @@ fn drive_codex_app_server(
                 usage: state.usage.clone(),
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
+                context_recovery: None,
                 warnings: state.warnings,
             });
         }
     };
+    let mut context_recovery = None;
+    if compact_before_turn {
+        match run_official_context_compact(
+            &line_rx,
+            &mut child,
+            &mut stdin,
+            &mut state,
+            &mut progress,
+            &mut timeouts,
+            plan.invocation.approval_policy,
+            Some(&cancel_check),
+            narration_config,
+            &thread_id,
+            2,
+        )? {
+            ProtocolWait::CompactCompleted => {
+                context_recovery = Some(CodexContextRecoveryReceipt {
+                    status: "compact-before-turn".to_string(),
+                    queue_id: plan.queue_id.clone(),
+                    session_key: plan.session_key.clone(),
+                    original_thread_id: Some(thread_id.clone()),
+                    recovered_thread_id: Some(thread_id.clone()),
+                    official_compact_attempts: 1,
+                    retry_attempted: false,
+                    fallback_policy: context_policy.fallback_on_compact_failure.clone(),
+                    fresh_thread_attempted: false,
+                    fresh_thread_succeeded: false,
+                    checkpoint_file: None,
+                    rollover_file: None,
+                    binding_backup_file: None,
+                    reason: "Codex official context compaction completed before turn/start"
+                        .to_string(),
+                });
+            }
+            ProtocolWait::TimedOut(reason) => {
+                finish_codex_child_and_stdout_reader(
+                    &mut child,
+                    &mut reader_handle,
+                    &mut state.warnings,
+                    "context compact timed out",
+                );
+                let recovery = context_recovery_failure_receipt(
+                    plan,
+                    Some(thread_id.clone()),
+                    None,
+                    context_policy,
+                    "compact-before-turn-timeout",
+                    format!("Codex official context compact timed out: {reason}"),
+                    1,
+                    false,
+                );
+                return Ok(CodexAppServerRunResult {
+                    status: CodexRuntimeRunStatus::Timeout,
+                    reason,
+                    assistant_message: state.assistant_message_with_harness_notices(),
+                    assistant_narration: state.assistant_narration_records(),
+                    assistant_raw_message: state.assistant_raw_message(),
+                    assistant_final_found: state.assistant_final_found(),
+                    thread_id: Some(thread_id.clone()),
+                    event_count: state.event_count,
+                    usage: state.usage.clone(),
+                    stdout_log: Some(stdout_log),
+                    stderr_log: Some(stderr_log),
+                    context_recovery: Some(recovery),
+                    warnings: state.warnings,
+                });
+            }
+            ProtocolWait::Failed(reason) => {
+                finish_codex_child_and_stdout_reader(
+                    &mut child,
+                    &mut reader_handle,
+                    &mut state.warnings,
+                    "context compact failed",
+                );
+                let status = codex_status_for_protocol_failure(&reason);
+                let recovery = context_recovery_failure_receipt(
+                    plan,
+                    Some(thread_id.clone()),
+                    None,
+                    context_policy,
+                    "compact-before-turn-failed",
+                    format!("Codex official context compact failed: {reason}"),
+                    1,
+                    false,
+                );
+                return Ok(CodexAppServerRunResult {
+                    status,
+                    reason,
+                    assistant_message: state.assistant_message_with_harness_notices(),
+                    assistant_narration: state.assistant_narration_records(),
+                    assistant_raw_message: state.assistant_raw_message(),
+                    assistant_final_found: state.assistant_final_found(),
+                    thread_id: Some(thread_id.clone()),
+                    event_count: state.event_count,
+                    usage: state.usage.clone(),
+                    stdout_log: Some(stdout_log),
+                    stderr_log: Some(stderr_log),
+                    context_recovery: Some(recovery),
+                    warnings: state.warnings,
+                });
+            }
+            ProtocolWait::Canceled(reason) => {
+                finish_codex_child_and_stdout_reader(
+                    &mut child,
+                    &mut reader_handle,
+                    &mut state.warnings,
+                    "context compact canceled",
+                );
+                let recovery = context_recovery_failure_receipt(
+                    plan,
+                    Some(thread_id.clone()),
+                    None,
+                    context_policy,
+                    "compact-before-turn-canceled",
+                    format!("Codex official context compact canceled: {reason}"),
+                    1,
+                    false,
+                );
+                return Ok(CodexAppServerRunResult {
+                    status: CodexRuntimeRunStatus::Canceled,
+                    reason,
+                    assistant_message: state.assistant_message_with_harness_notices(),
+                    assistant_narration: state.assistant_narration_records(),
+                    assistant_raw_message: state.assistant_raw_message(),
+                    assistant_final_found: state.assistant_final_found(),
+                    thread_id: Some(thread_id.clone()),
+                    event_count: state.event_count,
+                    usage: state.usage.clone(),
+                    stdout_log: Some(stdout_log),
+                    stderr_log: Some(stderr_log),
+                    context_recovery: Some(recovery),
+                    warnings: state.warnings,
+                });
+            }
+            ProtocolWait::ThreadStarted(_) | ProtocolWait::TurnCompleted => {
+                finish_codex_child_and_stdout_reader(
+                    &mut child,
+                    &mut reader_handle,
+                    &mut state.warnings,
+                    "unexpected protocol response during context compact",
+                );
+                let reason =
+                    "codex app-server returned an unexpected response during context compact"
+                        .to_string();
+                let recovery = context_recovery_failure_receipt(
+                    plan,
+                    Some(thread_id.clone()),
+                    None,
+                    context_policy,
+                    "compact-before-turn-failed",
+                    reason.clone(),
+                    1,
+                    false,
+                );
+                return Ok(CodexAppServerRunResult {
+                    status: CodexRuntimeRunStatus::ProtocolError,
+                    reason,
+                    assistant_message: state.assistant_message_with_harness_notices(),
+                    assistant_narration: state.assistant_narration_records(),
+                    assistant_raw_message: state.assistant_raw_message(),
+                    assistant_final_found: state.assistant_final_found(),
+                    thread_id: Some(thread_id.clone()),
+                    event_count: state.event_count,
+                    usage: state.usage.clone(),
+                    stdout_log: Some(stdout_log),
+                    stderr_log: Some(stderr_log),
+                    context_recovery: Some(recovery),
+                    warnings: state.warnings,
+                });
+            }
+        }
+    }
     let prompt_input = fs::read_to_string(&plan.invocation.prompt_input_file)?;
     let turn_sandbox_policy =
         app_server_sandbox_policy_value(&app_server_sandbox, &runtime_workspace_root);
@@ -2144,7 +2876,7 @@ fn drive_codex_app_server(
     write_json_rpc(
         &mut stdin,
         &json!({
-            "id": 2,
+            "id": if compact_before_turn { 3 } else { 2 },
             "method": "turn/start",
             "params": turn_params
         }),
@@ -2181,6 +2913,7 @@ fn drive_codex_app_server(
                 usage: state.usage.clone(),
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
+                context_recovery: context_recovery.clone(),
                 warnings: state.warnings,
             });
         }
@@ -2192,7 +2925,7 @@ fn drive_codex_app_server(
                 "turn failed",
             );
             return Ok(CodexAppServerRunResult {
-                status: CodexRuntimeRunStatus::ProtocolError,
+                status: codex_status_for_protocol_failure(&reason),
                 reason,
                 assistant_message: state.assistant_message_with_harness_notices(),
                 assistant_narration: state.assistant_narration_records(),
@@ -2203,6 +2936,7 @@ fn drive_codex_app_server(
                 usage: state.usage.clone(),
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
+                context_recovery: context_recovery.clone(),
                 warnings: state.warnings,
             });
         }
@@ -2226,6 +2960,31 @@ fn drive_codex_app_server(
                 usage: state.usage.clone(),
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
+                context_recovery: context_recovery.clone(),
+                warnings: state.warnings,
+            });
+        }
+        ProtocolWait::CompactCompleted => {
+            finish_codex_child_and_stdout_reader(
+                &mut child,
+                &mut reader_handle,
+                &mut state.warnings,
+                "unexpected context compact response during turn",
+            );
+            return Ok(CodexAppServerRunResult {
+                status: CodexRuntimeRunStatus::ProtocolError,
+                reason: "codex app-server returned context compaction completion during turn"
+                    .to_string(),
+                assistant_message: state.assistant_message_with_harness_notices(),
+                assistant_narration: state.assistant_narration_records(),
+                assistant_raw_message: state.assistant_raw_message(),
+                assistant_final_found: state.assistant_final_found(),
+                thread_id: Some(thread_id.clone()),
+                event_count: state.event_count,
+                usage: state.usage.clone(),
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                context_recovery: context_recovery.clone(),
                 warnings: state.warnings,
             });
         }
@@ -2257,6 +3016,7 @@ fn drive_codex_app_server(
                 usage: state.usage.clone(),
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
+                context_recovery: context_recovery.clone(),
                 warnings: state.warnings,
             });
         }
@@ -2279,6 +3039,7 @@ fn drive_codex_app_server(
         usage: state.usage.clone(),
         stdout_log: Some(stdout_log),
         stderr_log: Some(stderr_log),
+        context_recovery,
         warnings: state.warnings,
     })
 }
@@ -2291,6 +3052,350 @@ fn app_server_model_provider(plan: &CodexRuntimePlanFile) -> Option<String> {
         .or_else(|| plan.provider.clone())
         .map(|provider| provider.trim().to_string())
         .filter(|provider| !provider.is_empty())
+}
+
+fn context_recovery_failure_receipt(
+    plan: &CodexRuntimePlanFile,
+    original_thread_id: Option<String>,
+    recovered_thread_id: Option<String>,
+    policy: &CodexContextPolicy,
+    status: &str,
+    reason: String,
+    official_compact_attempts: usize,
+    retry_attempted: bool,
+) -> CodexContextRecoveryReceipt {
+    CodexContextRecoveryReceipt {
+        status: status.to_string(),
+        queue_id: plan.queue_id.clone(),
+        session_key: plan.session_key.clone(),
+        original_thread_id,
+        recovered_thread_id,
+        official_compact_attempts,
+        retry_attempted,
+        fallback_policy: policy.fallback_on_compact_failure.clone(),
+        fresh_thread_attempted: false,
+        fresh_thread_succeeded: false,
+        checkpoint_file: None,
+        rollover_file: None,
+        binding_backup_file: None,
+        reason,
+    }
+}
+
+fn recover_codex_context_exhaustion(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    mut current: CodexAppServerRunResult,
+    timeout_ms: u64,
+    idle_timeout_ms: u64,
+    progress_context: Option<AgentProgressContext>,
+    narration_config: &AssistantNarrationConfig,
+    policy: &CodexContextPolicy,
+) -> io::Result<CodexAppServerRunResult> {
+    let original_thread_id = current
+        .thread_id
+        .clone()
+        .or_else(|| plan.invocation.thread_id.clone());
+    if !policy.enabled {
+        current.context_recovery = Some(context_recovery_failure_receipt(
+            plan,
+            original_thread_id,
+            None,
+            policy,
+            "compact-disabled",
+            "codexContext policy disabled; context exhaustion was not auto-recovered".to_string(),
+            current
+                .context_recovery
+                .as_ref()
+                .map(|receipt| receipt.official_compact_attempts)
+                .unwrap_or(0),
+            false,
+        ));
+        return Ok(current);
+    }
+
+    if policy.prefer_official_compact && policy.retry_once_after_compact {
+        if let Some(thread_id) = original_thread_id.clone() {
+            let original_reason = current.reason.clone();
+            let original_events = current.event_count;
+            let mut retry_plan = plan.clone();
+            retry_plan.invocation.thread_id = Some(thread_id.clone());
+            let mut retry_result = drive_codex_app_server(
+                harness_home,
+                &retry_plan,
+                timeout_ms,
+                idle_timeout_ms,
+                progress_context.clone(),
+                narration_config,
+                policy,
+                true,
+            )?;
+            retry_result.event_count = retry_result.event_count.saturating_add(original_events);
+            retry_result.warnings.push(format!(
+                "retried queue item once after Codex context exhaustion; original reason: {original_reason}"
+            ));
+            let compact_attempts = retry_result
+                .context_recovery
+                .as_ref()
+                .map(|receipt| receipt.official_compact_attempts)
+                .unwrap_or(1);
+            let succeeded = retry_result.status == CodexRuntimeRunStatus::Completed;
+            retry_result.context_recovery = Some(CodexContextRecoveryReceipt {
+                status: if succeeded {
+                    "compact-retry-succeeded".to_string()
+                } else {
+                    "compact-retry-failed".to_string()
+                },
+                queue_id: plan.queue_id.clone(),
+                session_key: plan.session_key.clone(),
+                original_thread_id: Some(thread_id),
+                recovered_thread_id: retry_result.thread_id.clone(),
+                official_compact_attempts: compact_attempts,
+                retry_attempted: true,
+                fallback_policy: policy.fallback_on_compact_failure.clone(),
+                fresh_thread_attempted: false,
+                fresh_thread_succeeded: false,
+                checkpoint_file: None,
+                rollover_file: None,
+                binding_backup_file: None,
+                reason: if succeeded {
+                    format!(
+                        "Codex context exhausted; official compact completed and retry succeeded. Original reason: {original_reason}"
+                    )
+                } else {
+                    format!(
+                        "Codex context exhausted; official compact retry failed. Original reason: {original_reason}; retry reason: {}",
+                        retry_result.reason
+                    )
+                },
+            });
+            if succeeded {
+                return Ok(retry_result);
+            }
+            current = retry_result;
+        } else {
+            current.context_recovery = Some(context_recovery_failure_receipt(
+                plan,
+                None,
+                None,
+                policy,
+                "compact-unavailable",
+                "Codex context exhausted, but no thread id was available for official compact"
+                    .to_string(),
+                current
+                    .context_recovery
+                    .as_ref()
+                    .map(|receipt| receipt.official_compact_attempts)
+                    .unwrap_or(0),
+                false,
+            ));
+        }
+    }
+
+    if policy.fallback_on_compact_failure == "checkpoint-and-new-thread" {
+        return run_context_checkpoint_fallback(
+            harness_home,
+            plan,
+            current,
+            original_thread_id,
+            timeout_ms,
+            idle_timeout_ms,
+            progress_context,
+            narration_config,
+            policy,
+        );
+    }
+
+    if current.context_recovery.is_none() {
+        current.context_recovery = Some(context_recovery_failure_receipt(
+            plan,
+            original_thread_id,
+            None,
+            policy,
+            "manual-recovery-required",
+            "Codex context exhausted and automatic fallback recovery is not enabled".to_string(),
+            0,
+            false,
+        ));
+    }
+    Ok(current)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_context_checkpoint_fallback(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    prior: CodexAppServerRunResult,
+    original_thread_id: Option<String>,
+    timeout_ms: u64,
+    idle_timeout_ms: u64,
+    progress_context: Option<AgentProgressContext>,
+    narration_config: &AssistantNarrationConfig,
+    policy: &CodexContextPolicy,
+) -> io::Result<CodexAppServerRunResult> {
+    let execution_dir = runtime_execution_dir(plan);
+    fs::create_dir_all(&execution_dir)?;
+    let checkpoint_file = write_context_checkpoint(
+        plan,
+        original_thread_id.clone(),
+        &prior.reason,
+        &execution_dir,
+    )?;
+    let rollover = write_context_rollover_receipt(
+        plan,
+        original_thread_id.clone(),
+        &prior.reason,
+        &execution_dir,
+    )?;
+    let fallback_prompt_file =
+        write_context_fallback_prompt(plan, &prior.reason, &checkpoint_file, &execution_dir)?;
+    let mut fallback_plan = plan.clone();
+    fallback_plan.invocation.thread_id = None;
+    fallback_plan.invocation.prompt_input_file = fallback_prompt_file;
+    let mut fallback_result = drive_codex_app_server(
+        harness_home,
+        &fallback_plan,
+        timeout_ms,
+        idle_timeout_ms,
+        progress_context,
+        narration_config,
+        policy,
+        false,
+    )?;
+    fallback_result.event_count = fallback_result
+        .event_count
+        .saturating_add(prior.event_count);
+    let succeeded = fallback_result.status == CodexRuntimeRunStatus::Completed;
+    let official_compact_attempts = prior
+        .context_recovery
+        .as_ref()
+        .map(|receipt| receipt.official_compact_attempts)
+        .unwrap_or(0);
+    fallback_result.warnings.push(format!(
+        "Codex context fallback wrote checkpoint {} and opened a fresh Codex thread",
+        checkpoint_file.display()
+    ));
+    fallback_result.context_recovery = Some(CodexContextRecoveryReceipt {
+        status: if succeeded {
+            "fresh-thread-succeeded".to_string()
+        } else {
+            "fresh-thread-failed".to_string()
+        },
+        queue_id: plan.queue_id.clone(),
+        session_key: plan.session_key.clone(),
+        original_thread_id,
+        recovered_thread_id: fallback_result.thread_id.clone(),
+        official_compact_attempts,
+        retry_attempted: prior
+            .context_recovery
+            .as_ref()
+            .map(|receipt| receipt.retry_attempted)
+            .unwrap_or(false),
+        fallback_policy: policy.fallback_on_compact_failure.clone(),
+        fresh_thread_attempted: true,
+        fresh_thread_succeeded: succeeded,
+        checkpoint_file: Some(checkpoint_file),
+        rollover_file: Some(rollover.rollover_file),
+        binding_backup_file: rollover.binding_backup_file,
+        reason: if succeeded {
+            format!(
+                "Codex context exhausted; checkpoint fallback opened a fresh Codex thread after official compact recovery failed or was unavailable. Prior reason: {}",
+                prior.reason
+            )
+        } else {
+            format!(
+                "Codex context exhausted; checkpoint fallback also failed. Prior reason: {}; fallback reason: {}",
+                prior.reason, fallback_result.reason
+            )
+        },
+    });
+    Ok(fallback_result)
+}
+
+struct ContextRolloverFiles {
+    rollover_file: PathBuf,
+    binding_backup_file: Option<PathBuf>,
+}
+
+fn write_context_checkpoint(
+    plan: &CodexRuntimePlanFile,
+    previous_thread_id: Option<String>,
+    reason: &str,
+    execution_dir: &Path,
+) -> io::Result<PathBuf> {
+    let checkpoint_file = execution_dir.join("codex-context-checkpoint.json");
+    let checkpoint = CodexContextCheckpoint {
+        schema: CODEX_CONTEXT_CHECKPOINT_SCHEMA,
+        queue_id: plan.queue_id.clone(),
+        session_key: plan.session_key.clone(),
+        agent_id: plan.agent_id.clone(),
+        previous_thread_id,
+        codex_binding_file: plan.outputs.codex_binding_file.clone(),
+        transcript_file: plan.outputs.transcript_file.clone(),
+        trajectory_file: plan.outputs.trajectory_file.clone(),
+        prompt_bundle_json: plan.prompt_bundle_json.clone(),
+        prompt_markdown: plan.prompt_markdown.clone(),
+        reason: reason.to_string(),
+        created_at_ms: current_log_time_ms()?,
+    };
+    write_json_atomic(&checkpoint_file, &checkpoint)?;
+    Ok(checkpoint_file)
+}
+
+fn write_context_rollover_receipt(
+    plan: &CodexRuntimePlanFile,
+    previous_thread_id: Option<String>,
+    reason: &str,
+    execution_dir: &Path,
+) -> io::Result<ContextRolloverFiles> {
+    let rollover_file = execution_dir.join("codex-context-rollover.json");
+    let binding_backup_file = if plan.outputs.codex_binding_file.is_file() {
+        let backup_file = execution_dir.join("codex-binding-before-context-rollover.json");
+        fs::copy(&plan.outputs.codex_binding_file, &backup_file)?;
+        Some(backup_file)
+    } else {
+        None
+    };
+    let receipt = CodexContextRolloverReceipt {
+        schema: CODEX_CONTEXT_ROLLOVER_SCHEMA,
+        queue_id: plan.queue_id.clone(),
+        session_key: plan.session_key.clone(),
+        previous_thread_id,
+        codex_binding_file: plan.outputs.codex_binding_file.clone(),
+        binding_backup_file: binding_backup_file.clone(),
+        reason: reason.to_string(),
+        created_at_ms: current_log_time_ms()?,
+    };
+    write_json_atomic(&rollover_file, &receipt)?;
+    Ok(ContextRolloverFiles {
+        rollover_file,
+        binding_backup_file,
+    })
+}
+
+fn write_context_fallback_prompt(
+    plan: &CodexRuntimePlanFile,
+    reason: &str,
+    checkpoint_file: &Path,
+    execution_dir: &Path,
+) -> io::Result<PathBuf> {
+    let original_prompt = fs::read_to_string(&plan.invocation.prompt_input_file)?;
+    let fallback_prompt_file = execution_dir.join("prompt.context-fallback.md");
+    let previous_thread = plan.invocation.thread_id.as_deref().unwrap_or("(unknown)");
+    let prompt = format!(
+        "[Harness context recovery]\n\
+         The previous Codex thread reached the context limit before this queued turn could complete.\n\
+         Previous Codex thread id: {previous_thread}\n\
+         Checkpoint artifact: {}\n\
+         Recovery reason: {}\n\
+         Continue the same harness session using the checkpoint and the original queued prompt below.\n\n\
+         [Original queued prompt]\n\
+         {original_prompt}",
+        checkpoint_file.display(),
+        truncate_for_notice(reason, 600)
+    );
+    fs::write(&fallback_prompt_file, prompt)?;
+    Ok(fallback_prompt_file)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2942,6 +4047,7 @@ fn looks_like_progress_event_payload(text: &str) -> bool {
 enum ProtocolWait {
     ThreadStarted(String),
     TurnCompleted,
+    CompactCompleted,
     Canceled(String),
     Failed(String),
     TimedOut(String),
@@ -3031,6 +4137,102 @@ fn wait_for_thread_start(
                     record_turn_usage(&value, state);
                     if let Some(reason) = turn_completed_failure_reason(&value) {
                         return Ok(ProtocolWait::Failed(reason));
+                    }
+                    return Ok(ProtocolWait::TurnCompleted);
+                }
+                collect_agent_output(&value, state, progress, narration_config);
+            }
+            ProtocolEvent::TimedOut(reason) => return Ok(ProtocolWait::TimedOut(reason)),
+            ProtocolEvent::Failed(reason) => return Ok(ProtocolWait::Failed(reason)),
+            ProtocolEvent::Canceled(reason) => return Ok(ProtocolWait::Canceled(reason)),
+        }
+    }
+}
+
+fn run_official_context_compact(
+    line_rx: &mpsc::Receiver<Result<String, String>>,
+    child: &mut std::process::Child,
+    stdin: &mut impl Write,
+    state: &mut CodexProtocolState,
+    progress: &mut Option<CodexProgressEmitter>,
+    timeouts: &mut CodexProtocolTimeouts,
+    approval_policy: CodexApprovalPolicy,
+    cancel_check: Option<&RuntimeCancelCheck>,
+    narration_config: &AssistantNarrationConfig,
+    thread_id: &str,
+    request_id: i64,
+) -> io::Result<ProtocolWait> {
+    write_json_rpc(
+        stdin,
+        &json!({
+            "id": request_id,
+            "method": "thread/compact/start",
+            "params": {
+                "threadId": thread_id
+            }
+        }),
+    )?;
+    wait_for_context_compaction_completed(
+        line_rx,
+        child,
+        stdin,
+        state,
+        progress,
+        timeouts,
+        approval_policy,
+        cancel_check,
+        narration_config,
+        request_id,
+    )
+}
+
+fn wait_for_context_compaction_completed(
+    line_rx: &mpsc::Receiver<Result<String, String>>,
+    child: &mut std::process::Child,
+    stdin: &mut impl Write,
+    state: &mut CodexProtocolState,
+    progress: &mut Option<CodexProgressEmitter>,
+    timeouts: &mut CodexProtocolTimeouts,
+    approval_policy: CodexApprovalPolicy,
+    cancel_check: Option<&RuntimeCancelCheck>,
+    narration_config: &AssistantNarrationConfig,
+    request_id: i64,
+) -> io::Result<ProtocolWait> {
+    let mut acknowledged = false;
+    let mut compaction_started = false;
+    loop {
+        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check)? {
+            ProtocolEvent::Json(value) => {
+                if let Some(error) = protocol_error(&value) {
+                    return Ok(ProtocolWait::Failed(error));
+                }
+                emit_codex_progress(progress, &value, state);
+                if answer_unattended_server_request(&value, stdin, state, approval_policy)? {
+                    continue;
+                }
+                if json_id(&value) == Some(request_id) {
+                    acknowledged = true;
+                }
+                if is_context_compaction_started(&value) {
+                    compaction_started = true;
+                    state
+                        .warnings
+                        .push("Codex official context compaction started".to_string());
+                    continue;
+                }
+                if is_context_compaction_completed(&value) || is_thread_compacted(&value) {
+                    state
+                        .warnings
+                        .push("Codex official context compaction completed".to_string());
+                    return Ok(ProtocolWait::CompactCompleted);
+                }
+                if is_turn_completed(&value) {
+                    record_turn_usage(&value, state);
+                    if let Some(reason) = turn_completed_failure_reason(&value) {
+                        return Ok(ProtocolWait::Failed(reason));
+                    }
+                    if acknowledged || compaction_started {
+                        return Ok(ProtocolWait::CompactCompleted);
                     }
                     return Ok(ProtocolWait::TurnCompleted);
                 }
@@ -3716,6 +4918,40 @@ fn is_turn_completed(value: &Value) -> bool {
     matches!(json_method(value), Some("turn/completed"))
 }
 
+fn is_thread_compacted(value: &Value) -> bool {
+    matches!(json_method(value), Some("thread/compacted"))
+}
+
+fn is_context_compaction_started(value: &Value) -> bool {
+    matches!(json_method(value), Some("item/started")) && is_context_compaction_item(value)
+}
+
+fn is_context_compaction_completed(value: &Value) -> bool {
+    matches!(json_method(value), Some("item/completed")) && is_context_compaction_item(value)
+}
+
+fn is_context_compaction_item(value: &Value) -> bool {
+    first_string_pointer(
+        value,
+        &[
+            "/params/item/type",
+            "/params/item/item/type",
+            "/params/item/kind",
+            "/params/type",
+            "/params/kind",
+        ],
+    )
+    .map(|kind| normalize_compaction_kind(&kind) == "contextcompaction")
+    .unwrap_or(false)
+}
+
+fn normalize_compaction_kind(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', '-', ' '], "")
+}
+
 fn turn_completed_failure_reason(value: &Value) -> Option<String> {
     if !is_turn_completed(value) {
         return None;
@@ -3830,6 +5066,36 @@ fn protocol_error(value: &Value) -> Option<String> {
         value.get("error")?
     };
     Some(render_protocol_error(error))
+}
+
+fn codex_status_for_protocol_failure(reason: &str) -> CodexRuntimeRunStatus {
+    if is_context_window_exhaustion(reason) {
+        CodexRuntimeRunStatus::ContextExhausted
+    } else {
+        CodexRuntimeRunStatus::ProtocolError
+    }
+}
+
+fn is_context_window_exhaustion(reason: &str) -> bool {
+    let normalized = reason
+        .to_ascii_lowercase()
+        .replace(['_', '-', '`', '"', '\''], " ");
+    [
+        "contextwindowexceeded",
+        "context window exceeded",
+        "context length exceeded",
+        "context limit",
+        "context window",
+        "maximum context length",
+        "max context length",
+        "ran out of room",
+        "too many tokens",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+        || reason
+            .to_ascii_lowercase()
+            .contains("context_length_exceeded")
 }
 
 fn render_protocol_error(error: &Value) -> String {
@@ -5149,15 +6415,27 @@ fn ensure_harness_codex_config(
         return Ok(());
     };
     let sandbox = resolve_codex_sandbox(harness_home, warnings);
+    let context_policy = match load_codex_context_policy(harness_home) {
+        Ok(policy) => policy,
+        Err(error) => {
+            warnings.push(format!(
+                "failed to load codexContext policy for Codex config generation: {error}; using defaults"
+            ));
+            CodexContextPolicy::default()
+        }
+    };
     let config_file = codex_home.join("config.toml");
     if config_file.is_file() {
         let existing = fs::read_to_string(&config_file)?;
         if let Some(provider_config) = provider_config {
-            let updated = ensure_provider_config_in_toml(&existing, provider_config);
+            let updated = ensure_codex_context_config_in_toml(
+                &ensure_provider_config_in_toml(&existing, provider_config),
+                &context_policy,
+            );
             if updated != existing {
                 fs::write(&config_file, updated)?;
                 warnings.push(format!(
-                    "updated harness-local Codex config provider stanza at {}",
+                    "updated harness-local Codex config provider/context stanza at {}",
                     config_file.display()
                 ));
             }
@@ -5169,6 +6447,7 @@ fn ensure_harness_codex_config(
                 harness_home,
                 &sandbox,
                 provider_config,
+                &context_policy,
             );
             if existing != desired {
                 fs::write(&config_file, desired)?;
@@ -5182,8 +6461,13 @@ fn ensure_harness_codex_config(
     }
 
     fs::create_dir_all(codex_home)?;
-    let config =
-        harness_codex_config_toml(working_directory, harness_home, &sandbox, provider_config);
+    let config = harness_codex_config_toml(
+        working_directory,
+        harness_home,
+        &sandbox,
+        provider_config,
+        &context_policy,
+    );
     fs::write(&config_file, config)?;
     warnings.push(format!(
         "created harness-local Codex config at {} with Windows sandbox={sandbox:?} and trusted runtime workspace",
@@ -5245,6 +6529,14 @@ fn ensure_provider_config_in_toml(existing: &str, provider_config: &CodexProvide
             "wire_api",
             &toml_basic_string(&provider_config.wire_api),
         );
+    }
+    config
+}
+
+fn ensure_codex_context_config_in_toml(existing: &str, policy: &CodexContextPolicy) -> String {
+    let mut config = existing.to_string();
+    for (key, value) in codex_context_toml_entries(policy) {
+        config = ensure_top_level_toml_key(&config, &key, &value);
     }
     config
 }
@@ -5315,6 +6607,7 @@ fn harness_codex_config_toml(
     harness_home: &Path,
     sandbox: &str,
     provider_config: Option<&CodexProviderConfig>,
+    context_policy: &CodexContextPolicy,
 ) -> String {
     let mut project_roots = vec![
         absolute_for_config(working_directory),
@@ -5332,6 +6625,15 @@ fn harness_codex_config_toml(
         config.push_str("model_provider = ");
         config.push_str(&toml_basic_string(&provider_config.provider));
         config.push_str("\n\n");
+    }
+    for (key, value) in codex_context_toml_entries(context_policy) {
+        config.push_str(&key);
+        config.push_str(" = ");
+        config.push_str(&value);
+        config.push('\n');
+    }
+    if !codex_context_toml_entries(context_policy).is_empty() {
+        config.push('\n');
     }
     config.push_str(&format!(
         "[windows]\n\
@@ -5362,6 +6664,38 @@ fn harness_codex_config_toml(
         config.push_str("]\ntrust_level = \"trusted\"\n");
     }
     config
+}
+
+fn codex_context_toml_entries(policy: &CodexContextPolicy) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    if let Some(value) = policy.model_context_window {
+        entries.push(("model_context_window".to_string(), value.to_string()));
+    }
+    if let Some(value) = policy.model_auto_compact_token_limit {
+        entries.push((
+            "model_auto_compact_token_limit".to_string(),
+            value.to_string(),
+        ));
+    }
+    if let Some(value) = policy.model_auto_compact_token_limit_scope.as_deref() {
+        entries.push((
+            "model_auto_compact_token_limit_scope".to_string(),
+            toml_basic_string(value),
+        ));
+    }
+    if let Some(value) = policy.tool_output_token_limit {
+        entries.push(("tool_output_token_limit".to_string(), value.to_string()));
+    }
+    if let Some(value) = policy.compact_prompt.as_deref() {
+        entries.push(("compact_prompt".to_string(), toml_basic_string(value)));
+    }
+    if let Some(value) = policy.experimental_compact_prompt_file.as_ref() {
+        entries.push((
+            "experimental_compact_prompt_file".to_string(),
+            toml_basic_string(&value.to_string_lossy()),
+        ));
+    }
+    entries
 }
 
 fn absolute_for_config(path: &Path) -> PathBuf {
@@ -5459,6 +6793,7 @@ mod tests {
         PromptAssemblyOptions, RuntimeQueueEnqueueOptions, RuntimeQueuePrepareOptions,
         TurnPlanInput, build_channel_step, build_source_skill_index, build_turn_plan,
         enqueue_channel_step, load_agent_registry, prepare_runtime_queue_item,
+        runtime_worker::release_runtime_queue_lease,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -5695,6 +7030,20 @@ mod tests {
         let shared_after_openrouter =
             fs::read_to_string(shared_codex_home.join("config.toml")).unwrap();
         assert!(shared_after_openrouter.contains("model_provider = \"openrouter\""));
+        crate::append_jsonl_value(
+            &harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("run-once-receipts.jsonl"),
+            &serde_json::json!({
+                "queueId": openrouter_plan.queue_id.as_deref().unwrap(),
+                "status": "completed",
+                "reason": "test terminal receipt"
+            }),
+        )
+        .unwrap();
+        release_runtime_queue_lease(&harness_home, openrouter_plan.queue_id.as_deref().unwrap())
+            .unwrap();
 
         let main_source = write_codex_runtime_source(&root.join("main"));
         enqueue_and_prepare_at(&main_source, &harness_home, 1235);
@@ -5927,6 +7276,7 @@ mod tests {
             Path::new("relative-harness"),
             DEFAULT_CODEX_SANDBOX,
             None,
+            &CodexContextPolicy::default(),
         );
 
         assert!(config.contains(&toml_basic_string(
@@ -6429,6 +7779,245 @@ mod tests {
         let run_file = report.run_file.unwrap();
         let run_json = fs::read_to_string(run_file).unwrap();
         assert!(!run_json.contains("(no assistant text captured"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_context_error_maps_to_context_exhausted_when_recovery_disabled() {
+        let root = temp_root(
+            "run_codex_runtime_context_error_maps_to_context_exhausted_when_recovery_disabled",
+        );
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"codexContext":{"retryOnceAfterCompact":false,"fallbackOnCompactFailure":"disabled"}}"#,
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments, _events) =
+            context_error_then_compact_success_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 10_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.receipt.status,
+            CodexRuntimeRunStatus::ContextExhausted
+        );
+        assert!(report.receipt.reason.contains("ContextWindowExceeded"));
+        assert_eq!(
+            report
+                .receipt
+                .context_recovery
+                .as_ref()
+                .map(|receipt| receipt.status.as_str()),
+            Some("manual-recovery-required")
+        );
+        assert!(report.completion.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_preflight_compacts_existing_thread_before_turn() {
+        let root = temp_root("run_codex_runtime_preflight_compacts_existing_thread_before_turn");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"codexContext":{"modelContextWindow":1000,"compactAtActiveContextRatio":0.5,"modelAutoCompactTokenLimit":900}}"#,
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan = plan_report.plan.as_ref().unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        replace_invocation_thread_id(plan_file, Some("thread-existing"));
+        let receipts_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-runtime-run-receipts.jsonl");
+        fs::write(
+            &receipts_file,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "codexBindingFile": plan.outputs.codex_binding_file.to_string_lossy(),
+                    "usage": {
+                        "inputTokens": 920,
+                        "outputTokens": 10,
+                        "totalTokens": 930,
+                        "source": "test"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let (executable, arguments, events_file) = compact_tracking_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 10_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert_eq!(
+            report
+                .receipt
+                .context_recovery
+                .as_ref()
+                .map(|receipt| receipt.status.as_str()),
+            Some("compact-before-turn")
+        );
+        let events = fs::read_to_string(events_file).unwrap();
+        let compact_index = events.find("thread/compact/start").unwrap();
+        let turn_index = events.find("turn/start").unwrap();
+        assert!(compact_index < turn_index);
+        let preflight = fs::read_to_string(
+            plan_report
+                .execution_dir
+                .as_ref()
+                .unwrap()
+                .join("codex-context-preflight.json"),
+        )
+        .unwrap();
+        assert!(preflight.contains(r#""compactBeforeTurn": true"#));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_context_error_compacts_and_retries_once() {
+        let root = temp_root("run_codex_runtime_context_error_compacts_and_retries_once");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments, events_file) =
+            context_error_then_compact_success_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 10_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let recovery = report.receipt.context_recovery.as_ref().unwrap();
+        assert_eq!(recovery.status, "compact-retry-succeeded");
+        assert_eq!(recovery.official_compact_attempts, 1);
+        assert!(recovery.retry_attempted);
+        assert!(recovery.checkpoint_file.is_none());
+        let events = fs::read_to_string(events_file).unwrap();
+        assert_eq!(events.matches("turn/start").count(), 2);
+        assert!(events.contains("thread/compact/start"));
+        let transcript =
+            fs::read_to_string(report.completion.unwrap().transcript_file.unwrap()).unwrap();
+        assert!(transcript.contains("Recovered after compact."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_context_error_falls_back_to_checkpoint_fresh_thread() {
+        let root =
+            temp_root("run_codex_runtime_context_error_falls_back_to_checkpoint_fresh_thread");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan = plan_report.plan.as_ref().unwrap();
+        fs::create_dir_all(plan.outputs.codex_binding_file.parent().unwrap()).unwrap();
+        fs::write(
+            &plan.outputs.codex_binding_file,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": CODEX_BINDING_SCHEMA,
+                "queueId": "previous",
+                "sessionKey": plan.session_key,
+                "threadId": "thread-existing"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        replace_invocation_thread_id(plan_file, Some("thread-existing"));
+        let (executable, arguments, events_file) =
+            context_error_then_compact_failure_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 10_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let recovery = report.receipt.context_recovery.as_ref().unwrap();
+        assert_eq!(recovery.status, "fresh-thread-succeeded");
+        assert!(recovery.fresh_thread_attempted);
+        assert!(recovery.fresh_thread_succeeded);
+        assert!(recovery.checkpoint_file.as_ref().unwrap().is_file());
+        assert!(recovery.rollover_file.as_ref().unwrap().is_file());
+        assert!(recovery.binding_backup_file.as_ref().unwrap().is_file());
+        let events = fs::read_to_string(events_file).unwrap();
+        assert!(events.contains("thread/compact/start"));
+        let transcript =
+            fs::read_to_string(report.completion.unwrap().transcript_file.unwrap()).unwrap();
+        assert!(transcript.contains("Fresh fallback reply."));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -7267,6 +8856,192 @@ while ($true) {
         )
     }
 
+    #[cfg(windows)]
+    fn compact_tracking_app_server_command(root: &Path) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("compact-tracking-app-server.ps1");
+        let events = root.join("compact-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+$events = Join-Path $PSScriptRoot 'compact-events.jsonl'
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.method) { Add-Content -LiteralPath $events -Value $msg.method }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/resume') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/compact/start') {
+        [Console]::Out.WriteLine('{"id":2,"result":{}}')
+        [Console]::Out.WriteLine('{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Compacted reply.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+            events,
+        )
+    }
+
+    #[cfg(windows)]
+    fn context_error_then_compact_success_app_server_command(
+        root: &Path,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("context-error-then-compact-success.ps1");
+        let events = root.join("context-retry-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+$events = Join-Path $PSScriptRoot 'context-retry-events.jsonl'
+$marker = Join-Path $PSScriptRoot 'context-first-failed.marker'
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.method) { Add-Content -LiteralPath $events -Value $msg.method }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/compact/start') {
+        [Console]::Out.WriteLine('{"id":2,"result":{}}')
+        [Console]::Out.WriteLine('{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        if (!(Test-Path -LiteralPath $marker)) {
+            Set-Content -LiteralPath $marker -Value 'failed'
+            [Console]::Out.WriteLine('{"method":"error","params":{"error":{"message":"ContextWindowExceeded: ran out of room in the model context window."},"threadId":"thread-test","turnId":"turn-failed"}}')
+            [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-failed","status":"failed","error":{"message":"ContextWindowExceeded: ran out of room in the model context window."}}}}')
+            [Console]::Out.Flush()
+            break
+        }
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Recovered after compact.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":20,"outputTokens":8,"totalTokens":28}}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+            events,
+        )
+    }
+
+    #[cfg(windows)]
+    fn context_error_then_compact_failure_app_server_command(
+        root: &Path,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("context-error-then-compact-failure.ps1");
+        let events = root.join("context-fallback-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+$events = Join-Path $PSScriptRoot 'context-fallback-events.jsonl'
+$first = Join-Path $PSScriptRoot 'context-first-failed.marker'
+$compact = Join-Path $PSScriptRoot 'compact-failed.marker'
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.method) { Add-Content -LiteralPath $events -Value $msg.method }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/compact/start') {
+        Set-Content -LiteralPath $compact -Value 'failed'
+        [Console]::Out.WriteLine('{"method":"error","params":{"error":{"message":"ContextWindowExceeded: compact failed inside the model context window."},"threadId":"thread-test","turnId":"compact-failed"}}')
+        [Console]::Out.Flush()
+        break
+    } elseif ($msg.method -eq 'turn/start') {
+        if (!(Test-Path -LiteralPath $first)) {
+            Set-Content -LiteralPath $first -Value 'failed'
+            [Console]::Out.WriteLine('{"method":"error","params":{"error":{"message":"ContextWindowExceeded: ran out of room in the model context window."},"threadId":"thread-test","turnId":"turn-failed"}}')
+            [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-failed","status":"failed","error":{"message":"ContextWindowExceeded: ran out of room in the model context window."}}}}')
+            [Console]::Out.Flush()
+            break
+        }
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-fresh","status":"completed","usage":{"inputTokens":18,"outputTokens":7,"totalTokens":25}}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+            events,
+        )
+    }
+
     #[cfg(not(windows))]
     fn fake_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
         let script = root.join("fake-app-server.sh");
@@ -7386,6 +9161,148 @@ done
         .unwrap();
         make_executable(&script);
         (PathBuf::from("sh"), vec![script.display().to_string()])
+    }
+
+    #[cfg(not(windows))]
+    fn compact_tracking_app_server_command(root: &Path) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("compact-tracking-app-server.sh");
+        let events = root.join("compact-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+events="$(dirname "$0")/compact-events.jsonl"
+while IFS= read -r line; do
+    method="$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')"
+    [ -n "$method" ] && printf '%s\n' "$method" >> "$events"
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"thread/compact/start"'*)
+            printf '%s\n' '{"id":2,"result":{}}'
+            printf '%s\n' '{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}'
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Compacted reply.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        make_executable(&script);
+        (
+            PathBuf::from("sh"),
+            vec![script.display().to_string()],
+            events,
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn context_error_then_compact_success_app_server_command(
+        root: &Path,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("context-error-then-compact-success.sh");
+        let events = root.join("context-retry-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+dir="$(dirname "$0")"
+events="$dir/context-retry-events.jsonl"
+marker="$dir/context-first-failed.marker"
+while IFS= read -r line; do
+    method="$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')"
+    [ -n "$method" ] && printf '%s\n' "$method" >> "$events"
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"thread/compact/start"'*)
+            printf '%s\n' '{"id":2,"result":{}}'
+            printf '%s\n' '{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}'
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}'
+            ;;
+        *'"method":"turn/start"'*)
+            if [ ! -f "$marker" ]; then
+                printf failed > "$marker"
+                printf '%s\n' '{"method":"error","params":{"error":{"message":"ContextWindowExceeded: ran out of room in the model context window."},"threadId":"thread-test","turnId":"turn-failed"}}'
+                printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-failed","status":"failed","error":{"message":"ContextWindowExceeded: ran out of room in the model context window."}}}}'
+                exit 0
+            fi
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Recovered after compact.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":20,"outputTokens":8,"totalTokens":28}}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        make_executable(&script);
+        (
+            PathBuf::from("sh"),
+            vec![script.display().to_string()],
+            events,
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn context_error_then_compact_failure_app_server_command(
+        root: &Path,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("context-error-then-compact-failure.sh");
+        let events = root.join("context-fallback-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+dir="$(dirname "$0")"
+events="$dir/context-fallback-events.jsonl"
+first="$dir/context-first-failed.marker"
+while IFS= read -r line; do
+    method="$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')"
+    [ -n "$method" ] && printf '%s\n' "$method" >> "$events"
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"thread/compact/start"'*)
+            printf '%s\n' '{"method":"error","params":{"error":{"message":"ContextWindowExceeded: compact failed inside the model context window."},"threadId":"thread-test","turnId":"compact-failed"}}'
+            exit 0
+            ;;
+        *'"method":"turn/start"'*)
+            if [ ! -f "$first" ]; then
+                printf failed > "$first"
+                printf '%s\n' '{"method":"error","params":{"error":{"message":"ContextWindowExceeded: ran out of room in the model context window."},"threadId":"thread-test","turnId":"turn-failed"}}'
+                printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-failed","status":"failed","error":{"message":"ContextWindowExceeded: ran out of room in the model context window."}}}}'
+                exit 0
+            fi
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-fresh","status":"completed","usage":{"inputTokens":18,"outputTokens":7,"totalTokens":25}}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        make_executable(&script);
+        (
+            PathBuf::from("sh"),
+            vec![script.display().to_string()],
+            events,
+        )
     }
 
     fn write_codex_runtime_source(root: &Path) -> crate::AgentSource {

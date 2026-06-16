@@ -14325,6 +14325,7 @@ fn runtime_run_once_status_label(status: RuntimeRunOnceStatus) -> &'static str {
         RuntimeRunOnceStatus::RetryPending => "retry-pending",
         RuntimeRunOnceStatus::DeadLetter => "dead-letter",
         RuntimeRunOnceStatus::FailedTerminal => "failed-terminal",
+        RuntimeRunOnceStatus::ContextExhausted => "context-exhausted",
         RuntimeRunOnceStatus::Canceled => "canceled",
     }
 }

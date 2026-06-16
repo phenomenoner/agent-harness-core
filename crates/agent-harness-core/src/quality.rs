@@ -101,6 +101,21 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "append-only receipts; retry creates fresh ids",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.codex-context-preflight.v1",
+            owner_module: "codex_runtime",
+            compatibility: "append-only JSONL plus per-execution JSON; additive fields only in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.codex-context-checkpoint.v1",
+            owner_module: "codex_runtime",
+            compatibility: "per-execution recovery artifact; additive fields only in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.codex-context-rollover.v1",
+            owner_module: "codex_runtime",
+            compatibility: "per-execution recovery artifact; binding backup path remains optional",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.channel-identity-check.v1",
             owner_module: "channel_identity",
             compatibility: "additive fields only in v1; non-bound statuses remain fail-closed",
@@ -311,6 +326,11 @@ mod tests {
             schema_registry_entries()
                 .iter()
                 .any(|entry| entry.schema == "agent-harness.encrypted-vault.v1")
+        );
+        assert!(
+            schema_registry_entries()
+                .iter()
+                .any(|entry| entry.schema == "agent-harness.codex-context-preflight.v1")
         );
         assert!(
             release_checklist()

@@ -6,6 +6,8 @@ This is the internal operator/agent handbook. For a new working session, read th
 
 As of 2026-06-16 after the follow-up operator-surface live cutover, the live gateway is running the repo-local `target\debug\agent-harness.exe` copied from `target\staging-build-followup\debug\agent-harness.exe`. The operator-controlled cutover used ticket `cutover-1781543670554`, pre-cutover backup label `pre-followup-operator-surfaces-cutover`, and previous-binary backup `target\debug\agent-harness.pre-followup-operator-surfaces-20260616011809.exe`; it synced bundled `agent-windows-harness` (already current), regenerated the 7-loop supervisor plan, and started direct runners because scheduled tasks are not registered in this environment. Post-cutover `healthz --harness-home .\.agent-harness --require-writable-state` reports `ready=true`, `live=true`, writable state, and all 7 loop heartbeats present/non-stale. Post-cutover `status --harness-home .\.agent-harness --json` reports `ready=true`, readiness `passed=59`, `warnings=0`, `failed=0`; `worker-status` reports totals `pending=0`, `leased=0`, `running=0`, `failedRetryable=0`, and `failedTerminal=0`. The live `channel-outbox-plan --outbox-limit 100` alias now works and reports full outbox summary counters (`lines=370`, `pending=81`, `delivered=289`, `failed_retryable=0`, `invalid=0`) while only limiting displayed pending details. Live `cron-scheduler-lint` still exits with expected `error` because imported cron path blockers remain, but its JSON findings now include `agentId` and `proposedAction` for migration-ledger tracking.
 
+Round6 staged implementation adds same-session main-agent serialization plus Codex context-window recovery. Ordinary channel-origin `interactive` turns for the same `runtimeClass + agentId + platform + channelId + userId + sessionKey` now have a session lane limit of 1 and FIFO blocking, even when `workerDispatch.channelConcurrencyLimit` or broader runtime channel capacity is higher. Runtime leases now carry the normalized `sessionLaneKey`, and capacity inspection surfaces session-active/session-fifo blockers. Worker and subagent lanes remain controlled by worker dispatch and runtime class limits; this change is not a global fan-out collapse. Codex runtime now writes `codex-context-preflight.json` per execution, appends `state/runtime-queue/codex-context-preflight-receipts.jsonl`, passes official Codex compact config keys into generated Codex config, can call official app-server `thread/compact/start` before a risky resumed turn, classifies hard context-window failures as `context-exhausted`, retries once after official compaction, and falls back to `codex-context-checkpoint.json` plus `codex-context-rollover.json` and a fresh Codex thread when policy allows. Official evidence checked during implementation: the current Codex manual documents automatic compaction, `/compact`, and `model_context_window`/`model_auto_compact_token_limit`/`tool_output_token_limit`/`compact_prompt` settings; the official `openai/codex` app-server README and protocol enum document `thread/compact/start`, `turn/*` and `item/*` progress, and `contextCompaction` items.
+
 As of 2026-06-15 after the source-home routing hotfix live cutover, the live gateway is running the repo-local `target\debug\agent-harness.exe` copied from `target\staging-build-sourcehome\debug\agent-harness.exe`. The operator-controlled cutover used ticket `cutover-1781537737517`, pre-cutover backup label `pre-sourcehome-routing-hotfix-cutover`, and previous-binary backup `target\debug\agent-harness.pre-sourcehome-20260615233707.exe`; it synced bundled `agent-windows-harness` v0.1.12, regenerated the 7-loop supervisor plan with explicit `.agent-harness` source-home, and started direct runners because scheduled tasks are not registered in this environment. Generated supervisor scripts contain no retired `.openclaw`, imported snapshot, or Linux/container source paths. Post-cutover `healthz --harness-home .\.agent-harness --require-writable-state` reports `ready=true`, `live=true`, writable state, and all 7 loop heartbeats present/non-stale. Post-cutover `status --harness-home .\.agent-harness --json` reports `ready=true`, readiness `passed=59`, `warnings=0`, `failed=0`; `worker-status` reports pending/running `0` and blockers `0`; `cron-runs --limit 20` reports `total=0`, `active=0`, and `quarantined=0`. The active registry resolves 24 agents with Telegram/Discord configured, and the Discord DM diagnostic `turn-plan --source-home .\.agent-harness --harness-home .\.agent-harness --platform discord --channel-id 1483028851222253579 --user-id 902441554659123201` dispatches `AgentTurn` to `main` instead of `NoAgentAvailable`.
 
 As of 2026-06-15 after the Round5 cron/runtime isolation live cutover, the live gateway is running the repo-local `target\debug\agent-harness.exe` copied from `target\staging-build-round5-resume2\debug\agent-harness.exe`. The operator-controlled cutover used ticket `cutover-1781524146730`, pre-cutover backup label `pre-round5-cron-runtime-isolation-cutover`, and previous-binary backup `target\debug\agent-harness.pre-round5-20260615195055.exe`; it synced the bundled `agent-windows-harness` skill, regenerated the 7-loop supervisor plan, and started direct runners because scheduled tasks are not registered in this environment. Post-cutover `healthz --harness-home .\.agent-harness --require-writable-state` reports `ready=true`, `live=true`, writable state, and all 7 loop heartbeats present/non-stale. Post-cutover `status --harness-home .\.agent-harness --json` reports `ready=true`, readiness `passed=59`, `warnings=0`, `failed=0`; runtime `queued=277`, `open=71`, `prepared=56`, `completed=258`, `cronQueuedItems=76`, `cronOpenItems=0`; runtime class leases exist for `cron`, `interactive`, and legacy root leases with `activeLeases=0`; worker dispatch has `cron` lane limit `3`, pending/running `0`, and blockers `0`; `cron-runs --limit 20` reports `total=0`, `active=0`, and `quarantined=0`. The live `runtime-loop` command includes `--runtime-concurrency 12` and `--safe-mode-restart-ms 60000`.
@@ -308,7 +310,7 @@ Supported modes are `off`, `progress_panel`, and `inline_preface`. The default `
 
 `codex-launch-probe` re-runs preflight, starts the planned app-server process only when preflight is ready, sends no JSON-RPC request and no prompt, waits for `--startup-probe-ms`, then terminates and waits for the child process. It writes `codex-runtime-launch-probe.json`, appends `codex-runtime-launch-receipts.jsonl`, and keeps stdout/stderr logs under the prepared execution directory. This proves process supervision before the worker starts real model-backed turns.
 
-`codex-run` re-runs preflight, skips the model request if a completion receipt already exists, otherwise starts `codex app-server`, sends `initialize`, `initialized`, `thread/start` or `thread/resume`, and `turn/start` over JSONL stdio, captures assistant `agentMessage` item ids and phases, waits for `turn/completed`, and then calls the deterministic completion sink only when the app-server turn succeeds. `phase=commentary` is treated as assistant narration, `phase=final_answer` is treated as the final reply, and legacy delta-only streams fall back to raw assistant text instead of dropping content. App-server `method=error` events and `turn/completed` statuses such as `failed` are recorded as protocol failures, so they do not generate placeholder assistant replies. `runtime-run-once` classifies known stream-disconnect protocol errors as retryable and leaves other protocol/config failures terminal. It uses the imported legacy source workspace as the Codex thread cwd, stores the returned `threadId` in the Codex binding file for same-session resume, writes `codex-runtime-run.json`, appends `codex-runtime-run-receipts.jsonl`, and keeps raw app-server stdout/stderr logs under the prepared execution directory. The harness sends the assembled agent turn payload as user input; Codex remains responsible for its own system prompt, built-in tool schemas, MCP/tool inventory, approvals, and session continuity.
+`codex-run` re-runs runtime preflight and then runs Codex context preflight. Context preflight records prompt sizes, transcript size, latest recorded Codex token usage when available, existing binding/thread id, policy, and whether a pre-turn compact is required in `codex-context-preflight.json`, then appends `codex-context-preflight-receipts.jsonl`. If the bound thread is near the configured compact threshold, `codex-run` starts `codex app-server`, sends `initialize`, `initialized`, `thread/start` or `thread/resume`, calls official `thread/compact/start`, waits for the `contextCompaction` item to complete, and only then sends `turn/start`. Normal turns capture assistant `agentMessage` item ids and phases, wait for `turn/completed`, and call the deterministic completion sink only when the app-server turn succeeds. `phase=commentary` is treated as assistant narration, `phase=final_answer` is treated as the final reply, and legacy delta-only streams fall back to raw assistant text instead of dropping content. App-server `method=error` events and `turn/completed` statuses such as `failed` are recorded as protocol failures, so they do not generate placeholder assistant replies. Known stream-disconnect protocol errors remain retryable; known context-window failures such as `ContextWindowExceeded` are classified as `context-exhausted`. When context is exhausted, the harness tries official compact plus one retry of the original queued turn; if compact is unavailable or the retry still fails and `codexContext.fallbackOnCompactFailure` is `checkpoint-and-new-thread`, it writes `codex-context-checkpoint.json`, `codex-context-rollover.json`, backs up the previous binding when present, clears only the Codex thread binding, and retries on a fresh Codex thread with a checkpoint prompt. The run receipt includes a structured `contextRecovery` object for compact-before-turn, compact-retry, and fallback outcomes. It uses the imported legacy source workspace as the Codex thread cwd, stores the returned `threadId` in the Codex binding file for same-session resume, writes `codex-runtime-run.json`, appends `codex-runtime-run-receipts.jsonl`, and keeps raw app-server stdout/stderr logs under the prepared execution directory. The harness sends the assembled agent turn payload as user input; Codex remains responsible for its own system prompt, built-in tool schemas, MCP/tool inventory, approvals, and session continuity.
 
 `codex-complete` records assistant output into the output contract from `codex-plan`. It reads `codex-runtime-plan.json`, copies the inbound user message from `prompt-bundle.json`, appends user, optional `assistant_narration`, and final assistant entries to the planned transcript JSONL, appends trajectory events, writes the Codex binding mirror, writes `codex-runtime-completion-receipt.json`, and appends `codex-runtime-completion-receipts.jsonl`. Completion receipts include the selected narration mode, final reply character count, and narration item count.
 
@@ -339,6 +341,61 @@ Worker concurrency is configured through `harness-config.json` or `config/harnes
 ```
 
 The concurrency invariant is `globalConcurrencyLimit >= groupConcurrencyLimit >= channelConcurrencyLimit`. If config violates that invariant, the narrower limit is capped and surfaced as a warning. `rateLeaseLimit=0` disables rate leases. When enabled, jobs with the same `rate_key` are also limited within `rateLeaseWindowMs`.
+
+`workerDispatch.channelConcurrencyLimit` is a worker/fan-out channel cap. It is not permission for the same non-subagent main-agent session to run multiple ordinary channel messages at once. Runtime queue serialization is controlled by `runtimeDispatch`; the default interactive class now serializes ordinary channel-origin main-agent work per session lane:
+
+```json
+{
+  "runtimeDispatch": {
+    "globalConcurrencyLimit": 12,
+    "interactiveReserve": 2,
+    "classes": {
+      "interactive": {
+        "maxActive": 12,
+        "perAgentMaxActive": 6,
+        "perChannelMaxActive": 3,
+        "perSessionMaxActive": 1,
+        "sessionFifo": true,
+        "sameSessionMainAgentSerialization": true
+      },
+      "cron": {
+        "maxActive": 3,
+        "perSessionMaxActive": 1,
+        "sessionFifo": true
+      },
+      "worker": {
+        "maxActive": 2,
+        "sameSessionMainAgentSerialization": false
+      }
+    }
+  }
+}
+```
+
+For ordinary channel-origin `interactive` turns, the session lane key is `runtimeClass + agentId + platform + channelId + userId + sessionKey`. A second same-session message stays queued until older same-lane items have terminal run receipts and no active session lease. Different sessions in the same channel can still use the broader channel cap when capacity allows, and worker/subagent lanes are not collapsed by the interactive session mutex.
+
+Codex context recovery is configured with `codexContext`:
+
+```json
+{
+  "codexContext": {
+    "enabled": true,
+    "preferOfficialCompact": true,
+    "autoCompactBeforeTurn": true,
+    "retryOnceAfterCompact": true,
+    "fallbackOnCompactFailure": "checkpoint-and-new-thread",
+    "warnAtActiveContextRatio": 0.75,
+    "compactAtActiveContextRatio": 0.85,
+    "manualRecoveryAllowed": true,
+    "modelContextWindow": 128000,
+    "modelAutoCompactTokenLimit": 100000,
+    "modelAutoCompactTokenLimitScope": "total",
+    "toolOutputTokenLimit": 12000
+  }
+}
+```
+
+The optional `modelContextWindow`, `modelAutoCompactTokenLimit`, `modelAutoCompactTokenLimitScope`, `toolOutputTokenLimit`, `compactPrompt`, and `experimentalCompactPromptFile` keys are passed through to generated Codex TOML using Codex's official snake_case names. Leave them unset to rely on Codex/model defaults; set them when operators need deterministic compact thresholds for a specific model/provider path.
 
 Cron import has two separate source lanes: imported native agent-turn cron and extended deterministic crontab/Supercronic-style workspace cron runners under `workspace/tools/cron-runner` plus `workspace/tools/backup-cron-runner`. In the live environment, native cron is evaluated from active `.agent-harness` source/config authority; `.openclaw/cron` names only the retired import snapshot layout. The Rust harness keeps those lanes separate because only the native lane is allowed to enqueue LLM-backed agent or subagent turns. Execution now converges on the unified worker dispatch layer instead of direct scheduler execution.
 

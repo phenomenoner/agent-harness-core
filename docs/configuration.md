@@ -46,6 +46,8 @@ Long-running jobs or local services that intentionally outlive the chat turn sho
 
 Native LLM cron jobs use the `cron` worker lane before they hand off to the `cron` runtime class. This keeps scheduler-originated LLM work from filling the general `llm` worker lane.
 
+`channelConcurrencyLimit` is a worker/fan-out cap. It does not allow the same ordinary main-agent DM/session to run multiple Codex turns at once; same-session ordering is enforced by `runtimeDispatch`.
+
 The invariant is:
 
 ```text
@@ -70,6 +72,9 @@ Runtime queue items now carry `runtimeClass` and `origin` metadata. Channel ingr
         "maxActive": 12,
         "perAgentMaxActive": 6,
         "perChannelMaxActive": 3,
+        "perSessionMaxActive": 1,
+        "sessionFifo": true,
+        "sameSessionMainAgentSerialization": true,
         "perJobMaxActive": 999999,
         "maxQueuedPerAgent": 999999
       },
@@ -77,6 +82,8 @@ Runtime queue items now carry `runtimeClass` and `origin` metadata. Channel ingr
         "maxActive": 2,
         "perAgentMaxActive": 1,
         "perChannelMaxActive": 1,
+        "perSessionMaxActive": 1,
+        "sessionFifo": true,
         "perJobMaxActive": 1,
         "maxQueuedPerAgent": 4
       }
@@ -86,6 +93,35 @@ Runtime queue items now carry `runtimeClass` and `origin` metadata. Channel ingr
 ```
 
 The runtime loop uses class-scoped lease files under `state/runtime-queue/classes/<class>/runtime-leases.json`. Legacy root `state/runtime-queue/runtime-leases.json` is still read during capacity checks so an upgrade does not ignore active pre-Round5 leases.
+
+For ordinary channel-origin `interactive` main-agent items, the session lane key is `runtimeClass + agentId + platform + channelId + userId + sessionKey`. `perSessionMaxActive=1` and `sessionFifo=true` mean a second same-session message waits for the older same-lane item to reach terminal run status even when broader `perChannelMaxActive` capacity remains. Worker/subagent lanes can keep wider fan-out because `sameSessionMainAgentSerialization` is false outside the interactive main-agent lane by default.
+
+## Codex Context Recovery
+
+`codexContext` controls harness integration with Codex's official context compaction path:
+
+```json
+{
+  "codexContext": {
+    "enabled": true,
+    "preferOfficialCompact": true,
+    "autoCompactBeforeTurn": true,
+    "retryOnceAfterCompact": true,
+    "fallbackOnCompactFailure": "checkpoint-and-new-thread",
+    "warnAtActiveContextRatio": 0.75,
+    "compactAtActiveContextRatio": 0.85,
+    "manualRecoveryAllowed": true,
+    "modelContextWindow": 128000,
+    "modelAutoCompactTokenLimit": 100000,
+    "modelAutoCompactTokenLimitScope": "total",
+    "toolOutputTokenLimit": 12000
+  }
+}
+```
+
+The optional model/token keys are passed through to generated Codex TOML as `model_context_window`, `model_auto_compact_token_limit`, `model_auto_compact_token_limit_scope`, and `tool_output_token_limit`. `compactPrompt` and `experimentalCompactPromptFile` are also accepted and passed through as `compact_prompt` and `experimental_compact_prompt_file`.
+
+Each `codex-run` writes per-execution `codex-context-preflight.json` and appends `state/runtime-queue/codex-context-preflight-receipts.jsonl`. When a resumed thread is over the compact threshold, the harness calls official app-server `thread/compact/start` before `turn/start` and waits for the `contextCompaction` item to complete. Hard context-window failures are classified as `context-exhausted`; the harness retries once after official compact, then writes `codex-context-checkpoint.json` and `codex-context-rollover.json` and opens a fresh Codex thread when fallback is enabled.
 
 ## Cron Run Isolation
 

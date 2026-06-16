@@ -80,6 +80,7 @@ pub enum RuntimeRunOnceStatus {
     PreflightBlocked,
     SpawnFailed,
     ProtocolError,
+    ContextExhausted,
     Timeout,
     RetryPending,
     DeadLetter,
@@ -98,6 +99,7 @@ impl RuntimeRunOnceStatus {
             Self::PreflightBlocked => "preflight-blocked",
             Self::SpawnFailed => "spawn-failed",
             Self::ProtocolError => "protocol-error",
+            Self::ContextExhausted => "context-exhausted",
             Self::Timeout => "timeout",
             Self::RetryPending => "retry-pending",
             Self::DeadLetter => "dead-letter",
@@ -594,6 +596,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         RuntimeRunOnceStatus::Completed => HarnessLogLevel::Info,
         RuntimeRunOnceStatus::Timeout
         | RuntimeRunOnceStatus::ProtocolError
+        | RuntimeRunOnceStatus::ContextExhausted
         | RuntimeRunOnceStatus::SpawnFailed
         | RuntimeRunOnceStatus::DeadLetter
         | RuntimeRunOnceStatus::FailedTerminal => HarnessLogLevel::Error,
@@ -614,6 +617,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         RuntimeRunOnceStatus::PreflightBlocked => "runtime.run-once.preflight-blocked",
         RuntimeRunOnceStatus::SpawnFailed => "runtime.run-once.spawn-failed",
         RuntimeRunOnceStatus::ProtocolError => "runtime.run-once.protocol-error",
+        RuntimeRunOnceStatus::ContextExhausted => "runtime.run-once.context-exhausted",
         RuntimeRunOnceStatus::Timeout => "runtime.run-once.timeout",
         RuntimeRunOnceStatus::RetryPending => "runtime.run-once.retry-pending",
         RuntimeRunOnceStatus::DeadLetter => "runtime.run-once.dead-letter",
@@ -808,6 +812,10 @@ fn runtime_progress_preview(status: RuntimeRunOnceStatus, reason: &str) -> Strin
             "transient Codex stream disconnect exhausted retry budget; moved to dead-letter"
                 .to_string()
         }
+        RuntimeRunOnceStatus::ContextExhausted => {
+            "Codex context exhausted; compact recovery failed or required manual recovery"
+                .to_string()
+        }
         _ => reason.to_string(),
     }
 }
@@ -829,6 +837,7 @@ fn map_run_once_status(status: CodexRuntimeRunStatus) -> RuntimeRunOnceStatus {
         CodexRuntimeRunStatus::NoRuntimePlan => RuntimeRunOnceStatus::NoRuntimePlan,
         CodexRuntimeRunStatus::SpawnFailed => RuntimeRunOnceStatus::SpawnFailed,
         CodexRuntimeRunStatus::ProtocolError => RuntimeRunOnceStatus::ProtocolError,
+        CodexRuntimeRunStatus::ContextExhausted => RuntimeRunOnceStatus::ContextExhausted,
         CodexRuntimeRunStatus::Timeout => RuntimeRunOnceStatus::Timeout,
         CodexRuntimeRunStatus::Canceled => RuntimeRunOnceStatus::Canceled,
     }
@@ -848,6 +857,12 @@ fn runtime_failure_reply_text(
     if status == RuntimeRunOnceStatus::FailedTerminal {
         return format!(
             "Agent harness could not process this request and marked it failed-terminal.{queue_line}\nReason: {}\n\nGateway restart will not resume a terminal queue item. Use /status runtime to inspect the queue.",
+            truncate_for_channel(reason, 360),
+        );
+    }
+    if status == RuntimeRunOnceStatus::ContextExhausted {
+        return format!(
+            "This session reached the Codex context limit, and automatic compact recovery did not complete.{queue_line}\nReason: {}\n\nUse /status runtime to inspect the queue. Start a fresh session or retry after manual recovery.",
             truncate_for_channel(reason, 360),
         );
     }
@@ -877,6 +892,7 @@ fn final_run_once_status(
             RuntimeRunOnceStatus::RetryPending
         }
         CodexRuntimeRunStatus::Timeout => RuntimeRunOnceStatus::DeadLetter,
+        CodexRuntimeRunStatus::ContextExhausted => RuntimeRunOnceStatus::ContextExhausted,
         CodexRuntimeRunStatus::ProtocolError
             if is_retryable_codex_protocol_error(reason)
                 && failure_attempts < max_failure_attempts =>
@@ -917,6 +933,9 @@ fn final_run_once_reason(
         RuntimeRunOnceStatus::FailedTerminal => format!(
             "runtime queue item failed terminally after {failure_attempts} attempt(s); last codex status={codex_status:?}; reason: {reason}"
         ),
+        RuntimeRunOnceStatus::ContextExhausted => format!(
+            "runtime queue item reached Codex context limit after {failure_attempts} attempt(s); compact recovery did not complete; last codex status={codex_status:?}; reason: {reason}"
+        ),
         RuntimeRunOnceStatus::Canceled => {
             format!("runtime queue item was canceled by operator request; reason: {reason}")
         }
@@ -934,6 +953,7 @@ fn should_write_failure_outbox(status: RuntimeRunOnceStatus) -> bool {
             | RuntimeRunOnceStatus::PreflightBlocked
             | RuntimeRunOnceStatus::SpawnFailed
             | RuntimeRunOnceStatus::ProtocolError
+            | RuntimeRunOnceStatus::ContextExhausted
     )
 }
 
@@ -1843,6 +1863,26 @@ mod tests {
             runtime_progress_preview(RuntimeRunOnceStatus::RetryPending, reason),
             "transient runtime failure; preserving session for retry"
         );
+        assert_eq!(
+            map_run_once_status(CodexRuntimeRunStatus::ContextExhausted),
+            RuntimeRunOnceStatus::ContextExhausted
+        );
+        assert_eq!(
+            final_run_once_status(
+                CodexRuntimeRunStatus::ContextExhausted,
+                1,
+                "ContextWindowExceeded",
+                3
+            ),
+            RuntimeRunOnceStatus::ContextExhausted
+        );
+        let reply = runtime_failure_reply_text(
+            RuntimeRunOnceStatus::ContextExhausted,
+            "ContextWindowExceeded",
+            Some("queue-context"),
+        );
+        assert!(reply.contains("Codex context limit"));
+        assert!(reply.contains("queue-context"));
     }
 
     #[test]

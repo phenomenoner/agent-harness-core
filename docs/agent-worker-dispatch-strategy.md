@@ -131,6 +131,8 @@ Worker dispatch enforces concurrency limits before leasing a job:
 - Per-agent/group concurrency limit: maximum concurrently executing jobs for one master agent or fan-out group.
 - Per-agent-per-channel concurrency limit: maximum concurrently executing jobs for one agent/channel pair, so one busy Telegram or Discord channel cannot consume the whole per-agent budget.
 
+These limits apply to worker job leasing and broader fan-out pressure. They are not the ordering primitive for ordinary `main` agent channel sessions. Interactive runtime dispatch now separately serializes same-session main-agent Codex turns through `runtimeDispatch.classes.interactive.perSessionMaxActive=1`, `sessionFifo=true`, and `sameSessionMainAgentSerialization=true`.
+
 The invariant is `globalConcurrencyLimit >= groupConcurrencyLimit >= channelConcurrencyLimit`. The MVP caps the narrower limits down and surfaces a warning if the invariant is violated.
 
 Suggested `harness-config.json` shape:
@@ -160,6 +162,7 @@ Lease policy:
 
 - A worker can lease a job only when global capacity, lane capacity, per-agent/group capacity, and per-agent-per-channel capacity are all available.
 - If capacity is exhausted, eligible jobs stay `Pending` with their original `available_at` and are retried by later scheduler ticks or worker-loop iterations.
+- An ordinary channel-origin `interactive` main-agent runtime item can be accepted into `state/runtime-queue/pending.jsonl` but still wait behind an older same-session runtime item. Its session lane key is `runtimeClass + agentId + platform + channelId + userId + sessionKey`, and older non-terminal same-lane items block later ones even when channel capacity remains.
 - Cron bursts must enqueue and wait like any other jobs. Cron must not bypass concurrency limits.
 - Cron LLM worker jobs are isolated first by the `cron` worker lane and then by cron runtime capacity. A cron job can be accepted into the worker queue but still wait behind `runtimeDispatch.classes.cron` when Codex runtime slots are full.
 - A stuck or noisy cron job can be skipped or quarantined through `cron-run-control` without consuming the interactive runtime class. Manual retry clears the scheduler watermark for that run's slot and uses the CronRun attempt number in the worker idempotency key. Worker and runtime dispatch both re-check CronRunStore controls, tombstone skipped runtime items, and avoid overwriting operator skip/quarantine state.

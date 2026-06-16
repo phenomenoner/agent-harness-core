@@ -101,7 +101,9 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
         "learning",
         "staging",
         "codex",
+        "codexContext",
         "runtime",
+        "runtimeDispatch",
         "runtimeBackoff",
         "cronScheduler",
         "channelIdentity",
@@ -124,7 +126,11 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
             "learning" => validate_learning_object("$.learning", child, errors),
             "staging" => validate_staging_object("$.staging", child, errors),
             "codex" => validate_codex_object("$.codex", child, errors),
+            "codexContext" => validate_codex_context_object("$.codexContext", child, errors),
             "runtime" => validate_runtime_object("$.runtime", child, errors),
+            "runtimeDispatch" => {
+                validate_runtime_dispatch_object("$.runtimeDispatch", child, errors)
+            }
             "runtimeBackoff" => validate_runtime_backoff_object("$.runtimeBackoff", child, errors),
             "cronScheduler" => validate_cron_scheduler_object("$.cronScheduler", child, errors),
             "channelIdentity" => {
@@ -295,6 +301,103 @@ fn validate_runtime_object(path: &str, value: &Value, errors: &mut Vec<String>) 
             }
             "backoff" => validate_runtime_backoff_object(&path_key(path, key), child, errors),
             other => errors.push(format!("unknown runtime config key `{other}` at {path}")),
+        }
+    }
+}
+
+fn validate_runtime_dispatch_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "globalConcurrencyLimit" => expect_positive_u64(path_key(path, key), child, errors),
+            "interactiveReserve" | "interactiveReserved" => {
+                expect_u64(path_key(path, key), child, errors)
+            }
+            "classes" => validate_runtime_dispatch_classes(path_key(path, key), child, errors),
+            other => errors.push(format!(
+                "unknown runtimeDispatch config key `{other}` at {path}"
+            )),
+        }
+    }
+}
+
+fn validate_runtime_dispatch_classes(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(&path, value, errors) else {
+        return;
+    };
+    for (class_name, child) in object {
+        validate_runtime_dispatch_class(path_key(&path, class_name), child, errors);
+    }
+}
+
+fn validate_runtime_dispatch_class(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(&path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "maxActive"
+            | "perAgentMaxActive"
+            | "perChannelMaxActive"
+            | "perAgentChannelMaxActive"
+            | "perSessionMaxActive"
+            | "perSessionLaneMaxActive"
+            | "perJobMaxActive"
+            | "maxQueuedPerAgent" => expect_positive_u64(path_key(&path, key), child, errors),
+            "sessionFifo" | "sameSessionMainAgentSerialization" => {
+                expect_bool(path_key(&path, key), child, errors)
+            }
+            other => errors.push(format!(
+                "unknown runtimeDispatch class config key `{other}` at {path}"
+            )),
+        }
+    }
+}
+
+fn validate_codex_context_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "enabled"
+            | "preferOfficialCompact"
+            | "prefer_official_compact"
+            | "autoCompactBeforeTurn"
+            | "auto_compact_before_turn"
+            | "retryOnceAfterCompact"
+            | "retry_once_after_compact"
+            | "manualRecoveryAllowed"
+            | "manual_recovery_allowed" => expect_bool(path_key(path, key), child, errors),
+            "fallbackOnCompactFailure" | "fallback_on_compact_failure" => expect_enum(
+                path_key(path, key),
+                child,
+                &["checkpoint-and-new-thread", "manual", "disabled"],
+                errors,
+            ),
+            "warnAtActiveContextRatio"
+            | "warn_at_active_context_ratio"
+            | "compactAtActiveContextRatio"
+            | "compact_at_active_context_ratio" => expect_ratio(path_key(path, key), child, errors),
+            "modelContextWindow"
+            | "model_context_window"
+            | "modelAutoCompactTokenLimit"
+            | "model_auto_compact_token_limit"
+            | "toolOutputTokenLimit"
+            | "tool_output_token_limit" => expect_positive_u64(path_key(path, key), child, errors),
+            "modelAutoCompactTokenLimitScope"
+            | "model_auto_compact_token_limit_scope"
+            | "compactPrompt"
+            | "compact_prompt"
+            | "experimentalCompactPromptFile"
+            | "experimental_compact_prompt_file" => {
+                expect_string(path_key(path, key), child, errors)
+            }
+            other => errors.push(format!(
+                "unknown codexContext config key `{other}` at {path}"
+            )),
         }
     }
 }
@@ -642,6 +745,16 @@ fn expect_positive_i64(path: impl Into<String>, value: &Value, errors: &mut Vec<
     match value.as_i64() {
         Some(value) if value > 0 => {}
         _ => errors.push(format!("{} must be a positive integer", path.into())),
+    }
+}
+
+fn expect_ratio(path: impl Into<String>, value: &Value, errors: &mut Vec<String>) {
+    let path = path.into();
+    match value.as_f64() {
+        Some(value) if value > 0.0 && value <= 1.0 => {}
+        _ => errors.push(format!(
+            "{path} must be a number greater than 0 and at most 1"
+        )),
     }
 }
 

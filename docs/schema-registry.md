@@ -1,14 +1,17 @@
 # Agent Harness Schema Registry
 
-Date: 2026-06-15
+Date: 2026-06-16
 
 The authoritative in-code registry is `agent_harness_core::quality::schema_registry_entries`, exposed by `agent-harness schema-registry`. This document records the current public compatibility contract for review and release checks.
 
 | Schema | Owner module | Compatibility rule | Current status |
 |---|---|---|---|
-| `agent-harness.runtime-run-once.v1` | `runtime_pipeline` | Append-only JSONL; additive fields only in v1. | Existing reader accepts legacy `timeout`; v1 adds `retry-pending`, `dead-letter`, Round5 runtime metadata fields (`runtimeClass`, `origin`, `cronRunId`, `scheduledForMs`), and skipped cron tombstones emitted when CronRunStore control blocks stale runtime dispatch. |
+| `agent-harness.runtime-run-once.v1` | `runtime_pipeline` | Append-only JSONL; additive fields only in v1. | Existing reader accepts legacy `timeout`; v1 adds `retry-pending`, `dead-letter`, `context-exhausted`, Round5 runtime metadata fields (`runtimeClass`, `origin`, `cronRunId`, `scheduledForMs`), and skipped cron tombstones emitted when CronRunStore control blocks stale runtime dispatch. |
 | `agent-harness.runtime-dead-letter.v1` | `runtime_pipeline` | Additive fields only in v1; terminal receipt semantics are immutable. | Implemented in staging. |
 | `agent-harness.runtime-queue-control.v1` | `runtime_queue` | Retry/skip receipts are append-only; terminal source ids are never mutated. | Implemented in staging. |
+| `agent-harness.codex-context-preflight.v1` | `codex_runtime` | Append-only JSONL plus per-execution JSON; additive fields only in v1. | Implemented in staging. |
+| `agent-harness.codex-context-checkpoint.v1` | `codex_runtime` | Per-execution recovery artifact; additive fields only in v1. | Implemented in staging. |
+| `agent-harness.codex-context-rollover.v1` | `codex_runtime` | Per-execution recovery artifact; binding backup path remains optional. | Implemented in staging. |
 | `agent-harness.channel-identity-check.v1` | `channel_identity` | Additive fields only in v1; non-bound statuses remain fail-closed. | Implemented. |
 | `agent-harness.channel-identity-registry.v1` | `channel_identity` | Additive binding fields only in v1; ambiguous bindings must fail closed. | Implemented. |
 | `agent-harness.channel-delivery-intent.v1` | `channel_runtime` | Additive fields only in v1; provider ids must come from captured inbound context. | Implemented. |

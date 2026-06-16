@@ -1,6 +1,6 @@
 # Agent Harness TG/Discord DM Self-Check Guide
 
-Date: 2026-06-15
+Date: 2026-06-16
 
 This guide is the operator handoff for asking the `main` agent to verify the live Telegram DM and Discord DM channel paths from inside Agent Harness. It is designed for a single normal-message turn in each DM channel, with the agent doing as much read-only verification as it can and returning artifact pointers for operator follow-up.
 
@@ -17,6 +17,8 @@ Current activation baseline:
 - Live loops currently expected in status after the scheduler cutover: `runtime-loop`, `worker-loop`, `progress-delivery-loop`, `telegram-loop`, `discord-outbox-loop`, `discord-gateway-loop`, and `cron-scheduler-loop`.
 - Supervisor plan: 6 always-on task entries plus `cron-scheduler-loop` when scheduling is enabled. `runtime-loop` is a single process with bounded in-process runtime concurrency via `--runtime-concurrency 12`; in supervised infinite mode it should keep safe-mode restart enabled.
 - Channel identity: when a binding registry is configured, the platform/account/channel tuple must resolve to `main` before the DM reaches the model.
+- Same-session runtime ordering: ordinary channel-origin `main` turns are serialized per `agent + platform + channel + user + sessionKey`; `workerDispatch.channelConcurrencyLimit=3` is still a broader worker/fan-out cap and must not be interpreted as permission for the same DM session to run multiple main-agent Codex turns at once.
+- Codex context recovery: context preflight writes `state/runtime-queue/codex-context-preflight-receipts.jsonl` plus per-execution `codex-context-preflight.json`; hard context-window failures should surface as `context-exhausted` with official compact retry or checkpoint/fresh-thread recovery metadata instead of a generic failed-terminal reply.
 - Runtime-loop liveness rule: missing/stale/error/stopped/stopping runtime-loop heartbeat is FAIL for live readiness. `safe-mode` is WARN/degraded because the loop is still alive but has reduced runtime concurrency to 1.
 - Large-ledger rule: `status`, `healthz`, and readiness may report sampled log/outbox/runtime counts after tail-sampling large JSONL files. Treat sampled counts as an operational window and check the warning text before comparing historical totals.
 
@@ -35,7 +37,7 @@ A single normal DM sent to `main` can prove:
 
 - The platform inbound adapter accepted the allowed DM.
 - The message was routed to `main`.
-- A runtime queue item was prepared and executed through Codex.
+- A runtime queue item was prepared and executed through Codex, and same-session queue ordering would keep a second ordinary DM message queued until the first reaches terminal status.
 - Prompt assembly, imported memory context, model/session continuity, and transcript/trajectory recording were available to the turn.
 - The agent can read or summarize status artifacts if shell/filesystem tools are available.
 - The final response contains a channel-specific sentinel that the operator can use to verify delivery.
@@ -84,7 +86,7 @@ mode=read-only-self-check
    - .\target\debug\agent-harness.exe enable-check --harness-home .\.agent-harness
    - .\target\debug\agent-harness.exe status --harness-home .\.agent-harness --json
    - .\target\debug\agent-harness.exe worker-status --harness-home .\.agent-harness
-3. 檢查或摘要：runtime queue 是否沒有 open backlog、status 是否有 latest non-idle runtime event、loop heartbeats 是否包含 runtime/worker/progress/telegram/discord-outbox/discord-gateway/cron-scheduler（若 scheduler 已啟用）、runtime-loop 是否是單 loop bounded concurrency 而不是多個 runtime-loop-N 互搶 queue、runtime-loop 是否沒有 missing/stale/error/stopped/stopping（safe-mode 只能算 WARN）、worker failedTerminal 是否為 0、worker config 是否是 global=12/per-agent=6/per-agent-channel=3、memory hook/prompt-context 是否可用、plugin hooks/memory-slot receipts 是否存在。
+3. 檢查或摘要：runtime queue 是否沒有 open backlog、status 是否有 latest non-idle runtime event、loop heartbeats 是否包含 runtime/worker/progress/telegram/discord-outbox/discord-gateway/cron-scheduler（若 scheduler 已啟用）、runtime-loop 是否是單 loop bounded concurrency 而不是多個 runtime-loop-N 互搶 queue、runtime-loop 是否沒有 missing/stale/error/stopped/stopping（safe-mode 只能算 WARN）、worker failedTerminal 是否為 0、worker config 是否是 global=12/per-agent=6/per-agent-channel=3、runtimeDispatch 是否對 interactive main-agent same-session turn 使用 perSessionMaxActive=1/sessionFifo=true、Codex context preflight/recovery receipts 是否存在或可解釋為本 turn 尚未觸發 recovery、memory hook/prompt-context 是否可用、plugin hooks/memory-slot receipts 是否存在。
 4. 檢查 prompt context：Prompt files 不應是 0/7；目前 `.agent-harness/workspace` 若沒有 `BOOTSTRAP.md`，`6/7` 是可接受 baseline。每個 prompt file 應有明確作用說明並要求 agent 遵守，例如 AGENTS.md 是 workspace instructions、SOUL.md 是 persona/voice、TOOLS.md 是 tool policy、USER.md 是 user preferences、IDENTITY.md 是 identity、HEARTBEAT.md 是 cadence/liveness、BOOTSTRAP.md 是 startup context。Skills 是 dynamic task context；若本 turn 沒選到 skill，應說明這可能正常，而不是當成 prompt-file loading failure。
 5. 確認本 turn 可作為 Telegram inbound allowed-user routing、main agent dispatch、Codex runtime、prompt/memory context、transcript/trajectory write 的 live smoke。
 6. 回覆時必須包含 sentinel：TG-DM-SELF-CHECK:tg-main-selfcheck-YYYYMMDD-HHMM
@@ -109,8 +111,9 @@ Telegram-specific pass criteria:
 - No secret values are printed.
 - Readiness/status summary is `ready=true` with no failed checks, or the agent explains any drift.
 - Artifact pointers include at least:
-  - `state/runtime-queue/run-once-receipts.jsonl`
-  - `state/runtime-queue/codex-runtime-completion-receipts.jsonl`
+- `state/runtime-queue/run-once-receipts.jsonl`
+- `state/runtime-queue/codex-context-preflight-receipts.jsonl`
+- `state/runtime-queue/codex-runtime-completion-receipts.jsonl`
   - `agents/main/sessions/`
   - `state/channels/outbox.jsonl`
   - `state/channels/delivery-receipts.jsonl`
@@ -135,7 +138,7 @@ mode=read-only-self-check
    - .\target\debug\agent-harness.exe enable-check --harness-home .\.agent-harness
    - .\target\debug\agent-harness.exe status --harness-home .\.agent-harness --json
    - .\target\debug\agent-harness.exe worker-status --harness-home .\.agent-harness
-3. 檢查或摘要：Discord gateway heartbeat 是否 live、discord-outbox-loop 是否 live、runtime queue 是否沒有 open backlog、status 是否有 latest non-idle runtime event、runtime-loop 是否是單 loop bounded concurrency 而不是多個 runtime-loop-N 互搶 queue、runtime-loop 是否沒有 missing/stale/error/stopped/stopping（safe-mode 只能算 WARN）、cron-scheduler-loop 是否在 scheduler 已啟用時 live、worker failedTerminal 是否為 0、worker config 是否是 global=12/per-agent=6/per-agent-channel=3、memory hook/prompt-context 是否可用、plugin hooks/memory-slot receipts 是否存在。
+3. 檢查或摘要：Discord gateway heartbeat 是否 live、discord-outbox-loop 是否 live、runtime queue 是否沒有 open backlog、status 是否有 latest non-idle runtime event、runtime-loop 是否是單 loop bounded concurrency 而不是多個 runtime-loop-N 互搶 queue、runtime-loop 是否沒有 missing/stale/error/stopped/stopping（safe-mode 只能算 WARN）、cron-scheduler-loop 是否在 scheduler 已啟用時 live、worker failedTerminal 是否為 0、worker config 是否是 global=12/per-agent=6/per-agent-channel=3、runtimeDispatch 是否對 interactive main-agent same-session turn 使用 perSessionMaxActive=1/sessionFifo=true、Codex context preflight/recovery receipts 是否存在或可解釋為本 turn 尚未觸發 recovery、memory hook/prompt-context 是否可用、plugin hooks/memory-slot receipts 是否存在。
 4. 檢查 prompt context：Prompt files 不應是 0/7；目前 `.agent-harness/workspace` 若沒有 `BOOTSTRAP.md`，`6/7` 是可接受 baseline。每個 prompt file 應有明確作用說明並要求 agent 遵守，例如 AGENTS.md 是 workspace instructions、SOUL.md 是 persona/voice、TOOLS.md 是 tool policy、USER.md 是 user preferences、IDENTITY.md 是 identity、HEARTBEAT.md 是 cadence/liveness、BOOTSTRAP.md 是 startup context。Skills 是 dynamic task context；若本 turn 沒選到 skill，應說明這可能正常，而不是當成 prompt-file loading failure。
 5. 確認本 turn 可作為 Discord DM inbound Gateway routing、main agent dispatch、Codex runtime、prompt/memory context、transcript/trajectory write 的 live smoke。
 6. 回覆時必須包含 sentinel：DISCORD-DM-SELF-CHECK:discord-main-selfcheck-YYYYMMDD-HHMM
@@ -162,8 +165,9 @@ Discord-specific pass criteria:
 - Artifact pointers include at least:
   - `state/channels/discord-gateway-events.jsonl`
   - `state/channels/discord-gateway-probe-receipts.jsonl`
-  - `state/runtime-queue/run-once-receipts.jsonl`
-  - `state/runtime-queue/codex-runtime-completion-receipts.jsonl`
+- `state/runtime-queue/run-once-receipts.jsonl`
+- `state/runtime-queue/codex-context-preflight-receipts.jsonl`
+- `state/runtime-queue/codex-runtime-completion-receipts.jsonl`
   - `agents/main/sessions/`
   - `state/channels/outbox.jsonl`
   - `state/channels/delivery-receipts.jsonl`
