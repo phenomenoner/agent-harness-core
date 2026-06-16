@@ -208,7 +208,7 @@ Reason:
 
 - The harness can prove its adapter surface; it cannot guarantee all external pack paths enforce the same policy until that contract exists and is tested.
 
-## Verification So Far
+## Verification
 
 Completed:
 
@@ -236,14 +236,57 @@ Observed:
 - Diff hygiene: no whitespace errors; Windows line-ending warnings only.
 - PowerShell wrapper smoke: `openclaw-mem-env-tests-ok`.
 
-Pending before cutover/finish:
+## Live Cutover Evidence
 
-```powershell
-final review pass
-commit/push
-operator-approved live cutover and post-cutover status/health validation
-```
+Completed on 2026-06-17 through the operator cutover path.
+
+Cutover metadata:
+
+- Ticket: `cutover-1781636630556`.
+- Candidate binary: `target\staging-build-round6-2\debug\agent-harness.exe`.
+- Live binary replaced: `target\debug\agent-harness.exe`.
+- Previous binary backup: `target\debug\agent-harness.pre-round6-2-progress-memory-20260617030804.exe`.
+- Non-secret backup label: `pre-round6-2-progress-memory-cutover-after-stop`.
+- Backup manifest entries: `4130`.
+
+Operational notes:
+
+- A first `ops-backup` before stop failed on a live file lock (`os error 32`).
+- The cutover then followed the token-gated path:
+  - `ops-cutover-request`
+  - `ops-cutover-approve`
+  - `ops-cutover-apply`
+  - `harness.ps1 gateway stop --live-control-token <redacted>`
+  - retry `ops-backup` after graceful stop
+  - copy staged binary over `target\debug\agent-harness.exe`
+  - `harness-skills-sync`
+  - `harness.ps1 gateway start --live-control-token <redacted>`
+  - post-cutover `healthz`, `status`, `worker-status`, and memory smoke
+- The existing 8-loop supervisor scripts were preserved instead of regenerated. A staging `supervisor-plan` dry run produced only 7 tasks and would have dropped the live `telegram-loop-xiaoxiaoli` runner; this code change did not require supervisor-script changes.
+- Direct runners started after cutover:
+  - `runtime-loop`
+  - `worker-loop`
+  - `cron-scheduler-loop`
+  - `progress-delivery-loop`
+  - primary `telegram-loop`
+  - `telegram-loop-xiaoxiaoli`
+  - `discord-outbox-loop`
+  - `discord-gateway-loop`
+
+Post-cutover validation:
+
+- `healthz --harness-home .\.agent-harness --require-writable-state`: `ready=true`, `live=true`.
+- `status --harness-home .\.agent-harness --json`: `ready=true`, readiness `passed=59`, `warnings=0`, `failed=0`.
+- `worker-status --harness-home .\.agent-harness --json`: `pending=0`, `leased=0`, `running=0`, `failedRetryable=0`, `failedTerminal=0`.
+- Active `target\debug\agent-harness.exe` process count: `8`.
+- `memory-service-status --harness-home .\.agent-harness --json`: `status=ready`, `directCliEnvBridgeRequired=true`.
+- Live direct CLI bridge mappings:
+  - `AGENT_HARNESS_MEMORY_EMBEDDING_API_KEY` -> `OPENAI_API_KEY`
+  - `AGENT_HARNESS_MEMORY_EMBEDDING_BASE_URL` -> `OPENAI_BASE_URL`
+  - `AGENT_HARNESS_MEMORY_EMBEDDING_BASE_URL` -> `OPENAI_API_BASE`
+  - `AGENT_HARNESS_MEMORY_EMBEDDING_MODEL` -> `AGENT_HARNESS_MEMORY_EMBEDDING_MODEL`
+- `memory-read-path-smoke --harness-home .\.agent-harness --json`: `status=ready`, `scopeTrustSmokeOk=true`, `scopeTrustSmokeFindings=[]`.
 
 ## Live Cutover Note
 
-This changes live progress UX and CLI/status memory metadata. It should follow normal staged validation and the operator cutover path. Do not hot-patch or restart live `.agent-harness` from an active channel session before the intentional cutover step.
+This changed live progress UX and CLI/status memory metadata. The cutover used the normal staged validation and operator token path; no hot-patch or direct binary replacement was performed while the live runtime loop was still running.
