@@ -199,8 +199,18 @@ pub struct MemoryCredentialBridgeReport {
     pub model: String,
     pub base_url: String,
     pub subprocess_env_keys: Vec<String>,
+    pub direct_cli_env_bridge_required: bool,
+    pub direct_cli_env_mappings: Vec<MemoryCredentialEnvMapping>,
+    pub direct_cli_note: String,
     pub windows_utf8_env: BTreeMap<String, String>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryCredentialEnvMapping {
+    pub source_env: String,
+    pub target_env: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -282,6 +292,8 @@ pub struct OpenClawMemReadPathSmokeReport {
     pub recall_report: OpenClawMemServiceRecallReport,
     pub bom_jsonl_smoke_ok: bool,
     pub no_bom_jsonl_smoke_ok: bool,
+    pub scope_trust_smoke_ok: bool,
+    pub scope_trust_smoke_findings: Vec<String>,
     pub embedding_smoke_status: String,
     pub warnings: Vec<String>,
 }
@@ -877,6 +889,28 @@ fn inspect_memory_credential_bridge(harness_home: &Path) -> MemoryCredentialBrid
     let mut windows_utf8_env = BTreeMap::new();
     windows_utf8_env.insert("PYTHONUTF8".to_string(), "1".to_string());
     windows_utf8_env.insert("PYTHONIOENCODING".to_string(), "utf-8".to_string());
+    let direct_cli_env_mappings = vec![
+        MemoryCredentialEnvMapping {
+            source_env: MEMORY_EMBEDDING_API_KEY_ENV.to_string(),
+            target_env: "OPENAI_API_KEY".to_string(),
+        },
+        MemoryCredentialEnvMapping {
+            source_env: MEMORY_EMBEDDING_BASE_URL_ENV.to_string(),
+            target_env: "OPENAI_BASE_URL".to_string(),
+        },
+        MemoryCredentialEnvMapping {
+            source_env: MEMORY_EMBEDDING_BASE_URL_ENV.to_string(),
+            target_env: "OPENAI_API_BASE".to_string(),
+        },
+        MemoryCredentialEnvMapping {
+            source_env: MEMORY_EMBEDDING_MODEL_ENV.to_string(),
+            target_env: MEMORY_EMBEDDING_MODEL_ENV.to_string(),
+        },
+    ];
+    warnings.push(
+        "direct openclaw-mem CLI invocations do not automatically inherit harness memory credentials; apply the reported env bridge or use harness-mediated memory commands"
+            .to_string(),
+    );
     MemoryCredentialBridgeReport {
         api_key_present: config.api_key.is_some(),
         api_key_length: config.api_key.as_ref().map(|key| key.len()).unwrap_or(0),
@@ -888,6 +922,11 @@ fn inspect_memory_credential_bridge(harness_home: &Path) -> MemoryCredentialBrid
             "OPENAI_API_BASE".to_string(),
             MEMORY_EMBEDDING_MODEL_ENV.to_string(),
         ],
+        direct_cli_env_bridge_required: true,
+        direct_cli_env_mappings,
+        direct_cli_note:
+            "Map harness memory embedding env names to OpenAI-compatible env names before naked openclaw-mem CLI pack/search runs; values remain redacted from receipts."
+                .to_string(),
         windows_utf8_env,
         warnings,
     }
@@ -982,6 +1021,36 @@ fn memory_trust_policy() -> MemoryTrustPolicyReport {
         noisy_tool_output_action: "demote-unless-explicit-match".to_string(),
         receipts_include_decisions: true,
     }
+}
+
+fn memory_scope_trust_smoke_findings(report: &OpenClawMemServiceStatusReport) -> Vec<String> {
+    let mut findings = Vec::new();
+    if !report.scope_policy.global_imported_snapshot_allowed {
+        findings.push("global_imported_snapshot_not_allowed".to_string());
+    }
+    if !report.scope_policy.per_agent_writeback_required {
+        findings.push("per_agent_writeback_not_required".to_string());
+    }
+    if report.scope_policy.cross_agent_private_recall_allowed {
+        findings.push("cross_agent_private_recall_allowed".to_string());
+    }
+    if !report.scope_policy.receipts_include_scope {
+        findings.push("scope_receipts_missing".to_string());
+    }
+    if report.trust_policy.mode != "conservative-snapshot-default" {
+        findings.push("unexpected_trust_policy_mode".to_string());
+    }
+    if !report.trust_policy.receipts_include_decisions {
+        findings.push("trust_receipts_missing_decisions".to_string());
+    }
+    if !report
+        .trust_policy
+        .noisy_tool_output_action
+        .contains("demote")
+    {
+        findings.push("noisy_tool_output_not_demoted".to_string());
+    }
+    findings
 }
 
 fn memory_graph_readiness(harness_home: &Path) -> MemoryGraphReadinessReport {
@@ -1204,6 +1273,14 @@ pub fn run_openclaw_mem_read_path_smoke(
     let mut warnings = Vec::new();
     warnings.extend(status_report.warnings.clone());
     warnings.extend(recall_report.warnings.clone());
+    let scope_trust_smoke_findings = memory_scope_trust_smoke_findings(&status_report);
+    let scope_trust_smoke_ok = scope_trust_smoke_findings.is_empty();
+    if !scope_trust_smoke_ok {
+        warnings.push(format!(
+            "memory scope/trust smoke findings: {}",
+            scope_trust_smoke_findings.join(", ")
+        ));
+    }
     let embedding_smoke_status = if status_report.credential_bridge.api_key_present {
         "credential-bridge-ready-offline-smoke-not-run".to_string()
     } else {
@@ -1218,6 +1295,8 @@ pub fn run_openclaw_mem_read_path_smoke(
         recall_report,
         bom_jsonl_smoke_ok,
         no_bom_jsonl_smoke_ok,
+        scope_trust_smoke_ok,
+        scope_trust_smoke_findings,
         embedding_smoke_status,
         warnings,
     };
@@ -3843,6 +3922,53 @@ mod tests {
     }
 
     #[test]
+    fn openclaw_mem_service_status_reports_direct_cli_env_bridge_without_secret() {
+        let root = temp_root("openclaw_mem_service_status_reports_direct_cli_env_bridge");
+        let harness_home = root.join("harness");
+        fs::create_dir_all(harness_home.join("memory")).unwrap();
+        fs::create_dir_all(harness_home.join("secrets")).unwrap();
+        fs::write(
+            memory_credentials_env_file(&harness_home),
+            "AGENT_HARNESS_MEMORY_EMBEDDING_API_KEY=sk-test-memory-key\nAGENT_HARNESS_MEMORY_EMBEDDING_MODEL=text-embedding-3-small\nAGENT_HARNESS_MEMORY_EMBEDDING_BASE_URL=https://api.openai.com/v1\n",
+        )
+        .unwrap();
+
+        let report = inspect_openclaw_mem_service(OpenClawMemServiceStatusOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+        })
+        .unwrap();
+
+        assert!(report.credential_bridge.api_key_present);
+        assert_eq!(
+            report.credential_bridge.api_key_length,
+            "sk-test-memory-key".len()
+        );
+        assert!(report.credential_bridge.direct_cli_env_bridge_required);
+        assert!(
+            report
+                .credential_bridge
+                .direct_cli_env_mappings
+                .iter()
+                .any(|mapping| mapping.source_env == MEMORY_EMBEDDING_API_KEY_ENV
+                    && mapping.target_env == "OPENAI_API_KEY")
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("direct openclaw-mem CLI"))
+        );
+        let receipt =
+            fs::read_to_string(openclaw_mem_service_status_latest_file(&harness_home)).unwrap();
+        assert!(receipt.contains("directCliEnvMappings"));
+        assert!(receipt.contains("OPENAI_API_KEY"));
+        assert!(!receipt.contains("sk-test-memory-key"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn openclaw_mem_service_store_requires_approval_and_feeds_recall_canvas() {
         let root =
             temp_root("openclaw_mem_service_store_requires_approval_and_feeds_recall_canvas");
@@ -3895,6 +4021,68 @@ mod tests {
         .unwrap();
         assert_eq!(canvas.status, MemoryCanvasWorkerStatus::Written);
         assert_eq!(canvas.episodes_read, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn openclaw_mem_service_recall_keeps_agent_writeback_private() {
+        let root = temp_root("openclaw_mem_service_recall_keeps_agent_writeback_private");
+        let harness_home = root.join("harness");
+
+        store_openclaw_mem_service_memory(OpenClawMemServiceStoreOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            session_key: Some("session-main".to_string()),
+            text: "main-private-blueprint".to_string(),
+            payload: serde_json::json!({}),
+            approved: true,
+            now_ms: 1_000,
+        })
+        .unwrap();
+        store_openclaw_mem_service_memory(OpenClawMemServiceStoreOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("xiao".to_string()),
+            session_key: Some("session-xiao".to_string()),
+            text: "xiao-private-blueprint".to_string(),
+            payload: serde_json::json!({}),
+            approved: true,
+            now_ms: 2_000,
+        })
+        .unwrap();
+
+        let main_recall_xiao = recall_openclaw_mem_service(OpenClawMemServiceRecallOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            query: "xiao-private-blueprint".to_string(),
+            limit: 5,
+            max_file_bytes: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            main_recall_xiao.status,
+            OpenClawMemServiceRecallStatus::NoHits
+        );
+        assert!(main_recall_xiao.hits.is_empty());
+
+        let xiao_recall_xiao = recall_openclaw_mem_service(OpenClawMemServiceRecallOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("xiao".to_string()),
+            query: "xiao-private-blueprint".to_string(),
+            limit: 5,
+            max_file_bytes: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            xiao_recall_xiao.status,
+            OpenClawMemServiceRecallStatus::Ready
+        );
+        assert_eq!(xiao_recall_xiao.hits[0].lane, "service-writeback");
+        assert!(
+            xiao_recall_xiao.hits[0]
+                .text
+                .contains("xiao-private-blueprint")
+        );
 
         let _ = fs::remove_dir_all(root);
     }

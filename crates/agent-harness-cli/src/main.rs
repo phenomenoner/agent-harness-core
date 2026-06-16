@@ -1384,6 +1384,18 @@ fn run_memory_service_status(args: &[String]) -> Result<(), String> {
             report.credential_bridge.base_url,
             report.credential_bridge.api_key_length
         );
+        let direct_cli_targets = report
+            .credential_bridge
+            .direct_cli_env_mappings
+            .iter()
+            .map(|mapping| format!("{}->{}", mapping.source_env, mapping.target_env))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "Direct CLI bridge: required={} mappings=[{}]",
+            yes_no(report.credential_bridge.direct_cli_env_bridge_required),
+            direct_cli_targets
+        );
         println!(
             "Embedding coverage: observations={}/{} episodic={}/{} docs={}/{}",
             display_opt_u64(report.embedding_coverage.observation_embeddings),
@@ -2020,6 +2032,13 @@ fn run_memory_read_path_smoke(args: &[String]) -> Result<(), String> {
         println!("Embedding smoke: {}", report.embedding_smoke_status);
         println!("BOM JSONL smoke: {}", report.bom_jsonl_smoke_ok);
         println!("No-BOM JSONL smoke: {}", report.no_bom_jsonl_smoke_ok);
+        println!("Scope/trust smoke: {}", report.scope_trust_smoke_ok);
+        if !report.scope_trust_smoke_findings.is_empty() {
+            println!(
+                "Scope/trust findings: {}",
+                report.scope_trust_smoke_findings.join(", ")
+            );
+        }
         println!(
             "Graph verdict: {}",
             report.status_report.graph_readiness.verdict
