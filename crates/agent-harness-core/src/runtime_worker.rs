@@ -13,8 +13,8 @@ use serde_json::Value;
 use std::os::windows::fs::OpenOptionsExt;
 
 use crate::{
-    AgentSource, HarnessLogEvent, HarnessLogLevel, PromptAssemblyOptions, append_harness_log,
-    assemble_prompt_bundle, build_runtime_skill_index, build_turn_plan,
+    AgentSource, HarnessLogEvent, HarnessLogLevel, InboundMediaArtifact, PromptAssemblyOptions,
+    append_harness_log, assemble_prompt_bundle, build_runtime_skill_index, build_turn_plan,
     cron_run_runtime_dispatch_blocker, current_log_time_ms, load_agent_registry,
     load_worker_dispatch_config, write_json_atomic, write_prompt_bundle,
 };
@@ -123,6 +123,8 @@ pub struct RuntimeQueuePreparedItem {
     pub user_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inbound_context: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inbound_media_artifacts: Vec<InboundMediaArtifact>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub execution_dir: PathBuf,
@@ -152,6 +154,8 @@ pub struct RuntimeExecutionReceipt {
     pub prompt_markdown: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_workspace: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbound_media_artifacts: Vec<InboundMediaArtifact>,
     pub reason: String,
 }
 
@@ -196,6 +200,7 @@ struct PendingQueueItem {
     user_id: String,
     message_text: String,
     inbound_context: Option<String>,
+    inbound_media_artifacts: Vec<InboundMediaArtifact>,
     source_home: PathBuf,
     source_workspace: PathBuf,
     runtime_workspace: Option<PathBuf>,
@@ -291,6 +296,7 @@ pub fn prepare_runtime_queue_item(
                 prompt_bundle_json: None,
                 prompt_markdown: None,
                 runtime_workspace: None,
+                inbound_media_artifacts: Vec::new(),
                 reason: format!(
                     "runtime queue lease lock is busy for class `{lock_runtime_class}`"
                 ),
@@ -344,6 +350,7 @@ pub fn prepare_runtime_queue_item(
             prompt_bundle_json: None,
             prompt_markdown: None,
             runtime_workspace: None,
+            inbound_media_artifacts: Vec::new(),
             reason: "requested runtime queue item already has a terminal run receipt".to_string(),
         };
         append_json_line(&execution_receipts_file, &receipt)?;
@@ -372,6 +379,7 @@ pub fn prepare_runtime_queue_item(
                 prompt_bundle_json: None,
                 prompt_markdown: None,
                 runtime_workspace: None,
+                inbound_media_artifacts: Vec::new(),
                 reason: "requested runtime queue item is already leased".to_string(),
             };
             write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
@@ -402,6 +410,7 @@ pub fn prepare_runtime_queue_item(
                     prompt_bundle_json: None,
                     prompt_markdown: None,
                     runtime_workspace: None,
+                    inbound_media_artifacts: Vec::new(),
                     reason: format!("runtime queue item blocked by {blocker}"),
                 };
                 write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
@@ -430,6 +439,7 @@ pub fn prepare_runtime_queue_item(
                     prompt_bundle_json: None,
                     prompt_markdown: None,
                     runtime_workspace: None,
+                    inbound_media_artifacts: Vec::new(),
                     reason: format!("runtime queue capacity blocked by {blocker}"),
                 };
                 write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
@@ -461,6 +471,7 @@ pub fn prepare_runtime_queue_item(
                     prompt_bundle_json: None,
                     prompt_markdown: None,
                     runtime_workspace: None,
+                    inbound_media_artifacts: Vec::new(),
                     reason: format!("runtime queue item blocked by {blocker}"),
                 };
                 write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
@@ -489,6 +500,7 @@ pub fn prepare_runtime_queue_item(
             prompt_bundle_json: prepared.prompt_bundle_json.clone(),
             prompt_markdown: prepared.prompt_markdown.clone(),
             runtime_workspace: prepared.runtime_workspace.clone(),
+            inbound_media_artifacts: prepared.inbound_media_artifacts.clone(),
             reason: "requested runtime queue item was already prepared".to_string(),
         };
         append_json_line(&execution_receipts_file, &receipt)?;
@@ -562,6 +574,7 @@ pub fn prepare_runtime_queue_item(
                     prompt_bundle_json: prepared.prompt_bundle_json.clone(),
                     prompt_markdown: prepared.prompt_markdown.clone(),
                     runtime_workspace: prepared.runtime_workspace.clone(),
+                    inbound_media_artifacts: prepared.inbound_media_artifacts.clone(),
                     reason:
                         "resuming previously prepared runtime queue item without terminal run receipt"
                             .to_string(),
@@ -622,6 +635,7 @@ pub fn prepare_runtime_queue_item(
             prompt_bundle_json: None,
             prompt_markdown: None,
             runtime_workspace: None,
+            inbound_media_artifacts: Vec::new(),
             reason: "no matching queued runtime item found".to_string(),
         };
         append_json_line(&execution_receipts_file, &receipt)?;
@@ -671,6 +685,7 @@ pub fn prepare_runtime_queue_item(
             user_id: pending.user_id.clone(),
             text: pending.message_text.clone(),
             inbound_context: pending.inbound_context.clone(),
+            inbound_media_artifacts: pending.inbound_media_artifacts.clone(),
             requested_agent_id: Some(pending.agent_id.clone()),
             session_hint: Some(pending.session_key.clone()),
             skill_limit: pending.selected_skill_ids.len().max(5),
@@ -716,6 +731,7 @@ pub fn prepare_runtime_queue_item(
         channel_id: pending.channel_id.clone(),
         user_id: pending.user_id.clone(),
         inbound_context: pending.inbound_context.clone(),
+        inbound_media_artifacts: pending.inbound_media_artifacts.clone(),
         provider: bundle.provider.clone(),
         model: bundle.model.clone(),
         execution_dir: execution_dir.clone(),
@@ -737,6 +753,7 @@ pub fn prepare_runtime_queue_item(
         prompt_bundle_json: Some(prompt_files.json),
         prompt_markdown: Some(prompt_files.markdown),
         runtime_workspace: pending.runtime_workspace,
+        inbound_media_artifacts: item.inbound_media_artifacts.clone(),
         reason: "prompt bundle prepared; Codex runtime adapter not invoked yet".to_string(),
     };
     write_json_atomic(&receipt_file, &receipt)?;
@@ -2093,6 +2110,10 @@ fn parse_pending_item(value: &Value) -> Option<PendingQueueItem> {
         message_text: string_field(value, &["messageText", "message_text"])?.to_string(),
         inbound_context: string_field(value, &["inboundContext", "inbound_context"])
             .map(ToString::to_string),
+        inbound_media_artifacts: inbound_media_artifacts_field(
+            value,
+            &["inboundMediaArtifacts", "inbound_media_artifacts"],
+        ),
         source_home: path_field(source, &["sourceHome", "source_home"])?,
         source_workspace: path_field(source, &["sourceWorkspace", "source_workspace"])?,
         runtime_workspace: path_field(source, &["runtimeWorkspace", "runtime_workspace"]),
@@ -2186,6 +2207,16 @@ fn string_array_field(value: &Value, keys: &[&str]) -> Vec<String> {
     Vec::new()
 }
 
+fn inbound_media_artifacts_field(value: &Value, keys: &[&str]) -> Vec<InboundMediaArtifact> {
+    for key in keys {
+        if let Some(artifacts) = value.get(*key) {
+            return serde_json::from_value::<Vec<InboundMediaArtifact>>(artifacts.clone())
+                .unwrap_or_default();
+        }
+    }
+    Vec::new()
+}
+
 fn normalize_key_part(value: &str) -> String {
     let mut normalized = String::new();
     for ch in value.chars() {
@@ -2206,8 +2237,10 @@ fn normalize_key_part(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
-        RuntimeQueueEnqueueOptions, TurnPlanInput, build_channel_step, build_source_skill_index,
-        build_turn_plan, enqueue_channel_step,
+        InboundMediaArtifact, InboundMediaDownloadStatus, InboundMediaModelAttachmentStatus,
+        InboundMediaSelectedVariant, RuntimeQueueEnqueueOptions, TurnPlanInput, build_channel_step,
+        build_source_skill_index, build_turn_plan, enqueue_channel_step,
+        inbound_media_attachment_root,
     };
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2218,6 +2251,9 @@ mod tests {
         let source = write_worker_source(&root);
         let harness_home = root.join(".agent-harness");
         enqueue_fixture_turn(&source, &harness_home);
+        let pending_text =
+            fs::read_to_string(queue_dir(&harness_home).join("pending.jsonl")).unwrap();
+        assert!(!pending_text.contains("inboundMediaArtifacts"));
 
         let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
             harness_home: harness_home.clone(),
@@ -2232,6 +2268,7 @@ mod tests {
         );
         assert!(report.execution_receipts_file.is_file());
         let item = report.item.unwrap();
+        assert!(item.inbound_media_artifacts.is_empty());
         assert_eq!(item.agent_id, "main");
         assert_eq!(item.provider.as_deref(), Some("openai"));
         assert_eq!(item.model.as_deref(), Some("gpt-5"));
@@ -2250,6 +2287,103 @@ mod tests {
         let receipt_json: Value =
             serde_json::from_slice(&fs::read(item.receipt_file).unwrap()).unwrap();
         assert_eq!(receipt_json["status"], "prepared");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_runtime_queue_item_round_trips_inbound_media_artifacts_to_prompt() {
+        let root =
+            temp_root("prepare_runtime_queue_item_round_trips_inbound_media_artifacts_to_prompt");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let local_path = inbound_media_attachment_root(&harness_home)
+            .join("turn-1234")
+            .join("0.jpg");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "telegram".to_string(),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                text: "what is in this image?".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: vec![InboundMediaArtifact {
+                    platform: "telegram".to_string(),
+                    kind: "photo".to_string(),
+                    message_id: Some("99".to_string()),
+                    variant_count: Some(4),
+                    selected_variant: Some(InboundMediaSelectedVariant {
+                        width: Some(961),
+                        height: Some(1280),
+                        file_size: Some(179414),
+                    }),
+                    local_path: Some(local_path.clone()),
+                    artifact_uri: Some("agent-harness://inbound-media/turn-1234/0.jpg".to_string()),
+                    mime: Some("image/jpeg".to_string()),
+                    sha256: Some("abc123".to_string()),
+                    source: "https://api.telegram.org/botTOKEN/getFile?file_id=secret".to_string(),
+                    download_status: InboundMediaDownloadStatus::Downloaded,
+                    model_attachment_status: InboundMediaModelAttachmentStatus::PromptOnly,
+                    warnings: vec!["file_id=secret".to_string()],
+                    ..InboundMediaArtifact::default()
+                }],
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let step = build_channel_step(&registry, &turn);
+        enqueue_channel_step(
+            &step,
+            RuntimeQueueEnqueueOptions {
+                harness_home: harness_home.clone(),
+                runtime_workspace: None,
+                now_ms: 1234,
+            },
+        )
+        .unwrap();
+
+        let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+
+        let item = report.item.unwrap();
+        assert_eq!(item.inbound_media_artifacts.len(), 1);
+        assert_eq!(
+            item.inbound_media_artifacts[0].sha256.as_deref(),
+            Some("abc123")
+        );
+        let bundle_json: Value =
+            serde_json::from_slice(&fs::read(&item.prompt_bundle_json).unwrap()).unwrap();
+        assert_eq!(bundle_json["summary"]["inboundMediaSectionsIncluded"], 1);
+        let prompt_markdown = fs::read_to_string(item.prompt_markdown).unwrap();
+        assert!(prompt_markdown.contains("## InboundMedia: Telegram attachments"));
+        assert!(
+            prompt_markdown
+                .contains("localPath=state/channels/telegram-attachments/turn-1234/0.jpg")
+        );
+        assert!(
+            prompt_markdown.contains("artifactUri=agent-harness://inbound-media/turn-1234/0.jpg")
+        );
+        assert!(prompt_markdown.contains("mime=image/jpeg"));
+        assert!(prompt_markdown.contains("sha256=abc123"));
+        assert!(prompt_markdown.contains("width=961"));
+        assert!(prompt_markdown.contains("height=1280"));
+        assert!(prompt_markdown.contains("downloadStatus=downloaded"));
+        assert!(prompt_markdown.contains("modelAttachmentStatus=vision-tool-available"));
+        assert!(!prompt_markdown.contains("file_id=secret"));
+        assert!(!prompt_markdown.contains("botTOKEN"));
+        assert!(!prompt_markdown.contains("api.telegram.org/file"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2277,6 +2411,7 @@ mod tests {
                 user_id: "user-7".to_string(),
                 text: "repair memory cron".to_string(),
                 inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -3363,6 +3498,7 @@ mod tests {
                 user_id: user_id.to_string(),
                 text: text.to_string(),
                 inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
                 requested_agent_id: Some("main".to_string()),
                 session_hint: session_key.map(ToString::to_string),
                 skill_limit: 3,
@@ -3487,6 +3623,7 @@ mod tests {
             user_id: "cron-scheduler".to_string(),
             message_text: format!("run {queue_id}"),
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             source_home: PathBuf::from("source"),
             source_workspace: PathBuf::from("workspace"),
             runtime_workspace: None,

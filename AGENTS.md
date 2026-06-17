@@ -4,8 +4,14 @@
 
 - For a new working session, read [docs/agent-harness-operations-handbook.md](docs/agent-harness-operations-handbook.md) first: it holds the live topology, current live validation, the full command walkthrough, and the documentation map. The root `README.md` is the public-facing overview, not the operational source of truth.
 
+## Default Superpowers For Development
+
+- For programming or software-development tasks, default to enabling and following [$superpowers](C:\Users\user\.agents\skills\superpowers\SKILL.md) before implementation unless the user explicitly says not to use it.
+- Treat Superpowers as the baseline development workflow for planning, implementation discipline, verification, and completion checks. If the skill file is unavailable in a session, state that briefly and continue with the closest matching local process.
+
 ## Command Approval Discipline
 
+- Prefer an already reviewed external PowerShell command path with `sandbox_permissions: "require_escalated"` for shell work in this repository. Treat the local sandbox Windows logon/session failure (`CreateProcessAsUserW failed: 1312`) as a confirmed local limitation, not an intermittent issue to repeatedly retry.
 - Do not submit three or more parallel escalated shell commands for automatic review.
 <!-- Temporarily disabled by operator experiment:
 - When a command needs `sandbox_permissions: "require_escalated"`, run one escalated command at a time unless the user explicitly asks for parallel execution.

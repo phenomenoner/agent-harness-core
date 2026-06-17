@@ -2,12 +2,16 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::Value;
+
+use crate::memory_owner::{MEM_ENGINE_OWNER, MemoryOwnerState, read_memory_owner_state_or_default};
+use crate::skill_envelope::strip_skill_envelopes_for_memory;
 
 const MEMORY_SEARCH_RECEIPT_SCHEMA: &str = "agent-harness.memory-search-receipt.v1";
 const MEMORY_PROMPT_CONTEXT_RECEIPT_SCHEMA: &str = "agent-harness.memory-prompt-context-receipt.v1";
@@ -18,6 +22,11 @@ const MEMORY_CANVAS_RECEIPT_SCHEMA: &str = "agent-harness.memory-canvas-receipt.
 const MEMORY_HOOK_RECEIPT_SCHEMA: &str = "agent-harness.memory-hook-receipt.v1";
 const MEMORY_STORE_PROPOSAL_SCHEMA: &str = "agent-harness.memory-store-proposal.v1";
 const MEMORY_SLOT_RECEIPT_SCHEMA: &str = "agent-harness.memory-slot-receipt.v1";
+const MEMORY_RECALL_PLAN_RECEIPT_SCHEMA: &str = "agent-harness.memory-recall-plan-receipt.v1";
+const MEMORY_GRAPH_FRESHNESS_RECEIPT_SCHEMA: &str =
+    "agent-harness.memory-graph-freshness-receipt.v1";
+const MEMORY_PROVENANCE_CHAIN_RECEIPT_SCHEMA: &str =
+    "agent-harness.memory-provenance-chain-receipt.v1";
 const OPENCLAW_MEM_SERVICE_STATUS_SCHEMA: &str = "agent-harness.openclaw-mem-service-status.v1";
 const OPENCLAW_MEM_SERVICE_RECALL_SCHEMA: &str = "agent-harness.openclaw-mem-service-recall.v1";
 const OPENCLAW_MEM_SERVICE_PROPOSAL_SCHEMA: &str = "agent-harness.openclaw-mem-service-proposal.v1";
@@ -31,6 +40,8 @@ const DEFAULT_VECTOR_CONTEXT_LIMIT: usize = 5;
 const EPISODE_TEXT_CAP_CHARS: usize = 1_200;
 const EPISODE_SUMMARY_CAP_CHARS: usize = 220;
 const AUTO_CAPTURE_MAX_CANDIDATES: usize = 3;
+const DEFAULT_RECALL_PLAN_BUDGET: usize = 8;
+const DEFAULT_GRAPH_TOPOLOGY_MAX_AGE_MS: i64 = 86_400_000;
 const MEMORY_EMBEDDING_API_KEY_ENV: &str = "AGENT_HARNESS_MEMORY_EMBEDDING_API_KEY";
 const MEMORY_EMBEDDING_MODEL_ENV: &str = "AGENT_HARNESS_MEMORY_EMBEDDING_MODEL";
 const MEMORY_EMBEDDING_BASE_URL_ENV: &str = "AGENT_HARNESS_MEMORY_EMBEDDING_BASE_URL";
@@ -172,6 +183,11 @@ pub struct OpenClawMemServiceStatusReport {
     pub agent_id: Option<String>,
     pub status: OpenClawMemServiceStatus,
     pub reason: String,
+    pub adapter_readiness: MemoryAdapterReadinessReport,
+    pub capability_mode: String,
+    pub mem_engine_ownership: MemoryMemEngineOwnershipReport,
+    pub qdrant_native_recall: String,
+    pub semantic_coverage: MemorySemanticCoverageReport,
     pub service_mode: String,
     pub active_slot_owner: String,
     pub service_endpoint: Option<String>,
@@ -262,6 +278,146 @@ pub struct MemoryGraphReadinessReport {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryGraphFreshnessOptions {
+    pub harness_home: PathBuf,
+    pub support_plane_ready: bool,
+    pub provenance_ready: bool,
+    pub max_age_ms: i64,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryGraphFreshnessStatus {
+    Green,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryGraphFreshnessReport {
+    pub schema: &'static str,
+    pub harness_home: PathBuf,
+    pub status: MemoryGraphFreshnessStatus,
+    pub reason: String,
+    pub topology_source: PathBuf,
+    pub topology_source_present: bool,
+    pub topology_source_mtime_ms: Option<i64>,
+    pub topology_source_age_ms: Option<i64>,
+    pub max_age_ms: i64,
+    pub graph_ready_for_autonomous_match: bool,
+    pub support_plane_ready: bool,
+    pub provenance_ready: bool,
+    pub autonomous_matching_enabled: bool,
+    pub blockers: Vec<String>,
+    pub receipt_file: PathBuf,
+    pub latest_file: PathBuf,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRecallPlanOptions {
+    pub harness_home: PathBuf,
+    pub agent_id: Option<String>,
+    pub session_key: Option<String>,
+    pub query: String,
+    pub route_auto_project: Option<String>,
+    pub budget: usize,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryRecallPlanStatus {
+    Planned,
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRecallSourceBudget {
+    pub source: String,
+    pub budget: usize,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRecallPlanReport {
+    pub schema: &'static str,
+    pub harness_home: PathBuf,
+    pub status: MemoryRecallPlanStatus,
+    pub reason: String,
+    pub agent_id: Option<String>,
+    pub session_key: Option<String>,
+    pub query_length: usize,
+    pub query_hash: Option<String>,
+    pub query_rewrites: Vec<String>,
+    pub route_auto_project: Option<String>,
+    pub route_mode: String,
+    pub source_budgets: Vec<MemoryRecallSourceBudget>,
+    pub scope_policy: MemoryScopePolicyReport,
+    pub trust_policy: MemoryTrustPolicyReport,
+    pub graph_episode_doc_balance: String,
+    pub graph_autonomous_matching_enabled: bool,
+    pub graph_freshness_status: MemoryGraphFreshnessStatus,
+    pub graph_blockers: Vec<String>,
+    pub receipt_file: PathBuf,
+    pub latest_file: PathBuf,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryProvenanceChainOptions {
+    pub harness_home: PathBuf,
+    pub agent_id: Option<String>,
+    pub session_key: Option<String>,
+    pub correlation_id: Option<String>,
+    pub recall_input: Option<String>,
+    pub recall_receipt_refs: Vec<PathBuf>,
+    pub injected_citations: Vec<String>,
+    pub final_answer_text: String,
+    pub proposed_memory_refs: Vec<PathBuf>,
+    pub stored_memory_refs: Vec<PathBuf>,
+    pub later_recall_refs: Vec<PathBuf>,
+    pub rollback_refs: Vec<PathBuf>,
+    pub export_refs: Vec<PathBuf>,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryProvenanceChainStatus {
+    Recorded,
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryProvenanceChainReport {
+    pub schema: &'static str,
+    pub harness_home: PathBuf,
+    pub status: MemoryProvenanceChainStatus,
+    pub reason: String,
+    pub correlation_id: String,
+    pub agent_id: Option<String>,
+    pub session_key: Option<String>,
+    pub recall_input_hash: Option<String>,
+    pub recall_receipt_refs: Vec<PathBuf>,
+    pub injected_citations: Vec<String>,
+    pub final_answer_hash: Option<String>,
+    pub final_answer_chars: usize,
+    pub proposed_memory_refs: Vec<PathBuf>,
+    pub stored_memory_refs: Vec<PathBuf>,
+    pub later_recall_refs: Vec<PathBuf>,
+    pub rollback_refs: Vec<PathBuf>,
+    pub export_refs: Vec<PathBuf>,
+    pub receipt_file: PathBuf,
+    pub latest_file: PathBuf,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryMemEngineCanaryReport {
@@ -271,6 +427,52 @@ pub struct MemoryMemEngineCanaryReport {
     pub rollback_slot_owner: String,
     pub qdrant_edge_mode: String,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryAdapterReadinessReport {
+    pub status: String,
+    pub local_snapshot_backend: bool,
+    pub qdrant_snapshot_present: bool,
+    pub service_endpoint_configured: bool,
+    pub writeback_available: bool,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryMemEngineOwnershipReport {
+    pub active_owner: String,
+    pub canary_status: String,
+    pub promotion_ready: bool,
+    pub rollback_owner: String,
+    pub promotion_status: String,
+    pub lease_id: Option<String>,
+    pub heartbeat_at_ms: Option<i64>,
+    pub lease_expires_at_ms: Option<i64>,
+    pub last_parity_receipt: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemorySemanticCoverageReport {
+    pub observations: MemorySemanticCoverageLane,
+    pub episodic_events: MemorySemanticCoverageLane,
+    pub docs_chunks: MemorySemanticCoverageLane,
+    pub service_writeback: MemorySemanticCoverageLane,
+    pub active_store_proposals: MemorySemanticCoverageLane,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemorySemanticCoverageLane {
+    pub source: String,
+    pub items: Option<u64>,
+    pub indexed_items: Option<u64>,
+    pub coverage_bps: Option<u64>,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -484,6 +686,7 @@ pub struct MemoryLifecycleReport {
     pub capture_candidates: usize,
     pub auto_capture_enabled: bool,
     pub episodes_enabled: bool,
+    pub failed_turn_capture_enabled: bool,
     pub symbolic_canvas_enabled: bool,
     pub warnings: Vec<String>,
 }
@@ -529,6 +732,7 @@ pub enum MemoryCanvasWorkerStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MemoryHookKind {
+    BeforeAgentStart,
     BeforePromptBuild,
     ToolResult,
     AgentEnd,
@@ -540,6 +744,7 @@ pub enum MemoryHookKind {
 impl MemoryHookKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::BeforeAgentStart => "before-agent-start",
             Self::BeforePromptBuild => "before-prompt-build",
             Self::ToolResult => "tool-result",
             Self::AgentEnd => "agent-end",
@@ -555,6 +760,8 @@ impl std::str::FromStr for MemoryHookKind {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "before-agent-start" | "before_agent_start" | "agent-start" | "agent_start"
+            | "warm-up" | "warmup" | "warm_up" => Ok(Self::BeforeAgentStart),
             "before-prompt-build" | "before_prompt_build" | "before-prompt" => {
                 Ok(Self::BeforePromptBuild)
             }
@@ -776,6 +983,56 @@ pub fn memory_slot_receipts_file(harness_home: impl AsRef<Path>) -> PathBuf {
         .join("slot-receipts.jsonl")
 }
 
+pub fn memory_recall_plan_receipts_file(harness_home: impl AsRef<Path>) -> PathBuf {
+    harness_home
+        .as_ref()
+        .join("state")
+        .join("memory")
+        .join("recall-plan-receipts.jsonl")
+}
+
+pub fn memory_recall_plan_latest_file(harness_home: impl AsRef<Path>) -> PathBuf {
+    harness_home
+        .as_ref()
+        .join("state")
+        .join("memory")
+        .join("recall-plan-last.json")
+}
+
+pub fn memory_graph_freshness_receipts_file(harness_home: impl AsRef<Path>) -> PathBuf {
+    harness_home
+        .as_ref()
+        .join("state")
+        .join("memory")
+        .join("graph")
+        .join("freshness-receipts.jsonl")
+}
+
+pub fn memory_graph_freshness_latest_file(harness_home: impl AsRef<Path>) -> PathBuf {
+    harness_home
+        .as_ref()
+        .join("state")
+        .join("memory")
+        .join("graph")
+        .join("freshness-last.json")
+}
+
+pub fn memory_provenance_chain_receipts_file(harness_home: impl AsRef<Path>) -> PathBuf {
+    harness_home
+        .as_ref()
+        .join("state")
+        .join("memory")
+        .join("provenance-chain-receipts.jsonl")
+}
+
+pub fn memory_provenance_chain_latest_file(harness_home: impl AsRef<Path>) -> PathBuf {
+    harness_home
+        .as_ref()
+        .join("state")
+        .join("memory")
+        .join("provenance-chain-last.json")
+}
+
 pub fn openclaw_mem_service_status_latest_file(harness_home: impl AsRef<Path>) -> PathBuf {
     harness_home
         .as_ref()
@@ -991,6 +1248,222 @@ fn coverage_bps(numerator: Option<u64>, denominator: Option<u64>) -> Option<u64>
     Some(numerator.saturating_mul(10_000) / denominator)
 }
 
+pub fn collect_memory_embedding_coverage(
+    harness_home: impl AsRef<Path>,
+) -> MemoryEmbeddingCoverageReport {
+    memory_embedding_coverage(harness_home.as_ref())
+}
+
+pub fn collect_memory_semantic_coverage(
+    harness_home: impl AsRef<Path>,
+    agent_id: Option<&str>,
+    embedding_coverage: &MemoryEmbeddingCoverageReport,
+) -> io::Result<MemorySemanticCoverageReport> {
+    let harness_home = harness_home.as_ref();
+    Ok(MemorySemanticCoverageReport {
+        observations: embedding_lane(
+            "sqlite.observations",
+            embedding_coverage.observations,
+            embedding_coverage.observation_embeddings,
+            embedding_coverage.observation_coverage_bps,
+        ),
+        episodic_events: embedding_lane(
+            "sqlite.episodic_events",
+            embedding_coverage.episodic_events,
+            embedding_coverage.episodic_event_embeddings,
+            embedding_coverage.episodic_coverage_bps,
+        ),
+        docs_chunks: embedding_lane(
+            "sqlite.docs_chunks",
+            embedding_coverage.docs_chunks,
+            embedding_coverage.docs_embeddings,
+            embedding_coverage.docs_coverage_bps,
+        ),
+        service_writeback: jsonl_lane(
+            &openclaw_mem_service_store_file_for_agent(harness_home, agent_id),
+            "openclaw-mem.service_writeback",
+        )?,
+        active_store_proposals: jsonl_lane(
+            &openclaw_mem_service_proposals_file_for_agent(harness_home, agent_id),
+            "openclaw-mem.active_store_proposals",
+        )?,
+    })
+}
+
+pub fn memory_adapter_readiness_report(
+    local_snapshot_backend: bool,
+    qdrant_snapshot_present: bool,
+    service_endpoint_configured: bool,
+    writeback_available: bool,
+) -> MemoryAdapterReadinessReport {
+    let mut blockers = Vec::new();
+    if !local_snapshot_backend {
+        blockers.push("no readable SQLite/JSONL/writeback snapshot backend".to_string());
+    }
+    if service_endpoint_configured {
+        blockers.push(
+            "remote mem-engine endpoint configured but wire contract is not proven".to_string(),
+        );
+    }
+    let status = if local_snapshot_backend {
+        "ready"
+    } else if qdrant_snapshot_present {
+        "degraded"
+    } else {
+        "blocked"
+    };
+    MemoryAdapterReadinessReport {
+        status: status.to_string(),
+        local_snapshot_backend,
+        qdrant_snapshot_present,
+        service_endpoint_configured,
+        writeback_available,
+        blockers,
+    }
+}
+
+pub fn memory_capability_mode_from_readiness(
+    adapter_readiness: &MemoryAdapterReadinessReport,
+) -> String {
+    match adapter_readiness.status.as_str() {
+        "ready" => "snapshot-adapter-ready".to_string(),
+        "degraded" => "snapshot-adapter-degraded".to_string(),
+        _ => "blocked-no-readable-backend".to_string(),
+    }
+}
+
+pub fn memory_mem_engine_ownership_report(
+    canary: &MemoryMemEngineCanaryReport,
+) -> MemoryMemEngineOwnershipReport {
+    let promotion_ready = canary.status == "promotion-ready";
+    MemoryMemEngineOwnershipReport {
+        active_owner: canary.active_slot_owner.clone(),
+        canary_status: canary.status.clone(),
+        promotion_ready,
+        rollback_owner: canary.rollback_slot_owner.clone(),
+        promotion_status: if promotion_ready {
+            "canary-promotion-ready".to_string()
+        } else {
+            "snapshot-active".to_string()
+        },
+        lease_id: None,
+        heartbeat_at_ms: None,
+        lease_expires_at_ms: None,
+        last_parity_receipt: None,
+        reason: if promotion_ready {
+            "mem-engine canary is promotion-ready".to_string()
+        } else {
+            "snapshot-adapter remains active owner until mem-engine shadow traffic and promotion receipts pass"
+                .to_string()
+        },
+    }
+}
+
+pub fn memory_mem_engine_ownership_report_for_owner_state(
+    canary: &MemoryMemEngineCanaryReport,
+    owner_state: &MemoryOwnerState,
+) -> MemoryMemEngineOwnershipReport {
+    let gates = &owner_state.promotion_gates;
+    let promotion_ready = owner_state.owner == MEM_ENGINE_OWNER
+        || (gates.endpoint_probe_passed
+            && gates.lease_active
+            && gates.heartbeat_fresh
+            && gates.rollback_proof
+            && gates.trust_scope_tests
+            && gates.recall_parity_sample
+            && gates.store_propose_parity_sample
+            && gates.operator_approved_promotion);
+    MemoryMemEngineOwnershipReport {
+        active_owner: owner_state.owner.clone(),
+        canary_status: canary.status.clone(),
+        promotion_ready,
+        rollback_owner: owner_state.rollback_owner.clone(),
+        promotion_status: owner_state.promotion_status.clone(),
+        lease_id: owner_state.lease_id.clone(),
+        heartbeat_at_ms: owner_state.heartbeat_at_ms,
+        lease_expires_at_ms: owner_state.lease_expires_at_ms,
+        last_parity_receipt: owner_state
+            .last_parity_receipt
+            .as_ref()
+            .map(|receipt| receipt.receipt_id.clone()),
+        reason: if owner_state.owner == MEM_ENGINE_OWNER {
+            "mem-engine is active owner after operator-approved promotion gates passed".to_string()
+        } else {
+            "snapshot-adapter remains active owner until mem-engine endpoint, lease, shadow parity, trust/scope, and operator promotion gates pass"
+                .to_string()
+        },
+    }
+}
+
+pub fn memory_qdrant_native_recall_status(qdrant_snapshot_present: bool) -> String {
+    if qdrant_snapshot_present {
+        "snapshot-preserved-native-recall-inactive".to_string()
+    } else {
+        "not-present".to_string()
+    }
+}
+
+fn embedding_lane(
+    source: &str,
+    items: Option<u64>,
+    indexed_items: Option<u64>,
+    coverage_bps: Option<u64>,
+) -> MemorySemanticCoverageLane {
+    MemorySemanticCoverageLane {
+        source: source.to_string(),
+        items,
+        indexed_items,
+        coverage_bps,
+        status: semantic_lane_status(items, indexed_items, coverage_bps),
+    }
+}
+
+fn jsonl_lane(path: &Path, source: &str) -> io::Result<MemorySemanticCoverageLane> {
+    let items = count_jsonl_records(path)?;
+    let status = match items {
+        None => "missing",
+        Some(0) => "empty",
+        Some(_) => "present",
+    }
+    .to_string();
+    Ok(MemorySemanticCoverageLane {
+        source: format!("{source}:{}", path.display()),
+        items,
+        indexed_items: None,
+        coverage_bps: None,
+        status,
+    })
+}
+
+fn semantic_lane_status(
+    items: Option<u64>,
+    indexed_items: Option<u64>,
+    coverage_bps: Option<u64>,
+) -> String {
+    match (items, indexed_items, coverage_bps) {
+        (None, _, _) => "missing".to_string(),
+        (Some(0), _, _) => "empty".to_string(),
+        (Some(_), Some(_), Some(10_000)) => "complete".to_string(),
+        (Some(_), Some(indexed), Some(_)) if indexed > 0 => "partial".to_string(),
+        (Some(_), _, _) => "unindexed".to_string(),
+    }
+}
+
+fn count_jsonl_records(path: &Path) -> io::Result<Option<u64>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut count = 0u64;
+    for line in io::BufReader::new(file).lines() {
+        if !line?.trim().is_empty() {
+            count += 1;
+        }
+    }
+    Ok(Some(count))
+}
+
 fn parse_lenient_jsonl_value(line: &str) -> Option<Value> {
     let trimmed = line.trim().trim_start_matches('\u{feff}');
     if trimmed.is_empty() {
@@ -1102,6 +1575,281 @@ fn memory_graph_readiness(harness_home: &Path) -> MemoryGraphReadinessReport {
     }
 }
 
+pub fn record_memory_graph_freshness(
+    options: MemoryGraphFreshnessOptions,
+) -> io::Result<MemoryGraphFreshnessReport> {
+    let readiness = memory_graph_readiness(&options.harness_home);
+    let latest_file = memory_graph_freshness_latest_file(&options.harness_home);
+    let receipt_file = memory_graph_freshness_receipts_file(&options.harness_home);
+    let topology_source_mtime_ms = file_modified_epoch_ms(&readiness.topology_source)?;
+    let topology_source_age_ms =
+        topology_source_mtime_ms.map(|mtime| options.now_ms.saturating_sub(mtime));
+    let max_age_ms = if options.max_age_ms <= 0 {
+        DEFAULT_GRAPH_TOPOLOGY_MAX_AGE_MS
+    } else {
+        options.max_age_ms
+    };
+    let mut blockers = readiness.blockers.clone();
+    if !options.support_plane_ready {
+        blockers.push("support_plane_not_ready".to_string());
+    }
+    if !options.provenance_ready {
+        blockers.push("provenance_checks_not_ready".to_string());
+    }
+    match topology_source_age_ms {
+        Some(age_ms) if age_ms > max_age_ms => {
+            blockers.push("topology_source_stale".to_string());
+        }
+        None if readiness.topology_source_present => {
+            blockers.push("topology_source_mtime_unreadable".to_string());
+        }
+        None => {}
+        Some(_) => {}
+    }
+    blockers.sort();
+    blockers.dedup();
+    let autonomous_matching_enabled = readiness.ready_for_autonomous_match
+        && options.support_plane_ready
+        && options.provenance_ready
+        && topology_source_age_ms.is_some_and(|age_ms| age_ms <= max_age_ms);
+    let status = if autonomous_matching_enabled {
+        MemoryGraphFreshnessStatus::Green
+    } else {
+        MemoryGraphFreshnessStatus::Blocked
+    };
+    let reason = if autonomous_matching_enabled {
+        "graph topology freshness gates are green; autonomous matching may be enabled".to_string()
+    } else {
+        format!(
+            "graph autonomous matching remains disabled; blockers={}",
+            blockers.join(",")
+        )
+    };
+    let report = MemoryGraphFreshnessReport {
+        schema: MEMORY_GRAPH_FRESHNESS_RECEIPT_SCHEMA,
+        harness_home: options.harness_home,
+        status,
+        reason,
+        topology_source: readiness.topology_source,
+        topology_source_present: readiness.topology_source_present,
+        topology_source_mtime_ms,
+        topology_source_age_ms,
+        max_age_ms,
+        graph_ready_for_autonomous_match: readiness.ready_for_autonomous_match,
+        support_plane_ready: options.support_plane_ready,
+        provenance_ready: options.provenance_ready,
+        autonomous_matching_enabled,
+        blockers,
+        receipt_file,
+        latest_file,
+        warnings: readiness.warnings,
+    };
+    write_latest_and_receipt(&report.latest_file, &report.receipt_file, &report)?;
+    Ok(report)
+}
+
+pub fn plan_memory_policy_recall(
+    options: MemoryRecallPlanOptions,
+) -> io::Result<MemoryRecallPlanReport> {
+    let latest_file = memory_recall_plan_latest_file(&options.harness_home);
+    let receipt_file = memory_recall_plan_receipts_file(&options.harness_home);
+    let query = redact_sensitive(options.query.trim());
+    let query_length = query.chars().count();
+    let scope_policy = memory_scope_policy(options.agent_id.clone());
+    let trust_policy = memory_trust_policy();
+    let graph = record_memory_graph_freshness(MemoryGraphFreshnessOptions {
+        harness_home: options.harness_home.clone(),
+        support_plane_ready: false,
+        provenance_ready: false,
+        max_age_ms: DEFAULT_GRAPH_TOPOLOGY_MAX_AGE_MS,
+        now_ms: options.now_ms,
+    })?;
+    let mut warnings = graph.warnings.clone();
+    warnings.push(
+        "graph autonomous matching stays disabled until topology, support-plane, provenance, and freshness gates are green"
+            .to_string(),
+    );
+    if query.is_empty() {
+        let report = MemoryRecallPlanReport {
+            schema: MEMORY_RECALL_PLAN_RECEIPT_SCHEMA,
+            harness_home: options.harness_home,
+            status: MemoryRecallPlanStatus::Skipped,
+            reason: "memory recall plan skipped because query was empty".to_string(),
+            agent_id: options.agent_id,
+            session_key: options.session_key,
+            query_length,
+            query_hash: None,
+            query_rewrites: Vec::new(),
+            route_auto_project: options.route_auto_project,
+            route_mode: "skipped".to_string(),
+            source_budgets: Vec::new(),
+            scope_policy,
+            trust_policy,
+            graph_episode_doc_balance: "skipped".to_string(),
+            graph_autonomous_matching_enabled: false,
+            graph_freshness_status: graph.status,
+            graph_blockers: graph.blockers,
+            receipt_file,
+            latest_file,
+            warnings,
+        };
+        write_latest_and_receipt(&report.latest_file, &report.receipt_file, &report)?;
+        return Ok(report);
+    }
+
+    let budget = options.budget.max(1).min(32);
+    let mut rewrites = vec![short_text(&query, 180)];
+    let lower = query.to_lowercase();
+    if lower != query {
+        rewrites.push(short_text(&lower, 180));
+    }
+    if let Some(project) = options.route_auto_project.as_deref() {
+        rewrites.push(short_text(&format!("project:{project} {query}"), 180));
+    }
+    rewrites.sort();
+    rewrites.dedup();
+    let graph_budget = if graph.autonomous_matching_enabled {
+        budget.saturating_div(4).max(1)
+    } else {
+        0
+    };
+    let source_budgets = vec![
+        MemoryRecallSourceBudget {
+            source: "episodic-events".to_string(),
+            budget: budget.saturating_div(3).max(1),
+            role: "episode continuity and user preference recall".to_string(),
+        },
+        MemoryRecallSourceBudget {
+            source: "docs-chunks".to_string(),
+            budget: budget.saturating_div(4).max(1),
+            role: "documentation and design evidence recall".to_string(),
+        },
+        MemoryRecallSourceBudget {
+            source: "observations".to_string(),
+            budget: budget.saturating_div(4).max(1),
+            role: "fact and operational observation recall".to_string(),
+        },
+        MemoryRecallSourceBudget {
+            source: "service-writeback".to_string(),
+            budget: budget.saturating_div(4).max(1),
+            role: "reviewed harness writeback recall".to_string(),
+        },
+        MemoryRecallSourceBudget {
+            source: "graph".to_string(),
+            budget: graph_budget,
+            role: "disabled unless graph freshness gates are green".to_string(),
+        },
+    ];
+    let report = MemoryRecallPlanReport {
+        schema: MEMORY_RECALL_PLAN_RECEIPT_SCHEMA,
+        harness_home: options.harness_home,
+        status: MemoryRecallPlanStatus::Planned,
+        reason: "policy-driven memory recall plan prepared with scope, trust, and graph gates"
+            .to_string(),
+        agent_id: options.agent_id,
+        session_key: options.session_key,
+        query_length,
+        query_hash: Some(stable_text_hash("memory-recall-query", &query)),
+        query_rewrites: rewrites,
+        route_auto_project: options.route_auto_project.clone(),
+        route_mode: if options.route_auto_project.is_some() {
+            "route-auto-project".to_string()
+        } else {
+            "agent-scope-default".to_string()
+        },
+        source_budgets,
+        scope_policy,
+        trust_policy,
+        graph_episode_doc_balance:
+            "episodic-events + docs-chunks + observations are balanced; graph is gate-controlled"
+                .to_string(),
+        graph_autonomous_matching_enabled: graph.autonomous_matching_enabled,
+        graph_freshness_status: graph.status,
+        graph_blockers: graph.blockers,
+        receipt_file,
+        latest_file,
+        warnings,
+    };
+    write_latest_and_receipt(&report.latest_file, &report.receipt_file, &report)?;
+    Ok(report)
+}
+
+pub fn record_memory_provenance_chain(
+    options: MemoryProvenanceChainOptions,
+) -> io::Result<MemoryProvenanceChainReport> {
+    let latest_file = memory_provenance_chain_latest_file(&options.harness_home);
+    let receipt_file = memory_provenance_chain_receipts_file(&options.harness_home);
+    let agent = options.agent_id.as_deref().unwrap_or("global");
+    let session = options.session_key.as_deref().unwrap_or("unknown");
+    let correlation_id = options
+        .correlation_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| stable_event_id("memory.provenance", agent, session, options.now_ms, 0));
+    let final_answer = redact_sensitive(options.final_answer_text.trim());
+    let final_answer_chars = final_answer.chars().count();
+    let recall_input_hash = options
+        .recall_input
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| stable_text_hash("memory-recall-input", &redact_sensitive(value)));
+    let final_answer_hash =
+        (!final_answer.is_empty()).then(|| stable_text_hash("memory-final-answer", &final_answer));
+    let mut citations = options
+        .injected_citations
+        .iter()
+        .map(|citation| short_text(&redact_sensitive(citation.trim()), 240))
+        .filter(|citation| !citation.is_empty())
+        .collect::<Vec<_>>();
+    citations.sort();
+    citations.dedup();
+    let evidence_count = options.recall_receipt_refs.len()
+        + citations.len()
+        + options.proposed_memory_refs.len()
+        + options.stored_memory_refs.len()
+        + options.later_recall_refs.len()
+        + options.rollback_refs.len()
+        + options.export_refs.len()
+        + usize::from(final_answer_hash.is_some())
+        + usize::from(recall_input_hash.is_some());
+    let status = if evidence_count == 0 {
+        MemoryProvenanceChainStatus::Skipped
+    } else {
+        MemoryProvenanceChainStatus::Recorded
+    };
+    let reason = if status == MemoryProvenanceChainStatus::Recorded {
+        "memory provenance chain recorded across recall, injection, answer, memory mutation, recall, rollback, and export refs"
+            .to_string()
+    } else {
+        "memory provenance chain skipped because no bounded evidence refs were supplied".to_string()
+    };
+    let report = MemoryProvenanceChainReport {
+        schema: MEMORY_PROVENANCE_CHAIN_RECEIPT_SCHEMA,
+        harness_home: options.harness_home,
+        status,
+        reason,
+        correlation_id,
+        agent_id: options.agent_id,
+        session_key: options.session_key,
+        recall_input_hash,
+        recall_receipt_refs: options.recall_receipt_refs,
+        injected_citations: citations,
+        final_answer_hash,
+        final_answer_chars,
+        proposed_memory_refs: options.proposed_memory_refs,
+        stored_memory_refs: options.stored_memory_refs,
+        later_recall_refs: options.later_recall_refs,
+        rollback_refs: options.rollback_refs,
+        export_refs: options.export_refs,
+        receipt_file,
+        latest_file,
+        warnings: Vec::new(),
+    };
+    write_latest_and_receipt(&report.latest_file, &report.receipt_file, &report)?;
+    Ok(report)
+}
+
 fn memory_mem_engine_canary(
     harness_home: &Path,
     qdrant_edge_mode: &str,
@@ -1136,6 +1884,7 @@ pub fn inspect_openclaw_mem_service(
     options: OpenClawMemServiceStatusOptions,
 ) -> io::Result<OpenClawMemServiceStatusReport> {
     let qdrant_edge = qdrant_edge_dir(&options.harness_home);
+    let qdrant_snapshot_present = qdrant_edge.is_some();
     let sqlite = legacy_mem_sqlite_file(&options.harness_home);
     let observations = options
         .harness_home
@@ -1153,9 +1902,10 @@ pub fn inspect_openclaw_mem_service(
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let service_endpoint_configured = service_endpoint.is_some();
     let mut warnings = Vec::new();
     let service_mode = "snapshot-adapter".to_string();
-    if service_endpoint.is_some() {
+    if service_endpoint_configured {
         warnings.push(
             "live openclaw-mem service endpoint is configured, but no remote wire contract is available in the imported artifacts; using local snapshot/writeback adapter"
                 .to_string(),
@@ -1166,12 +1916,12 @@ pub fn inspect_openclaw_mem_service(
                 .to_string(),
         );
     }
-    let qdrant_edge_mode = if qdrant_edge.is_some() {
+    let qdrant_edge_mode = if qdrant_snapshot_present {
         "preserved-snapshot".to_string()
     } else {
         "missing".to_string()
     };
-    if qdrant_edge.is_some() {
+    if qdrant_snapshot_present {
         warnings.push(
             "Qdrant edge is present as an imported snapshot; this adapter does not raw-read it as a live Qdrant service"
                 .to_string(),
@@ -1192,9 +1942,13 @@ pub fn inspect_openclaw_mem_service(
     }
     let mem_engine_canary = memory_mem_engine_canary(&options.harness_home, &qdrant_edge_mode);
     warnings.extend(mem_engine_canary.warnings.clone());
+    let owner_state = read_memory_owner_state_or_default(
+        &options.harness_home,
+        crate::current_log_time_ms().unwrap_or(0),
+    )?;
     let has_local_backend =
         sqlite.is_file() || observations.is_file() || episodes.is_file() || agent_store.is_file();
-    let has_any_backend = has_local_backend || qdrant_edge.is_some();
+    let has_any_backend = has_local_backend || qdrant_snapshot_present;
     let status = if has_local_backend {
         OpenClawMemServiceStatus::Ready
     } else if has_any_backend {
@@ -1216,14 +1970,35 @@ pub fn inspect_openclaw_mem_service(
                 .to_string()
         }
     };
+    let adapter_readiness = memory_adapter_readiness_report(
+        has_local_backend,
+        qdrant_snapshot_present,
+        service_endpoint_configured,
+        true,
+    );
+    let capability_mode = memory_capability_mode_from_readiness(&adapter_readiness);
+    let mem_engine_ownership =
+        memory_mem_engine_ownership_report_for_owner_state(&mem_engine_canary, &owner_state);
+    let active_slot_owner = mem_engine_ownership.active_owner.clone();
+    let qdrant_native_recall = memory_qdrant_native_recall_status(qdrant_snapshot_present);
+    let semantic_coverage = collect_memory_semantic_coverage(
+        &options.harness_home,
+        options.agent_id.as_deref(),
+        &embedding_coverage,
+    )?;
     let report = OpenClawMemServiceStatusReport {
         schema: OPENCLAW_MEM_SERVICE_STATUS_SCHEMA,
         harness_home: options.harness_home,
         agent_id: options.agent_id,
         status,
         reason,
+        adapter_readiness,
+        capability_mode,
+        mem_engine_ownership,
+        qdrant_native_recall,
+        semantic_coverage,
         service_mode,
-        active_slot_owner: "snapshot-adapter".to_string(),
+        active_slot_owner,
         service_endpoint,
         qdrant_edge_dir: qdrant_edge,
         qdrant_edge_mode,
@@ -1589,7 +2364,7 @@ pub fn run_memory_hook_adapter(options: MemoryHookAdapterOptions) -> io::Result<
     let receipts_file = memory_hook_receipts_file(&options.harness_home);
     let mut warnings = Vec::new();
     let (status, reason, artifact_refs) = match options.hook {
-        MemoryHookKind::BeforePromptBuild => {
+        MemoryHookKind::BeforeAgentStart | MemoryHookKind::BeforePromptBuild => {
             let query = options
                 .query
                 .clone()
@@ -1601,10 +2376,22 @@ pub fn run_memory_hook_adapter(options: MemoryHookAdapterOptions) -> io::Result<
                 .clone()
                 .or_else(|| payload_string(&options.payload, "sessionKey"))
                 .unwrap_or_else(|| "memory-hook".to_string());
+            let route_auto_project = payload_string(&options.payload, "routeAutoProject")
+                .or_else(|| payload_string(&options.payload, "projectId"));
+            let recall_plan = plan_memory_policy_recall(MemoryRecallPlanOptions {
+                harness_home: options.harness_home.clone(),
+                agent_id: options.agent_id.clone(),
+                session_key: Some(session_key.clone()),
+                query: query.clone(),
+                route_auto_project,
+                budget: options.limit.max(DEFAULT_RECALL_PLAN_BUDGET),
+                now_ms: options.now_ms,
+            })?;
+            warnings.extend(recall_plan.warnings.clone());
             let report = build_memory_prompt_context(MemoryPromptContextOptions {
                 harness_home: options.harness_home.clone(),
                 agent_id: options.agent_id.clone(),
-                session_key,
+                session_key: session_key.clone(),
                 query,
                 limit: options.limit,
                 max_file_bytes: options.max_file_bytes,
@@ -1618,10 +2405,21 @@ pub fn run_memory_hook_adapter(options: MemoryHookAdapterOptions) -> io::Result<
                     MemoryHookStatus::Recorded
                 }
             };
+            let boundary = if options.hook == MemoryHookKind::BeforeAgentStart {
+                "before-agent-start warm-up recall"
+            } else {
+                "before-prompt-build prompt context recall"
+            };
             (
                 status,
-                report.reason.clone(),
+                format!("{boundary}: {}", report.reason),
                 serde_json::json!({
+                    "hookBoundary": options.hook.as_str(),
+                    "recallPlanLast": recall_plan.latest_file,
+                    "recallPlanReceipts": recall_plan.receipt_file,
+                    "recallPlanStatus": recall_plan.status,
+                    "routeMode": recall_plan.route_mode,
+                    "graphAutonomousMatchingEnabled": recall_plan.graph_autonomous_matching_enabled,
                     "promptContextLast": memory_prompt_context_latest_file_for_agent(
                         &options.harness_home,
                         options.agent_id.as_deref(),
@@ -1663,11 +2461,37 @@ pub fn run_memory_hook_adapter(options: MemoryHookAdapterOptions) -> io::Result<
             let report = record_memory_lifecycle_turn(MemoryLifecycleTurnOptions {
                 harness_home: options.harness_home.clone(),
                 prompt_bundle_json,
-                assistant_text,
+                assistant_text: assistant_text.clone(),
                 success: options.success,
                 now_ms: options.now_ms,
             })?;
             warnings.extend(report.warnings.clone());
+            let provenance = record_memory_provenance_chain(MemoryProvenanceChainOptions {
+                harness_home: options.harness_home.clone(),
+                agent_id: report.agent_id.clone().or_else(|| options.agent_id.clone()),
+                session_key: report
+                    .session_key
+                    .clone()
+                    .or_else(|| options.session_key.clone()),
+                correlation_id: payload_string(&options.payload, "correlationId"),
+                recall_input: options
+                    .query
+                    .clone()
+                    .or_else(|| payload_string(&options.payload, "query")),
+                recall_receipt_refs: vec![memory_prompt_context_receipts_file_for_agent(
+                    &options.harness_home,
+                    report.agent_id.as_deref().or(options.agent_id.as_deref()),
+                )],
+                injected_citations: payload_string_array(&options.payload, "injectedCitations"),
+                final_answer_text: assistant_text,
+                proposed_memory_refs: payload_path_array(&options.payload, "proposedMemoryRefs"),
+                stored_memory_refs: payload_path_array(&options.payload, "storedMemoryRefs"),
+                later_recall_refs: payload_path_array(&options.payload, "laterRecallRefs"),
+                rollback_refs: payload_path_array(&options.payload, "rollbackRefs"),
+                export_refs: payload_path_array(&options.payload, "exportRefs"),
+                now_ms: options.now_ms,
+            })?;
+            warnings.extend(provenance.warnings.clone());
             let status = match report.status {
                 MemoryLifecycleStatus::Recorded => MemoryHookStatus::Recorded,
                 MemoryLifecycleStatus::Skipped => MemoryHookStatus::Skipped,
@@ -1689,6 +2513,10 @@ pub fn run_memory_hook_adapter(options: MemoryHookAdapterOptions) -> io::Result<
                     "captureCandidatesFile": report.capture_candidates_file,
                     "episodesAppended": report.episodes_appended,
                     "captureCandidates": report.capture_candidates,
+                    "provenanceChainLast": provenance.latest_file,
+                    "provenanceChainReceipts": provenance.receipt_file,
+                    "provenanceStatus": provenance.status,
+                    "correlationId": provenance.correlation_id,
                 }),
             )
         }
@@ -1725,6 +2553,7 @@ pub fn run_memory_hook_adapter(options: MemoryHookAdapterOptions) -> io::Result<
         }
         MemoryHookKind::StorePropose => {
             let proposal_file = memory_store_proposals_file(&options.harness_home);
+            let governance = governed_memory_adapter_operation("store-propose");
             let proposal = serde_json::json!({
                 "schema": MEMORY_STORE_PROPOSAL_SCHEMA,
                 "status": "recorded",
@@ -1732,6 +2561,7 @@ pub fn run_memory_hook_adapter(options: MemoryHookAdapterOptions) -> io::Result<
                 "sessionKey": &options.session_key,
                 "payloadKeys": payload_keys(&options.payload),
                 "payloadBytes": payload_bytes(&options.payload),
+                "governance": governance,
                 "atMs": options.now_ms,
                 "reason": "durable memory proposal recorded for external memory adapter review; raw payload is not stored in this receipt"
             });
@@ -1743,6 +2573,7 @@ pub fn run_memory_hook_adapter(options: MemoryHookAdapterOptions) -> io::Result<
                     "storeProposals": proposal_file,
                     "payloadKeys": payload_keys(&options.payload),
                     "payloadBytes": payload_bytes(&options.payload),
+                    "governance": governed_memory_adapter_operation("store-propose"),
                 }),
             )
         }
@@ -1753,6 +2584,7 @@ pub fn run_memory_hook_adapter(options: MemoryHookAdapterOptions) -> io::Result<
                 .clone()
                 .or_else(|| payload_string(&options.payload, "operation"))
                 .unwrap_or_else(|| "record".to_string());
+            let governance = governed_memory_adapter_operation("memory-slot");
             let receipt = serde_json::json!({
                 "schema": MEMORY_SLOT_RECEIPT_SCHEMA,
                 "status": "recorded",
@@ -1762,6 +2594,7 @@ pub fn run_memory_hook_adapter(options: MemoryHookAdapterOptions) -> io::Result<
                 "sessionKey": &options.session_key,
                 "payloadKeys": payload_keys(&options.payload),
                 "payloadBytes": payload_bytes(&options.payload),
+                "governance": governance,
                 "atMs": options.now_ms,
                 "reason": "OpenClaw-compatible memory slot hook recorded for external adapter handoff"
             });
@@ -1772,15 +2605,17 @@ pub fn run_memory_hook_adapter(options: MemoryHookAdapterOptions) -> io::Result<
                 serde_json::json!({
                     "slotReceipts": slot_file,
                     "operation": operation,
+                    "governance": governed_memory_adapter_operation("memory-slot"),
                 }),
             )
         }
         MemoryHookKind::ToolResult => (
             MemoryHookStatus::Recorded,
-            "tool-result memory hook receipt recorded for external adapter handoff".to_string(),
+            "tool-result memory hook governed receipt recorded for adapter handoff".to_string(),
             serde_json::json!({
                 "payloadKeys": payload_keys(&options.payload),
                 "payloadBytes": payload_bytes(&options.payload),
+                "governance": governed_memory_adapter_operation("tool-result"),
             }),
         ),
     };
@@ -2388,6 +3223,7 @@ pub fn record_memory_lifecycle_turn(
                 capture_candidates: 0,
                 auto_capture_enabled: false,
                 episodes_enabled: false,
+                failed_turn_capture_enabled: false,
                 symbolic_canvas_enabled: false,
                 warnings: Vec::new(),
             })?);
@@ -2397,38 +3233,84 @@ pub fn record_memory_lifecycle_turn(
     let source_home = path_value(&prompt_bundle, "sourceHome");
     let agent_id = string_value(&prompt_bundle, "agentId");
     let session_key = string_value(&prompt_bundle, "sessionKey");
-    let user_text = user_message_from_prompt_bundle(&prompt_bundle).unwrap_or_default();
     let config = source_home
         .as_deref()
         .map(load_memory_lifecycle_config)
         .transpose()?
         .unwrap_or_default();
 
-    if !options.success {
-        return write_memory_lifecycle_report(MemoryLifecycleReport {
-            schema: MEMORY_LIFECYCLE_RECEIPT_SCHEMA,
-            harness_home: options.harness_home,
-            status: MemoryLifecycleStatus::Skipped,
-            reason: "memory lifecycle skipped because runtime turn did not complete successfully"
-                .to_string(),
-            prompt_bundle_json: options.prompt_bundle_json,
-            source_home,
-            agent_id,
-            session_key,
-            episode_file: None,
-            episodes_appended: 0,
-            capture_candidates_file: None,
-            capture_candidates: 0,
-            auto_capture_enabled: config.auto_capture_enabled,
-            episodes_enabled: config.episodes_enabled,
-            symbolic_canvas_enabled: config.symbolic_canvas_enabled,
-            warnings: config.warnings,
-        });
-    }
-
     let mut warnings = config.warnings;
+    let raw_user_text = user_message_from_prompt_bundle(&prompt_bundle).unwrap_or_default();
+    let user_text = match strip_skill_envelopes_for_memory(&raw_user_text) {
+        Ok(text) => memory_user_instruction_text(&text),
+        Err(error) => {
+            warnings.push(format!(
+                "skill envelope stripped from memory capture after parse error: {error}"
+            ));
+            String::new()
+        }
+    };
     let mut episodes_appended = 0usize;
-    let episode_file = if config.episodes_enabled {
+    let episode_file = if !options.success {
+        if config.episodes_enabled
+            && config.failed_turn_capture_enabled
+            && (!user_text.trim().is_empty() || !options.assistant_text.trim().is_empty())
+        {
+            let episode_file = memory_path_for_agent(
+                &options.harness_home,
+                agent_id.as_deref(),
+                &config.episodes_output_path,
+            );
+            if !user_text.trim().is_empty() {
+                append_json_line(
+                    &episode_file,
+                    &episode_line(
+                        "conversation.user.failed",
+                        &user_text,
+                        &prompt_bundle,
+                        options.now_ms,
+                        episodes_appended,
+                    ),
+                )?;
+                episodes_appended += 1;
+            }
+            if !options.assistant_text.trim().is_empty() {
+                append_json_line(
+                    &episode_file,
+                    &episode_line(
+                        "conversation.assistant.failed",
+                        &options.assistant_text,
+                        &prompt_bundle,
+                        options.now_ms,
+                        episodes_appended,
+                    ),
+                )?;
+                episodes_appended += 1;
+            }
+            Some(episode_file)
+        } else {
+            return write_memory_lifecycle_report(MemoryLifecycleReport {
+                schema: MEMORY_LIFECYCLE_RECEIPT_SCHEMA,
+                harness_home: options.harness_home,
+                status: MemoryLifecycleStatus::Skipped,
+                reason: "memory lifecycle skipped because runtime turn did not complete successfully and failed-turn capture is not enabled"
+                    .to_string(),
+                prompt_bundle_json: options.prompt_bundle_json,
+                source_home,
+                agent_id,
+                session_key,
+                episode_file: None,
+                episodes_appended: 0,
+                capture_candidates_file: None,
+                capture_candidates: 0,
+                auto_capture_enabled: config.auto_capture_enabled,
+                episodes_enabled: config.episodes_enabled,
+                failed_turn_capture_enabled: config.failed_turn_capture_enabled,
+                symbolic_canvas_enabled: config.symbolic_canvas_enabled,
+                warnings,
+            });
+        }
+    } else if config.episodes_enabled {
         let episode_file = memory_path_for_agent(
             &options.harness_home,
             agent_id.as_deref(),
@@ -2465,7 +3347,7 @@ pub fn record_memory_lifecycle_turn(
         None
     };
 
-    let capture_candidates = if config.auto_capture_enabled {
+    let capture_candidates = if options.success && config.auto_capture_enabled {
         extract_auto_capture_candidates(&user_text)
     } else {
         Vec::new()
@@ -2492,7 +3374,7 @@ pub fn record_memory_lifecycle_turn(
         None
     };
 
-    if config.symbolic_canvas_enabled {
+    if options.success && config.symbolic_canvas_enabled {
         match run_memory_canvas_worker(MemoryCanvasWorkerOptions {
             harness_home: options.harness_home.clone(),
             agent_id: agent_id.clone(),
@@ -2510,11 +3392,18 @@ pub fn record_memory_lifecycle_turn(
         schema: MEMORY_LIFECYCLE_RECEIPT_SCHEMA,
         harness_home: options.harness_home,
         status: MemoryLifecycleStatus::Recorded,
-        reason: format!(
-            "memory lifecycle recorded episodes={} captureCandidates={}",
-            episodes_appended,
-            capture_candidates.len()
-        ),
+        reason: if options.success {
+            format!(
+                "memory lifecycle recorded episodes={} captureCandidates={}",
+                episodes_appended,
+                capture_candidates.len()
+            )
+        } else {
+            format!(
+                "memory lifecycle recorded bounded failed-turn episodes={}",
+                episodes_appended
+            )
+        },
         prompt_bundle_json: options.prompt_bundle_json,
         source_home,
         agent_id,
@@ -2525,6 +3414,7 @@ pub fn record_memory_lifecycle_turn(
         capture_candidates: capture_candidates.len(),
         auto_capture_enabled: config.auto_capture_enabled,
         episodes_enabled: config.episodes_enabled,
+        failed_turn_capture_enabled: config.failed_turn_capture_enabled,
         symbolic_canvas_enabled: config.symbolic_canvas_enabled,
         warnings,
     })
@@ -3432,6 +4322,7 @@ fn render_symbolic_canvas_markdown(now_ms: i64, canvas: &Value) -> String {
 struct MemoryLifecycleConfig {
     auto_capture_enabled: bool,
     episodes_enabled: bool,
+    failed_turn_capture_enabled: bool,
     symbolic_canvas_enabled: bool,
     episodes_output_path: PathBuf,
     warnings: Vec<String>,
@@ -3461,6 +4352,12 @@ fn load_memory_lifecycle_config(source_home: &Path) -> io::Result<MemoryLifecycl
         .get("enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let failed_turn_capture_enabled = episodes
+        .pointer("/captureFailedTurns/enabled")
+        .or_else(|| episodes.pointer("/failedTurns/enabled"))
+        .or_else(|| mem.pointer("/captureFailedTurns/enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let episodes_output_path = episodes
         .get("outputPath")
         .and_then(Value::as_str)
@@ -3478,6 +4375,7 @@ fn load_memory_lifecycle_config(source_home: &Path) -> io::Result<MemoryLifecycl
     Ok(MemoryLifecycleConfig {
         auto_capture_enabled,
         episodes_enabled,
+        failed_turn_capture_enabled,
         symbolic_canvas_enabled,
         episodes_output_path,
         warnings: Vec::new(),
@@ -3585,6 +4483,32 @@ fn stable_event_id(
     format!("rust-harness:{hash:016x}")
 }
 
+fn stable_text_hash(namespace: &str, text: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in namespace
+        .as_bytes()
+        .iter()
+        .chain([0].iter())
+        .chain(text.as_bytes())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+fn file_modified_epoch_ms(path: &Path) -> io::Result<Option<i64>> {
+    let modified = match fs::metadata(path).and_then(|metadata| metadata.modified()) {
+        Ok(modified) => modified,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let elapsed = modified
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_millis(0));
+    Ok(Some(elapsed.as_millis().min(i64::MAX as u128) as i64))
+}
+
 fn user_message_from_prompt_bundle(value: &Value) -> Option<String> {
     value
         .get("sections")
@@ -3599,6 +4523,30 @@ fn user_message_from_prompt_bundle(value: &Value) -> Option<String> {
         .and_then(|section| section.get("content"))
         .and_then(Value::as_str)
         .map(ToString::to_string)
+}
+
+fn memory_user_instruction_text(text: &str) -> String {
+    let stripped = text.trim();
+    if let Some(rest) = stripped.strip_prefix("/skill") {
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            let rest = rest.trim_start();
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let _skill_id = parts.next().unwrap_or("");
+            return parts.next().unwrap_or("").trim().to_string();
+        }
+    }
+    if let Some(rest) = stripped.strip_prefix('$') {
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let skill_id = parts.next().unwrap_or("");
+        if !skill_id.is_empty()
+            && skill_id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
+        {
+            return parts.next().unwrap_or("").trim().to_string();
+        }
+    }
+    stripped.to_string()
 }
 
 fn string_value(value: &Value, key: &str) -> Option<String> {
@@ -3681,6 +4629,40 @@ fn payload_path(value: &Value, key: &str) -> Option<PathBuf> {
     payload_string(value, key).map(PathBuf::from)
 }
 
+fn payload_string_array(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn payload_path_array(value: &Value, key: &str) -> Vec<PathBuf> {
+    payload_string_array(value, key)
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn governed_memory_adapter_operation(hook: &str) -> Value {
+    serde_json::json!({
+        "hook": hook,
+        "mode": "receipt-only-no-external-contract",
+        "adapterOperation": "receipt-only",
+        "externalContractPresent": false,
+        "reviewRequired": matches!(hook, "store-propose"),
+        "reason": "no compatible external memory wire contract is promoted; harness records a governed receipt instead of mutating memory state"
+    })
+}
+
 fn payload_keys(value: &Value) -> Vec<String> {
     match value {
         Value::Object(object) => object.keys().cloned().collect(),
@@ -3710,6 +4692,21 @@ fn short_text(text: &str, max_chars: usize) -> String {
 
 fn append_json_line(path: &Path, value: &impl Serialize) -> io::Result<()> {
     crate::append_jsonl_value(path, value)
+}
+
+fn write_latest_and_receipt(
+    latest_file: &Path,
+    receipt_file: &Path,
+    value: &impl Serialize,
+) -> io::Result<()> {
+    if let Some(parent) = latest_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        latest_file,
+        serde_json::to_string_pretty(value).map_err(io::Error::other)?,
+    )?;
+    append_json_line(receipt_file, value)
 }
 
 fn collect_text_hits(
@@ -3969,6 +4966,72 @@ mod tests {
     }
 
     #[test]
+    fn memory_service_status_reports_capability_mode_and_semantic_coverage() {
+        let root = temp_root("memory_service_status_reports_capability_mode_and_semantic_coverage");
+        let harness_home = root.join("harness");
+        fs::create_dir_all(
+            harness_home
+                .join("memory")
+                .join("qdrant-edge")
+                .join("collections"),
+        )
+        .unwrap();
+
+        store_openclaw_mem_service_memory(OpenClawMemServiceStoreOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            session_key: Some("telegram:dm:user:main".to_string()),
+            text: "Round6-3 service writeback memory".to_string(),
+            payload: serde_json::json!({"source": "test"}),
+            approved: true,
+            now_ms: 1_800_000_000_000,
+        })
+        .unwrap();
+        propose_openclaw_mem_service_memory(OpenClawMemServiceProposeOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            session_key: Some("telegram:dm:user:main".to_string()),
+            text: "Round6-3 active proposal memory".to_string(),
+            payload: serde_json::json!({"source": "test"}),
+            now_ms: 1_800_000_000_001,
+        })
+        .unwrap();
+
+        let report = inspect_openclaw_mem_service(OpenClawMemServiceStatusOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(report.status, OpenClawMemServiceStatus::Ready);
+        assert_eq!(report.service_mode, "snapshot-adapter");
+        assert_eq!(report.active_slot_owner, "snapshot-adapter");
+        assert_eq!(report.adapter_readiness.status, "ready");
+        assert!(report.adapter_readiness.local_snapshot_backend);
+        assert!(report.adapter_readiness.qdrant_snapshot_present);
+        assert_eq!(report.capability_mode, "snapshot-adapter-ready");
+        assert_eq!(report.mem_engine_ownership.active_owner, "snapshot-adapter");
+        assert!(!report.mem_engine_ownership.promotion_ready);
+        assert_eq!(
+            report.qdrant_native_recall,
+            "snapshot-preserved-native-recall-inactive"
+        );
+        assert_eq!(report.semantic_coverage.service_writeback.items, Some(1));
+        assert_eq!(report.semantic_coverage.service_writeback.status, "present");
+        assert_eq!(
+            report.semantic_coverage.active_store_proposals.items,
+            Some(1)
+        );
+        assert_eq!(
+            report.semantic_coverage.active_store_proposals.status,
+            "present"
+        );
+        assert!(openclaw_mem_service_status_latest_file(&harness_home).is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn openclaw_mem_service_store_requires_approval_and_feeds_recall_canvas() {
         let root =
             temp_root("openclaw_mem_service_store_requires_approval_and_feeds_recall_canvas");
@@ -4188,6 +5251,139 @@ mod tests {
         );
         let receipt = fs::read_to_string(memory_lifecycle_latest_file(&harness_home)).unwrap();
         assert!(receipt.contains(r#""status": "recorded""#));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn memory_skill_lifecycle_strips_invocation_envelope_body() {
+        let root = temp_root("memory_skill_lifecycle_strips_invocation_envelope_body");
+        let harness_home = root.join("harness");
+        let source_home = root.join(".openclaw");
+        fs::create_dir_all(&source_home).unwrap();
+        fs::write(
+            source_home.join("openclaw.json"),
+            r#"{
+              "plugins": {
+                "entries": {
+                  "openclaw-mem": {
+                    "config": {
+                      "episodes": {
+                        "enabled": true,
+                        "outputPath": "memory/episodes.jsonl"
+                      }
+                    }
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        let envelope = crate::render_skill_invocation_envelope(
+            "workspace:memory-cron",
+            "remember only this durable instruction",
+            "# Skill Body\n\nDO NOT STORE THIS SKILL SCAFFOLDING",
+        );
+        let prompt_bundle_json = root.join("prompt-bundle-skill-envelope.json");
+        fs::write(
+            &prompt_bundle_json,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "sourceHome": source_home,
+                "agentId": "main",
+                "sessionKey": "telegram:dm:user:main",
+                "sections": [{
+                    "kind": "user-message",
+                    "content": envelope
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = record_memory_lifecycle_turn(MemoryLifecycleTurnOptions {
+            harness_home: harness_home.clone(),
+            prompt_bundle_json,
+            assistant_text: String::new(),
+            success: true,
+            now_ms: 1_000,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, MemoryLifecycleStatus::Recorded);
+        assert_eq!(report.episodes_appended, 1);
+        let episodes = fs::read_to_string(
+            harness_home
+                .join("agents")
+                .join("main")
+                .join("memory")
+                .join("episodes.jsonl"),
+        )
+        .unwrap();
+        assert!(episodes.contains("remember only this durable instruction"));
+        assert!(!episodes.contains("DO NOT STORE THIS SKILL SCAFFOLDING"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn memory_skill_bare_invocation_has_no_durable_user_candidate() {
+        let root = temp_root("memory_skill_bare_invocation_has_no_durable_user_candidate");
+        let harness_home = root.join("harness");
+        let source_home = root.join(".openclaw");
+        fs::create_dir_all(&source_home).unwrap();
+        fs::write(
+            source_home.join("openclaw.json"),
+            r#"{
+              "plugins": {
+                "entries": {
+                  "openclaw-mem": {
+                    "config": {
+                      "episodes": {
+                        "enabled": true,
+                        "outputPath": "memory/episodes.jsonl"
+                      }
+                    }
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        let prompt_bundle_json = root.join("prompt-bundle-bare-skill.json");
+        fs::write(
+            &prompt_bundle_json,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "sourceHome": source_home,
+                "agentId": "main",
+                "sessionKey": "telegram:dm:user:main",
+                "sections": [{
+                    "kind": "user-message",
+                    "content": "/skill memory-cron"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = record_memory_lifecycle_turn(MemoryLifecycleTurnOptions {
+            harness_home: harness_home.clone(),
+            prompt_bundle_json,
+            assistant_text: String::new(),
+            success: true,
+            now_ms: 1_000,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, MemoryLifecycleStatus::Recorded);
+        assert_eq!(report.episodes_appended, 0);
+        assert!(
+            !harness_home
+                .join("agents")
+                .join("main")
+                .join("memory")
+                .join("episodes.jsonl")
+                .is_file()
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4585,6 +5781,180 @@ mod tests {
         let hook = fs::read_to_string(memory_hook_latest_file(&harness_home)).unwrap();
         assert!(hook.contains("store-propose"));
         assert!(!hook.contains("secret-memory-text"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn memory_hook_before_agent_start_records_warmup_recall_plan() {
+        let root = temp_root("memory_hook_before_agent_start_records_warmup_recall_plan");
+        let harness_home = root.join("harness");
+        let memory = harness_home.join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        fs::write(
+            memory.join("MEMORY.md"),
+            "Warm-up recall should find routeAuto project memory.",
+        )
+        .unwrap();
+
+        let report = run_memory_hook_adapter(MemoryHookAdapterOptions {
+            harness_home: harness_home.clone(),
+            hook: MemoryHookKind::BeforeAgentStart,
+            agent_id: Some("main".to_string()),
+            session_key: Some("session-1".to_string()),
+            query: Some("routeAuto project".to_string()),
+            prompt_bundle_json: None,
+            assistant_text: None,
+            success: true,
+            slot: None,
+            operation: None,
+            payload: serde_json::json!({
+                "routeAutoProject": "round6-3"
+            }),
+            now_ms: 1_800_000_000_000,
+            limit: 5,
+            max_file_bytes: 0,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, MemoryHookStatus::Recorded);
+        assert!(report.reason.contains("before-agent-start warm-up"));
+        let hook = fs::read_to_string(memory_hook_latest_file(&harness_home)).unwrap();
+        assert!(hook.contains("before-agent-start"));
+        assert!(hook.contains("recallPlanStatus"));
+        let plan = fs::read_to_string(memory_recall_plan_latest_file(&harness_home)).unwrap();
+        assert!(plan.contains("route-auto-project"));
+        assert!(plan.contains("project:round6-3"));
+        assert!(memory_graph_freshness_latest_file(&harness_home).is_file());
+        let prompt_receipt =
+            fs::read_to_string(memory_prompt_context_latest_file(&harness_home)).unwrap();
+        assert!(prompt_receipt.contains(r#""hitCount": 1"#));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn memory_provenance_records_correlation_chain_and_graph_freshness() {
+        let root = temp_root("memory_provenance_records_correlation_chain_and_graph_freshness");
+        let harness_home = root.join("harness");
+        fs::create_dir_all(harness_home.join("state").join("memory")).unwrap();
+
+        let graph = record_memory_graph_freshness(MemoryGraphFreshnessOptions {
+            harness_home: harness_home.clone(),
+            support_plane_ready: false,
+            provenance_ready: false,
+            max_age_ms: DEFAULT_GRAPH_TOPOLOGY_MAX_AGE_MS,
+            now_ms: 1_800_000_000_000,
+        })
+        .unwrap();
+        assert_eq!(graph.status, MemoryGraphFreshnessStatus::Blocked);
+        assert!(
+            graph
+                .blockers
+                .iter()
+                .any(|blocker| blocker == "topology_source_missing")
+        );
+        assert!(!graph.autonomous_matching_enabled);
+
+        let report = record_memory_provenance_chain(MemoryProvenanceChainOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            session_key: Some("session-1".to_string()),
+            correlation_id: Some("corr-1".to_string()),
+            recall_input: Some("remember secret token=abc123".to_string()),
+            recall_receipt_refs: vec![memory_recall_plan_receipts_file(&harness_home)],
+            injected_citations: vec!["memory://citation/1".to_string()],
+            final_answer_text: "Final answer with password=hunter2".to_string(),
+            proposed_memory_refs: vec![memory_store_proposals_file(&harness_home)],
+            stored_memory_refs: Vec::new(),
+            later_recall_refs: vec![memory_prompt_context_receipts_file(&harness_home)],
+            rollback_refs: vec![
+                harness_home
+                    .join("state")
+                    .join("memory")
+                    .join("rollback.jsonl"),
+            ],
+            export_refs: vec![
+                harness_home
+                    .join("state")
+                    .join("memory")
+                    .join("export.jsonl"),
+            ],
+            now_ms: 1_800_000_000_001,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, MemoryProvenanceChainStatus::Recorded);
+        assert_eq!(report.correlation_id, "corr-1");
+        assert!(report.recall_input_hash.is_some());
+        assert!(report.final_answer_hash.is_some());
+        let receipt =
+            fs::read_to_string(memory_provenance_chain_latest_file(&harness_home)).unwrap();
+        assert!(receipt.contains("memory://citation/1"));
+        assert!(receipt.contains("fnv1a64:"));
+        assert!(!receipt.contains("hunter2"));
+        assert!(!receipt.contains("abc123"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn memory_provenance_failed_turn_capture_records_bounded_episode_when_enabled() {
+        let root =
+            temp_root("memory_provenance_failed_turn_capture_records_bounded_episode_when_enabled");
+        let harness_home = root.join("harness");
+        let source_home = root.join(".openclaw");
+        fs::create_dir_all(&source_home).unwrap();
+        fs::write(
+            source_home.join("openclaw.json"),
+            r#"{
+              "plugins": {
+                "entries": {
+                  "openclaw-mem": {
+                    "config": {
+                      "episodes": {
+                        "enabled": true,
+                        "outputPath": "memory/episodes.jsonl",
+                        "captureFailedTurns": { "enabled": true }
+                      }
+                    }
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        let prompt_bundle_json = write_test_prompt_bundle(
+            &root,
+            &source_home,
+            "main",
+            "telegram:dm:user:main",
+            "remember failed turn preference",
+        );
+
+        let report = record_memory_lifecycle_turn(MemoryLifecycleTurnOptions {
+            harness_home: harness_home.clone(),
+            prompt_bundle_json,
+            assistant_text: "runtime failed-terminal: provider error token=secret".to_string(),
+            success: false,
+            now_ms: 1_800_000_000_002,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, MemoryLifecycleStatus::Recorded);
+        assert!(report.failed_turn_capture_enabled);
+        assert_eq!(report.episodes_appended, 2);
+        let episodes = fs::read_to_string(
+            harness_home
+                .join("agents")
+                .join("main")
+                .join("memory")
+                .join("episodes.jsonl"),
+        )
+        .unwrap();
+        assert!(episodes.contains("conversation.user.failed"));
+        assert!(episodes.contains("conversation.assistant.failed"));
+        assert!(!episodes.contains("token=secret"));
 
         let _ = fs::remove_dir_all(root);
     }

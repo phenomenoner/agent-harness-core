@@ -134,6 +134,7 @@ See the [Changelog](CHANGELOG.md), the [Roadmap & Backlog](docs/agent-harness-co
 | [Trust Boundaries](docs/trust-boundaries.md) | Where untrusted input enters and how it's bounded. |
 | [Invariants](docs/invariants.md) & [Schema Registry](docs/schema-registry.md) | The contracts the test suite enforces. |
 | [Test Handoff](docs/agent-harness-test-handoff.md) | Step-by-step live Telegram/Discord test plan. |
+| [Function Self-Check Guide](docs/agent-harness-function-self-check-guide.md) | Agent checklist for proving new functions, CLI commands, receipt writers, and runtime paths before handoff. |
 | [Release Checklist](docs/release-checklist.md) & [SECURITY.md](SECURITY.md) | Release gates and security policy. |
 | [Doc Writing Guidelines](DOC-GUIDELINES.md) | How documentation in this repo is written and kept honest. |
 

@@ -14,6 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+mod telegram_media;
+
 use agent_harness_core::{
     ActivationReadinessOptions, ActivationReadinessReport, AdmissionDecisionOptions,
     AgentProgressDeliveryAction, AgentProgressDeliveryPending, AgentProgressDeliveryPlanOptions,
@@ -31,16 +33,20 @@ use agent_harness_core::{
     CodexRuntimePlanReport, CodexRuntimePreflightOptions, CodexRuntimePreflightReport,
     CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy, ContextPackParseOptions,
     CronRunControlAction, CronRunControlOptions, CronRunListOptions, CronSchedulerLintStatus,
-    CronSchedulerRunOnceOptions, CronSchedulerTickStatus, DeterministicCronPlan,
-    DeterministicCronPlanInput, DeterministicCronWorkerEnqueueOptions, DriftCheckOptions,
-    DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel,
-    HarnessLogRotationOptions, HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport,
-    HealthzOptions, ImportPhaseStatus, ImportReport, LearningProposalOptions, LiveControlAction,
-    McpRequestOptions, MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport,
-    MemoryCanvasWorkerStatus, MemoryCredentialsExportOptions, MemoryCredentialsExportReport,
-    MemoryHookAdapterOptions, MemoryHookKind, MemorySearchOptions, MemorySearchReport,
-    MemoryVectorRecallOptions, MemoryVectorRecallReport, MemoryVectorRecallStatus, NativeCronPlan,
-    NativeCronPlanInput, NativeCronWorkerEnqueueOptions, OpenClawMemReadPathSmokeOptions,
+    CronSchedulerRunOnceOptions, CronSchedulerTickStatus, DEFAULT_MEMORY_BACKFILL_BATCH_SIZE,
+    DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS, DEFAULT_MEMORY_BACKFILL_MAX_ITEMS,
+    DEFAULT_MEMORY_BACKFILL_RATE_LIMIT_PER_MINUTE, DEFAULT_MEMORY_BACKFILL_RETRY_CAP,
+    DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION, DeterministicCronPlan, DeterministicCronPlanInput,
+    DeterministicCronWorkerEnqueueOptions, DriftCheckOptions, DryRunImportOptions,
+    ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel, HarnessLogRotationOptions,
+    HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport, HealthzOptions,
+    ImportPhaseStatus, ImportReport, LearningProposalOptions, LiveControlAction, McpRequestOptions,
+    MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport, MemoryCanvasWorkerStatus,
+    MemoryCredentialsExportOptions, MemoryCredentialsExportReport, MemoryEmbeddingBackfillLane,
+    MemoryEmbeddingBackfillOptions, MemoryEmbeddingBackfillReport, MemoryHookAdapterOptions,
+    MemoryHookKind, MemorySearchOptions, MemorySearchReport, MemoryVectorRecallOptions,
+    MemoryVectorRecallReport, MemoryVectorRecallStatus, NativeCronPlan, NativeCronPlanInput,
+    NativeCronWorkerEnqueueOptions, OpenClawMemReadPathSmokeOptions,
     OpenClawMemServiceProposeOptions, OpenClawMemServiceRecallOptions, OpenClawMemServiceStatus,
     OpenClawMemServiceStatusOptions, OpenClawMemServiceStoreOptions, OpsBackupOptions,
     OpsControlAction, OpsControlOptions, OpsCutoverApplyOptions, OpsCutoverApproveOptions,
@@ -50,40 +56,45 @@ use agent_harness_core::{
     RuntimeQueueControlAction, RuntimeQueueControlOptions, RuntimeQueueEnqueueOptions,
     RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
     RuntimeRunOnceOptions, RuntimeRunOnceReport, RuntimeRunOnceStatus, ScopedStopOptions,
-    ScopedStopTarget, SecurityScanOptions, SkillIndex, SkillSelectionQuery, SubagentPlan,
-    SubagentPlanInput, SubagentWorkerEnqueueOptions, SuperviseDeployCanaryOptions,
+    ScopedStopTarget, SecurityScanOptions, SkillApplyOptions, SkillArchiveOptions, SkillIndex,
+    SkillLearningProposalOperation, SkillLearningProposalStatus, SkillLearningSignal,
+    SkillProposalActionOptions, SkillProposalListOptions, SkillProposeOptions, SkillSelectionQuery,
+    SubagentPlan, SubagentPlanInput, SubagentWorkerEnqueueOptions, SuperviseDeployCanaryOptions,
     SupervisionEvaluateOptions, SupervisorChildState, TaskEntityOptions, TaskStatus,
     TokenEfficiencyOptions, TraceOptions, TurnPlan, TurnPlanInput, VaultGetOptions,
     VaultPutOptions, WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport,
     WorkerCancelOptions, WorkerEnqueueOptions, WorkerJobKind, WorkerReapStaleOptions,
     WorkerRunOnceOptions, WorkerRunOnceStatus, WorkerStatusOptions, acquire_budget,
-    append_harness_log, append_jsonl_value, apply_channel_command_step, assemble_prompt_bundle,
-    build_channel_step, build_dry_run_report, build_harness_skill_index, build_import_plan,
-    build_runtime_skill_index, build_source_skill_index, build_turn_plan, cancel_worker_job,
-    check_activation_readiness, check_config_drift, check_tool_description_pin,
-    collect_harness_metrics, collect_harness_status, collect_healthz, collect_ops_cutover_status,
-    collect_token_efficiency, collect_worker_status, compare_channel_turn_shadow, control_cron_run,
-    control_runtime_queue_item, create_learning_proposal, create_ops_backup, current_log_time_ms,
+    append_harness_log, append_jsonl_value, apply_channel_command_step, apply_skill_proposal,
+    assemble_prompt_bundle, build_channel_step, build_dry_run_report, build_harness_skill_index,
+    build_import_plan, build_runtime_skill_index, build_source_skill_index, build_turn_plan,
+    cancel_worker_job, check_activation_readiness, check_config_drift, check_tool_description_pin,
+    collect_harness_metrics, collect_harness_status, collect_healthz,
+    collect_inbound_media_cache_report, collect_ops_cutover_status, collect_token_efficiency,
+    collect_worker_status, compare_channel_turn_shadow, control_cron_run,
+    control_runtime_queue_item, create_learning_proposal, create_ops_backup,
+    create_skill_archive_proposal, create_skill_learning_proposal, current_log_time_ms,
     default_supervisor_child_specs, enqueue_channel_step, enqueue_deterministic_cron_workers,
     enqueue_native_cron_workers, enqueue_subagent_workers, enqueue_worker_job, evaluate_admission,
     evaluate_prompt_reduction, evaluate_supervisor_children, execute_import,
     export_harness_registry_files, export_memory_credentials, get_vault_secret, handle_mcp_request,
     inspect_openclaw_mem_service, inspect_runtime_queue_capacity, invariant_catalog, inventory,
-    lint_cron_scheduler, list_background_tasks, list_cron_runs, load_agent_registry,
-    load_deterministic_cron_store, load_native_cron_store, load_subagent_ledger,
-    parse_channel_command, parse_context_pack, plan_agent_progress_delivery, plan_channel_outbox,
-    plan_codex_runtime, plan_deterministic_cron, plan_native_cron, plan_subagents,
-    preflight_codex_runtime, prepare_runtime_queue_item, probe_codex_runtime_launch,
-    propose_openclaw_mem_service_memory, put_vault_secret, reap_stale_worker_jobs,
-    recall_openclaw_mem_service, receive_channel_message, record_agent_progress_delivery,
-    record_channel_delivery, record_channel_turn_shadow, record_codex_runtime_completion,
-    record_ops_control, record_ops_cutover_apply, record_ops_cutover_approval,
-    record_ops_cutover_receipt, record_ops_cutover_request, record_scoped_stop,
-    record_supervise_deploy_canary, release_checklist, resolve_channel_identity,
-    rotate_harness_log_if_needed, run_channel_once, run_codex_runtime, run_cron_scheduler_once,
-    run_memory_canvas_worker, run_memory_hook_adapter, run_openclaw_mem_read_path_smoke,
-    run_public_hygiene, run_runtime_queue_once, run_worker_once, scan_security_boundaries,
-    schema_registry_entries, search_imported_memory, search_imported_vector_memory, select_skills,
+    lint_cron_scheduler, list_background_tasks, list_cron_runs, list_skill_proposals,
+    load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
+    load_subagent_ledger, parse_channel_command, parse_context_pack, plan_agent_progress_delivery,
+    plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron, plan_native_cron,
+    plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
+    probe_codex_runtime_launch, propose_openclaw_mem_service_memory, put_vault_secret,
+    reap_stale_worker_jobs, recall_openclaw_mem_service, receive_channel_message,
+    record_agent_progress_delivery, record_channel_delivery, record_channel_turn_shadow,
+    record_codex_runtime_completion, record_ops_control, record_ops_cutover_apply,
+    record_ops_cutover_approval, record_ops_cutover_receipt, record_ops_cutover_request,
+    record_scoped_stop, record_supervise_deploy_canary, reject_skill_proposal, release_checklist,
+    resolve_channel_identity, rotate_harness_log_if_needed, run_channel_once, run_codex_runtime,
+    run_cron_scheduler_once, run_memory_canvas_worker, run_memory_embedding_backfill,
+    run_memory_hook_adapter, run_openclaw_mem_read_path_smoke, run_public_hygiene,
+    run_runtime_queue_once, run_worker_once, scan_security_boundaries, schema_registry_entries,
+    search_imported_memory, search_imported_vector_memory, select_skills,
     store_openclaw_mem_service_memory, sync_builtin_harness_skills, tool_description_hash,
     trace_harness_event, upsert_background_task, validate_harness_config, write_channel_step,
     write_deterministic_cron_plan, write_memory_search_receipt, write_memory_vector_recall_receipt,
@@ -149,6 +160,7 @@ fn main() {
         "memory-search" => run_memory_search(&rest),
         "memory-vector-search" => run_memory_vector_search(&rest),
         "memory-canvas-run" => run_memory_canvas_run(&rest),
+        "memory-embedding-backfill" => run_memory_embedding_backfill_cmd(&rest),
         "memory-hook" => run_memory_hook(&rest),
         "memory-service-status" => run_memory_service_status(&rest),
         "memory-service-recall" => run_memory_service_recall(&rest),
@@ -165,6 +177,11 @@ fn main() {
         "supervisor-plan" => run_supervisor_plan(&rest),
         "harness-skills-sync" => run_harness_skills_sync(&rest),
         "skills" => run_skills(&rest),
+        "skill-propose" => run_skill_propose(&rest),
+        "skill-proposals" => run_skill_proposals(&rest),
+        "skill-apply" => run_skill_apply(&rest),
+        "skill-reject" => run_skill_reject(&rest),
+        "skill-archive" => run_skill_archive(&rest),
         "turn-plan" => run_turn_plan(&rest),
         "channel-step" => run_channel_step(&rest),
         "channel-apply" => run_channel_apply(&rest),
@@ -173,6 +190,7 @@ fn main() {
         "channel-outbox-plan" => run_channel_outbox_plan(&rest),
         "channel-delivery-record" => run_channel_delivery_record(&rest),
         "channel-identity-check" => run_channel_identity_check(&rest),
+        "media-cache-status" => run_media_cache_status(&rest),
         "progress-delivery-once" => run_progress_delivery_once(&rest),
         "progress-delivery-loop" => run_progress_delivery_loop(&rest),
         "telegram-probe" => run_telegram_probe(&rest),
@@ -995,12 +1013,20 @@ fn run_mcp_request(args: &[String]) -> Result<(), String> {
     let (response, receipt) = handle_mcp_request(McpRequestOptions {
         request,
         allowed_tools,
+        harness_home: Some(options.target_home.clone()),
     });
     print_json(&serde_json::json!({
         "schema": "agent-harness.mcp-cli-response.v1",
         "response": response,
         "receipt": receipt
     }))
+}
+
+fn run_media_cache_status(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(args, "media-cache-status", &[], &[])?;
+    let report =
+        collect_inbound_media_cache_report(&options.target_home).map_err(|err| err.to_string())?;
+    print_json(&report)
 }
 
 fn run_security_scan(args: &[String]) -> Result<(), String> {
@@ -1302,6 +1328,50 @@ fn run_memory_canvas_run(args: &[String]) -> Result<(), String> {
     if report.status == MemoryCanvasWorkerStatus::Failed {
         Err(report.reason)
     } else {
+        Ok(())
+    }
+}
+
+fn run_memory_embedding_backfill_cmd(args: &[String]) -> Result<(), String> {
+    let args = memory_embedding_backfill_args_from_args(args)?;
+    let report = run_memory_embedding_backfill(MemoryEmbeddingBackfillOptions {
+        harness_home: args.target_home.clone(),
+        lane: args.lane,
+        model: args.model,
+        vector_dimension: args.vector_dimension,
+        batch_size: args.batch_size,
+        max_items: args.max_items,
+        rate_limit_per_minute: args.rate_limit_per_minute,
+        retry_cap: args.retry_cap,
+        coverage_threshold_bps: args.coverage_threshold_bps,
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+    })
+    .map_err(|err| err.to_string())?;
+    append_harness_log(
+        &args.target_home,
+        &HarnessLogEvent::new(
+            current_log_time_ms().map_err(|err| err.to_string())?,
+            if report.status == "blocked" || report.status == "dimension-mismatch" {
+                HarnessLogLevel::Warn
+            } else {
+                HarnessLogLevel::Info
+            },
+            "memory",
+            "memory.embedding-backfill",
+            format!(
+                "status={} lane={} selected={} coverageBefore={:?}",
+                report.status,
+                report.lane.as_str(),
+                report.selected_item_ids.len(),
+                report.coverage_before_bps
+            ),
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    if args.json {
+        print_json(&report)
+    } else {
+        print_memory_embedding_backfill_report(&report);
         Ok(())
     }
 }
@@ -1732,6 +1802,11 @@ fn run_skills(args: &[String]) -> Result<(), String> {
                 agent_id: args.agent_id,
                 channel: args.channel,
                 workspace: args.match_workspace,
+                agent_mode: None,
+                available_tools: Vec::new(),
+                available_toolsets: Vec::new(),
+                fts_enabled: false,
+                vector_tie_break_enabled: false,
                 limit: args.limit,
             },
         );
@@ -1739,8 +1814,13 @@ fn run_skills(args: &[String]) -> Result<(), String> {
         println!("Matched skills: {}", selections.len());
         for selection in selections {
             println!(
-                "- {} [{:?}] score={} title={}",
-                selection.skill_id, selection.source_kind, selection.score, selection.title
+                "- {} [{:?}] score={} mode={} checksum={} title={}",
+                selection.skill_id,
+                selection.source_kind,
+                selection.score,
+                selection.delivery_mode.as_str(),
+                selection.body_checksum,
+                selection.title
             );
             if !selection.reasons.is_empty() {
                 println!("  {}", selection.reasons.join("; "));
@@ -1749,6 +1829,242 @@ fn run_skills(args: &[String]) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+fn run_skill_propose(args: &[String]) -> Result<(), String> {
+    let mut harness_home = None;
+    let mut skill_id = None;
+    let mut target_path = None;
+    let mut operation = SkillLearningProposalOperation::Replace;
+    let mut body = None;
+    let mut diff = None;
+    let mut signal = None;
+    let mut source_turn = None;
+    let mut risk_class = "low".to_string();
+    let mut status = SkillLearningProposalStatus::Proposed;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                harness_home = Some(parse_harness_home_path(args, i, flag)?);
+            }
+            "--skill" | "--target-skill" => {
+                i += 1;
+                skill_id = Some(required_arg(args, i, "--skill")?.to_string());
+            }
+            "--target-path" => {
+                i += 1;
+                target_path = Some(PathBuf::from(required_arg(args, i, "--target-path")?));
+            }
+            "--operation" => {
+                i += 1;
+                operation = parse_skill_operation(required_arg(args, i, "--operation")?)?;
+            }
+            "--body" => {
+                i += 1;
+                body = Some(required_arg(args, i, "--body")?.to_string());
+            }
+            "--body-file" => {
+                i += 1;
+                body = Some(
+                    fs::read_to_string(required_arg(args, i, "--body-file")?)
+                        .map_err(|err| err.to_string())?,
+                );
+            }
+            "--diff" => {
+                i += 1;
+                diff = Some(required_arg(args, i, "--diff")?.to_string());
+            }
+            "--signal" => {
+                i += 1;
+                signal = Some(required_arg(args, i, "--signal")?.to_string());
+            }
+            "--source-turn" => {
+                i += 1;
+                source_turn = Some(required_arg(args, i, "--source-turn")?.to_string());
+            }
+            "--risk" | "--risk-class" => {
+                i += 1;
+                risk_class = required_arg(args, i, "--risk")?.to_string();
+            }
+            "--quarantine" | "--quarantined" => {
+                status = SkillLearningProposalStatus::Quarantined;
+            }
+            other => return Err(format!("unknown skill-propose arg: {other}")),
+        }
+        i += 1;
+    }
+    let harness_home = harness_home.ok_or_else(|| "--harness-home is required".to_string())?;
+    let skill_id = skill_id.ok_or_else(|| "--skill is required".to_string())?;
+    let target_path =
+        target_path.unwrap_or_else(|| resolve_skill_target_path(&harness_home, &skill_id));
+    let proposal = create_skill_learning_proposal(SkillProposeOptions {
+        harness_home,
+        target_skill_id: skill_id,
+        target_path,
+        operation,
+        replacement_body: body,
+        support_files: Vec::new(),
+        diff,
+        signals: signal
+            .map(|text| SkillLearningSignal {
+                kind: "operator-command".to_string(),
+                signal_hash: tool_description_hash(&text),
+                text,
+                trust: Some("operator".to_string()),
+            })
+            .into_iter()
+            .collect(),
+        source_turn,
+        risk_class,
+        status,
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+    })
+    .map_err(|err| err.to_string())?;
+    println!("Skill proposal: {}", proposal.proposal_id);
+    println!("Status: {}", proposal.status.as_str());
+    println!("Target: {}", proposal.target_path.display());
+    Ok(())
+}
+
+fn run_skill_proposals(args: &[String]) -> Result<(), String> {
+    let harness_home = parse_required_harness_home(args)?;
+    let report = list_skill_proposals(SkillProposalListOptions { harness_home })
+        .map_err(|err| err.to_string())?;
+    println!("Skill proposals: {}", report.proposals.len());
+    println!("File: {}", report.proposals_file.display());
+    for proposal in report.proposals {
+        println!(
+            "- {} {} {} {:?} {}",
+            proposal.proposal_id,
+            proposal.status.as_str(),
+            proposal.target_skill_id,
+            proposal.operation,
+            proposal.target_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_skill_apply(args: &[String]) -> Result<(), String> {
+    let mut harness_home = None;
+    let mut proposal_id = None;
+    let mut operator = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                harness_home = Some(parse_harness_home_path(args, i, flag)?);
+            }
+            "--proposal" => {
+                i += 1;
+                proposal_id = Some(required_arg(args, i, "--proposal")?.to_string());
+            }
+            "--operator" => {
+                i += 1;
+                operator = Some(required_arg(args, i, "--operator")?.to_string());
+            }
+            other => return Err(format!("unknown skill-apply arg: {other}")),
+        }
+        i += 1;
+    }
+    let report = apply_skill_proposal(SkillApplyOptions {
+        harness_home: harness_home.ok_or_else(|| "--harness-home is required".to_string())?,
+        proposal_id: proposal_id.ok_or_else(|| "--proposal is required".to_string())?,
+        operator,
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+    })
+    .map_err(|err| err.to_string())?;
+    println!("Skill apply: {}", report.status.as_str());
+    println!("Reason: {}", report.reason);
+    if let Some(target) = report.target_path {
+        println!("Target: {}", target.display());
+    }
+    if let Some(backup) = report.backup_dir {
+        println!("Backup: {}", backup.display());
+    }
+    Ok(())
+}
+
+fn run_skill_reject(args: &[String]) -> Result<(), String> {
+    let mut harness_home = None;
+    let mut proposal_id = None;
+    let mut reason = "rejected by operator".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                harness_home = Some(parse_harness_home_path(args, i, flag)?);
+            }
+            "--proposal" => {
+                i += 1;
+                proposal_id = Some(required_arg(args, i, "--proposal")?.to_string());
+            }
+            "--reason" => {
+                i += 1;
+                reason = required_arg(args, i, "--reason")?.to_string();
+            }
+            other => return Err(format!("unknown skill-reject arg: {other}")),
+        }
+        i += 1;
+    }
+    let report = reject_skill_proposal(SkillProposalActionOptions {
+        harness_home: harness_home.ok_or_else(|| "--harness-home is required".to_string())?,
+        proposal_id: proposal_id.ok_or_else(|| "--proposal is required".to_string())?,
+        reason,
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+    })
+    .map_err(|err| err.to_string())?;
+    println!("Skill reject: {:?}", report.status);
+    println!("Reason: {}", report.reason);
+    Ok(())
+}
+
+fn run_skill_archive(args: &[String]) -> Result<(), String> {
+    let mut harness_home = None;
+    let mut skill_id = None;
+    let mut target_path = None;
+    let mut reason = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                harness_home = Some(parse_harness_home_path(args, i, flag)?);
+            }
+            "--skill" => {
+                i += 1;
+                skill_id = Some(required_arg(args, i, "--skill")?.to_string());
+            }
+            "--target-path" => {
+                i += 1;
+                target_path = Some(PathBuf::from(required_arg(args, i, "--target-path")?));
+            }
+            "--reason" => {
+                i += 1;
+                reason = Some(required_arg(args, i, "--reason")?.to_string());
+            }
+            other => return Err(format!("unknown skill-archive arg: {other}")),
+        }
+        i += 1;
+    }
+    let harness_home = harness_home.ok_or_else(|| "--harness-home is required".to_string())?;
+    let skill_id = skill_id.ok_or_else(|| "--skill is required".to_string())?;
+    let proposal = create_skill_archive_proposal(SkillArchiveOptions {
+        target_path: target_path
+            .unwrap_or_else(|| resolve_skill_target_path(&harness_home, &skill_id)),
+        harness_home,
+        target_skill_id: skill_id,
+        reason: reason.ok_or_else(|| "--reason is required".to_string())?,
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+    })
+    .map_err(|err| err.to_string())?;
+    println!("Skill archive proposal: {}", proposal.proposal_id);
+    println!("Target: {}", proposal.target_path.display());
     Ok(())
 }
 
@@ -1771,6 +2087,7 @@ fn run_turn_plan(args: &[String]) -> Result<(), String> {
             user_id: args.user_id,
             text: args.message,
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             requested_agent_id: args.agent_id,
             session_hint: args.session_key,
             skill_limit: args.skill_limit,
@@ -1807,6 +2124,7 @@ fn run_channel_step(args: &[String]) -> Result<(), String> {
             user_id: args.user_id,
             text: args.message,
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             requested_agent_id: args.agent_id,
             session_hint: args.session_key,
             skill_limit: args.skill_limit,
@@ -1841,6 +2159,7 @@ fn run_channel_apply(args: &[String]) -> Result<(), String> {
             user_id: args.turn.user_id,
             text: args.turn.message,
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             requested_agent_id: args.turn.agent_id,
             session_hint: args.turn.session_key,
             skill_limit: args.turn.skill_limit,
@@ -1878,6 +2197,7 @@ fn run_channel_receive(args: &[String]) -> Result<(), String> {
         session_key: args.turn.session_key,
         message: args.turn.message,
         inbound_context: None,
+        inbound_media_artifacts: Vec::new(),
         skill_limit: args.turn.skill_limit,
         now_ms: args.now_ms,
     })
@@ -1901,6 +2221,7 @@ fn run_channel_run_once(args: &[String]) -> Result<(), String> {
         session_key: args.turn.session_key,
         message: args.turn.message,
         inbound_context: None,
+        inbound_media_artifacts: Vec::new(),
         skill_limit: args.turn.skill_limit,
         now_ms: args.now_ms,
         codex_executable: args.codex_exe,
@@ -2751,9 +3072,32 @@ fn execute_telegram_poll_once(
     let offset = read_telegram_offset(&offset_file, &mut warnings)?;
     let access_policy = channel_access_policy(&args.target_home)?;
     let updates = telegram_get_updates(token, offset, args.poll_timeout_seconds, args.max_updates)?;
+    let media_fetcher = telegram_media::TelegramBotApiMediaFetcher::new(token);
+    let account_id = telegram_account_id(args.telegram_account.as_deref());
     let mut handled_messages = 0;
     let mut skipped_updates = 0;
     let mut next_offset = offset;
+    let due_media_groups = telegram_media::take_due_telegram_media_groups(
+        &args.target_home,
+        &account_id,
+        current_time_ms()?,
+        telegram_media::DEFAULT_TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS,
+        telegram_media::DEFAULT_TELEGRAM_MEDIA_GROUP_STALE_MS,
+    )?;
+    for flush in due_media_groups {
+        if execute_telegram_media_group_flush(
+            args,
+            token,
+            &access_policy,
+            &media_fetcher,
+            &flush,
+            &mut warnings,
+        )? {
+            handled_messages += 1;
+        } else {
+            skipped_updates += flush.members.len().max(1);
+        }
+    }
     for update in &updates {
         let Some(update_id) = update.get("update_id").and_then(serde_json::Value::as_i64) else {
             skipped_updates += 1;
@@ -2794,7 +3138,6 @@ fn execute_telegram_poll_once(
             .get("chat")
             .and_then(|chat| chat.get("type"))
             .and_then(serde_json::Value::as_str);
-        let account_id = telegram_account_id(args.telegram_account.as_deref());
         let thread_id = message
             .get("message_thread_id")
             .and_then(telegram_id_string);
@@ -2836,6 +3179,49 @@ fn execute_telegram_poll_once(
             write_telegram_offset(&offset_file, next_offset)?;
             continue;
         }
+        if let Some(media_group_id) = message
+            .get("media_group_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            match telegram_media::buffer_telegram_media_group(
+                &args.target_home,
+                &account_id,
+                &chat_id,
+                media_group_id,
+                update_id,
+                message,
+                current_time_ms()?,
+                telegram_media::DEFAULT_TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS,
+            )? {
+                telegram_media::TelegramMediaGroupDecision::Buffered(_) => {
+                    write_telegram_offset(&offset_file, next_offset)?;
+                    continue;
+                }
+                telegram_media::TelegramMediaGroupDecision::Flush(flush) => {
+                    if execute_telegram_media_group_flush(
+                        args,
+                        token,
+                        &access_policy,
+                        &media_fetcher,
+                        &flush,
+                        &mut warnings,
+                    )? {
+                        handled_messages += 1;
+                    } else {
+                        skipped_updates += flush.members.len().max(1);
+                    }
+                    write_telegram_offset(&offset_file, next_offset)?;
+                    continue;
+                }
+            }
+        }
+        let media = telegram_media::ingest_telegram_media(
+            &args.target_home,
+            update_id,
+            message,
+            &media_fetcher,
+        )?;
+        warnings.extend(media.warnings.clone());
         if let Err(error) = telegram_send_chat_action(token, &chat_id, "typing") {
             warnings.push(format!(
                 "Telegram sendChatAction failed for update {update_id}: {error}"
@@ -2853,6 +3239,7 @@ fn execute_telegram_poll_once(
             session_key: None,
             message: text,
             inbound_context,
+            inbound_media_artifacts: media.artifacts,
             skill_limit: args.skill_limit,
             now_ms: current_time_ms()?,
             codex_executable: args.codex_exe.clone(),
@@ -2958,6 +3345,195 @@ fn execute_telegram_poll_once(
     )
     .map_err(|err| err.to_string())?;
     Ok(report)
+}
+
+fn execute_telegram_media_group_flush<F: telegram_media::TelegramMediaFetcher>(
+    args: &TelegramPollOnceArgs,
+    token: &str,
+    access_policy: &ChannelAccessPolicy,
+    media_fetcher: &F,
+    flush: &telegram_media::TelegramMediaGroupFlush,
+    warnings: &mut Vec<String>,
+) -> Result<bool, String> {
+    let Some(first_member) = flush.members.first() else {
+        telegram_media::record_telegram_media_group_discarded_no_agent(
+            &args.target_home,
+            flush,
+            "media group had no members",
+        )?;
+        return Ok(false);
+    };
+    let first_message = &first_member.message;
+    let chat_id = first_message
+        .get("chat")
+        .and_then(|chat| chat.get("id"))
+        .and_then(telegram_id_string)
+        .unwrap_or_else(|| flush.chat_id.clone());
+    let user_id = first_message
+        .get("from")
+        .and_then(|from| from.get("id"))
+        .and_then(telegram_id_string)
+        .unwrap_or_else(|| chat_id.clone());
+    let chat_type = first_message
+        .get("chat")
+        .and_then(|chat| chat.get("type"))
+        .and_then(serde_json::Value::as_str);
+    let thread_id = first_message
+        .get("message_thread_id")
+        .and_then(telegram_id_string);
+    let identity = resolve_channel_identity(ChannelIdentityLookup {
+        harness_home: args.target_home.clone(),
+        platform: "telegram".to_string(),
+        account_id: flush.account_id.clone(),
+        chat_id: chat_id.clone(),
+        thread_id,
+        requested_agent_id: args.agent_id.clone(),
+    })
+    .map_err(|err| err.to_string())?;
+    if !identity.is_bound() {
+        let reason = format!(
+            "Telegram media group {} denied by channel identity registry: {}",
+            flush.media_group_id, identity.reason
+        );
+        warnings.push(reason.clone());
+        telegram_media::record_telegram_media_group_discarded_no_agent(
+            &args.target_home,
+            flush,
+            &reason,
+        )?;
+        return Ok(false);
+    }
+    let permission = match telegram_access_decision(access_policy, &chat_id, &user_id, chat_type) {
+        ChannelAccessDecision::Allowed(permission) => permission,
+        ChannelAccessDecision::Denied(reason) => {
+            let reason = format!(
+                "Telegram media group {} denied by channel access policy: {reason}",
+                flush.media_group_id
+            );
+            warnings.push(reason.clone());
+            telegram_media::record_telegram_media_group_discarded_no_agent(
+                &args.target_home,
+                flush,
+                &reason,
+            )?;
+            return Ok(false);
+        }
+    };
+    let text = telegram_media_group_message_text(flush);
+    if let Err(reason) = channel_permission_allows_text(permission, &text) {
+        let reason = format!(
+            "Telegram media group {} denied by channel command permission: {reason}",
+            flush.media_group_id
+        );
+        warnings.push(reason.clone());
+        telegram_media::record_telegram_media_group_discarded_no_agent(
+            &args.target_home,
+            flush,
+            &reason,
+        )?;
+        return Ok(false);
+    }
+
+    let mut inbound_media_artifacts = Vec::new();
+    for member in &flush.members {
+        let media = telegram_media::ingest_telegram_media(
+            &args.target_home,
+            member.update_id,
+            &member.message,
+            media_fetcher,
+        )?;
+        warnings.extend(media.warnings);
+        inbound_media_artifacts.extend(media.artifacts);
+    }
+
+    if let Err(error) = telegram_send_chat_action(token, &chat_id, "typing") {
+        warnings.push(format!(
+            "Telegram sendChatAction failed for media group {}: {error}",
+            flush.media_group_id
+        ));
+    }
+    run_channel_once(ChannelRunOnceOptions {
+        source: args.source.clone(),
+        runtime_workspace: args.runtime_workspace.clone(),
+        harness_home: args.target_home.clone(),
+        platform: "telegram".to_string(),
+        account_id: Some(flush.account_id.clone()),
+        channel_id: chat_id,
+        user_id,
+        agent_id: identity.agent_id.clone(),
+        session_key: None,
+        message: text,
+        inbound_context: telegram_media_group_inbound_context(flush),
+        inbound_media_artifacts,
+        skill_limit: args.skill_limit,
+        now_ms: current_time_ms()?,
+        codex_executable: args.codex_exe.clone(),
+        timeout_ms: args.timeout_ms,
+        idle_timeout_ms: args.idle_timeout_ms,
+        prompt_options: PromptAssemblyOptions {
+            harness_home: Some(args.target_home.clone()),
+            ..PromptAssemblyOptions::default()
+        },
+        outbox_limit: args.outbox_limit,
+        run_runtime: false,
+    })
+    .map_err(|err| err.to_string())?;
+    Ok(true)
+}
+
+fn telegram_media_group_message_text(flush: &telegram_media::TelegramMediaGroupFlush) -> String {
+    flush
+        .members
+        .iter()
+        .find_map(|member| {
+            member
+                .message
+                .get("caption")
+                .and_then(serde_json::Value::as_str)
+                .filter(|caption| !caption.trim().is_empty())
+        })
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "[telegram media group]".to_string())
+}
+
+fn telegram_media_group_inbound_context(
+    flush: &telegram_media::TelegramMediaGroupFlush,
+) -> Option<String> {
+    let mut lines = Vec::new();
+    lines.push("## InboundMedia: Telegram media group".to_string());
+    lines.push(format!("- mediaGroupId: {}", flush.media_group_id));
+    lines.push(format!("- flushStatus: {:?}", flush.status));
+    lines.push(format!("- memberCount: {}", flush.members.len()));
+    for (index, member) in flush.members.iter().enumerate() {
+        let item = index + 1;
+        let mut parts = vec![
+            format!("item={item}"),
+            format!("updateId={}", member.update_id),
+        ];
+        if let Some(message_id) = member.message_id.as_deref() {
+            parts.push(format!("messageId={message_id}"));
+        }
+        if let Some(preview) = member.caption_preview.as_deref() {
+            parts.push(format!(
+                "captionPreview={}",
+                compact_preview(preview, REPLY_CONTEXT_PREVIEW_MAX_CHARS)
+            ));
+        }
+        lines.push(format!("- {}", parts.join(" ")));
+    }
+
+    for (index, member) in flush.members.iter().enumerate() {
+        if let Some(context) = telegram_inbound_context(&member.message) {
+            lines.push(String::new());
+            lines.push(format!(
+                "## InboundMedia: Telegram media group member {}",
+                index + 1
+            ));
+            lines.push(context);
+        }
+    }
+
+    (!flush.members.is_empty()).then(|| lines.join("\n"))
 }
 
 fn telegram_message_text(message: &serde_json::Value, has_inbound_context: bool) -> Option<String> {
@@ -3724,6 +4300,7 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
                                 session_key: None,
                                 message: message_text,
                                 inbound_context: message.inbound_context.clone(),
+                                inbound_media_artifacts: Vec::new(),
                                 skill_limit: args.skill_limit,
                                 now_ms: current_time_ms()?,
                                 codex_executable: args.codex_exe.clone(),
@@ -4130,6 +4707,7 @@ fn run_queue_enqueue(args: &[String]) -> Result<(), String> {
             user_id: args.turn.user_id,
             text: args.turn.message,
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             requested_agent_id: args.turn.agent_id,
             session_hint: args.turn.session_key,
             skill_limit: args.turn.skill_limit,
@@ -4939,6 +5517,7 @@ fn run_prompt_bundle(args: &[String]) -> Result<(), String> {
             user_id: args.user_id,
             text: args.message,
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             requested_agent_id: args.agent_id,
             session_hint: args.session_key,
             skill_limit: args.skill_limit,
@@ -5754,6 +6333,19 @@ struct MemoryVectorSearchArgs {
 struct MemoryCanvasRunArgs {
     target_home: PathBuf,
     agent_id: Option<String>,
+    json: bool,
+}
+
+struct MemoryEmbeddingBackfillArgs {
+    target_home: PathBuf,
+    lane: MemoryEmbeddingBackfillLane,
+    model: String,
+    vector_dimension: i64,
+    batch_size: usize,
+    max_items: usize,
+    rate_limit_per_minute: usize,
+    retry_cap: usize,
+    coverage_threshold_bps: u64,
     json: bool,
 }
 
@@ -7299,6 +7891,86 @@ fn memory_canvas_run_args_from_args(args: &[String]) -> Result<MemoryCanvasRunAr
     Ok(MemoryCanvasRunArgs {
         target_home,
         agent_id,
+        json,
+    })
+}
+
+fn memory_embedding_backfill_args_from_args(
+    args: &[String],
+) -> Result<MemoryEmbeddingBackfillArgs, String> {
+    let mut target_home = default_harness_home();
+    let mut lane = MemoryEmbeddingBackfillLane::default();
+    let mut model = "text-embedding-3-small".to_string();
+    let mut vector_dimension = DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION;
+    let mut batch_size = DEFAULT_MEMORY_BACKFILL_BATCH_SIZE;
+    let mut max_items = DEFAULT_MEMORY_BACKFILL_MAX_ITEMS;
+    let mut rate_limit_per_minute = DEFAULT_MEMORY_BACKFILL_RATE_LIMIT_PER_MINUTE;
+    let mut retry_cap = DEFAULT_MEMORY_BACKFILL_RETRY_CAP;
+    let mut coverage_threshold_bps = DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS;
+    let mut json = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = parse_harness_home_path(args, i, flag)?;
+            }
+            "--lane" => {
+                i += 1;
+                lane = required_arg(args, i, "--lane")?.parse::<MemoryEmbeddingBackfillLane>()?;
+            }
+            "--model" | "--embedding-model" => {
+                i += 1;
+                model = required_arg(args, i, "--model")?.to_string();
+            }
+            "--vector-dimension" | "--dim" => {
+                i += 1;
+                vector_dimension = parse_i64(
+                    required_arg(args, i, "--vector-dimension")?,
+                    "--vector-dimension",
+                )?;
+            }
+            "--batch-size" => {
+                i += 1;
+                batch_size = parse_limit(required_arg(args, i, "--batch-size")?)?;
+            }
+            "--max-items" => {
+                i += 1;
+                max_items = parse_limit(required_arg(args, i, "--max-items")?)?;
+            }
+            "--rate-limit-per-minute" => {
+                i += 1;
+                rate_limit_per_minute =
+                    parse_limit(required_arg(args, i, "--rate-limit-per-minute")?)?;
+            }
+            "--retry-cap" => {
+                i += 1;
+                retry_cap = parse_limit(required_arg(args, i, "--retry-cap")?)?;
+            }
+            "--coverage-threshold-bps" => {
+                i += 1;
+                coverage_threshold_bps = parse_u64(
+                    required_arg(args, i, "--coverage-threshold-bps")?,
+                    "--coverage-threshold-bps",
+                )?;
+            }
+            "--json" => json = true,
+            flag => return Err(format!("unknown argument: {flag}")),
+        }
+        i += 1;
+    }
+
+    Ok(MemoryEmbeddingBackfillArgs {
+        target_home,
+        lane,
+        model,
+        vector_dimension,
+        batch_size,
+        max_items,
+        rate_limit_per_minute,
+        retry_cap,
+        coverage_threshold_bps,
         json,
     })
 }
@@ -10708,10 +11380,78 @@ fn is_harness_home_arg(flag: &str) -> bool {
     matches!(flag, "--target-home" | "--harness-home")
 }
 
+fn parse_required_harness_home(args: &[String]) -> Result<PathBuf, String> {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                return parse_harness_home_path(args, i, flag);
+            }
+            other => return Err(format!("unknown arg: {other}")),
+        }
+    }
+    Err("--harness-home is required".to_string())
+}
+
 fn parse_harness_home_path(args: &[String], index: usize, flag: &str) -> Result<PathBuf, String> {
     args.get(index)
         .map(PathBuf::from)
         .ok_or_else(|| format!("{flag} requires a path"))
+}
+
+fn parse_skill_operation(value: &str) -> Result<SkillLearningProposalOperation, String> {
+    match value {
+        "create" => Ok(SkillLearningProposalOperation::Create),
+        "patch" => Ok(SkillLearningProposalOperation::Patch),
+        "replace" => Ok(SkillLearningProposalOperation::Replace),
+        "archive" => Ok(SkillLearningProposalOperation::Archive),
+        other => Err(format!("unsupported skill operation: {other}")),
+    }
+}
+
+fn resolve_skill_target_path(harness_home: &Path, skill_id: &str) -> PathBuf {
+    let suffix = skill_id
+        .rsplit_once(':')
+        .map(|(_, suffix)| suffix)
+        .unwrap_or(skill_id);
+    let candidates = [
+        harness_home.join("skills"),
+        harness_home.join("workspace").join("skills"),
+        harness_home
+            .join("workspace")
+            .join(".agents")
+            .join("skills"),
+    ];
+    for root in candidates {
+        if let Some(path) = find_skill_file_by_dir_name(&root, suffix) {
+            return path;
+        }
+    }
+    harness_home.join("skills").join(suffix).join("SKILL.md")
+}
+
+fn find_skill_file_by_dir_name(root: &Path, suffix: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case(suffix))
+            {
+                let skill_file = path.join("SKILL.md");
+                if skill_file.is_file() {
+                    return Some(skill_file);
+                }
+            }
+            if let Some(found) = find_skill_file_by_dir_name(&path, suffix) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 fn write_plugin_sidecar_bridge_receipt(
@@ -13977,6 +14717,13 @@ fn print_harness_status_report(report: &HarnessStatusReport) {
         receipt_summary(&report.memory.canvas_receipts)
     );
     println!(
+        "Learning: skillUsage={} proposals={} applyReceipts={} snapshot={}",
+        receipt_summary(&report.learning.skill_usage_events),
+        receipt_summary(&report.learning.skill_proposals),
+        receipt_summary(&report.learning.skill_apply_receipts),
+        yes_no(report.learning.skill_usage_snapshot_present)
+    );
+    println!(
         "Plugins: catalog={} tools={} execution={} probe={} bridge={}",
         yes_no(report.plugins.catalog_present),
         report.plugins.catalog_tools,
@@ -14160,6 +14907,36 @@ fn print_memory_canvas_report(report: &MemoryCanvasWorkerReport) {
         "Inputs: candidates={} episodes={}",
         report.candidates_read, report.episodes_read
     );
+    if !report.warnings.is_empty() {
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("- {warning}");
+        }
+    }
+}
+
+fn print_memory_embedding_backfill_report(report: &MemoryEmbeddingBackfillReport) {
+    println!("Harness memory embedding backfill");
+    println!("Harness home: {}", report.harness_home.display());
+    println!("Lane: {}", report.lane.as_str());
+    println!("Status: {}", report.status);
+    println!("Reason: {}", report.reason);
+    println!(
+        "Model: {} dim={} selected={} rateRemaining={}",
+        report.model,
+        report.vector_dimension,
+        report.selected_item_ids.len(),
+        report.rate_limit_remaining
+    );
+    println!(
+        "Coverage: before={:?} after={:?} threshold={} parityAllowed={}",
+        report.coverage_before_bps,
+        report.coverage_after_bps,
+        report.coverage_threshold_bps,
+        yes_no(report.parity_claim_allowed)
+    );
+    println!("Cursor: {}", report.cursor_file.display());
+    println!("Receipt: {}", report.receipt_file.display());
     if !report.warnings.is_empty() {
         println!("Warnings:");
         for warning in &report.warnings {
@@ -15371,6 +16148,7 @@ fn print_help() {
     println!("  memory-search   Search imported markdown/text memory files read-only");
     println!("  memory-vector-search Search imported SQLite vector memory with embedding query");
     println!("  memory-canvas-run Build compact symbolic canvas from captured candidates/episodes");
+    println!("  memory-embedding-backfill Plan resumable memory embedding backfill batches");
     println!("  memory-hook     Record OpenClaw-compatible memory adapter hook receipt");
     println!("  memory-service-status Inspect OpenClaw memory service/snapshot adapter readiness");
     println!("  memory-service-recall Recall through OpenClaw memory service adapter");
@@ -15387,6 +16165,11 @@ fn print_help() {
     println!("  supervisor-plan Generate Windows scheduled-task scripts for harness loops");
     println!("  harness-skills-sync Sync bundled harness operation skills");
     println!("  skills          Build a skill-first index and optionally match a task");
+    println!("  skill-propose   Record a checksum-guarded skill change proposal");
+    println!("  skill-proposals List skill change proposals");
+    println!("  skill-apply     Apply a reviewed skill proposal with stale-base quarantine");
+    println!("  skill-reject    Reject a skill proposal");
+    println!("  skill-archive   Record an archive proposal for a skill");
     println!("  turn-plan       Plan routing, commands, prompts, and skills for one turn");
     println!("  channel-step    Plan shared channel reply or agent dispatch for one DM");
     println!("  channel-apply   Persist channel command state and command receipts");
@@ -15471,6 +16254,12 @@ fn print_help() {
     println!("  --text <text>           Memory-service proposal/store text");
     println!("  --text-file <path>      Memory-service proposal/store text file");
     println!("  --approved              Approve memory-service-store writeback");
+    println!("  --lane <name>           Worker lane or memory embedding backfill lane");
+    println!("  --model <name>          Embedding model namespace for memory backfill");
+    println!("  --vector-dimension <n>  Expected embedding vector dimension");
+    println!("  --batch-size <n>        Memory embedding backfill batch size");
+    println!("  --rate-limit-per-minute <n> Memory embedding backfill lane rate cap");
+    println!("  --coverage-threshold-bps <n> Coverage bps required before parity claim");
     println!("  --message <text>        Incoming channel message for turn-plan");
     println!("  --platform <name>       local, telegram, discord, or cron");
     println!("  --channel-id <id>       Channel identity for session mapping");
@@ -15574,10 +16363,46 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_harness_core::{AGENT_HARNESS_CONTEXT_PACK_SCHEMA, OPENCLAW_MEM_CONTEXT_PACK_SCHEMA};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn set(values: &[&str]) -> BTreeSet<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn context_pack_cli_report_includes_schema_translation_fields() {
+        let report = parse_context_pack(ContextPackParseOptions {
+            raw_json: serde_json::json!({
+                "schema": OPENCLAW_MEM_CONTEXT_PACK_SCHEMA,
+                "packId": "pack-1",
+                "source": "openclaw-mem",
+                "items": [
+                    {"citationId":"obs:1","text":"memory text","sourceUri":"memory://obs/1"}
+                ]
+            })
+            .to_string(),
+            max_bytes: 4096,
+        });
+
+        assert!(report.accepted, "{:?}", report.warnings);
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(
+            value.get("inputSchema").and_then(serde_json::Value::as_str),
+            Some(OPENCLAW_MEM_CONTEXT_PACK_SCHEMA)
+        );
+        assert_eq!(
+            value
+                .get("normalizedSchema")
+                .and_then(serde_json::Value::as_str),
+            Some(AGENT_HARNESS_CONTEXT_PACK_SCHEMA)
+        );
+        assert_eq!(
+            value
+                .get("translationApplied")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     fn progress_pending(
@@ -15629,6 +16454,59 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&path);
         path
+    }
+
+    #[test]
+    fn skill_apply_cli_proposes_and_applies_replacement() {
+        let root = cli_temp_root("skill_apply_cli_proposes_and_applies_replacement");
+        let harness_home = root.join(".agent-harness");
+        let skill_file = root.join("skills").join("triage").join("SKILL.md");
+        fs::create_dir_all(skill_file.parent().unwrap()).unwrap();
+        fs::write(&skill_file, "# Triage\n\nOld body.\n").unwrap();
+
+        run_skill_propose(&[
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--skill".to_string(),
+            "workspace:triage".to_string(),
+            "--target-path".to_string(),
+            skill_file.display().to_string(),
+            "--operation".to_string(),
+            "replace".to_string(),
+            "--body".to_string(),
+            "# Triage\n\nNew body.\n".to_string(),
+        ])
+        .unwrap();
+        let proposals_text = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("learning")
+                .join("skill-proposals.jsonl"),
+        )
+        .unwrap();
+        let proposal: serde_json::Value =
+            serde_json::from_str(proposals_text.lines().next().unwrap()).unwrap();
+        let proposal_id = proposal
+            .get("proposalId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string();
+
+        run_skill_apply(&[
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--proposal".to_string(),
+            proposal_id,
+        ])
+        .unwrap();
+
+        assert!(
+            fs::read_to_string(&skill_file)
+                .unwrap()
+                .contains("New body")
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -16000,6 +16878,79 @@ mod tests {
         assert!(context.contains("fileIdPresent=yes"));
         assert!(!context.contains("raw-photo-file-id"));
         assert!(!context.contains("raw-doc-file-id"));
+    }
+
+    #[test]
+    fn telegram_media_only_message_uses_placeholder_and_redacted_context() {
+        let message = serde_json::json!({
+            "message_id": 12,
+            "photo": [
+                {
+                    "file_id": "raw-media-only-file-id",
+                    "width": 640,
+                    "height": 480,
+                    "file_size": 200
+                }
+            ]
+        });
+
+        assert_eq!(
+            telegram_message_text(&message, false),
+            Some("[telegram media message]".to_string())
+        );
+        let context = telegram_inbound_context(&message).unwrap();
+        assert!(context.contains("kind=photo"));
+        assert!(context.contains("fileIdPresent=yes"));
+        assert!(!context.contains("raw-media-only-file-id"));
+    }
+
+    #[test]
+    fn telegram_media_group_context_uses_first_caption_and_redacts_file_ids() {
+        let flush = telegram_media::TelegramMediaGroupFlush {
+            account_id: "default".to_string(),
+            chat_id: "-1001".to_string(),
+            media_group_id: "album-1".to_string(),
+            status: telegram_media::TelegramMediaGroupStatus::GroupFlushed,
+            members: vec![
+                telegram_media::TelegramMediaGroupMember {
+                    update_id: 101,
+                    message_id: Some("11".to_string()),
+                    caption_preview: Some("first caption".to_string()),
+                    message: serde_json::json!({
+                        "message_id": 11,
+                        "media_group_id": "album-1",
+                        "caption": "first caption",
+                        "chat": { "id": -1001, "type": "supergroup" },
+                        "from": { "id": 123 },
+                        "photo": [{"file_id":"raw-first-file-id","width":320,"height":240,"file_size":100}]
+                    }),
+                },
+                telegram_media::TelegramMediaGroupMember {
+                    update_id: 102,
+                    message_id: Some("12".to_string()),
+                    caption_preview: Some("second caption".to_string()),
+                    message: serde_json::json!({
+                        "message_id": 12,
+                        "media_group_id": "album-1",
+                        "caption": "second caption",
+                        "chat": { "id": -1001, "type": "supergroup" },
+                        "from": { "id": 123 },
+                        "photo": [{"file_id":"raw-second-file-id","width":640,"height":480,"file_size":200}]
+                    }),
+                },
+            ],
+        };
+
+        assert_eq!(telegram_media_group_message_text(&flush), "first caption");
+        let context = telegram_media_group_inbound_context(&flush).unwrap();
+        assert!(context.contains("mediaGroupId: album-1"));
+        assert!(context.contains("memberCount: 2"));
+        assert!(context.contains("messageId=11"));
+        assert!(context.contains("captionPreview=first caption"));
+        assert!(context.contains("kind=photo"));
+        assert!(context.contains("fileIdPresent=yes"));
+        assert!(!context.contains("raw-first-file-id"));
+        assert!(!context.contains("raw-second-file-id"));
     }
 
     #[test]

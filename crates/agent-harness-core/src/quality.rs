@@ -241,6 +241,46 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "proposal JSON may add review fields in v1",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.skill-invocation-envelope.v1",
+            owner_module: "skill_envelope",
+            compatibility: "byte-framed envelope; declared length/checksum fields are stable in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-selection.v1",
+            owner_module: "skills",
+            compatibility: "append-only selection receipts; matcher metadata and score components may add fields in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.prompt-injection-ledger.v2",
+            owner_module: "prompt",
+            compatibility: "v2 skill entries are keyed by session, agent, skill id, body checksum, and delivery mode; v1 path/fingerprint ledgers remain readable for one release cycle",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-usage.v1",
+            owner_module: "skill_usage",
+            compatibility: "append-only usage JSONL; action enum additions require status and curator compatibility tests",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-usage-snapshot.v1",
+            owner_module: "skill_usage",
+            compatibility: "derived compact status artifact; rebuildable from skill-usage JSONL",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-proposal.v1",
+            owner_module: "skill_learning",
+            compatibility: "append-only proposal state records; apply requires checksum match and explicit operator action",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-apply-receipt.v1",
+            owner_module: "skill_apply",
+            compatibility: "append-only apply receipts; stale-base quarantine semantics are stable in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.learning-review.v1",
+            owner_module: "skill_learning",
+            compatibility: "deterministic review reports only; worker must not mutate skill files directly",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.drift-report.v1",
             owner_module: "autonomy",
             compatibility: "additive fields only in v1",
@@ -248,7 +288,12 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.context-pack.v1",
             owner_module: "memory_contracts",
-            compatibility: "breaking memory contract changes require v2 and fail-open consumer tests",
+            compatibility: "canonical normalized memory context pack; breaking changes require v2 and fail-open consumer tests",
+        },
+        SchemaRegistryEntry {
+            schema: "openclaw-mem.context-pack.v1",
+            owner_module: "memory_contracts",
+            compatibility: "accepted producer schema translated to agent-harness.context-pack.v1; unknown versions fail open",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.security-scan.v1",

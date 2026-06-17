@@ -7,6 +7,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::memory::{
+    MemoryMemEngineCanaryReport, MemoryMemEngineOwnershipReport, MemorySemanticCoverageReport,
+    collect_memory_embedding_coverage, collect_memory_semantic_coverage,
+    memory_adapter_readiness_report, memory_capability_mode_from_readiness,
+    memory_mem_engine_ownership_report_for_owner_state, memory_qdrant_native_recall_status,
+};
+use crate::memory_owner::{MemoryOwnerState, read_memory_owner_state_or_default};
+use crate::skill_apply::skill_apply_receipts_file;
+use crate::skill_learning::skill_proposals_file;
+use crate::skill_usage::{skill_usage_events_file, skill_usage_snapshot_file};
 use crate::{
     ActivationReadinessOptions, ActivationReadinessReport, ActivationReadinessStatus,
     ChannelOutboxPlanSummary, CronRunSummary, WorkerStatusOptions, WorkerStatusReport,
@@ -36,6 +46,7 @@ pub struct HarnessStatusReport {
     pub cron_scheduler: HarnessCronSchedulerStatus,
     pub cron_runs: HarnessCronRunStatus,
     pub memory: HarnessMemoryStatus,
+    pub learning: HarnessLearningStatus,
     pub plugins: HarnessPluginStatus,
     pub logs: HarnessOperationalLogStatus,
     pub warnings: Vec<String>,
@@ -172,6 +183,9 @@ pub struct HarnessMemoryStatus {
     pub hook_receipts: HarnessJsonlStatus,
     pub store_proposals: HarnessJsonlStatus,
     pub slot_receipts: HarnessJsonlStatus,
+    pub recall_plan_receipts: HarnessJsonlStatus,
+    pub graph_freshness_receipts: HarnessJsonlStatus,
+    pub provenance_chain_receipts: HarnessJsonlStatus,
     pub capture_candidates: HarnessJsonlStatus,
     pub summary: HarnessMemoryHealthSummary,
 }
@@ -181,13 +195,32 @@ pub struct HarnessMemoryStatus {
 pub struct HarnessMemoryHealthSummary {
     pub active_recall_backend: String,
     pub qdrant_parity: String,
+    pub adapter_readiness: String,
+    pub capability_mode: String,
+    pub mem_engine_ownership: MemoryMemEngineOwnershipReport,
+    pub qdrant_native_recall: String,
+    pub semantic_coverage: MemorySemanticCoverageReport,
     pub prompt_context_status: Option<String>,
     pub lifecycle_status: Option<String>,
     pub canvas_status: Option<String>,
     pub hook_status: Option<String>,
+    pub recall_plan_status: Option<String>,
+    pub graph_freshness_status: Option<String>,
+    pub provenance_chain_status: Option<String>,
     pub capture_candidate_count: usize,
     pub store_proposal_count: usize,
     pub slot_receipt_count: usize,
+    pub provenance_chain_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessLearningStatus {
+    pub skill_usage_events: HarnessJsonlStatus,
+    pub skill_usage_snapshot_file: PathBuf,
+    pub skill_usage_snapshot_present: bool,
+    pub skill_proposals: HarnessJsonlStatus,
+    pub skill_apply_receipts: HarnessJsonlStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -262,6 +295,7 @@ pub fn collect_harness_status(options: HarnessStatusOptions) -> io::Result<Harne
     let cron_scheduler = cron_scheduler_status(&options.harness_home)?;
     let cron_runs = cron_runs_status(&options.harness_home)?;
     let memory = memory_status(&options.harness_home)?;
+    let learning = learning_status(&options.harness_home)?;
     let plugins = plugin_status(&options.harness_home)?;
 
     Ok(HarnessStatusReport {
@@ -276,9 +310,21 @@ pub fn collect_harness_status(options: HarnessStatusOptions) -> io::Result<Harne
         cron_scheduler,
         cron_runs,
         memory,
+        learning,
         plugins,
         logs,
         warnings,
+    })
+}
+
+fn learning_status(harness_home: &Path) -> io::Result<HarnessLearningStatus> {
+    let snapshot_file = skill_usage_snapshot_file(harness_home);
+    Ok(HarnessLearningStatus {
+        skill_usage_events: jsonl_status(skill_usage_events_file(harness_home))?,
+        skill_usage_snapshot_present: snapshot_file.is_file(),
+        skill_usage_snapshot_file: snapshot_file,
+        skill_proposals: jsonl_status(skill_proposals_file(harness_home))?,
+        skill_apply_receipts: jsonl_status(skill_apply_receipts_file(harness_home))?,
     })
 }
 
@@ -551,10 +597,26 @@ fn memory_status(harness_home: &Path) -> io::Result<HarnessMemoryStatus> {
     let hook_receipts = jsonl_status(memory_state_dir.join("hook-receipts.jsonl"))?;
     let store_proposals = jsonl_status(memory_state_dir.join("store-proposals.jsonl"))?;
     let slot_receipts = jsonl_status(memory_state_dir.join("slot-receipts.jsonl"))?;
+    let recall_plan_receipts = jsonl_status(memory_state_dir.join("recall-plan-receipts.jsonl"))?;
+    let graph_freshness_receipts = jsonl_status(
+        memory_state_dir
+            .join("graph")
+            .join("freshness-receipts.jsonl"),
+    )?;
+    let provenance_chain_receipts =
+        jsonl_status(memory_state_dir.join("provenance-chain-receipts.jsonl"))?;
     let capture_candidates = jsonl_status(memory_state_dir.join("auto-capture-candidates.jsonl"))?;
+    let embedding_coverage = collect_memory_embedding_coverage(harness_home);
+    let semantic_coverage =
+        collect_memory_semantic_coverage(harness_home, None, &embedding_coverage)?;
+    let memory_owner_state =
+        read_memory_owner_state_or_default(harness_home, epoch_ms().unwrap_or(0))?;
     let summary = memory_health_summary(
+        &memory_dir,
         qdrant_edge,
         legacy_mem_sqlite,
+        &semantic_coverage,
+        &memory_owner_state,
         &vector_recall_receipts,
         &prompt_context_receipts,
         &lifecycle_receipts,
@@ -562,6 +624,9 @@ fn memory_status(harness_home: &Path) -> io::Result<HarnessMemoryStatus> {
         &hook_receipts,
         &store_proposals,
         &slot_receipts,
+        &recall_plan_receipts,
+        &graph_freshness_receipts,
+        &provenance_chain_receipts,
         &capture_candidates,
     );
     Ok(HarnessMemoryStatus {
@@ -579,6 +644,9 @@ fn memory_status(harness_home: &Path) -> io::Result<HarnessMemoryStatus> {
         hook_receipts,
         store_proposals,
         slot_receipts,
+        recall_plan_receipts,
+        graph_freshness_receipts,
+        provenance_chain_receipts,
         capture_candidates,
         summary,
         memory_dir,
@@ -586,8 +654,11 @@ fn memory_status(harness_home: &Path) -> io::Result<HarnessMemoryStatus> {
 }
 
 fn memory_health_summary(
+    memory_dir: &Path,
     qdrant_edge: bool,
     legacy_mem_sqlite: bool,
+    semantic_coverage: &MemorySemanticCoverageReport,
+    memory_owner_state: &MemoryOwnerState,
     vector_recall_receipts: &HarnessJsonlStatus,
     prompt_context_receipts: &HarnessJsonlStatus,
     lifecycle_receipts: &HarnessJsonlStatus,
@@ -595,6 +666,9 @@ fn memory_health_summary(
     hook_receipts: &HarnessJsonlStatus,
     store_proposals: &HarnessJsonlStatus,
     slot_receipts: &HarnessJsonlStatus,
+    recall_plan_receipts: &HarnessJsonlStatus,
+    graph_freshness_receipts: &HarnessJsonlStatus,
+    provenance_chain_receipts: &HarnessJsonlStatus,
     capture_candidates: &HarnessJsonlStatus,
 ) -> HarnessMemoryHealthSummary {
     let vector_status = vector_recall_receipts.latest_status.as_deref();
@@ -608,6 +682,35 @@ fn memory_health_summary(
     } else {
         "none".to_string()
     };
+    let has_local_backend = legacy_mem_sqlite
+        || semantic_coverage.observations.items.unwrap_or(0) > 0
+        || semantic_coverage.episodic_events.items.unwrap_or(0) > 0
+        || semantic_coverage.service_writeback.items.unwrap_or(0) > 0;
+    let adapter_readiness =
+        memory_adapter_readiness_report(has_local_backend, qdrant_edge, false, true);
+    let capability_mode = memory_capability_mode_from_readiness(&adapter_readiness);
+    let mem_engine_state = memory_dir
+        .join("openclaw-mem-engine")
+        .join("sunrise_state.json");
+    let qdrant_edge_mode = if qdrant_edge {
+        "preserved-snapshot"
+    } else {
+        "missing"
+    };
+    let mem_engine_canary = MemoryMemEngineCanaryReport {
+        status: if mem_engine_state.is_file() {
+            "available-not-promoted".to_string()
+        } else {
+            "not-available".to_string()
+        },
+        active_slot_owner: "snapshot-adapter".to_string(),
+        engine_state_file: mem_engine_state.is_file().then_some(mem_engine_state),
+        rollback_slot_owner: "snapshot-adapter".to_string(),
+        qdrant_edge_mode: qdrant_edge_mode.to_string(),
+        warnings: Vec::new(),
+    };
+    let mem_engine_ownership =
+        memory_mem_engine_ownership_report_for_owner_state(&mem_engine_canary, memory_owner_state);
     let qdrant_parity = if active_recall_backend
         .to_ascii_lowercase()
         .contains("qdrant")
@@ -621,13 +724,22 @@ fn memory_health_summary(
     HarnessMemoryHealthSummary {
         active_recall_backend,
         qdrant_parity,
+        adapter_readiness: adapter_readiness.status,
+        capability_mode,
+        mem_engine_ownership,
+        qdrant_native_recall: memory_qdrant_native_recall_status(qdrant_edge),
+        semantic_coverage: semantic_coverage.clone(),
         prompt_context_status: prompt_context_receipts.latest_status.clone(),
         lifecycle_status: lifecycle_receipts.latest_status.clone(),
         canvas_status: canvas_receipts.latest_status.clone(),
         hook_status: hook_receipts.latest_status.clone(),
+        recall_plan_status: recall_plan_receipts.latest_status.clone(),
+        graph_freshness_status: graph_freshness_receipts.latest_status.clone(),
+        provenance_chain_status: provenance_chain_receipts.latest_status.clone(),
         capture_candidate_count: capture_candidates.lines,
         store_proposal_count: store_proposals.lines,
         slot_receipt_count: slot_receipts.lines,
+        provenance_chain_count: provenance_chain_receipts.lines,
     }
 }
 
@@ -1422,6 +1534,110 @@ mod tests {
                 .copied(),
             Some(true)
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn harness_status_reports_memory_capability_mode() {
+        let root = temp_root("harness_status_reports_memory_capability_mode");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(harness_home.join("state").join("memory")).unwrap();
+        fs::create_dir_all(harness_home.join("memory").join("qdrant-edge")).unwrap();
+
+        crate::memory::store_openclaw_mem_service_memory(
+            crate::memory::OpenClawMemServiceStoreOptions {
+                harness_home: harness_home.clone(),
+                agent_id: None,
+                session_key: Some("telegram:dm:user:main".to_string()),
+                text: "Global OpenClawMem service writeback".to_string(),
+                payload: serde_json::json!({"source": "status-test"}),
+                approved: true,
+                now_ms: 1_800_000_010_000,
+            },
+        )
+        .unwrap();
+        crate::memory::propose_openclaw_mem_service_memory(
+            crate::memory::OpenClawMemServiceProposeOptions {
+                harness_home: harness_home.clone(),
+                agent_id: None,
+                session_key: Some("telegram:dm:user:main".to_string()),
+                text: "Global OpenClawMem active store proposal".to_string(),
+                payload: serde_json::json!({"source": "status-test"}),
+                now_ms: 1_800_000_010_001,
+            },
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("memory")
+                .join("store-proposals.jsonl"),
+            r#"{"status":"pending-review","kind":"generic-store-proposal"}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("memory")
+                .join("slot-receipts.jsonl"),
+            r#"{"status":"recorded","owner":"snapshot-adapter"}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("memory")
+                .join("auto-capture-candidates.jsonl"),
+            r#"{"kind":"candidate","text":"remember capability mode"}"#,
+        )
+        .unwrap();
+
+        let report = collect_harness_status(HarnessStatusOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+
+        assert_eq!(report.memory.summary.active_recall_backend, "none");
+        assert_eq!(
+            report.memory.summary.qdrant_parity,
+            "snapshot-preserved; native-recall-not-active"
+        );
+        assert_eq!(report.memory.summary.adapter_readiness, "ready");
+        assert_eq!(
+            report.memory.summary.capability_mode,
+            "snapshot-adapter-ready"
+        );
+        assert_eq!(
+            report.memory.summary.mem_engine_ownership.active_owner,
+            "snapshot-adapter"
+        );
+        assert!(!report.memory.summary.mem_engine_ownership.promotion_ready);
+        assert_eq!(
+            report.memory.summary.qdrant_native_recall,
+            "snapshot-preserved-native-recall-inactive"
+        );
+        assert_eq!(
+            report
+                .memory
+                .summary
+                .semantic_coverage
+                .service_writeback
+                .items,
+            Some(1)
+        );
+        assert_eq!(
+            report
+                .memory
+                .summary
+                .semantic_coverage
+                .active_store_proposals
+                .items,
+            Some(1)
+        );
+        assert_eq!(report.memory.summary.capture_candidate_count, 1);
+        assert_eq!(report.memory.summary.store_proposal_count, 1);
+        assert_eq!(report.memory.summary.slot_receipt_count, 1);
 
         let _ = fs::remove_dir_all(root);
     }

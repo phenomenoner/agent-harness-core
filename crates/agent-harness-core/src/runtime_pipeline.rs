@@ -12,13 +12,15 @@ use crate::{
     ChannelOutboundMessage, ChannelOutboundMessageKind, CodexRuntimePlan, CodexRuntimePlanOptions,
     CodexRuntimePlanReport, CodexRuntimeReceiptStatus, CodexRuntimeRunOptions,
     CodexRuntimeRunReport, CodexRuntimeRunStatus, HarnessLogEvent, HarnessLogLevel,
-    MemoryLifecycleTurnOptions, PromptAssemblyOptions, ResponseToneConfig, ResponseToneContext,
-    RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
-    RuntimeQueuePreparedItem, append_agent_progress_event, append_harness_log, apply_response_tone,
-    current_log_time_ms, inspect_runtime_backoff_policy, load_assistant_narration_config,
-    load_response_tone_config, mark_cron_run_runtime_status_by_queue_id, plan_codex_runtime,
-    prepare_runtime_queue_item, read_channel_session_state, record_memory_lifecycle_turn,
-    release_runtime_queue_lease, run_codex_runtime, write_json_atomic,
+    InboundMediaArtifact, MemoryLifecycleTurnOptions, PromptAssemblyOptions, ResponseToneConfig,
+    ResponseToneContext, RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions,
+    RuntimeQueuePrepareReport, RuntimeQueuePreparedItem, append_agent_progress_event,
+    append_harness_log, apply_response_tone, current_log_time_ms, inspect_runtime_backoff_policy,
+    load_assistant_narration_config, load_response_tone_config,
+    mark_cron_run_runtime_status_by_queue_id, plan_codex_runtime, prepare_runtime_queue_item,
+    read_channel_session_state, record_memory_lifecycle_turn,
+    record_skill_usage_from_prompt_bundle, release_runtime_queue_lease, run_codex_runtime,
+    write_json_atomic,
 };
 
 const RUNTIME_RUN_ONCE_SCHEMA: &str = "agent-harness.runtime-run-once.v1";
@@ -109,6 +111,20 @@ impl RuntimeRunOnceStatus {
     }
 }
 
+fn should_record_failed_memory_lifecycle(status: &RuntimeRunOnceStatus) -> bool {
+    matches!(
+        status,
+        RuntimeRunOnceStatus::PreflightBlocked
+            | RuntimeRunOnceStatus::SpawnFailed
+            | RuntimeRunOnceStatus::ProtocolError
+            | RuntimeRunOnceStatus::ContextExhausted
+            | RuntimeRunOnceStatus::Timeout
+            | RuntimeRunOnceStatus::DeadLetter
+            | RuntimeRunOnceStatus::FailedTerminal
+            | RuntimeRunOnceStatus::Canceled
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RuntimeDeadLetterReceipt {
@@ -129,6 +145,7 @@ struct QueueChannelContext {
     user_id: String,
     session_key: String,
     inbound_context: Option<String>,
+    inbound_media_artifacts: Vec<InboundMediaArtifact>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -322,6 +339,16 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             &mut warnings,
         );
     }
+    if let Some(codex_plan) = plan.plan.as_ref()
+        && let Err(error) = record_skill_usage_from_prompt_bundle(
+            &options.harness_home,
+            &codex_plan.prompt_bundle_json,
+            codex_plan.queue_id.as_deref(),
+            "runtime-plan",
+        )
+    {
+        warnings.push(format!("skill usage ledger recording failed: {error}"));
+    }
 
     let run = run_codex_runtime(CodexRuntimeRunOptions {
         harness_home: options.harness_home.clone(),
@@ -393,6 +420,22 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             run.receipt.elapsed_ms,
             &mut warnings,
         );
+    }
+    if should_record_failed_memory_lifecycle(&receipt_status)
+        && let Some(codex_plan) = plan.plan.as_ref()
+    {
+        match record_memory_lifecycle_turn(MemoryLifecycleTurnOptions {
+            harness_home: options.harness_home.clone(),
+            prompt_bundle_json: codex_plan.prompt_bundle_json.clone(),
+            assistant_text: format!("runtime {}: {}", receipt_status.as_str(), receipt_reason),
+            success: false,
+            now_ms: current_log_time_ms()?,
+        }) {
+            Ok(memory) => warnings.extend(memory.warnings),
+            Err(error) => warnings.push(format!(
+                "failed-turn memory lifecycle recording failed: {error}"
+            )),
+        }
     }
     let mut outbox_file = None;
     let mut outbound_message = None;
@@ -1072,6 +1115,7 @@ fn channel_context_from_prepared_item(item: &RuntimeQueuePreparedItem) -> QueueC
         user_id: item.user_id.clone(),
         session_key: item.session_key.clone(),
         inbound_context: item.inbound_context.clone(),
+        inbound_media_artifacts: item.inbound_media_artifacts.clone(),
     }
 }
 
@@ -1152,6 +1196,10 @@ fn find_queue_channel_context(
                 .to_string(),
             inbound_context: string_field(&value, &["inboundContext", "inbound_context"])
                 .map(ToString::to_string),
+            inbound_media_artifacts: inbound_media_artifacts_field(
+                &value,
+                &["inboundMediaArtifacts", "inbound_media_artifacts"],
+            ),
         }));
     }
     warnings.push(format!(
@@ -1399,6 +1447,16 @@ fn string_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
     None
 }
 
+fn inbound_media_artifacts_field(value: &Value, keys: &[&str]) -> Vec<InboundMediaArtifact> {
+    for key in keys {
+        if let Some(artifacts) = value.get(*key) {
+            return serde_json::from_value::<Vec<InboundMediaArtifact>>(artifacts.clone())
+                .unwrap_or_default();
+        }
+    }
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1521,6 +1579,7 @@ mod tests {
             session_key: None,
             message: "repair memory cron".to_string(),
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -1630,6 +1689,7 @@ mod tests {
             session_key: None,
             message: "repair memory cron".to_string(),
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -1681,6 +1741,7 @@ mod tests {
             session_key: None,
             message: "repair memory cron".to_string(),
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -1743,6 +1804,7 @@ mod tests {
             session_key: None,
             message: "run a blocked command".to_string(),
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -1928,6 +1990,7 @@ mod tests {
             session_key: None,
             message: "keep my session while reconnecting".to_string(),
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -2031,6 +2094,7 @@ mod tests {
             session_key: None,
             message: "old in-flight request".to_string(),
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -2050,6 +2114,7 @@ mod tests {
             session_key: None,
             message: "/new".to_string(),
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             skill_limit: 3,
             now_ms: 1235,
         })
@@ -2116,6 +2181,7 @@ mod tests {
             session_key: None,
             message: "repair memory cron".to_string(),
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             skill_limit: 3,
             now_ms: 1234,
         })

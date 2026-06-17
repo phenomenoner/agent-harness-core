@@ -12,13 +12,14 @@ use serde_json::{Value, json};
 
 use crate::{
     AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
-    HarnessLogEvent, HarnessLogLevel, append_agent_progress_event, append_harness_log,
+    HarnessLogEvent, HarnessLogLevel, InboundMediaArtifact, InboundMediaInputPlan,
+    InboundMediaInputPlanOptions, append_agent_progress_event, append_harness_log,
     config::{
         HarnessConfigValidationReport, HarnessConfigValidationStatus, validate_harness_config,
     },
     current_log_time_ms,
     live_control::{classify_approval_request, is_live_harness_home},
-    write_json_atomic,
+    plan_inbound_media_inputs, write_json_atomic,
 };
 
 const CODEX_RUNTIME_PLAN_SCHEMA: &str = "agent-harness.codex-runtime-plan.v1";
@@ -238,6 +239,7 @@ pub struct CodexRuntimePlan {
     pub model: Option<String>,
     pub prompt_bundle_json: PathBuf,
     pub prompt_markdown: PathBuf,
+    pub media_plan: InboundMediaInputPlan,
     pub invocation: CodexInvocationPlan,
     pub outputs: CodexOutputPlan,
 }
@@ -449,6 +451,8 @@ pub struct CodexRuntimeRunReceipt {
     pub event_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<CodexRuntimeUsage>,
+    #[serde(default, skip_serializing_if = "InboundMediaInputPlan::is_empty")]
+    pub media_plan: InboundMediaInputPlan,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_recovery: Option<CodexContextRecoveryReceipt>,
 }
@@ -638,6 +642,8 @@ struct CodexRuntimePlanFile {
     pub model: Option<String>,
     pub prompt_bundle_json: PathBuf,
     pub prompt_markdown: PathBuf,
+    #[serde(default)]
+    pub media_plan: InboundMediaInputPlan,
     pub invocation: CodexInvocationPlan,
     pub outputs: CodexOutputPlan,
 }
@@ -736,6 +742,18 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
     let agent_id = string_field(&bundle, &["agentId", "agent_id"]).map(ToString::to_string);
     let provider = string_field(&bundle, &["provider"]).map(ToString::to_string);
     let model = string_field(&bundle, &["model"]).map(ToString::to_string);
+    let inbound_media_artifacts =
+        inbound_media_artifacts_from_prepared_receipt(&prepared_receipt, &mut warnings);
+    let native_image_input_enabled = codex_native_media_input_enabled();
+    let media_plan = plan_inbound_media_inputs(
+        InboundMediaInputPlanOptions {
+            harness_home: options.harness_home.clone(),
+            native_image_input_enabled,
+            vision_tool_available: true,
+        },
+        &inbound_media_artifacts,
+    );
+    warnings.extend(media_plan.warnings.clone());
     let transcript_file = transcript_file(&options.harness_home, agent_id.as_deref(), &session_key);
     let trajectory_file = trajectory_file(&transcript_file);
     let codex_binding_file = codex_binding_file(&transcript_file);
@@ -799,6 +817,7 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
         model,
         prompt_bundle_json,
         prompt_markdown,
+        media_plan,
         invocation,
         outputs,
     };
@@ -1131,6 +1150,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 elapsed_ms: 0,
                 event_count: 0,
                 usage: None,
+                media_plan: InboundMediaInputPlan::default(),
                 context_recovery: None,
             };
             append_codex_run_log(
@@ -1173,6 +1193,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 elapsed_ms: 0,
                 event_count: 0,
                 usage: None,
+                media_plan: InboundMediaInputPlan::default(),
                 context_recovery: None,
             };
             append_codex_run_log(
@@ -1219,6 +1240,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             elapsed_ms: 0,
             event_count: 0,
             usage: None,
+            media_plan: InboundMediaInputPlan::default(),
             context_recovery: None,
         };
         append_codex_run_log(
@@ -1269,6 +1291,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             elapsed_ms: 0,
             event_count: 0,
             usage: None,
+            media_plan: plan.media_plan.clone(),
             context_recovery: None,
         };
         append_codex_run_log(
@@ -1446,6 +1469,7 @@ fn finish_codex_runtime_run(
         elapsed_ms,
         event_count: run_result.event_count,
         usage: run_result.usage,
+        media_plan: plan.media_plan.clone(),
         context_recovery: run_result.context_recovery,
     };
     let log_level = match receipt.status {
@@ -2855,6 +2879,19 @@ fn drive_codex_app_server(
     let prompt_input = fs::read_to_string(&plan.invocation.prompt_input_file)?;
     let turn_sandbox_policy =
         app_server_sandbox_policy_value(&app_server_sandbox, &runtime_workspace_root);
+    let mut input_parts = vec![json!({
+        "type": "text",
+        "text": prompt_input
+    })];
+    for part in &plan.media_plan.native_input_parts {
+        input_parts.push(json!({
+            "type": "image",
+            "path": part.local_path.to_string_lossy().to_string(),
+            "mimeType": part.mime.clone(),
+            "artifactUri": part.artifact_uri.clone(),
+            "sha256": part.sha256.clone()
+        }));
+    }
     let turn_params = json!({
         "threadId": thread_id.clone(),
         "cwd": runtime_workspace_root,
@@ -2866,12 +2903,7 @@ fn drive_codex_app_server(
                 .to_string_lossy()
                 .to_string()
         ],
-        "input": [
-            {
-                "type": "text",
-                "text": prompt_input
-            }
-        ]
+        "input": input_parts
     });
     write_json_rpc(
         &mut stdin,
@@ -6301,6 +6333,39 @@ fn read_json_file_as<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T>
     serde_json::from_str(&text).map_err(io::Error::other)
 }
 
+fn inbound_media_artifacts_from_prepared_receipt(
+    prepared_receipt: &Value,
+    warnings: &mut Vec<String>,
+) -> Vec<InboundMediaArtifact> {
+    let Some(value) = prepared_receipt
+        .get("inboundMediaArtifacts")
+        .or_else(|| prepared_receipt.get("inbound_media_artifacts"))
+    else {
+        return Vec::new();
+    };
+    match serde_json::from_value::<Vec<InboundMediaArtifact>>(value.clone()) {
+        Ok(artifacts) => artifacts,
+        Err(error) => {
+            warnings.push(format!(
+                "prepared execution receipt inboundMediaArtifacts could not be parsed; media input planner disabled: {error}"
+            ));
+            Vec::new()
+        }
+    }
+}
+
+fn codex_native_media_input_enabled() -> bool {
+    env::var("AGENT_HARNESS_CODEX_NATIVE_MEDIA_INPUT")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "enabled" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn append_json_line(path: &Path, value: &impl Serialize) -> io::Result<()> {
     crate::append_jsonl_value(path, value)
 }
@@ -6790,9 +6855,9 @@ fn normalize_key_part(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
-        PromptAssemblyOptions, RuntimeQueueEnqueueOptions, RuntimeQueuePrepareOptions,
-        TurnPlanInput, build_channel_step, build_source_skill_index, build_turn_plan,
-        enqueue_channel_step, load_agent_registry, prepare_runtime_queue_item,
+        InboundMediaModelAttachmentStatus, PromptAssemblyOptions, RuntimeQueueEnqueueOptions,
+        RuntimeQueuePrepareOptions, TurnPlanInput, build_channel_step, build_source_skill_index,
+        build_turn_plan, enqueue_channel_step, load_agent_registry, prepare_runtime_queue_item,
         runtime_worker::release_runtime_queue_lease,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -6929,6 +6994,62 @@ mod tests {
                 .codex_binding_file
                 .to_string_lossy()
                 .ends_with(".jsonl.codex-app-server.json")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_media_plan_records_vision_fallback_from_prepared_receipt() {
+        let root = temp_root("codex_media_plan_records_vision_fallback_from_prepared_receipt");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let execution_dir = latest_prepared_execution_dir(&harness_home);
+        let attachment = crate::inbound_media_attachment_root(&harness_home)
+            .join("update-1")
+            .join("0.png");
+        fs::create_dir_all(attachment.parent().unwrap()).unwrap();
+        fs::write(&attachment, b"\x89PNG\r\n\x1a\n0000000000000000").unwrap();
+        let receipt_file = execution_dir.join("execution-receipt.json");
+        let mut receipt: Value = serde_json::from_slice(&fs::read(&receipt_file).unwrap()).unwrap();
+        receipt["inboundMediaArtifacts"] = json!([
+            {
+                "platform": "telegram",
+                "kind": "photo",
+                "localPath": attachment,
+                "artifactUri": "agent-harness://inbound-media/telegram/update-1/0.png",
+                "mime": "image/png",
+                "downloadStatus": "downloaded",
+                "modelAttachmentStatus": "prompt-only",
+                "source": "telegram.getFile"
+            }
+        ]);
+        fs::write(
+            &receipt_file,
+            serde_json::to_string_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+
+        let report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: Some(execution_dir),
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+
+        let plan = report.plan.unwrap();
+        assert_eq!(plan.media_plan.artifacts.len(), 1);
+        assert!(plan.media_plan.native_input_parts.is_empty());
+        assert_eq!(
+            plan.media_plan.artifacts[0].model_attachment_status,
+            InboundMediaModelAttachmentStatus::VisionToolAvailable
+        );
+        let plan_file: Value =
+            serde_json::from_slice(&fs::read(report.plan_file.unwrap()).unwrap()).unwrap();
+        assert_eq!(
+            plan_file["mediaPlan"]["artifacts"][0]["modelAttachmentStatus"],
+            "vision-tool-available"
         );
 
         let _ = fs::remove_dir_all(root);
@@ -8566,6 +8687,7 @@ mod tests {
                 user_id: "user-7".to_string(),
                 text: "repair memory cron".to_string(),
                 inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,

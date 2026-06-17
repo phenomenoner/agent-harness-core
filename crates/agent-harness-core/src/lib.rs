@@ -27,8 +27,11 @@ pub mod importer;
 pub mod live_control;
 pub mod logging;
 pub mod mcp;
+pub mod media;
 pub mod memory;
+pub mod memory_backfill;
 pub mod memory_contracts;
+pub mod memory_owner;
 pub mod metrics;
 pub mod ops;
 pub mod progress;
@@ -42,6 +45,11 @@ pub mod runtime_policy;
 pub mod runtime_queue;
 pub mod runtime_worker;
 pub mod security;
+pub mod skill_apply;
+pub mod skill_envelope;
+pub mod skill_learning;
+pub mod skill_matcher;
+pub mod skill_usage;
 pub mod skills;
 pub mod status;
 pub mod subagents;
@@ -197,48 +205,102 @@ pub use logging::{
     rotate_harness_log_if_needed, write_json_atomic,
 };
 pub use mcp::{McpRequestOptions, McpToolReceipt, handle_mcp_request};
+pub use media::{
+    DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM, DEFAULT_INBOUND_MEDIA_MAX_ITEMS_PER_TURN,
+    INBOUND_MEDIA_ARTIFACT_SCHEMA, INBOUND_MEDIA_CACHE_REPORT_SCHEMA,
+    INBOUND_MEDIA_INPUT_PLAN_SCHEMA, INBOUND_MEDIA_SAFETY_REPORT_SCHEMA,
+    INBOUND_MEDIA_VISION_ANALYSIS_SCHEMA, InboundMediaArtifact, InboundMediaCacheReport,
+    InboundMediaDownloadStatus, InboundMediaInputPlan, InboundMediaInputPlanOptions,
+    InboundMediaModelAttachmentStatus, InboundMediaNativeInputPart, InboundMediaSafetyPolicy,
+    InboundMediaSafetyReport, InboundMediaSelectedVariant, InboundMediaVisionAnalysis,
+    analyze_inbound_media_file, collect_inbound_media_cache_report, inbound_media_attachment_root,
+    plan_inbound_media_inputs, render_inbound_media_artifacts_for_prompt,
+    resolve_inbound_media_artifact_reference, validate_inbound_media_artifact_paths,
+    validate_inbound_media_safety,
+};
 pub use memory::{
-    MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport, MemoryCanvasWorkerStatus,
-    MemoryCredentialBridgeReport, MemoryCredentialsExportEntry, MemoryCredentialsExportOptions,
-    MemoryCredentialsExportReport, MemoryEmbeddingCoverageReport, MemoryGraphReadinessReport,
-    MemoryHookAdapterOptions, MemoryHookKind, MemoryHookReport, MemoryHookStatus,
-    MemoryLifecycleReport, MemoryLifecycleStatus, MemoryLifecycleTurnOptions,
-    MemoryMemEngineCanaryReport, MemoryPromptContextOptions, MemoryPromptContextReport,
-    MemoryPromptContextStatus, MemoryScopePolicyReport, MemorySearchHit, MemorySearchOptions,
-    MemorySearchReport, MemorySearchStatus, MemoryTrustPolicyReport, MemoryVectorHit,
-    MemoryVectorRecallOptions, MemoryVectorRecallReport, MemoryVectorRecallStatus,
-    OpenClawMemReadPathSmokeOptions, OpenClawMemReadPathSmokeReport, OpenClawMemServiceHit,
-    OpenClawMemServiceProposalReport, OpenClawMemServiceProposalStatus,
+    MemoryAdapterReadinessReport, MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport,
+    MemoryCanvasWorkerStatus, MemoryCredentialBridgeReport, MemoryCredentialsExportEntry,
+    MemoryCredentialsExportOptions, MemoryCredentialsExportReport, MemoryEmbeddingCoverageReport,
+    MemoryGraphFreshnessOptions, MemoryGraphFreshnessReport, MemoryGraphFreshnessStatus,
+    MemoryGraphReadinessReport, MemoryHookAdapterOptions, MemoryHookKind, MemoryHookReport,
+    MemoryHookStatus, MemoryLifecycleReport, MemoryLifecycleStatus, MemoryLifecycleTurnOptions,
+    MemoryMemEngineCanaryReport, MemoryMemEngineOwnershipReport, MemoryPromptContextOptions,
+    MemoryPromptContextReport, MemoryPromptContextStatus, MemoryProvenanceChainOptions,
+    MemoryProvenanceChainReport, MemoryProvenanceChainStatus, MemoryRecallPlanOptions,
+    MemoryRecallPlanReport, MemoryRecallPlanStatus, MemoryRecallSourceBudget,
+    MemoryScopePolicyReport, MemorySearchHit, MemorySearchOptions, MemorySearchReport,
+    MemorySearchStatus, MemorySemanticCoverageLane, MemorySemanticCoverageReport,
+    MemoryTrustPolicyReport, MemoryVectorHit, MemoryVectorRecallOptions, MemoryVectorRecallReport,
+    MemoryVectorRecallStatus, OpenClawMemReadPathSmokeOptions, OpenClawMemReadPathSmokeReport,
+    OpenClawMemServiceHit, OpenClawMemServiceProposalReport, OpenClawMemServiceProposalStatus,
     OpenClawMemServiceProposeOptions, OpenClawMemServiceRecallOptions,
     OpenClawMemServiceRecallReport, OpenClawMemServiceRecallStatus, OpenClawMemServiceStatus,
     OpenClawMemServiceStatusOptions, OpenClawMemServiceStatusReport,
     OpenClawMemServiceStoreOptions, OpenClawMemServiceStoreReport, OpenClawMemServiceStoreStatus,
-    build_memory_prompt_context, export_memory_credentials, inspect_openclaw_mem_service,
+    build_memory_prompt_context, collect_memory_embedding_coverage,
+    collect_memory_semantic_coverage, export_memory_credentials, inspect_openclaw_mem_service,
     memory_canvas_latest_file, memory_canvas_latest_file_for_agent, memory_canvas_receipts_file,
     memory_canvas_receipts_file_for_agent, memory_credentials_env_file,
-    memory_credentials_receipt_file, memory_hook_latest_file, memory_hook_receipts_file,
+    memory_credentials_receipt_file, memory_graph_freshness_latest_file,
+    memory_graph_freshness_receipts_file, memory_hook_latest_file, memory_hook_receipts_file,
     memory_lifecycle_latest_file, memory_lifecycle_latest_file_for_agent,
     memory_lifecycle_receipts_file, memory_lifecycle_receipts_file_for_agent,
     memory_prompt_context_latest_file, memory_prompt_context_latest_file_for_agent,
     memory_prompt_context_receipts_file, memory_prompt_context_receipts_file_for_agent,
-    memory_search_latest_file, memory_search_receipts_file, memory_slot_receipts_file,
-    memory_store_proposals_file, memory_vector_recall_latest_file,
-    memory_vector_recall_receipts_file, openclaw_mem_service_proposal_receipts_file_for_agent,
+    memory_provenance_chain_latest_file, memory_provenance_chain_receipts_file,
+    memory_recall_plan_latest_file, memory_recall_plan_receipts_file, memory_search_latest_file,
+    memory_search_receipts_file, memory_slot_receipts_file, memory_store_proposals_file,
+    memory_vector_recall_latest_file, memory_vector_recall_receipts_file,
+    openclaw_mem_service_proposal_receipts_file_for_agent,
     openclaw_mem_service_proposals_file_for_agent,
     openclaw_mem_service_recall_latest_file_for_agent,
     openclaw_mem_service_recall_receipts_file_for_agent, openclaw_mem_service_status_latest_file,
     openclaw_mem_service_status_receipts_file, openclaw_mem_service_store_file_for_agent,
-    openclaw_mem_service_store_receipts_file_for_agent, propose_openclaw_mem_service_memory,
-    recall_openclaw_mem_service, record_memory_lifecycle_turn, run_memory_canvas_worker,
-    run_memory_hook_adapter, run_openclaw_mem_read_path_smoke, search_imported_memory,
-    search_imported_vector_memory, search_imported_vector_memory_with_embedding,
-    store_openclaw_mem_service_memory, write_memory_prompt_context_receipt,
-    write_memory_search_receipt, write_memory_vector_recall_receipt,
+    openclaw_mem_service_store_receipts_file_for_agent, plan_memory_policy_recall,
+    propose_openclaw_mem_service_memory, recall_openclaw_mem_service,
+    record_memory_graph_freshness, record_memory_lifecycle_turn, record_memory_provenance_chain,
+    run_memory_canvas_worker, run_memory_hook_adapter, run_openclaw_mem_read_path_smoke,
+    search_imported_memory, search_imported_vector_memory,
+    search_imported_vector_memory_with_embedding, store_openclaw_mem_service_memory,
+    write_memory_prompt_context_receipt, write_memory_search_receipt,
+    write_memory_vector_recall_receipt,
+};
+pub use memory_backfill::{
+    DEFAULT_MEMORY_BACKFILL_BATCH_SIZE, DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS,
+    DEFAULT_MEMORY_BACKFILL_MAX_ITEMS, DEFAULT_MEMORY_BACKFILL_RATE_LIMIT_PER_MINUTE,
+    DEFAULT_MEMORY_BACKFILL_RETRY_CAP, DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION,
+    MEMORY_EMBEDDING_BACKFILL_CURSOR_SCHEMA, MEMORY_EMBEDDING_BACKFILL_SCHEMA,
+    MemoryEmbeddingBackfillCursor, MemoryEmbeddingBackfillLane, MemoryEmbeddingBackfillOptions,
+    MemoryEmbeddingBackfillReport, memory_embedding_backfill_cursor_file,
+    memory_embedding_backfill_latest_file, memory_embedding_backfill_receipts_file,
+    run_memory_embedding_backfill,
 };
 pub use memory_contracts::{
-    ContextPackChunk, ContextPackParseOptions, ContextPackParseReport, ContextPackV1,
-    MemoryIngestDecision, ToolDescriptionPinReport, check_tool_description_pin,
-    decide_memory_ingest, parse_context_pack, tool_description_hash,
+    AGENT_HARNESS_CONTEXT_PACK_SCHEMA, ContextPackChunk, ContextPackParseOptions,
+    ContextPackParseReport, ContextPackV1, MemoryIngestDecision, OPENCLAW_MEM_CONTEXT_PACK_SCHEMA,
+    ToolDescriptionPinReport, check_tool_description_pin, decide_memory_ingest, parse_context_pack,
+    tool_description_hash,
+};
+pub use memory_owner::{
+    DEFAULT_MEMORY_OWNER_HEARTBEAT_MAX_AGE_MS, MEM_ENGINE_OWNER,
+    MEMORY_OWNER_ENDPOINT_PROBE_SCHEMA, MEMORY_OWNER_PROMOTION_RECEIPT_SCHEMA,
+    MEMORY_OWNER_ROLLBACK_RECEIPT_SCHEMA, MEMORY_OWNER_SHADOW_RECEIPT_SCHEMA,
+    MEMORY_OWNER_STATE_SCHEMA, MemoryOwnerEndpointProbeOptions, MemoryOwnerEndpointProbeReport,
+    MemoryOwnerEndpointProbeState, MemoryOwnerEnsureOptions, MemoryOwnerHeartbeatOptions,
+    MemoryOwnerHeartbeatReport, MemoryOwnerPromotionGates, MemoryOwnerPromotionOptions,
+    MemoryOwnerPromotionReceipt, MemoryOwnerReceiptRef, MemoryOwnerRecoveryOptions,
+    MemoryOwnerRollbackReceipt, MemoryOwnerShadowKind, MemoryOwnerShadowOptions,
+    MemoryOwnerShadowReceipt, MemoryOwnerState, MemoryOwnerTrustScopeOptions,
+    MemoryOwnerTrustScopeReceipt, OPENCLAW_MEM_REMOTE_SERVICE_CONTRACT, SNAPSHOT_MEMORY_OWNER,
+    default_owner_state, ensure_memory_owner_state, memory_owner_endpoint_probe_receipts_file,
+    memory_owner_heartbeat_receipts_file, memory_owner_promotion_receipts_file,
+    memory_owner_rollback_receipts_file, memory_owner_shadow_receipts_file,
+    memory_owner_state_file, memory_owner_trust_scope_receipts_file, read_memory_owner_state,
+    read_memory_owner_state_or_default, record_memory_owner_endpoint_probe,
+    record_memory_owner_heartbeat, record_memory_owner_shadow_receipt,
+    record_memory_owner_trust_scope_receipt, recover_memory_owner_state,
+    request_memory_owner_promotion,
 };
 pub use metrics::{HarnessMetricsOptions, HarnessMetricsReport, collect_harness_metrics};
 pub use ops::{
@@ -262,7 +324,7 @@ pub use progress::{
 };
 pub use prompt::{
     PromptAssemblyOptions, PromptBundle, PromptBundleFiles, PromptBundleSummary, PromptSection,
-    PromptSectionKind, assemble_prompt_bundle, write_prompt_bundle,
+    PromptSectionKind, PromptSectionTier, assemble_prompt_bundle, write_prompt_bundle,
 };
 pub use quality::{
     InvariantEntry, PublicHygieneOptions, PublicHygieneReport, ReleaseChecklist,
@@ -304,15 +366,41 @@ pub use runtime_worker::{
     prepare_runtime_queue_item, release_runtime_queue_lease,
 };
 pub use security::{SecurityScanOptions, SecurityScanReport, scan_security_boundaries};
+pub use skill_apply::{
+    SkillApplyOptions, SkillApplyReport, SkillApplyStatus, SkillProposalActionOptions,
+    SkillProposalActionReport, SkillProposalActionStatus, SkillProposalListOptions,
+    SkillProposalListReport, apply_skill_proposal, list_skill_proposals, reject_skill_proposal,
+    skill_apply_receipts_file,
+};
+pub use skill_envelope::{
+    SKILL_INVOCATION_ENVELOPE_SCHEMA, SkillEnvelopeError, SkillInvocationEnvelope,
+    extract_user_instruction_from_skill_envelope, render_skill_invocation_envelope,
+    skill_body_checksum, strip_skill_envelopes_for_memory,
+};
+pub use skill_learning::{
+    LearningReviewOptions, LearningReviewReport, SkillArchiveOptions, SkillCuratorOptions,
+    SkillLearningProposal, SkillLearningProposalOperation, SkillLearningProposalStatus,
+    SkillLearningSignal, SkillProposeOptions, SkillStructuredPatch, SkillSupportFileOperation,
+    create_skill_archive_proposal, create_skill_learning_proposal, run_learning_review,
+    run_skill_curator, skill_proposals_file,
+};
+pub use skill_matcher::{SkillMatcherInfo, skill_matcher_info};
+pub use skill_usage::{
+    SkillUsageAction, SkillUsageEventOptions, SkillUsageProvenance, SkillUsageRecord,
+    SkillUsageReport, SkillUsageSnapshot, collect_skill_usage_snapshot, record_skill_usage_event,
+    record_skill_usage_from_prompt_bundle, skill_usage_events_file, skill_usage_snapshot_file,
+};
 pub use skills::{
-    HARNESS_BUILTIN_SKILL_NAMESPACE, SkillIndex, SkillIndexFile, SkillIndexOrigin,
-    SkillIndexSummary, SkillRecord, SkillSelection, SkillSelectionQuery, SkillSourceKind,
-    build_harness_skill_index, build_runtime_skill_index, build_source_skill_index, select_skills,
-    write_skill_index,
+    HARNESS_BUILTIN_SKILL_NAMESPACE, SKILL_SELECTION_RECEIPT_SCHEMA, SkillDeliveryMode,
+    SkillFrontmatter, SkillIndex, SkillIndexFile, SkillIndexOrigin, SkillIndexSummary, SkillRecord,
+    SkillScoreComponent, SkillSelection, SkillSelectionQuery, SkillSelectionReceipt,
+    SkillSourceKind, build_harness_skill_index, build_runtime_skill_index,
+    build_source_skill_index, select_skills, skill_selection_receipts_file, write_skill_index,
+    write_skill_selection_receipt,
 };
 pub use status::{
-    HarnessChannelStatus, HarnessCronSchedulerStatus, HarnessJsonlStatus, HarnessMemoryStatus,
-    HarnessOperationalLogStatus, HarnessOutboxStatus, HarnessPluginStatus,
+    HarnessChannelStatus, HarnessCronSchedulerStatus, HarnessJsonlStatus, HarnessLearningStatus,
+    HarnessMemoryStatus, HarnessOperationalLogStatus, HarnessOutboxStatus, HarnessPluginStatus,
     HarnessRuntimeReceiptStatus, HarnessRuntimeStatus, HarnessStatusOptions, HarnessStatusReport,
     collect_harness_status,
 };

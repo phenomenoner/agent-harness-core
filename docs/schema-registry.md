@@ -1,6 +1,6 @@
 # Agent Harness Schema Registry
 
-Date: 2026-06-16
+Date: 2026-06-17
 
 The authoritative in-code registry is `agent_harness_core::quality::schema_registry_entries`, exposed by `agent-harness schema-registry`. This document records the current public compatibility contract for review and release checks.
 
@@ -36,8 +36,17 @@ The authoritative in-code registry is `agent_harness_core::quality::schema_regis
 | `agent-harness.task-entity.v1` | `autonomy` | Additive fields only in v1; checkpoint JSONL remains append-only. | Implemented in staging. |
 | `agent-harness.budget-decision.v1` | `autonomy` | Additive fields only in v1; accepted/blocked decision semantics remain stable. | Implemented in staging. |
 | `agent-harness.learning-proposal.v1` | `autonomy` | Proposal JSON may add review fields in v1; auto-apply remains opt-in. | Implemented in staging. |
+| `agent-harness.skill-invocation-envelope.v1` | `skill_envelope` | Byte-framed envelope with declared lengths/checksum; parser must ignore nested sentinel text inside body bytes. | Implemented in staging. |
+| `agent-harness.skill-selection.v1` | `skills` | Append-only selection receipts with matcher metadata, delivery mode, body checksum, score components, and deterministic tie-breaks. | Implemented in staging. |
+| `agent-harness.prompt-injection-ledger.v2` | `prompt` | V2 skill entries are keyed by session, agent, skill id, body checksum, and delivery mode; v1 path/fingerprint ledgers remain readable for migration. | Implemented in staging. |
+| `agent-harness.skill-usage.v1` | `skill_usage` | Append-only skill usage/provenance JSONL; action enum additions require status and curator compatibility tests. | Implemented in staging. |
+| `agent-harness.skill-usage-snapshot.v1` | `skill_usage` | Derived compact status/curator artifact rebuildable from `skill-usage.jsonl`. | Implemented in staging. |
+| `agent-harness.skill-proposal.v1` | `skill_learning` | Append-only proposal state records; apply remains checksum-guarded and operator-mediated. | Implemented in staging. |
+| `agent-harness.skill-apply-receipt.v1` | `skill_apply` | Append-only apply receipts; stale-base quarantine and backup-before-mutation semantics are stable in v1. | Implemented in staging. |
+| `agent-harness.learning-review.v1` | `skill_learning` | Deterministic learning-review report; worker jobs may propose but never mutate skill files directly. | Implemented in staging. |
 | `agent-harness.drift-report.v1` | `autonomy` | Additive fields only in v1. | Implemented in staging. |
-| `agent-harness.context-pack.v1` | `memory_contracts` | Breaking memory contract changes require v2 and fail-open consumer tests. | Implemented in staging. |
+| `agent-harness.context-pack.v1` | `memory_contracts` | Canonical normalized memory context pack; breaking changes require v2 and fail-open consumer tests. | Implemented in staging. |
+| `openclaw-mem.context-pack.v1` | `memory_contracts` | Accepted producer schema translated to `agent-harness.context-pack.v1`; unknown versions fail open. | Implemented in staging. |
 | `agent-harness.encrypted-vault.v1` | `vault` | Breaking crypto/KDF changes require v2 and migration receipt. | Implemented in staging. |
 | `agent-harness.security-scan.v1` | `security` | Additive findings only in v1. | Implemented in staging. |
 | `agent-harness.quality-report.v1` | `quality` | Additive fields only in v1. | Implemented in staging. |

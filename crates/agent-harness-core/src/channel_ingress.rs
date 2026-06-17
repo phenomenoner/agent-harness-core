@@ -6,10 +6,10 @@ use serde::Serialize;
 
 use crate::{
     AgentSource, ChannelCommandApplyOptions, ChannelCommandApplyReport, ChannelOutboundMessage,
-    ChannelStepAction, HarnessLogEvent, HarnessLogLevel, RuntimeQueueEnqueueOptions,
-    RuntimeQueueEnqueueReport, SkillIndex, TurnPlanInput, append_harness_log,
-    apply_channel_command_step, build_channel_step, build_turn_plan, enqueue_channel_step,
-    load_agent_registry,
+    ChannelStepAction, HarnessLogEvent, HarnessLogLevel, InboundMediaArtifact,
+    RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, SkillIndex, TurnPlanInput,
+    append_harness_log, apply_channel_command_step, build_channel_step, build_turn_plan,
+    enqueue_channel_step, load_agent_registry,
 };
 
 const CHANNEL_RECEIVE_SCHEMA: &str = "agent-harness.channel-receive.v1";
@@ -28,6 +28,7 @@ pub struct ChannelReceiveOptions {
     pub session_key: Option<String>,
     pub message: String,
     pub inbound_context: Option<String>,
+    pub inbound_media_artifacts: Vec<InboundMediaArtifact>,
     pub skill_limit: usize,
     pub now_ms: i64,
 }
@@ -98,6 +99,7 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
             user_id: options.user_id.clone(),
             text: options.message,
             inbound_context: options.inbound_context,
+            inbound_media_artifacts: options.inbound_media_artifacts,
             requested_agent_id: options.agent_id,
             session_hint: options.session_key,
             skill_limit: options.skill_limit,
@@ -276,6 +278,7 @@ mod tests {
             session_key: None,
             message: "/model openrouter/anthropic/claude-sonnet-4".to_string(),
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             skill_limit: 3,
             now_ms: 1000,
         })
@@ -312,6 +315,7 @@ mod tests {
             session_key: None,
             message: "/model openrouter/anthropic/claude-sonnet-4".to_string(),
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             skill_limit: 3,
             now_ms: 1000,
         })
@@ -330,6 +334,7 @@ mod tests {
             session_key: None,
             message: "continue".to_string(),
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             skill_limit: 3,
             now_ms: 1001,
         })

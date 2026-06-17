@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 agent-harness-core = { path = "../agent-harness-core" }
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }

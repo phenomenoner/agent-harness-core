@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{ChannelStep, ChannelStepAction};
+use crate::{ChannelStep, ChannelStepAction, InboundMediaArtifact};
 
 const RUNTIME_QUEUE_REPORT_SCHEMA: &str = "agent-harness.runtime-queue-enqueue.v1";
 const RUNTIME_QUEUE_CONTROL_SCHEMA: &str = "agent-harness.runtime-queue-control.v1";
@@ -53,6 +53,8 @@ pub struct RuntimeQueueItem {
     pub message_text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inbound_context: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inbound_media_artifacts: Vec<InboundMediaArtifact>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub prompt_files_present: usize,
@@ -321,6 +323,7 @@ fn build_queue_item(
         user_id: step.user_id.clone(),
         message_text: step.message_text.clone(),
         inbound_context: step.inbound_context.clone(),
+        inbound_media_artifacts: step.inbound_media_artifacts.clone(),
         provider: agent_turn.provider.clone(),
         model: agent_turn.model.clone(),
         prompt_files_present: agent_turn.prompt_files_present,
@@ -422,8 +425,10 @@ fn fnv1a_64_hex(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
-        ChannelStepAction, TurnPlanInput, build_channel_step, build_source_skill_index,
-        build_turn_plan, load_agent_registry,
+        ChannelStepAction, InboundMediaArtifact, InboundMediaDownloadStatus,
+        InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant, TurnPlanInput,
+        build_channel_step, build_source_skill_index, build_turn_plan,
+        inbound_media_attachment_root, load_agent_registry,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -444,6 +449,7 @@ mod tests {
                 user_id: "user-7".to_string(),
                 text: "repair memory cron".to_string(),
                 inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -497,6 +503,100 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_channel_agent_turn_round_trips_inbound_media_artifacts() {
+        let root = temp_root("enqueue_channel_agent_turn_round_trips_inbound_media_artifacts");
+        let source = write_runtime_queue_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let local_path = inbound_media_attachment_root(&harness_home)
+            .join("turn-1234")
+            .join("0.jpg");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "telegram".to_string(),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                text: "what is in this image?".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: vec![InboundMediaArtifact {
+                    platform: "telegram".to_string(),
+                    kind: "photo".to_string(),
+                    media_group_id: Some("group-1".to_string()),
+                    message_id: Some("99".to_string()),
+                    variant_count: Some(4),
+                    selected_variant: Some(InboundMediaSelectedVariant {
+                        width: Some(961),
+                        height: Some(1280),
+                        file_size: Some(179414),
+                    }),
+                    local_path: Some(local_path.clone()),
+                    artifact_uri: Some("agent-harness://inbound-media/turn-1234/0.jpg".to_string()),
+                    mime: Some("image/jpeg".to_string()),
+                    sha256: Some("abc123".to_string()),
+                    source: "telegram.getFile".to_string(),
+                    download_status: InboundMediaDownloadStatus::Downloaded,
+                    model_attachment_status: InboundMediaModelAttachmentStatus::PromptOnly,
+                    warnings: Vec::new(),
+                    ..InboundMediaArtifact::default()
+                }],
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let step = build_channel_step(&registry, &turn);
+
+        let report = enqueue_channel_step(
+            &step,
+            RuntimeQueueEnqueueOptions {
+                harness_home,
+                runtime_workspace: None,
+                now_ms: 1234,
+            },
+        )
+        .unwrap();
+
+        let item = report.item.unwrap();
+        assert_eq!(item.inbound_media_artifacts.len(), 1);
+        assert_eq!(
+            item.inbound_media_artifacts[0].local_path.as_deref(),
+            Some(local_path.as_path())
+        );
+        assert_eq!(
+            item.inbound_media_artifacts[0].download_status,
+            InboundMediaDownloadStatus::Downloaded
+        );
+
+        let queue_json: Value = serde_json::from_str(
+            fs::read_to_string(&report.queue_file)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let artifact = &queue_json["inboundMediaArtifacts"][0];
+        assert_eq!(artifact["schema"], crate::INBOUND_MEDIA_ARTIFACT_SCHEMA);
+        assert_eq!(artifact["kind"], "photo");
+        assert_eq!(artifact["mediaGroupId"], "group-1");
+        assert_eq!(artifact["messageId"], "99");
+        assert_eq!(artifact["selectedVariant"]["width"], 961);
+        assert_eq!(artifact["selectedVariant"]["height"], 1280);
+        assert_eq!(artifact["mime"], "image/jpeg");
+        assert_eq!(artifact["sha256"], "abc123");
+        assert_eq!(artifact["downloadStatus"], "downloaded");
+        assert_eq!(artifact["modelAttachmentStatus"], "prompt-only");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn queue_control_retries_with_new_queue_id_and_skips_terminally() {
         let root = temp_root("queue_control_retries_with_new_queue_id_and_skips_terminally");
         let source = write_runtime_queue_source(&root);
@@ -513,6 +613,7 @@ mod tests {
                 user_id: "user-7".to_string(),
                 text: "repair memory cron".to_string(),
                 inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -619,6 +720,7 @@ mod tests {
                 user_id: "user".to_string(),
                 text: "/status".to_string(),
                 inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,

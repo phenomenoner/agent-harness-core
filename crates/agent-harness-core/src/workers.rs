@@ -11,13 +11,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    CronRunSummary, HarnessLogEvent, HarnessLogLevel, RuntimeQueueItem, RuntimeQueueItemStatus,
-    RuntimeQueueSource, RuntimeQueueSourceKind, append_harness_log, collect_cron_run_summary,
+    CronRunSummary, HarnessLogEvent, HarnessLogLevel, LearningReviewOptions, RuntimeQueueItem,
+    RuntimeQueueItemStatus, RuntimeQueueSource, RuntimeQueueSourceKind, append_harness_log,
+    collect_cron_run_summary,
     config::{
         HarnessConfigValidationReport, HarnessConfigValidationStatus, validate_harness_config,
     },
     cron_run_worker_dispatch_blocker, current_log_time_ms, mark_cron_run_runtime_enqueued,
     mark_cron_run_worker_status,
+    memory_backfill::{
+        DEFAULT_MEMORY_BACKFILL_BATCH_SIZE, DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS,
+        DEFAULT_MEMORY_BACKFILL_MAX_ITEMS, DEFAULT_MEMORY_BACKFILL_RATE_LIMIT_PER_MINUTE,
+        DEFAULT_MEMORY_BACKFILL_RETRY_CAP, DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION,
+        MemoryEmbeddingBackfillLane, MemoryEmbeddingBackfillOptions, run_memory_embedding_backfill,
+    },
+    run_learning_review,
 };
 
 const WORKER_STORE_SCHEMA: &str = "agent-harness.worker-store.v1";
@@ -200,6 +208,8 @@ pub enum WorkerJobKind {
     Watchdog,
     MasterWakeup,
     MemoryMaintenance,
+    MemoryEmbeddingBackfill,
+    LearningReview,
     PluginCall,
 }
 
@@ -211,6 +221,8 @@ impl WorkerJobKind {
             Self::Watchdog => "watchdog",
             Self::MasterWakeup => "master_wakeup",
             Self::MemoryMaintenance => "memory_maintenance",
+            Self::MemoryEmbeddingBackfill => "memory_embedding_backfill",
+            Self::LearningReview => "learning_review",
             Self::PluginCall => "plugin_call",
         }
     }
@@ -221,6 +233,8 @@ impl WorkerJobKind {
             Self::LlmSubagent | Self::MasterWakeup => "llm",
             Self::Watchdog => "watchdog",
             Self::MemoryMaintenance => "maintenance",
+            Self::MemoryEmbeddingBackfill => "memory_embedding_backfill",
+            Self::LearningReview => "learning_review",
             Self::PluginCall => "plugin",
         }
     }
@@ -236,6 +250,12 @@ impl std::str::FromStr for WorkerJobKind {
             "watchdog" => Ok(Self::Watchdog),
             "master_wakeup" | "master-wakeup" => Ok(Self::MasterWakeup),
             "memory_maintenance" | "memory-maintenance" => Ok(Self::MemoryMaintenance),
+            "memory_embedding_backfill" | "memory-embedding-backfill" | "memory-backfill" => {
+                Ok(Self::MemoryEmbeddingBackfill)
+            }
+            "learning_review" | "learning-review" | "skill-learning-review" => {
+                Ok(Self::LearningReview)
+            }
             "plugin_call" | "plugin-call" => Ok(Self::PluginCall),
             other => Err(format!("unsupported worker job kind: {other}")),
         }
@@ -1281,6 +1301,10 @@ fn execute_worker_job(
             queue_llm_worker_turn(harness_home, job, now_ms)
         }
         WorkerJobKind::Watchdog => run_watchdog_job(harness_home, conn, job, now_ms),
+        WorkerJobKind::MemoryEmbeddingBackfill => {
+            run_memory_embedding_backfill_job(harness_home, job, now_ms)
+        }
+        WorkerJobKind::LearningReview => run_learning_review_job(harness_home, job, now_ms),
         WorkerJobKind::MemoryMaintenance | WorkerJobKind::PluginCall => {
             Ok(WorkerJobExecutionResult {
                 status: WorkerJobStatus::Succeeded,
@@ -1291,6 +1315,106 @@ fn execute_worker_job(
             })
         }
     }
+}
+
+fn run_learning_review_job(
+    harness_home: &Path,
+    job: &WorkerJob,
+    now_ms: i64,
+) -> io::Result<WorkerJobExecutionResult> {
+    let target_path =
+        string_path_any(&job.payload, &["targetPath", "target_path"]).map(PathBuf::from);
+    let report = run_learning_review(LearningReviewOptions {
+        harness_home: harness_home.to_path_buf(),
+        agent_id: string_path_any(&job.payload, &["agentId", "agent_id"]).map(ToString::to_string),
+        target_skill_id: string_path_any(&job.payload, &["targetSkillId", "target_skill_id"])
+            .map(ToString::to_string),
+        target_path,
+        channel_trust: string_path_any(&job.payload, &["channelTrust", "channel_trust"])
+            .map(ToString::to_string),
+        signal_text: string_path_any(&job.payload, &["signalText", "signal_text", "text"])
+            .unwrap_or("")
+            .to_string(),
+        source_turn: string_path_any(&job.payload, &["sourceTurn", "source_turn"])
+            .map(ToString::to_string),
+        daily_cap: usize_payload(&job.payload, &["dailyCap", "daily_cap"], 5),
+        now_ms,
+    })?;
+    Ok(WorkerJobExecutionResult {
+        status: WorkerJobStatus::Succeeded,
+        reason: report.reason.clone(),
+        audit_path: Some(skill_learning_audit_path(harness_home)),
+        artifact_refs: Some(json!([format!(
+            "skill-proposals:{}",
+            crate::skill_proposals_file(harness_home).display()
+        )])),
+        result: Some(serde_json::to_value(&report).map_err(io::Error::other)?),
+    })
+}
+
+fn skill_learning_audit_path(harness_home: &Path) -> PathBuf {
+    harness_home.join("state").join("learning")
+}
+
+fn run_memory_embedding_backfill_job(
+    harness_home: &Path,
+    job: &WorkerJob,
+    now_ms: i64,
+) -> io::Result<WorkerJobExecutionResult> {
+    let lane = string_path_any(&job.payload, &["lane", "memoryLane", "backfillLane"])
+        .unwrap_or("episodic_events")
+        .parse::<MemoryEmbeddingBackfillLane>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let model = string_path_any(&job.payload, &["model", "embeddingModel"])
+        .unwrap_or("text-embedding-3-small")
+        .to_string();
+    let report = run_memory_embedding_backfill(MemoryEmbeddingBackfillOptions {
+        harness_home: harness_home.to_path_buf(),
+        lane,
+        model,
+        vector_dimension: i64_payload(
+            &job.payload,
+            &["vectorDimension", "vector_dimension", "dim"],
+            DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION,
+        ),
+        batch_size: usize_payload(
+            &job.payload,
+            &["batchSize", "batch_size"],
+            DEFAULT_MEMORY_BACKFILL_BATCH_SIZE,
+        ),
+        max_items: usize_payload(
+            &job.payload,
+            &["maxItems", "max_items"],
+            DEFAULT_MEMORY_BACKFILL_MAX_ITEMS,
+        ),
+        rate_limit_per_minute: usize_payload(
+            &job.payload,
+            &["rateLimitPerMinute", "rate_limit_per_minute"],
+            DEFAULT_MEMORY_BACKFILL_RATE_LIMIT_PER_MINUTE,
+        ),
+        retry_cap: usize_payload(
+            &job.payload,
+            &["retryCap", "retry_cap"],
+            DEFAULT_MEMORY_BACKFILL_RETRY_CAP,
+        ),
+        coverage_threshold_bps: u64_payload(
+            &job.payload,
+            &["coverageThresholdBps", "coverage_threshold_bps"],
+            DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS,
+        ),
+        now_ms,
+    })?;
+    Ok(WorkerJobExecutionResult {
+        status: WorkerJobStatus::Succeeded,
+        reason: format!("memory embedding backfill {}", report.status),
+        audit_path: None,
+        artifact_refs: Some(json!({
+            "cursorFile": report.cursor_file,
+            "receiptFile": report.receipt_file,
+            "latestFile": report.latest_file,
+        })),
+        result: Some(serde_json::to_value(&report).map_err(io::Error::other)?),
+    })
 }
 
 fn run_deterministic_shell_job(
@@ -1522,6 +1646,7 @@ fn queue_llm_worker_turn(
         user_id: user_id.to_string(),
         message_text: message_text.to_string(),
         inbound_context: string_path(&job.payload, "inboundContext").map(ToString::to_string),
+        inbound_media_artifacts: Vec::new(),
         provider: string_path(&job.payload, "provider").map(ToString::to_string),
         model: string_path(&job.payload, "model").map(ToString::to_string),
         prompt_files_present: 0,
@@ -1906,6 +2031,37 @@ fn string_path_any<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
 
 fn int_path(value: &Value, key: &str) -> Option<i64> {
     value.get(key).and_then(Value::as_i64)
+}
+
+fn usize_payload(value: &Value, keys: &[&str], default: usize) -> usize {
+    for key in keys {
+        if let Some(parsed) = value
+            .get(*key)
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        {
+            return parsed;
+        }
+    }
+    default
+}
+
+fn u64_payload(value: &Value, keys: &[&str], default: u64) -> u64 {
+    for key in keys {
+        if let Some(parsed) = value.get(*key).and_then(Value::as_u64) {
+            return parsed;
+        }
+    }
+    default
+}
+
+fn i64_payload(value: &Value, keys: &[&str], default: i64) -> i64 {
+    for key in keys {
+        if let Some(parsed) = value.get(*key).and_then(Value::as_i64) {
+            return parsed;
+        }
+    }
+    default
 }
 
 fn string_array_path(value: &Value, key: &str) -> Vec<String> {
@@ -2520,6 +2676,74 @@ mod tests {
     }
 
     #[test]
+    fn workers_memory_backfill_runs_embedding_job_and_writes_cursor() {
+        let root = temp_root("workers_memory_backfill_runs_embedding_job_and_writes_cursor");
+        let harness_home = root.join(".agent-harness");
+        create_backfill_sqlite(&harness_home);
+
+        let enqueue = enqueue_worker_job(WorkerEnqueueOptions {
+            harness_home: harness_home.clone(),
+            kind: WorkerJobKind::MemoryEmbeddingBackfill,
+            lane: Some("memory_embedding_backfill".to_string()),
+            payload: json!({
+                "lane": "episodic_events",
+                "model": "test-embedding",
+                "vectorDimension": 2,
+                "batchSize": 2,
+                "maxItems": 2,
+                "rateLimitPerMinute": 8
+            }),
+            idempotency_key: Some("memory-backfill:episodic-events".to_string()),
+            parent_job_id: None,
+            job_group_id: None,
+            master_agent_id: None,
+            master_session_key: None,
+            wake_policy: None,
+            source: None,
+            priority: 0,
+            available_at_ms: Some(1_000),
+            max_attempts: 1,
+            timeout_ms: None,
+            cascade_timeout_ms: None,
+            rate_key: Some("memory-backfill:episodic-events".to_string()),
+            concurrency_group_key: Some("memory-backfill".to_string()),
+            now_ms: 1_000,
+        })
+        .unwrap();
+        assert!(enqueue.inserted);
+
+        let run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("memory_embedding_backfill".to_string()),
+            worker_id: "worker-1".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1_100,
+        })
+        .unwrap();
+
+        assert_eq!(run.status, WorkerRunOnceStatus::Completed);
+        let result = run.result.unwrap();
+        assert_eq!(result.status, WorkerJobStatus::Succeeded);
+        assert!(result.reason.contains("memory embedding backfill planned"));
+        assert!(
+            crate::memory_backfill::memory_embedding_backfill_cursor_file(
+                &harness_home,
+                MemoryEmbeddingBackfillLane::EpisodicEvents
+            )
+            .is_file()
+        );
+        assert!(
+            crate::memory_backfill::memory_embedding_backfill_receipts_file(
+                &harness_home,
+                MemoryEmbeddingBackfillLane::EpisodicEvents
+            )
+            .is_file()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn watchdog_enqueues_master_wakeup_for_completed_group() {
         let root = temp_root("watchdog_enqueues_master_wakeup_for_completed_group");
         let harness_home = root.join(".agent-harness");
@@ -2648,6 +2872,40 @@ mod tests {
             concurrency_group_key: Some("master:main".to_string()),
             now_ms,
         }
+    }
+
+    fn create_backfill_sqlite(harness_home: &Path) {
+        let memory_dir = harness_home.join("memory");
+        fs::create_dir_all(&memory_dir).unwrap();
+        let conn = Connection::open(memory_dir.join("openclaw-mem.sqlite")).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE episodic_events (
+                ts TEXT,
+                summary TEXT
+            );
+            CREATE TABLE episodic_event_embeddings (
+                event_row_id INTEGER,
+                model TEXT,
+                dim INTEGER,
+                vector BLOB,
+                norm REAL
+            );
+            ",
+        )
+        .unwrap();
+        for summary in ["one", "two", "three"] {
+            conn.execute(
+                "INSERT INTO episodic_events (ts, summary) VALUES ('2026-06-17', ?1)",
+                [summary],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO episodic_event_embeddings (event_row_id, model, dim, vector, norm) VALUES (1, 'test-embedding', 2, x'0000', 1.0)",
+            [],
+        )
+        .unwrap();
     }
 
     fn temp_root(test_name: &str) -> PathBuf {

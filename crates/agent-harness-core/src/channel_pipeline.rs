@@ -6,9 +6,9 @@ use serde::Serialize;
 use crate::{
     AgentSource, ChannelOutboxPlanOptions, ChannelOutboxPlanReport, ChannelReceiveOptions,
     ChannelReceiveReport, ChannelReceiveStatus, HarnessLogEvent, HarnessLogLevel,
-    PromptAssemblyOptions, RuntimeRunOnceOptions, RuntimeRunOnceReport, append_harness_log,
-    build_runtime_skill_index, current_log_time_ms, plan_channel_outbox, receive_channel_message,
-    run_runtime_queue_once,
+    InboundMediaArtifact, PromptAssemblyOptions, RuntimeRunOnceOptions, RuntimeRunOnceReport,
+    append_harness_log, build_runtime_skill_index, current_log_time_ms, plan_channel_outbox,
+    receive_channel_message, run_runtime_queue_once,
 };
 
 const CHANNEL_RUN_ONCE_SCHEMA: &str = "agent-harness.channel-run-once.v1";
@@ -26,6 +26,7 @@ pub struct ChannelRunOnceOptions {
     pub session_key: Option<String>,
     pub message: String,
     pub inbound_context: Option<String>,
+    pub inbound_media_artifacts: Vec<InboundMediaArtifact>,
     pub skill_limit: usize,
     pub now_ms: i64,
     pub codex_executable: Option<PathBuf>,
@@ -73,6 +74,7 @@ pub fn run_channel_once(options: ChannelRunOnceOptions) -> io::Result<ChannelRun
         session_key: options.session_key,
         message: options.message,
         inbound_context: options.inbound_context,
+        inbound_media_artifacts: options.inbound_media_artifacts,
         skill_limit: options.skill_limit,
         now_ms: options.now_ms,
     })?;
@@ -182,6 +184,7 @@ mod tests {
             session_key: None,
             message: "/status".to_string(),
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             skill_limit: 3,
             now_ms: 1234,
             codex_executable: None,
@@ -228,6 +231,7 @@ mod tests {
             session_key: None,
             message: "repair memory cron".to_string(),
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             skill_limit: 3,
             now_ms: 1235,
             codex_executable: Some(fake_codex),

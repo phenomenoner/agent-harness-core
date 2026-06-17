@@ -6,9 +6,9 @@ use serde::Serialize;
 
 use crate::{
     AgentOverride, AgentProfile, AgentRegistry, AgentSource, ChannelCommand, ChannelCommandIntent,
-    ChannelSessionState, DEFAULT_THINKING_LEVEL, PROMPT_FILE_NAMES, SkillIndex, SkillSelection,
-    SkillSelectionQuery, parse_channel_command, read_agent_override, read_channel_session_state,
-    select_skills,
+    ChannelSessionState, DEFAULT_THINKING_LEVEL, InboundMediaArtifact, PROMPT_FILE_NAMES,
+    SkillIndex, SkillSelection, SkillSelectionQuery, parse_channel_command, read_agent_override,
+    read_channel_session_state, select_skills, write_skill_selection_receipt,
 };
 
 const TURN_PLAN_SCHEMA: &str = "agent-harness.turn-plan.v1";
@@ -21,6 +21,7 @@ pub struct TurnPlanInput {
     pub user_id: String,
     pub text: String,
     pub inbound_context: Option<String>,
+    pub inbound_media_artifacts: Vec<InboundMediaArtifact>,
     pub requested_agent_id: Option<String>,
     pub session_hint: Option<String>,
     pub skill_limit: usize,
@@ -39,6 +40,8 @@ pub struct TurnPlan {
     pub message_text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inbound_context: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inbound_media_artifacts: Vec<InboundMediaArtifact>,
     pub session_key: String,
     pub dispatch: TurnDispatch,
     pub agent: Option<TurnAgent>,
@@ -161,20 +164,31 @@ pub fn build_turn_plan(
 
     let (prompt_workspace, prompt_files) = prompt_files_for_source(source, &mut warnings)?;
     let skill_query_text = channel_state_query_text(&input.text, channel_state.as_ref());
+    let skill_query = SkillSelectionQuery {
+        text: skill_query_text,
+        agent_id: agent.as_ref().map(|agent| agent.id.clone()),
+        channel: Some(input.platform.clone()),
+        workspace: agent
+            .as_ref()
+            .and_then(|agent| agent.workspace.clone())
+            .or_else(|| Some(prompt_workspace.display().to_string())),
+        agent_mode: None,
+        available_tools: Vec::new(),
+        available_toolsets: Vec::new(),
+        fts_enabled: false,
+        vector_tie_break_enabled: false,
+        limit: input.skill_limit,
+    };
     let selected_skills = if dispatch == TurnDispatch::AgentTurn {
-        select_skills(
-            skill_index,
-            &SkillSelectionQuery {
-                text: skill_query_text,
-                agent_id: agent.as_ref().map(|agent| agent.id.clone()),
-                channel: Some(input.platform.clone()),
-                workspace: agent
-                    .as_ref()
-                    .and_then(|agent| agent.workspace.clone())
-                    .or_else(|| Some(prompt_workspace.display().to_string())),
-                limit: input.skill_limit,
-            },
-        )
+        let selected = select_skills(skill_index, &skill_query);
+        if let Some(harness_home) = input.harness_home.as_ref()
+            && let Err(error) = write_skill_selection_receipt(harness_home, &skill_query, &selected)
+        {
+            warnings.push(format!(
+                "skill selection receipt could not be written: {error}"
+            ));
+        }
+        selected
     } else {
         Vec::new()
     };
@@ -190,6 +204,7 @@ pub fn build_turn_plan(
         inbound_context: input
             .inbound_context
             .filter(|value| !value.trim().is_empty()),
+        inbound_media_artifacts: input.inbound_media_artifacts,
         session_key,
         dispatch,
         agent,
@@ -468,6 +483,7 @@ mod tests {
                 user_id: "user-7".to_string(),
                 text: "please repair memory cron jobs".to_string(),
                 inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -508,6 +524,7 @@ mod tests {
                 user_id: "user#7".to_string(),
                 text: "/status cron".to_string(),
                 inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -549,6 +566,7 @@ mod tests {
                 user_id: "user".to_string(),
                 text: "/status".to_string(),
                 inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -585,6 +603,7 @@ mod tests {
                 user_id: "user".to_string(),
                 text: "hello".to_string(),
                 inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
                 requested_agent_id: Some("missing-agent".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -620,6 +639,7 @@ mod tests {
                 user_id: "user".to_string(),
                 text: "hello".to_string(),
                 inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
                 requested_agent_id: None,
                 session_hint: Some("imported-session-key".to_string()),
                 skill_limit: 3,
@@ -686,6 +706,7 @@ mod tests {
                 user_id: "user".to_string(),
                 text: "continue".to_string(),
                 inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -749,6 +770,7 @@ mod tests {
                 user_id: "user".to_string(),
                 text: "continue".to_string(),
                 inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
                 requested_agent_id: Some("main".to_string()),
                 session_hint: None,
                 skill_limit: 3,
@@ -775,6 +797,7 @@ mod tests {
                 user_id: "user".to_string(),
                 text: "continue".to_string(),
                 inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
                 requested_agent_id: Some("other".to_string()),
                 session_hint: None,
                 skill_limit: 3,

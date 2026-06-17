@@ -206,3 +206,59 @@ If all scopes pass or pass with notes, no immediate code change is required. The
 - deterministic shell cron strategy
 - cron ownership migration
 - safe outbox skip/archive operator surface
+
+## Goal Closure Pointer - 2026-06-16
+
+CK opened a follow-up goal to execute and test the remaining checkpoint items
+without hot-patching `agent-harness-core` or performing live cutover. The safe
+read-only validation and repo-side policy closure are recorded in
+`docs/harness-agent-validation-goal-results-20260616.md`.
+
+Items that require core/CLI changes, live cron/channel state mutation, or a later
+operator cutover are collected in
+`docs/harness-agent-validation-deferred-20260616.md`.
+
+## Harness Agent Results - 2026-06-16
+
+### Summary
+
+- Overall status: PASS WITH NOTES
+- Commands run:
+  - `agent-harness.exe healthz --harness-home .agent-harness --require-writable-state`
+  - `agent-harness.exe status --harness-home .agent-harness --json`
+  - `agent-harness.exe worker-status --harness-home .agent-harness --json`
+  - `agent-harness.exe cron-runs --harness-home .agent-harness --limit 50`
+  - `agent-harness.exe channel-outbox-plan --harness-home .agent-harness --outbox-limit 5`
+  - `agent-harness.exe channel-outbox-plan --harness-home .agent-harness --outbox-limit 100`
+  - `agent-harness.exe channel-outbox-plan --harness-home .agent-harness --limit 5`
+  - `agent-harness.exe cron-scheduler-lint --harness-home .agent-harness --source-home .agent-harness --workspace .agent-harness\workspace --dry-run --enable --resume-cron --allow-deterministic-run`
+  - `Select-String` static docs/skill drift scan
+- Mutations performed: this documentation note only; no `.agent-harness` live state, queue, CronRun, outbox, delivery, supervisor, or watermark mutation.
+
+### Scope Results
+
+| scope | result | evidence | concern |
+| --- | --- | --- | --- |
+| 1 - Health / worker / cron run control plane | PASS | `healthz` reports `ready=true`, `live=true`, writable state, and all 7 loop heartbeats present/non-stale. `status --json` reports readiness `passed=59`, `warnings=0`, `failed=0`. `worker-status` reports total `78`, pending/leased/running `0`, succeeded `78`, failed `0`; cron lane `2` succeeded. `cron-runs --limit 50` reports total `2`, active `0`, terminal `2`, quarantined `0`, both `succeeded`. | Runtime still has interactive open work (`status`: open interactive `73`; worker downstream open interactive `2` at collection time), but cron class open is `0` and worker lane is not blocked. |
+| 2 - Channel outbox observability | PASS WITH NOTES | `--outbox-limit 5`, `--outbox-limit 100`, and legacy `--limit 5` are accepted. All three preserve the same outbox-plan summary: `lines=371`, `pending=81`, `delivered=290`, `failed_retryable=0`, `invalid=0`; only displayed pending details change. | `healthz`/`status` still report a different outbox aggregate (`pending=235`, `delivered=136`). Treat this as a remaining cross-command semantic mismatch to clarify before using these counters for policy automation. |
+| 3 - Cron lint migration ledger | PASS WITH EXPECTED ERRORS | Lint emits valid machine-readable JSON before exiting nonzero with `status=error`. Summary is `findings=128`, `errors=65`, `warnings=63`, `nativeEntries=114`, `deterministicEntries=26`. Findings include `agentId` and `proposedAction` fields, e.g. `rewrite-path-or-native-port`, `review-owner`, and `native-port-or-wrapper-policy`. | Errors are real legacy/import cron cleanup work, not a scheduler-loop failure. Current lint output still appends CLI help text after the JSON on nonzero exit, so parsers should extract the JSON object defensively. |
+| 4 - Documentation and skill drift | PASS WITH NOTES | Static scan shows active docs/skill mostly label `.agent-harness` as live authority and `.openclaw`, Docker/container paths, `/root/.openclaw`, `/home/agent/.openclaw`, `/workspace`, and import snapshots as retired/import/historical context. Key live guidance appears in `docs/activation-readiness-plan.md`, `docs/agent-harness-operations-handbook.md`, `docs/agent-harness-dev-handoff.md`, `docs/agent-worker-dispatch-strategy.md`, and bundled `agent-windows-harness` skill. | Historical docs such as `docs/project-assessment.md` still contain many old paths, but the file has a top status note marking it historical. Keep future edits careful so old path examples do not regain live-authority wording. |
+| 5 - Optional policy input collection | NOT DECIDED | Evidence collected from lint/outbox/runtime counters. | Leave decisions to main/operator: deterministic shell strategy, cron ownership migration, and stale outbox skip/archive policy. |
+
+### Findings Requiring Main-Agent Review
+
+| priority | finding | evidence | suggested next owner |
+| --- | --- | --- | --- |
+| P1 | Cron payload cleanup is still required before broad/full cron activation. | `cron-scheduler-lint`: 65 `native-runtime-path-mismatch` errors and 26 deterministic shell compatibility warning sources; many affected jobs still reference retired Linux/container paths or shell runners. | main/operator with cron owners (`cron-lite`, `steamer-cron`, `mem-cron`, `comms-cron`) |
+| P2 | Outbox aggregate counters are not yet one semantic truth across commands. | `healthz`/`status`: pending `235`, delivered `136`; `channel-outbox-plan`: pending `81`, delivered `290` on the same outbox file. | harness/operator surface owner |
+| P2 | `cron-runs` currently has no `--json` flag despite global `--json` help text implying JSON mode in some commands. | `cron-runs --limit 50 --json` exits with `unknown argument: --json`; `cron-runs --limit 50` already emits JSON. | CLI ergonomics owner |
+| P3 | Lint JSON is usable, but nonzero output includes trailing CLI help/error text after the JSON body. | `cron-scheduler-lint ...` prints valid `agent-harness.cron-scheduler.lint.v1` JSON with `findings`, then appends command help and `error: cron scheduler lint failed`. | CLI output contract owner |
+
+### Raw Evidence Pointers
+
+- Health counters: `healthz` ready/live/writable true; loop statuses non-stale (`runtime-loop`, `progress-delivery-loop`, `telegram-loop`, `discord-outbox-loop`, `discord-gateway-loop`, `worker-loop`, `cron-scheduler-loop`).
+- Runtime counters: `status --json` queued `285`, open `73`, prepared `64`, completed `264`; queued by runtime class `cron=78`, `interactive=207`; open by runtime class `interactive=73`, cron open `0`.
+- Worker counters: total `78`, pending/leased/running `0`, succeeded `78`, failed `0`; cron lane `2` succeeded; llm lane `76` succeeded.
+- CronRun counters: total `2`, active `0`, terminal `2`, quarantined `0`, byStatus `succeeded=2`.
+- Outbox counters: `channel-outbox-plan` summary `lines=371 pending=81 delivered=290 failed_retryable=0 invalid=0`; `healthz`/`status` channel aggregate `pending=235 delivered=136`.
+- Lint counters: findings `128`, errors `65`, warnings `63`, native entries `114`, deterministic entries `26`.

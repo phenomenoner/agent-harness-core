@@ -1,13 +1,19 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
 
-use crate::{AgentSource, SKILL_FILE_NAME};
+use crate::skill_envelope::skill_body_checksum;
+use crate::{AgentSource, SKILL_FILE_NAME, append_jsonl_value, current_log_time_ms};
 
 const SKILL_INDEX_SCHEMA: &str = "agent-harness.skill-index.v1";
+pub const SKILL_SELECTION_RECEIPT_SCHEMA: &str = "agent-harness.skill-selection.v1";
+pub const SKILL_MATCHER_NAME: &str = "agent-harness-skill-matcher";
+pub const SKILL_MATCHER_VERSION: &str = "v2";
+pub const SKILL_MATCHER_TOKENIZER: &str = "ascii-alnum-v1";
 const IMPORTED_SKILL_NAMESPACE: &str = "legacy-imports";
 const OPENCLAW_IMPORTED_SKILL_NAMESPACE: &str = "openclaw-imports";
 pub const HARNESS_BUILTIN_SKILL_NAMESPACE: &str = "agent-harness-core";
@@ -87,12 +93,56 @@ pub struct SkillRecord {
     pub title: String,
     pub description: Option<String>,
     pub keywords: Vec<String>,
+    pub frontmatter: SkillFrontmatter,
     pub has_references: bool,
     pub has_templates: bool,
     pub has_scripts: bool,
     pub has_assets: bool,
     pub file_count: usize,
     pub body_bytes: usize,
+    pub body_checksum: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillFrontmatter {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platforms: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires_toolsets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_modes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_mode: Option<SkillDeliveryMode>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SkillDeliveryMode {
+    IndexOnly,
+    #[default]
+    InjectedBody,
+    InvocationEnvelope,
+    ToolView,
+}
+
+impl SkillDeliveryMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IndexOnly => "index-only",
+            Self::InjectedBody => "injected-body",
+            Self::InvocationEnvelope => "invocation-envelope",
+            Self::ToolView => "tool-view",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +151,11 @@ pub struct SkillSelectionQuery {
     pub agent_id: Option<String>,
     pub channel: Option<String>,
     pub workspace: Option<String>,
+    pub agent_mode: Option<String>,
+    pub available_tools: Vec<String>,
+    pub available_toolsets: Vec<String>,
+    pub fts_enabled: bool,
+    pub vector_tie_break_enabled: bool,
     pub limit: usize,
 }
 
@@ -113,7 +168,42 @@ pub struct SkillSelection {
     pub title: String,
     pub directory: PathBuf,
     pub score: usize,
+    pub score_components: Vec<SkillScoreComponent>,
     pub reasons: Vec<String>,
+    pub delivery_mode: SkillDeliveryMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_instruction: Option<String>,
+    pub body_checksum: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_receipt_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillScoreComponent {
+    pub name: String,
+    pub score: usize,
+    pub matches: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSelectionReceipt {
+    pub schema: &'static str,
+    pub receipt_id: String,
+    pub harness_home: PathBuf,
+    pub at_ms: i64,
+    pub index_schema: &'static str,
+    pub matcher_name: &'static str,
+    pub matcher_version: &'static str,
+    pub tokenizer: &'static str,
+    pub fts_enabled: bool,
+    pub vector_enabled: bool,
+    pub query_text_bytes: usize,
+    pub agent_id: Option<String>,
+    pub channel: Option<String>,
+    pub workspace: Option<String>,
+    pub selected: Vec<SkillSelection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,16 +309,43 @@ pub fn build_runtime_skill_index(
 
 pub fn select_skills(index: &SkillIndex, query: &SkillSelectionQuery) -> Vec<SkillSelection> {
     let query_tokens = query_tokens(query);
-    if query_tokens.is_empty() {
+    let explicit = ExplicitSkillInvocation::parse(&query.text);
+    if query_tokens.is_empty() && explicit.is_none() {
         return Vec::new();
     }
+    let fts_scores = if query.fts_enabled {
+        sqlite_fts_scores(index, &query_tokens).unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
 
     let mut selections = Vec::new();
     for skill in &index.skills {
-        let (score, reasons) = score_skill(skill, &query_tokens, query);
+        let explicit_match = explicit
+            .as_ref()
+            .filter(|invocation| skill_id_matches(skill, &invocation.skill_id));
+        if explicit.is_some() && explicit_match.is_none() {
+            continue;
+        }
+        let Some((score, score_components, reasons)) =
+            score_skill(skill, &query_tokens, query, &fts_scores)
+        else {
+            continue;
+        };
         if score == 0 {
             continue;
         }
+        let delivery_mode = explicit_match
+            .map(|_| SkillDeliveryMode::InvocationEnvelope)
+            .or(skill.frontmatter.delivery_mode)
+            .unwrap_or(SkillDeliveryMode::InjectedBody);
+        let user_instruction = explicit_match.map(|invocation| invocation.user_instruction.clone());
+        let selection_receipt_id = Some(stable_selection_receipt_id(
+            &query.text,
+            &skill.id,
+            delivery_mode,
+            &skill.body_checksum,
+        ));
         selections.push(SkillSelection {
             skill_id: skill.id.clone(),
             original_id: skill.original_id.clone(),
@@ -236,7 +353,12 @@ pub fn select_skills(index: &SkillIndex, query: &SkillSelectionQuery) -> Vec<Ski
             title: skill.title.clone(),
             directory: skill.directory.clone(),
             score,
+            score_components,
             reasons,
+            delivery_mode,
+            user_instruction,
+            body_checksum: skill.body_checksum.clone(),
+            selection_receipt_id,
         });
     }
 
@@ -248,6 +370,57 @@ pub fn select_skills(index: &SkillIndex, query: &SkillSelectionQuery) -> Vec<Ski
     });
     selections.truncate(query.limit.max(1));
     selections
+}
+
+pub fn skill_selection_receipts_file(harness_home: impl AsRef<Path>) -> PathBuf {
+    harness_home
+        .as_ref()
+        .join("state")
+        .join("learning")
+        .join("skill-selection-receipts.jsonl")
+}
+
+pub fn write_skill_selection_receipt(
+    harness_home: impl AsRef<Path>,
+    query: &SkillSelectionQuery,
+    selections: &[SkillSelection],
+) -> io::Result<SkillSelectionReceipt> {
+    let harness_home = harness_home.as_ref();
+    let at_ms = current_log_time_ms().unwrap_or(0);
+    let receipt_id = stable_text_hash(
+        "skill-selection",
+        &format!(
+            "{}|{}|{}|{}|{}",
+            at_ms,
+            query.text,
+            query.agent_id.as_deref().unwrap_or(""),
+            query.channel.as_deref().unwrap_or(""),
+            selections
+                .iter()
+                .map(|selection| selection.skill_id.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    );
+    let receipt = SkillSelectionReceipt {
+        schema: SKILL_SELECTION_RECEIPT_SCHEMA,
+        receipt_id,
+        harness_home: harness_home.to_path_buf(),
+        at_ms,
+        index_schema: SKILL_INDEX_SCHEMA,
+        matcher_name: SKILL_MATCHER_NAME,
+        matcher_version: SKILL_MATCHER_VERSION,
+        tokenizer: SKILL_MATCHER_TOKENIZER,
+        fts_enabled: query.fts_enabled,
+        vector_enabled: query.vector_tie_break_enabled,
+        query_text_bytes: query.text.len(),
+        agent_id: query.agent_id.clone(),
+        channel: query.channel.clone(),
+        workspace: query.workspace.clone(),
+        selected: selections.to_vec(),
+    };
+    append_jsonl_value(&skill_selection_receipts_file(harness_home), &receipt)?;
+    Ok(receipt)
 }
 
 pub fn write_skill_index(
@@ -322,23 +495,27 @@ fn read_skill_record(
         title: metadata.title,
         description: metadata.description,
         keywords,
+        frontmatter: metadata.frontmatter,
         has_references,
         has_templates,
         has_scripts,
         has_assets,
         file_count,
         body_bytes: bytes.len(),
+        body_checksum: skill_body_checksum(&body),
     })
 }
 
 struct SkillMetadata {
     title: String,
     description: Option<String>,
+    frontmatter: SkillFrontmatter,
 }
 
 fn parse_skill_metadata(body: &str, fallback_id: &str) -> SkillMetadata {
     let mut title = frontmatter_value(body, &["title", "name"]);
     let mut description = frontmatter_value(body, &["description"]);
+    let frontmatter = parse_skill_frontmatter(body);
     let content_start = frontmatter_end_line(body).unwrap_or(0);
 
     for line in body.lines().skip(content_start) {
@@ -366,6 +543,24 @@ fn parse_skill_metadata(body: &str, fallback_id: &str) -> SkillMetadata {
     SkillMetadata {
         title: title.unwrap_or_else(|| fallback_id.to_string()),
         description,
+        frontmatter,
+    }
+}
+
+fn parse_skill_frontmatter(body: &str) -> SkillFrontmatter {
+    SkillFrontmatter {
+        triggers: frontmatter_values(body, &["triggers", "trigger"]),
+        conditions: frontmatter_values(body, &["conditions", "condition"]),
+        platforms: frontmatter_values(body, &["platforms", "platform"]),
+        requires_tools: frontmatter_values(body, &["requiresTools", "requires_tools"]),
+        requires_toolsets: frontmatter_values(
+            body,
+            &["requiresToolsets", "requires_toolsets", "toolsets"],
+        ),
+        agent_modes: frontmatter_values(body, &["agentModes", "agent_modes"]),
+        channels: frontmatter_values(body, &["channels", "channel"]),
+        delivery_mode: frontmatter_value(body, &["deliveryMode", "delivery_mode"])
+            .and_then(|value| parse_delivery_mode(&value)),
     }
 }
 
@@ -394,6 +589,87 @@ fn frontmatter_value(body: &str, keys: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+fn frontmatter_values(body: &str, keys: &[&str]) -> Vec<String> {
+    let Some(block) = frontmatter_block(body) else {
+        return Vec::new();
+    };
+    let mut values = BTreeSet::new();
+    let mut lines = block.iter().enumerate().peekable();
+    while let Some((index, line)) = lines.next() {
+        let trimmed = line.trim();
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        if !keys
+            .iter()
+            .any(|candidate| key.trim().eq_ignore_ascii_case(candidate))
+        {
+            continue;
+        }
+        extend_yaml_values(&mut values, value);
+        while let Some((_, next)) = lines.peek() {
+            let next_trimmed = next.trim();
+            if next_trimmed.is_empty() {
+                lines.next();
+                continue;
+            }
+            if next_trimmed.starts_with("- ") {
+                extend_yaml_values(&mut values, next_trimmed.trim_start_matches("- "));
+                lines.next();
+                continue;
+            }
+            if next.contains(':') && !next.starts_with(' ') && !next.starts_with('\t') {
+                break;
+            }
+            if index + 1 < block.len() {
+                break;
+            }
+        }
+    }
+    values.into_iter().collect()
+}
+
+fn frontmatter_block(body: &str) -> Option<Vec<&str>> {
+    let mut lines = body.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return None;
+    }
+    let mut block = Vec::new();
+    for line in lines {
+        if line.trim() == "---" {
+            return Some(block);
+        }
+        block.push(line);
+    }
+    None
+}
+
+fn extend_yaml_values(values: &mut BTreeSet<String>, value: &str) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let trimmed = trimmed.trim_start_matches('[').trim_end_matches(']').trim();
+    for item in trimmed.split(',') {
+        let item = trim_yaml_scalar(item);
+        if !item.is_empty() {
+            values.insert(item);
+        }
+    }
+}
+
+fn parse_delivery_mode(value: &str) -> Option<SkillDeliveryMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "index-only" | "index_only" => Some(SkillDeliveryMode::IndexOnly),
+        "injected-body" | "injected_body" | "body" => Some(SkillDeliveryMode::InjectedBody),
+        "invocation-envelope" | "invocation_envelope" | "envelope" => {
+            Some(SkillDeliveryMode::InvocationEnvelope)
+        }
+        "tool-view" | "tool_view" => Some(SkillDeliveryMode::ToolView),
+        _ => None,
+    }
 }
 
 fn frontmatter_end_line(body: &str) -> Option<usize> {
@@ -478,9 +754,39 @@ fn score_skill(
     skill: &SkillRecord,
     query_tokens: &BTreeSet<String>,
     query: &SkillSelectionQuery,
-) -> (usize, Vec<String>) {
+    fts_scores: &BTreeMap<String, usize>,
+) -> Option<(usize, Vec<SkillScoreComponent>, Vec<String>)> {
     let mut score = 0;
+    let mut components = Vec::new();
     let mut reasons = Vec::new();
+    if let Some(reason) = frontmatter_gate_blocker(skill, query_tokens, query) {
+        return if explicit_invocation_matches(skill, query) {
+            reasons.push(format!("explicit invocation bypassed gate: {reason}"));
+            Some((
+                10_000,
+                vec![SkillScoreComponent {
+                    name: "explicit-invocation".to_string(),
+                    score: 10_000,
+                    matches: 1,
+                }],
+                reasons,
+            ))
+        } else {
+            None
+        };
+    }
+
+    let explicit_invocation = explicit_invocation_matches(skill, query);
+    if explicit_invocation {
+        score += 10_000;
+        components.push(SkillScoreComponent {
+            name: "explicit-invocation".to_string(),
+            score: 10_000,
+            matches: 1,
+        });
+        reasons.push("explicit skill invocation".to_string());
+    }
+
     let id_tokens = token_set(&skill.original_id);
     let title_tokens = token_set(&skill.title);
     let description_tokens = skill
@@ -492,26 +798,63 @@ fn score_skill(
 
     let id_matches = count_matches(query_tokens, &id_tokens);
     if id_matches > 0 {
-        score += id_matches * 20;
+        let component_score = id_matches * 20;
+        score += component_score;
+        components.push(SkillScoreComponent {
+            name: "id".to_string(),
+            score: component_score,
+            matches: id_matches,
+        });
         reasons.push(format!("{id_matches} id token match(es)"));
     }
 
     let title_matches = count_matches(query_tokens, &title_tokens);
     if title_matches > 0 {
-        score += title_matches * 12;
+        let component_score = title_matches * 12;
+        score += component_score;
+        components.push(SkillScoreComponent {
+            name: "title".to_string(),
+            score: component_score,
+            matches: title_matches,
+        });
         reasons.push(format!("{title_matches} title token match(es)"));
     }
 
     let description_matches = count_matches(query_tokens, &description_tokens);
     if description_matches > 0 {
-        score += description_matches * 8;
+        let component_score = description_matches * 8;
+        score += component_score;
+        components.push(SkillScoreComponent {
+            name: "description".to_string(),
+            score: component_score,
+            matches: description_matches,
+        });
         reasons.push(format!("{description_matches} description token match(es)"));
     }
 
     let keyword_matches = count_matches(query_tokens, &keyword_tokens);
     if keyword_matches > 0 {
-        score += keyword_matches * 4;
+        let component_score = keyword_matches * 4;
+        score += component_score;
+        components.push(SkillScoreComponent {
+            name: "body-keywords".to_string(),
+            score: component_score,
+            matches: keyword_matches,
+        });
         reasons.push(format!("{keyword_matches} body keyword match(es)"));
+    }
+
+    let trigger_tokens = values_token_set(&skill.frontmatter.triggers);
+    let trigger_matches = count_matches(query_tokens, &trigger_tokens);
+    if trigger_matches > 0 {
+        let component_score = trigger_matches * 16;
+        score += component_score;
+        components.push(SkillScoreComponent {
+            name: "declared-triggers".to_string(),
+            score: component_score,
+            matches: trigger_matches,
+        });
+        reasons.push(format!("{trigger_matches} declared trigger match(es)"));
     }
 
     if query
@@ -520,6 +863,11 @@ fn score_skill(
         .is_some_and(|agent_id| text_contains_token(&skill.original_id, agent_id))
     {
         score += 5;
+        components.push(SkillScoreComponent {
+            name: "agent-id".to_string(),
+            score: 5,
+            matches: 1,
+        });
         reasons.push("agent id appears in skill id".to_string());
     }
 
@@ -529,10 +877,75 @@ fn score_skill(
         .is_some_and(|channel| text_contains_token(&skill.original_id, channel))
     {
         score += 5;
+        components.push(SkillScoreComponent {
+            name: "channel".to_string(),
+            score: 5,
+            matches: 1,
+        });
         reasons.push("channel appears in skill id".to_string());
     }
 
-    (score, reasons)
+    if let Some(fts_score) = fts_scores
+        .get(&skill.id)
+        .copied()
+        .filter(|score| *score > 0)
+    {
+        score += fts_score;
+        components.push(SkillScoreComponent {
+            name: "sqlite-fts5-bm25".to_string(),
+            score: fts_score,
+            matches: 1,
+        });
+        reasons.push("SQLite FTS5/BM25 match".to_string());
+    }
+
+    Some((score, components, reasons))
+}
+
+fn sqlite_fts_scores(
+    index: &SkillIndex,
+    query_tokens: &BTreeSet<String>,
+) -> io::Result<BTreeMap<String, usize>> {
+    if query_tokens.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let conn = Connection::open_in_memory().map_err(io::Error::other)?;
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE skill_fts USING fts5(skill_id UNINDEXED, title, description, keywords);",
+    )
+    .map_err(io::Error::other)?;
+    for skill in &index.skills {
+        conn.execute(
+            "INSERT INTO skill_fts(skill_id, title, description, keywords) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &skill.id,
+                &skill.title,
+                skill.description.as_deref().unwrap_or(""),
+                skill.keywords.join(" ")
+            ],
+        )
+        .map_err(io::Error::other)?;
+    }
+    let fts_query = query_tokens
+        .iter()
+        .map(|token| format!("\"{}\"", token.replace('"', "")))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let mut stmt = conn
+        .prepare("SELECT skill_id, bm25(skill_fts) FROM skill_fts WHERE skill_fts MATCH ?1")
+        .map_err(io::Error::other)?;
+    let rows = stmt
+        .query_map(params![fts_query], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })
+        .map_err(io::Error::other)?;
+    let mut scores = BTreeMap::new();
+    for row in rows {
+        let (skill_id, rank) = row.map_err(io::Error::other)?;
+        let score = (1000.0 / (1.0 + rank.abs())).round() as usize;
+        scores.insert(skill_id, score.max(1));
+    }
+    Ok(scores)
 }
 
 fn token_set(text: &str) -> BTreeSet<String> {
@@ -548,6 +961,201 @@ fn count_matches(left: &BTreeSet<String>, right: &BTreeSet<String>) -> usize {
 fn text_contains_token(text: &str, token: &str) -> bool {
     let token = token.to_ascii_lowercase();
     token_set(text).contains(&token)
+}
+
+fn values_token_set(values: &[String]) -> BTreeSet<String> {
+    let mut tokens = BTreeSet::new();
+    for value in values {
+        extend_tokens(&mut tokens, value);
+    }
+    tokens
+}
+
+fn frontmatter_gate_blocker(
+    skill: &SkillRecord,
+    query_tokens: &BTreeSet<String>,
+    query: &SkillSelectionQuery,
+) -> Option<String> {
+    if !skill.frontmatter.platforms.is_empty()
+        && !query
+            .channel
+            .as_deref()
+            .is_some_and(|channel| value_matches(&skill.frontmatter.platforms, channel))
+    {
+        return Some("platform gate did not match query channel".to_string());
+    }
+    if !skill.frontmatter.channels.is_empty()
+        && !query
+            .channel
+            .as_deref()
+            .is_some_and(|channel| value_matches(&skill.frontmatter.channels, channel))
+    {
+        return Some("channel gate did not match query channel".to_string());
+    }
+    if !skill.frontmatter.agent_modes.is_empty()
+        && !query
+            .agent_mode
+            .as_deref()
+            .is_some_and(|mode| value_matches(&skill.frontmatter.agent_modes, mode))
+    {
+        return Some("agent mode gate did not match".to_string());
+    }
+    if !skill.frontmatter.triggers.is_empty()
+        && count_matches(query_tokens, &values_token_set(&skill.frontmatter.triggers)) == 0
+    {
+        return Some("declared triggers did not match".to_string());
+    }
+    if !skill.frontmatter.conditions.is_empty()
+        && count_matches(
+            query_tokens,
+            &values_token_set(&skill.frontmatter.conditions),
+        ) == 0
+    {
+        return Some("declared conditions did not match".to_string());
+    }
+    if !query.available_tools.is_empty()
+        && !required_values_available(&skill.frontmatter.requires_tools, &query.available_tools)
+    {
+        return Some("required tools are not available".to_string());
+    }
+    if !query.available_toolsets.is_empty()
+        && !required_values_available(
+            &skill.frontmatter.requires_toolsets,
+            &query.available_toolsets,
+        )
+    {
+        return Some("required toolsets are not available".to_string());
+    }
+    None
+}
+
+fn value_matches(values: &[String], expected: &str) -> bool {
+    values.iter().any(|value| {
+        value.eq_ignore_ascii_case(expected)
+            || token_set(value).contains(&expected.to_ascii_lowercase())
+            || token_set(expected).contains(&value.to_ascii_lowercase())
+    })
+}
+
+fn required_values_available(required: &[String], available: &[String]) -> bool {
+    required.iter().all(|required| {
+        available
+            .iter()
+            .any(|value| value_matches(&[required.clone()], value))
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExplicitSkillInvocation {
+    skill_id: String,
+    user_instruction: String,
+}
+
+impl ExplicitSkillInvocation {
+    fn parse(text: &str) -> Option<Self> {
+        parse_slash_skill_invocation(text).or_else(|| parse_dollar_skill_invocation(text))
+    }
+}
+
+fn parse_slash_skill_invocation(text: &str) -> Option<ExplicitSkillInvocation> {
+    let trimmed = text.trim_start();
+    let rest = trimmed.strip_prefix("/skill")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let skill_id = parts.next()?.trim();
+    if skill_id.is_empty() {
+        return None;
+    }
+    Some(ExplicitSkillInvocation {
+        skill_id: skill_id.to_string(),
+        user_instruction: parts.next().unwrap_or("").trim().to_string(),
+    })
+}
+
+fn parse_dollar_skill_invocation(text: &str) -> Option<ExplicitSkillInvocation> {
+    let bytes = text.as_bytes();
+    for (index, ch) in text.char_indices() {
+        if ch != '$' {
+            continue;
+        }
+        if index > 0
+            && bytes
+                .get(index.saturating_sub(1))
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        {
+            continue;
+        }
+        let after = index + ch.len_utf8();
+        let rest = &text[after..];
+        let mut end = rest.len();
+        for (offset, item) in rest.char_indices() {
+            if item.is_whitespace() {
+                end = offset;
+                break;
+            }
+        }
+        let skill_id = &rest[..end];
+        if skill_id.is_empty() {
+            continue;
+        }
+        let user_instruction = rest[end..].trim();
+        return Some(ExplicitSkillInvocation {
+            skill_id: skill_id.to_string(),
+            user_instruction: user_instruction.to_string(),
+        });
+    }
+    None
+}
+
+fn explicit_invocation_matches(skill: &SkillRecord, query: &SkillSelectionQuery) -> bool {
+    ExplicitSkillInvocation::parse(&query.text)
+        .as_ref()
+        .is_some_and(|invocation| skill_id_matches(skill, &invocation.skill_id))
+}
+
+pub fn skill_id_matches(skill: &SkillRecord, requested: &str) -> bool {
+    let requested = requested.trim().trim_start_matches('$');
+    if requested.is_empty() {
+        return false;
+    }
+    skill.id.eq_ignore_ascii_case(requested)
+        || skill.original_id.eq_ignore_ascii_case(requested)
+        || skill
+            .id
+            .rsplit_once(':')
+            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case(requested))
+}
+
+fn stable_selection_receipt_id(
+    query_text: &str,
+    skill_id: &str,
+    delivery_mode: SkillDeliveryMode,
+    body_checksum: &str,
+) -> String {
+    stable_text_hash(
+        "skill-selection-item",
+        &format!(
+            "{query_text}|{skill_id}|{}|{body_checksum}",
+            delivery_mode.as_str()
+        ),
+    )
+}
+
+fn stable_text_hash(namespace: &str, text: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in namespace
+        .as_bytes()
+        .iter()
+        .chain([0].iter())
+        .chain(text.as_bytes())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv1a64:{hash:016x}")
 }
 
 fn summarize_skills(skills: &[SkillRecord]) -> SkillIndexSummary {
@@ -816,6 +1424,11 @@ mod tests {
                 agent_id: Some("mem-cron".to_string()),
                 channel: None,
                 workspace: None,
+                agent_mode: None,
+                available_tools: Vec::new(),
+                available_toolsets: Vec::new(),
+                fts_enabled: false,
+                vector_tie_break_enabled: false,
                 limit: 2,
             },
         );
@@ -828,6 +1441,59 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("id"))
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_selection_frontmatter_gates_and_writes_receipt() {
+        let root = temp_root("skill_selection_frontmatter_gates_and_writes_receipt");
+        let home = root.join(".openclaw");
+        let workspace = home.join("workspace");
+        let telegram_skill = workspace.join("skills").join("telegram-media");
+        let discord_skill = workspace.join("skills").join("discord-media");
+        fs::create_dir_all(&telegram_skill).unwrap();
+        fs::create_dir_all(&discord_skill).unwrap();
+        fs::write(
+            telegram_skill.join(SKILL_FILE_NAME),
+            "---\ntriggers: [photo, media]\nchannels: [telegram]\ndeliveryMode: index-only\n---\n# Telegram Media\n\nHandle Telegram media downloads.",
+        )
+        .unwrap();
+        fs::write(
+            discord_skill.join(SKILL_FILE_NAME),
+            "---\ntriggers: [photo, media]\nchannels: [discord]\n---\n# Discord Media\n\nHandle Discord media downloads.",
+        )
+        .unwrap();
+        let index =
+            build_source_skill_index(&AgentSource::with_workspace(&home, &workspace)).unwrap();
+        let query = SkillSelectionQuery {
+            text: "handle inbound photo media".to_string(),
+            agent_id: Some("main".to_string()),
+            channel: Some("telegram".to_string()),
+            workspace: None,
+            agent_mode: None,
+            available_tools: Vec::new(),
+            available_toolsets: Vec::new(),
+            fts_enabled: false,
+            vector_tie_break_enabled: false,
+            limit: 5,
+        };
+        let selections = select_skills(&index, &query);
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].skill_id, "workspace:telegram-media");
+        assert_eq!(selections[0].delivery_mode, SkillDeliveryMode::IndexOnly);
+        assert!(
+            selections[0]
+                .score_components
+                .iter()
+                .any(|component| component.name == "declared-triggers")
+        );
+
+        let receipt = write_skill_selection_receipt(&home, &query, &selections).unwrap();
+        assert_eq!(receipt.matcher_version, SKILL_MATCHER_VERSION);
+        let receipts = fs::read_to_string(skill_selection_receipts_file(&home)).unwrap();
+        assert!(receipts.contains(SKILL_SELECTION_RECEIPT_SCHEMA));
+        assert!(receipts.contains("telegram-media"));
 
         let _ = fs::remove_dir_all(root);
     }

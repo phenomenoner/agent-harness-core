@@ -13,6 +13,7 @@ name = "agent-harness-cli"
 version = "0.1.0"
 dependencies = [
  "agent-harness-core",
+ "ring",
  "serde",
  "serde_json",
  "ureq",

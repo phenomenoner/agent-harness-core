@@ -861,6 +861,7 @@ mod tests {
             user_id: "user".to_string(),
             message_text: "/test".to_string(),
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
             session_key: session_key.to_string(),
             action: ChannelStepAction::ReplyOnly,
             command_effect: Some(effect),
