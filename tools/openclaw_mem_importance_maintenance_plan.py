@@ -156,12 +156,63 @@ def write_summary(plan: dict[str, Any], path: Path) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def actionable_count(plan: dict[str, Any]) -> int:
+    return sum(int(item["count"]) for item in plan["candidates"].values())
+
+
+def build_notification(plan: dict[str, Any], summary_path: Path, notify_state_path: Path) -> str | None:
+    previous_digest = None
+    if notify_state_path.exists():
+        try:
+            previous_digest = json.loads(notify_state_path.read_text(encoding="utf-8")).get("lastNotifiedDigest")
+        except json.JSONDecodeError:
+            previous_digest = None
+
+    if previous_digest == plan["digest"]:
+        return None
+
+    count = actionable_count(plan)
+    if count <= 0:
+        return None
+
+    notify_state_path.write_text(
+        json.dumps(
+            {
+                "lastNotifiedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "lastNotifiedDigest": plan["digest"],
+                "actionableCount": count,
+                "summary": str(summary_path),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    lanes = sorted(
+        ((name, int(item["count"])) for name, item in plan["candidates"].items()),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:4]
+    lane_text = ", ".join(f"{name}={count}" for name, count in lanes)
+    return (
+        "memory-importance actionable findings\n"
+        f"summary={summary_path}\n"
+        f"digest={plan['digest']}\n"
+        f"total_candidate_signals={count}\n"
+        f"top_lanes={lane_text}\n"
+        "next_action=review summary.md and decide whether to keep plan-only or approve bounded apply mode"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, type=Path)
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--contract", required=True, type=Path)
     parser.add_argument("--print-summary", action="store_true")
+    parser.add_argument("--notify-on-actionable", action="store_true")
     args = parser.parse_args()
 
     if not args.db.exists():
@@ -182,6 +233,12 @@ def main() -> int:
     plan["artifacts"] = {"plan": str(plan_path), "summary": str(summary_path)}
     plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     write_summary(plan, summary_path)
+
+    if args.notify_on_actionable:
+        notification = build_notification(plan, summary_path, args.out_dir / "last-notified.json")
+        if notification:
+            print(notification)
+            return 0
 
     if args.print_summary:
         print(f"memory-importance-plan ok plan={plan_path} summary={summary_path} digest={plan['digest']}")

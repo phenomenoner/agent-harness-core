@@ -83,7 +83,8 @@ The weekly job is plan-only:
 - Inspect current memory table counts, embedding coverage, and noisy candidate counts.
 - Write a dated JSON plan and Markdown summary.
 - Propose candidate groups for promote/demote/stale/ignore.
-- Emit `NO_REPLY` on successful artifact creation.
+- Emit a short actionable notification when candidate counts produce a new digest that has not been reported before.
+- Emit `NO_REPLY` when the latest digest was already reported and no new action is needed.
 - Emit a short `BLOCKED` report if the plan cannot be written or the database cannot be read.
 
 Apply mode is out of scope for the scheduled job. Any future apply path must:
@@ -116,6 +117,7 @@ Runtime artifacts:
 
 - `D:\Warehouse\Rust-OpenClaw-Core\.agent-harness\state\memory\importance-maintenance\<YYYY-MM-DD>\plan.json`
 - `D:\Warehouse\Rust-OpenClaw-Core\.agent-harness\state\memory\importance-maintenance\<YYYY-MM-DD>\summary.md`
+- `D:\Warehouse\Rust-OpenClaw-Core\.agent-harness\state\memory\importance-maintenance\last-notified.json`
 
 Scheduled job:
 
@@ -133,6 +135,7 @@ A valid run must prove:
 - Row and embedding coverage counts were captured for observations, episodic events, and docs chunks.
 - Candidate counts were grouped by policy lane.
 - `plan.json` and `summary.md` were written.
+- Actionable findings were either reported once per digest or suppressed because the digest was already reported.
 - No SQLite mutation occurred.
 
 A valid policy update must include:
