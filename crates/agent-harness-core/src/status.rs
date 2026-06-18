@@ -367,16 +367,63 @@ fn loop_status(harness_home: &Path) -> io::Result<HarnessLoopStatus> {
         .join("supervisor")
         .join("loop-heartbeats");
     let now_ms = epoch_ms().unwrap_or(0);
+    let mut loop_names: Vec<String> = LOOP_NAMES.iter().map(|name| (*name).to_string()).collect();
+    let mut seen: BTreeSet<String> = loop_names.iter().cloned().collect();
+    for name in extra_loop_names(harness_home, &heartbeat_dir)? {
+        if seen.insert(name.clone()) {
+            loop_names.push(name);
+        }
+    }
     let mut heartbeats = Vec::new();
-    for name in LOOP_NAMES {
+    for name in loop_names {
         let heartbeat_file = heartbeat_dir.join(format!("{name}.json"));
-        let heartbeat = read_loop_heartbeat(name, &heartbeat_file, now_ms)?;
+        let heartbeat = read_loop_heartbeat(&name, &heartbeat_file, now_ms)?;
         heartbeats.push(heartbeat);
     }
     Ok(HarnessLoopStatus {
         heartbeat_dir,
         heartbeats,
     })
+}
+
+fn extra_loop_names(harness_home: &Path, heartbeat_dir: &Path) -> io::Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    match fs::read_dir(heartbeat_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                    if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+                        names.insert(stem.to_string());
+                    }
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let supervisor_plan = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("windows-scheduled-tasks")
+        .join("supervisor-plan.json");
+    if let Ok(text) = fs::read_to_string(&supervisor_plan) {
+        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+            if let Some(tasks) = value.get("tasks").and_then(Value::as_array) {
+                for task in tasks {
+                    if let Some(component) = task.get("component").and_then(Value::as_str) {
+                        if !component.trim().is_empty() {
+                            names.insert(component.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(names)
 }
 
 fn cron_scheduler_status(harness_home: &Path) -> io::Result<HarnessCronSchedulerStatus> {
@@ -2030,6 +2077,58 @@ mod tests {
             Some(cron_run.run_id.as_str())
         );
         assert_eq!(latest.scheduled_for_ms, Some(1000));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collect_status_includes_custom_supervisor_loop_heartbeats() {
+        let root = temp_root("collect_status_includes_custom_supervisor_loop_heartbeats");
+        let harness_home = root.join(".agent-harness");
+        let heartbeat_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("loop-heartbeats");
+        let plan_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("windows-scheduled-tasks");
+        fs::create_dir_all(&heartbeat_dir).unwrap();
+        fs::create_dir_all(&plan_dir).unwrap();
+        crate::write_json_atomic(
+            &heartbeat_dir.join("telegram-loop-xiaoxiaoli.json"),
+            &serde_json::json!({
+                "status": "running",
+                "iteration": 11,
+                "processId": 456,
+                "atMs": 1_000
+            }),
+        )
+        .unwrap();
+        crate::write_json_atomic(
+            &plan_dir.join("supervisor-plan.json"),
+            &serde_json::json!({
+                "tasks": [
+                    {
+                        "name": "AgentHarness-telegram-loop-xiaoxiaoli",
+                        "component": "telegram-loop-xiaoxiaoli",
+                        "runnerScript": "telegram-loop-xiaoxiaoli.ps1"
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+
+        let report = collect_harness_status(HarnessStatusOptions { harness_home }).unwrap();
+
+        let custom = report
+            .loops
+            .heartbeats
+            .iter()
+            .find(|item| item.name == "telegram-loop-xiaoxiaoli")
+            .expect("custom supervisor loop should be reported");
+        assert!(custom.present);
+        assert_eq!(custom.status.as_deref(), Some("running"));
 
         let _ = fs::remove_dir_all(root);
     }

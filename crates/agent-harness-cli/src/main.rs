@@ -36,17 +36,20 @@ use agent_harness_core::{
     CronSchedulerRunOnceOptions, CronSchedulerTickStatus, DEFAULT_MEMORY_BACKFILL_BATCH_SIZE,
     DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS, DEFAULT_MEMORY_BACKFILL_MAX_ITEMS,
     DEFAULT_MEMORY_BACKFILL_RATE_LIMIT_PER_MINUTE, DEFAULT_MEMORY_BACKFILL_RETRY_CAP,
-    DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION, DeterministicCronPlan, DeterministicCronPlanInput,
-    DeterministicCronWorkerEnqueueOptions, DriftCheckOptions, DryRunImportOptions,
-    ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel, HarnessLogRotationOptions,
-    HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport, HealthzOptions,
-    ImportPhaseStatus, ImportReport, LearningProposalOptions, LiveControlAction, McpRequestOptions,
-    MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport, MemoryCanvasWorkerStatus,
-    MemoryCredentialsExportOptions, MemoryCredentialsExportReport, MemoryEmbeddingBackfillLane,
-    MemoryEmbeddingBackfillOptions, MemoryEmbeddingBackfillReport, MemoryHookAdapterOptions,
-    MemoryHookKind, MemorySearchOptions, MemorySearchReport, MemoryVectorRecallOptions,
-    MemoryVectorRecallReport, MemoryVectorRecallStatus, NativeCronPlan, NativeCronPlanInput,
-    NativeCronWorkerEnqueueOptions, OpenClawMemReadPathSmokeOptions,
+    DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION, DEFAULT_MEMORY_OWNER_HEARTBEAT_MAX_AGE_MS,
+    DeterministicCronPlan, DeterministicCronPlanInput, DeterministicCronWorkerEnqueueOptions,
+    DriftCheckOptions, DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel,
+    HarnessLogRotationOptions, HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport,
+    HealthzOptions, ImportPhaseStatus, ImportReport, LearningProposalOptions, LiveControlAction,
+    McpRequestOptions, MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport,
+    MemoryCanvasWorkerStatus, MemoryCredentialsExportOptions, MemoryCredentialsExportReport,
+    MemoryEmbeddingBackfillLane, MemoryEmbeddingBackfillOptions, MemoryEmbeddingBackfillReport,
+    MemoryHookAdapterOptions, MemoryHookKind, MemoryOwnerEndpointProbeOptions,
+    MemoryOwnerEnsureOptions, MemoryOwnerHeartbeatOptions, MemoryOwnerPromotionOptions,
+    MemoryOwnerRecoveryOptions, MemoryOwnerShadowKind, MemoryOwnerShadowOptions,
+    MemoryOwnerTrustScopeOptions, MemorySearchOptions, MemorySearchReport,
+    MemoryVectorRecallOptions, MemoryVectorRecallReport, MemoryVectorRecallStatus, NativeCronPlan,
+    NativeCronPlanInput, NativeCronWorkerEnqueueOptions, OpenClawMemReadPathSmokeOptions,
     OpenClawMemServiceProposeOptions, OpenClawMemServiceRecallOptions, OpenClawMemServiceStatus,
     OpenClawMemServiceStatusOptions, OpenClawMemServiceStoreOptions, OpsBackupOptions,
     OpsControlAction, OpsControlOptions, OpsCutoverApplyOptions, OpsCutoverApproveOptions,
@@ -75,28 +78,32 @@ use agent_harness_core::{
     control_runtime_queue_item, create_learning_proposal, create_ops_backup,
     create_skill_archive_proposal, create_skill_learning_proposal, current_log_time_ms,
     default_supervisor_child_specs, enqueue_channel_step, enqueue_deterministic_cron_workers,
-    enqueue_native_cron_workers, enqueue_subagent_workers, enqueue_worker_job, evaluate_admission,
-    evaluate_prompt_reduction, evaluate_supervisor_children, execute_import,
-    export_harness_registry_files, export_memory_credentials, get_vault_secret, handle_mcp_request,
-    inspect_openclaw_mem_service, inspect_runtime_queue_capacity, invariant_catalog, inventory,
-    lint_cron_scheduler, list_background_tasks, list_cron_runs, list_skill_proposals,
-    load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
-    load_subagent_ledger, parse_channel_command, parse_context_pack, plan_agent_progress_delivery,
-    plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron, plan_native_cron,
-    plan_subagents, preflight_codex_runtime, prepare_runtime_queue_item,
-    probe_codex_runtime_launch, propose_openclaw_mem_service_memory, put_vault_secret,
-    reap_stale_worker_jobs, recall_openclaw_mem_service, receive_channel_message,
-    record_agent_progress_delivery, record_channel_delivery, record_channel_turn_shadow,
-    record_codex_runtime_completion, record_ops_control, record_ops_cutover_apply,
-    record_ops_cutover_approval, record_ops_cutover_receipt, record_ops_cutover_request,
-    record_scoped_stop, record_supervise_deploy_canary, reject_skill_proposal, release_checklist,
-    resolve_channel_identity, rotate_harness_log_if_needed, run_channel_once, run_codex_runtime,
-    run_cron_scheduler_once, run_memory_canvas_worker, run_memory_embedding_backfill,
-    run_memory_hook_adapter, run_openclaw_mem_read_path_smoke, run_public_hygiene,
-    run_runtime_queue_once, run_worker_once, scan_security_boundaries, schema_registry_entries,
-    search_imported_memory, search_imported_vector_memory, select_skills,
-    store_openclaw_mem_service_memory, sync_builtin_harness_skills, tool_description_hash,
-    trace_harness_event, upsert_background_task, validate_harness_config, write_channel_step,
+    enqueue_native_cron_workers, enqueue_subagent_workers, enqueue_worker_job,
+    ensure_memory_owner_state, evaluate_admission, evaluate_prompt_reduction,
+    evaluate_supervisor_children, execute_import, export_harness_registry_files,
+    export_memory_credentials, get_vault_secret, handle_mcp_request, inspect_openclaw_mem_service,
+    inspect_runtime_queue_capacity, invariant_catalog, inventory, lint_cron_scheduler,
+    list_background_tasks, list_cron_runs, list_skill_proposals, load_agent_registry,
+    load_deterministic_cron_store, load_native_cron_store, load_subagent_ledger,
+    parse_channel_command, parse_context_pack, plan_agent_progress_delivery, plan_channel_outbox,
+    plan_codex_runtime, plan_deterministic_cron, plan_native_cron, plan_subagents,
+    preflight_codex_runtime, prepare_runtime_queue_item, probe_codex_runtime_launch,
+    propose_openclaw_mem_service_memory, put_vault_secret, reap_stale_worker_jobs,
+    recall_openclaw_mem_service, receive_channel_message, record_agent_progress_delivery,
+    record_channel_delivery, record_channel_turn_shadow, record_codex_runtime_completion,
+    record_memory_owner_endpoint_probe, record_memory_owner_heartbeat,
+    record_memory_owner_shadow_receipt, record_memory_owner_trust_scope_receipt,
+    record_ops_control, record_ops_cutover_apply, record_ops_cutover_approval,
+    record_ops_cutover_receipt, record_ops_cutover_request, record_scoped_stop,
+    record_supervise_deploy_canary, recover_memory_owner_state, reject_skill_proposal,
+    release_checklist, request_memory_owner_promotion, resolve_channel_identity,
+    rotate_harness_log_if_needed, run_channel_once, run_codex_runtime, run_cron_scheduler_once,
+    run_memory_canvas_worker, run_memory_embedding_backfill, run_memory_hook_adapter,
+    run_openclaw_mem_read_path_smoke, run_public_hygiene, run_runtime_queue_once, run_worker_once,
+    scan_security_boundaries, schema_registry_entries, search_imported_memory,
+    search_imported_vector_memory, select_skills, store_openclaw_mem_service_memory,
+    sync_builtin_harness_skills, tool_description_hash, trace_harness_event,
+    upsert_background_task, validate_harness_config, write_channel_step,
     write_deterministic_cron_plan, write_memory_search_receipt, write_memory_vector_recall_receipt,
     write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
     write_subagent_plan, write_task_entity, write_turn_plan, write_windows_supervisor_plan,
@@ -168,6 +175,13 @@ fn main() {
         "memory-service-propose" => run_memory_service_propose(&rest),
         "memory-service-store" => run_memory_service_store(&rest),
         "memory-read-path-smoke" => run_memory_read_path_smoke(&rest),
+        "memory-owner-ensure" => run_memory_owner_ensure(&rest),
+        "memory-owner-endpoint-probe" => run_memory_owner_endpoint_probe(&rest),
+        "memory-owner-heartbeat" => run_memory_owner_heartbeat(&rest),
+        "memory-owner-shadow" => run_memory_owner_shadow(&rest),
+        "memory-owner-trust-scope" => run_memory_owner_trust_scope(&rest),
+        "memory-owner-promote" => run_memory_owner_promote(&rest),
+        "memory-owner-recover" => run_memory_owner_recover(&rest),
         "ops-backup" => run_ops_backup(&rest),
         "ops-cutover-request" => run_ops_cutover_request(&rest),
         "ops-cutover-approve" => run_ops_cutover_approve(&rest),
@@ -484,15 +498,29 @@ fn run_round7_receipt(args: &[String]) -> Result<(), String> {
     })
     .map_err(|err| err.to_string())?;
     let now_ms = current_log_time_ms().map_err(|err| err.to_string())?;
+    let latest_cutover_receipt = latest_ops_cutover_receipt(&harness_home);
+    let live_cutover_performed = latest_cutover_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.get("ready"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || latest_cutover_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.get("status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("ready");
     let receipt_dir = harness_home.join("state").join("round7");
     fs::create_dir_all(&receipt_dir).map_err(|err| err.to_string())?;
     let receipt_path = receipt_dir.join(format!("round7-receipt-{now_ms}.json"));
     let receipt = serde_json::json!({
         "schema": "agent-harness.round7-receipt.v1",
+        "receiptPurpose": "support-plane-evidence",
         "createdAtMs": now_ms,
         "harnessHome": harness_home,
-        "liveCutoverPerformed": false,
-        "liveCutoverRequired": true,
+        "liveCutoverPerformed": live_cutover_performed,
+        "liveCutoverRequired": !live_cutover_performed,
+        "liveCutoverStatusSource": "state/cutover/cutover-receipts.jsonl",
+        "latestOpsCutoverReceipt": latest_cutover_receipt,
         "activeRoots": {
             "harnessHome": report.harness_home,
             "memoryDir": report.memory.memory_dir,
@@ -525,6 +553,18 @@ fn run_round7_receipt(args: &[String]) -> Result<(), String> {
         println!("Round7 receipt: {}", receipt_path.display());
     }
     Ok(())
+}
+
+fn latest_ops_cutover_receipt(harness_home: &Path) -> Option<serde_json::Value> {
+    let path = harness_home
+        .join("state")
+        .join("cutover")
+        .join("cutover-receipts.jsonl");
+    fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
 }
 
 fn run_cron_runs(args: &[String]) -> Result<(), String> {
@@ -1701,7 +1741,20 @@ fn run_ops_backup(args: &[String]) -> Result<(), String> {
         now_ms: current_time_ms()?,
     })
     .map_err(|err| err.to_string())?;
-    print_json(&report)
+    if args.summary_only {
+        print_json(&serde_json::json!({
+            "schema": "agent-harness.ops-backup-summary.v1",
+            "harnessHome": report.harness_home,
+            "backupDir": report.backup_dir,
+            "manifestFile": report.manifest_file,
+            "copiedFiles": report.copied_files,
+            "skippedFiles": report.skipped_files,
+            "bytesCopied": report.bytes_copied,
+            "warnings": report.warnings,
+        }))
+    } else {
+        print_json(&report)
+    }
 }
 
 fn run_ops_cutover_request(args: &[String]) -> Result<(), String> {
@@ -2425,6 +2478,131 @@ fn run_memory_read_path_smoke(args: &[String]) -> Result<(), String> {
         }
         Ok(())
     }
+}
+
+fn run_memory_owner_ensure(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(args, "memory-owner-ensure", &[], &["--json"])?;
+    let report = ensure_memory_owner_state(MemoryOwnerEnsureOptions {
+        harness_home: options.target_home,
+        now_ms: current_time_ms()?,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
+}
+
+fn run_memory_owner_endpoint_probe(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(
+        args,
+        "memory-owner-endpoint-probe",
+        &["--endpoint", "--observed-contract"],
+        &["--json"],
+    )?;
+    let report = record_memory_owner_endpoint_probe(MemoryOwnerEndpointProbeOptions {
+        harness_home: options.target_home.clone(),
+        endpoint: options.optional("--endpoint").map(ToString::to_string),
+        observed_contract: options
+            .optional("--observed-contract")
+            .map(ToString::to_string),
+        now_ms: current_time_ms()?,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
+}
+
+fn run_memory_owner_heartbeat(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(
+        args,
+        "memory-owner-heartbeat",
+        &["--lease-id", "--lease-ttl-ms"],
+        &["--json"],
+    )?;
+    let report = record_memory_owner_heartbeat(MemoryOwnerHeartbeatOptions {
+        harness_home: options.target_home.clone(),
+        lease_id: options.required("--lease-id")?,
+        lease_ttl_ms: options
+            .optional_i64("--lease-ttl-ms")?
+            .unwrap_or(DEFAULT_MEMORY_OWNER_HEARTBEAT_MAX_AGE_MS),
+        now_ms: current_time_ms()?,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
+}
+
+fn run_memory_owner_shadow(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(
+        args,
+        "memory-owner-shadow",
+        &[
+            "--kind",
+            "--input-id",
+            "--snapshot-status",
+            "--mem-engine-status",
+            "--snapshot-digest",
+            "--mem-engine-digest",
+        ],
+        &["--json"],
+    )?;
+    let report = record_memory_owner_shadow_receipt(MemoryOwnerShadowOptions {
+        harness_home: options.target_home.clone(),
+        kind: parse_memory_owner_shadow_kind(&options.required("--kind")?)?,
+        input_id: options.required("--input-id")?,
+        snapshot_status: options.required("--snapshot-status")?,
+        mem_engine_status: options.required("--mem-engine-status")?,
+        snapshot_digest: options.required("--snapshot-digest")?,
+        mem_engine_digest: options.required("--mem-engine-digest")?,
+        now_ms: current_time_ms()?,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
+}
+
+fn run_memory_owner_trust_scope(args: &[String]) -> Result<(), String> {
+    let options =
+        SimpleOptions::parse(args, "memory-owner-trust-scope", &["--passed"], &["--json"])?;
+    let report = record_memory_owner_trust_scope_receipt(MemoryOwnerTrustScopeOptions {
+        harness_home: options.target_home.clone(),
+        passed: parse_bool_value(&options.required("--passed")?, "--passed")?,
+        now_ms: current_time_ms()?,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
+}
+
+fn run_memory_owner_promote(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(
+        args,
+        "memory-owner-promote",
+        &["--heartbeat-max-age-ms"],
+        &["--operator-approved", "--json"],
+    )?;
+    let report = request_memory_owner_promotion(MemoryOwnerPromotionOptions {
+        harness_home: options.target_home.clone(),
+        operator_approved: options.has_flag("--operator-approved"),
+        heartbeat_max_age_ms: options
+            .optional_i64("--heartbeat-max-age-ms")?
+            .unwrap_or(DEFAULT_MEMORY_OWNER_HEARTBEAT_MAX_AGE_MS),
+        now_ms: current_time_ms()?,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
+}
+
+fn run_memory_owner_recover(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(
+        args,
+        "memory-owner-recover",
+        &["--heartbeat-max-age-ms"],
+        &["--json"],
+    )?;
+    let report = recover_memory_owner_state(MemoryOwnerRecoveryOptions {
+        harness_home: options.target_home.clone(),
+        heartbeat_max_age_ms: options
+            .optional_i64("--heartbeat-max-age-ms")?
+            .unwrap_or(DEFAULT_MEMORY_OWNER_HEARTBEAT_MAX_AGE_MS),
+        now_ms: current_time_ms()?,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
 }
 
 fn run_progress_delivery_once(args: &[String]) -> Result<(), String> {
@@ -6936,6 +7114,7 @@ struct OpsBackupArgs {
     target_home: PathBuf,
     label: Option<String>,
     max_file_bytes: u64,
+    summary_only: bool,
 }
 
 struct OpsCutoverRequestArgs {
@@ -7130,6 +7309,18 @@ fn parse_bool_value(value: &str, flag: &str) -> Result<bool, String> {
         "1" | "true" | "yes" | "on" | "passed" | "pass" => Ok(true),
         "0" | "false" | "no" | "off" | "failed" | "fail" => Ok(false),
         _ => Err(format!("{flag} requires true/false, got: {value}")),
+    }
+}
+
+fn parse_memory_owner_shadow_kind(value: &str) -> Result<MemoryOwnerShadowKind, String> {
+    match value {
+        "recall" => Ok(MemoryOwnerShadowKind::Recall),
+        "store" => Ok(MemoryOwnerShadowKind::Store),
+        "capture" => Ok(MemoryOwnerShadowKind::Capture),
+        "store-propose" | "store_propose" => Ok(MemoryOwnerShadowKind::StorePropose),
+        other => Err(format!(
+            "unknown memory owner shadow kind: {other}; expected recall, store, capture, or store-propose"
+        )),
     }
 }
 
@@ -8396,6 +8587,7 @@ fn ops_backup_args_from_args(args: &[String]) -> Result<OpsBackupArgs, String> {
     let mut target_home = default_harness_home();
     let mut label = None;
     let mut max_file_bytes = 64 * 1024 * 1024u64;
+    let mut summary_only = false;
     let mut i = 0;
 
     while i < args.len() {
@@ -8415,6 +8607,9 @@ fn ops_backup_args_from_args(args: &[String]) -> Result<OpsBackupArgs, String> {
                     "--max-file-bytes",
                 )?;
             }
+            "--summary-only" => {
+                summary_only = true;
+            }
             flag => return Err(format!("unknown argument: {flag}")),
         }
         i += 1;
@@ -8424,6 +8619,7 @@ fn ops_backup_args_from_args(args: &[String]) -> Result<OpsBackupArgs, String> {
         target_home,
         label,
         max_file_bytes,
+        summary_only,
     })
 }
 
@@ -16207,6 +16403,13 @@ fn print_help() {
     println!("  memory-service-propose Record a reviewed OpenClaw memory proposal");
     println!("  memory-service-store Store approved OpenClaw memory writeback");
     println!("  memory-read-path-smoke Run read-only memory bridge/coverage/scope smoke");
+    println!("  memory-owner-ensure Ensure memory-owner state exists without promotion");
+    println!("  memory-owner-endpoint-probe Record remote mem-engine endpoint contract probe");
+    println!("  memory-owner-heartbeat Record mem-engine lease heartbeat receipt");
+    println!("  memory-owner-shadow Record recall/store shadow parity receipt");
+    println!("  memory-owner-trust-scope Record trust/scope gate receipt");
+    println!("  memory-owner-promote Request gated mem-engine owner promotion");
+    println!("  memory-owner-recover Recover stale mem-engine owner back to snapshot adapter");
     println!("  ops-backup      Copy non-secret harness state and write a backup manifest");
     println!("  ops-cutover-request Record an operator cutover request and ticket");
     println!("  ops-cutover-approve Issue a short-lived live-control token for a ticket");
@@ -16387,6 +16590,7 @@ fn print_help() {
     println!("  --ttl-seconds <n>       Live-control token lifetime for cutover approval");
     println!("  --live-control-token <token> Token required for live gateway stop/start");
     println!("  --label <name>          Backup label for ops-backup");
+    println!("  --summary-only          Print compact ops-backup receipt summary");
     println!("  --queue-id <id>         Select one runtime queue item for queue-prepare");
     println!("  --execution-dir <path>  Prepared execution directory for codex-plan");
     println!("  --codex-exe <path>      Codex executable path for codex-plan/runtime-run-once");
