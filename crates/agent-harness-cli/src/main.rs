@@ -49,17 +49,18 @@ use agent_harness_core::{
     MemoryOwnerRecoveryOptions, MemoryOwnerShadowKind, MemoryOwnerShadowOptions,
     MemoryOwnerTrustScopeOptions, MemorySearchOptions, MemorySearchReport,
     MemoryVectorRecallOptions, MemoryVectorRecallReport, MemoryVectorRecallStatus, NativeCronPlan,
-    NativeCronPlanInput, NativeCronWorkerEnqueueOptions, OpenClawMemReadPathSmokeOptions,
-    OpenClawMemServiceProposeOptions, OpenClawMemServiceRecallOptions, OpenClawMemServiceStatus,
-    OpenClawMemServiceStatusOptions, OpenClawMemServiceStoreOptions, OpsBackupOptions,
-    OpsControlAction, OpsControlOptions, OpsCutoverApplyOptions, OpsCutoverApproveOptions,
-    OpsCutoverReceiptOptions, OpsCutoverRequestOptions, OpsCutoverStatusOptions,
-    PromptAssemblyOptions, PromptBundle, PromptReductionOptions, PublicHygieneOptions,
-    QueueShadowCompareOptions, QueueShadowRecordOptions, RuntimeQueueCapacityOptions,
-    RuntimeQueueControlAction, RuntimeQueueControlOptions, RuntimeQueueEnqueueOptions,
-    RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
-    RuntimeRunOnceOptions, RuntimeRunOnceReport, RuntimeRunOnceStatus, ScopedStopOptions,
-    ScopedStopTarget, SecurityScanOptions, SkillApplyOptions, SkillArchiveOptions, SkillIndex,
+    NativeCronPlanInput, NativeCronWorkerEnqueueOptions, OpenClawMemLocalOwnerPrepareOptions,
+    OpenClawMemReadPathSmokeOptions, OpenClawMemServiceProposeOptions,
+    OpenClawMemServiceRecallOptions, OpenClawMemServiceStatus, OpenClawMemServiceStatusOptions,
+    OpenClawMemServiceStoreOptions, OpsBackupOptions, OpsControlAction, OpsControlOptions,
+    OpsCutoverApplyOptions, OpsCutoverApproveOptions, OpsCutoverReceiptOptions,
+    OpsCutoverRequestOptions, OpsCutoverStatusOptions, PromptAssemblyOptions, PromptBundle,
+    PromptReductionOptions, PublicHygieneOptions, QueueShadowCompareOptions,
+    QueueShadowRecordOptions, RuntimeQueueCapacityOptions, RuntimeQueueControlAction,
+    RuntimeQueueControlOptions, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
+    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeRunOnceOptions,
+    RuntimeRunOnceReport, RuntimeRunOnceStatus, ScopedStopOptions, ScopedStopTarget,
+    SecurityScanOptions, SkillApplyOptions, SkillArchiveOptions, SkillIndex,
     SkillLearningProposalOperation, SkillLearningProposalStatus, SkillLearningSignal,
     SkillProposalActionOptions, SkillProposalListOptions, SkillProposeOptions, SkillSelectionQuery,
     SubagentPlan, SubagentPlanInput, SubagentWorkerEnqueueOptions, SuperviseDeployCanaryOptions,
@@ -87,23 +88,23 @@ use agent_harness_core::{
     load_deterministic_cron_store, load_native_cron_store, load_subagent_ledger,
     parse_channel_command, parse_context_pack, plan_agent_progress_delivery, plan_channel_outbox,
     plan_codex_runtime, plan_deterministic_cron, plan_native_cron, plan_subagents,
-    preflight_codex_runtime, prepare_runtime_queue_item, probe_codex_runtime_launch,
-    propose_openclaw_mem_service_memory, put_vault_secret, reap_stale_worker_jobs,
-    recall_openclaw_mem_service, receive_channel_message, record_agent_progress_delivery,
-    record_channel_delivery, record_channel_turn_shadow, record_codex_runtime_completion,
-    record_memory_owner_endpoint_probe, record_memory_owner_heartbeat,
-    record_memory_owner_shadow_receipt, record_memory_owner_trust_scope_receipt,
-    record_ops_control, record_ops_cutover_apply, record_ops_cutover_approval,
-    record_ops_cutover_receipt, record_ops_cutover_request, record_scoped_stop,
-    record_supervise_deploy_canary, recover_memory_owner_state, reject_skill_proposal,
-    release_checklist, request_memory_owner_promotion, resolve_channel_identity,
-    rotate_harness_log_if_needed, run_channel_once, run_codex_runtime, run_cron_scheduler_once,
-    run_memory_canvas_worker, run_memory_embedding_backfill, run_memory_hook_adapter,
-    run_openclaw_mem_read_path_smoke, run_public_hygiene, run_runtime_queue_once, run_worker_once,
-    scan_security_boundaries, schema_registry_entries, search_imported_memory,
-    search_imported_vector_memory, select_skills, store_openclaw_mem_service_memory,
-    sync_builtin_harness_skills, tool_description_hash, trace_harness_event,
-    upsert_background_task, validate_harness_config, write_channel_step,
+    preflight_codex_runtime, prepare_openclaw_mem_local_owner, prepare_runtime_queue_item,
+    probe_codex_runtime_launch, propose_openclaw_mem_service_memory, put_vault_secret,
+    reap_stale_worker_jobs, recall_openclaw_mem_service, receive_channel_message,
+    record_agent_progress_delivery, record_channel_delivery, record_channel_turn_shadow,
+    record_codex_runtime_completion, record_memory_owner_endpoint_probe,
+    record_memory_owner_heartbeat, record_memory_owner_shadow_receipt,
+    record_memory_owner_trust_scope_receipt, record_ops_control, record_ops_cutover_apply,
+    record_ops_cutover_approval, record_ops_cutover_receipt, record_ops_cutover_request,
+    record_scoped_stop, record_supervise_deploy_canary, recover_memory_owner_state,
+    reject_skill_proposal, release_checklist, request_memory_owner_promotion,
+    resolve_channel_identity, rotate_harness_log_if_needed, run_channel_once, run_codex_runtime,
+    run_cron_scheduler_once, run_memory_canvas_worker, run_memory_embedding_backfill,
+    run_memory_hook_adapter, run_openclaw_mem_read_path_smoke, run_public_hygiene,
+    run_runtime_queue_once, run_worker_once, scan_security_boundaries, schema_registry_entries,
+    search_imported_memory, search_imported_vector_memory, select_skills,
+    store_openclaw_mem_service_memory, sync_builtin_harness_skills, tool_description_hash,
+    trace_harness_event, upsert_background_task, validate_harness_config, write_channel_step,
     write_deterministic_cron_plan, write_memory_search_receipt, write_memory_vector_recall_receipt,
     write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
     write_subagent_plan, write_task_entity, write_turn_plan, write_windows_supervisor_plan,
@@ -180,6 +181,7 @@ fn main() {
         "memory-owner-heartbeat" => run_memory_owner_heartbeat(&rest),
         "memory-owner-shadow" => run_memory_owner_shadow(&rest),
         "memory-owner-trust-scope" => run_memory_owner_trust_scope(&rest),
+        "memory-owner-local-prepare" => run_memory_owner_local_prepare(&rest),
         "memory-owner-promote" => run_memory_owner_promote(&rest),
         "memory-owner-recover" => run_memory_owner_recover(&rest),
         "ops-backup" => run_ops_backup(&rest),
@@ -2562,6 +2564,30 @@ fn run_memory_owner_trust_scope(args: &[String]) -> Result<(), String> {
     let report = record_memory_owner_trust_scope_receipt(MemoryOwnerTrustScopeOptions {
         harness_home: options.target_home.clone(),
         passed: parse_bool_value(&options.required("--passed")?, "--passed")?,
+        now_ms: current_time_ms()?,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
+}
+
+fn run_memory_owner_local_prepare(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(
+        args,
+        "memory-owner-local-prepare",
+        &["--agent", "--query", "--lease-id", "--lease-ttl-ms"],
+        &["--json"],
+    )?;
+    let report = prepare_openclaw_mem_local_owner(OpenClawMemLocalOwnerPrepareOptions {
+        harness_home: options.target_home.clone(),
+        agent_id: options.optional("--agent").map(ToString::to_string),
+        query: options
+            .optional("--query")
+            .unwrap_or("openclaw memory owner local adapter smoke")
+            .to_string(),
+        lease_id: options.optional("--lease-id").map(ToString::to_string),
+        lease_ttl_ms: options
+            .optional_i64("--lease-ttl-ms")?
+            .unwrap_or(DEFAULT_MEMORY_OWNER_HEARTBEAT_MAX_AGE_MS),
         now_ms: current_time_ms()?,
     })
     .map_err(|err| err.to_string())?;
@@ -16408,6 +16434,7 @@ fn print_help() {
     println!("  memory-owner-heartbeat Record mem-engine lease heartbeat receipt");
     println!("  memory-owner-shadow Record recall/store shadow parity receipt");
     println!("  memory-owner-trust-scope Record trust/scope gate receipt");
+    println!("  memory-owner-local-prepare Prepare local in-process memory owner gates");
     println!("  memory-owner-promote Request gated mem-engine owner promotion");
     println!("  memory-owner-recover Recover stale mem-engine owner back to snapshot adapter");
     println!("  ops-backup      Copy non-secret harness state and write a backup manifest");

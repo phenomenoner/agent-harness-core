@@ -296,6 +296,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "accepted producer schema translated to agent-harness.context-pack.v1; unknown versions fail open",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.openclaw-mem-local-owner-prepare.v1",
+            owner_module: "memory",
+            compatibility: "append-only receipts; local prepare may add diagnostics but must not promote without operator approval",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.security-scan.v1",
             owner_module: "security",
             compatibility: "additive findings only in v1",

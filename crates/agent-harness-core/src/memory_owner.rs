@@ -12,6 +12,7 @@ pub const MEMORY_OWNER_PROMOTION_RECEIPT_SCHEMA: &str =
 pub const MEMORY_OWNER_ROLLBACK_RECEIPT_SCHEMA: &str =
     "agent-harness.memory-owner-rollback-receipt.v1";
 pub const OPENCLAW_MEM_REMOTE_SERVICE_CONTRACT: &str = "openclaw-mem.remote-memory-service.v1";
+pub const OPENCLAW_MEM_LOCAL_IN_PROCESS_CONTRACT: &str = "openclaw-mem.local-in-process.v1";
 
 pub const SNAPSHOT_MEMORY_OWNER: &str = "snapshot-adapter";
 pub const MEM_ENGINE_OWNER: &str = "mem-engine";
@@ -329,8 +330,10 @@ pub fn record_memory_owner_endpoint_probe(
         .endpoint
         .as_deref()
         .is_some_and(|endpoint| !endpoint.trim().is_empty());
+    let observed_contract = options.observed_contract.as_deref();
+    let local_in_process = observed_contract == Some(OPENCLAW_MEM_LOCAL_IN_PROCESS_CONTRACT);
     let compatible = endpoint_configured
-        && options.observed_contract.as_deref() == Some(OPENCLAW_MEM_REMOTE_SERVICE_CONTRACT);
+        && (observed_contract == Some(OPENCLAW_MEM_REMOTE_SERVICE_CONTRACT) || local_in_process);
     let status = if compatible {
         "compatible"
     } else if endpoint_configured {
@@ -339,6 +342,9 @@ pub fn record_memory_owner_endpoint_probe(
         "not-configured"
     };
     let reason = match status {
+        "compatible" if local_in_process => {
+            "local in-process openclaw-mem adapter advertised the required contract"
+        }
         "compatible" => "remote openclaw-mem endpoint advertised the required contract",
         "incompatible" => "remote openclaw-mem endpoint did not advertise the required contract",
         _ => "remote openclaw-mem endpoint is not configured",
@@ -353,8 +359,16 @@ pub fn record_memory_owner_endpoint_probe(
         status: status.to_string(),
         compatible,
         endpoint_configured,
-        endpoint: endpoint_configured.then_some("[configured-redacted]".to_string()),
-        required_contract: OPENCLAW_MEM_REMOTE_SERVICE_CONTRACT,
+        endpoint: endpoint_configured.then_some(if local_in_process {
+            "[local-in-process]".to_string()
+        } else {
+            "[configured-redacted]".to_string()
+        }),
+        required_contract: if local_in_process {
+            OPENCLAW_MEM_LOCAL_IN_PROCESS_CONTRACT
+        } else {
+            OPENCLAW_MEM_REMOTE_SERVICE_CONTRACT
+        },
         observed_contract: options.observed_contract,
         owner_before,
         owner_after: SNAPSHOT_MEMORY_OWNER.to_string(),
@@ -373,7 +387,7 @@ pub fn record_memory_owner_endpoint_probe(
         status: status.to_string(),
         endpoint_configured,
         compatible,
-        required_contract: OPENCLAW_MEM_REMOTE_SERVICE_CONTRACT.to_string(),
+        required_contract: report.required_contract.to_string(),
         observed_contract: report.observed_contract.clone(),
         last_probe_receipt: Some(probe_ref),
         checked_at_ms: Some(options.now_ms),

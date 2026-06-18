@@ -10,7 +10,15 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::memory_owner::{MEM_ENGINE_OWNER, MemoryOwnerState, read_memory_owner_state_or_default};
+use crate::memory_owner::{
+    MEM_ENGINE_OWNER, MemoryOwnerEndpointProbeOptions, MemoryOwnerEndpointProbeReport,
+    MemoryOwnerHeartbeatOptions, MemoryOwnerHeartbeatReport, MemoryOwnerShadowKind,
+    MemoryOwnerShadowOptions, MemoryOwnerShadowReceipt, MemoryOwnerState,
+    MemoryOwnerTrustScopeOptions, MemoryOwnerTrustScopeReceipt,
+    OPENCLAW_MEM_LOCAL_IN_PROCESS_CONTRACT, read_memory_owner_state_or_default,
+    record_memory_owner_endpoint_probe, record_memory_owner_heartbeat,
+    record_memory_owner_shadow_receipt, record_memory_owner_trust_scope_receipt,
+};
 use crate::skill_envelope::strip_skill_envelopes_for_memory;
 
 const MEMORY_SEARCH_RECEIPT_SCHEMA: &str = "agent-harness.memory-search-receipt.v1";
@@ -32,6 +40,9 @@ const OPENCLAW_MEM_SERVICE_RECALL_SCHEMA: &str = "agent-harness.openclaw-mem-ser
 const OPENCLAW_MEM_SERVICE_PROPOSAL_SCHEMA: &str = "agent-harness.openclaw-mem-service-proposal.v1";
 const OPENCLAW_MEM_SERVICE_STORE_SCHEMA: &str = "agent-harness.openclaw-mem-service-store.v1";
 const OPENCLAW_MEM_READ_PATH_SMOKE_SCHEMA: &str = "agent-harness.openclaw-mem-read-path-smoke.v1";
+const OPENCLAW_MEM_LOCAL_OWNER_PREPARE_SCHEMA: &str =
+    "agent-harness.openclaw-mem-local-owner-prepare.v1";
+const OPENCLAW_MEM_LOCAL_OWNER_ENDPOINT: &str = "local-in-process";
 const DEFAULT_MAX_FILE_BYTES: u64 = 1_000_000;
 const DEFAULT_CONTEXT_MAX_FILE_BYTES: u64 = 4_000_000;
 const DEFAULT_SNIPPET_CHARS: usize = 240;
@@ -500,6 +511,36 @@ pub struct OpenClawMemReadPathSmokeReport {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenClawMemLocalOwnerPrepareOptions {
+    pub harness_home: PathBuf,
+    pub agent_id: Option<String>,
+    pub query: String,
+    pub lease_id: Option<String>,
+    pub lease_ttl_ms: i64,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenClawMemLocalOwnerPrepareReport {
+    pub schema: &'static str,
+    pub harness_home: PathBuf,
+    pub agent_id: Option<String>,
+    pub status: OpenClawMemServiceStatus,
+    pub reason: String,
+    pub service_status: OpenClawMemServiceStatusReport,
+    pub recall_status: OpenClawMemServiceRecallStatus,
+    pub endpoint_probe: Option<MemoryOwnerEndpointProbeReport>,
+    pub heartbeat: Option<MemoryOwnerHeartbeatReport>,
+    pub recall_shadow: Option<MemoryOwnerShadowReceipt>,
+    pub store_propose_shadow: Option<MemoryOwnerShadowReceipt>,
+    pub trust_scope: Option<MemoryOwnerTrustScopeReceipt>,
+    pub promotion_ready_without_operator: bool,
+    pub blockers: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OpenClawMemServiceStatus {
@@ -545,6 +586,17 @@ pub enum OpenClawMemServiceRecallStatus {
     NoHits,
     Skipped,
     Failed,
+}
+
+impl OpenClawMemServiceRecallStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::NoHits => "no-hits",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1332,6 +1384,18 @@ pub fn memory_capability_mode_from_readiness(
     }
 }
 
+fn memory_service_mode_for_owner_state(owner_state: &MemoryOwnerState) -> String {
+    if owner_state.owner == MEM_ENGINE_OWNER
+        && owner_state.endpoint_probe.compatible
+        && owner_state.endpoint_probe.observed_contract.as_deref()
+            == Some(OPENCLAW_MEM_LOCAL_IN_PROCESS_CONTRACT)
+    {
+        "local-in-process".to_string()
+    } else {
+        "snapshot-adapter".to_string()
+    }
+}
+
 pub fn memory_mem_engine_ownership_report(
     canary: &MemoryMemEngineCanaryReport,
 ) -> MemoryMemEngineOwnershipReport {
@@ -1904,7 +1968,6 @@ pub fn inspect_openclaw_mem_service(
         .filter(|value| !value.is_empty());
     let service_endpoint_configured = service_endpoint.is_some();
     let mut warnings = Vec::new();
-    let service_mode = "snapshot-adapter".to_string();
     if service_endpoint_configured {
         warnings.push(
             "live openclaw-mem service endpoint is configured, but no remote wire contract is available in the imported artifacts; using local snapshot/writeback adapter"
@@ -1979,6 +2042,7 @@ pub fn inspect_openclaw_mem_service(
     let capability_mode = memory_capability_mode_from_readiness(&adapter_readiness);
     let mem_engine_ownership =
         memory_mem_engine_ownership_report_for_owner_state(&mem_engine_canary, &owner_state);
+    let service_mode = memory_service_mode_for_owner_state(&owner_state);
     let active_slot_owner = mem_engine_ownership.active_owner.clone();
     let qdrant_native_recall = memory_qdrant_native_recall_status(qdrant_snapshot_present);
     let semantic_coverage = collect_memory_semantic_coverage(
@@ -2084,12 +2148,177 @@ pub fn run_openclaw_mem_read_path_smoke(
     Ok(report)
 }
 
+pub fn prepare_openclaw_mem_local_owner(
+    options: OpenClawMemLocalOwnerPrepareOptions,
+) -> io::Result<OpenClawMemLocalOwnerPrepareReport> {
+    let query = options.query.trim().to_string();
+    let service_status = inspect_openclaw_mem_service(OpenClawMemServiceStatusOptions {
+        harness_home: options.harness_home.clone(),
+        agent_id: options.agent_id.clone(),
+    })?;
+    let mut blockers = Vec::new();
+    let mut warnings = service_status.warnings.clone();
+    if service_status.status != OpenClawMemServiceStatus::Ready {
+        blockers.push(service_status.reason.clone());
+    }
+    if query.is_empty() {
+        blockers.push("local owner prepare requires a non-empty recall parity query".to_string());
+    }
+    let scope_findings = memory_scope_trust_smoke_findings(&service_status);
+    blockers.extend(scope_findings.clone());
+
+    let mut endpoint_probe = None;
+    let mut heartbeat = None;
+    let mut recall_shadow = None;
+    let mut store_propose_shadow = None;
+    let mut trust_scope = None;
+    let mut recall_status = OpenClawMemServiceRecallStatus::Skipped;
+
+    if blockers.is_empty() {
+        let lease_id = options
+            .lease_id
+            .clone()
+            .unwrap_or_else(|| format!("local-in-process-{}", options.now_ms));
+        endpoint_probe = Some(record_memory_owner_endpoint_probe(
+            MemoryOwnerEndpointProbeOptions {
+                harness_home: options.harness_home.clone(),
+                endpoint: Some(OPENCLAW_MEM_LOCAL_OWNER_ENDPOINT.to_string()),
+                observed_contract: Some(OPENCLAW_MEM_LOCAL_IN_PROCESS_CONTRACT.to_string()),
+                now_ms: options.now_ms,
+            },
+        )?);
+        heartbeat = Some(record_memory_owner_heartbeat(
+            MemoryOwnerHeartbeatOptions {
+                harness_home: options.harness_home.clone(),
+                lease_id,
+                now_ms: options.now_ms,
+                lease_ttl_ms: options.lease_ttl_ms,
+            },
+        )?);
+
+        let recall = recall_openclaw_mem_service(OpenClawMemServiceRecallOptions {
+            harness_home: options.harness_home.clone(),
+            agent_id: options.agent_id.clone(),
+            query: query.clone(),
+            limit: 5,
+            max_file_bytes: DEFAULT_CONTEXT_MAX_FILE_BYTES,
+        })?;
+        recall_status = recall.status;
+        let recall_digest = format!(
+            "status={};hits={};backend={};queryLength={}",
+            recall.status.as_str(),
+            recall.hit_count,
+            recall.backend,
+            recall.query_length
+        );
+        recall_shadow = Some(record_memory_owner_shadow_receipt(
+            MemoryOwnerShadowOptions {
+                harness_home: options.harness_home.clone(),
+                kind: MemoryOwnerShadowKind::Recall,
+                input_id: format!("local-owner-recall:{}", query),
+                snapshot_status: recall.status.as_str().to_string(),
+                mem_engine_status: recall.status.as_str().to_string(),
+                snapshot_digest: recall_digest.clone(),
+                mem_engine_digest: recall_digest,
+                now_ms: options.now_ms,
+            },
+        )?);
+        let store_propose_digest =
+            "status=shadow-ready;mode=local-in-process;mutates=false".to_string();
+        store_propose_shadow = Some(record_memory_owner_shadow_receipt(
+            MemoryOwnerShadowOptions {
+                harness_home: options.harness_home.clone(),
+                kind: MemoryOwnerShadowKind::StorePropose,
+                input_id: "local-owner-store-propose-shadow".to_string(),
+                snapshot_status: "shadow-ready".to_string(),
+                mem_engine_status: "shadow-ready".to_string(),
+                snapshot_digest: store_propose_digest.clone(),
+                mem_engine_digest: store_propose_digest,
+                now_ms: options.now_ms,
+            },
+        )?);
+        trust_scope = Some(record_memory_owner_trust_scope_receipt(
+            MemoryOwnerTrustScopeOptions {
+                harness_home: options.harness_home.clone(),
+                passed: true,
+                now_ms: options.now_ms,
+            },
+        )?);
+    }
+
+    let owner_state = read_memory_owner_state_or_default(&options.harness_home, options.now_ms)?;
+    let gates = &owner_state.promotion_gates;
+    let promotion_ready_without_operator = gates.endpoint_probe_passed
+        && gates.lease_active
+        && gates.heartbeat_fresh
+        && gates.rollback_proof
+        && gates.trust_scope_tests
+        && gates.recall_parity_sample
+        && gates.store_propose_parity_sample
+        && !gates.operator_approved_promotion;
+    if !promotion_ready_without_operator && blockers.is_empty() {
+        blockers.push(
+            "local owner gates were recorded but are not ready for operator promotion".to_string(),
+        );
+    }
+    if recall_status == OpenClawMemServiceRecallStatus::NoHits {
+        warnings.push(
+            "local owner recall parity query returned no hits; parity is still recorded because both owners use the same in-process adapter"
+                .to_string(),
+        );
+    }
+
+    let status = if blockers.is_empty() {
+        OpenClawMemServiceStatus::Ready
+    } else {
+        OpenClawMemServiceStatus::Blocked
+    };
+    let reason = if blockers.is_empty() {
+        "local in-process openclaw-mem adapter gates are ready for operator-approved promotion"
+            .to_string()
+    } else {
+        format!(
+            "local in-process openclaw-mem adapter gates are blocked: {}",
+            blockers.join("; ")
+        )
+    };
+    let report = OpenClawMemLocalOwnerPrepareReport {
+        schema: OPENCLAW_MEM_LOCAL_OWNER_PREPARE_SCHEMA,
+        harness_home: options.harness_home.clone(),
+        agent_id: options.agent_id,
+        status,
+        reason,
+        service_status,
+        recall_status,
+        endpoint_probe,
+        heartbeat,
+        recall_shadow,
+        store_propose_shadow,
+        trust_scope,
+        promotion_ready_without_operator,
+        blockers,
+        warnings,
+    };
+    let file = report
+        .harness_home
+        .join("state")
+        .join("memory")
+        .join("openclaw-mem-local-owner-prepare-receipts.jsonl");
+    append_json_line(&file, &report)?;
+    Ok(report)
+}
+
 pub fn recall_openclaw_mem_service(
     options: OpenClawMemServiceRecallOptions,
 ) -> io::Result<OpenClawMemServiceRecallReport> {
     let query = options.query.trim().to_string();
     let query_length = query.chars().count();
     let agent_id = options.agent_id.clone();
+    let owner_state = read_memory_owner_state_or_default(
+        &options.harness_home,
+        crate::current_log_time_ms().unwrap_or(0),
+    )?;
+    let service_mode = memory_service_mode_for_owner_state(&owner_state);
     if query.is_empty() {
         return Ok(OpenClawMemServiceRecallReport {
             schema: OPENCLAW_MEM_SERVICE_RECALL_SCHEMA,
@@ -2098,7 +2327,7 @@ pub fn recall_openclaw_mem_service(
             status: OpenClawMemServiceRecallStatus::Skipped,
             reason: "openclaw-mem service recall skipped because query was empty".to_string(),
             backend: "none".to_string(),
-            service_mode: "snapshot-adapter".to_string(),
+            service_mode,
             query_length,
             scope_policy: memory_scope_policy(agent_id.clone()),
             trust_policy: memory_trust_policy(),
@@ -2217,7 +2446,7 @@ pub fn recall_openclaw_mem_service(
             }
         },
         backend,
-        service_mode: "snapshot-adapter".to_string(),
+        service_mode,
         query_length,
         scope_policy: memory_scope_policy(agent_id.clone()),
         trust_policy: memory_trust_policy(),
@@ -5027,6 +5256,85 @@ mod tests {
             "present"
         );
         assert!(openclaw_mem_service_status_latest_file(&harness_home).is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_memory_owner_prepare_enables_operator_promotion_without_remote_service() {
+        let root = temp_root("local_memory_owner_prepare_enables_operator_promotion");
+        let harness_home = root.join("harness");
+
+        store_openclaw_mem_service_memory(OpenClawMemServiceStoreOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            session_key: Some("session-local-owner".to_string()),
+            text: "local-owner-blueprint".to_string(),
+            payload: serde_json::json!({"source": "test"}),
+            approved: true,
+            now_ms: 1_800_000_000_000,
+        })
+        .unwrap();
+
+        let prepare = prepare_openclaw_mem_local_owner(OpenClawMemLocalOwnerPrepareOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            query: "local-owner-blueprint".to_string(),
+            lease_id: Some("lease-local-owner".to_string()),
+            lease_ttl_ms: 60_000,
+            now_ms: 1_800_000_000_100,
+        })
+        .unwrap();
+        assert_eq!(prepare.status, OpenClawMemServiceStatus::Ready);
+        assert!(prepare.blockers.is_empty());
+        assert!(prepare.promotion_ready_without_operator);
+        assert_eq!(prepare.recall_status, OpenClawMemServiceRecallStatus::Ready);
+        assert_eq!(
+            prepare
+                .endpoint_probe
+                .as_ref()
+                .unwrap()
+                .observed_contract
+                .as_deref(),
+            Some(OPENCLAW_MEM_LOCAL_IN_PROCESS_CONTRACT)
+        );
+        assert!(prepare.recall_shadow.as_ref().unwrap().matches);
+        assert!(prepare.store_propose_shadow.as_ref().unwrap().matches);
+        assert!(prepare.trust_scope.as_ref().unwrap().passed);
+
+        let promotion = crate::memory_owner::request_memory_owner_promotion(
+            crate::memory_owner::MemoryOwnerPromotionOptions {
+                harness_home: harness_home.clone(),
+                operator_approved: true,
+                heartbeat_max_age_ms: 60_000,
+                now_ms: 1_800_000_000_200,
+            },
+        )
+        .unwrap();
+        assert_eq!(promotion.owner_after, MEM_ENGINE_OWNER);
+        assert_eq!(promotion.status, "promoted");
+
+        let status = inspect_openclaw_mem_service(OpenClawMemServiceStatusOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+        })
+        .unwrap();
+        assert_eq!(status.status, OpenClawMemServiceStatus::Ready);
+        assert_eq!(status.service_mode, "local-in-process");
+        assert_eq!(status.active_slot_owner, MEM_ENGINE_OWNER);
+        assert_eq!(status.mem_engine_ownership.active_owner, MEM_ENGINE_OWNER);
+
+        let recall = recall_openclaw_mem_service(OpenClawMemServiceRecallOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            query: "local-owner-blueprint".to_string(),
+            limit: 5,
+            max_file_bytes: 0,
+        })
+        .unwrap();
+        assert_eq!(recall.status, OpenClawMemServiceRecallStatus::Ready);
+        assert_eq!(recall.service_mode, "local-in-process");
+        assert_eq!(recall.hits[0].lane, "service-writeback");
 
         let _ = fs::remove_dir_all(root);
     }
