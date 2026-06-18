@@ -12,6 +12,7 @@ use crate::memory::{
     collect_memory_embedding_coverage, collect_memory_semantic_coverage,
     memory_adapter_readiness_report, memory_capability_mode_from_readiness,
     memory_mem_engine_ownership_report_for_owner_state, memory_qdrant_native_recall_status,
+    openclaw_mem_service_store_file_for_agent,
 };
 use crate::memory_owner::{MemoryOwnerState, read_memory_owner_state_or_default};
 use crate::skill_apply::skill_apply_receipts_file;
@@ -187,7 +188,30 @@ pub struct HarnessMemoryStatus {
     pub graph_freshness_receipts: HarnessJsonlStatus,
     pub provenance_chain_receipts: HarnessJsonlStatus,
     pub capture_candidates: HarnessJsonlStatus,
+    pub support_plane: HarnessOpenClawMemSupportPlaneStatus,
     pub summary: HarnessMemoryHealthSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessOpenClawMemSupportPlaneStatus {
+    pub db_path: PathBuf,
+    pub db_exists: bool,
+    pub topology_candidates: Vec<HarnessMemoryTopologyCandidateStatus>,
+    pub selected_topology_source: Option<PathBuf>,
+    pub service_store_path: PathBuf,
+    pub service_store_exists: bool,
+    pub writeback_store_path: PathBuf,
+    pub writeback_store_exists: bool,
+    pub graph_autonomous_matching_ready: bool,
+    pub missing_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessMemoryTopologyCandidateStatus {
+    pub path: PathBuf,
+    pub exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -606,6 +630,7 @@ fn memory_status(harness_home: &Path) -> io::Result<HarnessMemoryStatus> {
     let provenance_chain_receipts =
         jsonl_status(memory_state_dir.join("provenance-chain-receipts.jsonl"))?;
     let capture_candidates = jsonl_status(memory_state_dir.join("auto-capture-candidates.jsonl"))?;
+    let support_plane = openclaw_mem_support_plane_status(harness_home);
     let embedding_coverage = collect_memory_embedding_coverage(harness_home);
     let semantic_coverage =
         collect_memory_semantic_coverage(harness_home, None, &embedding_coverage)?;
@@ -648,9 +673,78 @@ fn memory_status(harness_home: &Path) -> io::Result<HarnessMemoryStatus> {
         graph_freshness_receipts,
         provenance_chain_receipts,
         capture_candidates,
+        support_plane,
         summary,
         memory_dir,
     })
+}
+
+fn openclaw_mem_support_plane_status(harness_home: &Path) -> HarnessOpenClawMemSupportPlaneStatus {
+    let memory_state_dir = harness_home.join("state").join("memory");
+    let db_path = harness_home.join("memory").join("openclaw-mem.sqlite");
+    let topology_paths = vec![
+        memory_state_dir
+            .join("graph")
+            .join("topology-extract-full.json"),
+        memory_state_dir
+            .join("graph")
+            .join("topology-extract-full.yaml"),
+        memory_state_dir.join("graph").join("topology-seed.yaml"),
+    ];
+    let topology_candidates = topology_paths
+        .iter()
+        .map(|path| HarnessMemoryTopologyCandidateStatus {
+            path: path.clone(),
+            exists: path.is_file(),
+        })
+        .collect::<Vec<_>>();
+    let selected_topology_source = topology_candidates
+        .iter()
+        .find(|candidate| candidate.exists)
+        .map(|candidate| candidate.path.clone());
+    let service_store_path = openclaw_mem_service_store_file_for_agent(harness_home, None);
+    let writeback_store_path = memory_state_dir.join("openclaw-mem-writeback.jsonl");
+    let db_exists = db_path.is_file();
+    let service_store_exists = service_store_path.is_file();
+    let writeback_store_exists = writeback_store_path.is_file();
+    let mut missing_reasons = Vec::new();
+    if !db_exists {
+        missing_reasons.push(format!("db_missing:{}", db_path.display()));
+    }
+    if selected_topology_source.is_none() {
+        missing_reasons.push(format!(
+            "topology_source_missing:{}",
+            topology_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join("|")
+        ));
+    }
+    if !service_store_exists {
+        missing_reasons.push(format!(
+            "service_store_missing:{}",
+            service_store_path.display()
+        ));
+    }
+    if !writeback_store_exists {
+        missing_reasons.push(format!(
+            "writeback_store_missing:{}",
+            writeback_store_path.display()
+        ));
+    }
+    HarnessOpenClawMemSupportPlaneStatus {
+        db_path,
+        db_exists,
+        topology_candidates,
+        selected_topology_source,
+        service_store_path,
+        service_store_exists,
+        writeback_store_path,
+        writeback_store_exists,
+        graph_autonomous_matching_ready: missing_reasons.is_empty(),
+        missing_reasons,
+    }
 }
 
 fn memory_health_summary(
@@ -1638,6 +1732,87 @@ mod tests {
         assert_eq!(report.memory.summary.capture_candidate_count, 1);
         assert_eq!(report.memory.summary.store_proposal_count, 1);
         assert_eq!(report.memory.summary.slot_receipt_count, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn harness_status_reports_openclaw_mem_support_plane_paths() {
+        let root = temp_root("harness_status_reports_openclaw_mem_support_plane_paths");
+        let harness_home = root.join(".agent-harness");
+        let memory_dir = harness_home.join("memory");
+        let memory_state = harness_home.join("state").join("memory");
+        fs::create_dir_all(memory_state.join("graph")).unwrap();
+        fs::create_dir_all(&memory_dir).unwrap();
+        fs::write(
+            memory_dir.join("openclaw-mem.sqlite"),
+            b"sqlite-placeholder",
+        )
+        .unwrap();
+        fs::write(
+            memory_state
+                .join("graph")
+                .join("topology-extract-full.json"),
+            r#"{"nodes":[],"edges":[]}"#,
+        )
+        .unwrap();
+        fs::write(memory_dir.join("openclaw-mem-service-store.jsonl"), "").unwrap();
+        fs::write(memory_state.join("openclaw-mem-writeback.jsonl"), "").unwrap();
+
+        let report = collect_harness_status(HarnessStatusOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+
+        assert!(report.memory.support_plane.db_exists);
+        assert!(report.memory.support_plane.service_store_exists);
+        assert!(report.memory.support_plane.writeback_store_exists);
+        assert_eq!(
+            report
+                .memory
+                .support_plane
+                .selected_topology_source
+                .as_deref(),
+            Some(
+                memory_state
+                    .join("graph")
+                    .join("topology-extract-full.json")
+                    .as_path()
+            )
+        );
+        assert!(report.memory.support_plane.graph_autonomous_matching_ready);
+        assert!(report.memory.support_plane.missing_reasons.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn harness_status_reports_openclaw_mem_support_plane_missing_paths() {
+        let root = temp_root("harness_status_reports_openclaw_mem_support_plane_missing_paths");
+        let harness_home = root.join(".agent-harness");
+        let report = collect_harness_status(HarnessStatusOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+
+        assert!(!report.memory.support_plane.db_exists);
+        assert!(!report.memory.support_plane.graph_autonomous_matching_ready);
+        assert!(
+            report
+                .memory
+                .support_plane
+                .missing_reasons
+                .iter()
+                .any(|reason| reason.starts_with("db_missing:"))
+        );
+        assert!(
+            report
+                .memory
+                .support_plane
+                .missing_reasons
+                .iter()
+                .any(|reason| reason.starts_with("topology_source_missing:"))
+        );
 
         let _ = fs::remove_dir_all(root);
     }

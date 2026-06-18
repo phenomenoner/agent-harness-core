@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 const WINDOWS_SUPERVISOR_PLAN_SCHEMA: &str = "agent-harness.windows-supervisor-plan.v1";
+const LEGACY_RUNTIME_WORKSPACE_ROOTS: &[&str] = &["D:\\Warehouse\\Research\\OpenClaw_WSL"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowsSupervisorPlanOptions {
@@ -75,11 +76,10 @@ pub fn write_windows_supervisor_plan(
         .as_deref()
         .map(absolutize_path)
         .transpose()?;
-    let runtime_workspace = options
-        .runtime_workspace
-        .as_deref()
-        .map(absolutize_path)
-        .transpose()?;
+    let runtime_workspace = match options.runtime_workspace.as_deref() {
+        Some(path) => absolutize_path_from_base(path, &harness_home)?,
+        None => harness_home.clone(),
+    };
     let harness_cli = absolutize_path(&options.harness_cli)?;
     let codex_executable = options
         .codex_executable
@@ -118,6 +118,16 @@ pub fn write_windows_supervisor_plan(
             source_home.display()
         ));
     }
+    if is_legacy_runtime_workspace(&runtime_workspace) {
+        warnings.push(format!(
+            "runtime-workspace {} points at a retired legacy workspace; generated plans should use the active harness home unless this is an explicit compatibility run",
+            runtime_workspace.display()
+        ));
+    }
+    warnings.extend(scan_stale_runtime_workspace_artifacts(
+        &harness_home,
+        &output_dir,
+    )?);
 
     if options.include_runtime {
         let component = "runtime-loop";
@@ -208,12 +218,10 @@ pub fn write_windows_supervisor_plan(
         if let Some(workspace) = &workspace {
             args.extend(["--workspace".to_string(), path_arg(workspace)]);
         }
-        if let Some(runtime_workspace) = &runtime_workspace {
-            args.extend([
-                "--runtime-workspace".to_string(),
-                path_arg(runtime_workspace),
-            ]);
-        }
+        args.extend([
+            "--runtime-workspace".to_string(),
+            path_arg(&runtime_workspace),
+        ]);
         write_runner_script(&runner_script, &harness_cli, &args, &log_dir, component)?;
         push_task(
             &mut scripts,
@@ -283,12 +291,10 @@ pub fn write_windows_supervisor_plan(
         if let Some(workspace) = &workspace {
             args.extend(["--workspace".to_string(), path_arg(workspace)]);
         }
-        if let Some(runtime_workspace) = &runtime_workspace {
-            args.extend([
-                "--runtime-workspace".to_string(),
-                path_arg(runtime_workspace),
-            ]);
-        }
+        args.extend([
+            "--runtime-workspace".to_string(),
+            path_arg(&runtime_workspace),
+        ]);
         if let Some(agent_id) = &options.agent_id {
             args.extend(["--agent".to_string(), agent_id.clone()]);
         }
@@ -360,12 +366,10 @@ pub fn write_windows_supervisor_plan(
         if let Some(workspace) = &workspace {
             args.extend(["--workspace".to_string(), path_arg(workspace)]);
         }
-        if let Some(runtime_workspace) = &runtime_workspace {
-            args.extend([
-                "--runtime-workspace".to_string(),
-                path_arg(runtime_workspace),
-            ]);
-        }
+        args.extend([
+            "--runtime-workspace".to_string(),
+            path_arg(&runtime_workspace),
+        ]);
         if let Some(agent_id) = &options.agent_id {
             args.extend(["--agent".to_string(), agent_id.clone()]);
         }
@@ -652,6 +656,14 @@ fn absolutize_path(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
+fn absolutize_path_from_base(path: &Path, base: &Path) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(base.join(path))
+    }
+}
+
 fn absolutize_command_path(path: &Path) -> io::Result<PathBuf> {
     if path.is_absolute() || path.components().count() == 1 {
         Ok(path.to_path_buf())
@@ -669,6 +681,79 @@ fn is_retired_legacy_source_home(source_home: &Path, harness_home: &Path) -> boo
         .and_then(|name| name.to_str())
         .map(|name| name.eq_ignore_ascii_case(".openclaw"))
         .unwrap_or(false)
+}
+
+fn is_legacy_runtime_workspace(path: &Path) -> bool {
+    let normalized = normalize_path_text(path);
+    LEGACY_RUNTIME_WORKSPACE_ROOTS
+        .iter()
+        .any(|root| normalized.starts_with(&normalize_path_text(Path::new(root))))
+}
+
+fn scan_stale_runtime_workspace_artifacts(
+    harness_home: &Path,
+    supervisor_output_dir: &Path,
+) -> io::Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    let supervisor_scripts = supervisor_output_dir.join("scripts");
+    let supervisor_hits = count_files_containing_legacy_roots(&supervisor_scripts)?;
+    if supervisor_hits > 0 {
+        warnings.push(format!(
+            "detected {supervisor_hits} existing supervisor script(s) with retired legacy runtime workspace references under {}; report-only, not rewritten",
+            supervisor_scripts.display()
+        ));
+    }
+
+    let session_hits = count_files_containing_legacy_roots(&harness_home.join("agents"))?;
+    if session_hits > 0 {
+        warnings.push(format!(
+            "detected {session_hits} existing Codex app-server session metadata file(s) with retired legacy workingDirectory references under {}; report-only, not rewritten",
+            harness_home.join("agents").display()
+        ));
+    }
+    Ok(warnings)
+}
+
+fn count_files_containing_legacy_roots(root: &Path) -> io::Result<usize> {
+    let mut count = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let entries = match fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                stack.push(path);
+            } else if metadata.is_file() && file_contains_legacy_root(&path)? {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn file_contains_legacy_root(path: &Path) -> io::Result<bool> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(LEGACY_RUNTIME_WORKSPACE_ROOTS
+        .iter()
+        .any(|root| text.contains(root)))
+}
+
+fn normalize_path_text(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
 }
 
 fn ps_quote_path(path: &Path) -> String {
@@ -858,6 +943,123 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("retired legacy .openclaw/import routing"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn defaults_runtime_workspace_to_harness_home() {
+        let root = temp_root("defaults_runtime_workspace_to_harness_home");
+        let harness_home = root.join(".agent-harness");
+        let output_dir = root.join("supervisor");
+        let report = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
+            harness_home: harness_home.clone(),
+            source_home: harness_home.clone(),
+            workspace: Some(harness_home.join("workspace")),
+            runtime_workspace: None,
+            harness_cli: root.join("agent-harness.exe"),
+            codex_executable: Some(root.join("codex.cmd")),
+            node_executable: PathBuf::from("node"),
+            discord_gateway_script: root.join("tools").join("discord").join("index.mjs"),
+            agent_id: Some("main".to_string()),
+            output_dir: Some(output_dir.clone()),
+            task_prefix: "AgentHarness".to_string(),
+            include_runtime: false,
+            runtime_workers: 1,
+            include_worker: false,
+            include_cron_scheduler: true,
+            include_progress: false,
+            include_telegram: true,
+            include_discord: true,
+            idle_ms: 1000,
+            runtime_timeout_ms: 1_800_000,
+            runtime_idle_timeout_ms: 300_000,
+            max_consecutive_errors: 5,
+            telegram_poll_timeout_seconds: 1,
+            telegram_max_updates: 10,
+            telegram_outbox_limit: 20,
+        })
+        .unwrap();
+
+        assert!(report.warnings.is_empty());
+        for script_name in [
+            "cron-scheduler-loop.ps1",
+            "telegram-loop.ps1",
+            "discord-gateway-loop.ps1",
+        ] {
+            let script = fs::read_to_string(output_dir.join("scripts").join(script_name)).unwrap();
+            assert!(script.contains("--runtime-workspace"));
+            assert!(script.contains(&harness_home.display().to_string()));
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn warns_for_legacy_runtime_workspace_without_rewriting_existing_artifacts() {
+        let root = temp_root("warns_for_legacy_runtime_workspace");
+        let harness_home = root.join(".agent-harness");
+        let output_dir = root.join("supervisor");
+        let scripts_dir = output_dir.join("scripts");
+        let session_dir = harness_home.join("agents").join("main").join("sessions");
+        fs::create_dir_all(&scripts_dir).unwrap();
+        fs::create_dir_all(&session_dir).unwrap();
+        let legacy_script = scripts_dir.join("telegram-loop.ps1");
+        let legacy_session = session_dir.join("session.codex-app-server.json");
+        fs::write(
+            &legacy_script,
+            "before D:\\Warehouse\\Research\\OpenClaw_WSL after",
+        )
+        .unwrap();
+        fs::write(
+            &legacy_session,
+            r#"{"workingDirectory":"D:\Warehouse\Research\OpenClaw_WSL"}"#,
+        )
+        .unwrap();
+
+        let report = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
+            harness_home: harness_home.clone(),
+            source_home: harness_home.clone(),
+            workspace: Some(harness_home.join("workspace")),
+            runtime_workspace: Some(PathBuf::from("D:\\Warehouse\\Research\\OpenClaw_WSL")),
+            harness_cli: root.join("agent-harness.exe"),
+            codex_executable: Some(root.join("codex.cmd")),
+            node_executable: PathBuf::from("node"),
+            discord_gateway_script: root.join("tools").join("discord").join("index.mjs"),
+            agent_id: Some("main".to_string()),
+            output_dir: Some(output_dir.clone()),
+            task_prefix: "AgentHarness".to_string(),
+            include_runtime: false,
+            runtime_workers: 1,
+            include_worker: false,
+            include_cron_scheduler: false,
+            include_progress: false,
+            include_telegram: true,
+            include_discord: false,
+            idle_ms: 1000,
+            runtime_timeout_ms: 1_800_000,
+            runtime_idle_timeout_ms: 300_000,
+            max_consecutive_errors: 5,
+            telegram_poll_timeout_seconds: 1,
+            telegram_max_updates: 10,
+            telegram_outbox_limit: 20,
+        })
+        .unwrap();
+
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("runtime-workspace") && warning.contains("retired legacy workspace")
+        }));
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("existing supervisor script") && warning.contains("report-only")
+        }));
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("Codex app-server session metadata") && warning.contains("report-only")
+        }));
+        assert!(
+            fs::read_to_string(&legacy_session)
+                .unwrap()
+                .contains("D:\\Warehouse\\Research\\OpenClaw_WSL")
         );
 
         let _ = fs::remove_dir_all(root);

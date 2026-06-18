@@ -121,6 +121,7 @@ fn main() {
         "registry-export" => run_registry_export(&rest),
         "enable-check" => run_enable_check(&rest),
         "status" | "harness-status" => run_harness_status(&rest),
+        "round7-receipt" => run_round7_receipt(&rest),
         "cron-runs" | "cron-run-list" => run_cron_runs(&rest),
         "cron-run-control" => run_cron_run_control(&rest),
         "config-validate" => run_config_validate(&rest),
@@ -471,6 +472,57 @@ fn run_harness_status(args: &[String]) -> Result<(), String> {
         println!("{json}");
     } else {
         print_harness_status_report(&report);
+    }
+    Ok(())
+}
+
+fn run_round7_receipt(args: &[String]) -> Result<(), String> {
+    let args = harness_status_args_from_args(args)?;
+    let harness_home = args.target_home.clone();
+    let report = collect_harness_status(HarnessStatusOptions {
+        harness_home: harness_home.clone(),
+    })
+    .map_err(|err| err.to_string())?;
+    let now_ms = current_log_time_ms().map_err(|err| err.to_string())?;
+    let receipt_dir = harness_home.join("state").join("round7");
+    fs::create_dir_all(&receipt_dir).map_err(|err| err.to_string())?;
+    let receipt_path = receipt_dir.join(format!("round7-receipt-{now_ms}.json"));
+    let receipt = serde_json::json!({
+        "schema": "agent-harness.round7-receipt.v1",
+        "createdAtMs": now_ms,
+        "harnessHome": harness_home,
+        "liveCutoverPerformed": false,
+        "liveCutoverRequired": true,
+        "activeRoots": {
+            "harnessHome": report.harness_home,
+            "memoryDir": report.memory.memory_dir,
+        },
+        "readiness": {
+            "ready": report.ready,
+            "summary": report.readiness.summary,
+        },
+        "openclawMem": {
+            "supportPlane": report.memory.support_plane,
+            "summary": report.memory.summary,
+        },
+        "runtime": {
+            "openItems": report.runtime.open_items,
+            "latestNonIdleRunOnce": report.runtime.latest_non_idle_run_once,
+        },
+        "warnings": report.warnings,
+        "externalCutoverNotes": [
+            "Build/use a fresh agent-harness binary outside the live gateway session.",
+            "Regenerate supervisor scripts only during the operator-approved cutover.",
+            "Do not rewrite historical .codex-app-server.json session metadata; treat stale legacy cwd entries as historical evidence.",
+            "After cutover, rerun status and compare memory.supportPlane against this receipt."
+        ]
+    });
+    let text = serde_json::to_string_pretty(&receipt).map_err(|err| err.to_string())?;
+    fs::write(&receipt_path, format!("{text}\n")).map_err(|err| err.to_string())?;
+    if args.json {
+        println!("{text}");
+    } else {
+        println!("Round7 receipt: {}", receipt_path.display());
     }
     Ok(())
 }

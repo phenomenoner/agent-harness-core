@@ -39,3 +39,4 @@
 - Close completed, timed-out, irrelevant, or invalid-dispatch sub-agents promptly so stalled side work does not consume worker capacity or hide the actual blocker.
 - Keep live gateway control, destructive shell actions, final cutover, and any operation that can interrupt the active communication channel on the main agent path.
 - For sub-agents that edit code, assign disjoint file ownership, tell them they are not alone in the codebase, and require them to work with existing changes instead of reverting unrelated edits.
+- Always include the intended root path in sub-agent prompts. For this repo use `D:\Warehouse\Rust-OpenClaw-Core`; for active harness-home operations use `D:\Warehouse\Rust-OpenClaw-Core\.agent-harness`. Do not rely on inherited cwd, which may still be the legacy compatibility root `D:\Warehouse\Research\OpenClaw_WSL`.
