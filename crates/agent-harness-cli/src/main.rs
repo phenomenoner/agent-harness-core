@@ -3152,7 +3152,7 @@ fn run_telegram_loop(args: &[String]) -> Result<(), String> {
             )?;
             write_loop_heartbeat(
                 &args.poll.target_home,
-                "telegram-loop",
+                &args.loop_name,
                 "stopped",
                 iterations,
                 "stop file requested",
@@ -3163,7 +3163,7 @@ fn run_telegram_loop(args: &[String]) -> Result<(), String> {
         iterations += 1;
         write_loop_heartbeat(
             &args.poll.target_home,
-            "telegram-loop",
+            &args.loop_name,
             "running",
             iterations,
             "polling Telegram updates",
@@ -3173,7 +3173,7 @@ fn run_telegram_loop(args: &[String]) -> Result<(), String> {
                 consecutive_errors = 0;
                 write_loop_heartbeat(
                     &args.poll.target_home,
-                    "telegram-loop",
+                    &args.loop_name,
                     "ok",
                     iterations,
                     &format!(
@@ -3191,14 +3191,14 @@ fn run_telegram_loop(args: &[String]) -> Result<(), String> {
                 consecutive_errors += 1;
                 write_loop_heartbeat(
                     &args.poll.target_home,
-                    "telegram-loop",
+                    &args.loop_name,
                     "error",
                     iterations,
                     &format!("consecutiveErrors={consecutive_errors} error={error}"),
                 )?;
                 eprintln!(
-                    "telegram-loop iteration {iterations} failed ({consecutive_errors}/{}): {error}",
-                    args.max_consecutive_errors
+                    "{} iteration {iterations} failed ({consecutive_errors}/{}): {error}",
+                    args.loop_name, args.max_consecutive_errors
                 );
                 let _ = append_harness_log(
                     &args.poll.target_home,
@@ -3214,8 +3214,8 @@ fn run_telegram_loop(args: &[String]) -> Result<(), String> {
                 );
                 if consecutive_errors >= args.max_consecutive_errors {
                     return Err(format!(
-                        "telegram-loop exceeded {} consecutive errors; last error: {error}",
-                        args.max_consecutive_errors
+                        "{} exceeded {} consecutive errors; last error: {error}",
+                        args.loop_name, args.max_consecutive_errors
                     ));
                 }
             }
@@ -6846,6 +6846,7 @@ enum ChannelPermission {
 
 struct TelegramLoopArgs {
     poll: TelegramPollOnceArgs,
+    loop_name: String,
     iterations: usize,
     idle_ms: u64,
     max_consecutive_errors: usize,
@@ -10010,6 +10011,7 @@ fn telegram_loop_args_from_args(args: &[String]) -> Result<TelegramLoopArgs, Str
     let mut poll_timeout_seconds = 1;
     let mut max_updates = 10;
     let mut outbox_limit = 20;
+    let mut loop_name = "telegram-loop".to_string();
     let mut iterations = 0;
     let mut idle_ms = 1_000;
     let mut max_consecutive_errors = 5;
@@ -10111,6 +10113,13 @@ fn telegram_loop_args_from_args(args: &[String]) -> Result<TelegramLoopArgs, Str
                     .ok_or_else(|| "--outbox-limit requires a positive integer".to_string())
                     .and_then(|value| parse_limit(value))?;
             }
+            "--loop-name" => {
+                i += 1;
+                loop_name = args
+                    .get(i)
+                    .cloned()
+                    .ok_or_else(|| "--loop-name requires a name".to_string())?;
+            }
             "--iterations" => {
                 i += 1;
                 iterations = args
@@ -10166,6 +10175,7 @@ fn telegram_loop_args_from_args(args: &[String]) -> Result<TelegramLoopArgs, Str
             max_updates,
             outbox_limit,
         },
+        loop_name,
         iterations,
         idle_ms,
         max_consecutive_errors,
@@ -16590,7 +16600,9 @@ fn print_help() {
     println!("  --max-consecutive-errors <n> Loop failure threshold");
     println!("  --safe-mode-restart-ms <n> Runtime-loop cooldown before service-mode retry");
     println!("  --no-safe-mode-restart Disable runtime-loop service-mode retry");
-    println!("  --loop-name <name>      Heartbeat component name for a runtime-loop instance");
+    println!(
+        "  --loop-name <name>      Heartbeat component name for loop commands that support it"
+    );
     println!("  --runtime-concurrency <n> Bounded in-process runtime tasks for runtime-loop");
     println!("  --stop-when-idle        Stop runtime-loop when the runtime queue is idle");
     println!("  --stop-file <path>      Stop-file path for runtime, Telegram, or Discord loops");
