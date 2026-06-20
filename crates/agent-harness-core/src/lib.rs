@@ -26,6 +26,7 @@ pub mod health;
 pub mod importer;
 pub mod live_control;
 pub mod logging;
+pub mod loop_health;
 pub mod mcp;
 pub mod media;
 pub mod memory;

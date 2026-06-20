@@ -15,6 +15,7 @@ use crate::{
     collect_worker_status,
     config::{HarnessConfigValidationStatus, validate_harness_config},
     logging::current_log_time_ms,
+    loop_health::{process_alive_for_pid, read_supervisor_stop_file},
     probe_harness_log_writable,
 };
 
@@ -756,6 +757,10 @@ fn check_runtime_loop(harness_home: &Path, checks: &mut Vec<ActivationReadinessC
 }
 
 fn live_loop_heartbeat_detail(harness_home: &Path, name: &str) -> Option<String> {
+    let stop_file = read_supervisor_stop_file(harness_home, name).ok()?;
+    if stop_file.present {
+        return None;
+    }
     let path = harness_home
         .join("state")
         .join("supervisor")
@@ -784,6 +789,14 @@ fn live_loop_heartbeat_detail(harness_home: &Path, name: &str) -> Option<String>
         .and_then(Value::as_i64)
         .and_then(|at_ms| current_log_time_ms().ok().map(|now_ms| now_ms - at_ms));
     if age_ms.is_some_and(|age_ms| age_ms > LOOP_HEARTBEAT_STALE_MS) {
+        return None;
+    }
+    if value
+        .get("processId")
+        .and_then(Value::as_i64)
+        .and_then(process_alive_for_pid)
+        == Some(false)
+    {
         return None;
     }
     let detail = value
@@ -893,6 +906,7 @@ fn check_supervisor_plan(harness_home: &Path, checks: &mut Vec<ActivationReadine
 fn check_loop_heartbeats(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
     for name in [
         "runtime-loop",
+        "progress-delivery-loop",
         "telegram-loop",
         "discord-outbox-loop",
         "discord-gateway-loop",
@@ -960,6 +974,33 @@ fn check_loop_heartbeat(
         .join("supervisor")
         .join("loop-heartbeats")
         .join(format!("{name}.json"));
+    let stop_file = match read_supervisor_stop_file(harness_home, name) {
+        Ok(stop_file) => stop_file,
+        Err(error) => {
+            checks.push(warn(
+                format!("{name}-heartbeat"),
+                format!("could not read {name} stop file state: {error}"),
+            ));
+            return;
+        }
+    };
+    if stop_file.present {
+        let reason = stop_file
+            .reason
+            .as_deref()
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or("no reason recorded");
+        let detail = format!(
+            "{name} is disabled by stop file at {}: {reason}",
+            stop_file.path.display()
+        );
+        if name == "runtime-loop" {
+            checks.push(fail(format!("{name}-heartbeat"), detail));
+        } else {
+            checks.push(warn(format!("{name}-heartbeat"), detail));
+        }
+        return;
+    }
     match read_json_value(&path) {
         Ok(value) => {
             let status = value
@@ -978,6 +1019,8 @@ fn check_loop_heartbeat(
                 .map(|age_ms| format!("ageMs={age_ms}"))
                 .unwrap_or_else(|| "ageMs=-".to_string());
             let check_name = format!("{name}-heartbeat");
+            let process_id = value.get("processId").and_then(Value::as_i64);
+            let process_alive = process_id.and_then(process_alive_for_pid);
             if matches!(
                 status,
                 "running" | "ok" | "no-work" | "ready" | "heartbeat" | "connected"
@@ -986,6 +1029,20 @@ fn check_loop_heartbeat(
                     let detail = format!(
                         "{name} heartbeat is stale at {}: status={status}, {age_detail}, detail={detail}",
                         path.display()
+                    );
+                    if name == "runtime-loop" {
+                        checks.push(fail(check_name, detail));
+                    } else {
+                        checks.push(warn(check_name, detail));
+                    }
+                } else if process_alive == Some(false) {
+                    let detail = loop_process_dead_detail(
+                        name,
+                        &path,
+                        process_id,
+                        status,
+                        &age_detail,
+                        detail,
                     );
                     if name == "runtime-loop" {
                         checks.push(fail(check_name, detail));
@@ -1002,7 +1059,7 @@ fn check_loop_heartbeat(
                     ));
                 }
             } else if status == "safe-mode" || status == "lease-busy" {
-                let detail = if age_ms.is_some_and(|age_ms| age_ms > LOOP_HEARTBEAT_STALE_MS) {
+                let base_detail = if age_ms.is_some_and(|age_ms| age_ms > LOOP_HEARTBEAT_STALE_MS) {
                     format!(
                         "{name} heartbeat is stale in degraded mode at {}: status={status}, {age_detail}, detail={detail}",
                         path.display()
@@ -1012,6 +1069,19 @@ fn check_loop_heartbeat(
                         "{name} heartbeat is in degraded mode at {}: status={status}, {age_detail}, detail={detail}",
                         path.display()
                     )
+                };
+                let detail = if process_alive == Some(false) {
+                    let process_detail = loop_process_dead_detail(
+                        name,
+                        &path,
+                        process_id,
+                        status,
+                        &age_detail,
+                        detail,
+                    );
+                    format!("{}; {}", base_detail, process_detail)
+                } else {
+                    base_detail
                 };
                 if name == "runtime-loop"
                     && age_ms.is_some_and(|age_ms| age_ms > LOOP_HEARTBEAT_STALE_MS)
@@ -1056,6 +1126,23 @@ fn check_loop_heartbeat(
             format!("could not read {}: {error}", path.display()),
         )),
     }
+}
+
+fn loop_process_dead_detail(
+    name: &str,
+    path: &Path,
+    process_id: Option<i64>,
+    status: &str,
+    age_detail: &str,
+    detail: &str,
+) -> String {
+    let process_id = process_id
+        .map(|process_id| process_id.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "{name} heartbeat references processId={process_id} but that process is not running at {}: status={status}, {age_detail}, detail={detail}",
+        path.display()
+    )
 }
 
 fn check_channel_state(harness_home: &Path, checks: &mut Vec<ActivationReadinessCheck>) {
@@ -2698,10 +2785,11 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
         let heartbeat_dir = state.join("supervisor").join("loop-heartbeats");
         fs::create_dir_all(&heartbeat_dir).unwrap();
         let now_ms = current_log_time_ms().unwrap();
+        let process_id = std::process::id();
         fs::write(
             heartbeat_dir.join("runtime-loop.json"),
             format!(
-                r#"{{"status":"safe-mode","iteration":4,"processId":42,"atMs":{now_ms},"detail":"safeModeRestart=1 after consecutiveErrors=5/5; runtimeConcurrency=1"}}"#
+                r#"{{"status":"safe-mode","iteration":4,"processId":{process_id},"atMs":{now_ms},"detail":"safeModeRestart=1 after consecutiveErrors=5/5; runtimeConcurrency=1"}}"#
             ),
         )
         .unwrap();
@@ -2726,7 +2814,7 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
         fs::write(
             heartbeat_dir.join("runtime-loop.json"),
             format!(
-                r#"{{"status":"lease-busy","iteration":5,"processId":42,"atMs":{now_ms},"detail":"runtime queue lease lock is busy during capacity inspection"}}"#
+                r#"{{"status":"lease-busy","iteration":5,"processId":{process_id},"atMs":{now_ms},"detail":"runtime queue lease lock is busy during capacity inspection"}}"#
             ),
         )
         .unwrap();
@@ -2760,7 +2848,7 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
         fs::write(
             heartbeat_dir.join("runtime-loop.json"),
             format!(
-                r#"{{"status":"running","iteration":3,"processId":42,"atMs":{now_ms},"detail":"checking runtime queue active=0/12"}}"#
+                r#"{{"status":"running","iteration":3,"processId":{process_id},"atMs":{now_ms},"detail":"checking runtime queue active=0/12"}}"#
             ),
         )
         .unwrap();
@@ -2852,10 +2940,11 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
         )
         .unwrap();
         let now_ms = current_log_time_ms().unwrap();
+        let process_id = std::process::id();
         fs::write(
             heartbeat_dir.join("runtime-loop.json"),
             format!(
-                r#"{{"status":"no-work","iteration":7,"processId":42,"atMs":{now_ms},"detail":"idle"}}"#
+                r#"{{"status":"no-work","iteration":7,"processId":{process_id},"atMs":{now_ms},"detail":"idle"}}"#
             ),
         )
         .unwrap();
@@ -2879,6 +2968,31 @@ AGENT_HARNESS_DISCORD_CHANNEL_IDS=\"discord-channel-1\"
             check.name == "telegram-loop-heartbeat"
                 && check.status == ActivationReadinessStatus::Fail
                 && check.detail.contains("status=stopped")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readiness_reports_progress_delivery_stop_file_as_disabled() {
+        let root = temp_root("readiness_reports_progress_delivery_stop_file_as_disabled");
+        let harness_home = root.join(".agent-harness");
+        let state = harness_home.join("state");
+        let stop_dir = state.join("supervisor").join("stop");
+        fs::create_dir_all(&stop_dir).unwrap();
+        fs::write(
+            stop_dir.join("progress-delivery-loop.stop"),
+            "stop for current-step cutover 2026-06-13T17:37:07.7114321+08:00",
+        )
+        .unwrap();
+
+        let report =
+            check_activation_readiness(ActivationReadinessOptions { harness_home }).unwrap();
+
+        assert!(report.checks.iter().any(|check| {
+            check.name == "progress-delivery-loop-heartbeat"
+                && check.status == ActivationReadinessStatus::Warn
+                && check.detail.contains("disabled by stop file")
         }));
 
         let _ = fs::remove_dir_all(root);

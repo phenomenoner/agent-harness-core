@@ -57,6 +57,10 @@ pub struct HealthzLoop {
     pub stale: bool,
     pub age_ms: Option<i64>,
     pub status: Option<String>,
+    pub process_id: Option<i64>,
+    pub process_alive: Option<bool>,
+    pub stop_file_present: bool,
+    pub stop_file_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -91,13 +95,19 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
                 || loop_status
                     .age_ms
                     .is_some_and(|age_ms| age_ms > options.loop_stale_ms)
-                || unhealthy_status;
+                || unhealthy_status
+                || loop_status.process_alive == Some(false)
+                || loop_status.stop_file_present;
             HealthzLoop {
                 name: loop_status.name.clone(),
                 present: loop_status.present,
                 stale,
                 age_ms: loop_status.age_ms,
                 status: loop_status.status.clone(),
+                process_id: loop_status.process_id,
+                process_alive: loop_status.process_alive,
+                stop_file_present: loop_status.stop_file_present,
+                stop_file_reason: loop_status.stop_file_reason.clone(),
             }
         })
         .collect();

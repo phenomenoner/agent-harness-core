@@ -86,7 +86,7 @@ These must pass before cutover.
    - Run `runtime-loop --stop-when-idle --iterations 1` for idle/drain smoke, or `runtime-loop --iterations 0` only under an operator/supervisor after handoff.
    - For supervised infinite loops, keep safe-mode restart enabled. `--no-safe-mode-restart` is only for finite/debug runs where the operator wants immediate process exit.
    - Confirm `state/runtime-queue/loop-last.json`.
-   - Confirm `enable-check` and `healthz --require-writable-state` report runtime-loop as live/ready. Missing/stale/error/stopped/stopping runtime-loop heartbeat blocks cutover; `safe-mode` is a degraded warning that requires inspection.
+   - Confirm `enable-check` and `healthz --require-writable-state` report runtime-loop as live/ready. Missing/stale/error/stopped/stopping runtime-loop heartbeat blocks cutover; `safe-mode` is a degraded warning that requires inspection. Confirm `progress-delivery-loop-heartbeat` is not disabled by a stop file and does not reference a missing process before claiming channel-visible progress panels are healthy.
    - Run `supervisor-plan` with the intended harness CLI, Codex executable, agent id, and channel loop selection.
    - Add `--include-cron-scheduler` only when the operator is intentionally enabling live scheduler ticks.
    - Before enabling or changing live scheduler ticks, run `cron-scheduler-lint --dry-run --enable` and `cron-scheduler-run-once --dry-run --enable` against the intended harness/source/workspace paths. Lint errors block scheduler cutover.

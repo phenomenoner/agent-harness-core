@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::loop_health::{process_alive_for_pid, read_supervisor_stop_file};
 use crate::memory::{
     MemoryMemEngineCanaryReport, MemoryMemEngineOwnershipReport, MemorySemanticCoverageReport,
     collect_memory_embedding_coverage, collect_memory_semantic_coverage,
@@ -132,9 +133,13 @@ pub struct HarnessLoopHeartbeatStatus {
     pub status: Option<String>,
     pub iteration: Option<i64>,
     pub process_id: Option<i64>,
+    pub process_alive: Option<bool>,
     pub at_ms: Option<i64>,
     pub age_ms: Option<i64>,
     pub detail: Option<String>,
+    pub stop_file: PathBuf,
+    pub stop_file_present: bool,
+    pub stop_file_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -313,6 +318,7 @@ pub fn collect_harness_status(options: HarnessStatusOptions) -> io::Result<Harne
     let logs = log_status(&options.harness_home)?;
     let runtime = runtime_status(&options.harness_home, &mut warnings)?;
     let loops = loop_status(&options.harness_home)?;
+    append_loop_health_warnings(&loops, &mut warnings);
     let workers = collect_worker_status(WorkerStatusOptions {
         harness_home: options.harness_home.clone(),
     })?;
@@ -377,7 +383,7 @@ fn loop_status(harness_home: &Path) -> io::Result<HarnessLoopStatus> {
     let mut heartbeats = Vec::new();
     for name in loop_names {
         let heartbeat_file = heartbeat_dir.join(format!("{name}.json"));
-        let heartbeat = read_loop_heartbeat(&name, &heartbeat_file, now_ms)?;
+        let heartbeat = read_loop_heartbeat(harness_home, &name, &heartbeat_file, now_ms)?;
         heartbeats.push(heartbeat);
     }
     Ok(HarnessLoopStatus {
@@ -490,10 +496,12 @@ fn cron_runs_status(harness_home: &Path) -> io::Result<HarnessCronRunStatus> {
 }
 
 fn read_loop_heartbeat(
+    harness_home: &Path,
     name: &str,
     heartbeat_file: &Path,
     now_ms: i64,
 ) -> io::Result<HarnessLoopHeartbeatStatus> {
+    let stop_file = read_supervisor_stop_file(harness_home, name)?;
     let text = match fs::read_to_string(heartbeat_file) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -504,26 +512,63 @@ fn read_loop_heartbeat(
                 status: None,
                 iteration: None,
                 process_id: None,
+                process_alive: None,
                 at_ms: None,
                 age_ms: None,
                 detail: None,
+                stop_file: stop_file.path,
+                stop_file_present: stop_file.present,
+                stop_file_reason: stop_file.reason,
             });
         }
         Err(error) => return Err(error),
     };
     let value = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
     let at_ms = i64_path(&value, &["atMs"]);
+    let process_id = i64_path(&value, &["processId"]);
     Ok(HarnessLoopHeartbeatStatus {
         name: name.to_string(),
         heartbeat_file: heartbeat_file.to_path_buf(),
         present: true,
         status: string_path(&value, &["status"]),
         iteration: i64_path(&value, &["iteration"]),
-        process_id: i64_path(&value, &["processId"]),
+        process_id,
+        process_alive: process_id.and_then(process_alive_for_pid),
         at_ms,
         age_ms: at_ms.map(|at_ms| now_ms.saturating_sub(at_ms)),
         detail: string_path(&value, &["detail"]),
+        stop_file: stop_file.path,
+        stop_file_present: stop_file.present,
+        stop_file_reason: stop_file.reason,
     })
+}
+
+fn append_loop_health_warnings(loops: &HarnessLoopStatus, warnings: &mut Vec<String>) {
+    for loop_status in &loops.heartbeats {
+        if loop_status.stop_file_present {
+            let reason = loop_status
+                .stop_file_reason
+                .as_deref()
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or("no reason recorded");
+            warnings.push(format!(
+                "{} is disabled by stop file at {}: {}",
+                loop_status.name,
+                loop_status.stop_file.display(),
+                reason
+            ));
+        }
+        if loop_status.process_alive == Some(false) {
+            let process_id = loop_status
+                .process_id
+                .map(|process_id| process_id.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            warnings.push(format!(
+                "{} heartbeat references processId={} but that process is not running",
+                loop_status.name, process_id
+            ));
+        }
+    }
 }
 
 fn runtime_status(
@@ -1674,6 +1719,61 @@ mod tests {
                 .get("runtime.loop-stopped")
                 .copied(),
             Some(true)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loop_status_reports_stop_file_and_missing_process() {
+        let root = temp_root("loop_status_reports_stop_file_and_missing_process");
+        let harness_home = root.join(".agent-harness");
+        let heartbeat_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("loop-heartbeats");
+        let stop_dir = harness_home.join("state").join("supervisor").join("stop");
+        fs::create_dir_all(&heartbeat_dir).unwrap();
+        fs::create_dir_all(&stop_dir).unwrap();
+        fs::write(
+            heartbeat_dir.join("progress-delivery-loop.json"),
+            r#"{"status":"running","iteration":9,"processId":0,"atMs":1000,"detail":"delivering progress"}"#,
+        )
+        .unwrap();
+        fs::write(
+            stop_dir.join("progress-delivery-loop.stop"),
+            "stop for current-step cutover 2026-06-13T17:37:07.7114321+08:00",
+        )
+        .unwrap();
+
+        let loops = loop_status(&harness_home).unwrap();
+        let progress_loop = loops
+            .heartbeats
+            .iter()
+            .find(|heartbeat| heartbeat.name == "progress-delivery-loop")
+            .unwrap();
+        assert!(progress_loop.present);
+        assert_eq!(progress_loop.process_id, Some(0));
+        assert_eq!(progress_loop.process_alive, Some(false));
+        assert!(progress_loop.stop_file_present);
+        assert!(
+            progress_loop
+                .stop_file_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("current-step cutover"))
+        );
+
+        let mut warnings = Vec::new();
+        append_loop_health_warnings(&loops, &mut warnings);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("disabled by stop file"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("processId=0"))
         );
 
         let _ = fs::remove_dir_all(root);

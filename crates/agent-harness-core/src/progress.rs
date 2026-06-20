@@ -1780,6 +1780,92 @@ mod tests {
     }
 
     #[test]
+    fn progress_delivery_plans_new_queue_after_prior_terminal_queue() {
+        let root = temp_root("progress_delivery_plans_new_queue_after_prior_terminal_queue");
+        let harness_home = root.join(".agent-harness");
+        let first_context = context();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &first_context,
+                AgentProgressKind::Terminal,
+                "terminal",
+                "pwsh: agent-harness status",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+        )
+        .unwrap();
+
+        let first = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(first.pending.len(), 2);
+        for pending in first.pending {
+            record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+                harness_home: harness_home.clone(),
+                queue_id: pending.queue_id,
+                platform: pending.platform,
+                account_id: pending.account_id,
+                channel_id: pending.channel_id,
+                thread_id: pending.thread_id,
+                user_id: pending.user_id,
+                session_key: pending.session_key,
+                message_kind: pending.message_kind,
+                action: pending.action,
+                status: AgentProgressDeliveryStatus::Delivered,
+                provider_message_id: Some(format!("provider-{:?}", pending.message_kind)),
+                event_line: pending.event_line,
+                text_hash: pending.text_hash,
+                terminal: pending.terminal,
+                policy_decision: Some("test".to_string()),
+                error: None,
+                now_ms: 2000,
+            })
+            .unwrap();
+        }
+
+        let mut second_context = context();
+        second_context.queue_id = "turn:2".to_string();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &second_context,
+                AgentProgressKind::Todo,
+                "todo",
+                "checking progress delivery",
+                AgentProgressStatus::Started,
+                3000,
+            ),
+        )
+        .unwrap();
+
+        let second = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 4000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(second.pending.len(), 2);
+        assert!(
+            second
+                .pending
+                .iter()
+                .all(|pending| pending.queue_id == "turn:2")
+        );
+        assert_eq!(second.summary.delivered_current, 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn terminal_cursor_does_not_suppress_unrecorded_lane_retry() {
         let root = temp_root("terminal_cursor_does_not_suppress_unrecorded_lane_retry");
         let harness_home = root.join(".agent-harness");
