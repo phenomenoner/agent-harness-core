@@ -70,6 +70,7 @@ No changes yet.
 - Round8 gateway stability verification: `cargo test -p agent-harness-cli --target-dir target\staging-test-round8-gateway-stability-cli -- --test-threads=1` (39 tests)
 - Round8 gateway stability verification: `cargo build -p agent-harness-cli --target-dir target\staging-build-round8-gateway-stability`
 - Round8 gateway stability verification: `target\staging-build-round8-gateway-stability\debug\agent-harness.exe public-hygiene --root .public-export\agent-harness-core` (`forbiddenHits=[]`)
+- Round8 gateway stability live cutover: ticket `cutover-1782046248578`, canonical live SHA-256 `55692DD0670E538CB0EE099F2F576FD3606CFB7F31FC696325E020F32915EB57`, preserved 8-loop topology, xiaoxiaoli offset repair, no remaining live-script `Tee-Object` references, forced bundled skill sync to v0.1.13, `healthz ready=true live=true`, `enable-check Ready: yes` (`passed=58 warnings=2 failed=0`), `worker-status pending=0 leased=0 running=0 failedRetryable=0 failedTerminal=3`, memory service/read-path smoke `Status: Ready`, and cutover receipt `status=ready` (`passed=59 warnings=1 failed=0`).
 - Source-home hotfix verification: `cargo fmt --all --check`
 - Source-home hotfix verification: `cargo test -p agent-harness-cli --target-dir target\staging-test-sourcehome-cli -- --test-threads=1` (23 tests)
 - Source-home hotfix verification: `cargo test -p agent-harness-core warns_when_source_home_is_retired_openclaw --target-dir target\staging-test-sourcehome-core -- --test-threads=1`
