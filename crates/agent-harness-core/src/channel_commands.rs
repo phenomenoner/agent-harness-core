@@ -13,6 +13,10 @@ pub enum ChannelCommand {
     Stop {
         reason: Option<String>,
     },
+    Restart {
+        target: Option<String>,
+        reason: Option<String>,
+    },
     Steer {
         instruction: String,
     },
@@ -41,6 +45,10 @@ pub enum ChannelCommandIntent {
     StopCurrentRun {
         reason: Option<String>,
     },
+    RestartChannel {
+        target: Option<String>,
+        reason: Option<String>,
+    },
     AddSteering {
         instruction: String,
     },
@@ -66,6 +74,7 @@ impl ChannelCommand {
             ChannelCommand::New { .. } => "new",
             ChannelCommand::Think { .. } => "think",
             ChannelCommand::Stop { .. } => "stop",
+            ChannelCommand::Restart { .. } => "restart",
             ChannelCommand::Steer { .. } => "steer",
             ChannelCommand::Btw { .. } => "btw",
             ChannelCommand::Model { .. } => "model",
@@ -80,6 +89,9 @@ impl ChannelCommand {
                 ChannelCommandIntent::Think { level, global }
             }
             ChannelCommand::Stop { reason } => ChannelCommandIntent::StopCurrentRun { reason },
+            ChannelCommand::Restart { target, reason } => {
+                ChannelCommandIntent::RestartChannel { target, reason }
+            }
             ChannelCommand::Steer { instruction } => {
                 ChannelCommandIntent::AddSteering { instruction }
             }
@@ -108,6 +120,10 @@ pub fn parse_channel_command(input: &str) -> Option<ChannelCommand> {
         "stop" => Some(ChannelCommand::Stop {
             reason: optional_text(rest),
         }),
+        "restart" => {
+            let (target, reason) = optional_restart_target(rest);
+            Some(ChannelCommand::Restart { target, reason })
+        }
         "steer" => required_text(rest).map(|instruction| ChannelCommand::Steer { instruction }),
         "btw" => required_text(rest).map(|note| ChannelCommand::Btw { note }),
         "model" => {
@@ -144,6 +160,20 @@ fn optional_text_with_global_flag(value: &str) -> (Option<String>, bool) {
     }
     let text = parts.join(" ");
     (required_text(&text), global)
+}
+
+fn optional_restart_target(value: &str) -> (Option<String>, Option<String>) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return (None, None);
+    }
+    let (first, rest) = split_command(trimmed);
+    match first.to_ascii_lowercase().as_str() {
+        "current" | "channel" | "tg" | "telegram" | "discord" => {
+            (Some(first.to_ascii_lowercase()), optional_text(rest))
+        }
+        _ => (None, optional_text(trimmed)),
+    }
 }
 
 fn required_text(value: &str) -> Option<String> {
@@ -205,6 +235,20 @@ mod tests {
         assert_eq!(
             parse_channel_command("/stop"),
             Some(ChannelCommand::Stop { reason: None })
+        );
+        assert_eq!(
+            parse_channel_command("/restart"),
+            Some(ChannelCommand::Restart {
+                target: None,
+                reason: None
+            })
+        );
+        assert_eq!(
+            parse_channel_command("/restart telegram reconnect websocket"),
+            Some(ChannelCommand::Restart {
+                target: Some("telegram".to_string()),
+                reason: Some("reconnect websocket".to_string())
+            })
         );
     }
 
@@ -280,6 +324,13 @@ mod tests {
             parse_channel_command_intent("/stop user canceled"),
             Some(ChannelCommandIntent::StopCurrentRun {
                 reason: Some("user canceled".to_string())
+            })
+        );
+        assert_eq!(
+            parse_channel_command_intent("/restart recycle adapter"),
+            Some(ChannelCommandIntent::RestartChannel {
+                target: None,
+                reason: Some("recycle adapter".to_string())
             })
         );
         assert_eq!(

@@ -101,8 +101,9 @@ use agent_harness_core::{
     resolve_channel_identity, rotate_harness_log_if_needed, run_channel_once, run_codex_runtime,
     run_cron_scheduler_once, run_memory_canvas_worker, run_memory_embedding_backfill,
     run_memory_hook_adapter, run_openclaw_mem_read_path_smoke, run_public_hygiene,
-    run_runtime_queue_once, run_worker_once, scan_security_boundaries, schema_registry_entries,
-    search_imported_memory, search_imported_vector_memory, select_skills,
+    run_runtime_queue_once, run_worker_once,
+    runtime_worker::reconcile_runtime_queue_leases_for_generation, scan_security_boundaries,
+    schema_registry_entries, search_imported_memory, search_imported_vector_memory, select_skills,
     store_openclaw_mem_service_memory, sync_builtin_harness_skills, tool_description_hash,
     trace_harness_event, upsert_background_task, validate_harness_config, write_channel_step,
     write_deterministic_cron_plan, write_json_atomic, write_memory_search_receipt,
@@ -228,6 +229,7 @@ fn main() {
         "queue-prepare" => run_queue_prepare(&rest),
         "runtime-run-once" => run_runtime_run_once(&rest),
         "runtime-loop" => run_runtime_loop(&rest),
+        "runtime-lease-reconcile" => run_runtime_lease_reconcile(&rest),
         "worker-enqueue" => run_worker_enqueue(&rest),
         "worker-run-once" => run_worker_run_once(&rest),
         "worker-loop" => run_worker_loop(&rest),
@@ -5328,6 +5330,25 @@ fn run_runtime_run_once(args: &[String]) -> Result<(), String> {
 
     print_runtime_run_once_report(&report);
     Ok(())
+}
+
+fn run_runtime_lease_reconcile(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(
+        args,
+        "runtime-lease-reconcile",
+        &["--service", "--generation-id"],
+        &[],
+    )?;
+    let service_id = options.required("--service")?;
+    let generation_id = options.required("--generation-id")?;
+    let report = reconcile_runtime_queue_leases_for_generation(
+        options.target_home,
+        &service_id,
+        &generation_id,
+        current_time_ms()?,
+    )
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
 }
 
 struct RuntimeLoopTaskResult {
@@ -17014,6 +17035,7 @@ fn print_help() {
     println!("  queue-prepare   Prepare one queued runtime item for Codex execution");
     println!("  runtime-run-once Prepare, run, and outbox one queued runtime item");
     println!("  runtime-loop    Drain runtime queue until stopped, idle, or error threshold");
+    println!("  runtime-lease-reconcile Reap leases owned by an exited runtime generation");
     println!("  worker-enqueue  Persist deterministic, subagent, watchdog, or wakeup worker job");
     println!("  worker-run-once Lease and execute one worker-dispatch job");
     println!("  worker-loop     Drain worker jobs until stopped, idle, or error threshold");

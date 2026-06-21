@@ -164,6 +164,7 @@ pub fn write_windows_supervisor_plan(
             &log_dir,
             component,
             &harness_home,
+            &stop_file,
         )?;
         push_task(
             &mut scripts,
@@ -198,6 +199,7 @@ pub fn write_windows_supervisor_plan(
             &log_dir,
             component,
             &harness_home,
+            &stop_file,
         )?;
         push_task(
             &mut scripts,
@@ -243,6 +245,7 @@ pub fn write_windows_supervisor_plan(
             &log_dir,
             component,
             &harness_home,
+            &stop_file,
         )?;
         push_task(
             &mut scripts,
@@ -285,6 +288,7 @@ pub fn write_windows_supervisor_plan(
             &log_dir,
             component,
             &harness_home,
+            &stop_file,
         )?;
         push_task(
             &mut scripts,
@@ -342,6 +346,7 @@ pub fn write_windows_supervisor_plan(
             &log_dir,
             component,
             &harness_home,
+            &stop_file,
         )?;
         push_task(
             &mut scripts,
@@ -386,6 +391,7 @@ pub fn write_windows_supervisor_plan(
             &log_dir,
             component,
             &harness_home,
+            &stop_file,
         )?;
         push_task(
             &mut scripts,
@@ -437,6 +443,7 @@ pub fn write_windows_supervisor_plan(
             &log_dir,
             component,
             &harness_home,
+            &stop_file,
         )?;
         push_task(
             &mut scripts,
@@ -542,6 +549,7 @@ fn write_runner_script(
     log_dir: &Path,
     log_name: &str,
     harness_home: &Path,
+    stop_file: &Path,
 ) -> io::Result<()> {
     let invocation = command_invocation(executable, args);
     let body = if log_name == "runtime-loop" {
@@ -549,16 +557,29 @@ fn write_runner_script(
             "$ErrorActionPreference = 'Continue'\n\
              $LogDir = {}\n\
              $HarnessHome = {}\n\
+             $HarnessCli = {}\n\
              $SupervisorStopDir = Join-Path $HarnessHome 'state\\supervisor\\stop'\n\
              New-Item -ItemType Directory -Force -Path $LogDir | Out-Null\n\
              $SafeModeState = Join-Path $LogDir '{}-runner-safe-mode.json'\n\
              $SafeModeRestarts = 0\n\
              while ($true) {{\n\
                Get-ChildItem -LiteralPath $LogDir -Filter '{}-*.log' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 20 | Remove-Item -Force -ErrorAction SilentlyContinue\n\
-              $LogFile = Join-Path $LogDir (\"{}-$(Get-Date -Format yyyyMMdd-HHmmss).log\")\n\
-              {} *> $LogFile\n\
+              $StartedAtMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()\n\
+              $GenerationId = '{}-supervised-' + $PID + '-' + $StartedAtMs + '-' + $SafeModeRestarts\n\
+              $env:AGENT_HARNESS_SERVICE_GENERATION_ID = $GenerationId\n\
+              $env:AGENT_HARNESS_SERVICE_STARTED_AT_MS = [string]$StartedAtMs\n\
+              $env:AGENT_HARNESS_SUPERVISOR_LAUNCH_OWNER = 'windows-runtime-runner'\n\
+              $env:AGENT_HARNESS_SUPERVISOR_OBSERVED_ONLY = 'false'\n\
+              $env:AGENT_HARNESS_SUPERVISOR_PARENT_PID = [string]$PID\n\
+               $LogFile = Join-Path $LogDir (\"{}-$(Get-Date -Format yyyyMMdd-HHmmss).log\")\n\
+               {} *> $LogFile\n\
                $ExitCode = $LASTEXITCODE\n\
                if ($ExitCode -eq 0) {{ exit 0 }}\n\
+               try {{\n\
+                 & $HarnessCli 'runtime-lease-reconcile' '--harness-home' $HarnessHome '--service' '{}' '--generation-id' $GenerationId *>> $LogFile\n\
+               }} catch {{\n\
+                 Add-Content -LiteralPath $LogFile -Value (\"runtime-lease-reconcile failed: \" + $_.Exception.Message)\n\
+               }}\n\
                $SafeModeRestarts += 1\n\
                $LogTail = ''\n\
                try {{ $LogTail = (Get-Content -LiteralPath $LogFile -Tail 200 -ErrorAction SilentlyContinue) -join \"`n\" }} catch {{ $LogTail = '' }}\n\
@@ -580,22 +601,42 @@ fn write_runner_script(
              }}\n",
             ps_quote_path(log_dir),
             ps_quote_path(harness_home),
+            ps_quote_path(executable),
+            ps_escape_single(log_name),
             ps_escape_single(log_name),
             ps_escape_single(log_name),
             ps_escape_single(log_name),
             invocation,
+            ps_escape_single(log_name),
             ps_escape_single(log_name)
         )
     } else {
         format!(
             "$ErrorActionPreference = 'Continue'\n\
              $LogDir = {}\n\
-             New-Item -ItemType Directory -Force -Path $LogDir | Out-Null\n\
-             Get-ChildItem -LiteralPath $LogDir -Filter '{}-*.log' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 20 | Remove-Item -Force -ErrorAction SilentlyContinue\n\
-              $LogFile = Join-Path $LogDir (\"{}-$(Get-Date -Format yyyyMMdd-HHmmss).log\")\n\
-              {} *> $LogFile\n\
-             exit $LASTEXITCODE\n",
+             $StopFile = {}\n\
+             while ($true) {{\n\
+               New-Item -ItemType Directory -Force -Path $LogDir | Out-Null\n\
+               Get-ChildItem -LiteralPath $LogDir -Filter '{}-*.log' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 20 | Remove-Item -Force -ErrorAction SilentlyContinue\n\
+               $LogFile = Join-Path $LogDir (\"{}-$(Get-Date -Format yyyyMMdd-HHmmss).log\")\n\
+               {} *> $LogFile\n\
+               $ExitCode = $LASTEXITCODE\n\
+               $RestartRequested = $false\n\
+               if (Test-Path -LiteralPath $StopFile) {{\n\
+                 try {{\n\
+                   $StopEnvelope = Get-Content -LiteralPath $StopFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop\n\
+                   if (($StopEnvelope.action -eq 'restart') -or ($StopEnvelope.restart -eq $true) -or (($StopEnvelope.persistent -eq $false) -and ($StopEnvelope.createdBy -eq 'channel-restart-command'))) {{ $RestartRequested = $true }}\n\
+                 }} catch {{ $RestartRequested = $false }}\n\
+               }}\n\
+               if ($RestartRequested) {{\n\
+                 Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $StopFile\n\
+                 Start-Sleep -Seconds 2\n\
+                 continue\n\
+               }}\n\
+               exit $ExitCode\n\
+             }}\n",
             ps_quote_path(log_dir),
+            ps_quote_path(stop_file),
             ps_escape_single(log_name),
             ps_escape_single(log_name),
             invocation
@@ -917,6 +958,11 @@ mod tests {
         assert!(runtime_script.contains("progress-delivery-loop.stop"));
         assert!(runtime_script.contains("pause-low-priority-service"));
         assert!(runtime_script.contains("memory-pressure-gate: runtime-loop resource exhaustion"));
+        assert!(runtime_script.contains("AGENT_HARNESS_SERVICE_GENERATION_ID"));
+        assert!(runtime_script.contains("AGENT_HARNESS_SERVICE_STARTED_AT_MS"));
+        assert!(runtime_script.contains("windows-runtime-runner"));
+        assert!(runtime_script.contains("runtime-lease-reconcile"));
+        assert!(runtime_script.contains("--generation-id"));
         assert!(runtime_script.contains("Start-Sleep -Seconds $RestartAfterSeconds"));
         let worker_script =
             fs::read_to_string(output_dir.join("scripts").join("worker-loop.ps1")).unwrap();
@@ -947,6 +993,25 @@ mod tests {
         assert!(discord_outbox_script.contains("$(Get-Date -Format yyyyMMdd-HHmmss)"));
         assert!(discord_outbox_script.contains("Select-Object -Skip 20"));
         assert!(!discord_outbox_script.contains("Tee-Object"));
+        let telegram_script =
+            fs::read_to_string(output_dir.join("scripts").join("telegram-loop.ps1")).unwrap();
+        assert!(telegram_script.contains("$StopFile"));
+        assert!(telegram_script.contains("channel-restart-command"));
+        assert!(
+            telegram_script.contains(
+                "Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $StopFile"
+            )
+        );
+        let discord_gateway_script =
+            fs::read_to_string(output_dir.join("scripts").join("discord-gateway-loop.ps1"))
+                .unwrap();
+        assert!(discord_gateway_script.contains("$StopFile"));
+        assert!(discord_gateway_script.contains("channel-restart-command"));
+        assert!(
+            discord_gateway_script.contains(
+                "Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $StopFile"
+            )
+        );
         let start_script =
             fs::read_to_string(output_dir.join("scripts").join("start-scheduled-tasks.ps1"))
                 .unwrap();

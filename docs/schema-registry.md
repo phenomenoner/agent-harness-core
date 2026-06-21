@@ -10,12 +10,14 @@ The authoritative in-code registry is `agent_harness_core::quality::schema_regis
 | `agent-harness.runtime-dead-letter.v1` | `runtime_pipeline` | Additive fields only in v1; terminal receipt semantics are immutable. | Implemented in staging. |
 | `agent-harness.runtime-queue-control.v1` | `runtime_queue` | Retry/skip receipts are append-only; terminal source ids are never mutated. | Implemented in staging. |
 | `agent-harness.runtime-queue-leases.v1` | `runtime_worker` | Class-scoped state JSON accepts legacy `owner: "pid:<n>"` strings and structured owner envelopes in v1. | Implemented in staging. |
+| `agent-harness.runtime-queue-lease-reconciliation.v1` | `runtime_worker` | Operator report for supervisor generation lease reaping; additive fields only in v1. | Implemented in staging. |
 | `agent-harness.codex-context-preflight.v1` | `codex_runtime` | Append-only JSONL plus per-execution JSON; additive fields only in v1. | Implemented in staging. |
 | `agent-harness.codex-context-checkpoint.v1` | `codex_runtime` | Per-execution recovery artifact; additive fields only in v1. | Implemented in staging. |
 | `agent-harness.codex-context-rollover.v1` | `codex_runtime` | Per-execution recovery artifact; binding backup path remains optional. | Implemented in staging. |
 | `agent-harness.channel-identity-check.v1` | `channel_identity` | Additive fields only in v1; non-bound statuses remain fail-closed. | Implemented. |
 | `agent-harness.channel-identity-registry.v1` | `channel_identity` | Additive binding fields only in v1; ambiguous bindings must fail closed. | Implemented. |
 | `agent-harness.channel-delivery-intent.v1` | `channel_runtime` | Additive fields only in v1; provider ids must come from captured inbound context. | Implemented. |
+| `agent-harness.channel-restart-request.v1` | `channel_runtime` | Restart request receipts are append-only; stop-file envelope action fields are additive in v1. | Implemented in staging. |
 | `agent-harness.cron-scheduler.run-once.v1` | `cron_scheduler` | Additive fields only in v1; dry-run must not enqueue or write watermarks. | Implemented. |
 | `agent-harness.cron-scheduler.lint.v1` | `cron_scheduler` | Additive diagnostics only in v1; error status remains fail-closed. | Implemented in staging. |
 | `agent-harness.cron-scheduler.tick.v1` | `cron_scheduler` | Append-only receipts; additive fields only in v1. | Implemented. |

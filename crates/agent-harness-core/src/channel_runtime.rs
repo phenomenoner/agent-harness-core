@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
     AgentRegistry, ChannelCommandIntent, DEFAULT_THINKING_LEVEL, InboundMediaArtifact,
@@ -12,6 +13,7 @@ use crate::{
 };
 
 const CHANNEL_STEP_SCHEMA: &str = "agent-harness.channel-step.v1";
+const CHANNEL_RESTART_REQUEST_SCHEMA: &str = "agent-harness.channel-restart-request.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,6 +56,17 @@ pub enum ChannelCommandEffect {
     },
     StopCurrentRun {
         reason: Option<String>,
+    },
+    RestartChannel {
+        target: Option<String>,
+        platform: String,
+        service_id: Option<String>,
+        status: String,
+        detail: String,
+        reason: Option<String>,
+        stop_file: Option<PathBuf>,
+        request_file: Option<PathBuf>,
+        receipt_file: Option<PathBuf>,
     },
     AddSteering {
         instruction: String,
@@ -359,7 +372,7 @@ fn command_effect(
     registry: &AgentRegistry,
     turn: &TurnPlan,
     intent: ChannelCommandIntent,
-    _warnings: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) -> ChannelCommandEffect {
     match intent {
         ChannelCommandIntent::StartNewSession { topic } => ChannelCommandEffect::StartNewSession {
@@ -371,6 +384,9 @@ fn command_effect(
         }
         ChannelCommandIntent::StopCurrentRun { reason } => {
             ChannelCommandEffect::StopCurrentRun { reason }
+        }
+        ChannelCommandIntent::RestartChannel { target, reason } => {
+            restart_channel_effect(turn, target, reason, warnings)
         }
         ChannelCommandIntent::AddSteering { instruction } => {
             ChannelCommandEffect::AddSteering { instruction }
@@ -384,6 +400,206 @@ fn command_effect(
             scope,
         },
     }
+}
+
+fn restart_channel_effect(
+    turn: &TurnPlan,
+    target: Option<String>,
+    reason: Option<String>,
+    warnings: &mut Vec<String>,
+) -> ChannelCommandEffect {
+    let Some(platform) = restart_target_platform(turn, target.as_deref()) else {
+        return ChannelCommandEffect::RestartChannel {
+            target,
+            platform: turn.platform.clone(),
+            service_id: None,
+            status: "unsupported-target".to_string(),
+            detail: "restart target must be current, channel, telegram, tg, or discord".to_string(),
+            reason,
+            stop_file: None,
+            request_file: None,
+            receipt_file: None,
+        };
+    };
+    let Some(service_id) = restart_service_id(&platform) else {
+        return ChannelCommandEffect::RestartChannel {
+            target,
+            platform,
+            service_id: None,
+            status: "unsupported-platform".to_string(),
+            detail: "restart is only supported for Telegram and Discord channel loops".to_string(),
+            reason,
+            stop_file: None,
+            request_file: None,
+            receipt_file: None,
+        };
+    };
+    let Some(harness_home) = turn.harness_home.as_ref() else {
+        return ChannelCommandEffect::RestartChannel {
+            target,
+            platform,
+            service_id: Some(service_id.to_string()),
+            status: "missing-harness-home".to_string(),
+            detail:
+                "restart command requires a harness home so the supervisor stop file can be written"
+                    .to_string(),
+            reason,
+            stop_file: None,
+            request_file: None,
+            receipt_file: None,
+        };
+    };
+
+    match write_channel_restart_request(turn, harness_home, &platform, service_id, reason.as_deref())
+    {
+        Ok(record) => ChannelCommandEffect::RestartChannel {
+            target,
+            platform,
+            service_id: Some(service_id.to_string()),
+            status: "requested".to_string(),
+            detail: "restart stop file written; supervised loop will relaunch when the runner observes it"
+                .to_string(),
+            reason,
+            stop_file: Some(record.stop_file),
+            request_file: Some(record.request_file),
+            receipt_file: Some(record.receipt_file),
+        },
+        Err(error) => {
+            warnings.push(format!("failed to record channel restart request: {error}"));
+            ChannelCommandEffect::RestartChannel {
+                target,
+                platform,
+                service_id: Some(service_id.to_string()),
+                status: "failed".to_string(),
+                detail: error.to_string(),
+                reason,
+                stop_file: None,
+                request_file: None,
+                receipt_file: None,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChannelRestartFiles {
+    stop_file: PathBuf,
+    request_file: PathBuf,
+    receipt_file: PathBuf,
+}
+
+fn write_channel_restart_request(
+    turn: &TurnPlan,
+    harness_home: &Path,
+    platform: &str,
+    service_id: &str,
+    reason: Option<&str>,
+) -> io::Result<ChannelRestartFiles> {
+    let at_ms = current_time_ms();
+    let reason = reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("channel /restart command requested");
+    let stop_file = channel_restart_stop_file(harness_home, service_id);
+    if let Some(parent) = stop_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let stop_file_envelope = serde_json::json!({
+        "schema": "agent-harness.supervisor-stop-file.v1",
+        "serviceId": service_id,
+        "action": "restart",
+        "restart": true,
+        "reason": reason,
+        "createdBy": "channel-restart-command",
+        "createdAtMs": at_ms,
+        "persistent": false,
+        "platform": platform,
+        "channelId": turn.channel_id,
+        "userId": turn.user_id,
+        "sessionKey": turn.session_key,
+    });
+    crate::write_json_atomic(&stop_file, &stop_file_envelope)?;
+
+    let request_dir = harness_home
+        .join("state")
+        .join("channels")
+        .join("restart-requests");
+    fs::create_dir_all(&request_dir)?;
+    let request_file = request_dir.join(format!(
+        "{}-{}.json",
+        at_ms,
+        safe_file_component(service_id)
+    ));
+    let receipt_file = harness_home
+        .join("state")
+        .join("channels")
+        .join("channel-restart-requests.jsonl");
+    let record = serde_json::json!({
+        "schema": CHANNEL_RESTART_REQUEST_SCHEMA,
+        "status": "requested",
+        "harnessHome": harness_home,
+        "platform": platform,
+        "serviceId": service_id,
+        "stopFile": stop_file,
+        "requestFile": request_file,
+        "receiptFile": receipt_file,
+        "reason": reason,
+        "channelId": turn.channel_id,
+        "userId": turn.user_id,
+        "sessionKey": turn.session_key,
+        "atMs": at_ms,
+    });
+    crate::write_json_atomic(&request_file, &record)?;
+    crate::append_jsonl_value(&receipt_file, &record)?;
+
+    Ok(ChannelRestartFiles {
+        stop_file,
+        request_file,
+        receipt_file,
+    })
+}
+
+fn restart_target_platform(turn: &TurnPlan, target: Option<&str>) -> Option<String> {
+    match target.map(|value| value.trim().to_ascii_lowercase()) {
+        None => Some(turn.platform.trim().to_ascii_lowercase()),
+        Some(target) if target.is_empty() || target == "current" || target == "channel" => {
+            Some(turn.platform.trim().to_ascii_lowercase())
+        }
+        Some(target) if target == "tg" || target == "telegram" => Some("telegram".to_string()),
+        Some(target) if target == "discord" => Some("discord".to_string()),
+        Some(_) => None,
+    }
+}
+
+fn restart_service_id(platform: &str) -> Option<&'static str> {
+    match platform {
+        "telegram" => Some("telegram-loop"),
+        "discord" => Some("discord-gateway-loop"),
+        _ => None,
+    }
+}
+
+fn channel_restart_stop_file(harness_home: &Path, service_id: &str) -> PathBuf {
+    let plan_file = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("windows-scheduled-tasks")
+        .join("supervisor-plan.json");
+    if let Ok(text) = fs::read_to_string(&plan_file) {
+        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+            if let Some(stop_file) = value
+                .get("tasks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|task| task.get("component").and_then(Value::as_str) == Some(service_id))
+                .and_then(|task| task.get("stopFile").and_then(Value::as_str))
+            {
+                return PathBuf::from(stop_file);
+            }
+        }
+    }
+    crate::loop_health::supervisor_stop_file_path(harness_home, service_id)
 }
 
 fn thinking_command_effect(
@@ -505,6 +721,29 @@ fn new_session_key(turn: &TurnPlan) -> String {
     )
 }
 
+fn current_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or_default()
+}
+
+fn safe_file_component(value: &str) -> String {
+    let mut output = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            output.push(ch);
+        } else {
+            output.push('_');
+        }
+    }
+    if output.is_empty() {
+        "restart".to_string()
+    } else {
+        output
+    }
+}
+
 fn normalize_key_part(value: &str) -> String {
     let mut normalized = String::new();
     for ch in value.chars() {
@@ -592,6 +831,28 @@ fn command_reply_text(effect: &ChannelCommandEffect) -> String {
             .as_ref()
             .map(|reason| format!("Stop requested for the current run: {reason}"))
             .unwrap_or_else(|| "Stop requested for the current run.".to_string()),
+        ChannelCommandEffect::RestartChannel {
+            platform,
+            service_id,
+            status,
+            detail,
+            reason,
+            ..
+        } => {
+            if status == "requested" {
+                format!(
+                    "Restart requested for {} channel loop `{}`.{}",
+                    platform,
+                    display_opt(service_id),
+                    reason
+                        .as_ref()
+                        .map(|reason| format!("\nReason: {reason}"))
+                        .unwrap_or_default()
+                )
+            } else {
+                format!("Restart request status: {status}\n{detail}")
+            }
+        }
         ChannelCommandEffect::AddSteering { instruction } => {
             format!("Steering note recorded for this session: {instruction}")
         }
@@ -1017,6 +1278,91 @@ mod tests {
                     && snapshot.discord_configured
                     && snapshot.telegram_configured
         ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_step_requests_channel_restart_stop_file() {
+        let root = temp_root("channel_step_requests_channel_restart_stop_file");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let supervisor_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("windows-scheduled-tasks");
+        let stop_file = supervisor_dir.join("stop").join("telegram-loop.stop");
+        fs::create_dir_all(stop_file.parent().unwrap()).unwrap();
+        fs::write(
+            supervisor_dir.join("supervisor-plan.json"),
+            serde_json::to_string(&serde_json::json!({
+                "tasks": [
+                    { "component": "telegram-loop", "stopFile": stop_file }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "operator".to_string(),
+                text: "/restart reconnect adapter".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        let step = build_channel_step(&registry, &turn);
+
+        assert_eq!(step.action, ChannelStepAction::ReplyOnly);
+        assert!(step.agent_turn.is_none());
+        assert!(
+            step.outbound_messages[0]
+                .text
+                .contains("Restart requested for telegram channel loop `telegram-loop`")
+        );
+        assert!(matches!(
+            step.command_effect,
+            Some(ChannelCommandEffect::RestartChannel {
+                ref platform,
+                ref service_id,
+                ref status,
+                ref reason,
+                ..
+            }) if platform == "telegram"
+                && service_id.as_deref() == Some("telegram-loop")
+                && status == "requested"
+                && reason.as_deref() == Some("reconnect adapter")
+        ));
+        let stop_value: Value = serde_json::from_slice(&fs::read(&stop_file).unwrap()).unwrap();
+        assert_eq!(
+            stop_value["schema"],
+            "agent-harness.supervisor-stop-file.v1"
+        );
+        assert_eq!(stop_value["serviceId"], "telegram-loop");
+        assert_eq!(stop_value["action"], "restart");
+        assert_eq!(stop_value["restart"], true);
+        assert_eq!(stop_value["createdBy"], "channel-restart-command");
+        assert_eq!(stop_value["persistent"], false);
+        assert!(
+            harness_home
+                .join("state")
+                .join("channels")
+                .join("channel-restart-requests.jsonl")
+                .is_file()
+        );
 
         let _ = fs::remove_dir_all(root);
     }

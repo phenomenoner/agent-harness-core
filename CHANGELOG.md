@@ -10,11 +10,15 @@
 - Generated progress delivery runners now launch `supervisor-run --service progress-delivery-loop`, moving the low-risk progress child under Rust supervisor ownership while other loops stay on the existing runner path.
 - Generated Discord outbox runners now launch `supervisor-run --service discord-outbox-loop`, moving final Discord delivery under Rust supervisor ownership with final-delivery priority and a shorter restart backoff.
 - Runtime queue leases now write structured owner envelopes with `serviceId`, `generationId`, `pid`, `processStartTimeMs`, and `acquiredAtMs`, while legacy `owner="pid:<n>"` leases remain readable and reapable.
+- Generated runtime runners now stamp runtime-loop child generations and call `runtime-lease-reconcile` after non-zero child exits so leases owned by the exited generation are reaped before restart backoff.
+- Telegram and Discord command handling now accepts admin-only `/restart` requests that write a nonpersistent restart stop-file envelope; generated channel runners clear `action=restart` stop files and relaunch instead of staying stopped.
 
 ### Added
 
 - Schema registry entry for `agent-harness.runtime-loop-runner-safe-mode.v1`.
 - Schema registry entry for `agent-harness.runtime-queue-leases.v1`.
+- Schema registry entries for `agent-harness.runtime-queue-lease-reconciliation.v1` and `agent-harness.channel-restart-request.v1`.
+- Added `runtime-lease-reconcile` for explicit generation-owned runtime lease cleanup after a supervised child exits.
 - Loop heartbeat writers now emit `generationId` metadata and per-service `agent-harness.supervisor-service-state.v1` records under `state/supervisor/services`.
 - Added `supervisor-run` for Rust-owned low-risk child supervision, starting with `progress-delivery-loop` and `discord-outbox-loop`.
 
@@ -34,6 +38,7 @@
 - Round8 supervisor-owned progress verification: `cargo fmt --all -- --check`, `cargo check --workspace --target-dir target\staging-check-round8-supervisor-progress`, full core tests (341), full CLI tests (40), `cargo build -p agent-harness-cli --target-dir target\staging-build-round8-supervisor-progress`, `git diff --check`, focused supervisor-run/status/health/schema coverage, public export hygiene (`forbiddenHits=[]`), and changed public/operator docs path hygiene (`forbiddenHits=[]`).
 - Round8 supervisor-owned final outbox verification: `cargo fmt --all -- --check`, `cargo check --workspace --target-dir target\staging-check-round8-supervisor-outbox`, full core tests (341), full CLI tests (41), `cargo build -p agent-harness-cli --target-dir target\staging-build-round8-supervisor-outbox`, `git diff --check`, focused supervisor-run final-outbox/status/health/schema coverage, public export hygiene (`forbiddenHits=[]`), changed public/operator docs path hygiene (`forbiddenHits=[]`), and public-facing content scan (`files=156`, `patterns=8`).
 - Round8 runtime lease owner envelope verification: `cargo fmt --all -- --check`, `cargo check --workspace --target-dir target\staging-check-round8-lease-owner`, focused `runtime_worker::tests`, full core tests (342), full CLI tests (41), `cargo build -p agent-harness-cli --target-dir target\staging-build-round8-lease-owner`, `git diff --check`, public export hygiene (`forbiddenHits=[]`), and added-line public/operator docs path hygiene (`forbiddenHits=[]`).
+- Round8 runtime generation reconciliation and channel `/restart` verification: `cargo fmt --all -- --check`, `cargo check --workspace --target-dir target\staging-check-round8-restart-clean`, full core tests (344), full CLI tests (41), `cargo build -p agent-harness-cli --target-dir target\staging-build-round8-restart`, `git diff --check`, and public export hygiene excluding `.debug` with `forbiddenHits=[]`.
 
 ## v0.1.1 - 2026-06-21
 

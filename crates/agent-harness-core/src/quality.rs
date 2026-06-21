@@ -106,6 +106,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "class-scoped state JSON accepts legacy owner strings and structured owner envelopes in v1",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.runtime-queue-lease-reconciliation.v1",
+            owner_module: "runtime_worker",
+            compatibility: "operator report for generation lease reaping; additive fields only in v1",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.progress-delivery-state.v1",
             owner_module: "progress",
             compatibility: "state JSON may add cursor/cache fields in v1; existing lane cursors remain readable",
@@ -139,6 +144,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             schema: "agent-harness.channel-delivery-intent.v1",
             owner_module: "channel_runtime",
             compatibility: "additive fields only in v1; provider ids must come from captured inbound context",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.channel-restart-request.v1",
+            owner_module: "channel_runtime",
+            compatibility: "append-only restart receipts; stop-file envelope action remains additive in v1",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.cron-scheduler.run-once.v1",

@@ -22,6 +22,8 @@ use crate::{
 
 const RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA: &str = "agent-harness.runtime-queue-prepare.v1";
 const RUNTIME_QUEUE_LEASES_SCHEMA: &str = "agent-harness.runtime-queue-leases.v1";
+const RUNTIME_QUEUE_LEASE_RECONCILIATION_SCHEMA: &str =
+    "agent-harness.runtime-queue-lease-reconciliation.v1";
 const RUNTIME_LOOP_SERVICE_ID: &str = "runtime-loop";
 const DEFAULT_RUNTIME_LEASE_MS: i64 = 30 * 60 * 1000;
 const RUNTIME_LEASE_ACQUIRE_LOCK_RETRY_MS: u64 = 2_000;
@@ -264,6 +266,29 @@ struct RuntimeQueueLeaseOwnerEnvelope {
     #[serde(alias = "processStartTime")]
     process_start_time_ms: i64,
     acquired_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeQueueLeaseReconciliationReport {
+    pub schema: &'static str,
+    pub harness_home: PathBuf,
+    pub service_id: String,
+    pub generation_id: String,
+    pub reaped_leases: Vec<RuntimeQueueLeaseReconciledItem>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeQueueLeaseReconciledItem {
+    pub queue_id: String,
+    pub runtime_class: String,
+    pub origin: String,
+    pub cron_run_id: Option<String>,
+    pub owner: Value,
+    pub at_ms: i64,
+    pub reason: String,
 }
 
 struct RuntimeQueueLeaseLock {
@@ -1552,6 +1577,93 @@ pub fn release_runtime_queue_lease(
     Ok(())
 }
 
+pub fn reconcile_runtime_queue_leases_for_generation(
+    harness_home: impl AsRef<Path>,
+    service_id: &str,
+    generation_id: &str,
+    at_ms: i64,
+) -> io::Result<RuntimeQueueLeaseReconciliationReport> {
+    let harness_home = harness_home.as_ref().to_path_buf();
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    fs::create_dir_all(&queue_dir)?;
+    let receipts_file = queue_dir.join("execution-receipts.jsonl");
+    let mut report = RuntimeQueueLeaseReconciliationReport {
+        schema: RUNTIME_QUEUE_LEASE_RECONCILIATION_SCHEMA,
+        harness_home: harness_home.clone(),
+        service_id: service_id.to_string(),
+        generation_id: generation_id.to_string(),
+        reaped_leases: Vec::new(),
+        warnings: Vec::new(),
+    };
+
+    for runtime_class in runtime_classes_for_release(&queue_dir) {
+        let Some(_lease_lock) = acquire_runtime_queue_lease_lock_with_retry(
+            &queue_dir,
+            &runtime_class,
+            Duration::from_millis(RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS),
+        )?
+        else {
+            report.warnings.push(format!(
+                "runtime queue lease lock stayed busy for class `{runtime_class}` while reconciling serviceId={service_id} generationId={generation_id}"
+            ));
+            continue;
+        };
+        let mut warnings = Vec::new();
+        let mut state = read_runtime_queue_leases(&queue_dir, &runtime_class, &mut warnings)?;
+        report.warnings.extend(warnings);
+        let matching_queue_ids = state
+            .leases
+            .iter()
+            .filter(|(_, lease)| lease.owner.matches_generation(service_id, generation_id))
+            .map(|(queue_id, _)| queue_id.clone())
+            .collect::<Vec<_>>();
+        if matching_queue_ids.is_empty() {
+            continue;
+        }
+
+        for queue_id in matching_queue_ids {
+            let Some(lease) = state.leases.remove(&queue_id) else {
+                continue;
+            };
+            let owner = lease.owner.as_json_value();
+            let runtime_class = lease.runtime_class.clone();
+            let origin = lease.origin.clone();
+            let cron_run_id = lease.cron_run_id.clone();
+            let reason = format!(
+                "runtime queue lease owner {} belonged to exited supervisor serviceId={service_id} generationId={generation_id}",
+                lease.owner.display_label()
+            );
+            append_json_line(
+                &receipts_file,
+                &serde_json::json!({
+                    "queueId": queue_id,
+                    "status": RuntimeExecutionReceiptStatus::StaleOwnerReaped,
+                    "runtimeClass": runtime_class,
+                    "origin": origin,
+                    "cronRunId": cron_run_id,
+                    "owner": owner,
+                    "serviceId": service_id,
+                    "generationId": generation_id,
+                    "atMs": at_ms,
+                    "reason": reason
+                }),
+            )?;
+            report.reaped_leases.push(RuntimeQueueLeaseReconciledItem {
+                queue_id,
+                runtime_class,
+                origin,
+                cron_run_id,
+                owner,
+                at_ms,
+                reason,
+            });
+        }
+        write_runtime_queue_leases(&queue_dir, &runtime_class, &state)?;
+    }
+
+    Ok(report)
+}
+
 fn runtime_classes_for_release(queue_dir: &Path) -> Vec<String> {
     let mut classes = vec![
         "interactive".to_string(),
@@ -1740,6 +1852,19 @@ impl RuntimeQueueLeaseOwner {
             ),
         }
     }
+
+    fn matches_generation(&self, service_id: &str, generation_id: &str) -> bool {
+        match self {
+            RuntimeQueueLeaseOwner::Envelope(owner) => {
+                owner.service_id == service_id && owner.generation_id == generation_id
+            }
+            RuntimeQueueLeaseOwner::Legacy(_) => false,
+        }
+    }
+
+    fn as_json_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or_else(|_| Value::String(self.display_label()))
+    }
 }
 
 fn runtime_queue_lease_owner_from_env(now_ms: i64) -> RuntimeQueueLeaseOwner {
@@ -1766,7 +1891,7 @@ fn runtime_queue_lease_owner_from_metadata(
         .unwrap_or(now_ms);
     let generation_id = generation_id
         .unwrap_or_else(|| format!("{RUNTIME_LOOP_SERVICE_ID}-{pid}-{process_start_time_ms}"));
-    let kind = if launch_owner.as_deref() == Some("rust-supervisor-run") {
+    let kind = if launch_owner.is_some() {
         "supervisor-child"
     } else {
         "process"
@@ -3408,6 +3533,94 @@ mod tests {
         let receipts = fs::read_to_string(&report.execution_receipts_file).unwrap();
         assert!(receipts.contains(r#""status":"stale-owner-reaped""#));
         assert!(receipts.contains(r#""pid:0""#));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconcile_runtime_queue_leases_for_generation_reaps_owned_leases() {
+        let root = temp_root("reconcile_runtime_queue_leases_for_generation");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let generation_id = "runtime-loop-supervised-test-generation";
+        let now_ms = current_log_time_ms().unwrap();
+        let mut lease_state = RuntimeQueueLeaseState {
+            schema: runtime_queue_leases_schema(),
+            leases: BTreeMap::new(),
+        };
+        lease_state.leases.insert(
+            "owned-generation".to_string(),
+            RuntimeQueueLease {
+                queue_id: "owned-generation".to_string(),
+                agent_id: "main".to_string(),
+                runtime_class: "interactive".to_string(),
+                origin: "channel".to_string(),
+                cron_run_id: None,
+                platform: "telegram".to_string(),
+                account_id: None,
+                channel_id: "tg-dm".to_string(),
+                user_id: Some("user-7".to_string()),
+                session_key: "main:telegram:tg-dm".to_string(),
+                session_lane_key: None,
+                owner: RuntimeQueueLeaseOwner::Envelope(RuntimeQueueLeaseOwnerEnvelope {
+                    kind: "supervisor-child".to_string(),
+                    service_id: RUNTIME_LOOP_SERVICE_ID.to_string(),
+                    generation_id: generation_id.to_string(),
+                    pid: 12_345,
+                    process_start_time_ms: now_ms.saturating_sub(1_000),
+                    acquired_at_ms: now_ms,
+                }),
+                started_at_ms: now_ms,
+                lease_expires_at_ms: now_ms.saturating_add(60_000),
+            },
+        );
+        lease_state.leases.insert(
+            "other-generation".to_string(),
+            RuntimeQueueLease {
+                queue_id: "other-generation".to_string(),
+                agent_id: "main".to_string(),
+                runtime_class: "interactive".to_string(),
+                origin: "channel".to_string(),
+                cron_run_id: None,
+                platform: "telegram".to_string(),
+                account_id: None,
+                channel_id: "tg-dm".to_string(),
+                user_id: Some("user-7".to_string()),
+                session_key: "main:telegram:tg-dm".to_string(),
+                session_lane_key: None,
+                owner: RuntimeQueueLeaseOwner::Envelope(RuntimeQueueLeaseOwnerEnvelope {
+                    kind: "supervisor-child".to_string(),
+                    service_id: RUNTIME_LOOP_SERVICE_ID.to_string(),
+                    generation_id: "different-generation".to_string(),
+                    pid: 12_346,
+                    process_start_time_ms: now_ms.saturating_sub(1_000),
+                    acquired_at_ms: now_ms,
+                }),
+                started_at_ms: now_ms,
+                lease_expires_at_ms: now_ms.saturating_add(60_000),
+            },
+        );
+        write_runtime_queue_leases(&queue_dir, "interactive", &lease_state).unwrap();
+
+        let report = reconcile_runtime_queue_leases_for_generation(
+            &harness_home,
+            RUNTIME_LOOP_SERVICE_ID,
+            generation_id,
+            now_ms.saturating_add(10),
+        )
+        .unwrap();
+
+        assert_eq!(report.reaped_leases.len(), 1);
+        assert_eq!(report.reaped_leases[0].queue_id, "owned-generation");
+        let updated_state =
+            read_runtime_queue_leases(&queue_dir, "interactive", &mut Vec::new()).unwrap();
+        assert!(!updated_state.leases.contains_key("owned-generation"));
+        assert!(updated_state.leases.contains_key("other-generation"));
+        let receipts = fs::read_to_string(queue_dir.join("execution-receipts.jsonl")).unwrap();
+        assert!(receipts.contains(r#""status":"stale-owner-reaped""#));
+        assert!(receipts.contains(r#""serviceId":"runtime-loop""#));
+        assert!(receipts.contains(generation_id));
 
         let _ = fs::remove_dir_all(root);
     }

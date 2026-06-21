@@ -9,12 +9,12 @@ use crate::{HARNESS_BUILTIN_SKILL_NAMESPACE, SKILL_FILE_NAME};
 const BUILTIN_HARNESS_SKILL_SYNC_SCHEMA: &str = "agent-harness.builtin-skill-sync.v1";
 const BUILTIN_HARNESS_SKILL_MANIFEST_SCHEMA: &str = "agent-harness.builtin-skill-manifest.v1";
 const AGENT_WINDOWS_HARNESS_SKILL_ID: &str = "agent-windows-harness";
-const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.19";
+const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.20";
 
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
 description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, response tone, and Codex prompt continuity policy.
-version: 0.1.19
+version: 0.1.20
 platforms: [windows]
 metadata:
   agent_harness:
@@ -108,6 +108,7 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - Retry-pending receipts must make the same queue id immediately claimable again. If a retry-pending Telegram or Discord turn shows `openItems>0` while `runtime-loop` reports `no-work`, inspect the class-scoped lease file under `state/runtime-queue/classes/<runtimeClass>/runtime-leases.json`; legacy root leases may still appear at `state/runtime-queue/runtime-leases.json` during migration. Stale retry-pending leases are a runtime lease-cleanup bug, not a channel adapter issue. New leases write structured owner envelopes with `serviceId`, `generationId`, `pid`, `processStartTimeMs`, and `acquiredAtMs`; legacy `owner="pid:<n>"` strings remain readable. Lease owners with definitely dead PIDs are reaped before queue selection/capacity checks and should write `stale-owner-reaped` receipts with owner/timestamp evidence.
 - Runtime queue lease acquisition writes a `lease-acquired` receipt before prompt/execution artifacts are prepared. Use it to distinguish "lease acquired", "execution prepared", "execution started", and "execution completed" in crash diagnostics.
 - `lease-busy` is a retryable non-idle runtime status. Do not report it as idle/no-work; inspect competing runtime-loop processes, the relevant runtime class lease file, or a recently active queue lease.
+- Generated runtime runners stamp runtime-loop leases with a child generation and call `runtime-lease-reconcile` after a non-zero child exit. Reconciliation removes leases owned by that exited generation and writes `stale-owner-reaped` receipts with `serviceId` and `generationId` evidence before the runner enters restart backoff.
 - In supervised infinite mode, keep runtime-loop safe-mode restart enabled. After repeated errors, `safe-mode` keeps the process alive with reduced concurrency and writes heartbeat/log evidence; missing/stale/error/stopped/stopping runtime-loop heartbeats are live readiness failures. The generated runtime runner also writes `state/logs/supervisor/runtime-loop-runner-safe-mode.json` after process-level exits, including `errorClass`, `restartAfterSeconds`, and `memoryGateDecision`; `resource-exhausted` indicates an OOM/memory-pressure signature, writes a temporary structured stop file for `progress-delivery-loop`, and uses a longer bounded restart delay.
 - Loop heartbeat writers also maintain a supervisor service registry under `state/supervisor/services/*.json`. `status --json` exposes it as `loops.services`, and `healthz` exposes it as `supervisorServices`. It records `serviceId`, `serviceKind`, `generationId`, `pid`, current iteration, last heartbeat, desired/actual state, launch ownership, service priority, delivery lane, and restart delay. Most loops still report `external-runner-observe-only`; generated progress delivery and Discord outbox runners now use `supervisor-run --service <loop>`, so progress telemetry and final Discord delivery can report `launchOwner=rust-supervisor-run` while runtime and ingress stay on the existing runner model.
 - Non-matching protocol/config/preflight/spawn failures stay failed-terminal. Gateway restart alone does not resume failed-terminal or dead-letter queue items.
@@ -135,6 +136,7 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - /btw appends side notes without resetting the session.
 - /model records a per-channel or per-session model override.
 - /status reports session, queue, runtime, model, and activation state.
+- /restart [current|channel|tg|telegram|discord] [reason] records an admin channel restart request for the current Telegram/Discord loop, writes a nonpersistent `action=restart` supervisor stop-file envelope, and relies on generated channel runners to clear the restart stop file before relaunching. It is a command effect and immediate command reply, not a model turn or runtime `/stop`.
 
 Commands should update channel state and receipts before enqueueing agent turns.
 
@@ -151,6 +153,7 @@ Commands should update channel state and receipts before enqueueing agent turns.
 - Use telegram-loop for operator-run Telegram handoff. It repeats the same poll-once path with --telegram-account, --iterations, --idle-ms, --max-consecutive-errors, and optional --stop-file. Use finite iterations for tests and --iterations 0 only when no retired Docker/OpenClaw gateway process is also consuming Telegram updates.
 - Use discord-outbox-send-once for Discord outbound smoke. It reads DISCORD_BOT_TOKEN or AGENT_HARNESS_DISCORD_ACCOUNT_<ID>_BOT_TOKEN from the environment or secrets/channel-credentials.env, sends pending platform=discord outbox messages for the selected account through Discord REST, records delivery receipts, and writes a discord.outbox-send-once operational log.
 - Use discord-event-run-once for Discord inbound normalization smoke. It accepts a Discord Gateway MESSAGE_CREATE event from --event-file or --event-json, skips bot/empty/duplicate messages, enforces imported Discord user/channel/guild allow-lists, resolves channel identity, calls channel-run-once for allowed text, writes discord-event receipts, and logs discord.event-run-once. Use discord-gateway-probe before discord-gateway-loop for live WebSocket handoff. The gateway loop accepts --discord-account and --stop-file, passes the account selector to event-run-once, and closes the WebSocket when the stop file appears. INTERACTION_CREATE application commands are acknowledged by the Node gateway, translated to slash-command text, and routed through the same Discord event pipeline; real DM text readiness still requires a MESSAGE_CREATE receipt.
+- Generated non-runtime channel runners treat a structured nonpersistent stop file with `action=restart`, `restart=true`, or `createdBy=channel-restart-command` as a bounce request: they remove that stop file and relaunch the child. Persistent stop files still keep the service stopped.
 - Failed receipts stay retryable; delivered receipts are skipped by future outbox plans.
 - Do not send the same already recorded Codex completion twice.
 
