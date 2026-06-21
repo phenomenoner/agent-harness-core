@@ -22,6 +22,7 @@ use crate::{
 
 const RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA: &str = "agent-harness.runtime-queue-prepare.v1";
 const RUNTIME_QUEUE_LEASES_SCHEMA: &str = "agent-harness.runtime-queue-leases.v1";
+const RUNTIME_LOOP_SERVICE_ID: &str = "runtime-loop";
 const DEFAULT_RUNTIME_LEASE_MS: i64 = 30 * 60 * 1000;
 const RUNTIME_LEASE_ACQUIRE_LOCK_RETRY_MS: u64 = 2_000;
 const RUNTIME_LEASE_RELEASE_LOCK_RETRY_MS: u64 = 2_000;
@@ -241,9 +242,28 @@ struct RuntimeQueueLease {
     session_key: String,
     #[serde(default)]
     session_lane_key: Option<String>,
-    owner: String,
+    owner: RuntimeQueueLeaseOwner,
     started_at_ms: i64,
     lease_expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum RuntimeQueueLeaseOwner {
+    Legacy(String),
+    Envelope(RuntimeQueueLeaseOwnerEnvelope),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeQueueLeaseOwnerEnvelope {
+    kind: String,
+    service_id: String,
+    generation_id: String,
+    pid: i64,
+    #[serde(alias = "processStartTime")]
+    process_start_time_ms: i64,
+    acquired_at_ms: i64,
 }
 
 struct RuntimeQueueLeaseLock {
@@ -280,7 +300,7 @@ pub fn prepare_runtime_queue_item(
         &prepared_receipts,
         &terminal_run_ids,
     );
-    let lease_owner = format!("pid:{}", std::process::id());
+    let lease_owner = runtime_queue_lease_owner_from_env(now_ms);
     let _lease_lock = match acquire_runtime_queue_lease_lock_with_retry(
         &queue_dir,
         &lock_runtime_class,
@@ -875,6 +895,7 @@ pub fn inspect_runtime_queue_capacity(
         write_runtime_queue_leases(&queue_dir, &runtime_class, &lease_state)?;
         leased_items += lease_state.leases.len();
         let mut simulated = lease_state.clone();
+        let capacity_owner = RuntimeQueueLeaseOwner::Legacy("capacity-inspect".to_string());
         let mut class_claimable = 0usize;
         let prepared_candidates = prepared_receipts
             .keys()
@@ -917,7 +938,7 @@ pub fn inspect_runtime_queue_capacity(
             claimable_items += 1;
             class_claimable += 1;
             claimable_queue_ids.push(queue_id);
-            lease_runtime_queue_item(&mut simulated, pending, "capacity-inspect", now_ms);
+            lease_runtime_queue_item(&mut simulated, pending, &capacity_owner, now_ms);
         }
 
         let prepared_ids = prepared_receipts.keys().cloned().collect::<HashSet<_>>();
@@ -961,7 +982,7 @@ pub fn inspect_runtime_queue_capacity(
             claimable_items += 1;
             class_claimable += 1;
             claimable_queue_ids.push(pending.queue_id.clone());
-            lease_runtime_queue_item(&mut simulated, pending, "capacity-inspect", now_ms);
+            lease_runtime_queue_item(&mut simulated, pending, &capacity_owner, now_ms);
         }
         classes.push(RuntimeQueueClassCapacity {
             leases_file: runtime_queue_leases_file(&queue_dir, &runtime_class),
@@ -1458,7 +1479,7 @@ fn purge_runtime_queue_leases(
             remove_silently.push(queue_id.clone());
             continue;
         }
-        if let Some(process_id) = dead_legacy_pid_owner(&lease.owner) {
+        if let Some(process_id) = dead_runtime_queue_lease_owner(&lease.owner) {
             reap_dead_owner.push((queue_id.clone(), process_id));
         }
     }
@@ -1469,9 +1490,10 @@ fn purge_runtime_queue_leases(
         let Some(lease) = state.leases.remove(&queue_id) else {
             continue;
         };
+        let owner = lease.owner.clone();
         let reason = format!(
             "runtime queue lease owner {} references a non-running processId={process_id}",
-            lease.owner
+            owner.display_label()
         );
         warnings.push(format!(
             "runtime queue lease `{queue_id}` reaped because {reason}"
@@ -1485,7 +1507,7 @@ fn purge_runtime_queue_leases(
                     "runtimeClass": lease.runtime_class,
                     "origin": lease.origin,
                     "cronRunId": lease.cron_run_id,
-                    "owner": lease.owner,
+                    "owner": owner,
                     "atMs": now_ms,
                     "reason": reason
                 }),
@@ -1681,7 +1703,7 @@ fn read_all_runtime_queue_leases_with_override(
                     .values()
                     .filter(|lease| {
                         lease.lease_expires_at_ms > now_ms
-                            && dead_legacy_pid_owner(&lease.owner).is_none()
+                            && dead_runtime_queue_lease_owner(&lease.owner).is_none()
                     })
                     .cloned(),
             );
@@ -1689,19 +1711,93 @@ fn read_all_runtime_queue_leases_with_override(
         }
         let state = read_runtime_queue_leases(&queue_dir, &runtime_class, &mut warnings)?;
         leases.extend(state.leases.values().filter_map(|lease| {
-            (lease.lease_expires_at_ms > now_ms && dead_legacy_pid_owner(&lease.owner).is_none())
-                .then_some(lease.clone())
+            (lease.lease_expires_at_ms > now_ms
+                && dead_runtime_queue_lease_owner(&lease.owner).is_none())
+            .then_some(lease.clone())
         }));
     }
     Ok(leases)
+}
+
+impl RuntimeQueueLeaseOwner {
+    fn process_id(&self) -> Option<i64> {
+        match self {
+            RuntimeQueueLeaseOwner::Legacy(owner) => legacy_pid_owner(owner),
+            RuntimeQueueLeaseOwner::Envelope(owner) => Some(owner.pid),
+        }
+    }
+
+    fn display_label(&self) -> String {
+        match self {
+            RuntimeQueueLeaseOwner::Legacy(owner) => owner.clone(),
+            RuntimeQueueLeaseOwner::Envelope(owner) => format!(
+                "{} serviceId={} generationId={} pid={} processStartTimeMs={}",
+                owner.kind,
+                owner.service_id,
+                owner.generation_id,
+                owner.pid,
+                owner.process_start_time_ms
+            ),
+        }
+    }
+}
+
+fn runtime_queue_lease_owner_from_env(now_ms: i64) -> RuntimeQueueLeaseOwner {
+    let generation_id = nonempty_env("AGENT_HARNESS_SERVICE_GENERATION_ID");
+    let process_start_time_ms = env_i64("AGENT_HARNESS_SERVICE_STARTED_AT_MS");
+    let launch_owner = nonempty_env("AGENT_HARNESS_SUPERVISOR_LAUNCH_OWNER");
+    runtime_queue_lease_owner_from_metadata(
+        now_ms,
+        generation_id,
+        process_start_time_ms,
+        launch_owner,
+    )
+}
+
+fn runtime_queue_lease_owner_from_metadata(
+    now_ms: i64,
+    generation_id: Option<String>,
+    process_start_time_ms: Option<i64>,
+    launch_owner: Option<String>,
+) -> RuntimeQueueLeaseOwner {
+    let pid = i64::from(std::process::id());
+    let process_start_time_ms = process_start_time_ms
+        .filter(|value| *value > 0)
+        .unwrap_or(now_ms);
+    let generation_id = generation_id
+        .unwrap_or_else(|| format!("{RUNTIME_LOOP_SERVICE_ID}-{pid}-{process_start_time_ms}"));
+    let kind = if launch_owner.as_deref() == Some("rust-supervisor-run") {
+        "supervisor-child"
+    } else {
+        "process"
+    };
+    RuntimeQueueLeaseOwner::Envelope(RuntimeQueueLeaseOwnerEnvelope {
+        kind: kind.to_string(),
+        service_id: RUNTIME_LOOP_SERVICE_ID.to_string(),
+        generation_id,
+        pid,
+        process_start_time_ms,
+        acquired_at_ms: now_ms,
+    })
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_i64(name: &str) -> Option<i64> {
+    nonempty_env(name)?.parse::<i64>().ok()
 }
 
 fn legacy_pid_owner(owner: &str) -> Option<i64> {
     owner.strip_prefix("pid:")?.trim().parse::<i64>().ok()
 }
 
-fn dead_legacy_pid_owner(owner: &str) -> Option<i64> {
-    let process_id = legacy_pid_owner(owner)?;
+fn dead_runtime_queue_lease_owner(owner: &RuntimeQueueLeaseOwner) -> Option<i64> {
+    let process_id = owner.process_id()?;
     (process_alive_for_pid(process_id) == Some(false)).then_some(process_id)
 }
 
@@ -1725,7 +1821,7 @@ fn lease_acquired_receipt(item: &PendingQueueItem, reason: &str) -> RuntimeExecu
 fn lease_runtime_queue_item(
     state: &mut RuntimeQueueLeaseState,
     item: &PendingQueueItem,
-    owner: &str,
+    owner: &RuntimeQueueLeaseOwner,
     now_ms: i64,
 ) {
     let session_lane_key = default_runtime_class_config_for_item(item)
@@ -1744,7 +1840,7 @@ fn lease_runtime_queue_item(
             user_id: Some(item.user_id.clone()),
             session_key: item.session_key.clone(),
             session_lane_key,
-            owner: owner.to_string(),
+            owner: owner.clone(),
             started_at_ms: now_ms,
             lease_expires_at_ms: now_ms.saturating_add(DEFAULT_RUNTIME_LEASE_MS),
         },
@@ -2346,6 +2442,36 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn runtime_queue_lease_owner_envelope_serializes_generation_metadata() {
+        let acquired_at_ms = 1_782_029_223_481;
+        let process_start_time_ms = 1_782_029_220_000;
+        let generation_id = "runtime-loop-supervised-1234".to_string();
+        let owner = runtime_queue_lease_owner_from_metadata(
+            acquired_at_ms,
+            Some(generation_id.clone()),
+            Some(process_start_time_ms),
+            Some("rust-supervisor-run".to_string()),
+        );
+
+        let value = serde_json::to_value(&owner).unwrap();
+        assert_eq!(value["kind"], "supervisor-child");
+        assert_eq!(value["serviceId"], RUNTIME_LOOP_SERVICE_ID);
+        assert_eq!(value["generationId"], generation_id);
+        assert_eq!(value["pid"], i64::from(std::process::id()));
+        assert_eq!(value["processStartTimeMs"], process_start_time_ms);
+        assert_eq!(value["acquiredAtMs"], acquired_at_ms);
+
+        let parsed: RuntimeQueueLeaseOwner = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.process_id(), Some(i64::from(std::process::id())));
+        let legacy: RuntimeQueueLeaseOwner = serde_json::from_str(r#""pid:0""#).unwrap();
+        assert_eq!(legacy.process_id(), Some(0));
+        assert_eq!(
+            serde_json::to_value(legacy).unwrap(),
+            Value::String("pid:0".to_string())
+        );
+    }
+
+    #[test]
     fn prepare_runtime_queue_item_writes_prompt_bundle_and_receipts() {
         let root = temp_root("prepare_runtime_queue_item_writes_prompt_bundle_and_receipts");
         let source = write_worker_source(&root);
@@ -2387,6 +2513,18 @@ mod tests {
         let receipt_json: Value =
             serde_json::from_slice(&fs::read(item.receipt_file).unwrap()).unwrap();
         assert_eq!(receipt_json["status"], "prepared");
+        let lease_state =
+            read_runtime_queue_leases(&queue_dir(&harness_home), "interactive", &mut Vec::new())
+                .unwrap();
+        let lease = lease_state.leases.get(&item.queue_id).unwrap();
+        let RuntimeQueueLeaseOwner::Envelope(owner) = &lease.owner else {
+            panic!("new runtime queue lease should use an owner envelope");
+        };
+        assert_eq!(owner.service_id, RUNTIME_LOOP_SERVICE_ID);
+        assert_eq!(owner.pid, i64::from(std::process::id()));
+        assert!(owner.generation_id.starts_with("runtime-loop-"));
+        assert!(owner.process_start_time_ms > 0);
+        assert_eq!(owner.acquired_at_ms, lease.started_at_ms);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3176,7 +3314,7 @@ mod tests {
                 user_id: Some("user-7".to_string()),
                 session_key: "main:telegram:tg-dm".to_string(),
                 session_lane_key: None,
-                owner: "legacy-worker".to_string(),
+                owner: RuntimeQueueLeaseOwner::Legacy("legacy-worker".to_string()),
                 started_at_ms: now_ms,
                 lease_expires_at_ms: now_ms.saturating_add(60_000),
             },
@@ -3246,7 +3384,7 @@ mod tests {
                 user_id: Some("user-7".to_string()),
                 session_key: "main:telegram:tg-dm".to_string(),
                 session_lane_key: None,
-                owner: "pid:0".to_string(),
+                owner: RuntimeQueueLeaseOwner::Legacy("pid:0".to_string()),
                 started_at_ms: now_ms,
                 lease_expires_at_ms: now_ms.saturating_add(60_000),
             },

@@ -101,6 +101,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "append-only receipts; retry creates fresh ids",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.runtime-queue-leases.v1",
+            owner_module: "runtime_worker",
+            compatibility: "class-scoped state JSON accepts legacy owner strings and structured owner envelopes in v1",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.progress-delivery-state.v1",
             owner_module: "progress",
             compatibility: "state JSON may add cursor/cache fields in v1; existing lane cursors remain readable",
