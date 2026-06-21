@@ -34,6 +34,8 @@ The generated stop script creates stop files for each loop. Long-running loops c
 
 Generated runners write all process streams directly to per-loop log files and rotate old logs with `Select-Object -Skip 20`. They no longer pipe long-running loop output through `Tee-Object`.
 
+The generated runtime-loop runner writes `runtime-loop-runner-safe-mode.json` after process-level exits. That state includes `errorClass`, `logFile`, restart count, and `restartAfterSeconds`; OOM or memory-pressure signatures are classified as `resource-exhausted` and use a longer bounded restart delay.
+
 The generated stop and uninstall scripts use the same live-control guard as start. A live channel agent turn must not stop/uninstall its own gateway path; it should create an `ops-cutover-request` ticket and wait for operator approval.
 
 ## Log Retention

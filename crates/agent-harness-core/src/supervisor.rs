@@ -496,8 +496,16 @@ fn write_runner_script(
                $ExitCode = $LASTEXITCODE\n\
                if ($ExitCode -eq 0) {{ exit 0 }}\n\
                $SafeModeRestarts += 1\n\
-               @{{ schema = 'agent-harness.runtime-loop-runner-safe-mode.v1'; component = '{}'; exitCode = $ExitCode; restarts = $SafeModeRestarts; logFile = $LogFile; at = (Get-Date).ToString('o'); restartAfterSeconds = 60 }} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $SafeModeState -Encoding UTF8\n\
-               Start-Sleep -Seconds 60\n\
+               $LogTail = ''\n\
+               try {{ $LogTail = (Get-Content -LiteralPath $LogFile -Tail 200 -ErrorAction SilentlyContinue) -join \"`n\" }} catch {{ $LogTail = '' }}\n\
+               $ErrorClass = 'process-exit'\n\
+               $RestartAfterSeconds = 60\n\
+               if ($LogTail -match '(?i)(out of memory|\\boom\\b|memory allocation|memory pressure|not enough memory|insufficient memory|resource exhausted|STATUS_NO_MEMORY|0xC0000017)') {{\n\
+                 $ErrorClass = 'resource-exhausted'\n\
+                 $RestartAfterSeconds = 300\n\
+               }}\n\
+               @{{ schema = 'agent-harness.runtime-loop-runner-safe-mode.v1'; component = '{}'; exitCode = $ExitCode; restarts = $SafeModeRestarts; errorClass = $ErrorClass; logFile = $LogFile; at = (Get-Date).ToString('o'); restartAfterSeconds = $RestartAfterSeconds }} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $SafeModeState -Encoding UTF8\n\
+               Start-Sleep -Seconds $RestartAfterSeconds\n\
              }}\n",
             ps_quote_path(log_dir),
             ps_escape_single(log_name),
@@ -829,6 +837,10 @@ mod tests {
         assert!(runtime_script.contains("'2'"));
         assert!(!runtime_script.contains("Tee-Object"));
         assert!(runtime_script.contains("*> $LogFile"));
+        assert!(runtime_script.contains("$ErrorClass = 'process-exit'"));
+        assert!(runtime_script.contains("$ErrorClass = 'resource-exhausted'"));
+        assert!(runtime_script.contains("restartAfterSeconds = $RestartAfterSeconds"));
+        assert!(runtime_script.contains("Start-Sleep -Seconds $RestartAfterSeconds"));
         let worker_script =
             fs::read_to_string(output_dir.join("scripts").join("worker-loop.ps1")).unwrap();
         assert!(worker_script.contains("worker-loop"));

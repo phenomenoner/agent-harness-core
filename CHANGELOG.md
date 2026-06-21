@@ -2,7 +2,13 @@
 
 ## Unreleased
 
-No changes yet.
+### Changed
+
+- Added generated runtime-runner process-exit classification for OOM/resource-exhaustion signatures, recording `errorClass` and a bounded `restartAfterSeconds` in `runtime-loop-runner-safe-mode.json`.
+
+### Added
+
+- Schema registry entry for `agent-harness.runtime-loop-runner-safe-mode.v1`.
 
 ## v0.1.1 - 2026-06-21
 

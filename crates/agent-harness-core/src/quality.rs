@@ -181,6 +181,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "JSON stop-file envelope may add metadata in v1; legacy plain-text reasons stay readable",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.runtime-loop-runner-safe-mode.v1",
+            owner_module: "supervisor",
+            compatibility: "runner safe-mode JSON may add diagnostic fields in v1; restartAfterSeconds remains advisory",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.queue-shadow-compare.v1",
             owner_module: "queue_shadow",
             compatibility: "additive divergence fields only in v1",
