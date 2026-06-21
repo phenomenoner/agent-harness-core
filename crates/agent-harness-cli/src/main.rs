@@ -105,9 +105,10 @@ use agent_harness_core::{
     search_imported_memory, search_imported_vector_memory, select_skills,
     store_openclaw_mem_service_memory, sync_builtin_harness_skills, tool_description_hash,
     trace_harness_event, upsert_background_task, validate_harness_config, write_channel_step,
-    write_deterministic_cron_plan, write_memory_search_receipt, write_memory_vector_recall_receipt,
-    write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
-    write_subagent_plan, write_task_entity, write_turn_plan, write_windows_supervisor_plan,
+    write_deterministic_cron_plan, write_json_atomic, write_memory_search_receipt,
+    write_memory_vector_recall_receipt, write_native_cron_plan, write_prompt_bundle,
+    write_report_files, write_skill_index, write_subagent_plan, write_task_entity, write_turn_plan,
+    write_windows_supervisor_plan,
 };
 
 const DEFAULT_CODEX_TIMEOUT_MS: u64 = 30 * 60 * 1000;
@@ -14546,11 +14547,8 @@ fn write_loop_heartbeat(
         "processId": std::process::id(),
     });
     let file = dir.join(format!("{name}.json"));
-    fs::write(
-        &file,
-        serde_json::to_string_pretty(&heartbeat).map_err(|err| err.to_string())?,
-    )
-    .map_err(|err| format!("failed to write loop heartbeat {}: {err}", file.display()))
+    write_json_atomic(&file, &heartbeat)
+        .map_err(|err| format!("failed to write loop heartbeat {}: {err}", file.display()))
 }
 
 fn format_status(status: &ImportPhaseStatus) -> &'static str {
@@ -16749,6 +16747,41 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&path);
         path
+    }
+
+    #[test]
+    fn write_loop_heartbeat_replaces_json_atomically() {
+        let root = cli_temp_root("write_loop_heartbeat_replaces_json_atomically");
+        let harness_home = root.join(".agent-harness");
+
+        write_loop_heartbeat(&harness_home, "runtime-loop", "running", 1, "first").unwrap();
+        write_loop_heartbeat(&harness_home, "runtime-loop", "no-work", 2, "second").unwrap();
+
+        let heartbeat_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("loop-heartbeats");
+        let heartbeat_file = heartbeat_dir.join("runtime-loop.json");
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&heartbeat_file).unwrap()).unwrap();
+        assert_eq!(value["status"], "no-work");
+        assert_eq!(value["iteration"], 2);
+        assert_eq!(value["detail"], "second");
+        let leftovers = fs::read_dir(&heartbeat_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path() != heartbeat_file)
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "unexpected heartbeat temp files: {:?}",
+            leftovers
+                .iter()
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>()
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

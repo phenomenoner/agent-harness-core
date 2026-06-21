@@ -26,9 +26,13 @@ When the script is invoked from a live agent session (`AGENT_HARNESS_LIVE_SESSIO
 
 ## Stop Files
 
-The generated stop script creates stop files for each loop. Long-running loops check those files and stop gracefully after active work reaches a safe point.
+The generated stop script creates stop files for each loop. Long-running loops check those files and stop gracefully after active work reaches a safe point. `ops-control stop` writes structured JSON stop files with `serviceId`, `reason`, `createdBy`, `createdAtMs`, and `persistent`; legacy plain-text stop files remain readable as a reason.
 
-`status --json` reports each loop's stop-file path, presence, and reason, and `healthz` treats an active stop file as not live. A fresh heartbeat timestamp is not enough to prove a loop is healthy if the heartbeat references a missing process or an active stop file remains in `state/supervisor/stop`.
+`status --json` reports each loop's stop-file path, presence, reason, and structured metadata, and `healthz` treats an active stop file as not live. A fresh heartbeat timestamp is not enough to prove a loop is healthy if the heartbeat is corrupt, references a missing process, or an active stop file remains in `state/supervisor/stop`.
+
+## Runner Logs
+
+Generated runners write all process streams directly to per-loop log files and rotate old logs with `Select-Object -Skip 20`. They no longer pipe long-running loop output through `Tee-Object`.
 
 The generated stop and uninstall scripts use the same live-control guard as start. A live channel agent turn must not stop/uninstall its own gateway path; it should create an `ops-cutover-request` ticket and wait for operator approval.
 

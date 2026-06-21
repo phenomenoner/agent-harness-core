@@ -9,12 +9,12 @@ use crate::{HARNESS_BUILTIN_SKILL_NAMESPACE, SKILL_FILE_NAME};
 const BUILTIN_HARNESS_SKILL_SYNC_SCHEMA: &str = "agent-harness.builtin-skill-sync.v1";
 const BUILTIN_HARNESS_SKILL_MANIFEST_SCHEMA: &str = "agent-harness.builtin-skill-manifest.v1";
 const AGENT_WINDOWS_HARNESS_SKILL_ID: &str = "agent-windows-harness";
-const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.12";
+const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.13";
 
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
 description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, response tone, and Codex prompt continuity policy.
-version: 0.1.12
+version: 0.1.13
 platforms: [windows]
 metadata:
   agent_harness:
@@ -105,7 +105,8 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - Telegram and Discord share the same runtime path after ingress: channel receive, queue, prepare, codex-run, runtime-run-once, outbox. Fix reconnect/session recovery in the runtime/Codex layer, not in one adapter.
 - Known transient Codex app-server stream disconnect protocol errors are retryable: `Reconnecting...`, `stream disconnected before completion`, and `websocket closed by server before response.completed`.
 - Retry-pending runtime failures are non-terminal. They should not write user-visible error replies, and progress should stay resumable for the same queue/session context.
-- Retry-pending receipts must make the same queue id immediately claimable again. If a retry-pending Telegram or Discord turn shows `openItems>0` while `runtime-loop` reports `no-work`, inspect the class-scoped lease file under `state/runtime-queue/classes/<runtimeClass>/runtime-leases.json`; legacy root leases may still appear at `state/runtime-queue/runtime-leases.json` during migration. Stale retry-pending leases are a runtime lease-cleanup bug, not a channel adapter issue.
+- Retry-pending receipts must make the same queue id immediately claimable again. If a retry-pending Telegram or Discord turn shows `openItems>0` while `runtime-loop` reports `no-work`, inspect the class-scoped lease file under `state/runtime-queue/classes/<runtimeClass>/runtime-leases.json`; legacy root leases may still appear at `state/runtime-queue/runtime-leases.json` during migration. Stale retry-pending leases are a runtime lease-cleanup bug, not a channel adapter issue. Legacy `owner="pid:<n>"` leases with definitely dead owners are reaped before queue selection/capacity checks and should write `stale-owner-reaped` receipts with owner/timestamp evidence.
+- Runtime queue lease acquisition writes a `lease-acquired` receipt before prompt/execution artifacts are prepared. Use it to distinguish "lease acquired", "execution prepared", "execution started", and "execution completed" in crash diagnostics.
 - `lease-busy` is a retryable non-idle runtime status. Do not report it as idle/no-work; inspect competing runtime-loop processes, the relevant runtime class lease file, or a recently active queue lease.
 - In supervised infinite mode, keep runtime-loop safe-mode restart enabled. After repeated errors, `safe-mode` keeps the process alive with reduced concurrency and writes heartbeat/log evidence; missing/stale/error/stopped/stopping runtime-loop heartbeats are live readiness failures.
 - Non-matching protocol/config/preflight/spawn failures stay failed-terminal. Gateway restart alone does not resume failed-terminal or dead-letter queue items.
@@ -210,7 +211,7 @@ For Windows supervisor handoff, use supervisor-plan:
 - It writes install-scheduled-tasks.ps1, start-scheduled-tasks.ps1, stop-scheduled-tasks.ps1, uninstall-scheduled-tasks.ps1, and supervisor-plan.json.
 - It uses absolute paths because Task Scheduler does not run from the repo directory by default.
 - Its channel and scheduler runner scripts must point `--source-home` at the active `.agent-harness`, not retired `.openclaw` or imported snapshot paths.
-- It uses stop files for graceful loop shutdown and never embeds raw bot tokens or API keys.
+- It writes loop output directly to per-loop log files without `Tee-Object`, uses structured JSON stop files for graceful loop shutdown, and never embeds raw bot tokens or API keys.
 - The operator must explicitly run the generated installer/start scripts after confirming no retired gateway process is consuming the same channels.
 
 For manual debugging of one prepared turn, the expanded path is:
@@ -236,7 +237,7 @@ Use status for operator-facing health checks before and after handoff:
 - status reports runtime class queued/open counts, class lease counts, CronRun summary counts, and recent cron scheduler decisions. Check the interactive class separately from the cron class when diagnosing a stalled user turn.
 - status includes memory-search receipts when the imported markdown/text memory probe has been run.
 - status --json is the monitor-friendly form for scheduled tasks or service wrappers.
-- healthz --require-writable-state is the live/readiness gate for loops, writable state, runtime backlog, and channel backlog.
+- healthz --require-writable-state is the live/readiness gate for loops, writable state, runtime backlog, and channel backlog. Corrupt heartbeat files are explicit `corrupt=true` loop states. A stale/dead progress-delivery loop is telemetry degradation and should warn without by itself marking final reply delivery not live when runtime, ingress, and final outbox loops are healthy.
 - Large ledgers are tail-sampled by status/health/readiness. When sampled is true, counts are an operational window rather than full historical totals.
 - runtime-loop writes loop-last.json for the most recent runtime-loop stop/degraded reason, iteration count, idle count, error count, and safe-mode restarts.
 - supervisor-plan readiness is checked through enable-check, not status-specific process liveness; installed task health still needs monitor integration.

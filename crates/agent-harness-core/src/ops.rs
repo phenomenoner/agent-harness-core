@@ -612,10 +612,19 @@ pub fn record_ops_control(options: OpsControlOptions) -> io::Result<OpsControlRe
                 if let Some(parent) = stop.stop_file.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::write(
-                    &stop.stop_file,
-                    b"stop requested by agent-harness ops-control\n",
-                )?;
+                let reason = options
+                    .reason
+                    .as_deref()
+                    .unwrap_or("stop files created; loops will exit at their next poll");
+                let stop_file = serde_json::json!({
+                    "schema": "agent-harness.supervisor-stop-file.v1",
+                    "serviceId": stop.component,
+                    "reason": reason,
+                    "createdBy": "ops-control",
+                    "createdAtMs": options.now_ms,
+                    "persistent": true
+                });
+                crate::write_json_atomic(&stop.stop_file, &stop_file)?;
             }
         }
         OpsControlAction::Start => {
@@ -923,6 +932,16 @@ mod tests {
         .unwrap();
         assert_eq!(stop.status, "stop-requested");
         assert!(stop.stop_files[0].present);
+        let stop_file_json: Value =
+            serde_json::from_slice(&fs::read(&stop.stop_files[0].stop_file).unwrap()).unwrap();
+        assert_eq!(
+            stop_file_json["schema"],
+            "agent-harness.supervisor-stop-file.v1"
+        );
+        assert_eq!(stop_file_json["serviceId"], "worker-loop");
+        assert_eq!(stop_file_json["createdBy"], "ops-control");
+        assert_eq!(stop_file_json["createdAtMs"], 1000);
+        assert_eq!(stop_file_json["persistent"], true);
 
         let start = record_ops_control(OpsControlOptions {
             harness_home,

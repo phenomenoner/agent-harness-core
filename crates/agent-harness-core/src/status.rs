@@ -130,6 +130,8 @@ pub struct HarnessLoopHeartbeatStatus {
     pub name: String,
     pub heartbeat_file: PathBuf,
     pub present: bool,
+    pub corrupt: bool,
+    pub parse_error: Option<String>,
     pub status: Option<String>,
     pub iteration: Option<i64>,
     pub process_id: Option<i64>,
@@ -140,6 +142,11 @@ pub struct HarnessLoopHeartbeatStatus {
     pub stop_file: PathBuf,
     pub stop_file_present: bool,
     pub stop_file_reason: Option<String>,
+    pub stop_file_service_id: Option<String>,
+    pub stop_file_created_by: Option<String>,
+    pub stop_file_created_at_ms: Option<i64>,
+    pub stop_file_expires_at_ms: Option<i64>,
+    pub stop_file_persistent: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -509,6 +516,8 @@ fn read_loop_heartbeat(
                 name: name.to_string(),
                 heartbeat_file: heartbeat_file.to_path_buf(),
                 present: false,
+                corrupt: false,
+                parse_error: None,
                 status: None,
                 iteration: None,
                 process_id: None,
@@ -519,17 +528,50 @@ fn read_loop_heartbeat(
                 stop_file: stop_file.path,
                 stop_file_present: stop_file.present,
                 stop_file_reason: stop_file.reason,
+                stop_file_service_id: stop_file.service_id,
+                stop_file_created_by: stop_file.created_by,
+                stop_file_created_at_ms: stop_file.created_at_ms,
+                stop_file_expires_at_ms: stop_file.expires_at_ms,
+                stop_file_persistent: stop_file.persistent,
             });
         }
         Err(error) => return Err(error),
     };
-    let value = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
+    let value = match serde_json::from_str::<Value>(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(HarnessLoopHeartbeatStatus {
+                name: name.to_string(),
+                heartbeat_file: heartbeat_file.to_path_buf(),
+                present: true,
+                corrupt: true,
+                parse_error: Some(error.to_string()),
+                status: None,
+                iteration: None,
+                process_id: None,
+                process_alive: None,
+                at_ms: None,
+                age_ms: None,
+                detail: None,
+                stop_file: stop_file.path,
+                stop_file_present: stop_file.present,
+                stop_file_reason: stop_file.reason,
+                stop_file_service_id: stop_file.service_id,
+                stop_file_created_by: stop_file.created_by,
+                stop_file_created_at_ms: stop_file.created_at_ms,
+                stop_file_expires_at_ms: stop_file.expires_at_ms,
+                stop_file_persistent: stop_file.persistent,
+            });
+        }
+    };
     let at_ms = i64_path(&value, &["atMs"]);
     let process_id = i64_path(&value, &["processId"]);
     Ok(HarnessLoopHeartbeatStatus {
         name: name.to_string(),
         heartbeat_file: heartbeat_file.to_path_buf(),
         present: true,
+        corrupt: false,
+        parse_error: None,
         status: string_path(&value, &["status"]),
         iteration: i64_path(&value, &["iteration"]),
         process_id,
@@ -540,6 +582,11 @@ fn read_loop_heartbeat(
         stop_file: stop_file.path,
         stop_file_present: stop_file.present,
         stop_file_reason: stop_file.reason,
+        stop_file_service_id: stop_file.service_id,
+        stop_file_created_by: stop_file.created_by,
+        stop_file_created_at_ms: stop_file.created_at_ms,
+        stop_file_expires_at_ms: stop_file.expires_at_ms,
+        stop_file_persistent: stop_file.persistent,
     })
 }
 
@@ -556,6 +603,18 @@ fn append_loop_health_warnings(loops: &HarnessLoopStatus, warnings: &mut Vec<Str
                 loop_status.name,
                 loop_status.stop_file.display(),
                 reason
+            ));
+        }
+        if loop_status.corrupt {
+            let error = loop_status
+                .parse_error
+                .as_deref()
+                .unwrap_or("invalid heartbeat JSON");
+            warnings.push(format!(
+                "{} heartbeat at {} is corrupt: {}",
+                loop_status.name,
+                loop_status.heartbeat_file.display(),
+                error
             ));
         }
         if loop_status.process_alive == Some(false) {
@@ -1374,6 +1433,8 @@ fn bounded_outbox_summary(
         ));
     }
     let mut summary = ChannelOutboxPlanSummary::default();
+    summary.sampled = sample.sampled;
+    summary.sampled_bytes = sample.sampled_bytes;
     for (index, line) in sample.text.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -1742,7 +1803,15 @@ mod tests {
         .unwrap();
         fs::write(
             stop_dir.join("progress-delivery-loop.stop"),
-            "stop for current-step cutover 2026-06-13T17:37:07.7114321+08:00",
+            serde_json::to_string(&serde_json::json!({
+                "schema": "agent-harness.supervisor-stop-file.v1",
+                "serviceId": "progress-delivery-loop",
+                "reason": "stop for current-step cutover",
+                "createdBy": "ops-control",
+                "createdAtMs": 1781343427711_i64,
+                "persistent": true
+            }))
+            .unwrap(),
         )
         .unwrap();
 
@@ -1760,8 +1829,18 @@ mod tests {
             progress_loop
                 .stop_file_reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("current-step cutover"))
+                .is_some_and(|reason| reason == "stop for current-step cutover")
         );
+        assert_eq!(
+            progress_loop.stop_file_service_id.as_deref(),
+            Some("progress-delivery-loop")
+        );
+        assert_eq!(
+            progress_loop.stop_file_created_by.as_deref(),
+            Some("ops-control")
+        );
+        assert_eq!(progress_loop.stop_file_created_at_ms, Some(1781343427711));
+        assert_eq!(progress_loop.stop_file_persistent, Some(true));
 
         let mut warnings = Vec::new();
         append_loop_health_warnings(&loops, &mut warnings);
@@ -1775,6 +1854,38 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("processId=0"))
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loop_status_reports_nul_heartbeat_as_corrupt() {
+        let root = temp_root("loop_status_reports_nul_heartbeat_as_corrupt");
+        let harness_home = root.join(".agent-harness");
+        let heartbeat_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("loop-heartbeats");
+        fs::create_dir_all(&heartbeat_dir).unwrap();
+        fs::write(heartbeat_dir.join("runtime-loop.json"), b"\0\0\0").unwrap();
+
+        let loops = loop_status(&harness_home).unwrap();
+        let runtime_loop = loops
+            .heartbeats
+            .iter()
+            .find(|heartbeat| heartbeat.name == "runtime-loop")
+            .unwrap();
+        assert!(runtime_loop.present);
+        assert!(runtime_loop.corrupt);
+        assert!(runtime_loop.parse_error.is_some());
+        assert_eq!(runtime_loop.status, None);
+        assert_eq!(runtime_loop.process_alive, None);
+
+        let mut warnings = Vec::new();
+        append_loop_health_warnings(&loops, &mut warnings);
+        assert!(warnings.iter().any(
+            |warning| warning.contains("runtime-loop heartbeat") && warning.contains("corrupt")
+        ));
 
         let _ = fs::remove_dir_all(root);
     }

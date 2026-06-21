@@ -101,6 +101,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "append-only receipts; retry creates fresh ids",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.progress-delivery-state.v1",
+            owner_module: "progress",
+            compatibility: "state JSON may add cursor/cache fields in v1; existing lane cursors remain readable",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.codex-context-preflight.v1",
             owner_module: "codex_runtime",
             compatibility: "append-only JSONL plus per-execution JSON; additive fields only in v1",
@@ -169,6 +174,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             schema: "agent-harness.supervision-evaluation.v1",
             owner_module: "supervision",
             compatibility: "additive child fields only in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.supervisor-stop-file.v1",
+            owner_module: "ops",
+            compatibility: "JSON stop-file envelope may add metadata in v1; legacy plain-text reasons stay readable",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.queue-shadow-compare.v1",
