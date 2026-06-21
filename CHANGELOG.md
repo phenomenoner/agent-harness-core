@@ -5,6 +5,7 @@
 ### Changed
 
 - Added generated runtime-runner process-exit classification for OOM/resource-exhaustion signatures, recording `errorClass` and a bounded `restartAfterSeconds` in `runtime-loop-runner-safe-mode.json`.
+- Generated runtime runners now write a structured temporary stop file for `progress-delivery-loop` and record `memoryGateDecision` before restarting after OOM/resource-exhaustion signatures.
 - `status --json` and `healthz` now expose observe-only supervisor service registry records without changing external runner launch ownership.
 
 ### Added
@@ -20,6 +21,11 @@
 - Round8 observe-only supervisor registry verification: `cargo test -p agent-harness-cli --target-dir target\staging-test-round8-supervisor-registry-cli-full -- --test-threads=1` (39 tests)
 - Round8 observe-only supervisor registry verification: `cargo build -p agent-harness-cli --target-dir target\staging-build-round8-supervisor-registry`
 - Round8 observe-only supervisor registry verification: `target\staging-build-round8-supervisor-registry\debug\agent-harness.exe public-hygiene --root .public-export\agent-harness-core` plus changed public/operator docs path hygiene (`forbiddenHits=[]`)
+- Round8 memory-pressure gate verification: `cargo fmt --all -- --check`
+- Round8 memory-pressure gate verification: `cargo check --workspace --target-dir target\staging-check-round8-memory-gate`
+- Round8 memory-pressure gate verification: `cargo test -p agent-harness-core --target-dir target\staging-test-round8-memory-gate-core-full -- --test-threads=1` (341 tests)
+- Round8 memory-pressure gate verification: `cargo build -p agent-harness-cli --target-dir target\staging-build-round8-memory-gate`
+- Round8 memory-pressure gate verification: public export and changed operator docs/skill path hygiene (`forbiddenHits=[]`)
 
 ## v0.1.1 - 2026-06-21
 

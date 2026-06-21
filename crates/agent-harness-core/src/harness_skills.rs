@@ -9,12 +9,12 @@ use crate::{HARNESS_BUILTIN_SKILL_NAMESPACE, SKILL_FILE_NAME};
 const BUILTIN_HARNESS_SKILL_SYNC_SCHEMA: &str = "agent-harness.builtin-skill-sync.v1";
 const BUILTIN_HARNESS_SKILL_MANIFEST_SCHEMA: &str = "agent-harness.builtin-skill-manifest.v1";
 const AGENT_WINDOWS_HARNESS_SKILL_ID: &str = "agent-windows-harness";
-const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.15";
+const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.16";
 
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
 description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, response tone, and Codex prompt continuity policy.
-version: 0.1.15
+version: 0.1.16
 platforms: [windows]
 metadata:
   agent_harness:
@@ -108,7 +108,7 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - Retry-pending receipts must make the same queue id immediately claimable again. If a retry-pending Telegram or Discord turn shows `openItems>0` while `runtime-loop` reports `no-work`, inspect the class-scoped lease file under `state/runtime-queue/classes/<runtimeClass>/runtime-leases.json`; legacy root leases may still appear at `state/runtime-queue/runtime-leases.json` during migration. Stale retry-pending leases are a runtime lease-cleanup bug, not a channel adapter issue. Legacy `owner="pid:<n>"` leases with definitely dead owners are reaped before queue selection/capacity checks and should write `stale-owner-reaped` receipts with owner/timestamp evidence.
 - Runtime queue lease acquisition writes a `lease-acquired` receipt before prompt/execution artifacts are prepared. Use it to distinguish "lease acquired", "execution prepared", "execution started", and "execution completed" in crash diagnostics.
 - `lease-busy` is a retryable non-idle runtime status. Do not report it as idle/no-work; inspect competing runtime-loop processes, the relevant runtime class lease file, or a recently active queue lease.
-- In supervised infinite mode, keep runtime-loop safe-mode restart enabled. After repeated errors, `safe-mode` keeps the process alive with reduced concurrency and writes heartbeat/log evidence; missing/stale/error/stopped/stopping runtime-loop heartbeats are live readiness failures. The generated runtime runner also writes `state/logs/supervisor/runtime-loop-runner-safe-mode.json` after process-level exits, including `errorClass` and `restartAfterSeconds`; `resource-exhausted` indicates an OOM/memory-pressure signature and uses a longer bounded restart delay.
+- In supervised infinite mode, keep runtime-loop safe-mode restart enabled. After repeated errors, `safe-mode` keeps the process alive with reduced concurrency and writes heartbeat/log evidence; missing/stale/error/stopped/stopping runtime-loop heartbeats are live readiness failures. The generated runtime runner also writes `state/logs/supervisor/runtime-loop-runner-safe-mode.json` after process-level exits, including `errorClass`, `restartAfterSeconds`, and `memoryGateDecision`; `resource-exhausted` indicates an OOM/memory-pressure signature, writes a temporary structured stop file for `progress-delivery-loop`, and uses a longer bounded restart delay.
 - Loop heartbeat writers also maintain an observe-only supervisor service registry under `state/supervisor/services/*.json`. `status --json` exposes it as `loops.services`, and `healthz` exposes it as `supervisorServices`. During this migration phase it records `serviceId`, `serviceKind`, `generationId`, `pid`, current iteration, last heartbeat, and desired/actual state without changing external runner launch ownership.
 - Non-matching protocol/config/preflight/spawn failures stay failed-terminal. Gateway restart alone does not resume failed-terminal or dead-letter queue items.
 - `runtimeBackoff` config controls retry caps and delay hints for retryable runtime failures. When retry attempts are exhausted, runtime-run-once dead-letters the item and writes an operator-friendly error reply. Provider/model fallback is operator-guided; the harness should not silently switch providers on behalf of a user turn.

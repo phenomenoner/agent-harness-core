@@ -24,7 +24,7 @@ The authoritative in-code registry is `agent_harness_core::quality::schema_regis
 | `agent-harness.log-rotation.v1` | `logging` | Additive fields only in v1; rotation receipts are append-only. | Implemented in staging. |
 | `agent-harness.supervision-evaluation.v1` | `supervision` | Additive child fields only in v1. | Implemented in staging. |
 | `agent-harness.supervisor-stop-file.v1` | `ops` | JSON stop-file envelope may add metadata in v1; legacy plain-text reasons stay readable. | Implemented in staging. |
-| `agent-harness.runtime-loop-runner-safe-mode.v1` | `supervisor` | Runner safe-mode JSON may add diagnostic fields in v1; `restartAfterSeconds` remains advisory. | Implemented in staging. |
+| `agent-harness.runtime-loop-runner-safe-mode.v1` | `supervisor` | Runner safe-mode JSON may add diagnostic fields in v1; `restartAfterSeconds` and `memoryGateDecision` remain advisory. | Implemented in staging. |
 | `agent-harness.supervisor-service-state.v1` | `supervisor` | Observe-only service state JSON may add diagnostic fields in v1; launch ownership remains external during migration. | Implemented in staging. |
 | `agent-harness.healthz.v1` | `health` | Local/admin JSON status; additive fields only in v1. | Implemented in staging. |
 | `agent-harness.trace.v1` | `trace` | Additive record fields only in v1. | Implemented in staging. |

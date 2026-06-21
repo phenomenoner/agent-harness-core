@@ -157,7 +157,14 @@ pub fn write_windows_supervisor_plan(
         if let Some(codex) = &codex_executable {
             args.extend(["--codex-exe".to_string(), path_arg(codex)]);
         }
-        write_runner_script(&runner_script, &harness_cli, &args, &log_dir, component)?;
+        write_runner_script(
+            &runner_script,
+            &harness_cli,
+            &args,
+            &log_dir,
+            component,
+            &harness_home,
+        )?;
         push_task(
             &mut scripts,
             &mut tasks,
@@ -184,7 +191,14 @@ pub fn write_windows_supervisor_plan(
             "--stop-file".to_string(),
             path_arg(&stop_file),
         ];
-        write_runner_script(&runner_script, &harness_cli, &args, &log_dir, component)?;
+        write_runner_script(
+            &runner_script,
+            &harness_cli,
+            &args,
+            &log_dir,
+            component,
+            &harness_home,
+        )?;
         push_task(
             &mut scripts,
             &mut tasks,
@@ -222,7 +236,14 @@ pub fn write_windows_supervisor_plan(
             "--runtime-workspace".to_string(),
             path_arg(&runtime_workspace),
         ]);
-        write_runner_script(&runner_script, &harness_cli, &args, &log_dir, component)?;
+        write_runner_script(
+            &runner_script,
+            &harness_cli,
+            &args,
+            &log_dir,
+            component,
+            &harness_home,
+        )?;
         push_task(
             &mut scripts,
             &mut tasks,
@@ -251,7 +272,14 @@ pub fn write_windows_supervisor_plan(
             "--stop-file".to_string(),
             path_arg(&stop_file),
         ];
-        write_runner_script(&runner_script, &harness_cli, &args, &log_dir, component)?;
+        write_runner_script(
+            &runner_script,
+            &harness_cli,
+            &args,
+            &log_dir,
+            component,
+            &harness_home,
+        )?;
         push_task(
             &mut scripts,
             &mut tasks,
@@ -301,7 +329,14 @@ pub fn write_windows_supervisor_plan(
         if let Some(codex) = &codex_executable {
             args.extend(["--codex-exe".to_string(), path_arg(codex)]);
         }
-        write_runner_script(&runner_script, &harness_cli, &args, &log_dir, component)?;
+        write_runner_script(
+            &runner_script,
+            &harness_cli,
+            &args,
+            &log_dir,
+            component,
+            &harness_home,
+        )?;
         push_task(
             &mut scripts,
             &mut tasks,
@@ -332,7 +367,14 @@ pub fn write_windows_supervisor_plan(
             "--stop-file".to_string(),
             path_arg(&stop_file),
         ];
-        write_runner_script(&runner_script, &harness_cli, &args, &log_dir, component)?;
+        write_runner_script(
+            &runner_script,
+            &harness_cli,
+            &args,
+            &log_dir,
+            component,
+            &harness_home,
+        )?;
         push_task(
             &mut scripts,
             &mut tasks,
@@ -376,7 +418,14 @@ pub fn write_windows_supervisor_plan(
         if let Some(codex) = &codex_executable {
             args.extend(["--codex-exe".to_string(), path_arg(codex)]);
         }
-        write_runner_script(&runner_script, &harness_cli, &args, &log_dir, component)?;
+        write_runner_script(
+            &runner_script,
+            &harness_cli,
+            &args,
+            &log_dir,
+            component,
+            &harness_home,
+        )?;
         push_task(
             &mut scripts,
             &mut tasks,
@@ -480,12 +529,15 @@ fn write_runner_script(
     args: &[String],
     log_dir: &Path,
     log_name: &str,
+    harness_home: &Path,
 ) -> io::Result<()> {
     let invocation = command_invocation(executable, args);
     let body = if log_name == "runtime-loop" {
         format!(
             "$ErrorActionPreference = 'Continue'\n\
              $LogDir = {}\n\
+             $HarnessHome = {}\n\
+             $SupervisorStopDir = Join-Path $HarnessHome 'state\\supervisor\\stop'\n\
              New-Item -ItemType Directory -Force -Path $LogDir | Out-Null\n\
              $SafeModeState = Join-Path $LogDir '{}-runner-safe-mode.json'\n\
              $SafeModeRestarts = 0\n\
@@ -500,14 +552,22 @@ fn write_runner_script(
                try {{ $LogTail = (Get-Content -LiteralPath $LogFile -Tail 200 -ErrorAction SilentlyContinue) -join \"`n\" }} catch {{ $LogTail = '' }}\n\
                $ErrorClass = 'process-exit'\n\
                $RestartAfterSeconds = 60\n\
+               $MemoryGateDecision = $null\n\
                if ($LogTail -match '(?i)(out of memory|\\boom\\b|memory allocation|memory pressure|not enough memory|insufficient memory|resource exhausted|STATUS_NO_MEMORY|0xC0000017)') {{\n\
                  $ErrorClass = 'resource-exhausted'\n\
                  $RestartAfterSeconds = 300\n\
+                 New-Item -ItemType Directory -Force -Path $SupervisorStopDir | Out-Null\n\
+                 $ProgressStopFile = Join-Path $SupervisorStopDir 'progress-delivery-loop.stop'\n\
+                 $CreatedAtMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()\n\
+                 $ExpiresAtMs = $CreatedAtMs + 300000\n\
+                 @{{ schema = 'agent-harness.supervisor-stop-file.v1'; serviceId = 'progress-delivery-loop'; reason = 'memory-pressure-gate: runtime-loop resource exhaustion'; createdBy = 'runtime-loop-runner'; createdAtMs = $CreatedAtMs; expiresAtMs = $ExpiresAtMs; persistent = $false }} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $ProgressStopFile -Encoding UTF8\n\
+                 $MemoryGateDecision = @{{ action = 'pause-low-priority-service'; serviceIds = @('progress-delivery-loop'); stopFiles = @($ProgressStopFile); reason = 'resource-exhausted'; expiresAtMs = $ExpiresAtMs }}\n\
                }}\n\
-               @{{ schema = 'agent-harness.runtime-loop-runner-safe-mode.v1'; component = '{}'; exitCode = $ExitCode; restarts = $SafeModeRestarts; errorClass = $ErrorClass; logFile = $LogFile; at = (Get-Date).ToString('o'); restartAfterSeconds = $RestartAfterSeconds }} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $SafeModeState -Encoding UTF8\n\
+               @{{ schema = 'agent-harness.runtime-loop-runner-safe-mode.v1'; component = '{}'; exitCode = $ExitCode; restarts = $SafeModeRestarts; errorClass = $ErrorClass; logFile = $LogFile; at = (Get-Date).ToString('o'); restartAfterSeconds = $RestartAfterSeconds; memoryGateDecision = $MemoryGateDecision }} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $SafeModeState -Encoding UTF8\n\
                Start-Sleep -Seconds $RestartAfterSeconds\n\
              }}\n",
             ps_quote_path(log_dir),
+            ps_quote_path(harness_home),
             ps_escape_single(log_name),
             ps_escape_single(log_name),
             ps_escape_single(log_name),
@@ -840,6 +900,11 @@ mod tests {
         assert!(runtime_script.contains("$ErrorClass = 'process-exit'"));
         assert!(runtime_script.contains("$ErrorClass = 'resource-exhausted'"));
         assert!(runtime_script.contains("restartAfterSeconds = $RestartAfterSeconds"));
+        assert!(runtime_script.contains("memoryGateDecision = $MemoryGateDecision"));
+        assert!(runtime_script.contains("agent-harness.supervisor-stop-file.v1"));
+        assert!(runtime_script.contains("progress-delivery-loop.stop"));
+        assert!(runtime_script.contains("pause-low-priority-service"));
+        assert!(runtime_script.contains("memory-pressure-gate: runtime-loop resource exhaustion"));
         assert!(runtime_script.contains("Start-Sleep -Seconds $RestartAfterSeconds"));
         let worker_script =
             fs::read_to_string(output_dir.join("scripts").join("worker-loop.ps1")).unwrap();
