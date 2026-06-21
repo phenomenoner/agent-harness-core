@@ -2936,6 +2936,28 @@ fn supervisor_child_args(args: &SupervisorRunArgs) -> Vec<String> {
             }
             child_args
         }
+        "discord-outbox-loop" => {
+            let mut child_args = vec![
+                "discord-outbox-loop".to_string(),
+                "--harness-home".to_string(),
+                args.target_home.display().to_string(),
+                "--iterations".to_string(),
+                args.child_iterations.to_string(),
+                "--idle-ms".to_string(),
+                args.idle_ms.to_string(),
+                "--max-consecutive-errors".to_string(),
+                args.max_consecutive_errors.to_string(),
+                "--outbox-limit".to_string(),
+                args.outbox_limit.to_string(),
+            ];
+            if let Some(discord_account) = &args.discord_account {
+                child_args.extend(["--discord-account".to_string(), discord_account.to_string()]);
+            }
+            if let Some(stop_file) = &args.stop_file {
+                child_args.extend(["--stop-file".to_string(), stop_file.display().to_string()]);
+            }
+            child_args
+        }
         _ => Vec::new(),
     }
 }
@@ -2987,6 +3009,10 @@ fn write_supervisor_run_state(
         "detail": detail,
         "launchOwner": "rust-supervisor-run",
         "observedOnly": false,
+        "servicePriority": supervisor_service_priority(&args.service),
+        "deliveryLane": supervisor_delivery_lane(&args.service),
+        "restartDelayMs": args.restart_delay_ms,
+        "maxRestarts": args.max_restarts,
         "memoryGateDecision": memory_gate_decision,
     });
     let file = dir.join(format!("{}.json", args.service));
@@ -2996,6 +3022,22 @@ fn write_supervisor_run_state(
             file.display()
         )
     })
+}
+
+fn supervisor_service_priority(service: &str) -> &'static str {
+    match service {
+        "discord-outbox-loop" => "final-delivery",
+        "progress-delivery-loop" => "telemetry",
+        _ => "standard",
+    }
+}
+
+fn supervisor_delivery_lane(service: &str) -> Option<&'static str> {
+    match service {
+        "discord-outbox-loop" => Some("final-outbox"),
+        "progress-delivery-loop" => Some("progress"),
+        _ => None,
+    }
 }
 
 fn execute_progress_delivery_once(
@@ -6922,6 +6964,8 @@ struct SupervisorRunArgs {
     restart_delay_ms: u64,
     max_restarts: usize,
     child_iterations: usize,
+    outbox_limit: usize,
+    discord_account: Option<String>,
     stop_file: Option<PathBuf>,
 }
 
@@ -9216,14 +9260,20 @@ fn supervisor_run_args_from_args(args: &[String]) -> Result<SupervisorRunArgs, S
             "--restart-delay-ms",
             "--max-restarts",
             "--child-iterations",
+            "--outbox-limit",
+            "--discord-account",
+            "--account",
             "--stop-file",
         ],
         &[],
     )?;
     let service = options.required("--service")?;
-    if service != "progress-delivery-loop" {
+    if !matches!(
+        service.as_str(),
+        "progress-delivery-loop" | "discord-outbox-loop"
+    ) {
         return Err(format!(
-            "supervisor-run currently supports progress-delivery-loop only, got {service}"
+            "supervisor-run currently supports progress-delivery-loop or discord-outbox-loop only, got {service}"
         ));
     }
     let max_consecutive_errors = options
@@ -9242,6 +9292,14 @@ fn supervisor_run_args_from_args(args: &[String]) -> Result<SupervisorRunArgs, S
         .unwrap_or(60_000);
     let max_restarts = options.optional_usize("--max-restarts")?.unwrap_or(0);
     let child_iterations = options.optional_usize("--child-iterations")?.unwrap_or(0);
+    let outbox_limit = options.optional_usize("--outbox-limit")?.unwrap_or(20);
+    if outbox_limit == 0 {
+        return Err("--outbox-limit must be greater than zero".to_string());
+    }
+    let discord_account = options
+        .optional("--discord-account")
+        .or_else(|| options.optional("--account"))
+        .map(ToString::to_string);
     let stop_file = options.optional("--stop-file").map(PathBuf::from);
     Ok(SupervisorRunArgs {
         target_home: options.target_home,
@@ -9252,6 +9310,8 @@ fn supervisor_run_args_from_args(args: &[String]) -> Result<SupervisorRunArgs, S
         restart_delay_ms,
         max_restarts,
         child_iterations,
+        outbox_limit,
+        discord_account,
         stop_file,
     })
 }
@@ -17333,6 +17393,8 @@ mod tests {
         assert_eq!(args.restart_delay_ms, 50);
         assert_eq!(args.max_restarts, 2);
         assert_eq!(args.child_iterations, 7);
+        assert_eq!(args.outbox_limit, 20);
+        assert_eq!(args.discord_account, None);
         assert_eq!(args.stop_file.as_deref(), Some(stop_file.as_path()));
 
         let child_args = supervisor_child_args(&args);
@@ -17354,7 +17416,90 @@ mod tests {
         let unsupported =
             supervisor_run_args_from_args(&["--service".to_string(), "runtime-loop".to_string()])
                 .unwrap_err();
-        assert!(unsupported.contains("progress-delivery-loop only"));
+        assert!(unsupported.contains("progress-delivery-loop or discord-outbox-loop only"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn supervisor_run_discord_outbox_child_args_wrap_final_delivery_loop() {
+        let root = cli_temp_root("supervisor_run_discord_outbox_child_args");
+        let harness_home = root.join(".agent-harness");
+        let stop_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("stop")
+            .join("discord-outbox-loop.stop");
+        let harness_cli = root.join("agent-harness.exe");
+        let args = supervisor_run_args_from_args(&[
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--service".to_string(),
+            "discord-outbox-loop".to_string(),
+            "--harness-cli".to_string(),
+            harness_cli.display().to_string(),
+            "--idle-ms".to_string(),
+            "30".to_string(),
+            "--max-consecutive-errors".to_string(),
+            "4".to_string(),
+            "--restart-delay-ms".to_string(),
+            "150".to_string(),
+            "--max-restarts".to_string(),
+            "3".to_string(),
+            "--child-iterations".to_string(),
+            "9".to_string(),
+            "--outbox-limit".to_string(),
+            "11".to_string(),
+            "--discord-account".to_string(),
+            "ops".to_string(),
+            "--stop-file".to_string(),
+            stop_file.display().to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(args.target_home, harness_home);
+        assert_eq!(args.service, "discord-outbox-loop");
+        assert_eq!(args.harness_cli, harness_cli);
+        assert_eq!(args.idle_ms, 30);
+        assert_eq!(args.max_consecutive_errors, 4);
+        assert_eq!(args.restart_delay_ms, 150);
+        assert_eq!(args.max_restarts, 3);
+        assert_eq!(args.child_iterations, 9);
+        assert_eq!(args.outbox_limit, 11);
+        assert_eq!(args.discord_account.as_deref(), Some("ops"));
+        assert_eq!(args.stop_file.as_deref(), Some(stop_file.as_path()));
+        assert_eq!(supervisor_service_priority(&args.service), "final-delivery");
+        assert_eq!(
+            supervisor_delivery_lane(&args.service),
+            Some("final-outbox")
+        );
+
+        let child_args = supervisor_child_args(&args);
+        let has_pair = |flag: &str, value: String| {
+            child_args
+                .windows(2)
+                .any(|pair| pair[0] == flag && pair[1] == value)
+        };
+        assert_eq!(child_args[0], "discord-outbox-loop");
+        assert!(has_pair(
+            "--harness-home",
+            harness_home.display().to_string()
+        ));
+        assert!(has_pair("--iterations", "9".to_string()));
+        assert!(has_pair("--idle-ms", "30".to_string()));
+        assert!(has_pair("--max-consecutive-errors", "4".to_string()));
+        assert!(has_pair("--outbox-limit", "11".to_string()));
+        assert!(has_pair("--discord-account", "ops".to_string()));
+        assert!(has_pair("--stop-file", stop_file.display().to_string()));
+
+        let zero_outbox_limit = supervisor_run_args_from_args(&[
+            "--service".to_string(),
+            "discord-outbox-loop".to_string(),
+            "--outbox-limit".to_string(),
+            "0".to_string(),
+        ])
+        .unwrap_err();
+        assert!(zero_outbox_limit.contains("--outbox-limit must be greater than zero"));
 
         let _ = fs::remove_dir_all(root);
     }

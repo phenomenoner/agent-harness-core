@@ -38,11 +38,11 @@ Loop heartbeat writers also write per-service records under:
 <harness-home>\state\supervisor\services
 ```
 
-Each record uses `agent-harness.supervisor-service-state.v1` and includes `serviceId`, `serviceKind`, `generationId`, `pid`, `startedAtMs`, `lastHeartbeatAtMs`, `lastSuccessfulIterationAtMs`, `iteration`, `desiredState`, and `actualState`. `status --json` reports these records under `loops.services`, while `healthz` reports them under `supervisorServices`.
+Each record uses `agent-harness.supervisor-service-state.v1` and includes `serviceId`, `serviceKind`, `generationId`, `pid`, `startedAtMs`, `lastHeartbeatAtMs`, `lastSuccessfulIterationAtMs`, `iteration`, `desiredState`, `actualState`, `servicePriority`, `deliveryLane`, and `restartDelayMs`. `status --json` reports these records under `loops.services`, while `healthz` reports them under `supervisorServices`.
 
 This registry is observe-only for loops that still use the existing external runner model. It also records supervisor-owned children as they migrate, giving operators a single service-state surface during the transition.
 
-`supervisor-run --service progress-delivery-loop` is the first supervisor-owned child path. Generated progress delivery runner scripts start this Rust wrapper instead of launching `progress-delivery-loop` directly. The wrapper starts the progress child with a stable service generation id, waits for process exit, writes restart/backoff state into `state\supervisor\services\progress-delivery-loop.json`, and restarts after failures. Other generated loop runners remain externally owned until their later migration phases.
+`supervisor-run --service progress-delivery-loop` and `supervisor-run --service discord-outbox-loop` are the first supervisor-owned child paths. Generated progress delivery and Discord outbox runner scripts start this Rust wrapper instead of launching their child loops directly. The wrapper starts each child with a stable service generation id, waits for process exit, writes restart/backoff state into `state\supervisor\services\<service>.json`, and restarts after failures. Progress is marked as telemetry priority; Discord outbox is marked as final-delivery priority with a shorter restart delay. Runtime, worker, and ingress runners remain externally owned until their later migration phases.
 
 ## Runner Logs
 

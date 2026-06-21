@@ -359,15 +359,21 @@ pub fn write_windows_supervisor_plan(
         let runner_script = scripts_dir.join(format!("{component}.ps1"));
         let stop_file = stop_dir.join(format!("{component}.stop"));
         let args = vec![
+            "supervisor-run".to_string(),
+            "--service".to_string(),
             "discord-outbox-loop".to_string(),
             "--harness-home".to_string(),
             path_arg(&harness_home),
-            "--iterations".to_string(),
+            "--harness-cli".to_string(),
+            path_arg(&harness_cli),
+            "--child-iterations".to_string(),
             "0".to_string(),
             "--idle-ms".to_string(),
             options.idle_ms.to_string(),
             "--max-consecutive-errors".to_string(),
             options.max_consecutive_errors.to_string(),
+            "--restart-delay-ms".to_string(),
+            "15000".to_string(),
             "--outbox-limit".to_string(),
             options.telegram_outbox_limit.to_string(),
             "--stop-file".to_string(),
@@ -933,6 +939,11 @@ mod tests {
         let discord_outbox_script =
             fs::read_to_string(output_dir.join("scripts").join("discord-outbox-loop.ps1")).unwrap();
         assert!(discord_outbox_script.contains("discord-outbox-loop"));
+        assert!(discord_outbox_script.contains("supervisor-run"));
+        assert!(discord_outbox_script.contains("--service"));
+        assert!(discord_outbox_script.contains("--child-iterations"));
+        assert!(discord_outbox_script.contains("--restart-delay-ms"));
+        assert!(discord_outbox_script.contains("--outbox-limit"));
         assert!(discord_outbox_script.contains("$(Get-Date -Format yyyyMMdd-HHmmss)"));
         assert!(discord_outbox_script.contains("Select-Object -Skip 20"));
         assert!(!discord_outbox_script.contains("Tee-Object"));

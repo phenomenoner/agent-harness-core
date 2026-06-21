@@ -98,6 +98,9 @@ pub struct HealthzSupervisorService {
     pub last_error_class: Option<String>,
     pub restart_count: Option<i64>,
     pub backoff_until_ms: Option<i64>,
+    pub service_priority: Option<String>,
+    pub delivery_lane: Option<String>,
+    pub restart_delay_ms: Option<i64>,
     pub memory_gate_action: Option<String>,
     pub memory_gate_reason: Option<String>,
     pub observed_only: Option<bool>,
@@ -203,6 +206,9 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
                 last_error_class: service.last_error_class.clone(),
                 restart_count: service.restart_count,
                 backoff_until_ms: service.backoff_until_ms,
+                service_priority: service.service_priority.clone(),
+                delivery_lane: service.delivery_lane.clone(),
+                restart_delay_ms: service.restart_delay_ms,
                 memory_gate_action: service.memory_gate_action.clone(),
                 memory_gate_reason: service.memory_gate_reason.clone(),
                 observed_only: service.observed_only,
@@ -385,6 +391,9 @@ mod tests {
                 "lastErrorClass": "process-exit",
                 "restartCount": 2,
                 "backoffUntilMs": now_ms + 60_000,
+                "servicePriority": "final-delivery",
+                "deliveryLane": "final-outbox",
+                "restartDelayMs": 15_000,
                 "memoryGateDecision": {
                     "action": "pause-low-priority-service",
                     "reason": "resource-exhausted"
@@ -432,6 +441,15 @@ mod tests {
         );
         assert_eq!(runtime_service.restart_count, Some(2));
         assert_eq!(runtime_service.backoff_until_ms, Some(now_ms + 60_000));
+        assert_eq!(
+            runtime_service.service_priority.as_deref(),
+            Some("final-delivery")
+        );
+        assert_eq!(
+            runtime_service.delivery_lane.as_deref(),
+            Some("final-outbox")
+        );
+        assert_eq!(runtime_service.restart_delay_ms, Some(15_000));
         assert_eq!(
             runtime_service.memory_gate_action.as_deref(),
             Some("pause-low-priority-service")

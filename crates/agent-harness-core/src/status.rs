@@ -173,6 +173,9 @@ pub struct HarnessSupervisorServiceStatus {
     pub last_error_class: Option<String>,
     pub restart_count: Option<i64>,
     pub backoff_until_ms: Option<i64>,
+    pub service_priority: Option<String>,
+    pub delivery_lane: Option<String>,
+    pub restart_delay_ms: Option<i64>,
     pub memory_gate_action: Option<String>,
     pub memory_gate_reason: Option<String>,
     pub age_ms: Option<i64>,
@@ -493,6 +496,9 @@ fn read_supervisor_services(
                     last_error_class: None,
                     restart_count: None,
                     backoff_until_ms: None,
+                    service_priority: None,
+                    delivery_lane: None,
+                    restart_delay_ms: None,
                     memory_gate_action: None,
                     memory_gate_reason: None,
                     age_ms: None,
@@ -529,6 +535,9 @@ fn read_supervisor_services(
             last_error_class: string_path(&value, &["lastErrorClass"]),
             restart_count: i64_path(&value, &["restartCount"]),
             backoff_until_ms: i64_path(&value, &["backoffUntilMs"]),
+            service_priority: string_path(&value, &["servicePriority"]),
+            delivery_lane: string_path(&value, &["deliveryLane"]),
+            restart_delay_ms: i64_path(&value, &["restartDelayMs"]),
             memory_gate_action: string_path(&value, &["memoryGateDecision", "action"]),
             memory_gate_reason: string_path(&value, &["memoryGateDecision", "reason"]),
             age_ms: last_heartbeat_at_ms.map(|at_ms| now_ms.saturating_sub(at_ms)),
@@ -2067,6 +2076,9 @@ mod tests {
                 "lastErrorClass": "process-exit",
                 "restartCount": 2,
                 "backoffUntilMs": now_ms + 60_000,
+                "servicePriority": "final-delivery",
+                "deliveryLane": "final-outbox",
+                "restartDelayMs": 15_000,
                 "memoryGateDecision": {
                     "action": "pause-low-priority-service",
                     "reason": "resource-exhausted"
@@ -2118,6 +2130,15 @@ mod tests {
         );
         assert_eq!(runtime_service.restart_count, Some(2));
         assert_eq!(runtime_service.backoff_until_ms, Some(now_ms + 60_000));
+        assert_eq!(
+            runtime_service.service_priority.as_deref(),
+            Some("final-delivery")
+        );
+        assert_eq!(
+            runtime_service.delivery_lane.as_deref(),
+            Some("final-outbox")
+        );
+        assert_eq!(runtime_service.restart_delay_ms, Some(15_000));
         assert_eq!(
             runtime_service.memory_gate_action.as_deref(),
             Some("pause-low-priority-service")
