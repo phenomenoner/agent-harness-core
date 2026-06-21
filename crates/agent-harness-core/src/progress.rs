@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -125,12 +125,16 @@ pub struct AgentProgressDeliveryPlanReport {
 #[serde(rename_all = "camelCase")]
 pub struct AgentProgressDeliveryPlanSummary {
     pub total_events: usize,
+    pub new_events: usize,
+    pub cached_events: usize,
     pub queues: usize,
     pub pending: usize,
     pub delivered_current: usize,
     pub rate_limited: usize,
     pub invalid_lines: usize,
     pub skipped_platform: usize,
+    pub read_from_byte: u64,
+    pub read_to_byte: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -235,6 +239,10 @@ struct AgentProgressDeliveryState {
     schema: String,
     #[serde(default)]
     queues: BTreeMap<String, AgentProgressDeliveryCursor>,
+    #[serde(default)]
+    ledger: AgentProgressDeliveryLedgerCursor,
+    #[serde(default)]
+    compacted_events: BTreeMap<String, Vec<StoredProgressEvent>>,
 }
 
 impl Default for AgentProgressDeliveryState {
@@ -242,8 +250,19 @@ impl Default for AgentProgressDeliveryState {
         Self {
             schema: AGENT_PROGRESS_DELIVERY_STATE_SCHEMA.to_string(),
             queues: BTreeMap::new(),
+            ledger: AgentProgressDeliveryLedgerCursor::default(),
+            compacted_events: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentProgressDeliveryLedgerCursor {
+    #[serde(default)]
+    offset_bytes: u64,
+    #[serde(default)]
+    line_number: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -434,10 +453,21 @@ impl AgentProgressDeliveryCursor {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StoredProgressEvent {
     line_number: usize,
     event: AgentProgressEvent,
+}
+
+#[derive(Debug, Clone)]
+struct ProgressEventReadResult {
+    events: Vec<StoredProgressEvent>,
+    cursor: AgentProgressDeliveryLedgerCursor,
+    reset: bool,
+    new_events: usize,
+    read_from_byte: u64,
+    read_to_byte: u64,
 }
 
 impl AgentProgressEvent {
@@ -532,10 +562,35 @@ pub fn plan_agent_progress_delivery(
     let state_file = agent_progress_delivery_state_file(&options.harness_home);
     let receipts_file = agent_progress_delivery_receipts_file(&options.harness_home);
     let mut warnings = Vec::new();
-    let events = read_progress_events(&events_file, &mut warnings)?;
-    let state = read_delivery_state(&state_file, &mut warnings)?;
+    let mut state = read_delivery_state(&state_file, &mut warnings)?;
+    let read_result =
+        read_progress_events_since_cursor(&events_file, &state.ledger, &mut warnings)?;
+    let cached_events = if read_result.reset {
+        BTreeMap::new()
+    } else {
+        state.compacted_events.clone()
+    };
+    let cached_event_count = cached_events.values().map(Vec::len).sum();
+    let mut all_by_queue = cached_events;
+    for stored in read_result.events {
+        all_by_queue
+            .entry(stored.event.queue_id.clone())
+            .or_default()
+            .push(stored);
+    }
+    for queue_events in all_by_queue.values_mut() {
+        queue_events.sort_by_key(|stored| stored.line_number);
+    }
+    state.ledger = read_result.cursor;
+    state.compacted_events =
+        compact_progress_events_by_queue(&all_by_queue, options.max_events_per_panel);
+    write_delivery_state(&state_file, &state)?;
     let mut summary = AgentProgressDeliveryPlanSummary {
-        total_events: events.len(),
+        total_events: all_by_queue.values().map(Vec::len).sum(),
+        new_events: read_result.new_events,
+        cached_events: cached_event_count,
+        read_from_byte: read_result.read_from_byte,
+        read_to_byte: read_result.read_to_byte,
         invalid_lines: warnings
             .iter()
             .filter(|warning| warning.contains("progress event line"))
@@ -543,19 +598,22 @@ pub fn plan_agent_progress_delivery(
         ..AgentProgressDeliveryPlanSummary::default()
     };
     let mut by_queue = BTreeMap::<String, Vec<StoredProgressEvent>>::new();
-    for stored in events {
-        if options
-            .platform
-            .as_ref()
-            .is_some_and(|platform| platform != &stored.event.platform)
-        {
-            summary.skipped_platform += 1;
-            continue;
+    for (queue_id, queue_events) in all_by_queue {
+        let mut kept = Vec::new();
+        for stored in queue_events {
+            if options
+                .platform
+                .as_ref()
+                .is_some_and(|platform| platform != &stored.event.platform)
+            {
+                summary.skipped_platform += 1;
+                continue;
+            }
+            kept.push(stored);
         }
-        by_queue
-            .entry(stored.event.queue_id.clone())
-            .or_default()
-            .push(stored);
+        if !kept.is_empty() {
+            by_queue.insert(queue_id, kept);
+        }
     }
     summary.queues = by_queue.len();
 
@@ -889,6 +947,7 @@ pub fn sanitize_progress_preview(value: &str, max_chars: usize) -> String {
     truncate_chars(&flattened, max_chars)
 }
 
+#[cfg(test)]
 fn read_progress_events(
     events_file: &Path,
     warnings: &mut Vec<String>,
@@ -916,6 +975,129 @@ fn read_progress_events(
         }
     }
     Ok(events)
+}
+
+fn read_progress_events_since_cursor(
+    events_file: &Path,
+    cursor: &AgentProgressDeliveryLedgerCursor,
+    warnings: &mut Vec<String>,
+) -> io::Result<ProgressEventReadResult> {
+    if !events_file.is_file() {
+        return Ok(ProgressEventReadResult {
+            events: Vec::new(),
+            cursor: AgentProgressDeliveryLedgerCursor::default(),
+            reset: cursor.offset_bytes > 0 || cursor.line_number > 0,
+            new_events: 0,
+            read_from_byte: 0,
+            read_to_byte: 0,
+        });
+    }
+    let file = File::open(events_file)?;
+    let len = file.metadata()?.len();
+    let reset = cursor.offset_bytes > len;
+    let read_from_byte = if reset { 0 } else { cursor.offset_bytes };
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(read_from_byte))?;
+    let mut line_number = if reset { 0 } else { cursor.line_number };
+    let mut offset_bytes = read_from_byte;
+    let mut events = Vec::new();
+    loop {
+        let mut line = String::new();
+        let bytes_read = reader.read_line(&mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_number += 1;
+        offset_bytes = offset_bytes.saturating_add(bytes_read as u64);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<AgentProgressEvent>(trimmed) {
+            Ok(event) => events.push(StoredProgressEvent { line_number, event }),
+            Err(error) => warnings.push(format!(
+                "progress event line {} is not valid JSON: {}",
+                line_number, error
+            )),
+        }
+    }
+    let new_events = events.len();
+    Ok(ProgressEventReadResult {
+        events,
+        cursor: AgentProgressDeliveryLedgerCursor {
+            offset_bytes,
+            line_number,
+        },
+        reset,
+        new_events,
+        read_from_byte,
+        read_to_byte: offset_bytes,
+    })
+}
+
+fn compact_progress_events_by_queue(
+    by_queue: &BTreeMap<String, Vec<StoredProgressEvent>>,
+    max_events_per_panel: usize,
+) -> BTreeMap<String, Vec<StoredProgressEvent>> {
+    let retain_recent = max_events_per_panel.max(16);
+    let mut compacted = BTreeMap::new();
+    for (queue_id, queue_events) in by_queue {
+        if queue_events.is_empty() {
+            continue;
+        }
+        let coalesced = coalesce_stored_progress_events(queue_events);
+        let mut selected = BTreeMap::<usize, StoredProgressEvent>::new();
+        if let Some(first) = queue_events.first() {
+            selected.insert(first.line_number, first.clone());
+        }
+        for stored in &coalesced {
+            if is_terminal_event(&stored.event) {
+                selected.insert(stored.line_number, stored.clone());
+            }
+        }
+        for stored in coalesced.iter().rev().take(retain_recent) {
+            selected.insert(stored.line_number, stored.clone());
+        }
+        compacted.insert(queue_id.clone(), selected.into_values().collect());
+    }
+    compacted
+}
+
+fn coalesce_stored_progress_events(events: &[StoredProgressEvent]) -> Vec<StoredProgressEvent> {
+    let mut coalesced = Vec::<StoredProgressEvent>::new();
+    for stored in events {
+        if let Some(last) = coalesced.last_mut()
+            && can_coalesce_progress_event(&last.event, &stored.event)
+        {
+            *last = stored.clone();
+            continue;
+        }
+        coalesced.push(stored.clone());
+    }
+    coalesced
+}
+
+fn can_coalesce_progress_event(left: &AgentProgressEvent, right: &AgentProgressEvent) -> bool {
+    if is_terminal_event(left) || is_terminal_event(right) {
+        return false;
+    }
+    matches!(
+        left.kind,
+        AgentProgressKind::ToolCall
+            | AgentProgressKind::AssistantStream
+            | AgentProgressKind::AssistantNarration
+            | AgentProgressKind::SearchFiles
+            | AgentProgressKind::ReadFile
+            | AgentProgressKind::ExecuteCode
+    ) && left.queue_id == right.queue_id
+        && left.kind == right.kind
+        && left.label == right.label
+        && left.preview == right.preview
+        && left.status == right.status
+        && left.platform == right.platform
+        && left.channel_id == right.channel_id
+        && left.user_id == right.user_id
+        && left.session_key == right.session_key
 }
 
 fn read_delivery_state(
@@ -1951,6 +2133,129 @@ mod tests {
             AgentProgressDeliveryMessageKind::Status
         );
         assert_eq!(retry.summary.delivered_current, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn progress_delivery_cursor_reads_only_new_events_after_offset() {
+        let root = temp_root("progress_delivery_cursor_reads_only_new_events_after_offset");
+        let harness_home = root.join(".agent-harness");
+        let context = context();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Runtime,
+                "runtime",
+                "starting",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+        )
+        .unwrap();
+
+        let first = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(first.summary.read_from_byte, 0);
+        assert_eq!(first.summary.new_events, 1);
+        assert!(first.summary.read_to_byte > 0);
+
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::ToolCall,
+                "tool_call",
+                "cargo test",
+                AgentProgressStatus::Started,
+                3000,
+            ),
+        )
+        .unwrap();
+
+        let second = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 4000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+
+        assert_eq!(second.summary.read_from_byte, first.summary.read_to_byte);
+        assert!(second.summary.read_to_byte > second.summary.read_from_byte);
+        assert_eq!(second.summary.new_events, 1);
+        assert_eq!(second.summary.cached_events, 1);
+        assert_eq!(second.summary.total_events, 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn progress_delivery_compacts_repeated_cached_tool_events() {
+        let root = temp_root("progress_delivery_compacts_repeated_cached_tool_events");
+        let harness_home = root.join(".agent-harness");
+        let context = context();
+        for index in 0..80 {
+            append_agent_progress_event(
+                &harness_home,
+                &AgentProgressEvent::new(
+                    &context,
+                    AgentProgressKind::ToolCall,
+                    "tool_call",
+                    "cargo test",
+                    AgentProgressStatus::Progress,
+                    1000 + index,
+                ),
+            )
+            .unwrap();
+        }
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Runtime,
+                "runtime",
+                "completed",
+                AgentProgressStatus::Completed,
+                2000,
+            ),
+        )
+        .unwrap();
+
+        let plan = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 3000,
+            min_update_interval_ms: 0,
+            max_events_per_panel: 8,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(plan.summary.new_events, 81);
+
+        let mut warnings = Vec::new();
+        let state = read_delivery_state(
+            &agent_progress_delivery_state_file(&harness_home),
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(warnings.is_empty());
+        let compacted = state.compacted_events.get("turn:1").unwrap();
+        assert!(compacted.len() < 20, "compacted len={}", compacted.len());
+        assert!(
+            compacted
+                .iter()
+                .any(|stored| is_terminal_event(&stored.event))
+        );
+        assert_eq!(state.ledger.line_number, 81);
 
         let _ = fs::remove_dir_all(root);
     }

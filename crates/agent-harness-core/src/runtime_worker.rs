@@ -12,6 +12,7 @@ use serde_json::Value;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 
+use crate::loop_health::process_alive_for_pid;
 use crate::{
     AgentSource, HarnessLogEvent, HarnessLogLevel, InboundMediaArtifact, PromptAssemblyOptions,
     append_harness_log, assemble_prompt_bundle, build_runtime_skill_index, build_turn_plan,
@@ -164,6 +165,8 @@ pub struct RuntimeExecutionReceipt {
 pub enum RuntimeExecutionReceiptStatus {
     Prepared,
     AlreadyPrepared,
+    LeaseAcquired,
+    StaleOwnerReaped,
     LeaseBusy,
     NoPendingItem,
 }
@@ -320,7 +323,9 @@ pub fn prepare_runtime_queue_item(
         now_ms,
         &terminal_run_ids,
         &retry_pending_run_ids,
-    );
+        Some(&execution_receipts_file),
+        &mut warnings,
+    )?;
     let pending_items = read_pending_items(&queue_file, &mut warnings)?;
     let pending_by_id = pending_items
         .iter()
@@ -394,6 +399,7 @@ pub fn prepare_runtime_queue_item(
                 warnings,
             });
         }
+        let mut acquired_prepared_lease = None;
         if let Some(pending) = pending_by_id.get(requested_queue_id) {
             if let Some(blocker) =
                 cron_runtime_dispatch_blocker_for_item(&options.harness_home, pending, now_ms)?
@@ -487,8 +493,18 @@ pub fn prepare_runtime_queue_item(
                 });
             }
             lease_runtime_queue_item(&mut lease_state, pending, &lease_owner, now_ms);
+            acquired_prepared_lease = Some(pending.clone());
         }
         write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+        if let Some(pending) = acquired_prepared_lease.as_ref() {
+            append_json_line(
+                &execution_receipts_file,
+                &lease_acquired_receipt(
+                    pending,
+                    "runtime queue lease acquired for requested prepared item resume",
+                ),
+            )?;
+        }
         let receipt = RuntimeExecutionReceipt {
             queue_id: Some(requested_queue_id.to_string()),
             status: RuntimeExecutionReceiptStatus::AlreadyPrepared,
@@ -563,6 +579,13 @@ pub fn prepare_runtime_queue_item(
                     }
                     lease_runtime_queue_item(&mut lease_state, pending, &lease_owner, now_ms);
                     write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+                    append_json_line(
+                        &execution_receipts_file,
+                        &lease_acquired_receipt(
+                            pending,
+                            "runtime queue lease acquired for prepared item resume",
+                        ),
+                    )?;
                     let receipt = RuntimeExecutionReceipt {
                     queue_id: Some(queue_id.clone()),
                     status: RuntimeExecutionReceiptStatus::AlreadyPrepared,
@@ -662,6 +685,13 @@ pub fn prepare_runtime_queue_item(
     };
     lease_runtime_queue_item(&mut lease_state, &pending, &lease_owner, now_ms);
     write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+    append_json_line(
+        &execution_receipts_file,
+        &lease_acquired_receipt(
+            &pending,
+            "runtime queue lease acquired before prompt bundle preparation",
+        ),
+    )?;
 
     let prompt_workspace = prompt_source_workspace(&pending.source_home, &pending.source_workspace);
     if !paths_equivalent(&prompt_workspace, &pending.source_workspace) {
@@ -839,7 +869,9 @@ pub fn inspect_runtime_queue_capacity(
             now_ms,
             &terminal_run_ids,
             &retry_pending_run_ids,
-        );
+            Some(&execution_receipts_file),
+            &mut warnings,
+        )?;
         write_runtime_queue_leases(&queue_dir, &runtime_class, &lease_state)?;
         leased_items += lease_state.leases.len();
         let mut simulated = lease_state.clone();
@@ -1413,12 +1445,54 @@ fn purge_runtime_queue_leases(
     now_ms: i64,
     terminal_run_ids: &HashSet<String>,
     retry_pending_run_ids: &HashSet<String>,
-) {
-    state.leases.retain(|queue_id, lease| {
-        lease.lease_expires_at_ms > now_ms
-            && !terminal_run_ids.contains(queue_id)
-            && !retry_pending_run_ids.contains(queue_id)
-    });
+    receipts_file: Option<&Path>,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    let mut remove_silently = Vec::new();
+    let mut reap_dead_owner = Vec::new();
+    for (queue_id, lease) in &state.leases {
+        if terminal_run_ids.contains(queue_id)
+            || retry_pending_run_ids.contains(queue_id)
+            || lease.lease_expires_at_ms <= now_ms
+        {
+            remove_silently.push(queue_id.clone());
+            continue;
+        }
+        if let Some(process_id) = dead_legacy_pid_owner(&lease.owner) {
+            reap_dead_owner.push((queue_id.clone(), process_id));
+        }
+    }
+    for queue_id in remove_silently {
+        state.leases.remove(&queue_id);
+    }
+    for (queue_id, process_id) in reap_dead_owner {
+        let Some(lease) = state.leases.remove(&queue_id) else {
+            continue;
+        };
+        let reason = format!(
+            "runtime queue lease owner {} references a non-running processId={process_id}",
+            lease.owner
+        );
+        warnings.push(format!(
+            "runtime queue lease `{queue_id}` reaped because {reason}"
+        ));
+        if let Some(receipts_file) = receipts_file {
+            append_json_line(
+                receipts_file,
+                &serde_json::json!({
+                    "queueId": queue_id,
+                    "status": RuntimeExecutionReceiptStatus::StaleOwnerReaped,
+                    "runtimeClass": lease.runtime_class,
+                    "origin": lease.origin,
+                    "cronRunId": lease.cron_run_id,
+                    "owner": lease.owner,
+                    "atMs": now_ms,
+                    "reason": reason
+                }),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub fn release_runtime_queue_lease(
@@ -1605,21 +1679,47 @@ fn read_all_runtime_queue_leases_with_override(
                 override_state
                     .leases
                     .values()
-                    .filter(|lease| lease.lease_expires_at_ms > now_ms)
+                    .filter(|lease| {
+                        lease.lease_expires_at_ms > now_ms
+                            && dead_legacy_pid_owner(&lease.owner).is_none()
+                    })
                     .cloned(),
             );
             continue;
         }
         let state = read_runtime_queue_leases(&queue_dir, &runtime_class, &mut warnings)?;
-        leases.extend(
-            state
-                .leases
-                .values()
-                .filter(|lease| lease.lease_expires_at_ms > now_ms)
-                .cloned(),
-        );
+        leases.extend(state.leases.values().filter_map(|lease| {
+            (lease.lease_expires_at_ms > now_ms && dead_legacy_pid_owner(&lease.owner).is_none())
+                .then_some(lease.clone())
+        }));
     }
     Ok(leases)
+}
+
+fn legacy_pid_owner(owner: &str) -> Option<i64> {
+    owner.strip_prefix("pid:")?.trim().parse::<i64>().ok()
+}
+
+fn dead_legacy_pid_owner(owner: &str) -> Option<i64> {
+    let process_id = legacy_pid_owner(owner)?;
+    (process_alive_for_pid(process_id) == Some(false)).then_some(process_id)
+}
+
+fn lease_acquired_receipt(item: &PendingQueueItem, reason: &str) -> RuntimeExecutionReceipt {
+    RuntimeExecutionReceipt {
+        queue_id: Some(item.queue_id.clone()),
+        status: RuntimeExecutionReceiptStatus::LeaseAcquired,
+        runtime_class: Some(item.runtime_class.clone()),
+        origin: Some(item.origin.clone()),
+        cron_run_id: item.cron_run_id.clone(),
+        scheduled_for_ms: item.scheduled_for_ms,
+        execution_dir: None,
+        prompt_bundle_json: None,
+        prompt_markdown: None,
+        runtime_workspace: item.runtime_workspace.clone(),
+        inbound_media_artifacts: item.inbound_media_artifacts.clone(),
+        reason: reason.to_string(),
+    }
 }
 
 fn lease_runtime_queue_item(
@@ -2287,6 +2387,43 @@ mod tests {
         let receipt_json: Value =
             serde_json::from_slice(&fs::read(item.receipt_file).unwrap()).unwrap();
         assert_eq!(receipt_json["status"], "prepared");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_runtime_queue_item_records_lease_acquired_before_prepared_receipt() {
+        let root = temp_root("prepare_runtime_queue_item_records_lease_acquired_before_prepared");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_fixture_turn(&source, &harness_home);
+
+        let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+        let receipts = fs::read_to_string(&report.execution_receipts_file).unwrap();
+        let statuses = receipts
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .map(|value| value["status"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(statuses.first().map(String::as_str), Some("lease-acquired"));
+        assert_eq!(statuses.last().map(String::as_str), Some("prepared"));
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| *status == "prepared")
+                .count(),
+            1
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3064,6 +3201,75 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("agent-channel limit"))
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_runtime_queue_item_reaps_dead_pid_owner_before_capacity_check() {
+        let root =
+            temp_root("prepare_runtime_queue_item_reaps_dead_pid_owner_before_capacity_check");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"workerDispatch":{"globalConcurrencyLimit":1,"groupConcurrencyLimit":1,"channelConcurrencyLimit":1,"laneConcurrencyLimits":{"llm":1}}}"#,
+        )
+        .unwrap();
+        enqueue_fixture_turn_with_platform_channel(
+            &source,
+            &harness_home,
+            "telegram",
+            "tg-dm",
+            "user-7",
+            "pending tg",
+            1234,
+        );
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        let now_ms = current_log_time_ms().unwrap();
+        let mut lease_state = RuntimeQueueLeaseState {
+            schema: runtime_queue_leases_schema(),
+            leases: BTreeMap::new(),
+        };
+        lease_state.leases.insert(
+            "dead-owner".to_string(),
+            RuntimeQueueLease {
+                queue_id: "dead-owner".to_string(),
+                agent_id: "main".to_string(),
+                runtime_class: "interactive".to_string(),
+                origin: "channel".to_string(),
+                cron_run_id: None,
+                platform: "telegram".to_string(),
+                account_id: None,
+                channel_id: "tg-dm".to_string(),
+                user_id: Some("user-7".to_string()),
+                session_key: "main:telegram:tg-dm".to_string(),
+                session_lane_key: None,
+                owner: "pid:0".to_string(),
+                started_at_ms: now_ms,
+                lease_expires_at_ms: now_ms.saturating_add(60_000),
+            },
+        );
+        write_runtime_queue_leases(&queue_dir, "interactive", &lease_state).unwrap();
+
+        let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+        let updated_state =
+            read_runtime_queue_leases(&queue_dir, "interactive", &mut Vec::new()).unwrap();
+        assert!(!updated_state.leases.contains_key("dead-owner"));
+        let receipts = fs::read_to_string(&report.execution_receipts_file).unwrap();
+        assert!(receipts.contains(r#""status":"stale-owner-reaped""#));
+        assert!(receipts.contains(r#""pid:0""#));
 
         let _ = fs::remove_dir_all(root);
     }

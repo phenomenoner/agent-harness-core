@@ -491,8 +491,8 @@ fn write_runner_script(
              $SafeModeRestarts = 0\n\
              while ($true) {{\n\
                Get-ChildItem -LiteralPath $LogDir -Filter '{}-*.log' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 20 | Remove-Item -Force -ErrorAction SilentlyContinue\n\
-               $LogFile = Join-Path $LogDir (\"{}-$(Get-Date -Format yyyyMMdd-HHmmss).log\")\n\
-               {} *>&1 | Tee-Object -FilePath $LogFile\n\
+              $LogFile = Join-Path $LogDir (\"{}-$(Get-Date -Format yyyyMMdd-HHmmss).log\")\n\
+              {} *> $LogFile\n\
                $ExitCode = $LASTEXITCODE\n\
                if ($ExitCode -eq 0) {{ exit 0 }}\n\
                $SafeModeRestarts += 1\n\
@@ -512,8 +512,8 @@ fn write_runner_script(
              $LogDir = {}\n\
              New-Item -ItemType Directory -Force -Path $LogDir | Out-Null\n\
              Get-ChildItem -LiteralPath $LogDir -Filter '{}-*.log' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 20 | Remove-Item -Force -ErrorAction SilentlyContinue\n\
-             $LogFile = Join-Path $LogDir (\"{}-$(Get-Date -Format yyyyMMdd-HHmmss).log\")\n\
-             {} *>&1 | Tee-Object -FilePath $LogFile\n\
+              $LogFile = Join-Path $LogDir (\"{}-$(Get-Date -Format yyyyMMdd-HHmmss).log\")\n\
+              {} *> $LogFile\n\
              exit $LASTEXITCODE\n",
             ps_quote_path(log_dir),
             ps_escape_single(log_name),
@@ -827,10 +827,13 @@ mod tests {
         assert!(runtime_script.contains("'300000'"));
         assert!(runtime_script.contains("--safe-mode-restart-ms"));
         assert!(runtime_script.contains("'2'"));
+        assert!(!runtime_script.contains("Tee-Object"));
+        assert!(runtime_script.contains("*> $LogFile"));
         let worker_script =
             fs::read_to_string(output_dir.join("scripts").join("worker-loop.ps1")).unwrap();
         assert!(worker_script.contains("worker-loop"));
         assert!(worker_script.contains("--stop-file"));
+        assert!(!worker_script.contains("Tee-Object"));
         let progress_script = fs::read_to_string(
             output_dir
                 .join("scripts")
@@ -838,11 +841,14 @@ mod tests {
         )
         .unwrap();
         assert!(progress_script.contains("progress-delivery-loop"));
+        assert!(!progress_script.contains("Tee-Object"));
+        assert!(progress_script.contains("*> $LogFile"));
         let discord_outbox_script =
             fs::read_to_string(output_dir.join("scripts").join("discord-outbox-loop.ps1")).unwrap();
         assert!(discord_outbox_script.contains("discord-outbox-loop"));
         assert!(discord_outbox_script.contains("$(Get-Date -Format yyyyMMdd-HHmmss)"));
         assert!(discord_outbox_script.contains("Select-Object -Skip 20"));
+        assert!(!discord_outbox_script.contains("Tee-Object"));
         let start_script =
             fs::read_to_string(output_dir.join("scripts").join("start-scheduled-tasks.ps1"))
                 .unwrap();

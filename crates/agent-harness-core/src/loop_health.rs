@@ -2,6 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -10,6 +11,28 @@ pub struct SupervisorStopFileStatus {
     pub path: PathBuf,
     pub present: bool,
     pub reason: Option<String>,
+    pub service_id: Option<String>,
+    pub created_by: Option<String>,
+    pub created_at_ms: Option<i64>,
+    pub expires_at_ms: Option<i64>,
+    pub persistent: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SupervisorStopFileEnvelope {
+    #[serde(default)]
+    service_id: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    created_by: Option<String>,
+    #[serde(default)]
+    created_at_ms: Option<i64>,
+    #[serde(default)]
+    expires_at_ms: Option<i64>,
+    #[serde(default)]
+    persistent: Option<bool>,
 }
 
 pub fn supervisor_stop_file_path(harness_home: impl AsRef<Path>, name: &str) -> PathBuf {
@@ -34,10 +57,18 @@ pub fn read_supervisor_stop_file(
         }
         match fs::read_to_string(&path) {
             Ok(text) => {
+                let parsed = parse_stop_file_text(&text);
                 return Ok(SupervisorStopFileStatus {
                     path,
                     present: true,
-                    reason: Some(truncate_stop_reason(text.trim())),
+                    reason: parsed
+                        .reason
+                        .or_else(|| Some(truncate_stop_reason(text.trim()))),
+                    service_id: parsed.service_id,
+                    created_by: parsed.created_by,
+                    created_at_ms: parsed.created_at_ms,
+                    expires_at_ms: parsed.expires_at_ms,
+                    persistent: parsed.persistent,
                 });
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -48,6 +79,11 @@ pub fn read_supervisor_stop_file(
         path: first_path.unwrap_or_else(|| supervisor_stop_file_path(harness_home, name)),
         present: false,
         reason: None,
+        service_id: None,
+        created_by: None,
+        created_at_ms: None,
+        expires_at_ms: None,
+        persistent: None,
     })
 }
 
@@ -109,4 +145,15 @@ fn truncate_stop_reason(value: &str) -> String {
     } else {
         truncated
     }
+}
+
+fn parse_stop_file_text(text: &str) -> SupervisorStopFileEnvelope {
+    serde_json::from_str::<SupervisorStopFileEnvelope>(text).unwrap_or(SupervisorStopFileEnvelope {
+        service_id: None,
+        reason: None,
+        created_by: None,
+        created_at_ms: None,
+        expires_at_ms: None,
+        persistent: None,
+    })
 }

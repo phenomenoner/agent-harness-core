@@ -36,6 +36,8 @@ pub struct ChannelOutboxPlanReport {
 #[serde(rename_all = "camelCase")]
 pub struct ChannelOutboxPlanSummary {
     pub total_outbox_lines: usize,
+    pub sampled: bool,
+    pub sampled_bytes: u64,
     pub pending: usize,
     pub delivered: usize,
     pub failed_retryable: usize,
