@@ -2,8 +2,16 @@
 
 ## Unreleased
 
+No changes yet.
+
+## v0.1.1 - 2026-06-21
+
 ### Changed
 
+- Stabilized Round8 gateway loop recovery: runtime queue leases now reap definitely dead legacy `owner="pid:<n>"` owners before queue selection/capacity checks, write `stale-owner-reaped` evidence, and emit a durable `lease-acquired` receipt before execution artifacts are prepared.
+- Made loop heartbeat writes atomic and surfaced corrupt/NUL heartbeat files through explicit `corrupt` / `parseError` status and health fields; `healthz` now warns for degraded progress delivery without marking final reply delivery not live when runtime, ingress, and final outbox loops are otherwise healthy.
+- Bounded progress delivery planning with a persisted progress-ledger byte cursor plus compacted per-queue cached state, preserving first/terminal events while coalescing repeated low-value cached events.
+- Changed generated long-running Windows runner scripts to write process streams directly to per-loop log files instead of using `Tee-Object`; `ops-control stop` now writes structured JSON stop files while preserving legacy plain-text stop-file readability.
 - Reworked `README.md` into a public-facing overview (positioning, architecture diagram, CLI family table, FAQ, dual-license section); moved the internal live-validation, topology, full command walkthrough, and capability ledger content verbatim to `docs/agent-harness-operations-handbook.md`, now referenced from `AGENTS.md` as the session entry point.
 - Replaced the condensed `LICENSE-APACHE` text with the canonical Apache License 2.0 text so GitHub license detection no longer reports "Other".
 - Fixed the placeholder workspace `repository` URL in `Cargo.toml` and added crate `description` metadata.
@@ -25,6 +33,7 @@
 
 ### Added
 
+- Schema registry entries for `agent-harness.progress-delivery-state.v1` and `agent-harness.supervisor-stop-file.v1`.
 - Staging roadmap implementation for P0-P7, Track T, Track M, P6, and P7 direct-code paths.
 - Fail-closed `harness-config.json` validation integrated into activation, worker dispatch, and Codex runtime planning.
 - Runtime retry/dead-letter statuses and receipts for timeout exhaustion.
@@ -55,6 +64,12 @@
 
 ### Verification
 
+- Round8 gateway stability verification: `cargo fmt --all -- --check`
+- Round8 gateway stability verification: `cargo check --workspace --target-dir target\staging-check-round8-gateway-stability`
+- Round8 gateway stability verification: `cargo test -p agent-harness-core --target-dir target\staging-test-round8-gateway-stability-core -- --test-threads=1` (339 tests)
+- Round8 gateway stability verification: `cargo test -p agent-harness-cli --target-dir target\staging-test-round8-gateway-stability-cli -- --test-threads=1` (39 tests)
+- Round8 gateway stability verification: `cargo build -p agent-harness-cli --target-dir target\staging-build-round8-gateway-stability`
+- Round8 gateway stability verification: `target\staging-build-round8-gateway-stability\debug\agent-harness.exe public-hygiene --root .public-export\agent-harness-core` (`forbiddenHits=[]`)
 - Source-home hotfix verification: `cargo fmt --all --check`
 - Source-home hotfix verification: `cargo test -p agent-harness-cli --target-dir target\staging-test-sourcehome-cli -- --test-threads=1` (23 tests)
 - Source-home hotfix verification: `cargo test -p agent-harness-core warns_when_source_home_is_retired_openclaw --target-dir target\staging-test-sourcehome-core -- --test-threads=1`
