@@ -6,12 +6,14 @@
 
 - Added generated runtime-runner process-exit classification for OOM/resource-exhaustion signatures, recording `errorClass` and a bounded `restartAfterSeconds` in `runtime-loop-runner-safe-mode.json`.
 - Generated runtime runners now write a structured temporary stop file for `progress-delivery-loop` and record `memoryGateDecision` before restarting after OOM/resource-exhaustion signatures.
-- `status --json` and `healthz` now expose observe-only supervisor service registry records without changing external runner launch ownership.
+- `status --json` and `healthz` now expose supervisor service registry records, including launch ownership, supervisor PID, restart/backoff, exit, and memory-gate fields.
+- Generated progress delivery runners now launch `supervisor-run --service progress-delivery-loop`, moving the low-risk progress child under Rust supervisor ownership while other loops stay on the existing runner path.
 
 ### Added
 
 - Schema registry entry for `agent-harness.runtime-loop-runner-safe-mode.v1`.
 - Loop heartbeat writers now emit `generationId` metadata and per-service `agent-harness.supervisor-service-state.v1` records under `state/supervisor/services`.
+- Added `supervisor-run` for Rust-owned low-risk child supervision, starting with `progress-delivery-loop`.
 
 ### Verification
 
@@ -26,6 +28,7 @@
 - Round8 memory-pressure gate verification: `cargo test -p agent-harness-core --target-dir target\staging-test-round8-memory-gate-core-full -- --test-threads=1` (341 tests)
 - Round8 memory-pressure gate verification: `cargo build -p agent-harness-cli --target-dir target\staging-build-round8-memory-gate`
 - Round8 memory-pressure gate verification: public export and changed operator docs/skill path hygiene (`forbiddenHits=[]`)
+- Round8 supervisor-owned progress verification: `cargo fmt --all -- --check`, `cargo check --workspace --target-dir target\staging-check-round8-supervisor-progress`, full core tests (341), full CLI tests (40), `cargo build -p agent-harness-cli --target-dir target\staging-build-round8-supervisor-progress`, `git diff --check`, focused supervisor-run/status/health/schema coverage, public export hygiene (`forbiddenHits=[]`), and changed public/operator docs path hygiene (`forbiddenHits=[]`).
 
 ## v0.1.1 - 2026-06-21
 

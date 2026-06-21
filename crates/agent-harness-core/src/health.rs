@@ -81,6 +81,7 @@ pub struct HealthzSupervisorService {
     pub generation_id: Option<String>,
     pub process_id: Option<i64>,
     pub process_alive: Option<bool>,
+    pub supervisor_process_id: Option<i64>,
     pub corrupt: bool,
     pub parse_error: Option<String>,
     pub stale: bool,
@@ -92,6 +93,13 @@ pub struct HealthzSupervisorService {
     pub started_at_ms: Option<i64>,
     pub last_heartbeat_at_ms: Option<i64>,
     pub last_successful_iteration_at_ms: Option<i64>,
+    pub last_exit_at_ms: Option<i64>,
+    pub last_exit_code: Option<i64>,
+    pub last_error_class: Option<String>,
+    pub restart_count: Option<i64>,
+    pub backoff_until_ms: Option<i64>,
+    pub memory_gate_action: Option<String>,
+    pub memory_gate_reason: Option<String>,
     pub observed_only: Option<bool>,
 }
 
@@ -178,6 +186,7 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
                 generation_id: service.generation_id.clone(),
                 process_id: service.process_id,
                 process_alive: service.process_alive,
+                supervisor_process_id: service.supervisor_process_id,
                 corrupt: service.corrupt,
                 parse_error: service.parse_error.clone(),
                 stale,
@@ -189,6 +198,13 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
                 started_at_ms: service.started_at_ms,
                 last_heartbeat_at_ms: service.last_heartbeat_at_ms,
                 last_successful_iteration_at_ms: service.last_successful_iteration_at_ms,
+                last_exit_at_ms: service.last_exit_at_ms,
+                last_exit_code: service.last_exit_code,
+                last_error_class: service.last_error_class.clone(),
+                restart_count: service.restart_count,
+                backoff_until_ms: service.backoff_until_ms,
+                memory_gate_action: service.memory_gate_action.clone(),
+                memory_gate_reason: service.memory_gate_reason.clone(),
                 observed_only: service.observed_only,
             }
         })
@@ -359,10 +375,20 @@ mod tests {
                 "serviceKind": "runtime",
                 "generationId": "runtime-loop-test-generation",
                 "pid": std::process::id(),
+                "supervisorPid": 4242,
                 "startedAtMs": now_ms - 1_000,
                 "processStartTimeMs": now_ms - 1_000,
                 "lastHeartbeatAtMs": now_ms,
                 "lastSuccessfulIterationAtMs": now_ms,
+                "lastExitAtMs": now_ms - 100,
+                "lastExitCode": 1,
+                "lastErrorClass": "process-exit",
+                "restartCount": 2,
+                "backoffUntilMs": now_ms + 60_000,
+                "memoryGateDecision": {
+                    "action": "pause-low-priority-service",
+                    "reason": "resource-exhausted"
+                },
                 "iteration": 23,
                 "status": "no-work",
                 "desiredState": "running",
@@ -397,6 +423,23 @@ mod tests {
             Some(i64::from(std::process::id()))
         );
         assert_eq!(runtime_service.process_alive, Some(true));
+        assert_eq!(runtime_service.supervisor_process_id, Some(4242));
+        assert_eq!(runtime_service.last_exit_at_ms, Some(now_ms - 100));
+        assert_eq!(runtime_service.last_exit_code, Some(1));
+        assert_eq!(
+            runtime_service.last_error_class.as_deref(),
+            Some("process-exit")
+        );
+        assert_eq!(runtime_service.restart_count, Some(2));
+        assert_eq!(runtime_service.backoff_until_ms, Some(now_ms + 60_000));
+        assert_eq!(
+            runtime_service.memory_gate_action.as_deref(),
+            Some("pause-low-priority-service")
+        );
+        assert_eq!(
+            runtime_service.memory_gate_reason.as_deref(),
+            Some("resource-exhausted")
+        );
         assert_eq!(runtime_service.iteration, Some(23));
         assert_eq!(runtime_service.status.as_deref(), Some("no-work"));
         assert_eq!(runtime_service.desired_state.as_deref(), Some("running"));

@@ -260,15 +260,21 @@ pub fn write_windows_supervisor_plan(
         let runner_script = scripts_dir.join(format!("{component}.ps1"));
         let stop_file = stop_dir.join(format!("{component}.stop"));
         let args = vec![
+            "supervisor-run".to_string(),
+            "--service".to_string(),
             "progress-delivery-loop".to_string(),
             "--harness-home".to_string(),
             path_arg(&harness_home),
-            "--iterations".to_string(),
+            "--harness-cli".to_string(),
+            path_arg(&harness_cli),
+            "--child-iterations".to_string(),
             "0".to_string(),
             "--idle-ms".to_string(),
             options.idle_ms.to_string(),
             "--max-consecutive-errors".to_string(),
             options.max_consecutive_errors.to_string(),
+            "--restart-delay-ms".to_string(),
+            "60000".to_string(),
             "--stop-file".to_string(),
             path_arg(&stop_file),
         ];
@@ -918,6 +924,10 @@ mod tests {
         )
         .unwrap();
         assert!(progress_script.contains("progress-delivery-loop"));
+        assert!(progress_script.contains("supervisor-run"));
+        assert!(progress_script.contains("--service"));
+        assert!(progress_script.contains("--child-iterations"));
+        assert!(progress_script.contains("--restart-delay-ms"));
         assert!(!progress_script.contains("Tee-Object"));
         assert!(progress_script.contains("*> $LogFile"));
         let discord_outbox_script =

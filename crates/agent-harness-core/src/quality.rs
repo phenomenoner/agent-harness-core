@@ -188,7 +188,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.supervisor-service-state.v1",
             owner_module: "supervisor",
-            compatibility: "observe-only service state JSON may add diagnostic fields in v1; launch ownership remains external during migration",
+            compatibility: "service state JSON may add diagnostic fields in v1; launchOwner distinguishes observe-only external runners from rust-supervisor-run children",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.queue-shadow-compare.v1",

@@ -192,6 +192,7 @@ fn main() {
         "ops-cutover-status" => run_ops_cutover_status(&rest),
         "ops-cutover-receipt" => run_ops_cutover_receipt(&rest),
         "ops-control" => run_ops_control(&rest),
+        "supervisor-run" => run_supervisor_run(&rest),
         "supervisor-plan" => run_supervisor_plan(&rest),
         "harness-skills-sync" => run_harness_skills_sync(&rest),
         "skills" => run_skills(&rest),
@@ -2732,6 +2733,269 @@ fn run_progress_delivery_loop(args: &[String]) -> Result<(), String> {
         thread::sleep(Duration::from_millis(args.idle_ms));
     }
     Ok(())
+}
+
+fn run_supervisor_run(args: &[String]) -> Result<(), String> {
+    let args = supervisor_run_args_from_args(args)?;
+    let mut restarts = 0usize;
+    let mut launches = 0usize;
+
+    loop {
+        if stop_file_requested(args.stop_file.as_deref()) {
+            write_supervisor_run_state(&args, None, None, "stopped", "stopped by stop file")?;
+            println!(
+                "supervisor-run {} stop requested after {launches} launch(es)",
+                args.service
+            );
+            return Ok(());
+        }
+
+        launches += 1;
+        let started_at_ms = current_time_ms()?;
+        let generation_id = format!(
+            "{}-supervised-{}-{}-{}",
+            args.service,
+            std::process::id(),
+            started_at_ms,
+            launches
+        );
+        let mut command = Command::new(&args.harness_cli);
+        command
+            .args(supervisor_child_args(&args))
+            .env("AGENT_HARNESS_SERVICE_GENERATION_ID", &generation_id)
+            .env(
+                "AGENT_HARNESS_SERVICE_STARTED_AT_MS",
+                started_at_ms.to_string(),
+            )
+            .env(
+                "AGENT_HARNESS_SUPERVISOR_LAUNCH_OWNER",
+                "rust-supervisor-run",
+            )
+            .env("AGENT_HARNESS_SUPERVISOR_OBSERVED_ONLY", "false")
+            .env(
+                "AGENT_HARNESS_SUPERVISOR_PARENT_PID",
+                std::process::id().to_string(),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                let detail = format!(
+                    "failed to start supervised {} child with {}: {err}",
+                    args.service,
+                    args.harness_cli.display()
+                );
+                let _ = write_supervisor_run_state(&args, None, None, "failed", &detail);
+                return Err(detail);
+            }
+        };
+        let child_pid = child.id();
+        write_supervisor_run_state(
+            &args,
+            Some(SupervisedChildRuntimeState {
+                pid: child_pid,
+                generation_id: generation_id.clone(),
+                started_at_ms,
+                last_exit_at_ms: None,
+                last_exit_code: None,
+                last_error_class: None,
+                restart_count: restarts,
+                backoff_until_ms: None,
+            }),
+            None,
+            "running",
+            "supervisor child running",
+        )?;
+
+        let status = child.wait().map_err(|err| {
+            format!(
+                "failed waiting for supervised {} child pid={child_pid}: {err}",
+                args.service
+            )
+        })?;
+        let exit_code = status.code();
+        let exit_code_text = exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "terminated".to_string());
+        let exit_at_ms = current_time_ms()?;
+        if status.success() {
+            let (actual_state, detail) = if stop_file_requested(args.stop_file.as_deref()) {
+                (
+                    "stopped",
+                    format!("child stopped by stop file with code {exit_code_text}"),
+                )
+            } else {
+                (
+                    "exited",
+                    format!("child exited successfully with code {exit_code_text}"),
+                )
+            };
+            write_supervisor_run_state(
+                &args,
+                Some(SupervisedChildRuntimeState {
+                    pid: child_pid,
+                    generation_id,
+                    started_at_ms,
+                    last_exit_at_ms: Some(exit_at_ms),
+                    last_exit_code: exit_code,
+                    last_error_class: None,
+                    restart_count: restarts,
+                    backoff_until_ms: None,
+                }),
+                None,
+                actual_state,
+                &detail,
+            )?;
+            return Ok(());
+        }
+
+        restarts += 1;
+        let error_class = "process-exit".to_string();
+        if args.max_restarts > 0 && restarts > args.max_restarts {
+            write_supervisor_run_state(
+                &args,
+                Some(SupervisedChildRuntimeState {
+                    pid: child_pid,
+                    generation_id,
+                    started_at_ms,
+                    last_exit_at_ms: Some(exit_at_ms),
+                    last_exit_code: exit_code,
+                    last_error_class: Some(error_class),
+                    restart_count: restarts,
+                    backoff_until_ms: None,
+                }),
+                None,
+                "failed",
+                &format!("child exit code {exit_code_text}; restart limit exceeded"),
+            )?;
+            return Err(format!(
+                "supervisor-run {} exceeded restart limit {}; last exit code {exit_code_text}",
+                args.service, args.max_restarts
+            ));
+        }
+
+        let backoff_until_ms = exit_at_ms.saturating_add(args.restart_delay_ms as i64);
+        write_supervisor_run_state(
+            &args,
+            Some(SupervisedChildRuntimeState {
+                pid: child_pid,
+                generation_id,
+                started_at_ms,
+                last_exit_at_ms: Some(exit_at_ms),
+                last_exit_code: exit_code,
+                last_error_class: Some(error_class),
+                restart_count: restarts,
+                backoff_until_ms: Some(backoff_until_ms),
+            }),
+            None,
+            "restart-backoff",
+            &format!(
+                "child exit code {exit_code_text}; restart {restarts} after {}ms",
+                args.restart_delay_ms
+            ),
+        )?;
+        if supervisor_backoff_stop_requested(args.restart_delay_ms, args.stop_file.as_deref()) {
+            write_supervisor_run_state(&args, None, None, "stopped", "stopped by stop file")?;
+            return Ok(());
+        }
+    }
+}
+
+fn supervisor_backoff_stop_requested(delay_ms: u64, stop_file: Option<&Path>) -> bool {
+    let mut remaining_ms = delay_ms;
+    while remaining_ms > 0 {
+        if stop_file_requested(stop_file) {
+            return true;
+        }
+        let sleep_ms = remaining_ms.min(1_000);
+        thread::sleep(Duration::from_millis(sleep_ms));
+        remaining_ms = remaining_ms.saturating_sub(sleep_ms);
+    }
+    stop_file_requested(stop_file)
+}
+
+fn supervisor_child_args(args: &SupervisorRunArgs) -> Vec<String> {
+    match args.service.as_str() {
+        "progress-delivery-loop" => {
+            let mut child_args = vec![
+                "progress-delivery-loop".to_string(),
+                "--harness-home".to_string(),
+                args.target_home.display().to_string(),
+                "--iterations".to_string(),
+                args.child_iterations.to_string(),
+                "--idle-ms".to_string(),
+                args.idle_ms.to_string(),
+                "--max-consecutive-errors".to_string(),
+                args.max_consecutive_errors.to_string(),
+            ];
+            if let Some(stop_file) = &args.stop_file {
+                child_args.extend(["--stop-file".to_string(), stop_file.display().to_string()]);
+            }
+            child_args
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn write_supervisor_run_state(
+    args: &SupervisorRunArgs,
+    runtime: Option<SupervisedChildRuntimeState>,
+    memory_gate_decision: Option<serde_json::Value>,
+    actual_state: &str,
+    detail: &str,
+) -> Result<(), String> {
+    let dir = args
+        .target_home
+        .join("state")
+        .join("supervisor")
+        .join("services");
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let now_ms = current_time_ms()?;
+    let desired_state = if actual_state == "stopped" {
+        "stopped"
+    } else {
+        "running"
+    };
+    let generation_id = runtime
+        .as_ref()
+        .map(|runtime| runtime.generation_id.clone())
+        .unwrap_or_else(|| format!("{}-supervisor-{}", args.service, std::process::id()));
+    let service = serde_json::json!({
+        "schema": "agent-harness.supervisor-service-state.v1",
+        "serviceId": args.service,
+        "serviceKind": loop_service_kind(&args.service),
+        "generationId": generation_id,
+        "pid": runtime.as_ref().map(|runtime| runtime.pid),
+        "processId": runtime.as_ref().map(|runtime| runtime.pid),
+        "supervisorPid": std::process::id(),
+        "processStartTimeMs": runtime.as_ref().map(|runtime| runtime.started_at_ms),
+        "startedAtMs": runtime.as_ref().map(|runtime| runtime.started_at_ms),
+        "lastHeartbeatAtMs": now_ms,
+        "lastSuccessfulIterationAtMs": if actual_state == "running" { Some(now_ms) } else { None },
+        "lastExitAtMs": runtime.as_ref().and_then(|runtime| runtime.last_exit_at_ms),
+        "lastExitCode": runtime.as_ref().and_then(|runtime| runtime.last_exit_code),
+        "lastErrorClass": runtime.as_ref().and_then(|runtime| runtime.last_error_class.clone()),
+        "restartCount": runtime.as_ref().map(|runtime| runtime.restart_count),
+        "backoffUntilMs": runtime.as_ref().and_then(|runtime| runtime.backoff_until_ms),
+        "iteration": runtime.as_ref().map(|runtime| runtime.restart_count),
+        "status": actual_state,
+        "desiredState": desired_state,
+        "actualState": actual_state,
+        "detail": detail,
+        "launchOwner": "rust-supervisor-run",
+        "observedOnly": false,
+        "memoryGateDecision": memory_gate_decision,
+    });
+    let file = dir.join(format!("{}.json", args.service));
+    write_json_atomic(&file, &service).map_err(|err| {
+        format!(
+            "failed to write supervisor service state {}: {err}",
+            file.display()
+        )
+    })
 }
 
 fn execute_progress_delivery_once(
@@ -6648,6 +6912,31 @@ struct MemoryServiceStoreArgs {
     json: bool,
 }
 
+#[derive(Debug, Clone)]
+struct SupervisorRunArgs {
+    target_home: PathBuf,
+    service: String,
+    harness_cli: PathBuf,
+    idle_ms: u64,
+    max_consecutive_errors: usize,
+    restart_delay_ms: u64,
+    max_restarts: usize,
+    child_iterations: usize,
+    stop_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct SupervisedChildRuntimeState {
+    pid: u32,
+    generation_id: String,
+    started_at_ms: i64,
+    last_exit_at_ms: Option<i64>,
+    last_exit_code: Option<i32>,
+    last_error_class: Option<String>,
+    restart_count: usize,
+    backoff_until_ms: Option<i64>,
+}
+
 struct SupervisorPlanArgs {
     target_home: PathBuf,
     source_home: PathBuf,
@@ -8912,6 +9201,58 @@ fn ops_control_args_from_args(args: &[String]) -> Result<OpsControlArgs, String>
         action: action.ok_or_else(|| "ops-control requires stop, start, or status".to_string())?,
         reason,
         live_control_token,
+    })
+}
+
+fn supervisor_run_args_from_args(args: &[String]) -> Result<SupervisorRunArgs, String> {
+    let options = SimpleOptions::parse(
+        args,
+        "supervisor-run",
+        &[
+            "--service",
+            "--harness-cli",
+            "--idle-ms",
+            "--max-consecutive-errors",
+            "--restart-delay-ms",
+            "--max-restarts",
+            "--child-iterations",
+            "--stop-file",
+        ],
+        &[],
+    )?;
+    let service = options.required("--service")?;
+    if service != "progress-delivery-loop" {
+        return Err(format!(
+            "supervisor-run currently supports progress-delivery-loop only, got {service}"
+        ));
+    }
+    let max_consecutive_errors = options
+        .optional_usize("--max-consecutive-errors")?
+        .unwrap_or(5);
+    if max_consecutive_errors == 0 {
+        return Err("--max-consecutive-errors must be greater than zero".to_string());
+    }
+    let harness_cli = options
+        .optional("--harness-cli")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_harness_cli);
+    let idle_ms = options.optional_u64("--idle-ms")?.unwrap_or(1_000);
+    let restart_delay_ms = options
+        .optional_u64("--restart-delay-ms")?
+        .unwrap_or(60_000);
+    let max_restarts = options.optional_usize("--max-restarts")?.unwrap_or(0);
+    let child_iterations = options.optional_usize("--child-iterations")?.unwrap_or(0);
+    let stop_file = options.optional("--stop-file").map(PathBuf::from);
+    Ok(SupervisorRunArgs {
+        target_home: options.target_home,
+        service,
+        harness_cli,
+        idle_ms,
+        max_consecutive_errors,
+        restart_delay_ms,
+        max_restarts,
+        child_iterations,
+        stop_file,
     })
 }
 
@@ -14539,8 +14880,12 @@ fn write_loop_heartbeat(
     fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
     let at_ms = current_time_ms()?;
     let process_id = std::process::id();
-    let started_at_ms = *LOOP_PROCESS_STARTED_AT_MS.get_or_init(|| at_ms);
-    let generation_id = loop_generation_id(name, process_id, started_at_ms);
+    let started_at_ms = env_i64("AGENT_HARNESS_SERVICE_STARTED_AT_MS")
+        .unwrap_or_else(|| *LOOP_PROCESS_STARTED_AT_MS.get_or_init(|| at_ms));
+    let generation_id = env::var("AGENT_HARNESS_SERVICE_GENERATION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| loop_generation_id(name, process_id, started_at_ms));
     let heartbeat = serde_json::json!({
         "schema": "agent-harness.loop-heartbeat.v1",
         "name": name,
@@ -14602,6 +14947,23 @@ fn loop_status_success_timestamp(status: &str, at_ms: i64) -> Option<i64> {
     }
 }
 
+fn env_i64(name: &str) -> Option<i64> {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    env::var(name).ok().and_then(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_supervisor_service_state(
     harness_home: &Path,
@@ -14620,6 +14982,12 @@ fn write_supervisor_service_state(
         .join("supervisor")
         .join("services");
     fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let launch_owner = env::var("AGENT_HARNESS_SUPERVISOR_LAUNCH_OWNER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "external-runner-observe-only".to_string());
+    let observed_only = env_bool("AGENT_HARNESS_SUPERVISOR_OBSERVED_ONLY").unwrap_or(true);
+    let supervisor_pid = env_i64("AGENT_HARNESS_SUPERVISOR_PARENT_PID");
     let service = serde_json::json!({
         "schema": "agent-harness.supervisor-service-state.v1",
         "serviceId": name,
@@ -14637,8 +15005,9 @@ fn write_supervisor_service_state(
         "actualState": status,
         "detail": detail,
         "heartbeatFile": heartbeat_file.display().to_string(),
-        "launchOwner": "external-runner-observe-only",
-        "observedOnly": true,
+        "launchOwner": launch_owner,
+        "observedOnly": observed_only,
+        "supervisorPid": supervisor_pid,
     });
     let file = dir.join(format!("{name}.json"));
     write_json_atomic(&file, &service).map_err(|err| {
@@ -16550,6 +16919,7 @@ fn print_help() {
     println!("  ops-cutover-status Inspect cutover tickets and optional token status");
     println!("  ops-cutover-receipt Record readiness summary for cutover audit");
     println!("  ops-control     Create/clear/inspect supervisor stop files");
+    println!("  supervisor-run  Own and restart a low-risk child service");
     println!("  supervisor-plan Generate Windows scheduled-task scripts for harness loops");
     println!("  harness-skills-sync Sync bundled harness operation skills");
     println!("  skills          Build a skill-first index and optionally match a task");
@@ -16919,6 +17289,72 @@ mod tests {
                 .map(|entry| entry.path())
                 .collect::<Vec<_>>()
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn supervisor_run_progress_child_args_wrap_progress_delivery_loop() {
+        let root = cli_temp_root("supervisor_run_progress_child_args");
+        let harness_home = root.join(".agent-harness");
+        let stop_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("stop")
+            .join("progress-delivery-loop.stop");
+        let harness_cli = root.join("agent-harness.exe");
+        let args = supervisor_run_args_from_args(&[
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--service".to_string(),
+            "progress-delivery-loop".to_string(),
+            "--harness-cli".to_string(),
+            harness_cli.display().to_string(),
+            "--idle-ms".to_string(),
+            "25".to_string(),
+            "--max-consecutive-errors".to_string(),
+            "3".to_string(),
+            "--restart-delay-ms".to_string(),
+            "50".to_string(),
+            "--max-restarts".to_string(),
+            "2".to_string(),
+            "--child-iterations".to_string(),
+            "7".to_string(),
+            "--stop-file".to_string(),
+            stop_file.display().to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(args.target_home, harness_home);
+        assert_eq!(args.service, "progress-delivery-loop");
+        assert_eq!(args.harness_cli, harness_cli);
+        assert_eq!(args.idle_ms, 25);
+        assert_eq!(args.max_consecutive_errors, 3);
+        assert_eq!(args.restart_delay_ms, 50);
+        assert_eq!(args.max_restarts, 2);
+        assert_eq!(args.child_iterations, 7);
+        assert_eq!(args.stop_file.as_deref(), Some(stop_file.as_path()));
+
+        let child_args = supervisor_child_args(&args);
+        let has_pair = |flag: &str, value: String| {
+            child_args
+                .windows(2)
+                .any(|pair| pair[0] == flag && pair[1] == value)
+        };
+        assert_eq!(child_args[0], "progress-delivery-loop");
+        assert!(has_pair(
+            "--harness-home",
+            harness_home.display().to_string()
+        ));
+        assert!(has_pair("--iterations", "7".to_string()));
+        assert!(has_pair("--idle-ms", "25".to_string()));
+        assert!(has_pair("--max-consecutive-errors", "3".to_string()));
+        assert!(has_pair("--stop-file", stop_file.display().to_string()));
+
+        let unsupported =
+            supervisor_run_args_from_args(&["--service".to_string(), "runtime-loop".to_string()])
+                .unwrap_err();
+        assert!(unsupported.contains("progress-delivery-loop only"));
 
         let _ = fs::remove_dir_all(root);
     }

@@ -163,10 +163,18 @@ pub struct HarnessSupervisorServiceStatus {
     pub generation_id: Option<String>,
     pub process_id: Option<i64>,
     pub process_alive: Option<bool>,
+    pub supervisor_process_id: Option<i64>,
     pub started_at_ms: Option<i64>,
     pub process_start_time_ms: Option<i64>,
     pub last_heartbeat_at_ms: Option<i64>,
     pub last_successful_iteration_at_ms: Option<i64>,
+    pub last_exit_at_ms: Option<i64>,
+    pub last_exit_code: Option<i64>,
+    pub last_error_class: Option<String>,
+    pub restart_count: Option<i64>,
+    pub backoff_until_ms: Option<i64>,
+    pub memory_gate_action: Option<String>,
+    pub memory_gate_reason: Option<String>,
     pub age_ms: Option<i64>,
     pub iteration: Option<i64>,
     pub status: Option<String>,
@@ -475,10 +483,18 @@ fn read_supervisor_services(
                     generation_id: None,
                     process_id: None,
                     process_alive: None,
+                    supervisor_process_id: None,
                     started_at_ms: None,
                     process_start_time_ms: None,
                     last_heartbeat_at_ms: None,
                     last_successful_iteration_at_ms: None,
+                    last_exit_at_ms: None,
+                    last_exit_code: None,
+                    last_error_class: None,
+                    restart_count: None,
+                    backoff_until_ms: None,
+                    memory_gate_action: None,
+                    memory_gate_reason: None,
                     age_ms: None,
                     iteration: None,
                     status: None,
@@ -503,10 +519,18 @@ fn read_supervisor_services(
             generation_id: string_path(&value, &["generationId"]),
             process_id,
             process_alive: process_id.and_then(process_alive_for_pid),
+            supervisor_process_id: i64_path(&value, &["supervisorPid"]),
             started_at_ms: i64_path(&value, &["startedAtMs"]),
             process_start_time_ms: i64_path(&value, &["processStartTimeMs"]),
             last_heartbeat_at_ms,
             last_successful_iteration_at_ms: i64_path(&value, &["lastSuccessfulIterationAtMs"]),
+            last_exit_at_ms: i64_path(&value, &["lastExitAtMs"]),
+            last_exit_code: i64_path(&value, &["lastExitCode"]),
+            last_error_class: string_path(&value, &["lastErrorClass"]),
+            restart_count: i64_path(&value, &["restartCount"]),
+            backoff_until_ms: i64_path(&value, &["backoffUntilMs"]),
+            memory_gate_action: string_path(&value, &["memoryGateDecision", "action"]),
+            memory_gate_reason: string_path(&value, &["memoryGateDecision", "reason"]),
             age_ms: last_heartbeat_at_ms.map(|at_ms| now_ms.saturating_sub(at_ms)),
             iteration: i64_path(&value, &["iteration"]),
             status: string_path(&value, &["status"]),
@@ -2033,10 +2057,20 @@ mod tests {
                 "serviceKind": "runtime",
                 "generationId": "runtime-loop-test-generation",
                 "pid": std::process::id(),
+                "supervisorPid": 4242,
                 "processStartTimeMs": now_ms - 500,
                 "startedAtMs": now_ms - 500,
                 "lastHeartbeatAtMs": now_ms - 10,
                 "lastSuccessfulIterationAtMs": now_ms - 10,
+                "lastExitAtMs": now_ms - 5,
+                "lastExitCode": 1,
+                "lastErrorClass": "process-exit",
+                "restartCount": 2,
+                "backoffUntilMs": now_ms + 60_000,
+                "memoryGateDecision": {
+                    "action": "pause-low-priority-service",
+                    "reason": "resource-exhausted"
+                },
                 "iteration": 17,
                 "status": "no-work",
                 "desiredState": "running",
@@ -2068,12 +2102,29 @@ mod tests {
             Some(i64::from(std::process::id()))
         );
         assert_eq!(runtime_service.process_alive, Some(true));
+        assert_eq!(runtime_service.supervisor_process_id, Some(4242));
         assert_eq!(runtime_service.started_at_ms, Some(now_ms - 500));
         assert_eq!(runtime_service.process_start_time_ms, Some(now_ms - 500));
         assert_eq!(runtime_service.last_heartbeat_at_ms, Some(now_ms - 10));
         assert_eq!(
             runtime_service.last_successful_iteration_at_ms,
             Some(now_ms - 10)
+        );
+        assert_eq!(runtime_service.last_exit_at_ms, Some(now_ms - 5));
+        assert_eq!(runtime_service.last_exit_code, Some(1));
+        assert_eq!(
+            runtime_service.last_error_class.as_deref(),
+            Some("process-exit")
+        );
+        assert_eq!(runtime_service.restart_count, Some(2));
+        assert_eq!(runtime_service.backoff_until_ms, Some(now_ms + 60_000));
+        assert_eq!(
+            runtime_service.memory_gate_action.as_deref(),
+            Some("pause-low-priority-service")
+        );
+        assert_eq!(
+            runtime_service.memory_gate_reason.as_deref(),
+            Some("resource-exhausted")
         );
         assert!(runtime_service.age_ms.is_some_and(|age_ms| age_ms >= 0));
         assert_eq!(runtime_service.iteration, Some(17));
