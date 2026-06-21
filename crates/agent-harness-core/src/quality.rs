@@ -186,6 +186,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "runner safe-mode JSON may add diagnostic fields in v1; restartAfterSeconds remains advisory",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.supervisor-service-state.v1",
+            owner_module: "supervisor",
+            compatibility: "observe-only service state JSON may add diagnostic fields in v1; launch ownership remains external during migration",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.queue-shadow-compare.v1",
             owner_module: "queue_shadow",
             compatibility: "additive divergence fields only in v1",

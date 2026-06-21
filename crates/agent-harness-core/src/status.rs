@@ -122,6 +122,8 @@ pub struct HarnessOutboxStatus {
 pub struct HarnessLoopStatus {
     pub heartbeat_dir: PathBuf,
     pub heartbeats: Vec<HarnessLoopHeartbeatStatus>,
+    pub services_dir: PathBuf,
+    pub services: Vec<HarnessSupervisorServiceStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -147,6 +149,32 @@ pub struct HarnessLoopHeartbeatStatus {
     pub stop_file_created_at_ms: Option<i64>,
     pub stop_file_expires_at_ms: Option<i64>,
     pub stop_file_persistent: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessSupervisorServiceStatus {
+    pub service_id: String,
+    pub service_file: PathBuf,
+    pub present: bool,
+    pub corrupt: bool,
+    pub parse_error: Option<String>,
+    pub service_kind: Option<String>,
+    pub generation_id: Option<String>,
+    pub process_id: Option<i64>,
+    pub process_alive: Option<bool>,
+    pub started_at_ms: Option<i64>,
+    pub process_start_time_ms: Option<i64>,
+    pub last_heartbeat_at_ms: Option<i64>,
+    pub last_successful_iteration_at_ms: Option<i64>,
+    pub age_ms: Option<i64>,
+    pub iteration: Option<i64>,
+    pub status: Option<String>,
+    pub desired_state: Option<String>,
+    pub actual_state: Option<String>,
+    pub detail: Option<String>,
+    pub launch_owner: Option<String>,
+    pub observed_only: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -393,10 +421,104 @@ fn loop_status(harness_home: &Path) -> io::Result<HarnessLoopStatus> {
         let heartbeat = read_loop_heartbeat(harness_home, &name, &heartbeat_file, now_ms)?;
         heartbeats.push(heartbeat);
     }
+    let services_dir = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("services");
+    let services = read_supervisor_services(&services_dir, now_ms)?;
     Ok(HarnessLoopStatus {
         heartbeat_dir,
         heartbeats,
+        services_dir,
+        services,
     })
+}
+
+fn read_supervisor_services(
+    services_dir: &Path,
+    now_ms: i64,
+) -> io::Result<Vec<HarnessSupervisorServiceStatus>> {
+    let mut service_files = Vec::new();
+    match fs::read_dir(services_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                    service_files.push(path);
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    service_files.sort();
+
+    let mut services = Vec::new();
+    for service_file in service_files {
+        let fallback_service_id = service_file
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("unknown-service")
+            .to_string();
+        let text = fs::read_to_string(&service_file)?;
+        let value = match serde_json::from_str::<Value>(&text) {
+            Ok(value) => value,
+            Err(error) => {
+                services.push(HarnessSupervisorServiceStatus {
+                    service_id: fallback_service_id,
+                    service_file,
+                    present: true,
+                    corrupt: true,
+                    parse_error: Some(error.to_string()),
+                    service_kind: None,
+                    generation_id: None,
+                    process_id: None,
+                    process_alive: None,
+                    started_at_ms: None,
+                    process_start_time_ms: None,
+                    last_heartbeat_at_ms: None,
+                    last_successful_iteration_at_ms: None,
+                    age_ms: None,
+                    iteration: None,
+                    status: None,
+                    desired_state: None,
+                    actual_state: None,
+                    detail: None,
+                    launch_owner: None,
+                    observed_only: None,
+                });
+                continue;
+            }
+        };
+        let process_id = i64_path(&value, &["pid"]).or_else(|| i64_path(&value, &["processId"]));
+        let last_heartbeat_at_ms = i64_path(&value, &["lastHeartbeatAtMs"]);
+        services.push(HarnessSupervisorServiceStatus {
+            service_id: string_path(&value, &["serviceId"]).unwrap_or(fallback_service_id),
+            service_file,
+            present: true,
+            corrupt: false,
+            parse_error: None,
+            service_kind: string_path(&value, &["serviceKind"]),
+            generation_id: string_path(&value, &["generationId"]),
+            process_id,
+            process_alive: process_id.and_then(process_alive_for_pid),
+            started_at_ms: i64_path(&value, &["startedAtMs"]),
+            process_start_time_ms: i64_path(&value, &["processStartTimeMs"]),
+            last_heartbeat_at_ms,
+            last_successful_iteration_at_ms: i64_path(&value, &["lastSuccessfulIterationAtMs"]),
+            age_ms: last_heartbeat_at_ms.map(|at_ms| now_ms.saturating_sub(at_ms)),
+            iteration: i64_path(&value, &["iteration"]),
+            status: string_path(&value, &["status"]),
+            desired_state: string_path(&value, &["desiredState"]),
+            actual_state: string_path(&value, &["actualState"]),
+            detail: string_path(&value, &["detail"]),
+            launch_owner: string_path(&value, &["launchOwner"]),
+            observed_only: bool_path(&value, &["observedOnly"]),
+        });
+    }
+
+    Ok(services)
 }
 
 fn extra_loop_names(harness_home: &Path, heartbeat_dir: &Path) -> io::Result<BTreeSet<String>> {
@@ -625,6 +747,30 @@ fn append_loop_health_warnings(loops: &HarnessLoopStatus, warnings: &mut Vec<Str
             warnings.push(format!(
                 "{} heartbeat references processId={} but that process is not running",
                 loop_status.name, process_id
+            ));
+        }
+    }
+    for service in &loops.services {
+        if service.corrupt {
+            let error = service
+                .parse_error
+                .as_deref()
+                .unwrap_or("invalid supervisor service JSON");
+            warnings.push(format!(
+                "{} supervisor service registry at {} is corrupt: {}",
+                service.service_id,
+                service.service_file.display(),
+                error
+            ));
+        }
+        if service.process_alive == Some(false) {
+            let process_id = service
+                .process_id
+                .map(|process_id| process_id.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            warnings.push(format!(
+                "{} supervisor service registry references pid={} but that process is not running",
+                service.service_id, process_id
             ));
         }
     }
@@ -1565,6 +1711,14 @@ fn i64_path(value: &Value, path: &[&str]) -> Option<i64> {
     current.as_i64()
 }
 
+fn bool_path(value: &Value, path: &[&str]) -> Option<bool> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_bool()
+}
+
 fn epoch_ms() -> io::Result<i64> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1854,6 +2008,88 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("processId=0"))
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loop_status_reads_observe_only_supervisor_service_registry() {
+        let root = temp_root("loop_status_reads_observe_only_supervisor_service_registry");
+        let harness_home = root.join(".agent-harness");
+        let services_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        fs::create_dir_all(&services_dir).unwrap();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        fs::write(
+            services_dir.join("runtime-loop.json"),
+            serde_json::to_string(&serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "runtime-loop",
+                "serviceKind": "runtime",
+                "generationId": "runtime-loop-test-generation",
+                "pid": std::process::id(),
+                "processStartTimeMs": now_ms - 500,
+                "startedAtMs": now_ms - 500,
+                "lastHeartbeatAtMs": now_ms - 10,
+                "lastSuccessfulIterationAtMs": now_ms - 10,
+                "iteration": 17,
+                "status": "no-work",
+                "desiredState": "running",
+                "actualState": "no-work",
+                "detail": "idle",
+                "launchOwner": "external-runner-observe-only",
+                "observedOnly": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loops = loop_status(&harness_home).unwrap();
+        assert_eq!(loops.services_dir, services_dir);
+        let runtime_service = loops
+            .services
+            .iter()
+            .find(|service| service.service_id == "runtime-loop")
+            .unwrap();
+        assert!(runtime_service.present);
+        assert!(!runtime_service.corrupt);
+        assert_eq!(runtime_service.service_kind.as_deref(), Some("runtime"));
+        assert_eq!(
+            runtime_service.generation_id.as_deref(),
+            Some("runtime-loop-test-generation")
+        );
+        assert_eq!(
+            runtime_service.process_id,
+            Some(i64::from(std::process::id()))
+        );
+        assert_eq!(runtime_service.process_alive, Some(true));
+        assert_eq!(runtime_service.started_at_ms, Some(now_ms - 500));
+        assert_eq!(runtime_service.process_start_time_ms, Some(now_ms - 500));
+        assert_eq!(runtime_service.last_heartbeat_at_ms, Some(now_ms - 10));
+        assert_eq!(
+            runtime_service.last_successful_iteration_at_ms,
+            Some(now_ms - 10)
+        );
+        assert!(runtime_service.age_ms.is_some_and(|age_ms| age_ms >= 0));
+        assert_eq!(runtime_service.iteration, Some(17));
+        assert_eq!(runtime_service.status.as_deref(), Some("no-work"));
+        assert_eq!(runtime_service.desired_state.as_deref(), Some("running"));
+        assert_eq!(runtime_service.actual_state.as_deref(), Some("no-work"));
+        assert_eq!(runtime_service.detail.as_deref(), Some("idle"));
+        assert_eq!(
+            runtime_service.launch_owner.as_deref(),
+            Some("external-runner-observe-only")
+        );
+        assert_eq!(runtime_service.observed_only, Some(true));
+
+        let mut warnings = Vec::new();
+        append_loop_health_warnings(&loops, &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
 
         let _ = fs::remove_dir_all(root);
     }

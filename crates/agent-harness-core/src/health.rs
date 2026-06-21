@@ -27,6 +27,7 @@ pub struct HealthzReport {
     pub queue: HealthzQueue,
     pub outbox: HealthzOutbox,
     pub loops: Vec<HealthzLoop>,
+    pub supervisor_services: Vec<HealthzSupervisorService>,
     pub state: HealthzState,
     pub warnings: Vec<String>,
 }
@@ -70,6 +71,28 @@ pub struct HealthzLoop {
     pub stop_file_created_at_ms: Option<i64>,
     pub stop_file_expires_at_ms: Option<i64>,
     pub stop_file_persistent: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthzSupervisorService {
+    pub service_id: String,
+    pub service_kind: Option<String>,
+    pub generation_id: Option<String>,
+    pub process_id: Option<i64>,
+    pub process_alive: Option<bool>,
+    pub corrupt: bool,
+    pub parse_error: Option<String>,
+    pub stale: bool,
+    pub age_ms: Option<i64>,
+    pub status: Option<String>,
+    pub desired_state: Option<String>,
+    pub actual_state: Option<String>,
+    pub iteration: Option<i64>,
+    pub started_at_ms: Option<i64>,
+    pub last_heartbeat_at_ms: Option<i64>,
+    pub last_successful_iteration_at_ms: Option<i64>,
+    pub observed_only: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -128,6 +151,48 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
             }
         })
         .collect();
+    let supervisor_services: Vec<_> = status
+        .loops
+        .services
+        .iter()
+        .map(|service| {
+            let unhealthy_state = service
+                .actual_state
+                .as_deref()
+                .or(service.status.as_deref())
+                .is_some_and(|state| {
+                    state == "stopped"
+                        || state == "closed"
+                        || state.contains("error")
+                        || state.contains("fail")
+                });
+            let stale = service.corrupt
+                || service
+                    .age_ms
+                    .is_some_and(|age_ms| age_ms > options.loop_stale_ms)
+                || unhealthy_state
+                || service.process_alive == Some(false);
+            HealthzSupervisorService {
+                service_id: service.service_id.clone(),
+                service_kind: service.service_kind.clone(),
+                generation_id: service.generation_id.clone(),
+                process_id: service.process_id,
+                process_alive: service.process_alive,
+                corrupt: service.corrupt,
+                parse_error: service.parse_error.clone(),
+                stale,
+                age_ms: service.age_ms,
+                status: service.status.clone(),
+                desired_state: service.desired_state.clone(),
+                actual_state: service.actual_state.clone(),
+                iteration: service.iteration,
+                started_at_ms: service.started_at_ms,
+                last_heartbeat_at_ms: service.last_heartbeat_at_ms,
+                last_successful_iteration_at_ms: service.last_successful_iteration_at_ms,
+                observed_only: service.observed_only,
+            }
+        })
+        .collect();
     let runtime_loop_unhealthy = loops.iter().any(|item| {
         item.name == "runtime-loop"
             && (item.stale
@@ -183,6 +248,7 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
             sampled_bytes: status.channels.outbox.all.sampled_bytes,
         },
         loops,
+        supervisor_services,
         state,
         warnings,
     })
@@ -265,6 +331,77 @@ mod tests {
                 .iter()
                 .any(|item| item.name == "runtime-loop" && item.stale)
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn healthz_includes_observe_only_supervisor_services() {
+        let root = temp_root("healthz_includes_observe_only_supervisor_services");
+        let harness_home = root.join(".agent-harness");
+        let state = harness_home.join("state");
+        fs::create_dir_all(state.join("runtime-queue")).unwrap();
+        fs::create_dir_all(state.join("channels")).unwrap();
+        fs::create_dir_all(state.join("logs")).unwrap();
+        fs::create_dir_all(state.join("plugin-sidecar")).unwrap();
+        fs::create_dir_all(state.join("memory")).unwrap();
+        let services_dir = state.join("supervisor").join("services");
+        fs::create_dir_all(&services_dir).unwrap();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        write_json_atomic(
+            &services_dir.join("runtime-loop.json"),
+            &serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "runtime-loop",
+                "serviceKind": "runtime",
+                "generationId": "runtime-loop-test-generation",
+                "pid": std::process::id(),
+                "startedAtMs": now_ms - 1_000,
+                "processStartTimeMs": now_ms - 1_000,
+                "lastHeartbeatAtMs": now_ms,
+                "lastSuccessfulIterationAtMs": now_ms,
+                "iteration": 23,
+                "status": "no-work",
+                "desiredState": "running",
+                "actualState": "no-work",
+                "observedOnly": true
+            }),
+        )
+        .unwrap();
+
+        let report = collect_healthz(HealthzOptions {
+            harness_home,
+            now_ms,
+            loop_stale_ms: 120_000,
+            require_writable_state: false,
+        })
+        .unwrap();
+
+        let runtime_service = report
+            .supervisor_services
+            .iter()
+            .find(|service| service.service_id == "runtime-loop")
+            .unwrap();
+        assert!(!runtime_service.corrupt);
+        assert!(!runtime_service.stale);
+        assert_eq!(runtime_service.service_kind.as_deref(), Some("runtime"));
+        assert_eq!(
+            runtime_service.generation_id.as_deref(),
+            Some("runtime-loop-test-generation")
+        );
+        assert_eq!(
+            runtime_service.process_id,
+            Some(i64::from(std::process::id()))
+        );
+        assert_eq!(runtime_service.process_alive, Some(true));
+        assert_eq!(runtime_service.iteration, Some(23));
+        assert_eq!(runtime_service.status.as_deref(), Some("no-work"));
+        assert_eq!(runtime_service.desired_state.as_deref(), Some("running"));
+        assert_eq!(runtime_service.actual_state.as_deref(), Some("no-work"));
+        assert_eq!(runtime_service.observed_only, Some(true));
 
         let _ = fs::remove_dir_all(root);
     }

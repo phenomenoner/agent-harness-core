@@ -9,17 +9,17 @@ use crate::{HARNESS_BUILTIN_SKILL_NAMESPACE, SKILL_FILE_NAME};
 const BUILTIN_HARNESS_SKILL_SYNC_SCHEMA: &str = "agent-harness.builtin-skill-sync.v1";
 const BUILTIN_HARNESS_SKILL_MANIFEST_SCHEMA: &str = "agent-harness.builtin-skill-manifest.v1";
 const AGENT_WINDOWS_HARNESS_SKILL_ID: &str = "agent-windows-harness";
-const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.14";
+const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.15";
 
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
 description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, response tone, and Codex prompt continuity policy.
-version: 0.1.14
+version: 0.1.15
 platforms: [windows]
 metadata:
   agent_harness:
     category: operations
-    tags: [legacy-import, codex, openrouter, telegram, discord, migration, activation, response-tone, reconnect, channel-identity, cron-scheduler, cron-runs, runtime-classes, scheduler-lint, safe-mode]
+    tags: [legacy-import, codex, openrouter, telegram, discord, migration, activation, response-tone, reconnect, channel-identity, cron-scheduler, cron-runs, runtime-classes, scheduler-lint, safe-mode, supervisor-registry]
 ---
 
 # Agent Windows Harness
@@ -109,6 +109,7 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - Runtime queue lease acquisition writes a `lease-acquired` receipt before prompt/execution artifacts are prepared. Use it to distinguish "lease acquired", "execution prepared", "execution started", and "execution completed" in crash diagnostics.
 - `lease-busy` is a retryable non-idle runtime status. Do not report it as idle/no-work; inspect competing runtime-loop processes, the relevant runtime class lease file, or a recently active queue lease.
 - In supervised infinite mode, keep runtime-loop safe-mode restart enabled. After repeated errors, `safe-mode` keeps the process alive with reduced concurrency and writes heartbeat/log evidence; missing/stale/error/stopped/stopping runtime-loop heartbeats are live readiness failures. The generated runtime runner also writes `state/logs/supervisor/runtime-loop-runner-safe-mode.json` after process-level exits, including `errorClass` and `restartAfterSeconds`; `resource-exhausted` indicates an OOM/memory-pressure signature and uses a longer bounded restart delay.
+- Loop heartbeat writers also maintain an observe-only supervisor service registry under `state/supervisor/services/*.json`. `status --json` exposes it as `loops.services`, and `healthz` exposes it as `supervisorServices`. During this migration phase it records `serviceId`, `serviceKind`, `generationId`, `pid`, current iteration, last heartbeat, and desired/actual state without changing external runner launch ownership.
 - Non-matching protocol/config/preflight/spawn failures stay failed-terminal. Gateway restart alone does not resume failed-terminal or dead-letter queue items.
 - `runtimeBackoff` config controls retry caps and delay hints for retryable runtime failures. When retry attempts are exhausted, runtime-run-once dead-letters the item and writes an operator-friendly error reply. Provider/model fallback is operator-guided; the harness should not silently switch providers on behalf of a user turn.
 - Use `queue-retry` for manual recovery of a timeout/dead-letter item. It creates a fresh queue id while preserving `sessionKey`, agent, platform/channel/user, provider/model, selected skills, and planned transcript/trajectory paths.

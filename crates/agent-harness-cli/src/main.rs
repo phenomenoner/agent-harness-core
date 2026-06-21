@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -14537,18 +14537,116 @@ fn write_loop_heartbeat(
         .join("supervisor")
         .join("loop-heartbeats");
     fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let at_ms = current_time_ms()?;
+    let process_id = std::process::id();
+    let started_at_ms = *LOOP_PROCESS_STARTED_AT_MS.get_or_init(|| at_ms);
+    let generation_id = loop_generation_id(name, process_id, started_at_ms);
     let heartbeat = serde_json::json!({
         "schema": "agent-harness.loop-heartbeat.v1",
         "name": name,
+        "serviceId": name,
+        "serviceKind": loop_service_kind(name),
+        "generationId": generation_id,
         "status": status,
         "iteration": iteration,
         "detail": detail,
-        "atMs": current_time_ms()?,
-        "processId": std::process::id(),
+        "atMs": at_ms,
+        "processId": process_id,
     });
     let file = dir.join(format!("{name}.json"));
     write_json_atomic(&file, &heartbeat)
-        .map_err(|err| format!("failed to write loop heartbeat {}: {err}", file.display()))
+        .map_err(|err| format!("failed to write loop heartbeat {}: {err}", file.display()))?;
+    write_supervisor_service_state(
+        harness_home,
+        name,
+        status,
+        iteration,
+        detail,
+        at_ms,
+        process_id,
+        started_at_ms,
+        &generation_id,
+        &file,
+    )
+}
+
+static LOOP_PROCESS_STARTED_AT_MS: OnceLock<i64> = OnceLock::new();
+
+fn loop_generation_id(name: &str, process_id: u32, started_at_ms: i64) -> String {
+    format!("{name}-{process_id}-{started_at_ms}")
+}
+
+fn loop_service_kind(name: &str) -> &'static str {
+    match name {
+        "runtime-loop" => "runtime",
+        "worker-loop" => "worker",
+        "cron-scheduler-loop" => "cron",
+        "progress-delivery-loop" => "progress-delivery",
+        "telegram-loop" => "telegram-ingress",
+        "discord-outbox-loop" => "final-outbox",
+        "discord-gateway-loop" => "discord-gateway",
+        _ if name.starts_with("telegram-loop") => "telegram-ingress",
+        _ => "loop",
+    }
+}
+
+fn loop_status_success_timestamp(status: &str, at_ms: i64) -> Option<i64> {
+    let lowered = status.to_ascii_lowercase();
+    if matches!(lowered.as_str(), "stopped" | "stopping" | "closed")
+        || lowered.contains("error")
+        || lowered.contains("fail")
+    {
+        None
+    } else {
+        Some(at_ms)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_supervisor_service_state(
+    harness_home: &Path,
+    name: &str,
+    status: &str,
+    iteration: usize,
+    detail: &str,
+    at_ms: i64,
+    process_id: u32,
+    started_at_ms: i64,
+    generation_id: &str,
+    heartbeat_file: &Path,
+) -> Result<(), String> {
+    let dir = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("services");
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let service = serde_json::json!({
+        "schema": "agent-harness.supervisor-service-state.v1",
+        "serviceId": name,
+        "serviceKind": loop_service_kind(name),
+        "generationId": generation_id,
+        "pid": process_id,
+        "processId": process_id,
+        "processStartTimeMs": started_at_ms,
+        "startedAtMs": started_at_ms,
+        "lastHeartbeatAtMs": at_ms,
+        "lastSuccessfulIterationAtMs": loop_status_success_timestamp(status, at_ms),
+        "iteration": iteration,
+        "status": status,
+        "desiredState": "running",
+        "actualState": status,
+        "detail": detail,
+        "heartbeatFile": heartbeat_file.display().to_string(),
+        "launchOwner": "external-runner-observe-only",
+        "observedOnly": true,
+    });
+    let file = dir.join(format!("{name}.json"));
+    write_json_atomic(&file, &service).map_err(|err| {
+        format!(
+            "failed to write supervisor service state {}: {err}",
+            file.display()
+        )
+    })
 }
 
 fn format_status(status: &ImportPhaseStatus) -> &'static str {
@@ -16767,6 +16865,47 @@ mod tests {
         assert_eq!(value["status"], "no-work");
         assert_eq!(value["iteration"], 2);
         assert_eq!(value["detail"], "second");
+        assert_eq!(value["serviceId"], "runtime-loop");
+        assert_eq!(value["serviceKind"], "runtime");
+        assert_eq!(
+            value["processId"].as_u64(),
+            Some(u64::from(std::process::id()))
+        );
+        assert!(
+            value["generationId"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("runtime-loop-"))
+        );
+
+        let service_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services")
+            .join("runtime-loop.json");
+        let service: serde_json::Value =
+            serde_json::from_slice(&fs::read(&service_file).unwrap()).unwrap();
+        assert_eq!(
+            service["schema"],
+            "agent-harness.supervisor-service-state.v1"
+        );
+        assert_eq!(service["serviceId"], "runtime-loop");
+        assert_eq!(service["serviceKind"], "runtime");
+        assert_eq!(service["pid"].as_u64(), Some(u64::from(std::process::id())));
+        assert_eq!(
+            service["processId"].as_u64(),
+            Some(u64::from(std::process::id()))
+        );
+        assert_eq!(service["generationId"], value["generationId"]);
+        assert_eq!(service["lastHeartbeatAtMs"], value["atMs"]);
+        assert_eq!(service["lastSuccessfulIterationAtMs"], value["atMs"]);
+        assert_eq!(service["iteration"], 2);
+        assert_eq!(service["actualState"], "no-work");
+        assert_eq!(service["desiredState"], "running");
+        assert_eq!(service["observedOnly"], true);
+        assert_eq!(
+            service["heartbeatFile"],
+            heartbeat_file.display().to_string()
+        );
         let leftovers = fs::read_dir(&heartbeat_dir)
             .unwrap()
             .filter_map(Result::ok)

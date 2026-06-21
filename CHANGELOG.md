@@ -5,10 +5,21 @@
 ### Changed
 
 - Added generated runtime-runner process-exit classification for OOM/resource-exhaustion signatures, recording `errorClass` and a bounded `restartAfterSeconds` in `runtime-loop-runner-safe-mode.json`.
+- `status --json` and `healthz` now expose observe-only supervisor service registry records without changing external runner launch ownership.
 
 ### Added
 
 - Schema registry entry for `agent-harness.runtime-loop-runner-safe-mode.v1`.
+- Loop heartbeat writers now emit `generationId` metadata and per-service `agent-harness.supervisor-service-state.v1` records under `state/supervisor/services`.
+
+### Verification
+
+- Round8 observe-only supervisor registry verification: `cargo fmt --all -- --check`
+- Round8 observe-only supervisor registry verification: `cargo check --workspace --target-dir target\staging-check-round8-supervisor-registry`
+- Round8 observe-only supervisor registry verification: `cargo test -p agent-harness-core --target-dir target\staging-test-round8-supervisor-registry-core-full -- --test-threads=1` (341 tests)
+- Round8 observe-only supervisor registry verification: `cargo test -p agent-harness-cli --target-dir target\staging-test-round8-supervisor-registry-cli-full -- --test-threads=1` (39 tests)
+- Round8 observe-only supervisor registry verification: `cargo build -p agent-harness-cli --target-dir target\staging-build-round8-supervisor-registry`
+- Round8 observe-only supervisor registry verification: `target\staging-build-round8-supervisor-registry\debug\agent-harness.exe public-hygiene --root .public-export\agent-harness-core` plus changed public/operator docs path hygiene (`forbiddenHits=[]`)
 
 ## v0.1.1 - 2026-06-21
 

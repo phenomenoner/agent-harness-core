@@ -30,6 +30,18 @@ The generated stop script creates stop files for each loop. Long-running loops c
 
 `status --json` reports each loop's stop-file path, presence, reason, and structured metadata, and `healthz` treats an active stop file as not live. A fresh heartbeat timestamp is not enough to prove a loop is healthy if the heartbeat is corrupt, references a missing process, or an active stop file remains in `state/supervisor/stop`.
 
+## Observe-Only Service Registry
+
+Loop heartbeat writers also write per-service records under:
+
+```text
+<harness-home>\state\supervisor\services
+```
+
+Each record uses `agent-harness.supervisor-service-state.v1` and includes `serviceId`, `serviceKind`, `generationId`, `pid`, `startedAtMs`, `lastHeartbeatAtMs`, `lastSuccessfulIterationAtMs`, `iteration`, `desiredState`, and `actualState`. `status --json` reports these records under `loops.services`, while `healthz` reports them under `supervisorServices`.
+
+This registry is observe-only in the current migration phase. The existing PowerShell runners still own process launch and restart behavior; the registry gives operators a single service-state surface before supervisor-owned child processes are introduced.
+
 ## Runner Logs
 
 Generated runners write all process streams directly to per-loop log files and rotate old logs with `Select-Object -Skip 20`. They no longer pipe long-running loop output through `Tee-Object`.
