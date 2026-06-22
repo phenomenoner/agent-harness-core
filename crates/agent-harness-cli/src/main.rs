@@ -1544,6 +1544,23 @@ fn run_memory_service_status(args: &[String]) -> Result<(), String> {
         println!("Status: {:?}", report.status);
         println!("Mode: {}", report.service_mode);
         println!("Active slot owner: {}", report.active_slot_owner);
+        println!("Recall provider: {}", report.recall_provider);
+        println!("Retrieval backend: {}", report.retrieval_backend);
+        println!(
+            "Bridge: reachable={} latencyMs={} timeouts={} lastReceipt={} lastError={}",
+            yes_no(report.bridge_reachable.unwrap_or(false)),
+            display_opt_u64(report.bridge_latency_ms),
+            report.bridge_timeouts,
+            report.last_mem_engine_receipt_id.as_deref().unwrap_or("-"),
+            report.last_mem_engine_error_code.as_deref().unwrap_or("-")
+        );
+        println!(
+            "Fallback: used={} backend={} reason={}",
+            report.fallback_used.map(yes_no).unwrap_or("unknown"),
+            report.fallback_backend.as_deref().unwrap_or("-"),
+            report.fallback_reason.as_deref().unwrap_or("-")
+        );
+        println!("Policy source: {}", report.policy_source);
         println!("Qdrant edge mode: {}", report.qdrant_edge_mode);
         println!(
             "Credential bridge: apiKeyPresent={} model={} baseUrl={} keyLength={}",
@@ -1621,8 +1638,12 @@ fn run_memory_service_recall(args: &[String]) -> Result<(), String> {
             "memory",
             "memory.openclaw-mem-service.recall",
             format!(
-                "status={:?} hits={} backend={}",
-                report.status, report.hit_count, report.backend
+                "status={:?} hits={} provider={} backend={} fallbackUsed={}",
+                report.status,
+                report.hit_count,
+                report.recall_provider,
+                report.backend,
+                report.fallback_used
             ),
         ),
     )
@@ -1637,7 +1658,31 @@ fn run_memory_service_recall(args: &[String]) -> Result<(), String> {
             report.agent_id.as_deref().unwrap_or("(global)")
         );
         println!("Status: {:?}", report.status);
+        println!("Provider: {}", report.recall_provider);
         println!("Backend: {}", report.backend);
+        println!("Retrieval backend: {}", report.retrieval_backend);
+        println!(
+            "Fallback: used={} backend={} reason={}",
+            yes_no(report.fallback_used),
+            report.fallback_backend.as_deref().unwrap_or("-"),
+            report.fallback_reason.as_deref().unwrap_or("-")
+        );
+        println!(
+            "Bridge: reachable={} latencyMs={} lastReceipt={} lastError={}",
+            yes_no(report.bridge_reachable),
+            display_opt_u64(report.bridge_latency_ms),
+            report.last_mem_engine_receipt_id.as_deref().unwrap_or("-"),
+            report.last_mem_engine_error_code.as_deref().unwrap_or("-")
+        );
+        println!(
+            "Writes: performed={} canonicalAllowed={}",
+            yes_no(report.writes_performed),
+            report
+                .canonical_writes_allowed
+                .map(yes_no)
+                .unwrap_or("unknown")
+        );
+        println!("Policy source: {}", report.policy_source);
         println!("Hits: {}", report.hit_count);
         println!("Reason: {}", report.reason);
         for hit in &report.hits {
@@ -2342,6 +2387,7 @@ fn run_channel_run_once(args: &[String]) -> Result<(), String> {
             max_prompt_file_bytes: args.turn.max_prompt_file_bytes,
             max_skill_file_bytes: args.turn.max_skill_file_bytes,
             harness_home: Some(args.target_home),
+            ..PromptAssemblyOptions::default()
         },
         outbox_limit: args.outbox_limit,
         run_runtime: true,
@@ -2440,9 +2486,12 @@ fn run_memory_read_path_smoke(args: &[String]) -> Result<(), String> {
             "memory",
             "memory.openclaw-mem-read-path-smoke",
             format!(
-                "status={:?} recall={:?} bom={} noBom={} embedding={}",
+                "status={:?} recall={:?} provider={} backend={} fallbackUsed={} bom={} noBom={} embedding={}",
                 report.status,
                 report.recall_report.status,
+                report.recall_report.recall_provider,
+                report.recall_report.backend,
+                report.recall_report.fallback_used,
                 report.bom_jsonl_smoke_ok,
                 report.no_bom_jsonl_smoke_ok,
                 report.embedding_smoke_status
@@ -2461,6 +2510,43 @@ fn run_memory_read_path_smoke(args: &[String]) -> Result<(), String> {
         );
         println!("Status: {:?}", report.status);
         println!("Recall: {:?}", report.recall_report.status);
+        println!("Recall provider: {}", report.recall_report.recall_provider);
+        println!(
+            "Retrieval backend: {}",
+            report.recall_report.retrieval_backend
+        );
+        println!(
+            "Fallback: used={} backend={} reason={}",
+            yes_no(report.recall_report.fallback_used),
+            report
+                .recall_report
+                .fallback_backend
+                .as_deref()
+                .unwrap_or("-"),
+            report
+                .recall_report
+                .fallback_reason
+                .as_deref()
+                .unwrap_or("-")
+        );
+        println!(
+            "Bridge: reachable={} lastReceipt={} lastError={}",
+            yes_no(report.recall_report.bridge_reachable),
+            report
+                .recall_report
+                .last_mem_engine_receipt_id
+                .as_deref()
+                .unwrap_or("-"),
+            report
+                .recall_report
+                .last_mem_engine_error_code
+                .as_deref()
+                .unwrap_or("-")
+        );
+        println!(
+            "Writes performed: {}",
+            yes_no(report.recall_report.writes_performed)
+        );
         println!("Embedding smoke: {}", report.embedding_smoke_status);
         println!("BOM JSONL smoke: {}", report.bom_jsonl_smoke_ok);
         println!("No-BOM JSONL smoke: {}", report.no_bom_jsonl_smoke_ok);
@@ -5303,6 +5389,7 @@ fn run_queue_prepare(args: &[String]) -> Result<(), String> {
             max_prompt_file_bytes: args.max_prompt_file_bytes,
             max_skill_file_bytes: args.max_skill_file_bytes,
             harness_home: Some(args.target_home.clone()),
+            ..PromptAssemblyOptions::default()
         },
     })
     .map_err(|err| err.to_string())?;
@@ -5324,6 +5411,7 @@ fn run_runtime_run_once(args: &[String]) -> Result<(), String> {
             max_prompt_file_bytes: args.max_prompt_file_bytes,
             max_skill_file_bytes: args.max_skill_file_bytes,
             harness_home: Some(args.target_home),
+            ..PromptAssemblyOptions::default()
         },
     })
     .map_err(|err| err.to_string())?;
@@ -5710,6 +5798,7 @@ fn spawn_runtime_loop_task(
                 max_prompt_file_bytes: task_args.max_prompt_file_bytes,
                 max_skill_file_bytes: task_args.max_skill_file_bytes,
                 harness_home: Some(task_args.target_home),
+                ..PromptAssemblyOptions::default()
             },
         })
         .map_err(|err| err.to_string());
@@ -6114,6 +6203,7 @@ fn run_prompt_bundle(args: &[String]) -> Result<(), String> {
             max_prompt_file_bytes: args.max_prompt_file_bytes,
             max_skill_file_bytes: args.max_skill_file_bytes,
             harness_home: args.harness_home.clone(),
+            ..PromptAssemblyOptions::default()
         },
     )
     .map_err(|err| err.to_string())?;

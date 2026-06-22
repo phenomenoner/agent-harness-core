@@ -33,6 +33,7 @@ pub mod memory;
 pub mod memory_backfill;
 pub mod memory_contracts;
 pub mod memory_owner;
+pub mod memory_pack;
 pub mod metrics;
 pub mod ops;
 pub mod progress;
@@ -304,6 +305,20 @@ pub use memory_owner::{
     record_memory_owner_heartbeat, record_memory_owner_shadow_receipt,
     record_memory_owner_trust_scope_receipt, recover_memory_owner_state,
     request_memory_owner_promotion,
+};
+pub use memory_pack::{
+    PACK_ARTIFACT_MARKER_PREFIX, PACK_ARTIFACT_MARKER_SUFFIX, PACK_ARTIFACT_PUT_RECEIPT_SCHEMA,
+    PACK_CANARY_REPORT_SCHEMA, PACK_OBSERVE_REPORT_SCHEMA, PACK_RECEIPT_SCHEMA,
+    PACK_RETRIEVE_RECEIPT_SCHEMA, PackAdmissionConfig, PackArtifactMarker, PackArtifactMetadata,
+    PackArtifactPutOptions, PackArtifactPutReport, PackArtifactRetrieveOptions,
+    PackArtifactRetrieveReport, PackCanary, PackCanaryReport, PackCanaryValidationReport,
+    PackCandidateOptions, PackCandidateReport, PackObserveReport, PackOmissionSummary,
+    PackPolicyDecision, PackStrategyConfig, PackTtlPolicy, collect_pack_observe_report,
+    pack_artifact_hash_for_bytes, pack_artifact_put_receipts_file,
+    pack_artifact_retrieve_receipts_file, pack_artifact_store_file, pack_candidate,
+    pack_observe_latest_file, pack_receipts_file, pack_strategy_config_file,
+    parse_pack_artifact_marker, put_pack_artifact, read_pack_strategy_config,
+    retrieve_pack_artifact, validate_pack_canary_schema, write_pack_strategy_config,
 };
 pub use metrics::{HarnessMetricsOptions, HarnessMetricsReport, collect_harness_metrics};
 pub use ops::{

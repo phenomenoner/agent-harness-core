@@ -229,6 +229,7 @@ pub struct HarnessMemoryStatus {
     pub regular_files: usize,
     pub search_receipts: HarnessJsonlStatus,
     pub vector_recall_receipts: HarnessJsonlStatus,
+    pub service_recall_receipts: HarnessJsonlStatus,
     pub prompt_context_receipts: HarnessJsonlStatus,
     pub lifecycle_receipts: HarnessJsonlStatus,
     pub canvas_receipts: HarnessJsonlStatus,
@@ -944,6 +945,8 @@ fn memory_status(harness_home: &Path) -> io::Result<HarnessMemoryStatus> {
     let search_receipts = jsonl_status(memory_state_dir.join("search-receipts.jsonl"))?;
     let vector_recall_receipts =
         jsonl_status(memory_state_dir.join("vector-recall-receipts.jsonl"))?;
+    let service_recall_receipts =
+        jsonl_status(memory_state_dir.join("openclaw-mem-service-recall-receipts.jsonl"))?;
     let prompt_context_receipts =
         jsonl_status(memory_state_dir.join("prompt-context-receipts.jsonl"))?;
     let lifecycle_receipts = jsonl_status(memory_state_dir.join("lifecycle-receipts.jsonl"))?;
@@ -972,6 +975,7 @@ fn memory_status(harness_home: &Path) -> io::Result<HarnessMemoryStatus> {
         legacy_mem_sqlite,
         &semantic_coverage,
         &memory_owner_state,
+        &service_recall_receipts,
         &vector_recall_receipts,
         &prompt_context_receipts,
         &lifecycle_receipts,
@@ -993,6 +997,7 @@ fn memory_status(harness_home: &Path) -> io::Result<HarnessMemoryStatus> {
         regular_files,
         search_receipts,
         vector_recall_receipts,
+        service_recall_receipts,
         prompt_context_receipts,
         lifecycle_receipts,
         canvas_receipts,
@@ -1083,6 +1088,7 @@ fn memory_health_summary(
     legacy_mem_sqlite: bool,
     semantic_coverage: &MemorySemanticCoverageReport,
     memory_owner_state: &MemoryOwnerState,
+    service_recall_receipts: &HarnessJsonlStatus,
     vector_recall_receipts: &HarnessJsonlStatus,
     prompt_context_receipts: &HarnessJsonlStatus,
     lifecycle_receipts: &HarnessJsonlStatus,
@@ -1095,8 +1101,14 @@ fn memory_health_summary(
     provenance_chain_receipts: &HarnessJsonlStatus,
     capture_candidates: &HarnessJsonlStatus,
 ) -> HarnessMemoryHealthSummary {
+    let service_status = service_recall_receipts.latest_status.as_deref();
     let vector_status = vector_recall_receipts.latest_status.as_deref();
-    let active_recall_backend = if matches!(vector_status, Some("ready" | "no-hits")) {
+    let active_recall_backend = if matches!(service_status, Some("ready" | "no-hits")) {
+        service_recall_receipts
+            .latest_backend
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string())
+    } else if matches!(vector_status, Some("ready" | "no-hits")) {
         vector_recall_receipts
             .latest_backend
             .clone()
@@ -1851,6 +1863,14 @@ mod tests {
             harness_home
                 .join("state")
                 .join("memory")
+                .join("openclaw-mem-service-recall-receipts.jsonl"),
+            r#"{"status":"ready","hitCount":2,"backend":"qdrant-edge","recallProvider":"openclaw-mem-engine","reason":"ok"}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("memory")
                 .join("prompt-context-receipts.jsonl"),
             r#"{"status":"ready","hitCount":1,"reason":"ok"}"#,
         )
@@ -1924,11 +1944,8 @@ mod tests {
                 .as_deref(),
             Some("sqlite-vector")
         );
-        assert_eq!(report.memory.summary.active_recall_backend, "sqlite-vector");
-        assert_eq!(
-            report.memory.summary.qdrant_parity,
-            "snapshot-preserved; native-recall-not-active"
-        );
+        assert_eq!(report.memory.summary.active_recall_backend, "qdrant-edge");
+        assert_eq!(report.memory.summary.qdrant_parity, "native-recall-active");
         assert_eq!(report.memory.summary.capture_candidate_count, 2);
         assert_eq!(
             report
