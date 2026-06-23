@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     InboundMediaInputPlanOptions, InboundMediaModelAttachmentStatus, MemoryPromptContextOptions,
-    MemoryPromptContextStatus, MemoryRecallPlanOptions, SKILL_FILE_NAME, SkillDeliveryMode,
-    SkillSelection, TurnDispatch, TurnPlan, build_memory_prompt_context, current_log_time_ms,
-    plan_inbound_media_inputs, plan_memory_policy_recall,
-    render_inbound_media_artifacts_for_prompt, render_skill_invocation_envelope,
-    skill_body_checksum, write_memory_prompt_context_receipt,
+    MemoryPromptContextStatus, MemoryRecallPlanOptions, PackArtifactMetadata, PackCandidateOptions,
+    PackTtlPolicy, SKILL_FILE_NAME, SkillDeliveryMode, SkillSelection, TurnDispatch, TurnPlan,
+    build_memory_prompt_context, current_log_time_ms, pack_candidate, plan_inbound_media_inputs,
+    plan_memory_policy_recall, render_inbound_media_artifacts_for_prompt,
+    render_skill_invocation_envelope, skill_body_checksum, write_memory_prompt_context_receipt,
 };
 
 const PROMPT_BUNDLE_SCHEMA: &str = "agent-harness.prompt-bundle.v1";
@@ -23,6 +23,7 @@ pub struct PromptAssemblyOptions {
     pub max_prompt_file_bytes: usize,
     pub max_skill_file_bytes: usize,
     pub harness_home: Option<PathBuf>,
+    pub memory_pack: PromptMemoryPackOptions,
 }
 
 impl Default for PromptAssemblyOptions {
@@ -31,8 +32,16 @@ impl Default for PromptAssemblyOptions {
             max_prompt_file_bytes: 64 * 1024,
             max_skill_file_bytes: 96 * 1024,
             harness_home: None,
+            memory_pack: PromptMemoryPackOptions::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptMemoryPackOptions {
+    pub enabled: bool,
+    pub admission: crate::PackAdmissionConfig,
+    pub strategy_config: crate::PackStrategyConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -247,8 +256,15 @@ pub fn assemble_prompt_bundle(
             write_memory_prompt_context_receipt(&memory)?;
             warnings.extend(memory.warnings.clone());
             if memory.status == MemoryPromptContextStatus::Ready
-                && let Some(context) = memory.context
+                && let Some(mut context) = memory.context
             {
+                context = maybe_pack_memory_context(
+                    context,
+                    harness_home,
+                    agent_id.as_deref(),
+                    &plan.session_key,
+                    &options.memory_pack,
+                )?;
                 sections.push(memory_context_section(context));
             }
         }
@@ -512,6 +528,44 @@ fn memory_context_section(content: String) -> PromptSection {
         delivery_mode: None,
         content,
     }
+}
+
+fn maybe_pack_memory_context(
+    context: String,
+    harness_home: &Path,
+    agent_id: Option<&str>,
+    session_key: &str,
+    options: &PromptMemoryPackOptions,
+) -> io::Result<String> {
+    if !options.enabled {
+        return Ok(context);
+    }
+    let now_ms = current_log_time_ms().unwrap_or(0);
+    let report = pack_candidate(PackCandidateOptions {
+        harness_home: harness_home.to_path_buf(),
+        raw_bytes: context.into_bytes(),
+        metadata: PackArtifactMetadata {
+            agent_id: agent_id.unwrap_or("unknown").to_string(),
+            session_key: session_key.to_string(),
+            source_kind: "log".to_string(),
+            source_id: "prompt-memory-context".to_string(),
+            trust_level: "global-imported".to_string(),
+            scope: if agent_id.is_some() {
+                "agent-private".to_string()
+            } else {
+                "session".to_string()
+            },
+            content_type: "text/plain".to_string(),
+            producer: "agent-harness".to_string(),
+            command_or_tool: "prompt-memory-context".to_string(),
+            receipt_id: format!("prompt-memory-context-{now_ms}"),
+            ttl_policy: PackTtlPolicy::default(),
+        },
+        admission: options.admission.clone(),
+        strategy_config: options.strategy_config.clone(),
+        now_ms,
+    })?;
+    Ok(report.prompt_text)
 }
 
 fn inbound_context_section(context: &str) -> PromptSection {
@@ -1225,9 +1279,9 @@ mod tests {
     use super::*;
     use crate::{
         AgentSource, InboundMediaArtifact, InboundMediaDownloadStatus,
-        InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant, TurnPlanInput,
-        build_source_skill_index, build_turn_plan, inbound_media_attachment_root,
-        load_agent_registry,
+        InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant, PackAdmissionConfig,
+        PackArtifactRetrieveOptions, TurnPlanInput, build_source_skill_index, build_turn_plan,
+        inbound_media_attachment_root, load_agent_registry, retrieve_pack_artifact,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1583,6 +1637,108 @@ mod tests {
     }
 
     #[test]
+    fn prompt_bundle_can_pack_imported_memory_context_without_touching_stable_prefix() {
+        let root = temp_root(
+            "prompt_bundle_can_pack_imported_memory_context_without_touching_stable_prefix",
+        );
+        let source = write_prompt_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let memory = harness_home.join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        let repeated = (0..20)
+            .map(|index| {
+                if index == 3 {
+                    format!("packmarker memory line {index} ERROR AUTH_EXPIRED")
+                } else {
+                    format!("packmarker memory line {index} ok")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(memory.join("MEMORY.md"), repeated).unwrap();
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let input = TurnPlanInput {
+            harness_home: Some(harness_home.clone()),
+            platform: "telegram".to_string(),
+            channel_id: "dm".to_string(),
+            user_id: "user".to_string(),
+            text: "packmarker".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            requested_agent_id: Some("main".to_string()),
+            session_hint: Some("telegram:dm:user:main".to_string()),
+            skill_limit: 3,
+        };
+        let plan = build_turn_plan(&source, &registry, &skills, input).unwrap();
+        let unpacked = assemble_prompt_bundle(
+            &plan,
+            PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        )
+        .unwrap();
+        let packed = assemble_prompt_bundle(
+            &plan,
+            PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                memory_pack: PromptMemoryPackOptions {
+                    enabled: true,
+                    admission: PackAdmissionConfig::testing(),
+                    strategy_config: crate::PackStrategyConfig::default(),
+                },
+                ..PromptAssemblyOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            stable_runtime_control_section_text(&unpacked),
+            stable_runtime_control_section_text(&packed)
+        );
+        assert_eq!(
+            packed.summary.prompt_files_reused,
+            unpacked.summary.prompt_files_included
+        );
+        assert_eq!(user_message_text(&unpacked).as_deref(), Some("packmarker"));
+        assert_eq!(user_message_text(&packed).as_deref(), Some("packmarker"));
+        let memory_section = packed
+            .sections
+            .iter()
+            .find(|section| section.kind == PromptSectionKind::MemoryContext)
+            .expect("packed memory context section");
+        assert!(memory_section.content.contains("log-anomaly-v1"));
+        let marker = extract_pack_marker(&memory_section.content).expect("pack marker");
+        let retrieved = retrieve_pack_artifact(PackArtifactRetrieveOptions {
+            harness_home: harness_home.clone(),
+            marker_or_hash: marker,
+            agent_id: "main".to_string(),
+            session_key: "telegram:dm:user:main".to_string(),
+            requester: "operator".to_string(),
+            now_ms: current_log_time_ms().unwrap_or(0),
+        })
+        .unwrap();
+        assert_eq!(retrieved.decision, "returned");
+        let raw = String::from_utf8(retrieved.raw_bytes.unwrap()).unwrap();
+        assert!(raw.contains("packmarker memory line"));
+        assert!(raw.contains("AUTH_EXPIRED"));
+
+        let default_memory_section = unpacked
+            .sections
+            .iter()
+            .find(|section| section.kind == PromptSectionKind::MemoryContext)
+            .expect("default memory context section");
+        assert!(
+            !default_memory_section
+                .content
+                .contains("<<ocm:artifact:v1:sha256:")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn prompt_bundle_truncates_large_sections() {
         let root = temp_root("prompt_bundle_truncates_large_sections");
         let source = write_prompt_source(&root);
@@ -1614,6 +1770,7 @@ mod tests {
                 max_prompt_file_bytes: 3,
                 max_skill_file_bytes: 4,
                 harness_home: None,
+                ..PromptAssemblyOptions::default()
             },
         )
         .unwrap();
@@ -1988,5 +2145,31 @@ mod tests {
             "agent-harness-prompt-{test_name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn stable_runtime_control_section_text(bundle: &PromptBundle) -> Vec<String> {
+        bundle
+            .sections
+            .iter()
+            .filter(|section| {
+                section.tier == PromptSectionTier::StableRuntime
+                    && section.kind != PromptSectionKind::PromptFile
+            })
+            .map(|section| section.content.clone())
+            .collect()
+    }
+
+    fn user_message_text(bundle: &PromptBundle) -> Option<String> {
+        bundle
+            .sections
+            .iter()
+            .find(|section| section.kind == PromptSectionKind::UserMessage)
+            .map(|section| section.content.clone())
+    }
+
+    fn extract_pack_marker(text: &str) -> Option<String> {
+        let start = text.find("<<ocm:artifact:v1:sha256:")?;
+        let end = text[start..].find(">>")?;
+        Some(text[start..start + end + 2].to_string())
     }
 }

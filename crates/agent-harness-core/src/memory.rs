@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::memory_owner::{
@@ -43,6 +43,9 @@ const OPENCLAW_MEM_READ_PATH_SMOKE_SCHEMA: &str = "agent-harness.openclaw-mem-re
 const OPENCLAW_MEM_LOCAL_OWNER_PREPARE_SCHEMA: &str =
     "agent-harness.openclaw-mem-local-owner-prepare.v1";
 const OPENCLAW_MEM_LOCAL_OWNER_ENDPOINT: &str = "local-in-process";
+const OPENCLAW_MEM_ENGINE_PROVIDER: &str = "openclaw-mem-engine";
+const MEMORY_MIGRATION_FALLBACK_PROVIDER: &str = "migration-fallback";
+const OPENCLAW_MEM_ENGINE_RECALL_DEADLINE_MS: u64 = 1_500;
 const DEFAULT_MAX_FILE_BYTES: u64 = 1_000_000;
 const DEFAULT_CONTEXT_MAX_FILE_BYTES: u64 = 4_000_000;
 const DEFAULT_SNIPPET_CHARS: usize = 240;
@@ -201,6 +204,18 @@ pub struct OpenClawMemServiceStatusReport {
     pub semantic_coverage: MemorySemanticCoverageReport,
     pub service_mode: String,
     pub active_slot_owner: String,
+    pub recall_provider: String,
+    pub retrieval_backend: String,
+    pub attempted_backend: Option<String>,
+    pub fallback_backend: Option<String>,
+    pub fallback_used: Option<bool>,
+    pub fallback_reason: Option<String>,
+    pub bridge_reachable: Option<bool>,
+    pub bridge_latency_ms: Option<u64>,
+    pub bridge_timeouts: u64,
+    pub last_mem_engine_receipt_id: Option<String>,
+    pub last_mem_engine_error_code: Option<String>,
+    pub policy_source: String,
     pub service_endpoint: Option<String>,
     pub qdrant_edge_dir: Option<PathBuf>,
     pub qdrant_edge_mode: String,
@@ -566,7 +581,20 @@ pub struct OpenClawMemServiceRecallReport {
     pub agent_id: Option<String>,
     pub status: OpenClawMemServiceRecallStatus,
     pub reason: String,
+    pub recall_provider: String,
     pub backend: String,
+    pub retrieval_backend: String,
+    pub attempted_backend: Option<String>,
+    pub fallback_backend: Option<String>,
+    pub fallback_used: bool,
+    pub fallback_reason: Option<String>,
+    pub writes_performed: bool,
+    pub canonical_writes_allowed: Option<bool>,
+    pub bridge_reachable: bool,
+    pub bridge_latency_ms: Option<u64>,
+    pub last_mem_engine_receipt_id: Option<String>,
+    pub last_mem_engine_error_code: Option<String>,
+    pub policy_source: String,
     pub service_mode: String,
     pub query_length: usize,
     pub scope_policy: MemoryScopePolicyReport,
@@ -1198,6 +1226,7 @@ fn inspect_memory_credential_bridge(harness_home: &Path) -> MemoryCredentialBrid
     let mut windows_utf8_env = BTreeMap::new();
     windows_utf8_env.insert("PYTHONUTF8".to_string(), "1".to_string());
     windows_utf8_env.insert("PYTHONIOENCODING".to_string(), "utf-8".to_string());
+    windows_utf8_env.insert("NODE_NO_WARNINGS".to_string(), "1".to_string());
     let direct_cli_env_mappings = vec![
         MemoryCredentialEnvMapping {
             source_env: MEMORY_EMBEDDING_API_KEY_ENV.to_string(),
@@ -1914,9 +1943,10 @@ pub fn record_memory_provenance_chain(
     Ok(report)
 }
 
-fn memory_mem_engine_canary(
+pub fn memory_mem_engine_canary_report(
     harness_home: &Path,
     qdrant_edge_mode: &str,
+    owner_state: &MemoryOwnerState,
 ) -> MemoryMemEngineCanaryReport {
     let engine_state = harness_home
         .join("memory")
@@ -1924,21 +1954,24 @@ fn memory_mem_engine_canary(
         .join("sunrise_state.json");
     let engine_state_file = engine_state.is_file().then_some(engine_state);
     let mut warnings = Vec::new();
-    if engine_state_file.is_some() {
+    let mem_engine_active = owner_state.owner == MEM_ENGINE_OWNER;
+    if engine_state_file.is_some() && !mem_engine_active {
         warnings.push(
-            "openclaw-mem-engine state is imported but not promoted; snapshot adapter remains rollback"
+            "openclaw-mem-engine state is imported but not promoted; snapshot adapter remains active owner"
                 .to_string(),
         );
     }
     MemoryMemEngineCanaryReport {
-        status: if engine_state_file.is_some() {
+        status: if mem_engine_active {
+            "mem-engine-active".to_string()
+        } else if engine_state_file.is_some() {
             "available-not-promoted".to_string()
         } else {
             "not-available".to_string()
         },
-        active_slot_owner: "snapshot-adapter".to_string(),
+        active_slot_owner: owner_state.owner.clone(),
         engine_state_file,
-        rollback_slot_owner: "snapshot-adapter".to_string(),
+        rollback_slot_owner: owner_state.rollback_owner.clone(),
         qdrant_edge_mode: qdrant_edge_mode.to_string(),
         warnings,
     }
@@ -2003,12 +2036,13 @@ pub fn inspect_openclaw_mem_service(
             graph_readiness.blockers.join(", ")
         ));
     }
-    let mem_engine_canary = memory_mem_engine_canary(&options.harness_home, &qdrant_edge_mode);
-    warnings.extend(mem_engine_canary.warnings.clone());
     let owner_state = read_memory_owner_state_or_default(
         &options.harness_home,
         crate::current_log_time_ms().unwrap_or(0),
     )?;
+    let mem_engine_canary =
+        memory_mem_engine_canary_report(&options.harness_home, &qdrant_edge_mode, &owner_state);
+    warnings.extend(mem_engine_canary.warnings.clone());
     let has_local_backend =
         sqlite.is_file() || observations.is_file() || episodes.is_file() || agent_store.is_file();
     let has_any_backend = has_local_backend || qdrant_snapshot_present;
@@ -2050,6 +2084,15 @@ pub fn inspect_openclaw_mem_service(
         options.agent_id.as_deref(),
         &embedding_coverage,
     )?;
+    let recall_telemetry =
+        recall_layer_telemetry_from_latest(&options.harness_home, options.agent_id.as_deref())
+            .unwrap_or_else(|| {
+                MemoryLayerTelemetry::for_status(
+                    &active_slot_owner,
+                    has_local_backend,
+                    qdrant_snapshot_present,
+                )
+            });
     let report = OpenClawMemServiceStatusReport {
         schema: OPENCLAW_MEM_SERVICE_STATUS_SCHEMA,
         harness_home: options.harness_home,
@@ -2063,6 +2106,18 @@ pub fn inspect_openclaw_mem_service(
         semantic_coverage,
         service_mode,
         active_slot_owner,
+        recall_provider: recall_telemetry.recall_provider,
+        retrieval_backend: recall_telemetry.retrieval_backend,
+        attempted_backend: recall_telemetry.attempted_backend,
+        fallback_backend: recall_telemetry.fallback_backend,
+        fallback_used: recall_telemetry.fallback_used,
+        fallback_reason: recall_telemetry.fallback_reason,
+        bridge_reachable: recall_telemetry.bridge_reachable,
+        bridge_latency_ms: recall_telemetry.bridge_latency_ms,
+        bridge_timeouts: recall_telemetry.bridge_timeouts,
+        last_mem_engine_receipt_id: recall_telemetry.last_mem_engine_receipt_id,
+        last_mem_engine_error_code: recall_telemetry.last_mem_engine_error_code,
+        policy_source: recall_telemetry.policy_source,
         service_endpoint,
         qdrant_edge_dir: qdrant_edge,
         qdrant_edge_mode,
@@ -2319,6 +2374,7 @@ pub fn recall_openclaw_mem_service(
         crate::current_log_time_ms().unwrap_or(0),
     )?;
     let service_mode = memory_service_mode_for_owner_state(&owner_state);
+    let qdrant = qdrant_edge_dir(&options.harness_home);
     if query.is_empty() {
         return Ok(OpenClawMemServiceRecallReport {
             schema: OPENCLAW_MEM_SERVICE_RECALL_SCHEMA,
@@ -2326,7 +2382,20 @@ pub fn recall_openclaw_mem_service(
             agent_id: agent_id.clone(),
             status: OpenClawMemServiceRecallStatus::Skipped,
             reason: "openclaw-mem service recall skipped because query was empty".to_string(),
+            recall_provider: "none".to_string(),
             backend: "none".to_string(),
+            retrieval_backend: "none".to_string(),
+            attempted_backend: None,
+            fallback_backend: None,
+            fallback_used: false,
+            fallback_reason: None,
+            writes_performed: false,
+            canonical_writes_allowed: Some(false),
+            bridge_reachable: false,
+            bridge_latency_ms: None,
+            last_mem_engine_receipt_id: None,
+            last_mem_engine_error_code: None,
+            policy_source: "harness-legacy".to_string(),
             service_mode,
             query_length,
             scope_policy: memory_scope_policy(agent_id.clone()),
@@ -2334,18 +2403,92 @@ pub fn recall_openclaw_mem_service(
             hit_count: 0,
             searched_files: 0,
             skipped_files: 0,
-            qdrant_edge_dir: None,
+            qdrant_edge_dir: qdrant,
             hits: Vec::new(),
             warnings: Vec::new(),
         });
     }
 
+    if owner_state.owner == MEM_ENGINE_OWNER {
+        match recall_openclaw_mem_engine_bridge(
+            &options.harness_home,
+            agent_id.clone(),
+            &query,
+            options.limit,
+            &service_mode,
+            qdrant.clone(),
+        )? {
+            MemEngineBridgeRecallResult::Report(mut report) => {
+                report.scope_policy = memory_scope_policy(agent_id.clone());
+                write_openclaw_mem_service_recall_receipt(&report)?;
+                return Ok(report);
+            }
+            MemEngineBridgeRecallResult::Fallback(fallback) => {
+                return recall_openclaw_mem_migration_fallback(
+                    options,
+                    query,
+                    agent_id,
+                    service_mode,
+                    qdrant,
+                    RecallFallbackTelemetry {
+                        recall_provider: MEMORY_MIGRATION_FALLBACK_PROVIDER.to_string(),
+                        attempted_backend: Some(OPENCLAW_MEM_ENGINE_PROVIDER.to_string()),
+                        fallback_used: true,
+                        fallback_reason: Some(fallback.reason),
+                        bridge_reachable: false,
+                        last_mem_engine_error_code: fallback.error_code,
+                        warnings: fallback.warnings,
+                        fallback_only: true,
+                    },
+                );
+            }
+        }
+    }
+
+    recall_openclaw_mem_migration_fallback(
+        options,
+        query,
+        agent_id,
+        service_mode,
+        qdrant,
+        RecallFallbackTelemetry {
+            recall_provider: "snapshot-adapter".to_string(),
+            attempted_backend: None,
+            fallback_used: false,
+            fallback_reason: None,
+            bridge_reachable: false,
+            last_mem_engine_error_code: None,
+            warnings: Vec::new(),
+            fallback_only: false,
+        },
+    )
+}
+
+struct RecallFallbackTelemetry {
+    recall_provider: String,
+    attempted_backend: Option<String>,
+    fallback_used: bool,
+    fallback_reason: Option<String>,
+    bridge_reachable: bool,
+    last_mem_engine_error_code: Option<String>,
+    warnings: Vec<String>,
+    fallback_only: bool,
+}
+
+fn recall_openclaw_mem_migration_fallback(
+    options: OpenClawMemServiceRecallOptions,
+    query: String,
+    agent_id: Option<String>,
+    service_mode: String,
+    qdrant: Option<PathBuf>,
+    telemetry: RecallFallbackTelemetry,
+) -> io::Result<OpenClawMemServiceRecallReport> {
+    let query_length = query.chars().count();
     let mut hits = Vec::new();
     let mut searched_files = 0usize;
     let mut skipped_files = 0usize;
-    let mut warnings = Vec::new();
+    let mut warnings = telemetry.warnings;
     let mut backend = "snapshot-text+service-writeback".to_string();
-    let qdrant = qdrant_edge_dir(&options.harness_home);
     if env::var_os(OPENCLAW_MEM_SERVICE_URL_ENV).is_some() {
         warnings.push(
             "live openclaw-mem service endpoint is configured, but no remote recall wire contract is available in the imported artifacts; using local snapshot/writeback adapter"
@@ -2353,10 +2496,17 @@ pub fn recall_openclaw_mem_service(
         );
     }
     if qdrant.is_some() {
-        warnings.push(
-            "Qdrant edge is preserved as imported snapshot evidence; recall uses SQLite vector/text/writeback adapters"
-                .to_string(),
-        );
+        if telemetry.fallback_only {
+            warnings.push(
+                "Qdrant edge retrieval belongs to openclaw-mem-engine; migration fallback is using SQLite vector/text/writeback adapters read-only"
+                    .to_string(),
+            );
+        } else {
+            warnings.push(
+                "Qdrant edge is preserved as imported snapshot evidence; recall uses SQLite vector/text/writeback adapters"
+                    .to_string(),
+            );
+        }
     }
 
     let vector = search_imported_vector_memory(MemoryVectorRecallOptions {
@@ -2425,6 +2575,12 @@ pub fn recall_openclaw_mem_service(
     } else {
         OpenClawMemServiceRecallStatus::Ready
     };
+    let retrieval_backend = backend.clone();
+    let backend = if telemetry.fallback_only {
+        format!("fallback_only:{backend}")
+    } else {
+        backend
+    };
     let report = OpenClawMemServiceRecallReport {
         schema: OPENCLAW_MEM_SERVICE_RECALL_SCHEMA,
         harness_home: options.harness_home,
@@ -2445,7 +2601,20 @@ pub fn recall_openclaw_mem_service(
                 "openclaw-mem service recall failed".to_string()
             }
         },
+        recall_provider: telemetry.recall_provider,
         backend,
+        retrieval_backend: retrieval_backend.clone(),
+        attempted_backend: telemetry.attempted_backend,
+        fallback_backend: telemetry.fallback_used.then(|| retrieval_backend.clone()),
+        fallback_used: telemetry.fallback_used,
+        fallback_reason: telemetry.fallback_reason,
+        writes_performed: false,
+        canonical_writes_allowed: Some(false),
+        bridge_reachable: telemetry.bridge_reachable,
+        bridge_latency_ms: None,
+        last_mem_engine_receipt_id: None,
+        last_mem_engine_error_code: telemetry.last_mem_engine_error_code,
+        policy_source: "harness-legacy".to_string(),
         service_mode,
         query_length,
         scope_policy: memory_scope_policy(agent_id.clone()),
@@ -3835,7 +4004,7 @@ fn render_openclaw_mem_service_context(
     );
     if let Some(path) = qdrant_edge_dir {
         out.push_str(&format!(
-            "Qdrant edge snapshot is present at {}; current harness recall uses service adapter backends, not a live Qdrant process.\n",
+            "Qdrant edge artifacts are present at {}; active retrieval backend and fallback posture are reported by memory-layer recall receipts.\n",
             path.display()
         ));
     }
@@ -4227,6 +4396,421 @@ fn legacy_mem_sqlite_file(harness_home: &Path) -> PathBuf {
 fn qdrant_edge_dir(harness_home: &Path) -> Option<PathBuf> {
     let dir = harness_home.join("memory").join("qdrant-edge");
     dir.is_dir().then_some(dir)
+}
+
+fn openclaw_mem_engine_bridge_dir(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("memory")
+        .join("openclaw-mem-engine-bridge")
+}
+
+fn openclaw_mem_engine_recall_request_file(harness_home: &Path) -> PathBuf {
+    openclaw_mem_engine_bridge_dir(harness_home).join("recall-request-last.json")
+}
+
+fn openclaw_mem_engine_recall_response_file(harness_home: &Path) -> PathBuf {
+    openclaw_mem_engine_bridge_dir(harness_home).join("recall-response.json")
+}
+
+fn openclaw_mem_engine_recall_request_id(agent_id: Option<&str>, query: &str) -> String {
+    stable_text_hash(
+        "openclaw-mem-engine.recall.request",
+        &format!("{}|{}", agent_id.unwrap_or("global"), query.trim()),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemoryLayerTelemetry {
+    recall_provider: String,
+    retrieval_backend: String,
+    attempted_backend: Option<String>,
+    fallback_backend: Option<String>,
+    fallback_used: Option<bool>,
+    fallback_reason: Option<String>,
+    bridge_reachable: Option<bool>,
+    bridge_latency_ms: Option<u64>,
+    bridge_timeouts: u64,
+    last_mem_engine_receipt_id: Option<String>,
+    last_mem_engine_error_code: Option<String>,
+    policy_source: String,
+}
+
+impl MemoryLayerTelemetry {
+    fn for_status(
+        active_slot_owner: &str,
+        has_local_backend: bool,
+        qdrant_snapshot_present: bool,
+    ) -> Self {
+        if active_slot_owner == MEM_ENGINE_OWNER {
+            Self {
+                recall_provider: OPENCLAW_MEM_ENGINE_PROVIDER.to_string(),
+                retrieval_backend: if qdrant_snapshot_present {
+                    "qdrant-edge".to_string()
+                } else {
+                    "unknown".to_string()
+                },
+                attempted_backend: Some(OPENCLAW_MEM_ENGINE_PROVIDER.to_string()),
+                fallback_backend: Some("sqlite-vector+service-writeback".to_string()),
+                fallback_used: None,
+                fallback_reason: None,
+                bridge_reachable: None,
+                bridge_latency_ms: None,
+                bridge_timeouts: 0,
+                last_mem_engine_receipt_id: None,
+                last_mem_engine_error_code: None,
+                policy_source: OPENCLAW_MEM_ENGINE_PROVIDER.to_string(),
+            }
+        } else {
+            Self {
+                recall_provider: "snapshot-adapter".to_string(),
+                retrieval_backend: if has_local_backend {
+                    "sqlite-vector+service-writeback".to_string()
+                } else if qdrant_snapshot_present {
+                    "qdrant-edge-snapshot".to_string()
+                } else {
+                    "none".to_string()
+                },
+                attempted_backend: None,
+                fallback_backend: None,
+                fallback_used: Some(false),
+                fallback_reason: None,
+                bridge_reachable: Some(false),
+                bridge_latency_ms: None,
+                bridge_timeouts: 0,
+                last_mem_engine_receipt_id: None,
+                last_mem_engine_error_code: None,
+                policy_source: "harness-legacy".to_string(),
+            }
+        }
+    }
+}
+
+fn recall_layer_telemetry_from_latest(
+    harness_home: &Path,
+    agent_id: Option<&str>,
+) -> Option<MemoryLayerTelemetry> {
+    let value = fs::read_to_string(openclaw_mem_service_recall_latest_file_for_agent(
+        harness_home,
+        agent_id,
+    ))
+    .ok()
+    .and_then(|text| serde_json::from_str::<Value>(&text).ok())?;
+    let recall_provider = json_string(&value, "recallProvider")?;
+    Some(MemoryLayerTelemetry {
+        recall_provider,
+        retrieval_backend: json_string(&value, "retrievalBackend")
+            .or_else(|| json_string(&value, "backend"))
+            .unwrap_or_else(|| "unknown".to_string()),
+        attempted_backend: json_string(&value, "attemptedBackend"),
+        fallback_backend: json_string(&value, "fallbackBackend"),
+        fallback_used: value.get("fallbackUsed").and_then(Value::as_bool),
+        fallback_reason: json_string(&value, "fallbackReason"),
+        bridge_reachable: value.get("bridgeReachable").and_then(Value::as_bool),
+        bridge_latency_ms: value.get("bridgeLatencyMs").and_then(Value::as_u64),
+        bridge_timeouts: if json_string(&value, "fallbackReason").as_deref()
+            == Some("mem_engine_deadline")
+        {
+            1
+        } else {
+            0
+        },
+        last_mem_engine_receipt_id: json_string(&value, "lastMemEngineReceiptId"),
+        last_mem_engine_error_code: json_string(&value, "lastMemEngineErrorCode"),
+        policy_source: json_string(&value, "policySource")
+            .unwrap_or_else(|| "harness-legacy".to_string()),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemEngineBridgeFallback {
+    reason: String,
+    error_code: Option<String>,
+    warnings: Vec<String>,
+}
+
+enum MemEngineBridgeRecallResult {
+    Report(OpenClawMemServiceRecallReport),
+    Fallback(MemEngineBridgeFallback),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MemEngineRecallEnvelope {
+    request_id: Option<String>,
+    provider: Option<String>,
+    operation: Option<String>,
+    status: Option<String>,
+    receipt_id: Option<String>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+    payload: Option<Value>,
+}
+
+fn recall_openclaw_mem_engine_bridge(
+    harness_home: &Path,
+    agent_id: Option<String>,
+    query: &str,
+    limit: usize,
+    service_mode: &str,
+    qdrant_edge_dir: Option<PathBuf>,
+) -> io::Result<MemEngineBridgeRecallResult> {
+    let request_id = openclaw_mem_engine_recall_request_id(agent_id.as_deref(), query);
+    let request_file = openclaw_mem_engine_recall_request_file(harness_home);
+    if let Some(parent) = request_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let request = serde_json::json!({
+        "v": 1,
+        "op": "recall",
+        "requestId": request_id,
+        "deadlineMs": OPENCLAW_MEM_ENGINE_RECALL_DEADLINE_MS,
+        "host": {
+            "agentId": agent_id.as_deref().unwrap_or("global"),
+            "sessionKey": null,
+            "platform": std::env::consts::OS,
+            "harnessVersion": env!("CARGO_PKG_VERSION")
+        },
+        "payload": {
+            "query": query,
+            "limit": limit.max(1)
+        }
+    });
+    fs::write(
+        &request_file,
+        serde_json::to_string_pretty(&request).map_err(io::Error::other)?,
+    )?;
+
+    let response_file = openclaw_mem_engine_recall_response_file(harness_home);
+    let response_text = match fs::read_to_string(&response_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(MemEngineBridgeRecallResult::Fallback(
+                mem_engine_bridge_fallback(
+                    "mem_engine_unreachable",
+                    Some("bridge_unreachable".to_string()),
+                    format!(
+                        "openclaw-mem-engine recall bridge response not found at {}",
+                        response_file.display()
+                    ),
+                ),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let envelope = match serde_json::from_str::<MemEngineRecallEnvelope>(&response_text) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            return Ok(MemEngineBridgeRecallResult::Fallback(
+                mem_engine_bridge_fallback(
+                    "bridge_protocol",
+                    Some("bridge_protocol".to_string()),
+                    format!("openclaw-mem-engine recall bridge returned malformed JSON: {error}"),
+                ),
+            ));
+        }
+    };
+    let Some(response_request_id) = envelope.request_id.as_deref() else {
+        return Ok(MemEngineBridgeRecallResult::Fallback(
+            mem_engine_bridge_fallback(
+                "bridge_protocol",
+                Some("bridge_protocol".to_string()),
+                "openclaw-mem-engine recall bridge omitted requestId".to_string(),
+            ),
+        ));
+    };
+    if response_request_id != request["requestId"].as_str().unwrap_or_default() {
+        return Ok(MemEngineBridgeRecallResult::Fallback(
+            mem_engine_bridge_fallback(
+                "bridge_protocol",
+                Some("bridge_protocol".to_string()),
+                "openclaw-mem-engine recall bridge requestId did not match request envelope"
+                    .to_string(),
+            ),
+        ));
+    }
+    if envelope.provider.as_deref() != Some(OPENCLAW_MEM_ENGINE_PROVIDER)
+        || envelope.operation.as_deref() != Some("recall")
+    {
+        return Ok(MemEngineBridgeRecallResult::Fallback(
+            mem_engine_bridge_fallback(
+                "bridge_protocol",
+                Some("bridge_protocol".to_string()),
+                "openclaw-mem-engine recall bridge provider/operation mismatch".to_string(),
+            ),
+        ));
+    }
+    if let Some(error_code) = envelope.error_code.as_deref() {
+        if !matches!(
+            error_code,
+            "bridge_unreachable"
+                | "bridge_timeout"
+                | "bridge_protocol"
+                | "policy_denied"
+                | "backend_unavailable"
+                | "internal"
+        ) {
+            return Ok(MemEngineBridgeRecallResult::Fallback(
+                mem_engine_bridge_fallback(
+                    "bridge_protocol",
+                    Some("bridge_protocol".to_string()),
+                    format!(
+                        "openclaw-mem-engine recall bridge returned unknown errorCode={error_code}"
+                    ),
+                ),
+            ));
+        }
+    }
+    let status = envelope.status.as_deref().unwrap_or("");
+    if !matches!(
+        status,
+        "ready" | "degraded" | "unavailable" | "policy_denied" | "error"
+    ) {
+        return Ok(MemEngineBridgeRecallResult::Fallback(
+            mem_engine_bridge_fallback(
+                "bridge_protocol",
+                Some("bridge_protocol".to_string()),
+                format!("openclaw-mem-engine recall bridge returned unknown status={status}"),
+            ),
+        ));
+    }
+    if matches!(status, "unavailable" | "error") {
+        let error_code = envelope
+            .error_code
+            .clone()
+            .unwrap_or_else(|| "backend_unavailable".to_string());
+        let fallback_reason = match error_code.as_str() {
+            "bridge_timeout" => "mem_engine_deadline",
+            "bridge_protocol" => "bridge_protocol",
+            _ => "mem_engine_unreachable",
+        };
+        return Ok(MemEngineBridgeRecallResult::Fallback(
+            mem_engine_bridge_fallback(
+                fallback_reason,
+                Some(error_code),
+                envelope.error_message.unwrap_or_else(|| {
+                    "openclaw-mem-engine recall bridge reported unavailable".to_string()
+                }),
+            ),
+        ));
+    }
+
+    let payload = envelope.payload.unwrap_or(Value::Null);
+    let backend = json_string(&payload, "backend")
+        .or_else(|| json_string(&payload, "retrievalBackend"))
+        .unwrap_or_else(|| OPENCLAW_MEM_ENGINE_PROVIDER.to_string());
+    let attempted_backend = json_string(&payload, "attemptedBackend").or(Some(backend.clone()));
+    let fallback_backend = json_string(&payload, "fallbackBackend");
+    let fallback_used = payload
+        .get("fallbackUsed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let fallback_reason = json_string(&payload, "fallbackReason");
+    let writes_performed = payload
+        .get("writesPerformed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let canonical_writes_allowed = payload
+        .get("canonicalWritesAllowed")
+        .and_then(Value::as_bool);
+    let hits = mem_engine_hits_from_payload(&payload, limit.max(1));
+    let recall_status = if status == "policy_denied" {
+        OpenClawMemServiceRecallStatus::NoHits
+    } else if hits.is_empty() {
+        OpenClawMemServiceRecallStatus::NoHits
+    } else {
+        OpenClawMemServiceRecallStatus::Ready
+    };
+    let mut warnings = Vec::new();
+    if status == "degraded" {
+        warnings.push("openclaw-mem-engine recall bridge reported degraded status".to_string());
+    }
+    if let Some(message) = envelope.error_message {
+        warnings.push(message);
+    }
+    let report = OpenClawMemServiceRecallReport {
+        schema: OPENCLAW_MEM_SERVICE_RECALL_SCHEMA,
+        harness_home: harness_home.to_path_buf(),
+        agent_id,
+        status: recall_status,
+        reason: match (status, recall_status) {
+            ("policy_denied", _) => {
+                "openclaw-mem-engine recall denied by memory policy".to_string()
+            }
+            (_, OpenClawMemServiceRecallStatus::Ready) => format!(
+                "openclaw-mem-engine recall returned {} hit(s) via {backend}",
+                hits.len()
+            ),
+            _ => "openclaw-mem-engine recall ran but returned no hits".to_string(),
+        },
+        recall_provider: OPENCLAW_MEM_ENGINE_PROVIDER.to_string(),
+        backend: backend.clone(),
+        retrieval_backend: backend,
+        attempted_backend,
+        fallback_backend,
+        fallback_used,
+        fallback_reason,
+        writes_performed,
+        canonical_writes_allowed,
+        bridge_reachable: true,
+        bridge_latency_ms: Some(0),
+        last_mem_engine_receipt_id: envelope.receipt_id,
+        last_mem_engine_error_code: envelope.error_code,
+        policy_source: OPENCLAW_MEM_ENGINE_PROVIDER.to_string(),
+        service_mode: service_mode.to_string(),
+        query_length: query.chars().count(),
+        scope_policy: memory_scope_policy(None),
+        trust_policy: memory_trust_policy(),
+        hit_count: hits.len(),
+        searched_files: 0,
+        skipped_files: 0,
+        qdrant_edge_dir,
+        hits,
+        warnings,
+    };
+    Ok(MemEngineBridgeRecallResult::Report(report))
+}
+
+fn mem_engine_bridge_fallback(
+    reason: &str,
+    error_code: Option<String>,
+    warning: String,
+) -> MemEngineBridgeFallback {
+    MemEngineBridgeFallback {
+        reason: reason.to_string(),
+        error_code,
+        warnings: vec![warning],
+    }
+}
+
+fn mem_engine_hits_from_payload(payload: &Value, limit: usize) -> Vec<OpenClawMemServiceHit> {
+    payload
+        .get("hits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(limit)
+        .enumerate()
+        .map(|(index, value)| OpenClawMemServiceHit {
+            lane: json_string(value, "lane").unwrap_or_else(|| "mem-engine".to_string()),
+            id: json_string(value, "id").unwrap_or_else(|| format!("mem-engine-hit-{index}")),
+            score: value.get("score").and_then(Value::as_f64).unwrap_or(1.0) as f32,
+            title: json_string(value, "title")
+                .unwrap_or_else(|| "openclaw-mem-engine recall".to_string()),
+            text: json_string(value, "text").unwrap_or_default(),
+            source: json_string(value, "source"),
+        })
+        .filter(|hit| !hit.text.trim().is_empty())
+        .collect()
+}
+
+fn json_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
 }
 
 fn collect_observation_vector_hits(
@@ -5322,6 +5906,18 @@ mod tests {
         assert_eq!(status.status, OpenClawMemServiceStatus::Ready);
         assert_eq!(status.service_mode, "local-in-process");
         assert_eq!(status.active_slot_owner, MEM_ENGINE_OWNER);
+        assert_eq!(status.mem_engine_canary.status, "mem-engine-active");
+        assert_eq!(status.mem_engine_canary.active_slot_owner, MEM_ENGINE_OWNER);
+        assert_eq!(
+            status.mem_engine_canary.rollback_slot_owner,
+            "snapshot-adapter"
+        );
+        assert!(
+            !status
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("not promoted"))
+        );
         assert_eq!(status.mem_engine_ownership.active_owner, MEM_ENGINE_OWNER);
 
         let recall = recall_openclaw_mem_service(OpenClawMemServiceRecallOptions {
@@ -5335,6 +5931,202 @@ mod tests {
         assert_eq!(recall.status, OpenClawMemServiceRecallStatus::Ready);
         assert_eq!(recall.service_mode, "local-in-process");
         assert_eq!(recall.hits[0].lane, "service-writeback");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mem_engine_owner_recall_uses_ready_bridge_report() {
+        let root = temp_root("mem_engine_owner_recall_uses_ready_bridge_report");
+        let harness_home = root.join("harness");
+
+        store_openclaw_mem_service_memory(OpenClawMemServiceStoreOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            session_key: Some("session-local-owner".to_string()),
+            text: "legacy fallback should not be selected".to_string(),
+            payload: serde_json::json!({"source": "test"}),
+            approved: true,
+            now_ms: 1_800_000_000_000,
+        })
+        .unwrap();
+        prepare_openclaw_mem_local_owner(OpenClawMemLocalOwnerPrepareOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            query: "legacy fallback".to_string(),
+            lease_id: Some("lease-local-owner".to_string()),
+            lease_ttl_ms: 60_000,
+            now_ms: 1_800_000_000_100,
+        })
+        .unwrap();
+        crate::memory_owner::request_memory_owner_promotion(
+            crate::memory_owner::MemoryOwnerPromotionOptions {
+                harness_home: harness_home.clone(),
+                operator_approved: true,
+                heartbeat_max_age_ms: 60_000,
+                now_ms: 1_800_000_000_200,
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(openclaw_mem_engine_bridge_dir(&harness_home)).unwrap();
+        let request_id = openclaw_mem_engine_recall_request_id(Some("main"), "qdrant recall");
+        fs::write(
+            openclaw_mem_engine_bridge_dir(&harness_home).join("recall-response.json"),
+            serde_json::json!({
+                "v": 1,
+                "requestId": request_id,
+                "provider": "openclaw-mem-engine",
+                "operation": "recall",
+                "status": "ready",
+                "receiptId": "ocm-recall-test",
+                "payload": {
+                    "backend": "qdrant-edge",
+                    "attemptedBackend": "qdrant-edge",
+                    "fallbackUsed": false,
+                    "fallbackBackend": "lancedb",
+                    "fallbackReason": null,
+                    "writesPerformed": false,
+                    "canonicalWritesAllowed": false,
+                    "hits": [
+                        {
+                            "lane": "mem-engine",
+                            "id": "mem-1",
+                            "score": 0.91,
+                            "title": "Qdrant hit",
+                            "text": "mem-engine qdrant recall result",
+                            "source": "qdrant-edge"
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let recall = recall_openclaw_mem_service(OpenClawMemServiceRecallOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            query: "qdrant recall".to_string(),
+            limit: 5,
+            max_file_bytes: 0,
+        })
+        .unwrap();
+
+        assert_eq!(recall.status, OpenClawMemServiceRecallStatus::Ready);
+        assert_eq!(recall.service_mode, "local-in-process");
+        assert_eq!(recall.recall_provider, "openclaw-mem-engine");
+        assert_eq!(recall.backend, "qdrant-edge");
+        assert_eq!(recall.retrieval_backend, "qdrant-edge");
+        assert_eq!(recall.attempted_backend.as_deref(), Some("qdrant-edge"));
+        assert!(!recall.fallback_used);
+        assert_eq!(recall.fallback_backend.as_deref(), Some("lancedb"));
+        assert_eq!(recall.fallback_reason, None);
+        assert!(!recall.writes_performed);
+        assert_eq!(recall.canonical_writes_allowed, Some(false));
+        assert!(recall.bridge_reachable);
+        assert_eq!(
+            recall.last_mem_engine_receipt_id.as_deref(),
+            Some("ocm-recall-test")
+        );
+        assert_eq!(recall.hits[0].lane, "mem-engine");
+
+        let status = inspect_openclaw_mem_service(OpenClawMemServiceStatusOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+        })
+        .unwrap();
+        assert_eq!(status.active_slot_owner, MEM_ENGINE_OWNER);
+        assert_eq!(status.recall_provider, "openclaw-mem-engine");
+        assert_eq!(status.retrieval_backend, "qdrant-edge");
+        assert_eq!(status.fallback_used, Some(false));
+        assert_eq!(
+            status.last_mem_engine_receipt_id.as_deref(),
+            Some("ocm-recall-test")
+        );
+
+        let smoke = run_openclaw_mem_read_path_smoke(OpenClawMemReadPathSmokeOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            query: "qdrant recall".to_string(),
+            limit: 5,
+        })
+        .unwrap();
+        assert_eq!(smoke.recall_report.recall_provider, "openclaw-mem-engine");
+        assert_eq!(smoke.recall_report.backend, "qdrant-edge");
+        assert_eq!(smoke.recall_report.hit_count, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mem_engine_owner_recall_falls_back_read_only_when_bridge_missing() {
+        let root = temp_root("mem_engine_owner_recall_falls_back_read_only_when_bridge_missing");
+        let harness_home = root.join("harness");
+
+        store_openclaw_mem_service_memory(OpenClawMemServiceStoreOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            session_key: Some("session-local-owner".to_string()),
+            text: "fallback-only-blueprint".to_string(),
+            payload: serde_json::json!({"source": "test"}),
+            approved: true,
+            now_ms: 1_800_000_000_000,
+        })
+        .unwrap();
+        prepare_openclaw_mem_local_owner(OpenClawMemLocalOwnerPrepareOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            query: "fallback-only-blueprint".to_string(),
+            lease_id: Some("lease-local-owner".to_string()),
+            lease_ttl_ms: 60_000,
+            now_ms: 1_800_000_000_100,
+        })
+        .unwrap();
+        crate::memory_owner::request_memory_owner_promotion(
+            crate::memory_owner::MemoryOwnerPromotionOptions {
+                harness_home: harness_home.clone(),
+                operator_approved: true,
+                heartbeat_max_age_ms: 60_000,
+                now_ms: 1_800_000_000_200,
+            },
+        )
+        .unwrap();
+
+        let recall = recall_openclaw_mem_service(OpenClawMemServiceRecallOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            query: "fallback-only-blueprint".to_string(),
+            limit: 5,
+            max_file_bytes: 0,
+        })
+        .unwrap();
+
+        assert_eq!(recall.status, OpenClawMemServiceRecallStatus::Ready);
+        assert_eq!(recall.service_mode, "local-in-process");
+        assert_eq!(recall.recall_provider, "migration-fallback");
+        assert_eq!(
+            recall.backend,
+            "fallback_only:snapshot-text+service-writeback"
+        );
+        assert_eq!(recall.retrieval_backend, "snapshot-text+service-writeback");
+        assert_eq!(
+            recall.attempted_backend.as_deref(),
+            Some("openclaw-mem-engine")
+        );
+        assert!(recall.fallback_used);
+        assert_eq!(
+            recall.fallback_reason.as_deref(),
+            Some("mem_engine_unreachable")
+        );
+        assert!(!recall.bridge_reachable);
+        assert!(!recall.writes_performed);
+        assert_eq!(recall.canonical_writes_allowed, Some(false));
+        assert!(
+            recall
+                .hits
+                .iter()
+                .any(|hit| hit.lane == "service-writeback")
+        );
 
         let _ = fs::remove_dir_all(root);
     }

@@ -9,11 +9,11 @@ use serde_json::Value;
 
 use crate::loop_health::{process_alive_for_pid, read_supervisor_stop_file};
 use crate::memory::{
-    MemoryMemEngineCanaryReport, MemoryMemEngineOwnershipReport, MemorySemanticCoverageReport,
+    MemoryMemEngineOwnershipReport, MemorySemanticCoverageReport,
     collect_memory_embedding_coverage, collect_memory_semantic_coverage,
     memory_adapter_readiness_report, memory_capability_mode_from_readiness,
-    memory_mem_engine_ownership_report_for_owner_state, memory_qdrant_native_recall_status,
-    openclaw_mem_service_store_file_for_agent,
+    memory_mem_engine_canary_report, memory_mem_engine_ownership_report_for_owner_state,
+    memory_qdrant_native_recall_status, openclaw_mem_service_store_file_for_agent,
 };
 use crate::memory_owner::{MemoryOwnerState, read_memory_owner_state_or_default};
 use crate::skill_apply::skill_apply_receipts_file;
@@ -229,6 +229,7 @@ pub struct HarnessMemoryStatus {
     pub regular_files: usize,
     pub search_receipts: HarnessJsonlStatus,
     pub vector_recall_receipts: HarnessJsonlStatus,
+    pub service_recall_receipts: HarnessJsonlStatus,
     pub prompt_context_receipts: HarnessJsonlStatus,
     pub lifecycle_receipts: HarnessJsonlStatus,
     pub canvas_receipts: HarnessJsonlStatus,
@@ -944,6 +945,8 @@ fn memory_status(harness_home: &Path) -> io::Result<HarnessMemoryStatus> {
     let search_receipts = jsonl_status(memory_state_dir.join("search-receipts.jsonl"))?;
     let vector_recall_receipts =
         jsonl_status(memory_state_dir.join("vector-recall-receipts.jsonl"))?;
+    let service_recall_receipts =
+        jsonl_status(memory_state_dir.join("openclaw-mem-service-recall-receipts.jsonl"))?;
     let prompt_context_receipts =
         jsonl_status(memory_state_dir.join("prompt-context-receipts.jsonl"))?;
     let lifecycle_receipts = jsonl_status(memory_state_dir.join("lifecycle-receipts.jsonl"))?;
@@ -972,6 +975,7 @@ fn memory_status(harness_home: &Path) -> io::Result<HarnessMemoryStatus> {
         legacy_mem_sqlite,
         &semantic_coverage,
         &memory_owner_state,
+        &service_recall_receipts,
         &vector_recall_receipts,
         &prompt_context_receipts,
         &lifecycle_receipts,
@@ -993,6 +997,7 @@ fn memory_status(harness_home: &Path) -> io::Result<HarnessMemoryStatus> {
         regular_files,
         search_receipts,
         vector_recall_receipts,
+        service_recall_receipts,
         prompt_context_receipts,
         lifecycle_receipts,
         canvas_receipts,
@@ -1083,6 +1088,7 @@ fn memory_health_summary(
     legacy_mem_sqlite: bool,
     semantic_coverage: &MemorySemanticCoverageReport,
     memory_owner_state: &MemoryOwnerState,
+    service_recall_receipts: &HarnessJsonlStatus,
     vector_recall_receipts: &HarnessJsonlStatus,
     prompt_context_receipts: &HarnessJsonlStatus,
     lifecycle_receipts: &HarnessJsonlStatus,
@@ -1095,8 +1101,14 @@ fn memory_health_summary(
     provenance_chain_receipts: &HarnessJsonlStatus,
     capture_candidates: &HarnessJsonlStatus,
 ) -> HarnessMemoryHealthSummary {
+    let service_status = service_recall_receipts.latest_status.as_deref();
     let vector_status = vector_recall_receipts.latest_status.as_deref();
-    let active_recall_backend = if matches!(vector_status, Some("ready" | "no-hits")) {
+    let active_recall_backend = if matches!(service_status, Some("ready" | "no-hits")) {
+        service_recall_receipts
+            .latest_backend
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string())
+    } else if matches!(vector_status, Some("ready" | "no-hits")) {
         vector_recall_receipts
             .latest_backend
             .clone()
@@ -1113,26 +1125,16 @@ fn memory_health_summary(
     let adapter_readiness =
         memory_adapter_readiness_report(has_local_backend, qdrant_edge, false, true);
     let capability_mode = memory_capability_mode_from_readiness(&adapter_readiness);
-    let mem_engine_state = memory_dir
-        .join("openclaw-mem-engine")
-        .join("sunrise_state.json");
     let qdrant_edge_mode = if qdrant_edge {
         "preserved-snapshot"
     } else {
         "missing"
     };
-    let mem_engine_canary = MemoryMemEngineCanaryReport {
-        status: if mem_engine_state.is_file() {
-            "available-not-promoted".to_string()
-        } else {
-            "not-available".to_string()
-        },
-        active_slot_owner: "snapshot-adapter".to_string(),
-        engine_state_file: mem_engine_state.is_file().then_some(mem_engine_state),
-        rollback_slot_owner: "snapshot-adapter".to_string(),
-        qdrant_edge_mode: qdrant_edge_mode.to_string(),
-        warnings: Vec::new(),
-    };
+    let mem_engine_canary = memory_mem_engine_canary_report(
+        memory_dir.parent().unwrap_or(memory_dir),
+        qdrant_edge_mode,
+        memory_owner_state,
+    );
     let mem_engine_ownership =
         memory_mem_engine_ownership_report_for_owner_state(&mem_engine_canary, memory_owner_state);
     let qdrant_parity = if active_recall_backend
@@ -1851,6 +1853,14 @@ mod tests {
             harness_home
                 .join("state")
                 .join("memory")
+                .join("openclaw-mem-service-recall-receipts.jsonl"),
+            r#"{"status":"ready","hitCount":2,"backend":"qdrant-edge","recallProvider":"openclaw-mem-engine","reason":"ok"}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home
+                .join("state")
+                .join("memory")
                 .join("prompt-context-receipts.jsonl"),
             r#"{"status":"ready","hitCount":1,"reason":"ok"}"#,
         )
@@ -1924,11 +1934,8 @@ mod tests {
                 .as_deref(),
             Some("sqlite-vector")
         );
-        assert_eq!(report.memory.summary.active_recall_backend, "sqlite-vector");
-        assert_eq!(
-            report.memory.summary.qdrant_parity,
-            "snapshot-preserved; native-recall-not-active"
-        );
+        assert_eq!(report.memory.summary.active_recall_backend, "qdrant-edge");
+        assert_eq!(report.memory.summary.qdrant_parity, "native-recall-active");
         assert_eq!(report.memory.summary.capture_candidate_count, 2);
         assert_eq!(
             report
