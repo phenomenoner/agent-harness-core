@@ -3144,6 +3144,7 @@ fn execute_progress_delivery_once(
     let mut warnings = plan.warnings.clone();
     let policy = channel_access_policy(&args.target_home)?;
     let pending_count = plan.pending.len();
+    let skipped_muted = plan.summary.skipped_muted;
     let mut sent_messages = 0usize;
     let mut edited_messages = 0usize;
     let mut skipped_denied = 0usize;
@@ -3212,6 +3213,7 @@ fn execute_progress_delivery_once(
 
     let report = ProgressDeliveryOnceReport {
         pending_count,
+        skipped_muted,
         sent_messages,
         edited_messages,
         skipped_denied,
@@ -3231,8 +3233,9 @@ fn execute_progress_delivery_once(
             "progress",
             "progress.delivery-once",
             format!(
-                "pending={} sent={} edited={} denied={} permanent={} failed={}",
+                "pending={} muted={} sent={} edited={} denied={} permanent={} failed={}",
                 report.pending_count,
+                report.skipped_muted,
                 report.sent_messages,
                 report.edited_messages,
                 report.skipped_denied,
@@ -7210,6 +7213,7 @@ struct ProgressDeliveryLoopArgs {
 #[derive(Debug, Clone)]
 struct ProgressDeliveryOnceReport {
     pending_count: usize,
+    skipped_muted: usize,
     sent_messages: usize,
     edited_messages: usize,
     skipped_denied: usize,
@@ -16169,6 +16173,7 @@ fn print_channel_delivery_receipt(receipt: &ChannelDeliveryReceipt) {
 fn print_progress_delivery_once_report(report: &ProgressDeliveryOnceReport) {
     println!("Agent progress delivery once");
     println!("Pending panels: {}", report.pending_count);
+    println!("Muted events: {}", report.skipped_muted);
     println!("Sent panels: {}", report.sent_messages);
     println!("Edited panels: {}", report.edited_messages);
     println!("Denied panels: {}", report.skipped_denied);

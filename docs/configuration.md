@@ -152,6 +152,13 @@ Native cron LLM turns use CronRunStore before worker enqueue:
     },
     "emojiAccentChannelModes": {
       "telegram:12345": "subtle"
+    },
+    "progressDeliveryMode": "on",
+    "progressDeliveryAgentModes": {
+      "ops": "off"
+    },
+    "progressDeliveryChannelModes": {
+      "telegram:-1003968507595": "off"
     }
   }
 }
@@ -169,6 +176,13 @@ Emoji accent modes:
 - `subtle`: opt-in. Append one small accent to successful `agent-reply` text only.
 
 The accent policy is applied at the final `agent-reply` outbox boundary after a successful runtime turn when `subtle` is selected. It does not alter command replies, `/status`, error replies, progress/status messages, code-heavy replies, fenced code blocks, risk/security/status-style replies, or text that already ends with an emoji. Channel overrides win over agent overrides, and agent overrides win over the global default. Channel selectors can be `platform:channelId:userId`, `platform:channelId`, `channelId`, or `platform`.
+
+Progress delivery modes:
+
+- `on`: default. Deliver eligible progress panels normally.
+- `off`: mute eligible progress panels while final `agent-reply` delivery remains unchanged.
+
+`progressDeliveryMode` sets the global default, `progressDeliveryAgentModes` overrides by agent id, and `progressDeliveryChannelModes` overrides by channel selector. Channel selectors use the same progress event identity order as delivery: `platform:channelId:thread:threadId`, `platform:channelId`, `channelId:thread:threadId`, then `channelId`, so a group/topic-specific mute can be narrower than a whole channel mute. Channel overrides win over agent overrides, which win over the global setting. Supported off aliases are `off`, `none`, `hidden`, `disabled`, `disable`, `false`, `mute`, and `muted`; supported on aliases are `on`, `enabled`, `enable`, `true`, `progress_panel`, and `progress-panel`.
 
 ## Prompt Files
 

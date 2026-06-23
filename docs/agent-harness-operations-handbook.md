@@ -344,6 +344,13 @@ Assistant narration and final-reply tone are configured under `response` in `.ag
     },
     "telegramFormattingChannelModes": {
       "telegram:2118296735": "plain"
+    },
+    "progressDeliveryMode": "on",
+    "progressDeliveryAgentModes": {
+      "ops": "off"
+    },
+    "progressDeliveryChannelModes": {
+      "telegram:-1003968507595": "off"
     }
   }
 }
@@ -354,6 +361,8 @@ Supported modes are `off`, `progress_panel`, and `inline_preface`. The default `
 `emojiAccentMode` supports `off` and `subtle`; the default is `off`. The accent policy is per-agent/per-channel and applies only when `runtime-run-once` writes a successful `agent-reply` to the channel outbox and the resolved mode is `subtle`. It must not be applied to command replies, `/status`, error/failure replies, progress/status panels, code-heavy replies, fenced code blocks, risk/security/status-style replies, or text already ending with an emoji. Channel selectors can be `platform:channelId:userId`, `platform:channelId`, `channelId`, or `platform`; channel overrides win over agent overrides, which win over the global setting.
 
 `telegramFormattingMode` supports `plain` and `html`; the default is `plain`. HTML mode is only applied to successful Telegram `agent-reply` text after policy selection, not to commands, errors, progress panels, or attachments. The renderer escapes all dynamic text before adding Telegram-safe `<b>`, `<code>`, or `<pre>` tags, includes `parse_mode=HTML`, disables previews through `link_preview_options.is_disabled=true`, and falls back to plain policy by config. Channel overrides win over account overrides, which win over agent overrides, which win over the global setting.
+
+`progressDeliveryMode` supports `on` and `off`; the default is `on`. `progressDeliveryAgentModes` can mute or re-enable progress panels by agent id, and `progressDeliveryChannelModes` can mute or re-enable by channel selector. Progress channel selectors are checked from most specific to least specific: `platform:channelId:thread:threadId`, `platform:channelId`, `channelId:thread:threadId`, then `channelId`; channel overrides win over agent overrides, which win over the global setting. Muted progress events advance the delivery cursor and compacted cache so old tool-use panels do not replay after a mute. This only affects progress panels such as `todo`, `skill_view`, `terminal`, status, and `Done`; final outbox delivery is not muted by these keys.
 
 `codex-plan` reads the latest prepared execution or an explicit `--execution-dir`, writes `codex-runtime-plan.json` plus `codex-runtime-receipt.json`, and appends `codex-runtime-receipts.jsonl`. It plans a stdio `codex app-server` invocation, model/env requirements, and legacy-compatible transcript/trajectory/Codex binding output paths. It still does not start Codex or make a model request.
 

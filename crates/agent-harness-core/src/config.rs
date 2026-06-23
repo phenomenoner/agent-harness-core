@@ -194,6 +194,15 @@ fn validate_response_object(path: &str, value: &Value, errors: &mut Vec<String>)
             "telegramFormattingChannelModes" | "telegram_formatting_channel_modes" => {
                 validate_telegram_formatting_mode_map(path_key(path, key), child, errors)
             }
+            "progressDeliveryMode" | "progress_delivery_mode" => {
+                expect_progress_delivery_mode(path_key(path, key), child, errors)
+            }
+            "progressDeliveryAgentModes" | "progress_delivery_agent_modes" => {
+                validate_progress_delivery_mode_map(path_key(path, key), child, errors)
+            }
+            "progressDeliveryChannelModes" | "progress_delivery_channel_modes" => {
+                validate_progress_delivery_mode_map(path_key(path, key), child, errors)
+            }
             other => errors.push(format!("unknown response config key `{other}` at {path}")),
         }
     }
@@ -248,6 +257,39 @@ fn expect_telegram_formatting_mode(
             "on",
             "enabled",
             "true",
+        ],
+        errors,
+    );
+}
+
+fn validate_progress_delivery_mode_map(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(&path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        expect_progress_delivery_mode(path_key(&path, key), child, errors);
+    }
+}
+
+fn expect_progress_delivery_mode(path: impl Into<String>, value: &Value, errors: &mut Vec<String>) {
+    expect_enum(
+        path,
+        value,
+        &[
+            "on",
+            "enabled",
+            "enable",
+            "true",
+            "progress_panel",
+            "progress-panel",
+            "off",
+            "none",
+            "hidden",
+            "disabled",
+            "disable",
+            "false",
+            "mute",
+            "muted",
         ],
         errors,
     );
@@ -845,7 +887,10 @@ mod tests {
                 "telegramFormattingMode": "plain",
                 "telegramFormattingAgentModes": { "main": "html" },
                 "telegramFormattingAccountModes": { "xiaoxiaoli": "html" },
-                "telegramFormattingChannelModes": { "telegram:dm-42": "plain" }
+                "telegramFormattingChannelModes": { "telegram:dm-42": "plain" },
+                "progressDeliveryMode": "on",
+                "progressDeliveryAgentModes": { "xiaoxiaoli": "off" },
+                "progressDeliveryChannelModes": { "telegram:-1003968507595": "muted" }
               },
               "security": {
                 "codexApprovalPolicy": "accept",
@@ -951,7 +996,8 @@ mod tests {
             r#"{
               "response": {
                 "assistantNarrationMode": "chatty",
-                "emojiAccentMode": "loud"
+                "emojiAccentMode": "loud",
+                "progressDeliveryMode": "chatty"
               },
               "security": { "codexApprovalPolicy": "YOLO" },
               "workerDispatch": {
@@ -980,6 +1026,12 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.contains("emojiAccentMode"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("progressDeliveryMode"))
         );
         assert!(
             report

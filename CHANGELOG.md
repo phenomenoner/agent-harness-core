@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Added `response.progressDeliveryMode`, `response.progressDeliveryAgentModes`, and `response.progressDeliveryChannelModes` so operators can mute progress panels globally, per agent, or per channel without disabling final replies.
+- Treat `timeout` runtime trace records as terminal in `trace`, matching runtime queue and progress delivery timeout semantics.
 - Added generated runtime-runner process-exit classification for OOM/resource-exhaustion signatures, recording `errorClass` and a bounded `restartAfterSeconds` in `runtime-loop-runner-safe-mode.json`.
 - Generated runtime runners now write a structured temporary stop file for `progress-delivery-loop` and record `memoryGateDecision` before restarting after OOM/resource-exhaustion signatures.
 - `status --json` and `healthz` now expose supervisor service registry records, including launch ownership, supervisor PID, restart/backoff, exit, and memory-gate fields.

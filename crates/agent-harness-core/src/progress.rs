@@ -4,7 +4,9 @@ use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::config::harness_config_candidates;
 use crate::write_json_atomic;
 
 const AGENT_PROGRESS_EVENT_SCHEMA: &str = "agent-harness.progress-event.v1";
@@ -133,6 +135,7 @@ pub struct AgentProgressDeliveryPlanSummary {
     pub rate_limited: usize,
     pub invalid_lines: usize,
     pub skipped_platform: usize,
+    pub skipped_muted: usize,
     pub read_from_byte: u64,
     pub read_to_byte: u64,
 }
@@ -231,6 +234,25 @@ pub enum AgentProgressDeliveryStatus {
     Failed,
     SkippedDenied,
     SkippedPermanent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentProgressDeliveryMode {
+    On,
+    Off,
+}
+
+impl Default for AgentProgressDeliveryMode {
+    fn default() -> Self {
+        Self::On
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AgentProgressDeliveryMuteConfig {
+    default_mode: AgentProgressDeliveryMode,
+    agent_modes: BTreeMap<String, AgentProgressDeliveryMode>,
+    channel_modes: BTreeMap<String, AgentProgressDeliveryMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -562,6 +584,7 @@ pub fn plan_agent_progress_delivery(
     let state_file = agent_progress_delivery_state_file(&options.harness_home);
     let receipts_file = agent_progress_delivery_receipts_file(&options.harness_home);
     let mut warnings = Vec::new();
+    let mute_config = load_progress_delivery_mute_config(&options.harness_home, &mut warnings)?;
     let mut state = read_delivery_state(&state_file, &mut warnings)?;
     let read_result =
         read_progress_events_since_cursor(&events_file, &state.ledger, &mut warnings)?;
@@ -581,10 +604,6 @@ pub fn plan_agent_progress_delivery(
     for queue_events in all_by_queue.values_mut() {
         queue_events.sort_by_key(|stored| stored.line_number);
     }
-    state.ledger = read_result.cursor;
-    state.compacted_events =
-        compact_progress_events_by_queue(&all_by_queue, options.max_events_per_panel);
-    write_delivery_state(&state_file, &state)?;
     let mut summary = AgentProgressDeliveryPlanSummary {
         total_events: all_by_queue.values().map(Vec::len).sum(),
         new_events: read_result.new_events,
@@ -609,12 +628,20 @@ pub fn plan_agent_progress_delivery(
                 summary.skipped_platform += 1;
                 continue;
             }
+            if !progress_delivery_enabled_for_event(&mute_config, &stored.event) {
+                summary.skipped_muted += 1;
+                continue;
+            }
             kept.push(stored);
         }
         if !kept.is_empty() {
             by_queue.insert(queue_id, kept);
         }
     }
+    state.ledger = read_result.cursor;
+    state.compacted_events =
+        compact_progress_events_by_queue(&by_queue, options.max_events_per_panel);
+    write_delivery_state(&state_file, &state)?;
     summary.queues = by_queue.len();
 
     let mut pending = Vec::new();
@@ -727,6 +754,174 @@ pub fn plan_agent_progress_delivery(
         summary,
         warnings,
     })
+}
+
+fn load_progress_delivery_mute_config(
+    harness_home: impl AsRef<Path>,
+    warnings: &mut Vec<String>,
+) -> io::Result<AgentProgressDeliveryMuteConfig> {
+    let harness_home = harness_home.as_ref();
+    let Some(config_file) = harness_config_candidates(harness_home)
+        .into_iter()
+        .find(|path| path.is_file())
+    else {
+        return Ok(AgentProgressDeliveryMuteConfig::default());
+    };
+    let text = fs::read_to_string(&config_file)?;
+    let value = match serde_json::from_str::<Value>(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            warnings.push(format!(
+                "failed to parse {} for progress delivery mute config: {error}; using defaults",
+                config_file.display()
+            ));
+            return Ok(AgentProgressDeliveryMuteConfig::default());
+        }
+    };
+    let Some(response) = value.get("response").and_then(Value::as_object) else {
+        return Ok(AgentProgressDeliveryMuteConfig::default());
+    };
+
+    let mut config = AgentProgressDeliveryMuteConfig::default();
+    if let Some(mode) = response
+        .get("progressDeliveryMode")
+        .or_else(|| response.get("progress_delivery_mode"))
+    {
+        match parse_progress_delivery_mode_value(mode) {
+            Some(mode) => config.default_mode = mode,
+            None => warnings.push(format!(
+                "unknown response.progressDeliveryMode in {}; using {}",
+                config_file.display(),
+                progress_delivery_mode_name(config.default_mode)
+            )),
+        }
+    }
+    load_progress_delivery_mode_map(
+        response
+            .get("progressDeliveryAgentModes")
+            .or_else(|| response.get("progress_delivery_agent_modes")),
+        &mut config.agent_modes,
+        "response.progressDeliveryAgentModes",
+        &config_file,
+        warnings,
+    );
+    load_progress_delivery_mode_map(
+        response
+            .get("progressDeliveryChannelModes")
+            .or_else(|| response.get("progress_delivery_channel_modes")),
+        &mut config.channel_modes,
+        "response.progressDeliveryChannelModes",
+        &config_file,
+        warnings,
+    );
+    Ok(config)
+}
+
+fn load_progress_delivery_mode_map(
+    value: Option<&Value>,
+    target: &mut BTreeMap<String, AgentProgressDeliveryMode>,
+    label: &str,
+    config_file: &Path,
+    warnings: &mut Vec<String>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    let Some(object) = value.as_object() else {
+        warnings.push(format!(
+            "{label} in {} must be an object; ignoring it",
+            config_file.display()
+        ));
+        return;
+    };
+    for (key, value) in object {
+        let key = key.trim();
+        if key.is_empty() {
+            warnings.push(format!(
+                "{label} in {} contains an empty key; ignoring it",
+                config_file.display()
+            ));
+            continue;
+        }
+        match parse_progress_delivery_mode_value(value) {
+            Some(mode) => {
+                target.insert(key.to_string(), mode);
+            }
+            None => warnings.push(format!(
+                "unknown {label}.{key} in {}; ignoring it",
+                config_file.display()
+            )),
+        }
+    }
+}
+
+fn parse_progress_delivery_mode_value(value: &Value) -> Option<AgentProgressDeliveryMode> {
+    value.as_str().and_then(parse_progress_delivery_mode)
+}
+
+fn parse_progress_delivery_mode(value: &str) -> Option<AgentProgressDeliveryMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "enabled" | "enable" | "true" | "progress_panel" | "progress-panel" => {
+            Some(AgentProgressDeliveryMode::On)
+        }
+        "off" | "none" | "hidden" | "disabled" | "disable" | "false" | "mute" | "muted" => {
+            Some(AgentProgressDeliveryMode::Off)
+        }
+        _ => None,
+    }
+}
+
+fn progress_delivery_mode_name(mode: AgentProgressDeliveryMode) -> &'static str {
+    match mode {
+        AgentProgressDeliveryMode::On => "on",
+        AgentProgressDeliveryMode::Off => "off",
+    }
+}
+
+fn progress_delivery_enabled_for_event(
+    config: &AgentProgressDeliveryMuteConfig,
+    event: &AgentProgressEvent,
+) -> bool {
+    for key in progress_delivery_channel_match_keys(event) {
+        if let Some(mode) = config.channel_modes.get(&key) {
+            return *mode == AgentProgressDeliveryMode::On;
+        }
+    }
+    if let Some(agent_id) = event
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|agent_id| !agent_id.is_empty())
+        && let Some(mode) = config.agent_modes.get(agent_id)
+    {
+        return *mode == AgentProgressDeliveryMode::On;
+    }
+    config.default_mode == AgentProgressDeliveryMode::On
+}
+
+fn progress_delivery_channel_match_keys(event: &AgentProgressEvent) -> Vec<String> {
+    let platform = event.platform.trim();
+    let channel_id = event.channel_id.trim();
+    let thread_id = event
+        .thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty());
+    let mut keys = Vec::new();
+    // Most specific keys win: platform+thread, platform+channel, raw thread, raw channel.
+    if !platform.is_empty() && !channel_id.is_empty() {
+        if let Some(thread_id) = thread_id {
+            keys.push(format!("{platform}:{channel_id}:thread:{thread_id}"));
+        }
+        keys.push(format!("{platform}:{channel_id}"));
+    }
+    if !channel_id.is_empty() {
+        if let Some(thread_id) = thread_id {
+            keys.push(format!("{channel_id}:thread:{thread_id}"));
+        }
+        keys.push(channel_id.to_string());
+    }
+    keys
 }
 
 pub fn record_agent_progress_delivery(
@@ -1316,6 +1511,7 @@ struct RenderedAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HARNESS_CONFIG_FILE_NAME;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -2256,6 +2452,161 @@ mod tests {
                 .any(|stored| is_terminal_event(&stored.event))
         );
         assert_eq!(state.ledger.line_number, 81);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn progress_delivery_agent_mute_suppresses_pending_and_cache() {
+        let root = temp_root("progress_delivery_agent_mute_suppresses_pending_and_cache");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "response": {
+                "progressDeliveryAgentModes": { "xiaoxiaoli": "off" }
+              }
+            }"#,
+        )
+        .unwrap();
+        let mut context = context();
+        context.agent_id = Some("xiaoxiaoli".to_string());
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Todo,
+                "todo",
+                "planning 1 task(s)",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+        )
+        .unwrap();
+
+        let plan = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+
+        assert!(plan.pending.is_empty());
+        assert_eq!(plan.summary.skipped_muted, 1);
+
+        let mut warnings = Vec::new();
+        let state = read_delivery_state(
+            &agent_progress_delivery_state_file(&harness_home),
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(warnings.is_empty());
+        assert!(state.compacted_events.is_empty());
+        assert_eq!(state.ledger.line_number, 1);
+
+        let next = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 3000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert!(next.pending.is_empty());
+        assert_eq!(next.summary.skipped_muted, 0);
+        assert_eq!(next.summary.cached_events, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn progress_delivery_global_off_suppresses_pending() {
+        let root = temp_root("progress_delivery_global_off_suppresses_pending");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "response": {
+                "progressDeliveryMode": "off"
+              }
+            }"#,
+        )
+        .unwrap();
+        let context = context();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Todo,
+                "todo",
+                "planning 1 task(s)",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+        )
+        .unwrap();
+
+        let plan = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+
+        assert!(plan.pending.is_empty());
+        assert_eq!(plan.summary.skipped_muted, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn progress_delivery_channel_mode_overrides_agent_mute() {
+        let root = temp_root("progress_delivery_channel_mode_overrides_agent_mute");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "response": {
+                "progressDeliveryAgentModes": { "xiaoxiaoli": "off" },
+                "progressDeliveryChannelModes": { "telegram:-1003968507595": "on" }
+              }
+            }"#,
+        )
+        .unwrap();
+        let mut context = context();
+        context.agent_id = Some("xiaoxiaoli".to_string());
+        context.channel_id = "-1003968507595".to_string();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Todo,
+                "todo",
+                "planning 1 task(s)",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+        )
+        .unwrap();
+
+        let plan = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+
+        assert_eq!(plan.pending.len(), 2);
+        assert_eq!(plan.summary.skipped_muted, 0);
 
         let _ = fs::remove_dir_all(root);
     }

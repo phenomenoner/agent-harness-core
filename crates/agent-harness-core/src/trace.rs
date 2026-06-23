@@ -66,6 +66,7 @@ pub fn trace_harness_event(options: TraceOptions) -> io::Result<TraceReport> {
                     | "delivered"
                     | "failed-terminal"
                     | "dead-letter"
+                    | "timeout"
                     | "skipped"
                     | "canceled"
             )
@@ -206,6 +207,31 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.records.len(), 3);
+        assert!(report.terminal);
+        assert!(report.diagnostics.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn trace_treats_timeout_status_as_terminal() {
+        let root = temp_root("trace_treats_timeout_status_as_terminal");
+        let harness_home = root.join(".agent-harness");
+        let queue = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue).unwrap();
+        fs::write(
+            queue.join("run-once-receipts.jsonl"),
+            r#"{"queueId":"q-timeout","status":"timeout","reason":"runtime timeout"}"#,
+        )
+        .unwrap();
+
+        let report = trace_harness_event(TraceOptions {
+            harness_home,
+            id: "q-timeout".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(report.records.len(), 1);
         assert!(report.terminal);
         assert!(report.diagnostics.is_empty());
 
