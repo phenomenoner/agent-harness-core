@@ -9,11 +9,11 @@ use serde_json::Value;
 
 use crate::loop_health::{process_alive_for_pid, read_supervisor_stop_file};
 use crate::memory::{
-    MemoryMemEngineCanaryReport, MemoryMemEngineOwnershipReport, MemorySemanticCoverageReport,
+    MemoryMemEngineOwnershipReport, MemorySemanticCoverageReport,
     collect_memory_embedding_coverage, collect_memory_semantic_coverage,
     memory_adapter_readiness_report, memory_capability_mode_from_readiness,
-    memory_mem_engine_ownership_report_for_owner_state, memory_qdrant_native_recall_status,
-    openclaw_mem_service_store_file_for_agent,
+    memory_mem_engine_canary_report, memory_mem_engine_ownership_report_for_owner_state,
+    memory_qdrant_native_recall_status, openclaw_mem_service_store_file_for_agent,
 };
 use crate::memory_owner::{MemoryOwnerState, read_memory_owner_state_or_default};
 use crate::skill_apply::skill_apply_receipts_file;
@@ -1125,26 +1125,16 @@ fn memory_health_summary(
     let adapter_readiness =
         memory_adapter_readiness_report(has_local_backend, qdrant_edge, false, true);
     let capability_mode = memory_capability_mode_from_readiness(&adapter_readiness);
-    let mem_engine_state = memory_dir
-        .join("openclaw-mem-engine")
-        .join("sunrise_state.json");
     let qdrant_edge_mode = if qdrant_edge {
         "preserved-snapshot"
     } else {
         "missing"
     };
-    let mem_engine_canary = MemoryMemEngineCanaryReport {
-        status: if mem_engine_state.is_file() {
-            "available-not-promoted".to_string()
-        } else {
-            "not-available".to_string()
-        },
-        active_slot_owner: "snapshot-adapter".to_string(),
-        engine_state_file: mem_engine_state.is_file().then_some(mem_engine_state),
-        rollback_slot_owner: "snapshot-adapter".to_string(),
-        qdrant_edge_mode: qdrant_edge_mode.to_string(),
-        warnings: Vec::new(),
-    };
+    let mem_engine_canary = memory_mem_engine_canary_report(
+        memory_dir.parent().unwrap_or(memory_dir),
+        qdrant_edge_mode,
+        memory_owner_state,
+    );
     let mem_engine_ownership =
         memory_mem_engine_ownership_report_for_owner_state(&mem_engine_canary, memory_owner_state);
     let qdrant_parity = if active_recall_backend

@@ -1943,9 +1943,10 @@ pub fn record_memory_provenance_chain(
     Ok(report)
 }
 
-fn memory_mem_engine_canary(
+pub fn memory_mem_engine_canary_report(
     harness_home: &Path,
     qdrant_edge_mode: &str,
+    owner_state: &MemoryOwnerState,
 ) -> MemoryMemEngineCanaryReport {
     let engine_state = harness_home
         .join("memory")
@@ -1953,21 +1954,24 @@ fn memory_mem_engine_canary(
         .join("sunrise_state.json");
     let engine_state_file = engine_state.is_file().then_some(engine_state);
     let mut warnings = Vec::new();
-    if engine_state_file.is_some() {
+    let mem_engine_active = owner_state.owner == MEM_ENGINE_OWNER;
+    if engine_state_file.is_some() && !mem_engine_active {
         warnings.push(
-            "openclaw-mem-engine state is imported but not promoted; snapshot adapter remains rollback"
+            "openclaw-mem-engine state is imported but not promoted; snapshot adapter remains active owner"
                 .to_string(),
         );
     }
     MemoryMemEngineCanaryReport {
-        status: if engine_state_file.is_some() {
+        status: if mem_engine_active {
+            "mem-engine-active".to_string()
+        } else if engine_state_file.is_some() {
             "available-not-promoted".to_string()
         } else {
             "not-available".to_string()
         },
-        active_slot_owner: "snapshot-adapter".to_string(),
+        active_slot_owner: owner_state.owner.clone(),
         engine_state_file,
-        rollback_slot_owner: "snapshot-adapter".to_string(),
+        rollback_slot_owner: owner_state.rollback_owner.clone(),
         qdrant_edge_mode: qdrant_edge_mode.to_string(),
         warnings,
     }
@@ -2032,12 +2036,13 @@ pub fn inspect_openclaw_mem_service(
             graph_readiness.blockers.join(", ")
         ));
     }
-    let mem_engine_canary = memory_mem_engine_canary(&options.harness_home, &qdrant_edge_mode);
-    warnings.extend(mem_engine_canary.warnings.clone());
     let owner_state = read_memory_owner_state_or_default(
         &options.harness_home,
         crate::current_log_time_ms().unwrap_or(0),
     )?;
+    let mem_engine_canary =
+        memory_mem_engine_canary_report(&options.harness_home, &qdrant_edge_mode, &owner_state);
+    warnings.extend(mem_engine_canary.warnings.clone());
     let has_local_backend =
         sqlite.is_file() || observations.is_file() || episodes.is_file() || agent_store.is_file();
     let has_any_backend = has_local_backend || qdrant_snapshot_present;
@@ -5901,6 +5906,18 @@ mod tests {
         assert_eq!(status.status, OpenClawMemServiceStatus::Ready);
         assert_eq!(status.service_mode, "local-in-process");
         assert_eq!(status.active_slot_owner, MEM_ENGINE_OWNER);
+        assert_eq!(status.mem_engine_canary.status, "mem-engine-active");
+        assert_eq!(status.mem_engine_canary.active_slot_owner, MEM_ENGINE_OWNER);
+        assert_eq!(
+            status.mem_engine_canary.rollback_slot_owner,
+            "snapshot-adapter"
+        );
+        assert!(
+            !status
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("not promoted"))
+        );
         assert_eq!(status.mem_engine_ownership.active_owner, MEM_ENGINE_OWNER);
 
         let recall = recall_openclaw_mem_service(OpenClawMemServiceRecallOptions {
