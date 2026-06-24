@@ -14,6 +14,7 @@ use crate::{
 
 const CHANNEL_STEP_SCHEMA: &str = "agent-harness.channel-step.v1";
 const CHANNEL_RESTART_REQUEST_SCHEMA: &str = "agent-harness.channel-restart-request.v1";
+const CHANNEL_GATEWAY_RESTART_REQUEST_SCHEMA: &str = "agent-harness.gateway-restart-request.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +66,13 @@ pub enum ChannelCommandEffect {
         detail: String,
         reason: Option<String>,
         stop_file: Option<PathBuf>,
+        request_file: Option<PathBuf>,
+        receipt_file: Option<PathBuf>,
+    },
+    RestartGateway {
+        status: String,
+        detail: String,
+        reason: Option<String>,
         request_file: Option<PathBuf>,
         receipt_file: Option<PathBuf>,
     },
@@ -388,6 +396,9 @@ fn command_effect(
         ChannelCommandIntent::RestartChannel { target, reason } => {
             restart_channel_effect(turn, target, reason, warnings)
         }
+        ChannelCommandIntent::RestartGateway { reason } => {
+            restart_gateway_effect(turn, reason, warnings)
+        }
         ChannelCommandIntent::AddSteering { instruction } => {
             ChannelCommandEffect::AddSteering { instruction }
         }
@@ -481,9 +492,54 @@ fn restart_channel_effect(
     }
 }
 
+fn restart_gateway_effect(
+    turn: &TurnPlan,
+    reason: Option<String>,
+    warnings: &mut Vec<String>,
+) -> ChannelCommandEffect {
+    let Some(harness_home) = turn.harness_home.as_ref() else {
+        return ChannelCommandEffect::RestartGateway {
+            status: "failed".to_string(),
+            detail:
+                "restart command requires a harness home so the gateway restart request can be recorded"
+                    .to_string(),
+            reason,
+            request_file: None,
+            receipt_file: None,
+        };
+    };
+
+    match write_gateway_restart_request(turn, harness_home, reason.as_deref()) {
+        Ok(record) => ChannelCommandEffect::RestartGateway {
+            status: "requested".to_string(),
+            detail: "protected gateway restart request recorded; operator token + idle gate control are required"
+                .to_string(),
+            reason,
+            request_file: Some(record.request_file),
+            receipt_file: Some(record.receipt_file),
+        },
+        Err(error) => {
+            warnings.push(format!("failed to record gateway restart request: {error}"));
+            ChannelCommandEffect::RestartGateway {
+                status: "failed".to_string(),
+                detail: error.to_string(),
+                reason,
+                request_file: None,
+                receipt_file: None,
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChannelRestartFiles {
     stop_file: PathBuf,
+    request_file: PathBuf,
+    receipt_file: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatewayRestartFiles {
     request_file: PathBuf,
     receipt_file: PathBuf,
 }
@@ -496,10 +552,7 @@ fn write_channel_restart_request(
     reason: Option<&str>,
 ) -> io::Result<ChannelRestartFiles> {
     let at_ms = current_time_ms();
-    let reason = reason
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("channel /restart command requested");
+    let reason = normalize_restart_reason(reason, "channel /restart command requested");
     let stop_file = channel_restart_stop_file(harness_home, service_id);
     if let Some(parent) = stop_file.parent() {
         fs::create_dir_all(parent)?;
@@ -559,6 +612,50 @@ fn write_channel_restart_request(
     })
 }
 
+fn write_gateway_restart_request(
+    turn: &TurnPlan,
+    harness_home: &Path,
+    reason: Option<&str>,
+) -> io::Result<GatewayRestartFiles> {
+    let at_ms = current_time_ms();
+    let reason = normalize_restart_reason(reason, "gateway /restart command requested");
+    let request_dir = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("gateway-restart-requests");
+    fs::create_dir_all(&request_dir)?;
+    let request_file = request_dir.join(format!(
+        "{}-{}.json",
+        at_ms,
+        safe_file_component(&turn.user_id)
+    ));
+    let receipt_file = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("gateway-restart-requests.jsonl");
+    let record = serde_json::json!({
+        "schema": CHANNEL_GATEWAY_RESTART_REQUEST_SCHEMA,
+        "status": "requested",
+        "target": "gateway",
+        "platform": "gateway",
+        "requestingPlatform": turn.platform,
+        "channelId": turn.channel_id,
+        "userId": turn.user_id,
+        "sessionKey": turn.session_key,
+        "reason": reason,
+        "requestFile": request_file,
+        "receiptFile": receipt_file,
+        "atMs": at_ms,
+    });
+    crate::write_json_atomic(&request_file, &record)?;
+    crate::append_jsonl_value(&receipt_file, &record)?;
+
+    Ok(GatewayRestartFiles {
+        request_file,
+        receipt_file,
+    })
+}
+
 fn restart_target_platform(turn: &TurnPlan, target: Option<&str>) -> Option<String> {
     match target.map(|value| value.trim().to_ascii_lowercase()) {
         None => Some(turn.platform.trim().to_ascii_lowercase()),
@@ -569,6 +666,14 @@ fn restart_target_platform(turn: &TurnPlan, target: Option<&str>) -> Option<Stri
         Some(target) if target == "discord" => Some("discord".to_string()),
         Some(_) => None,
     }
+}
+
+fn normalize_restart_reason(reason: Option<&str>, fallback: &str) -> String {
+    reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 fn restart_service_id(platform: &str) -> Option<&'static str> {
@@ -848,6 +953,26 @@ fn command_reply_text(effect: &ChannelCommandEffect) -> String {
                         .as_ref()
                         .map(|reason| format!("\nReason: {reason}"))
                         .unwrap_or_default()
+                )
+            } else {
+                format!("Restart request status: {status}\n{detail}")
+            }
+        }
+        ChannelCommandEffect::RestartGateway {
+            status,
+            detail,
+            reason,
+            ..
+        } => {
+            if status == "requested" {
+                format!(
+                    "{}{}\n{}",
+                    detail,
+                    reason
+                        .as_ref()
+                        .map(|reason| format!("\nReason: {reason}"))
+                        .unwrap_or_default(),
+                    "Operator token and idle-gate control are required before restart execution."
                 )
             } else {
                 format!("Restart request status: {status}\n{detail}")
@@ -1314,7 +1439,7 @@ mod tests {
                 platform: "telegram".to_string(),
                 channel_id: "dm".to_string(),
                 user_id: "operator".to_string(),
-                text: "/restart reconnect adapter".to_string(),
+                text: "/restart telegram reconnect adapter".to_string(),
                 inbound_context: None,
                 inbound_media_artifacts: Vec::new(),
                 requested_agent_id: Some("main".to_string()),
@@ -1361,6 +1486,73 @@ mod tests {
                 .join("state")
                 .join("channels")
                 .join("channel-restart-requests.jsonl")
+                .is_file()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_step_requests_gateway_restart_for_bare_restart_command() {
+        let root = temp_root("channel_step_requests_gateway_restart_for_bare_restart_command");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let stop_file =
+            crate::loop_health::supervisor_stop_file_path(&harness_home, "telegram-loop");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "operator".to_string(),
+                text: "/restart".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        let step = build_channel_step(&registry, &turn);
+
+        assert_eq!(step.action, ChannelStepAction::ReplyOnly);
+        assert!(step.agent_turn.is_none());
+        assert!(
+            step.outbound_messages[0]
+                .text
+                .contains("protected gateway restart request recorded")
+        );
+        assert!(
+            step.outbound_messages[0]
+                .text
+                .contains("Operator token and idle-gate control are required")
+        );
+        assert!(matches!(
+            step.command_effect,
+            Some(ChannelCommandEffect::RestartGateway {
+                ref status,
+                ref reason,
+                ref request_file,
+                ref receipt_file,
+                ..
+            }) if status == "requested"
+                && reason.is_none()
+                && request_file.as_ref().is_some_and(|path| path.is_file())
+                && receipt_file.as_ref().is_some_and(|path| path.is_file())
+        ));
+        assert!(!stop_file.exists());
+        assert!(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("gateway-restart-requests.jsonl")
                 .is_file()
         );
 

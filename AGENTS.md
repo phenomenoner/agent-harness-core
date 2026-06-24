@@ -7,6 +7,7 @@
 ## Default Superpowers For Development
 
 - For programming or software-development tasks, default to enabling and following [$superpowers](C:\Users\user\.agents\skills\superpowers\SKILL.md) before implementation unless the user explicitly says not to use it.
+- Treat this repo-level AGENTS section, or a user `[$superpowers]` mention, as the explicit project invocation for this repository if the standalone Superpowers skill text says it should only be used when explicitly invoked.
 - Treat Superpowers as the baseline development workflow for planning, implementation discipline, verification, and completion checks. If the skill file is unavailable in a session, state that briefly and continue with the closest matching local process.
 
 ## Command Approval Discipline
@@ -33,7 +34,9 @@
 
 ## Sub-Agent Delegation Preference
 
-- When sub-agent tooling is available, use sub-agents by default to accelerate bounded sidecar tasks such as read-only codebase inspection, plan/diff review, documentation gap checks, and test matrix review, unless the user explicitly asks not to use sub-agents.
+- When sub-agent tooling is available and the task is inside CK's authorized delegation envelope, use sub-agents by default to accelerate bounded sidecar tasks such as read-only codebase inspection, plan/diff review, documentation gap checks, and test matrix review, unless the user explicitly asks not to use sub-agents.
+- CK's authorized delegation envelope includes requests that explicitly mention sub-agents, delegation, parallel work, reviewer loops, smoke checks, long-running ops work, or workflows naturally split across bounded sidecar inspection/verification tasks. It excludes tiny single-answer replies, destructive/live-control operations, auth or permission changes, external posts/messages, purchases/trades/spend, and any task where CK explicitly says not to delegate.
+- For implementation work that can be split into disjoint code ownership, prefer delegating bounded coding subtasks to `gpt-5.3-codex-spark` worker sub-agents, with `gpt-5.4-mini` as the fallback when Spark is unavailable, spawn is rejected, or a narrower retry is appropriate. Use Codex-authenticated worker lanes only; if provider/auth routing is not visible in the sub-agent receipt, record Codex-auth status as unverified rather than assuming it.
 - Every sub-agent assignment must have a bounded scope and an expected output. When waiting for a sub-agent, always use an explicit `timeout_ms` instead of an unbounded wait.
 - If a sub-agent wait times out, inspect whether the result is needed on the critical path. If it is not critical, continue locally; if it is critical, retry at most once with a shorter, clearer prompt and timeout.
 - Close completed, timed-out, irrelevant, or invalid-dispatch sub-agents promptly so stalled side work does not consume worker capacity or hide the actual blocker.

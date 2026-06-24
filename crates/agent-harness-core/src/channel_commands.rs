@@ -45,6 +45,9 @@ pub enum ChannelCommandIntent {
     StopCurrentRun {
         reason: Option<String>,
     },
+    RestartGateway {
+        reason: Option<String>,
+    },
     RestartChannel {
         target: Option<String>,
         reason: Option<String>,
@@ -89,9 +92,12 @@ impl ChannelCommand {
                 ChannelCommandIntent::Think { level, global }
             }
             ChannelCommand::Stop { reason } => ChannelCommandIntent::StopCurrentRun { reason },
-            ChannelCommand::Restart { target, reason } => {
-                ChannelCommandIntent::RestartChannel { target, reason }
-            }
+            ChannelCommand::Restart { target, reason } => match target.as_deref() {
+                Some("channel") | Some("tg") | Some("telegram") | Some("discord")
+                | Some("current") => ChannelCommandIntent::RestartChannel { target, reason },
+                Some("gateway") | None => ChannelCommandIntent::RestartGateway { reason },
+                Some(_) => ChannelCommandIntent::RestartGateway { reason },
+            },
             ChannelCommand::Steer { instruction } => {
                 ChannelCommandIntent::AddSteering { instruction }
             }
@@ -169,6 +175,7 @@ fn optional_restart_target(value: &str) -> (Option<String>, Option<String>) {
     }
     let (first, rest) = split_command(trimmed);
     match first.to_ascii_lowercase().as_str() {
+        "gateway" => (Some(first.to_ascii_lowercase()), optional_text(rest)),
         "current" | "channel" | "tg" | "telegram" | "discord" => {
             (Some(first.to_ascii_lowercase()), optional_text(rest))
         }
@@ -328,9 +335,19 @@ mod tests {
         );
         assert_eq!(
             parse_channel_command_intent("/restart recycle adapter"),
-            Some(ChannelCommandIntent::RestartChannel {
-                target: None,
+            Some(ChannelCommandIntent::RestartGateway {
                 reason: Some("recycle adapter".to_string())
+            })
+        );
+        assert_eq!(
+            parse_channel_command_intent("/restart gateway"),
+            Some(ChannelCommandIntent::RestartGateway { reason: None })
+        );
+        assert_eq!(
+            parse_channel_command_intent("/restart channel reconnect websocket"),
+            Some(ChannelCommandIntent::RestartChannel {
+                target: Some("channel".to_string()),
+                reason: Some("reconnect websocket".to_string())
             })
         );
         assert_eq!(

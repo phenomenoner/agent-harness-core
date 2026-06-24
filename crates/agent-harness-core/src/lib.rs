@@ -24,6 +24,7 @@ pub mod harness_registry;
 pub mod harness_skills;
 pub mod health;
 pub mod importer;
+pub mod latency;
 pub mod live_control;
 pub mod logging;
 pub mod loop_health;
@@ -35,6 +36,7 @@ pub mod memory_contracts;
 pub mod memory_owner;
 pub mod memory_pack;
 pub mod metrics;
+pub mod operation_plan;
 pub mod ops;
 pub mod progress;
 pub mod prompt;
@@ -47,6 +49,7 @@ pub mod runtime_policy;
 pub mod runtime_queue;
 pub mod runtime_worker;
 pub mod security;
+pub mod self_improvement;
 pub mod skill_apply;
 pub mod skill_envelope;
 pub mod skill_learning;
@@ -57,10 +60,12 @@ pub mod status;
 pub mod subagents;
 pub mod supervision;
 pub mod supervisor;
+pub mod supervisor_inventory;
 pub mod token_efficiency;
 pub mod trace;
 pub mod turns;
 pub mod vault;
+pub mod wake;
 pub mod worker_adapters;
 pub mod workers;
 
@@ -321,6 +326,21 @@ pub use memory_pack::{
     retrieve_pack_artifact, validate_pack_canary_schema, write_pack_strategy_config,
 };
 pub use metrics::{HarnessMetricsOptions, HarnessMetricsReport, collect_harness_metrics};
+pub use operation_plan::{
+    CreateOperationPlanOptions, OperationPlan, OperationPlanAddItemOptions,
+    OperationPlanAddItemReport, OperationPlanBlockOptions, OperationPlanBlockReport,
+    OperationPlanComment, OperationPlanCommentOptions, OperationPlanCommentReport,
+    OperationPlanCompleteOptions, OperationPlanCompleteReport, OperationPlanCreateReport,
+    OperationPlanDelegateItemOptions, OperationPlanEvent, OperationPlanEventKind,
+    OperationPlanItem, OperationPlanItemStatus, OperationPlanPromoteDependenciesOptions,
+    OperationPlanPromoteDependenciesReport, OperationPlanReceipt, OperationPlanReceiptAction,
+    OperationPlanShowOptions, OperationPlanShowReport, OperationPlanStatus, OperationPlanSummary,
+    OperationPlanUpdateItemOptions, OperationPlanUpdateItemReport, add_operation_plan_item,
+    block_operation_plan, comment_on_operation_plan, complete_operation_plan,
+    create_operation_plan, delegate_operation_plan_item, list_operation_plans,
+    promote_operation_plan_items_from_dependencies, show_operation_plan,
+    update_operation_plan_item,
+};
 pub use ops::{
     OpsBackupEntry, OpsBackupOptions, OpsBackupReport, OpsControlAction, OpsControlOptions,
     OpsControlReport, OpsCutoverApplyOptions, OpsCutoverApplyReport, OpsCutoverApproveOptions,
@@ -384,6 +404,12 @@ pub use runtime_worker::{
     prepare_runtime_queue_item, release_runtime_queue_lease,
 };
 pub use security::{SecurityScanOptions, SecurityScanReport, scan_security_boundaries};
+pub use self_improvement::{
+    SelfImprovementNotificationTarget, SelfImprovementReviewConfig,
+    SelfImprovementReviewHookOptions, SelfImprovementReviewHookReport, SelfImprovementReviewMode,
+    append_self_improvement_notification, load_self_improvement_review_config,
+    run_self_improvement_review_hook, self_improvement_review_receipts_file,
+};
 pub use skill_apply::{
     SkillApplyOptions, SkillApplyReport, SkillApplyStatus, SkillProposalActionOptions,
     SkillProposalActionReport, SkillProposalActionStatus, SkillProposalListOptions,
@@ -399,8 +425,8 @@ pub use skill_learning::{
     LearningReviewOptions, LearningReviewReport, SkillArchiveOptions, SkillCuratorOptions,
     SkillLearningProposal, SkillLearningProposalOperation, SkillLearningProposalStatus,
     SkillLearningSignal, SkillProposeOptions, SkillStructuredPatch, SkillSupportFileOperation,
-    create_skill_archive_proposal, create_skill_learning_proposal, run_learning_review,
-    run_skill_curator, skill_proposals_file,
+    build_self_improvement_replacement_body, create_skill_archive_proposal,
+    create_skill_learning_proposal, run_learning_review, run_skill_curator, skill_proposals_file,
 };
 pub use skill_matcher::{SkillMatcherInfo, skill_matcher_info};
 pub use skill_usage::{
@@ -435,6 +461,11 @@ pub use supervision::{
 pub use supervisor::{
     WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport, WindowsSupervisorScript,
     WindowsSupervisorTask, write_windows_supervisor_plan,
+};
+pub use supervisor_inventory::{
+    SupervisorInventoryOptions, SupervisorInventoryReport, SupervisorInventoryServiceConfig,
+    SupervisorInventoryServiceSummary, SupervisorInventoryStatus, SupervisorLaunchCommand,
+    reconcile_supervisor_inventory,
 };
 pub use token_efficiency::{
     PromptReductionOptions, PromptReductionReport, TokenEfficiencyOptions, TokenEfficiencyReport,

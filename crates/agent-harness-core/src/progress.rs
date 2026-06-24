@@ -572,8 +572,19 @@ pub fn append_agent_progress_event(
     harness_home: impl AsRef<Path>,
     event: &AgentProgressEvent,
 ) -> io::Result<PathBuf> {
+    let harness_home = harness_home.as_ref();
     let file = agent_progress_events_file(harness_home);
     append_json_line(&file, event)?;
+    let wake_file = harness_home
+        .join("state")
+        .join("wake")
+        .join("progress-delivery.json");
+    let _ = crate::wake::signal_wake(
+        harness_home,
+        wake_file,
+        "progress-delivery",
+        "agent progress event appended",
+    );
     Ok(file)
 }
 
@@ -1513,6 +1524,47 @@ mod tests {
     use super::*;
     use crate::config::HARNESS_CONFIG_FILE_NAME;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn append_agent_progress_event_signals_delivery_wake() {
+        let root = temp_root("append_agent_progress_event_signals_delivery_wake");
+        let harness_home = root.join(".agent-harness");
+        let wake_file = harness_home
+            .join("state")
+            .join("wake")
+            .join("progress-delivery.json");
+        let context = context();
+
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Terminal,
+                "terminal",
+                "cargo test",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+        )
+        .unwrap();
+        assert_eq!(crate::wake::read_wake_sequence(&wake_file).unwrap(), 1);
+
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Runtime,
+                "runtime",
+                "completed",
+                AgentProgressStatus::Completed,
+                2000,
+            ),
+        )
+        .unwrap();
+        assert_eq!(crate::wake::read_wake_sequence(&wake_file).unwrap(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn renders_safe_operation_action_stream_separate_from_status_by_default() {

@@ -106,6 +106,7 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
         "runtimeDispatch",
         "runtimeBackoff",
         "cronScheduler",
+        "supervisor",
         "channelIdentity",
         "liveControlGuard",
     ];
@@ -133,6 +134,7 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
             }
             "runtimeBackoff" => validate_runtime_backoff_object("$.runtimeBackoff", child, errors),
             "cronScheduler" => validate_cron_scheduler_object("$.cronScheduler", child, errors),
+            "supervisor" => validate_supervisor_object("$.supervisor", child, errors),
             "channelIdentity" => {
                 validate_channel_identity_object("$.channelIdentity", child, errors)
             }
@@ -584,6 +586,99 @@ fn validate_cron_scheduler_deterministic(path: String, value: &Value, errors: &m
     }
 }
 
+fn validate_supervisor_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "enabled" | "manageAllLoops" => expect_bool(path_key(path, key), child, errors),
+            "defaultHeartbeatTimeoutMs" | "restartDelayMs" | "idleMs" => {
+                expect_positive_i64(path_key(path, key), child, errors)
+            }
+            "runtimeLoop"
+            | "workerLoop"
+            | "cronSchedulerLoop"
+            | "progressDeliveryLoop"
+            | "telegramLoop"
+            | "discordOutboxLoop"
+            | "discordGatewayLoop" => {
+                validate_supervisor_loop_object(path_key(path, key), child, errors)
+            }
+            "telegramLoops" => {
+                validate_supervisor_telegram_loops(path_key(path, key), child, errors)
+            }
+            "services" => validate_supervisor_services(path_key(path, key), child, errors),
+            other => errors.push(format!("unknown supervisor config key `{other}` at {path}")),
+        }
+    }
+}
+
+fn validate_supervisor_loop_object(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(&path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "enabled" => expect_bool(path_key(&path, key), child, errors),
+            "serviceId" | "serviceKind" | "account" | "telegramAccount" | "discordAccount"
+            | "agent" | "agentId" | "lane" | "workerId" => {
+                expect_string(path_key(&path, key), child, errors)
+            }
+            "restartDelayMs" | "heartbeatTimeoutMs" | "idleMs" | "timeoutMs" | "idleTimeoutMs"
+            | "leaseMs" => expect_positive_i64(path_key(&path, key), child, errors),
+            "runtimeConcurrency"
+            | "maxConsecutiveErrors"
+            | "pollTimeoutSeconds"
+            | "maxUpdates"
+            | "outboxLimit" => expect_positive_u64(path_key(&path, key), child, errors),
+            "childIterations" => expect_u64(path_key(&path, key), child, errors),
+            "args" => validate_string_array(path_key(&path, key), child, errors),
+            other => errors.push(format!(
+                "unknown supervisor loop config key `{other}` at {path}"
+            )),
+        }
+    }
+}
+
+fn validate_supervisor_telegram_loops(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(array) = value.as_array() else {
+        errors.push(format!("{path} must be an array"));
+        return;
+    };
+    for (index, child) in array.iter().enumerate() {
+        validate_supervisor_loop_object(format!("{path}[{index}]"), child, errors);
+    }
+}
+
+fn validate_supervisor_services(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(array) = value.as_array() else {
+        errors.push(format!("{path} must be an array"));
+        return;
+    };
+    for (index, child) in array.iter().enumerate() {
+        let item_path = format!("{path}[{index}]");
+        let Some(object) = expect_object(&item_path, child, errors) else {
+            continue;
+        };
+        for (key, value) in object {
+            match key.as_str() {
+                "enabled" => expect_bool(path_key(&item_path, key), value, errors),
+                "serviceId" | "serviceKind" | "priority" => {
+                    expect_string(path_key(&item_path, key), value, errors)
+                }
+                "restartDelayMs" | "heartbeatTimeoutMs" => {
+                    expect_positive_i64(path_key(&item_path, key), value, errors)
+                }
+                "args" => validate_string_array(path_key(&item_path, key), value, errors),
+                other => errors.push(format!(
+                    "unknown supervisor service config key `{other}` at {item_path}"
+                )),
+            }
+        }
+    }
+}
+
 fn validate_channel_identity_object(path: &str, value: &Value, errors: &mut Vec<String>) {
     let Some(object) = expect_object(path, value, errors) else {
         return;
@@ -693,7 +788,12 @@ fn validate_learning_object(path: &str, value: &Value, errors: &mut Vec<String>)
     };
     for (key, child) in object {
         match key.as_str() {
-            "skillLearning" | "memoryNudge" | "backgroundReview" | "curator" | "sessionSearch"
+            "skillLearning"
+            | "memoryNudge"
+            | "backgroundReview"
+            | "selfImprovementReview"
+            | "curator"
+            | "sessionSearch"
             | "userModel" => validate_learning_section(path_key(path, key), child, errors),
             other => errors.push(format!("unknown learning config key `{other}` at {path}")),
         }
@@ -706,11 +806,39 @@ fn validate_learning_section(path: String, value: &Value, errors: &mut Vec<Strin
     };
     for (key, child) in object {
         match key.as_str() {
-            "enabled" | "usageWeighted" => expect_bool(path_key(&path, key), child, errors),
+            "enabled" | "usageWeighted" | "notify" => {
+                expect_bool(path_key(&path, key), child, errors)
+            }
+            "mode" => expect_enum(
+                path_key(&path, key),
+                child,
+                &[
+                    "propose-only",
+                    "propose-record-only",
+                    "record-only",
+                    "dispatch-and-replace",
+                    "dispatch-and-replacement",
+                    "auto",
+                    "apply",
+                    "off",
+                ],
+                errors,
+            ),
             "applyMode" => expect_enum(
                 path_key(&path, key),
                 child,
-                &["propose", "auto", "off", "quarantine"],
+                &[
+                    "propose",
+                    "auto",
+                    "off",
+                    "quarantine",
+                    "propose-only",
+                    "propose-record-only",
+                    "record-only",
+                    "dispatch-and-replace",
+                    "dispatch-and-replacement",
+                    "apply",
+                ],
                 errors,
             ),
             "trigger" => expect_enum(
@@ -721,7 +849,7 @@ fn validate_learning_section(path: String, value: &Value, errors: &mut Vec<Strin
             ),
             "tokenizer" => expect_enum(path_key(&path, key), child, &["trigram"], errors),
             "provider" => expect_string(path_key(&path, key), child, errors),
-            "turnInterval" | "dailyJobCap" | "intervalHours" => {
+            "turnInterval" | "dailyJobCap" | "dailyCap" | "intervalHours" | "maxSelectedSkills" => {
                 expect_positive_u64(path_key(&path, key), child, errors)
             }
             other => errors.push(format!("unknown learning section key `{other}` at {path}")),
@@ -905,8 +1033,36 @@ mod tests {
                 "rateLeaseLimit": 0,
                 "rateLeaseWindowMs": 60000
               },
+              "supervisor": {
+                "enabled": true,
+                "manageAllLoops": true,
+                "defaultHeartbeatTimeoutMs": 120000,
+                "restartDelayMs": 60000,
+                "runtimeLoop": { "enabled": true, "runtimeConcurrency": 1, "childIterations": 0 },
+                "workerLoop": { "enabled": true, "leaseMs": 120000 },
+                "cronSchedulerLoop": { "enabled": true, "idleMs": 60000 },
+                "progressDeliveryLoop": { "enabled": true },
+                "telegramLoop": { "enabled": true },
+                "telegramLoops": [
+                  { "enabled": true, "serviceId": "telegram-loop-xiaoxiaoli", "telegramAccount": "xiaoxiaoli", "agent": "xiaoxiaoli" }
+                ],
+                "discordOutboxLoop": { "enabled": true, "outboxLimit": 20 },
+                "discordGatewayLoop": { "enabled": true },
+                "services": [
+                  {
+                    "enabled": true,
+                    "serviceId": "custom-loop",
+                    "serviceKind": "loop",
+                    "priority": "standard",
+                    "args": ["--source-home", "."],
+                    "restartDelayMs": 60000,
+                    "heartbeatTimeoutMs": 120000
+                  }
+                ]
+              },
               "learning": {
                 "skillLearning": { "enabled": true, "applyMode": "propose" },
+                "selfImprovementReview": { "enabled": true, "mode": "dispatch-and-replace", "notify": true, "dailyCap": 24, "maxSelectedSkills": 1 },
                 "memoryNudge": { "enabled": true, "turnInterval": 6 },
                 "backgroundReview": { "enabled": true, "trigger": "signal", "dailyJobCap": 24 },
                 "curator": { "enabled": true, "intervalHours": 168, "usageWeighted": true },

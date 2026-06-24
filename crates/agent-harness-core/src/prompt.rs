@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::operation_plan::{
+    OperationPlanItemStatus, OperationPlanShowOptions, OperationPlanShowReport,
+    OperationPlanStatus, list_operation_plans, show_operation_plan,
+};
 use crate::{
     InboundMediaInputPlanOptions, InboundMediaModelAttachmentStatus, MemoryPromptContextOptions,
     MemoryPromptContextStatus, MemoryRecallPlanOptions, PackArtifactMetadata, PackCandidateOptions,
@@ -175,6 +179,12 @@ pub fn assemble_prompt_bundle(
         ));
     } else {
         sections.push(agent_identity_section(plan));
+        if let Some(harness_home) = options.harness_home.as_ref() {
+            match operation_plan_context_section(harness_home, plan, agent_id.as_deref()) {
+                Ok(section) => sections.push(section),
+                Err(error) => warnings.push(format!("operation plan context unavailable: {error}")),
+            }
+        }
 
         for prompt_file in &plan.prompt_files {
             if !prompt_file.exists {
@@ -411,6 +421,178 @@ Backend continuity note:
         delivery_mode: None,
         content,
     }
+}
+
+fn operation_plan_context_section(
+    harness_home: &Path,
+    turn: &TurnPlan,
+    agent_id: Option<&str>,
+) -> io::Result<PromptSection> {
+    let summaries = list_operation_plans(harness_home.to_path_buf())?;
+    let mut matching = Vec::new();
+    let mut fallback = Vec::new();
+
+    for summary in summaries
+        .into_iter()
+        .filter(|summary| {
+            matches!(
+                summary.status,
+                OperationPlanStatus::Open | OperationPlanStatus::Blocked
+            )
+        })
+        .take(8)
+    {
+        let report = show_operation_plan(OperationPlanShowOptions {
+            harness_home: harness_home.to_path_buf(),
+            plan_id: summary.plan_id,
+        })?;
+        let session_match = report.plan.session_key == turn.session_key;
+        let agent_match = agent_id.is_some_and(|agent_id| report.plan.agent_id == agent_id);
+        if session_match || agent_match {
+            matching.push(report);
+        } else if fallback.len() < 3 {
+            fallback.push(report);
+        }
+        if matching.len() >= 3 {
+            break;
+        }
+    }
+
+    let selected = if matching.is_empty() {
+        fallback
+    } else {
+        matching
+    };
+    let mut content = format!(
+        "\
+Hermes-style OperationPlan support is available for this turn.
+
+Use OperationPlan when a request has more than one meaningful step, may discover new subtasks, needs review gates, or should delegate bounded work to subagents. Treat OperationPlan as the durable task to-do source of truth; runtime queue items are execution units only.
+
+CLI command surface:
+- Create: agent-harness operation-plan --target-home \"{}\" --action create --plan-id <stable-id> --session-key \"{}\" --agent-id \"{}\" --goal <goal>
+- Add item: agent-harness operation-plan --target-home \"{}\" --action add-item --plan-id <plan-id> --item-id <item-id> --title <title> --body <body> [--depends-on a,b]
+- Update item: agent-harness operation-plan --target-home \"{}\" --action update-item --plan-id <plan-id> --item-id <item-id> --status <todo|ready|running|review|done|blocked|canceled> [--add-evidence <note>]
+- Delegate item: agent-harness operation-plan --target-home \"{}\" --action delegate --plan-id <plan-id> --item-id <item-id> --assignee <subagent-or-worker> --idempotency-key <stable-key>
+- Promote ready dependencies: agent-harness operation-plan --target-home \"{}\" --action promote --plan-id <plan-id>
+- Comment/block/complete: use --action comment, block, or complete with the same --plan-id.
+
+Maintenance rule: keep the plan current as work changes. Add newly discovered tasks, mark dependencies ready/running/review/done, attach evidence before completion, and keep only truly active work open.
+",
+        harness_home.display(),
+        turn.session_key,
+        agent_id.unwrap_or("main"),
+        harness_home.display(),
+        harness_home.display(),
+        harness_home.display(),
+        harness_home.display(),
+    );
+
+    if selected.is_empty() {
+        content.push_str("\nActive OperationPlans: none visible for this harness. Create one when this turn needs multi-item tracking.\n");
+    } else {
+        content.push_str("\nActive OperationPlans:\n");
+        for report in selected {
+            render_operation_plan_snapshot(&mut content, &report);
+        }
+    }
+
+    let bytes = content.len();
+    Ok(PromptSection {
+        kind: PromptSectionKind::RuntimeContext,
+        tier: PromptSectionTier::StableRuntime,
+        title: "OperationPlan task list".to_string(),
+        path: None,
+        bytes_original: bytes,
+        bytes_included: bytes,
+        truncated: false,
+        skill_id: None,
+        body_checksum: None,
+        delivery_mode: None,
+        content,
+    })
+}
+
+fn render_operation_plan_snapshot(content: &mut String, report: &OperationPlanShowReport) {
+    content.push_str(&format!(
+        "- planId={} status={} version={} goal={}\n",
+        report.plan.plan_id,
+        operation_plan_status_label(report.plan.status),
+        report.plan.version,
+        single_line(&report.plan.goal)
+    ));
+    if let Some(criteria) = report.plan.acceptance_criteria.as_deref() {
+        content.push_str(&format!("  acceptanceCriteria={}\n", single_line(criteria)));
+    }
+    let mut open_items = report
+        .items
+        .iter()
+        .filter(|item| !item.status.is_terminal())
+        .collect::<Vec<_>>();
+    open_items.sort_by(|left, right| {
+        operation_plan_item_status_rank(left.status)
+            .cmp(&operation_plan_item_status_rank(right.status))
+            .then_with(|| left.item_id.cmp(&right.item_id))
+    });
+    if open_items.is_empty() {
+        content.push_str("  openItems: none\n");
+        return;
+    }
+    content.push_str("  openItems:\n");
+    for item in open_items.into_iter().take(8) {
+        let assignee = item.assignee.as_deref().unwrap_or("-");
+        let deps = if item.depends_on.is_empty() {
+            "-".to_string()
+        } else {
+            item.depends_on.join(",")
+        };
+        content.push_str(&format!(
+            "  - itemId={} status={} version={} assignee={} dependsOn={} title={}\n",
+            item.item_id,
+            operation_plan_item_status_label(item.status),
+            item.version,
+            assignee,
+            deps,
+            single_line(&item.title)
+        ));
+    }
+}
+
+fn operation_plan_status_label(status: OperationPlanStatus) -> &'static str {
+    match status {
+        OperationPlanStatus::Open => "open",
+        OperationPlanStatus::Blocked => "blocked",
+        OperationPlanStatus::Completed => "completed",
+        OperationPlanStatus::Canceled => "canceled",
+    }
+}
+
+fn operation_plan_item_status_label(status: OperationPlanItemStatus) -> &'static str {
+    match status {
+        OperationPlanItemStatus::Todo => "todo",
+        OperationPlanItemStatus::Ready => "ready",
+        OperationPlanItemStatus::Running => "running",
+        OperationPlanItemStatus::Review => "review",
+        OperationPlanItemStatus::Done => "done",
+        OperationPlanItemStatus::Blocked => "blocked",
+        OperationPlanItemStatus::Canceled => "canceled",
+    }
+}
+
+fn operation_plan_item_status_rank(status: OperationPlanItemStatus) -> u8 {
+    match status {
+        OperationPlanItemStatus::Running => 0,
+        OperationPlanItemStatus::Review => 1,
+        OperationPlanItemStatus::Ready => 2,
+        OperationPlanItemStatus::Todo => 3,
+        OperationPlanItemStatus::Blocked => 4,
+        OperationPlanItemStatus::Done => 5,
+        OperationPlanItemStatus::Canceled => 6,
+    }
+}
+
+fn single_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn skill_index_section(skills: &[SkillSelection]) -> PromptSection {
@@ -1347,6 +1529,84 @@ mod tests {
                 .any(|section| section.kind == PromptSectionKind::UserMessage
                     && section.content == "repair memory cron")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prompt_bundle_includes_operation_plan_context() {
+        let root = temp_root("prompt_bundle_includes_operation_plan_context");
+        let source = write_prompt_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "implement the full streamlining plan".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        crate::operation_plan::create_operation_plan(
+            crate::operation_plan::CreateOperationPlanOptions {
+                harness_home: harness_home.clone(),
+                plan_id: "streamline-1".to_string(),
+                origin_queue_id: Some("queue-1".to_string()),
+                session_key: plan.session_key.clone(),
+                agent_id: "main".to_string(),
+                goal: "Implement streamlining without losing stability".to_string(),
+                acceptance_criteria: Some("focused tests pass and cutover is gated".to_string()),
+                constraints: Some("do not interrupt live gateway before cutover".to_string()),
+                max_open_items: Some(6),
+                max_fanout: Some(2),
+                now_ms: 1000,
+            },
+        )
+        .unwrap();
+        crate::operation_plan::add_operation_plan_item(
+            crate::operation_plan::OperationPlanAddItemOptions {
+                harness_home: harness_home.clone(),
+                plan_id: "streamline-1".to_string(),
+                item_id: "wake-runtime".to_string(),
+                title: "Wire runtime wake path".to_string(),
+                body: "Signal runtime loop immediately after enqueue.".to_string(),
+                depends_on: Vec::new(),
+                acceptance_criteria: Some("runtime enqueue writes wake sequence".to_string()),
+                risk: Some("lost wake race".to_string()),
+                now_ms: 1001,
+            },
+        )
+        .unwrap();
+
+        let bundle = assemble_prompt_bundle(
+            &plan,
+            PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        )
+        .unwrap();
+        let section = bundle
+            .sections
+            .iter()
+            .find(|section| section.title == "OperationPlan task list")
+            .unwrap();
+        assert!(section.content.contains("Hermes-style OperationPlan"));
+        assert!(section.content.contains("--action add-item"));
+        assert!(section.content.contains("planId=streamline-1"));
+        assert!(section.content.contains("itemId=wake-runtime"));
 
         let _ = fs::remove_dir_all(root);
     }

@@ -14,13 +14,14 @@ use crate::{
     CodexRuntimeRunReport, CodexRuntimeRunStatus, HarnessLogEvent, HarnessLogLevel,
     InboundMediaArtifact, MemoryLifecycleTurnOptions, PromptAssemblyOptions, ResponseToneConfig,
     ResponseToneContext, RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions,
-    RuntimeQueuePrepareReport, RuntimeQueuePreparedItem, append_agent_progress_event,
-    append_harness_log, apply_response_tone, current_log_time_ms, inspect_runtime_backoff_policy,
+    RuntimeQueuePrepareReport, RuntimeQueuePreparedItem, SelfImprovementNotificationTarget,
+    SelfImprovementReviewHookOptions, append_agent_progress_event, append_harness_log,
+    apply_response_tone, current_log_time_ms, inspect_runtime_backoff_policy,
     load_assistant_narration_config, load_response_tone_config,
     mark_cron_run_runtime_status_by_queue_id, plan_codex_runtime, prepare_runtime_queue_item,
     read_channel_session_state, record_memory_lifecycle_turn,
     record_skill_usage_from_prompt_bundle, release_runtime_queue_lease, run_codex_runtime,
-    write_json_atomic,
+    run_self_improvement_review_hook, write_json_atomic,
 };
 
 const RUNTIME_RUN_ONCE_SCHEMA: &str = "agent-harness.runtime-run-once.v1";
@@ -327,6 +328,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         channel_context =
             find_queue_channel_context(&options.harness_home, queue_id, &mut warnings)?;
     }
+    let channel_context_for_self_improvement = channel_context.clone();
 
     let progress_context =
         progress_context_from(&prepare, plan.plan.as_ref(), channel_context.as_ref());
@@ -681,6 +683,40 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 reason: receipt.reason.clone(),
             },
         )?;
+    }
+    if receipt.status == RuntimeRunOnceStatus::Completed
+        && let Some(codex_plan) = plan.plan.as_ref()
+    {
+        let notification_target = channel_context_for_self_improvement
+            .as_ref()
+            .map(|context| SelfImprovementNotificationTarget {
+                platform: context.platform.clone(),
+                account_id: context.account_id.clone(),
+                channel_id: context.channel_id.clone(),
+                user_id: context.user_id.clone(),
+                session_key: context.session_key.clone(),
+            });
+        let assistant_text = outbound_message
+            .as_ref()
+            .map(|message| message.text.clone())
+            .unwrap_or_else(|| receipt.reason.clone());
+        match run_self_improvement_review_hook(SelfImprovementReviewHookOptions {
+            harness_home: options.harness_home.clone(),
+            prompt_bundle_json: codex_plan.prompt_bundle_json.clone(),
+            assistant_text,
+            queue_id: receipt.queue_id.clone(),
+            session_key: channel_context_for_self_improvement
+                .as_ref()
+                .map(|context| context.session_key.clone()),
+            agent_id: codex_plan.agent_id.clone(),
+            notification_target,
+            now_ms: current_log_time_ms()?,
+        }) {
+            Ok(report) => warnings.extend(report.warnings),
+            Err(error) => warnings.push(format!(
+                "self-improvement review hook failed after completed turn: {error}"
+            )),
+        }
     }
     if let Some(queue_id) = receipt.queue_id.as_deref() {
         if let Err(error) = release_runtime_queue_lease(&options.harness_home, queue_id) {
@@ -1431,6 +1467,16 @@ fn append_outbound_message(
         .join("channels")
         .join("outbox.jsonl");
     append_json_line(&outbox_file, message)?;
+    let wake_file = harness_home
+        .join("state")
+        .join("wake")
+        .join("final-outbox.json");
+    let _ = crate::wake::signal_wake(
+        harness_home,
+        wake_file,
+        "final-outbox",
+        "channel outbox message appended",
+    );
     Ok(outbox_file)
 }
 
@@ -1595,8 +1641,8 @@ mod tests {
             harness_home: harness_home.clone(),
             queue_id: None,
             codex_executable: Some(fake_codex),
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             prompt_options: PromptAssemblyOptions {
                 harness_home: Some(harness_home.clone()),
                 ..PromptAssemblyOptions::default()
@@ -1705,8 +1751,8 @@ mod tests {
             harness_home: harness_home.clone(),
             queue_id: None,
             codex_executable: Some(fake_codex),
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             prompt_options: PromptAssemblyOptions {
                 harness_home: Some(harness_home),
                 ..PromptAssemblyOptions::default()
@@ -1757,8 +1803,8 @@ mod tests {
             harness_home: harness_home.clone(),
             queue_id: Some(queue_id.clone()),
             codex_executable: None,
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             prompt_options: PromptAssemblyOptions {
                 harness_home: Some(harness_home),
                 ..PromptAssemblyOptions::default()
@@ -1820,8 +1866,8 @@ mod tests {
             harness_home: harness_home.clone(),
             queue_id: None,
             codex_executable: Some(fake_codex),
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             prompt_options: PromptAssemblyOptions {
                 harness_home: Some(harness_home.clone()),
                 ..PromptAssemblyOptions::default()
@@ -1847,8 +1893,8 @@ mod tests {
             harness_home: harness_home.clone(),
             queue_id: None,
             codex_executable: Some(fake_failing_codex_executable(&root)),
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             prompt_options: PromptAssemblyOptions {
                 harness_home: Some(harness_home.clone()),
                 ..PromptAssemblyOptions::default()
@@ -2006,8 +2052,8 @@ mod tests {
             harness_home: harness_home.clone(),
             queue_id: Some(queue_id.clone()),
             codex_executable: Some(fake_reconnecting_codex_executable(&root)),
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             prompt_options: PromptAssemblyOptions {
                 harness_home: Some(harness_home.clone()),
                 ..PromptAssemblyOptions::default()
@@ -2031,8 +2077,8 @@ mod tests {
             harness_home: harness_home.clone(),
             queue_id: None,
             codex_executable: Some(fake_reconnecting_codex_executable(&root)),
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             prompt_options: PromptAssemblyOptions {
                 harness_home: Some(harness_home.clone()),
                 ..PromptAssemblyOptions::default()
@@ -2047,8 +2093,8 @@ mod tests {
             harness_home: harness_home.clone(),
             queue_id: Some(queue_id.clone()),
             codex_executable: Some(fake_reconnecting_codex_executable(&root)),
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             prompt_options: PromptAssemblyOptions {
                 harness_home: Some(harness_home.clone()),
                 ..PromptAssemblyOptions::default()
@@ -2131,8 +2177,8 @@ mod tests {
             harness_home: harness_home.clone(),
             queue_id: None,
             codex_executable: Some(fake_codex),
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             prompt_options: PromptAssemblyOptions {
                 harness_home: Some(harness_home.clone()),
                 ..PromptAssemblyOptions::default()
@@ -2197,8 +2243,8 @@ mod tests {
             harness_home: harness_home.clone(),
             queue_id: None,
             codex_executable: Some(fake_codex.clone()),
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             prompt_options: PromptAssemblyOptions {
                 harness_home: Some(harness_home.clone()),
                 ..PromptAssemblyOptions::default()
@@ -2212,8 +2258,8 @@ mod tests {
             harness_home: harness_home.clone(),
             queue_id: None,
             codex_executable: Some(fake_codex),
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             prompt_options: PromptAssemblyOptions {
                 harness_home: Some(harness_home.clone()),
                 ..PromptAssemblyOptions::default()

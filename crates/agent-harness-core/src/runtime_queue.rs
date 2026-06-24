@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::latency::{LatencyStage, latency_receipts_file, record_latency_stage};
+use crate::wake::signal_wake;
 use crate::{ChannelStep, ChannelStepAction, InboundMediaArtifact};
 
 const RUNTIME_QUEUE_REPORT_SCHEMA: &str = "agent-harness.runtime-queue-enqueue.v1";
@@ -200,6 +202,34 @@ pub fn enqueue_channel_step(
         },
     };
     append_json_line(&receipts_file, &receipt)?;
+
+    if let Some(item) = item.as_ref() {
+        if let Err(error) = record_latency_stage(
+            latency_receipts_file(&options.harness_home),
+            &item.queue_id,
+            &item.runtime_class,
+            LatencyStage::RuntimeEnqueued,
+            Some(options.now_ms),
+        ) {
+            warnings.push(format!(
+                "failed to record runtime enqueue latency stage: {error}"
+            ));
+        }
+
+        let wake_file = options
+            .harness_home
+            .join("state")
+            .join("wake")
+            .join("runtime.json");
+        if let Err(error) = signal_wake(
+            &options.harness_home,
+            wake_file,
+            "runtime",
+            "runtime queue enqueue",
+        ) {
+            warnings.push(format!("failed to signal runtime queue wake: {error}"));
+        }
+    }
 
     Ok(RuntimeQueueEnqueueReport {
         schema: RUNTIME_QUEUE_REPORT_SCHEMA,
@@ -428,7 +458,10 @@ mod tests {
         ChannelStepAction, InboundMediaArtifact, InboundMediaDownloadStatus,
         InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant, TurnPlanInput,
         build_channel_step, build_source_skill_index, build_turn_plan,
-        inbound_media_attachment_root, load_agent_registry,
+        inbound_media_attachment_root,
+        latency::{LatencyStage, latency_receipts_file, read_latest_queue_receipt},
+        load_agent_registry,
+        wake::read_wake_sequence,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -480,6 +513,30 @@ mod tests {
         assert_eq!(item.provider.as_deref(), Some("openai"));
         assert_eq!(item.model.as_deref(), Some("gpt-5"));
         assert_eq!(item.selected_skill_ids, vec!["workspace:memory-cron"]);
+        let latency_receipt = read_latest_queue_receipt(
+            latency_receipts_file(root.join(".agent-harness")),
+            &item.queue_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            latency_receipt
+                .stages
+                .get(&LatencyStage::RuntimeEnqueued)
+                .copied(),
+            Some(1234)
+        );
+        assert_eq!(latency_receipt.lane, item.runtime_class);
+        assert_eq!(
+            read_wake_sequence(
+                root.join(".agent-harness")
+                    .join("state")
+                    .join("wake")
+                    .join("runtime.json")
+            )
+            .unwrap(),
+            1
+        );
         assert!(
             item.planned_transcript_file
                 .ends_with("agents\\main\\sessions\\telegram_dm-42_user-7_main.jsonl")

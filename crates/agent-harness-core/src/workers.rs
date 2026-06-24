@@ -12,13 +12,16 @@ use serde_json::{Value, json};
 
 use crate::{
     CronRunSummary, HarnessLogEvent, HarnessLogLevel, LearningReviewOptions, RuntimeQueueItem,
-    RuntimeQueueItemStatus, RuntimeQueueSource, RuntimeQueueSourceKind, append_harness_log,
-    collect_cron_run_summary,
+    RuntimeQueueItemStatus, RuntimeQueueSource, RuntimeQueueSourceKind,
+    SelfImprovementNotificationTarget, SelfImprovementReviewMode, SkillApplyOptions,
+    SkillLearningProposalOperation, SkillLearningProposalStatus, SkillLearningSignal,
+    SkillProposeOptions, append_harness_log, append_self_improvement_notification,
+    apply_skill_proposal, build_self_improvement_replacement_body, collect_cron_run_summary,
     config::{
         HarnessConfigValidationReport, HarnessConfigValidationStatus, validate_harness_config,
     },
-    cron_run_worker_dispatch_blocker, current_log_time_ms, mark_cron_run_runtime_enqueued,
-    mark_cron_run_worker_status,
+    create_skill_learning_proposal, cron_run_worker_dispatch_blocker, current_log_time_ms,
+    mark_cron_run_runtime_enqueued, mark_cron_run_worker_status,
     memory_backfill::{
         DEFAULT_MEMORY_BACKFILL_BATCH_SIZE, DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS,
         DEFAULT_MEMORY_BACKFILL_MAX_ITEMS, DEFAULT_MEMORY_BACKFILL_RATE_LIMIT_PER_MINUTE,
@@ -406,6 +409,7 @@ pub fn enqueue_worker_job(options: WorkerEnqueueOptions) -> io::Result<WorkerEnq
     });
 
     if let Some(existing) = find_job_by_idempotency(&conn, &idempotency_key)? {
+        signal_worker_queue_wake(&options.harness_home, &lane, "worker job idempotency hit");
         return Ok(WorkerEnqueueReport {
             schema: WORKER_ENQUEUE_SCHEMA,
             harness_home: options.harness_home,
@@ -466,6 +470,7 @@ pub fn enqueue_worker_job(options: WorkerEnqueueOptions) -> io::Result<WorkerEnq
     .map_err(io::Error::other)?;
     let job = find_job_by_id(&conn, &job_id)?
         .ok_or_else(|| io::Error::other(format!("inserted worker job not found: {job_id}")))?;
+    signal_worker_queue_wake(&options.harness_home, &lane, "worker job enqueue");
 
     Ok(WorkerEnqueueReport {
         schema: WORKER_ENQUEUE_SCHEMA,
@@ -1324,22 +1329,126 @@ fn run_learning_review_job(
 ) -> io::Result<WorkerJobExecutionResult> {
     let target_path =
         string_path_any(&job.payload, &["targetPath", "target_path"]).map(PathBuf::from);
-    let report = run_learning_review(LearningReviewOptions {
-        harness_home: harness_home.to_path_buf(),
-        agent_id: string_path_any(&job.payload, &["agentId", "agent_id"]).map(ToString::to_string),
-        target_skill_id: string_path_any(&job.payload, &["targetSkillId", "target_skill_id"])
-            .map(ToString::to_string),
-        target_path,
-        channel_trust: string_path_any(&job.payload, &["channelTrust", "channel_trust"])
-            .map(ToString::to_string),
-        signal_text: string_path_any(&job.payload, &["signalText", "signal_text", "text"])
-            .unwrap_or("")
-            .to_string(),
-        source_turn: string_path_any(&job.payload, &["sourceTurn", "source_turn"])
-            .map(ToString::to_string),
-        daily_cap: usize_payload(&job.payload, &["dailyCap", "daily_cap"], 5),
-        now_ms,
-    })?;
+    let target_skill_id = string_path_any(&job.payload, &["targetSkillId", "target_skill_id"])
+        .map(ToString::to_string);
+    let signal_text = string_path_any(&job.payload, &["signalText", "signal_text", "text"])
+        .unwrap_or("")
+        .to_string();
+    let source_turn =
+        string_path_any(&job.payload, &["sourceTurn", "source_turn"]).map(ToString::to_string);
+    let mode = self_improvement_mode_from_payload(&job.payload);
+    let payload_replacement_body =
+        string_path_any(&job.payload, &["replacementBody", "replacement_body"])
+            .map(ToString::to_string);
+    let replacement_body = match payload_replacement_body {
+        Some(body) => Some(body),
+        None if mode == SelfImprovementReviewMode::DispatchAndReplace => {
+            match (target_skill_id.as_deref(), target_path.as_ref()) {
+                (Some(skill_id), Some(path)) => {
+                    let validated_path = crate::skill_learning::validate_skill_target_path(
+                        harness_home,
+                        skill_id,
+                        path,
+                    )?;
+                    build_self_improvement_replacement_body(
+                        &validated_path,
+                        &signal_text,
+                        source_turn.as_deref(),
+                        now_ms,
+                    )?
+                }
+                _ => None,
+            }
+        }
+        None => None,
+    };
+    let replacement_requested = replacement_body.is_some();
+
+    let report = if let (Some(replacement_body), Some(target_skill_id), Some(target_path)) = (
+        replacement_body,
+        target_skill_id.clone(),
+        target_path.clone(),
+    ) {
+        let proposal = create_skill_learning_proposal(SkillProposeOptions {
+            harness_home: harness_home.to_path_buf(),
+            target_skill_id,
+            target_path,
+            operation: SkillLearningProposalOperation::Replace,
+            replacement_body: Some(replacement_body),
+            support_files: Vec::new(),
+            diff: Some(signal_text.clone()),
+            signals: vec![SkillLearningSignal {
+                kind: "self-improvement-review".to_string(),
+                signal_hash: stable_worker_text_hash("self-improvement-review", &signal_text),
+                text: signal_text.clone(),
+                trust: string_path_any(&job.payload, &["channelTrust", "channel_trust"])
+                    .map(ToString::to_string),
+            }],
+            source_turn: source_turn.clone(),
+            risk_class: "low".to_string(),
+            status: SkillLearningProposalStatus::Proposed,
+            now_ms,
+        })?;
+        crate::LearningReviewReport {
+            schema: "agent-harness.learning-review.v1",
+            harness_home: harness_home.to_path_buf(),
+            status: "proposed".to_string(),
+            proposals_created: 1,
+            proposal_ids: vec![proposal.proposal_id],
+            reason: "self-improvement replacement proposal recorded".to_string(),
+        }
+    } else {
+        run_learning_review(LearningReviewOptions {
+            harness_home: harness_home.to_path_buf(),
+            agent_id: string_path_any(&job.payload, &["agentId", "agent_id"])
+                .map(ToString::to_string),
+            target_skill_id,
+            target_path,
+            channel_trust: string_path_any(&job.payload, &["channelTrust", "channel_trust"])
+                .map(ToString::to_string),
+            signal_text: signal_text.clone(),
+            source_turn: source_turn.clone(),
+            daily_cap: usize_payload(&job.payload, &["dailyCap", "daily_cap"], 5),
+            now_ms,
+        })?
+    };
+
+    let mut apply_reports = Vec::new();
+    if mode == SelfImprovementReviewMode::DispatchAndReplace && replacement_requested {
+        for proposal_id in &report.proposal_ids {
+            let apply = apply_skill_proposal(SkillApplyOptions {
+                harness_home: harness_home.to_path_buf(),
+                proposal_id: proposal_id.clone(),
+                operator: Some("self-improvement-review".to_string()),
+                now_ms,
+            })?;
+            apply_reports.push(serde_json::to_value(&apply).map_err(io::Error::other)?);
+            if bool_payload(&job.payload, &["notify"], true)
+                && apply.status == crate::SkillApplyStatus::Applied
+                && let Some(target) = notification_target_from_payload(&job.payload)
+            {
+                let skill_id = string_path_any(&job.payload, &["targetSkillId", "target_skill_id"])
+                    .unwrap_or("unknown");
+                let text = format!(
+                    "Self-improvement review: Patched SKILL.md in skill '{}' (1 replacement).",
+                    skill_id
+                );
+                let _ = append_self_improvement_notification(harness_home, &target, text);
+            }
+        }
+    } else if bool_payload(&job.payload, &["notify"], false)
+        && report.proposals_created > 0
+        && let Some(target) = notification_target_from_payload(&job.payload)
+    {
+        let skill_id = string_path_any(&job.payload, &["targetSkillId", "target_skill_id"])
+            .unwrap_or("unknown");
+        let text = format!(
+            "Self-improvement review: Recorded proposal for skill '{}' ({} proposal).",
+            skill_id, report.proposals_created
+        );
+        let _ = append_self_improvement_notification(harness_home, &target, text);
+    }
+
     Ok(WorkerJobExecutionResult {
         status: WorkerJobStatus::Succeeded,
         reason: report.reason.clone(),
@@ -1348,7 +1457,11 @@ fn run_learning_review_job(
             "skill-proposals:{}",
             crate::skill_proposals_file(harness_home).display()
         )])),
-        result: Some(serde_json::to_value(&report).map_err(io::Error::other)?),
+        result: Some(json!({
+            "review": report,
+            "mode": mode.as_str(),
+            "applyReports": apply_reports,
+        })),
     })
 }
 
@@ -2046,6 +2159,15 @@ fn usize_payload(value: &Value, keys: &[&str], default: usize) -> usize {
     default
 }
 
+fn bool_payload(value: &Value, keys: &[&str], default: bool) -> bool {
+    for key in keys {
+        if let Some(parsed) = value.get(*key).and_then(Value::as_bool) {
+            return parsed;
+        }
+    }
+    default
+}
+
 fn u64_payload(value: &Value, keys: &[&str], default: u64) -> u64 {
     for key in keys {
         if let Some(parsed) = value.get(*key).and_then(Value::as_u64) {
@@ -2062,6 +2184,37 @@ fn i64_payload(value: &Value, keys: &[&str], default: i64) -> i64 {
         }
     }
     default
+}
+
+fn self_improvement_mode_from_payload(value: &Value) -> SelfImprovementReviewMode {
+    match string_path_any(value, &["mode", "applyMode", "apply_mode"])
+        .unwrap_or("dispatch-and-replace")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "propose" | "propose-only" | "propose-record-only" | "record-only" => {
+            SelfImprovementReviewMode::ProposeOnly
+        }
+        _ => SelfImprovementReviewMode::DispatchAndReplace,
+    }
+}
+
+fn notification_target_from_payload(value: &Value) -> Option<SelfImprovementNotificationTarget> {
+    value
+        .get("notificationTarget")
+        .or_else(|| value.get("notification_target"))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn stable_worker_text_hash(kind: &str, text: &str) -> String {
+    let mut hash: u64 = 14_695_981_039_346_656_037u64;
+    for byte in format!("{kind}\n{text}").as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    format!("{hash:016x}")
 }
 
 fn string_array_path(value: &Value, key: &str) -> Vec<String> {
@@ -2204,6 +2357,20 @@ fn normalize_key_part(value: &str) -> String {
     }
 }
 
+fn signal_worker_queue_wake(harness_home: &Path, lane: &str, reason: &str) {
+    let wake_dir = harness_home.join("state").join("wake");
+    let _ = crate::wake::signal_wake(harness_home, wake_dir.join("worker.json"), "worker", reason);
+
+    let lane_key = normalize_key_part(lane);
+    let lane_name = format!("worker-{lane_key}");
+    let _ = crate::wake::signal_wake(
+        harness_home,
+        wake_dir.join(format!("{lane_name}.json")),
+        &lane_name,
+        reason,
+    );
+}
+
 fn backoff_ms(attempt: i64) -> i64 {
     let exponent = attempt.clamp(0, 6) as u32;
     1_000_i64.saturating_mul(2_i64.saturating_pow(exponent))
@@ -2241,6 +2408,23 @@ mod tests {
         assert!(first.inserted);
         assert!(!second.inserted);
         assert_eq!(first.job.job_id, second.job.job_id);
+        assert_eq!(
+            crate::wake::read_wake_sequence(
+                harness_home.join("state").join("wake").join("worker.json")
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            crate::wake::read_wake_sequence(
+                harness_home
+                    .join("state")
+                    .join("wake")
+                    .join("worker-shell.json")
+            )
+            .unwrap(),
+            2
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2671,6 +2855,154 @@ mod tests {
         let result = run.result.unwrap();
         assert_eq!(result.status, WorkerJobStatus::Succeeded);
         assert!(result.audit_path.unwrap().is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn self_improvement_learning_review_applies_replacement_and_notifies() {
+        let root = temp_root("self_improvement_learning_review_applies_replacement_and_notifies");
+        let harness_home = root.join(".agent-harness");
+        let skill_dir = root.join("skills").join("quiet-cron-watchdogs");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill_file = skill_dir.join("SKILL.md");
+        fs::write(&skill_file, "# Quiet Cron Watchdogs\n\nOriginal.\n").unwrap();
+
+        let replacement_body = "# Quiet Cron Watchdogs\n\nUpdated from post-turn review.\n";
+        enqueue_worker_job(WorkerEnqueueOptions {
+            harness_home: harness_home.clone(),
+            kind: WorkerJobKind::LearningReview,
+            lane: Some("learning_review".to_string()),
+            payload: json!({
+                "mode": "dispatch-and-replace",
+                "notify": true,
+                "targetSkillId": "workspace:quiet-cron-watchdogs",
+                "targetPath": skill_file,
+                "replacementBody": replacement_body,
+                "signalText": "post-turn review found a reusable cron watchdog note",
+                "sourceTurn": "queue-1",
+                "channelTrust": "operator",
+                "notificationTarget": {
+                    "platform": "telegram",
+                    "channelId": "dm-1",
+                    "userId": "operator",
+                    "sessionKey": "session-1"
+                }
+            }),
+            idempotency_key: Some("self-improvement:queue-1".to_string()),
+            parent_job_id: None,
+            job_group_id: None,
+            master_agent_id: Some("main".to_string()),
+            master_session_key: Some("session-1".to_string()),
+            wake_policy: None,
+            source: Some("self-improvement-review".to_string()),
+            priority: 0,
+            available_at_ms: Some(1000),
+            max_attempts: 1,
+            timeout_ms: Some(DEFAULT_TIMEOUT_MS),
+            cascade_timeout_ms: None,
+            rate_key: None,
+            concurrency_group_key: None,
+            now_ms: 1000,
+        })
+        .unwrap();
+
+        let run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("learning_review".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1001,
+        })
+        .unwrap();
+
+        assert_eq!(run.status, WorkerRunOnceStatus::Completed);
+        let result = run.result.unwrap();
+        assert_eq!(result.status, WorkerJobStatus::Succeeded);
+        assert_eq!(fs::read_to_string(&skill_file).unwrap(), replacement_body);
+        let outbox_file = harness_home
+            .join("state")
+            .join("channels")
+            .join("outbox.jsonl");
+        let outbox_text = fs::read_to_string(&outbox_file).unwrap();
+        assert!(outbox_text.contains(
+            "Self-improvement review: Patched SKILL.md in skill 'workspace:quiet-cron-watchdogs' (1 replacement)."
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn self_improvement_dispatch_replace_auto_applies_high_confidence_signal() {
+        let root =
+            temp_root("self_improvement_dispatch_replace_auto_applies_high_confidence_signal");
+        let harness_home = root.join(".agent-harness");
+        let skill_dir = root.join("skills").join("quiet-cron-watchdogs");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill_file = skill_dir.join("SKILL.md");
+        fs::write(&skill_file, "# Quiet Cron Watchdogs\n\nOriginal.\n").unwrap();
+
+        enqueue_worker_job(WorkerEnqueueOptions {
+            harness_home: harness_home.clone(),
+            kind: WorkerJobKind::LearningReview,
+            lane: Some("learning_review".to_string()),
+            payload: json!({
+                "mode": "dispatch-and-replace",
+                "notify": true,
+                "targetSkillId": "workspace:quiet-cron-watchdogs",
+                "targetPath": skill_file,
+                "signalText": "remember to keep cron watchdog fixes in this skill after repeated scheduler errors",
+                "sourceTurn": "queue-auto-1",
+                "channelTrust": "operator",
+                "notificationTarget": {
+                    "platform": "telegram",
+                    "channelId": "dm-1",
+                    "userId": "operator",
+                    "sessionKey": "session-1"
+                }
+            }),
+            idempotency_key: Some("self-improvement:queue-auto-1".to_string()),
+            parent_job_id: None,
+            job_group_id: None,
+            master_agent_id: Some("main".to_string()),
+            master_session_key: Some("session-1".to_string()),
+            wake_policy: None,
+            source: Some("self-improvement-review".to_string()),
+            priority: 0,
+            available_at_ms: Some(1000),
+            max_attempts: 1,
+            timeout_ms: Some(DEFAULT_TIMEOUT_MS),
+            cascade_timeout_ms: None,
+            rate_key: None,
+            concurrency_group_key: None,
+            now_ms: 1000,
+        })
+        .unwrap();
+
+        let run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("learning_review".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1001,
+        })
+        .unwrap();
+
+        assert_eq!(run.status, WorkerRunOnceStatus::Completed);
+        let result = run.result.unwrap();
+        assert_eq!(result.status, WorkerJobStatus::Succeeded);
+        let skill_text = fs::read_to_string(&skill_file).unwrap();
+        assert!(skill_text.contains("## Self-Improvement Notes"));
+        assert!(skill_text.contains("remember to keep cron watchdog fixes"));
+        assert!(skill_text.contains("sourceTurn `queue-auto-1`"));
+        let outbox_file = harness_home
+            .join("state")
+            .join("channels")
+            .join("outbox.jsonl");
+        let outbox_text = fs::read_to_string(&outbox_file).unwrap();
+        assert!(outbox_text.contains(
+            "Self-improvement review: Patched SKILL.md in skill 'workspace:quiet-cron-watchdogs' (1 replacement)."
+        ));
 
         let _ = fs::remove_dir_all(root);
     }

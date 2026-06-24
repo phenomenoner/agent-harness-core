@@ -745,6 +745,7 @@ fn should_skip_backup_path(path: &Path) -> bool {
 }
 
 fn discover_stop_files(harness_home: &Path) -> io::Result<Vec<OpsStopFileStatus>> {
+    let mut stops = Vec::new();
     let plan_file = harness_home
         .join("state")
         .join("supervisor")
@@ -752,56 +753,64 @@ fn discover_stop_files(harness_home: &Path) -> io::Result<Vec<OpsStopFileStatus>
         .join("supervisor-plan.json");
     if let Ok(text) = fs::read_to_string(&plan_file) {
         if let Ok(value) = serde_json::from_str::<Value>(&text) {
-            let mut stops = value
-                .get("tasks")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|task| {
-                    let component = task.get("component").and_then(Value::as_str)?;
-                    let stop_file = task.get("stopFile").and_then(Value::as_str)?;
-                    Some(stop_file_status(
-                        component.to_string(),
-                        PathBuf::from(stop_file),
-                    ))
-                })
-                .collect::<Vec<_>>();
-            if !stops.is_empty() {
-                stops.sort_by(|left, right| left.component.cmp(&right.component));
-                return Ok(stops);
-            }
+            stops.extend(
+                value
+                    .get("tasks")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|task| {
+                        let component = task.get("component").and_then(Value::as_str)?;
+                        let stop_file = task.get("stopFile").and_then(Value::as_str)?;
+                        Some(stop_file_status(
+                            component.to_string(),
+                            PathBuf::from(stop_file),
+                        ))
+                    }),
+            );
         }
     }
 
-    let stop_dir = harness_home
-        .join("state")
-        .join("supervisor")
-        .join("windows-scheduled-tasks")
-        .join("stop");
-    let mut stops = Vec::new();
-    match fs::read_dir(&stop_dir) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = entry?;
-                let path = entry.path();
-                if path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("stop"))
-                {
-                    let component = path
-                        .file_stem()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    stops.push(stop_file_status(component, path));
+    let stop_dirs = [
+        harness_home
+            .join("state")
+            .join("supervisor")
+            .join("windows-scheduled-tasks")
+            .join("stop"),
+        harness_home.join("state").join("supervisor").join("stop"),
+    ];
+    for stop_dir in stop_dirs {
+        match fs::read_dir(&stop_dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("stop"))
+                    {
+                        let component = path
+                            .file_stem()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        stops.push(stop_file_status(component, path));
+                    }
                 }
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
     }
-    stops.sort_by(|left, right| left.component.cmp(&right.component));
+    stops.sort_by(|left, right| {
+        left.component
+            .cmp(&right.component)
+            .then_with(|| left.stop_file.cmp(&right.stop_file))
+    });
+    stops.dedup_by(|left, right| {
+        left.component == right.component && left.stop_file == right.stop_file
+    });
     Ok(stops)
 }
 

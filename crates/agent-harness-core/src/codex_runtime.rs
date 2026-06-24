@@ -54,6 +54,10 @@ const RUNTIME_CANCEL_REQUEST_MAX_AGE_MS: i64 = 60_000;
 const CODEX_CHILD_TERMINATE_TIMEOUT_MS: u64 = 2_000;
 const CODEX_STDOUT_READER_JOIN_TIMEOUT_MS: u64 = 2_000;
 const DEFAULT_ASSISTANT_NARRATION_MAX_CHARS: usize = 1200;
+const CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT: u64 = 1_000_000;
+const CODEX_THREAD_INLINE_IMAGE_TOTAL_BYTES_LIMIT: u64 = 3_000_000;
+const CODEX_THREAD_TOOL_OUTPUT_BYTES_LIMIT: u64 = 1_000_000;
+const CODEX_ROLLOUT_SCAN_MAX_FILES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRuntimePlanOptions {
@@ -517,6 +521,23 @@ struct CodexContextPolicy {
     configured: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadHealthReport {
+    thread_id: Option<String>,
+    rollout_file: Option<PathBuf>,
+    data_image_count: usize,
+    inline_image_bytes: u64,
+    last_turn_inline_image_bytes: u64,
+    oversized_tool_output_count: usize,
+    oversized_tool_output_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_usage: Option<CodexRuntimeUsage>,
+    compact_recommended: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
 impl Default for CodexContextPolicy {
     fn default() -> Self {
         Self {
@@ -562,6 +583,7 @@ struct CodexContextPreflightReceipt {
     model_context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_context_ratio: Option<f64>,
+    thread_health: CodexThreadHealthReport,
     compact_before_turn: bool,
     reason: String,
     policy: CodexContextPolicy,
@@ -1373,6 +1395,18 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
         &context_policy,
         context_preflight.receipt.compact_before_turn,
     )?;
+    if should_recover_compact_before_turn_failure(&run_result, &context_policy) {
+        run_result = recover_compact_before_turn_failure(
+            &options.harness_home,
+            &plan,
+            run_result,
+            options.timeout_ms,
+            options.idle_timeout_ms,
+            options.progress_context.clone(),
+            &narration_config,
+            &context_policy,
+        )?;
+    }
     if run_result.status == CodexRuntimeRunStatus::ContextExhausted {
         run_result = recover_codex_context_exhaustion(
             &options.harness_home,
@@ -1383,6 +1417,19 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             options.progress_context.clone(),
             &narration_config,
             &context_policy,
+        )?;
+    }
+    if should_recover_thread_health_protocol_error(&run_result, &context_preflight.receipt) {
+        run_result = recover_thread_health_protocol_error(
+            &options.harness_home,
+            &plan,
+            run_result,
+            options.timeout_ms,
+            options.idle_timeout_ms,
+            options.progress_context.clone(),
+            &narration_config,
+            &context_policy,
+            &context_preflight.receipt,
         )?;
     }
     let elapsed_ms = started.elapsed().as_millis();
@@ -1544,6 +1591,7 @@ fn recover_completed_codex_run_from_stdout_log(
         event_count += 1;
         match serde_json::from_str::<Value>(&line) {
             Ok(value) => {
+                record_protocol_usage_event(&value, &mut state);
                 if let Some(extracted_thread_id) = extract_thread_id(&value) {
                     thread_id = Some(extracted_thread_id);
                 }
@@ -1856,11 +1904,13 @@ fn preflight_codex_context(
     let prompt_markdown_bytes = file_len_or_zero(&plan.prompt_markdown);
     let prompt_bundle_bytes = file_len_or_zero(&plan.prompt_bundle_json);
     let (transcript_lines, transcript_bytes) = transcript_stats(&plan.outputs.transcript_file);
+    let thread_health = scan_codex_thread_health(harness_home, plan, &mut warnings);
     let latest_usage = latest_codex_runtime_usage(
         harness_home,
         &plan.outputs.codex_binding_file,
         &mut warnings,
-    );
+    )
+    .or_else(|| thread_health.latest_usage.clone());
     let latest_tokens = latest_usage.as_ref().and_then(codex_usage_total_tokens);
     let model_context_window = policy.model_context_window;
     let active_context_ratio = latest_tokens.and_then(|tokens| {
@@ -1885,6 +1935,13 @@ fn preflight_codex_context(
         (
             false,
             "no existing Codex thread is bound to this harness session".to_string(),
+        )
+    } else if thread_health.compact_recommended {
+        (
+            true,
+            thread_health.reason.clone().unwrap_or_else(|| {
+                "bound Codex thread health guard recommended compact before turn".to_string()
+            }),
         )
     } else if let (Some(tokens), Some(limit)) =
         (latest_tokens, policy.model_auto_compact_token_limit)
@@ -1941,6 +1998,7 @@ fn preflight_codex_context(
         latest_usage,
         model_context_window,
         active_context_ratio,
+        thread_health,
         compact_before_turn,
         reason,
         policy,
@@ -2026,6 +2084,165 @@ fn latest_codex_runtime_usage(
         }
     }
     fallback
+}
+
+fn scan_codex_thread_health(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    warnings: &mut Vec<String>,
+) -> CodexThreadHealthReport {
+    let thread_id = plan.invocation.thread_id.clone();
+    let Some(thread_id_text) = thread_id.as_deref() else {
+        return CodexThreadHealthReport {
+            thread_id,
+            ..CodexThreadHealthReport::default()
+        };
+    };
+    let codex_home = plan
+        .invocation
+        .codex_home
+        .clone()
+        .unwrap_or_else(|| harness_home.join("codex-home"));
+    let sessions_root = codex_home.join("sessions");
+    let mut files = Vec::new();
+    collect_thread_rollout_files(&sessions_root, thread_id_text, &mut files, warnings);
+    files.sort();
+    let Some(rollout_file) = files.pop() else {
+        return CodexThreadHealthReport {
+            thread_id,
+            ..CodexThreadHealthReport::default()
+        };
+    };
+    scan_codex_rollout_file_for_thread_health(thread_id, rollout_file, warnings)
+}
+
+fn collect_thread_rollout_files(
+    dir: &Path,
+    thread_id: &str,
+    files: &mut Vec<PathBuf>,
+    warnings: &mut Vec<String>,
+) {
+    if files.len() >= CODEX_ROLLOUT_SCAN_MAX_FILES {
+        return;
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            warnings.push(format!(
+                "failed to scan Codex rollout directory {}: {error}",
+                dir.display()
+            ));
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        if files.len() >= CODEX_ROLLOUT_SCAN_MAX_FILES {
+            return;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            collect_thread_rollout_files(&path, thread_id, files, warnings);
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if file_name.starts_with("rollout-")
+            && file_name.ends_with(".jsonl")
+            && file_name.contains(thread_id)
+        {
+            files.push(path);
+        }
+    }
+}
+
+fn scan_codex_rollout_file_for_thread_health(
+    thread_id: Option<String>,
+    rollout_file: PathBuf,
+    warnings: &mut Vec<String>,
+) -> CodexThreadHealthReport {
+    let file = match fs::File::open(&rollout_file) {
+        Ok(file) => file,
+        Err(error) => {
+            warnings.push(format!(
+                "failed to open Codex rollout file {} for thread health scan: {error}",
+                rollout_file.display()
+            ));
+            return CodexThreadHealthReport {
+                thread_id,
+                rollout_file: Some(rollout_file),
+                ..CodexThreadHealthReport::default()
+            };
+        }
+    };
+    let mut report = CodexThreadHealthReport {
+        thread_id,
+        rollout_file: Some(rollout_file.clone()),
+        ..CodexThreadHealthReport::default()
+    };
+    let mut current_turn_inline_image_bytes = 0u64;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            warnings.push(format!(
+                "failed to read a line from Codex rollout file {}",
+                rollout_file.display()
+            ));
+            continue;
+        };
+        let line_bytes = u64::try_from(line.len()).unwrap_or(u64::MAX);
+        if line.contains("\"turn/start\"")
+            || line.contains("\"turn/started\"")
+            || line.contains("\"turn_context\"")
+        {
+            report.last_turn_inline_image_bytes = current_turn_inline_image_bytes;
+            current_turn_inline_image_bytes = 0;
+        }
+        if line.contains("data:image") {
+            let count = line.matches("data:image").count();
+            report.data_image_count = report.data_image_count.saturating_add(count);
+            report.inline_image_bytes = report.inline_image_bytes.saturating_add(line_bytes);
+            current_turn_inline_image_bytes =
+                current_turn_inline_image_bytes.saturating_add(line_bytes);
+        }
+        if line_bytes >= CODEX_THREAD_TOOL_OUTPUT_BYTES_LIMIT
+            && (line.contains("function_call_output") || line.contains("tool_output"))
+        {
+            report.oversized_tool_output_count =
+                report.oversized_tool_output_count.saturating_add(1);
+            report.oversized_tool_output_bytes = report
+                .oversized_tool_output_bytes
+                .saturating_add(line_bytes);
+        }
+        if (line.contains("token_count") || line.contains("tokenUsage"))
+            && let Ok(value) = serde_json::from_str::<Value>(&line)
+            && let Some(usage) = extract_protocol_usage(&value)
+        {
+            report.latest_usage = Some(usage);
+        }
+    }
+    report.last_turn_inline_image_bytes = current_turn_inline_image_bytes;
+    if report.last_turn_inline_image_bytes >= CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT {
+        report.compact_recommended = true;
+        report.reason = Some(format!(
+            "bound Codex thread has {} inline image byte(s) in the latest observed turn, above limit {}",
+            report.last_turn_inline_image_bytes, CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT
+        ));
+    } else if report.inline_image_bytes >= CODEX_THREAD_INLINE_IMAGE_TOTAL_BYTES_LIMIT {
+        report.compact_recommended = true;
+        report.reason = Some(format!(
+            "bound Codex thread has {} total inline image byte(s), above limit {}",
+            report.inline_image_bytes, CODEX_THREAD_INLINE_IMAGE_TOTAL_BYTES_LIMIT
+        ));
+    } else if report.oversized_tool_output_bytes >= CODEX_THREAD_TOOL_OUTPUT_BYTES_LIMIT {
+        report.compact_recommended = true;
+        report.reason = Some(format!(
+            "bound Codex thread has {} oversized tool-output byte(s), above limit {}",
+            report.oversized_tool_output_bytes, CODEX_THREAD_TOOL_OUTPUT_BYTES_LIMIT
+        ));
+    }
+    report
 }
 
 fn normalize_path_text_for_match(path: &str) -> String {
@@ -3254,6 +3471,165 @@ fn recover_codex_context_exhaustion(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn recover_compact_before_turn_failure(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    prior: CodexAppServerRunResult,
+    timeout_ms: u64,
+    idle_timeout_ms: u64,
+    progress_context: Option<AgentProgressContext>,
+    narration_config: &AssistantNarrationConfig,
+    policy: &CodexContextPolicy,
+) -> io::Result<CodexAppServerRunResult> {
+    let original_thread_id = plan
+        .invocation
+        .thread_id
+        .clone()
+        .or_else(|| prior.thread_id.clone())
+        .or_else(|| {
+            prior
+                .context_recovery
+                .as_ref()
+                .and_then(|receipt| receipt.original_thread_id.clone())
+        });
+    let prior_reason = prior.reason.clone();
+    let prior_recovery_status = prior
+        .context_recovery
+        .as_ref()
+        .map(|receipt| receipt.status.clone())
+        .unwrap_or_else(|| "compact-before-turn-failed".to_string());
+    let mut recovered = run_context_checkpoint_fallback(
+        harness_home,
+        plan,
+        prior,
+        original_thread_id,
+        timeout_ms,
+        idle_timeout_ms,
+        progress_context,
+        narration_config,
+        policy,
+    )?;
+    let succeeded = recovered.status == CodexRuntimeRunStatus::Completed;
+    if let Some(recovery) = recovered.context_recovery.as_mut() {
+        recovery.status = if succeeded {
+            "compact-before-turn-fallback-succeeded".to_string()
+        } else {
+            "compact-before-turn-fallback-failed".to_string()
+        };
+        recovery.reason = if succeeded {
+            format!(
+                "Codex compact-before-turn recovery status {prior_recovery_status}; checkpoint fallback opened a fresh Codex thread. Prior reason: {prior_reason}"
+            )
+        } else {
+            format!(
+                "Codex compact-before-turn recovery status {prior_recovery_status}; checkpoint fallback also failed. Prior reason: {prior_reason}; fallback reason: {}",
+                recovered.reason
+            )
+        };
+    }
+    recovered.warnings.push(format!(
+        "Codex compact-before-turn recovery status {prior_recovery_status} used fresh-thread checkpoint fallback: {prior_reason}"
+    ));
+    Ok(recovered)
+}
+
+fn should_recover_compact_before_turn_failure(
+    result: &CodexAppServerRunResult,
+    policy: &CodexContextPolicy,
+) -> bool {
+    if policy.fallback_on_compact_failure != "checkpoint-and-new-thread" {
+        return false;
+    }
+    if result.status == CodexRuntimeRunStatus::Canceled {
+        return false;
+    }
+    let Some(recovery) = result.context_recovery.as_ref() else {
+        return false;
+    };
+    matches!(
+        recovery.status.as_str(),
+        "compact-before-turn-timeout" | "compact-before-turn-failed"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_thread_health_protocol_error(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    prior: CodexAppServerRunResult,
+    timeout_ms: u64,
+    idle_timeout_ms: u64,
+    progress_context: Option<AgentProgressContext>,
+    narration_config: &AssistantNarrationConfig,
+    policy: &CodexContextPolicy,
+    preflight: &CodexContextPreflightReceipt,
+) -> io::Result<CodexAppServerRunResult> {
+    let original_thread_id = plan
+        .invocation
+        .thread_id
+        .clone()
+        .or_else(|| prior.thread_id.clone());
+    let guard_reason = preflight
+        .thread_health
+        .reason
+        .clone()
+        .unwrap_or_else(|| "bound Codex thread health guard recommended rollover".to_string());
+    let prior_reason = prior.reason.clone();
+    let mut recovered = run_context_checkpoint_fallback(
+        harness_home,
+        plan,
+        prior,
+        original_thread_id,
+        timeout_ms,
+        idle_timeout_ms,
+        progress_context,
+        narration_config,
+        policy,
+    )?;
+    let succeeded = recovered.status == CodexRuntimeRunStatus::Completed;
+    if let Some(recovery) = recovered.context_recovery.as_mut() {
+        recovery.status = if succeeded {
+            "thread-health-rollover-succeeded".to_string()
+        } else {
+            "thread-health-rollover-failed".to_string()
+        };
+        recovery.reason = if succeeded {
+            format!(
+                "retryable Codex ProtocolError after unhealthy bound thread; checkpoint fallback opened a fresh Codex thread. Guard reason: {guard_reason}. Prior reason: {prior_reason}"
+            )
+        } else {
+            format!(
+                "retryable Codex ProtocolError after unhealthy bound thread; checkpoint fallback also failed. Guard reason: {guard_reason}. Prior reason: {prior_reason}; fallback reason: {}",
+                recovered.reason
+            )
+        };
+    }
+    recovered.warnings.push(format!(
+        "retryable Codex ProtocolError used fresh-thread rollover because bound thread health guard triggered: {guard_reason}"
+    ));
+    Ok(recovered)
+}
+
+fn should_recover_thread_health_protocol_error(
+    result: &CodexAppServerRunResult,
+    preflight: &CodexContextPreflightReceipt,
+) -> bool {
+    result.status == CodexRuntimeRunStatus::ProtocolError
+        && preflight.thread_health.compact_recommended
+        && preflight.policy.fallback_on_compact_failure == "checkpoint-and-new-thread"
+        && is_retryable_stream_disconnect_protocol_error(&result.reason)
+        && !result.assistant_final_found
+        && result.assistant_raw_message.trim().is_empty()
+}
+
+fn is_retryable_stream_disconnect_protocol_error(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("stream disconnected before completion")
+        || lower.contains("websocket closed by server before response.completed")
+        || lower.contains("reconnecting...")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_context_checkpoint_fallback(
     harness_home: &Path,
     plan: &CodexRuntimePlanFile,
@@ -3331,12 +3707,12 @@ fn run_context_checkpoint_fallback(
         binding_backup_file: rollover.binding_backup_file,
         reason: if succeeded {
             format!(
-                "Codex context exhausted; checkpoint fallback opened a fresh Codex thread after official compact recovery failed or was unavailable. Prior reason: {}",
+                "Codex thread recovery opened a fresh Codex thread after official compact recovery failed or was unavailable. Prior reason: {}",
                 prior.reason
             )
         } else {
             format!(
-                "Codex context exhausted; checkpoint fallback also failed. Prior reason: {}; fallback reason: {}",
+                "Codex thread recovery checkpoint fallback also failed. Prior reason: {}; fallback reason: {}",
                 prior.reason, fallback_result.reason
             )
         },
@@ -3416,7 +3792,7 @@ fn write_context_fallback_prompt(
     let previous_thread = plan.invocation.thread_id.as_deref().unwrap_or("(unknown)");
     let prompt = format!(
         "[Harness context recovery]\n\
-         The previous Codex thread reached the context limit before this queued turn could complete.\n\
+         The previous Codex thread could not safely complete this queued turn.\n\
          Previous Codex thread id: {previous_thread}\n\
          Checkpoint artifact: {}\n\
          Recovery reason: {}\n\
@@ -4349,7 +4725,10 @@ fn receive_protocol_event(
                 state.event_count += 1;
                 timeouts.note_event();
                 return match serde_json::from_str::<Value>(&line) {
-                    Ok(value) => Ok(ProtocolEvent::Json(value)),
+                    Ok(value) => {
+                        record_protocol_usage_event(&value, state);
+                        Ok(ProtocolEvent::Json(value))
+                    }
                     Err(error) => Ok(ProtocolEvent::Failed(format!(
                         "codex app-server stdout line was not valid JSON: {error}"
                     ))),
@@ -5028,6 +5407,16 @@ fn record_turn_usage(value: &Value, state: &mut CodexProtocolState) {
     }
 }
 
+fn record_protocol_usage_event(value: &Value, state: &mut CodexProtocolState) {
+    if let Some(usage) = extract_protocol_usage(value) {
+        state.usage = Some(usage);
+    }
+}
+
+fn extract_protocol_usage(value: &Value) -> Option<CodexRuntimeUsage> {
+    extract_turn_usage(value).or_else(|| extract_token_usage_event(value))
+}
+
 fn extract_turn_usage(value: &Value) -> Option<CodexRuntimeUsage> {
     for pointer in [
         "/params/usage",
@@ -5075,6 +5464,117 @@ fn extract_turn_usage(value: &Value) -> Option<CodexRuntimeUsage> {
         }
     }
     None
+}
+
+fn extract_token_usage_event(value: &Value) -> Option<CodexRuntimeUsage> {
+    let method = json_method(value).unwrap_or_default();
+    let likely_usage_event = method.eq_ignore_ascii_case("thread/tokenUsage/updated")
+        || method.to_ascii_lowercase().contains("tokenusage")
+        || method.to_ascii_lowercase().contains("token_usage")
+        || value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("token_count"))
+        || value
+            .pointer("/msg/type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("event_msg"))
+        || value
+            .pointer("/msg/payload/type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("token_count"))
+        || value
+            .pointer("/payload/type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("token_count"));
+    if !likely_usage_event {
+        return None;
+    }
+    for pointer in [
+        "/params/usage",
+        "/params/tokenUsage",
+        "/params/token_usage",
+        "/params",
+        "/params/thread",
+        "/msg/payload",
+        "/payload",
+        "/info",
+    ] {
+        if let Some(candidate) = value.pointer(pointer)
+            && let Some(usage) = token_usage_from_value(
+                candidate,
+                &format!(
+                    "{}.{}",
+                    pointer.trim_start_matches('/').replace('/', "."),
+                    "token"
+                ),
+            )
+        {
+            return Some(usage);
+        }
+    }
+    token_usage_from_value(value, "token-usage-event")
+}
+
+fn token_usage_from_value(value: &Value, source: &str) -> Option<CodexRuntimeUsage> {
+    if let Some(usage) = direct_token_usage(value, source) {
+        return Some(usage);
+    }
+    match value {
+        Value::Object(object) => object
+            .values()
+            .find_map(|value| token_usage_from_value(value, source)),
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| token_usage_from_value(value, source)),
+        _ => None,
+    }
+}
+
+fn direct_token_usage(value: &Value, source: &str) -> Option<CodexRuntimeUsage> {
+    let input_tokens = usage_u64(
+        value,
+        &[
+            "inputTokens",
+            "input_tokens",
+            "promptTokens",
+            "prompt_tokens",
+            "input",
+        ],
+    );
+    let output_tokens = usage_u64(
+        value,
+        &[
+            "outputTokens",
+            "output_tokens",
+            "completionTokens",
+            "completion_tokens",
+            "output",
+        ],
+    );
+    let total_tokens = usage_u64(
+        value,
+        &[
+            "totalTokens",
+            "total_tokens",
+            "total",
+            "totalTokenUsage",
+            "total_token_usage",
+        ],
+    );
+    if input_tokens.is_none() && output_tokens.is_none() && total_tokens.is_none() {
+        return None;
+    }
+    let raw = serde_json::to_string(value)
+        .ok()
+        .map(|text| truncate_for_notice(&text, 512));
+    Some(CodexRuntimeUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        source: source.to_string(),
+        raw,
+    })
 }
 
 fn usage_u64(value: &Value, keys: &[&str]) -> Option<u64> {
@@ -6863,6 +7363,202 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn token_usage_event_updates_usage_without_turn_completed() {
+        let event = json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "tokenUsage": {
+                    "input": 1200,
+                    "output": 34,
+                    "total": 1234
+                }
+            }
+        });
+
+        let usage = extract_protocol_usage(&event).unwrap();
+
+        assert_eq!(usage.input_tokens, Some(1200));
+        assert_eq!(usage.output_tokens, Some(34));
+        assert_eq!(usage.total_tokens, Some(1234));
+        assert!(usage.source.contains("params.tokenUsage"));
+    }
+
+    #[test]
+    fn rollout_thread_health_flags_inline_image_bloat_and_token_count() {
+        let root = temp_root("rollout_thread_health_flags_inline_image_bloat_and_token_count");
+        let rollout_file = root.join("rollout-2026-06-24T11-06-52-019ef798-thread-health.jsonl");
+        fs::create_dir_all(rollout_file.parent().unwrap()).unwrap();
+        let image_payload = "A".repeat(
+            usize::try_from(CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT).unwrap() + 128,
+        );
+        let image_line = json!({
+            "type": "function_call_output",
+            "output": format!("data:image/png;base64,{image_payload}")
+        })
+        .to_string();
+        let token_line = json!({
+            "msg": {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "input": 6379328_u64,
+                    "total": 6414501_u64
+                }
+            }
+        })
+        .to_string();
+        fs::write(&rollout_file, format!("{image_line}\n{token_line}\n")).unwrap();
+        let mut warnings = Vec::new();
+
+        let report = scan_codex_rollout_file_for_thread_health(
+            Some("019ef798-thread-health".to_string()),
+            rollout_file,
+            &mut warnings,
+        );
+
+        assert!(warnings.is_empty());
+        assert!(report.compact_recommended);
+        assert_eq!(report.data_image_count, 1);
+        assert!(
+            report.last_turn_inline_image_bytes > CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT
+        );
+        assert_eq!(report.latest_usage.unwrap().total_tokens, Some(6414501));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_preflight_compacts_for_bound_thread_inline_image_bloat() {
+        let root = temp_root("context_preflight_compacts_for_bound_thread_inline_image_bloat");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let thread_id = "019ef798-346b-7ae2-b341-60a7a20a8d96";
+        let rollout_dir = harness_home
+            .join("codex-home")
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("24");
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let image_payload = "B".repeat(
+            usize::try_from(CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT).unwrap() + 128,
+        );
+        let rollout_file =
+            rollout_dir.join(format!("rollout-2026-06-24T11-06-52-{thread_id}.jsonl"));
+        fs::write(
+            &rollout_file,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "function_call_output",
+                    "output": format!("data:image/png;base64,{image_payload}")
+                })
+            ),
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_invocation_thread_id(plan_file, Some(thread_id));
+        let plan: CodexRuntimePlanFile =
+            serde_json::from_slice(&fs::read(plan_file).unwrap()).unwrap();
+
+        let preflight =
+            preflight_codex_context(&harness_home, &plan, plan_file, plan_file.parent()).unwrap();
+
+        assert!(preflight.receipt.compact_before_turn);
+        assert!(preflight.receipt.reason.contains("inline image"));
+        assert!(preflight.receipt.thread_health.compact_recommended);
+        assert_eq!(
+            preflight.receipt.thread_health.thread_id.as_deref(),
+            Some(thread_id)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retryable_protocol_error_after_bloated_thread_rolls_over_to_fresh_thread() {
+        let root =
+            temp_root("retryable_protocol_error_after_bloated_thread_rolls_over_to_fresh_thread");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let thread_id = "019ef798-346b-7ae2-b341-60a7a20a8d96";
+        let rollout_dir = harness_home
+            .join("codex-home")
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("24");
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let image_payload = "C".repeat(
+            usize::try_from(CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT).unwrap() + 128,
+        );
+        fs::write(
+            rollout_dir.join(format!("rollout-2026-06-24T11-06-52-{thread_id}.jsonl")),
+            format!(
+                "{}\n",
+                json!({
+                    "type": "function_call_output",
+                    "output": format!("data:image/png;base64,{image_payload}")
+                })
+            ),
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        replace_invocation_thread_id(plan_file, Some(thread_id));
+        let (executable, arguments, events_file) =
+            stream_disconnect_then_fresh_thread_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert_eq!(
+            report.receipt.context_recovery.as_ref().unwrap().status,
+            "thread-health-rollover-succeeded"
+        );
+        assert!(
+            report
+                .receipt
+                .context_recovery
+                .as_ref()
+                .unwrap()
+                .fresh_thread_attempted
+        );
+        let completion = report.completion.as_ref().unwrap();
+        let transcript = fs::read_to_string(completion.transcript_file.as_ref().unwrap()).unwrap();
+        assert!(transcript.contains("Fresh fallback reply"));
+        let events = fs::read_to_string(events_file).unwrap();
+        assert!(events.contains("thread/resume"));
+        assert!(events.contains("thread/compact/start"));
+        assert!(events.contains("thread/start"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn codex_progress_skips_terminal_delta_event_wrappers() {
         let context = progress_context();
         let event = codex_progress_event_from_json(
@@ -7712,8 +8408,8 @@ mod tests {
             harness_home: harness_home.clone(),
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             progress_context: None,
         })
         .unwrap();
@@ -7760,8 +8456,8 @@ mod tests {
             harness_home,
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             progress_context: None,
         })
         .unwrap();
@@ -7804,8 +8500,8 @@ mod tests {
             harness_home,
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             progress_context: None,
         })
         .unwrap();
@@ -8042,6 +8738,100 @@ mod tests {
     }
 
     #[test]
+    fn run_codex_runtime_preflight_compact_failure_falls_back_to_fresh_thread() {
+        assert_preflight_compact_problem_falls_back("failed", 10_000);
+    }
+
+    #[test]
+    fn run_codex_runtime_preflight_compact_timeout_falls_back_to_fresh_thread() {
+        assert_preflight_compact_problem_falls_back("timeout", 5_000);
+    }
+
+    #[test]
+    fn run_codex_runtime_preflight_compact_unexpected_response_falls_back_to_fresh_thread() {
+        assert_preflight_compact_problem_falls_back("unexpected", 10_000);
+    }
+
+    fn assert_preflight_compact_problem_falls_back(scenario: &str, idle_timeout_ms: u64) {
+        let root = temp_root(&format!(
+            "run_codex_runtime_preflight_compact_{scenario}_falls_back_to_fresh_thread"
+        ));
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"codexContext":{"modelContextWindow":1000,"compactAtActiveContextRatio":0.5,"modelAutoCompactTokenLimit":900,"fallbackOnCompactFailure":"checkpoint-and-new-thread"}}"#,
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan = plan_report.plan.as_ref().unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        replace_invocation_thread_id(plan_file, Some("thread-existing"));
+        let receipts_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-runtime-run-receipts.jsonl");
+        fs::write(
+            &receipts_file,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "codexBindingFile": plan.outputs.codex_binding_file.to_string_lossy(),
+                    "usage": {
+                        "inputTokens": 920,
+                        "outputTokens": 10,
+                        "totalTokens": 930,
+                        "source": "test"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let (executable, arguments, events_file) =
+            preflight_compact_problem_then_fresh_thread_app_server_command(&root, scenario);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let recovery = report.receipt.context_recovery.as_ref().unwrap();
+        assert_eq!(
+            recovery.status.as_str(),
+            "compact-before-turn-fallback-succeeded"
+        );
+        assert_eq!(recovery.official_compact_attempts, 1);
+        assert!(recovery.fresh_thread_attempted);
+        assert!(recovery.fresh_thread_succeeded);
+        assert!(recovery.checkpoint_file.as_ref().unwrap().is_file());
+        assert!(recovery.rollover_file.as_ref().unwrap().is_file());
+        assert!(recovery.reason.contains("compact-before-turn"));
+        let events = fs::read_to_string(events_file).unwrap();
+        assert!(events.contains("thread/compact/start"));
+        assert!(events.matches("turn/start").count() >= 1);
+        let transcript =
+            fs::read_to_string(report.completion.unwrap().transcript_file.unwrap()).unwrap();
+        assert!(transcript.contains("Fresh fallback reply."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_codex_runtime_context_error_compacts_and_retries_once() {
         let root = temp_root("run_codex_runtime_context_error_compacts_and_retries_once");
         let source = write_codex_runtime_source(&root);
@@ -8167,8 +8957,8 @@ mod tests {
             harness_home,
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             progress_context: None,
         })
         .unwrap();
@@ -8251,8 +9041,8 @@ mod tests {
             harness_home: harness_home.clone(),
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             progress_context: None,
         })
         .unwrap();
@@ -9038,6 +9828,142 @@ while ($true) {
     }
 
     #[cfg(windows)]
+    fn stream_disconnect_then_fresh_thread_app_server_command(
+        root: &Path,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("stream-disconnect-then-fresh-thread.ps1");
+        let events = root.join("stream-disconnect-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+$events = Join-Path $PSScriptRoot 'stream-disconnect-events.jsonl'
+$first = Join-Path $PSScriptRoot 'stream-disconnect-first.marker'
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.method) { Add-Content -LiteralPath $events -Value $msg.method }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/resume') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-bloated"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-fresh"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/compact/start') {
+        [Console]::Out.WriteLine('{"id":2,"result":{}}')
+        [Console]::Out.WriteLine('{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-bloated"}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-bloated"}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        if (!(Test-Path -LiteralPath $first)) {
+            Set-Content -LiteralPath $first -Value 'failed'
+            [Console]::Out.WriteLine('{"method":"error","params":{"error":{"message":"Reconnecting... 2/5","additionalDetails":"stream disconnected before completion: websocket closed by server before response.completed"},"willRetry":true,"threadId":"thread-bloated","turnId":"turn-failed"}}')
+            [Console]::Out.Flush()
+            break
+        }
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-fresh","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-fresh","turn":{"id":"turn-fresh","status":"completed","usage":{"inputTokens":18,"outputTokens":7,"totalTokens":25}}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+            events,
+        )
+    }
+
+    #[cfg(windows)]
+    fn preflight_compact_problem_then_fresh_thread_app_server_command(
+        root: &Path,
+        scenario: &str,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("preflight-compact-problem.ps1");
+        let events = root.join("preflight-compact-problem-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+$scenario = $args[0]
+if ([string]::IsNullOrWhiteSpace($scenario)) { $scenario = 'failed' }
+$events = Join-Path $PSScriptRoot 'preflight-compact-problem-events.jsonl'
+$marker = Join-Path $PSScriptRoot ("preflight-compact-" + $scenario + ".marker")
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.method) { Add-Content -LiteralPath $events -Value $msg.method }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/compact/start') {
+        Set-Content -LiteralPath $marker -Value 'compact-problem'
+        if ($scenario -eq 'timeout') {
+            Start-Sleep -Seconds 10
+            break
+        } elseif ($scenario -eq 'unexpected') {
+            [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-unexpected","status":"completed"}}}')
+            [Console]::Out.Flush()
+            break
+        } else {
+            [Console]::Out.WriteLine('{"method":"error","params":{"error":{"message":"ContextWindowExceeded: compact failed before turn."},"threadId":"thread-test","turnId":"compact-failed"}}')
+            [Console]::Out.Flush()
+            break
+        }
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-fresh","status":"completed","usage":{"inputTokens":18,"outputTokens":7,"totalTokens":25}}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+                scenario.to_string(),
+            ],
+            events,
+        )
+    }
+
+    #[cfg(windows)]
     fn context_error_then_compact_success_app_server_command(
         root: &Path,
     ) -> (PathBuf, Vec<String>, PathBuf) {
@@ -9324,6 +10250,119 @@ done
         (
             PathBuf::from("sh"),
             vec![script.display().to_string()],
+            events,
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn stream_disconnect_then_fresh_thread_app_server_command(
+        root: &Path,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("stream-disconnect-then-fresh-thread.sh");
+        let events = root.join("stream-disconnect-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+dir="$(dirname "$0")"
+events="$dir/stream-disconnect-events.jsonl"
+first="$dir/stream-disconnect-first.marker"
+while IFS= read -r line; do
+    method="$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')"
+    [ -n "$method" ] && printf '%s\n' "$method" >> "$events"
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/resume"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-bloated"}}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-fresh"}}}'
+            ;;
+        *'"method":"thread/compact/start"'*)
+            printf '%s\n' '{"id":2,"result":{}}'
+            printf '%s\n' '{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-bloated"}}'
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-bloated"}}'
+            ;;
+        *'"method":"turn/start"'*)
+            if [ ! -f "$first" ]; then
+                printf failed > "$first"
+                printf '%s\n' '{"method":"error","params":{"error":{"message":"Reconnecting... 2/5","additionalDetails":"stream disconnected before completion: websocket closed by server before response.completed"},"willRetry":true,"threadId":"thread-bloated","turnId":"turn-failed"}}'
+                exit 0
+            fi
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-fresh","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-fresh","turn":{"id":"turn-fresh","status":"completed","usage":{"inputTokens":18,"outputTokens":7,"totalTokens":25}}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        make_executable(&script);
+        (
+            PathBuf::from("sh"),
+            vec![script.display().to_string()],
+            events,
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn preflight_compact_problem_then_fresh_thread_app_server_command(
+        root: &Path,
+        scenario: &str,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("preflight-compact-problem.sh");
+        let events = root.join("preflight-compact-problem-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+scenario="$1"
+[ -n "$scenario" ] || scenario="failed"
+dir="$(dirname "$0")"
+events="$dir/preflight-compact-problem-events.jsonl"
+marker="$dir/preflight-compact-$scenario.marker"
+while IFS= read -r line; do
+    method="$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')"
+    [ -n "$method" ] && printf '%s\n' "$method" >> "$events"
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"thread/compact/start"'*)
+            printf compact-problem > "$marker"
+            case "$scenario" in
+                timeout)
+                    sleep 10
+                    exit 0
+                    ;;
+                unexpected)
+                    printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-unexpected","status":"completed"}}}'
+                    exit 0
+                    ;;
+                *)
+                    printf '%s\n' '{"method":"error","params":{"error":{"message":"ContextWindowExceeded: compact failed before turn."},"threadId":"thread-test","turnId":"compact-failed"}}'
+                    exit 0
+                    ;;
+            esac
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-fresh","status":"completed","usage":{"inputTokens":18,"outputTokens":7,"totalTokens":25}}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        make_executable(&script);
+        (
+            PathBuf::from("sh"),
+            vec![script.display().to_string(), scenario.to_string()],
             events,
         )
     }

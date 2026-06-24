@@ -366,6 +366,7 @@ fn apply_effect(
             write_runtime_cancel_request(harness_home, state, reason.clone(), now_ms)?;
         }
         ChannelCommandEffect::RestartChannel { .. } => {}
+        ChannelCommandEffect::RestartGateway { .. } => {}
         ChannelCommandEffect::AddSteering { instruction } => {
             state.steering_notes.push(ChannelSessionNote {
                 at_ms: now_ms,
@@ -458,6 +459,7 @@ fn command_name(effect: &ChannelCommandEffect) -> &'static str {
         ChannelCommandEffect::SwitchThinking { .. } => "think",
         ChannelCommandEffect::StopCurrentRun { .. } => "stop",
         ChannelCommandEffect::RestartChannel { .. } => "restart",
+        ChannelCommandEffect::RestartGateway { .. } => "restart",
         ChannelCommandEffect::AddSteering { .. } => "steer",
         ChannelCommandEffect::AddBtwNote { .. } => "btw",
         ChannelCommandEffect::ShowModel { .. } => "model",
