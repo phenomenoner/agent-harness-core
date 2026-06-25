@@ -15,6 +15,7 @@ const AGENT_PROGRESS_DELIVERY_STATE_SCHEMA: &str = "agent-harness.progress-deliv
 const AGENT_PROGRESS_DELIVERY_RECEIPT_SCHEMA: &str = "agent-harness.progress-delivery-receipt.v1";
 const DEFAULT_PREVIEW_CHARS: usize = 120;
 const DEFAULT_CURRENT_STEP_CHARS: usize = 1200;
+const TERMINAL_PROGRESS_STATE_RETENTION_MS: i64 = 10 * 60 * 1000;
 const SENSITIVE_PREVIEW: &str = "[redacted sensitive preview]";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -586,6 +587,7 @@ pub fn plan_agent_progress_delivery(
     let mut warnings = Vec::new();
     let mute_config = load_progress_delivery_mute_config(&options.harness_home, &mut warnings)?;
     let mut state = read_delivery_state(&state_file, &mut warnings)?;
+    prune_old_terminal_delivery_state(&mut state, options.now_ms);
     let read_result =
         read_progress_events_since_cursor(&events_file, &state.ledger, &mut warnings)?;
     let cached_events = if read_result.reset {
@@ -1313,6 +1315,29 @@ fn read_delivery_state(
             ));
             Ok(AgentProgressDeliveryState::default())
         }
+    }
+}
+
+fn prune_old_terminal_delivery_state(state: &mut AgentProgressDeliveryState, now_ms: i64) {
+    if now_ms <= 0 {
+        return;
+    }
+    let cutoff_ms = now_ms.saturating_sub(TERMINAL_PROGRESS_STATE_RETENTION_MS);
+    let old_terminal_queues = state
+        .queues
+        .iter()
+        .filter_map(|(queue_id, cursor)| {
+            let latest_sent_at_ms = cursor
+                .body_last_sent_at_ms
+                .max(cursor.status_last_sent_at_ms)
+                .max(cursor.last_sent_at_ms);
+            (cursor.terminal && latest_sent_at_ms > 0 && latest_sent_at_ms <= cutoff_ms)
+                .then(|| queue_id.clone())
+        })
+        .collect::<Vec<_>>();
+    for queue_id in old_terminal_queues {
+        state.queues.remove(&queue_id);
+        state.compacted_events.remove(&queue_id);
     }
 }
 
@@ -2663,6 +2688,118 @@ mod tests {
                 .any(|stored| is_terminal_event(&stored.event))
         );
         assert_eq!(state.ledger.line_number, 81);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn progress_delivery_prunes_old_delivered_terminal_queue_cache() {
+        let root = temp_root("progress_delivery_prunes_old_delivered_terminal_queue_cache");
+        let harness_home = root.join(".agent-harness");
+        let mut state = AgentProgressDeliveryState::default();
+        for index in 0..40 {
+            let mut old_context = context();
+            old_context.queue_id = format!("turn:old:{index}");
+            old_context.session_key = format!("telegram:dm:user:main:old-{index}");
+            let line_number = index + 1;
+            let event = AgentProgressEvent::new(
+                &old_context,
+                AgentProgressKind::Runtime,
+                "runtime",
+                "completed",
+                AgentProgressStatus::Completed,
+                1_000 + index as i64,
+            );
+            state.compacted_events.insert(
+                old_context.queue_id.clone(),
+                vec![StoredProgressEvent { line_number, event }],
+            );
+            let mut cursor = AgentProgressDeliveryCursor::new(
+                old_context.platform.clone(),
+                old_context.channel_id.clone(),
+                old_context.user_id.clone(),
+                old_context.session_key.clone(),
+            );
+            cursor.record_lane(
+                AgentProgressDeliveryMessageKind::Body,
+                Some(format!("body-{index}")),
+                line_number,
+                format!("body-hash-{index}"),
+                2_000 + index as i64,
+                true,
+            );
+            cursor.record_lane(
+                AgentProgressDeliveryMessageKind::Status,
+                Some(format!("status-{index}")),
+                line_number,
+                format!("status-hash-{index}"),
+                2_000 + index as i64,
+                true,
+            );
+            state.queues.insert(old_context.queue_id.clone(), cursor);
+        }
+
+        let mut active_context = context();
+        active_context.queue_id = "turn:active".to_string();
+        let active_event = AgentProgressEvent::new(
+            &active_context,
+            AgentProgressKind::Todo,
+            "todo",
+            "planning 1 task(s)",
+            AgentProgressStatus::Started,
+            9_900_000,
+        );
+        state.compacted_events.insert(
+            active_context.queue_id.clone(),
+            vec![StoredProgressEvent {
+                line_number: 41,
+                event: active_event,
+            }],
+        );
+        state.queues.insert(
+            active_context.queue_id.clone(),
+            AgentProgressDeliveryCursor::new(
+                active_context.platform.clone(),
+                active_context.channel_id.clone(),
+                active_context.user_id.clone(),
+                active_context.session_key.clone(),
+            ),
+        );
+        let state_file = agent_progress_delivery_state_file(&harness_home);
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        write_delivery_state(&state_file, &state).unwrap();
+
+        let plan = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 10_000_000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+
+        assert_eq!(plan.summary.queues, 1);
+        let mut warnings = Vec::new();
+        let pruned = read_delivery_state(&state_file, &mut warnings).unwrap();
+        assert!(warnings.is_empty());
+        assert!(pruned.compacted_events.contains_key("turn:active"));
+        assert!(pruned.queues.contains_key("turn:active"));
+        assert!(
+            pruned
+                .compacted_events
+                .keys()
+                .all(|queue_id| !queue_id.starts_with("turn:old:")),
+            "{:?}",
+            pruned.compacted_events.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            pruned
+                .queues
+                .keys()
+                .all(|queue_id| !queue_id.starts_with("turn:old:")),
+            "{:?}",
+            pruned.queues.keys().collect::<Vec<_>>()
+        );
 
         let _ = fs::remove_dir_all(root);
     }

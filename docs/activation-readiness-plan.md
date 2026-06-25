@@ -63,7 +63,7 @@ These must pass before cutover.
 4. Credential gate
    - Prefer Codex OAuth for Codex models.
    - Confirm Codex auth through local `CODEX_HOME`, `%USERPROFILE%\.codex\auth.json`, or `%USERPROFILE%\.codex\auth.toml`.
-   - Confirm the harness uses a spawnable Codex CLI binary. The Codex Desktop MSIX resource path may resolve on `PATH` but fail to spawn with Windows `os error 5`; use a standalone release or a local npm install such as `.tools/codex-cli/node_modules/.bin/codex.cmd`.
+   - Confirm the harness uses a spawnable Codex CLI binary. On Windows, prefer the repo-local vendor binary `.tools/codex-cli/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe`, with `.tools/codex-cli/node_modules/.bin/codex.cmd` as fallback. Do not rely on extensionless npm shims or the Codex Desktop MSIX resource path; they may resolve on `PATH` but fail to spawn with Windows `os error 5`.
    - Run `channel-credentials-export --include-sensitive` when migrating from an existing Source home. It writes Telegram/Discord tokens and known channel/user/guild IDs into `secrets/channel-credentials.env` and redacted receipts into `secrets/channel-credentials-receipts.json`.
    - Confirm `TELEGRAM_BOT_TOKEN` is present either in process env or `secrets/channel-credentials.env` when Telegram is enabled.
    - Confirm `DISCORD_BOT_TOKEN` is present either in process env or `secrets/channel-credentials.env` when Discord is enabled.
@@ -87,11 +87,11 @@ These must pass before cutover.
    - For supervised infinite loops, keep safe-mode restart enabled. `--no-safe-mode-restart` is only for finite/debug runs where the operator wants immediate process exit.
    - Confirm `state/runtime-queue/loop-last.json`.
    - Confirm `enable-check` and `healthz --require-writable-state` report runtime-loop as live/ready. Missing/stale/error/stopped/stopping runtime-loop heartbeat blocks cutover; `safe-mode` is a degraded warning that requires inspection. Confirm `progress-delivery-loop-heartbeat` is not disabled by a stop file and does not reference a missing process before claiming channel-visible progress panels are healthy.
-   - Run `supervisor-plan` with the intended harness CLI, Codex executable, agent id, and channel loop selection.
+   - Run `supervisor-plan` with the intended harness CLI, Codex executable, agent id, and channel loop selection. If `--codex-exe` is omitted, the planner should discover and pin the repo-local spawnable Codex binary instead of leaving runtime scripts dependent on `PATH`.
    - Add `--include-cron-scheduler` only when the operator is intentionally enabling live scheduler ticks.
    - Before enabling or changing live scheduler ticks, run `cron-scheduler-lint --dry-run --enable` and `cron-scheduler-run-once --dry-run --enable` against the intended harness/source/workspace paths. Lint errors block scheduler cutover.
    - Confirm `state/supervisor/windows-scheduled-tasks/supervisor-plan.json`.
-   - Confirm generated scripts use absolute paths and do not contain raw tokens.
+   - Confirm generated scripts use absolute paths, include `--codex-exe` for runtime-capable loops, and do not contain raw tokens.
    - Confirm `enable-check` reports `supervisor-plan` as pass.
    - Confirm transcript and trajectory files under `agents/<agent-id>/sessions`.
    - Confirm raw Codex stdout/stderr logs under the execution directory.
@@ -130,7 +130,7 @@ These should be run before any handoff from a retired gateway or before enabling
    - Telegram DM ordinary message to `main`.
    - Discord DM ordinary message to `main`.
    - Confirm `channel-run-once` or `runtime-run-once` writes fresh agent replies and delivery receipts.
-   - Use `--codex-exe` with the standalone/local Codex CLI that passed `codex-launch-probe`, not the Codex Desktop MSIX resource path.
+   - Use the standalone/local Codex CLI that passed `codex-launch-probe`; generated live scripts should carry that path through `--codex-exe` instead of depending on `PATH` or the Codex Desktop MSIX resource path.
 
 3. Prompt continuity smoke
    - Send two ordinary messages in the same session.

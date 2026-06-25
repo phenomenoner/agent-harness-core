@@ -7136,14 +7136,54 @@ fn normalize_codex_sandbox_policy(value: &str) -> String {
 
 fn check_executable(executable: &Path) -> CodexRuntimePreflightCheck {
     match resolve_executable(executable) {
-        Some(path) => pass_check(
-            "codex-executable",
-            format!("resolved {} to {}", executable.display(), path.display()),
-        ),
+        Some(path) => match executable_spawn_block_reason(&path) {
+            None => pass_check(
+                "codex-executable",
+                format!("resolved {} to {}", executable.display(), path.display()),
+            ),
+            Some(reason) => fail_check(
+                "codex-executable",
+                format!(
+                    "resolved {} to {}; {reason}; pass --codex-exe with a repo-local codex.exe or codex.cmd",
+                    executable.display(),
+                    path.display()
+                ),
+            ),
+        },
         None => fail_check(
             "codex-executable",
             format!("could not resolve executable {}", executable.display()),
         ),
+    }
+}
+
+fn executable_spawn_block_reason(path: &Path) -> Option<&'static str> {
+    #[cfg(windows)]
+    {
+        if path.extension().is_none() {
+            return Some("extensionless Windows npm shim is not spawnable by the harness");
+        }
+        if path.components().any(|component| {
+            let text = component.as_os_str().to_string_lossy();
+            text.eq_ignore_ascii_case("WindowsApps")
+                || text.to_ascii_lowercase().starts_with("openai.codex_")
+        }) && path.components().any(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("openai.codex_")
+        }) {
+            return Some(
+                "Codex Desktop MSIX resource path is not a supported service runtime path",
+            );
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
     }
 }
 
@@ -8968,6 +9008,89 @@ mod tests {
                 .iter()
                 .any(|check| check.name == "codex-executable")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn preflight_codex_runtime_blocks_extensionless_windows_shim() {
+        let root = temp_root("preflight_codex_runtime_blocks_extensionless_windows_shim");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let shim = root
+            .join(".tools")
+            .join("codex-cli")
+            .join("node_modules")
+            .join(".bin")
+            .join("codex");
+        fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        fs::write(&shim, "").unwrap();
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(shim),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+
+        let report = preflight_codex_runtime(CodexRuntimePreflightOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimePreflightStatus::Blocked);
+        assert!(report.checks.iter().any(|check| {
+            check.name == "codex-executable"
+                && check.status == CodexRuntimePreflightCheckStatus::Fail
+                && check.detail.contains("extensionless")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn preflight_codex_runtime_blocks_codex_desktop_msix_resource_path() {
+        let root = temp_root("preflight_codex_runtime_blocks_codex_desktop_msix_resource_path");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let msix_codex = root
+            .join("Program Files")
+            .join("WindowsApps")
+            .join("OpenAI.Codex_26.616.9593.0_x64__2p2nqsd0c76g0")
+            .join("app")
+            .join("resources")
+            .join("codex.exe");
+        fs::create_dir_all(msix_codex.parent().unwrap()).unwrap();
+        fs::write(&msix_codex, "").unwrap();
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(msix_codex),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+
+        let report = preflight_codex_runtime(CodexRuntimePreflightOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimePreflightStatus::Blocked);
+        assert!(report.checks.iter().any(|check| {
+            check.name == "codex-executable"
+                && check.status == CodexRuntimePreflightCheckStatus::Fail
+                && check.detail.contains("MSIX")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
