@@ -1,6 +1,6 @@
 # Agent Harness TG/Discord DM Self-Check Guide
 
-Date: 2026-06-16
+Date: 2026-06-25
 
 This guide is the operator handoff for asking the `main` agent to verify the live Telegram DM and Discord DM channel paths from inside Agent Harness. It is designed for a single normal-message turn in each DM channel, with the agent doing as much read-only verification as it can and returning artifact pointers for operator follow-up.
 
@@ -10,12 +10,13 @@ Current activation baseline:
 - Active prompt/config authority: `D:\Warehouse\Rust-OpenClaw-Core\.agent-harness\workspace`, `.agent-harness\openclaw.json`, and `.agent-harness\harness-config.json`
 - Harness CLI: `D:\Warehouse\Rust-OpenClaw-Core\target\debug\agent-harness.exe`
 - Retired source snapshot archive: `D:\Warehouse\Rust-OpenClaw-Core\imports\openclaw-core-snapshot`
-- Runtime workspace/Codex cwd: `D:\Warehouse\Research\OpenClaw_WSL`
+- Runtime workspace/Codex cwd: `D:\Warehouse\Rust-OpenClaw-Core\.agent-harness`
+- Codex runtime executable: generated live runners should pass `--codex-exe D:\Warehouse\Rust-OpenClaw-Core\.tools\codex-cli\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe`; an extensionless npm shim or Codex Desktop MSIX resource path is not a valid live app-server executable.
 - Active agent: `main`
 - Latest readiness target: `ready=true`, no failed checks, and no unexpected warnings. Exact pass counts may drift as new readiness checks are added.
 - Latest channel outbox target: `pending=0`, `retryable=0`; any new test backlog should drain after delivery settles.
-- Live loops currently expected in status after the scheduler cutover: `runtime-loop`, `worker-loop`, `progress-delivery-loop`, `telegram-loop`, `discord-outbox-loop`, `discord-gateway-loop`, and `cron-scheduler-loop`.
-- Supervisor plan: 6 always-on task entries plus `cron-scheduler-loop` when scheduling is enabled. `runtime-loop` is a single process with bounded in-process runtime concurrency via `--runtime-concurrency 12`; in supervised infinite mode it should keep safe-mode restart enabled.
+- Live loops currently expected in status after the current cutover: `runtime-loop`, `worker-loop`, `progress-delivery-loop`, `telegram-loop`, `telegram-loop-xiaoxiaoli`, `discord-outbox-loop`, `discord-gateway-loop`, and `cron-scheduler-loop`.
+- Supervisor plan: canonical generated entries cover the always-on runtime, worker, progress, Telegram, Discord outbox/gateway, and cron loops; the preserved `telegram-loop-xiaoxiaoli` runner is started with the same pinned Codex executable. `runtime-loop` is a single process with bounded in-process runtime concurrency via `--runtime-concurrency 12`; in supervised infinite mode it should keep safe-mode restart enabled.
 - Channel identity: when a binding registry is configured, the platform/account/channel tuple must resolve to `main` before the DM reaches the model.
 - Same-session runtime ordering: ordinary channel-origin `main` turns are serialized per `agent + platform + channel + user + sessionKey`; `workerDispatch.channelConcurrencyLimit=3` is still a broader worker/fan-out cap and must not be interpreted as permission for the same DM session to run multiple main-agent Codex turns at once.
 - Codex context recovery: context preflight writes `state/runtime-queue/codex-context-preflight-receipts.jsonl` plus per-execution `codex-context-preflight.json`; hard context-window failures should surface as `context-exhausted` with official compact retry or checkpoint/fresh-thread recovery metadata instead of a generic failed-terminal reply.
