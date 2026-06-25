@@ -15,6 +15,7 @@ pub mod channel_runtime;
 pub mod channel_state;
 pub mod codex_runtime;
 pub mod config;
+pub mod context_rollover;
 pub mod cron;
 pub mod cron_runs;
 pub mod cron_scheduler;
@@ -57,6 +58,7 @@ pub mod skill_matcher;
 pub mod skill_usage;
 pub mod skills;
 pub mod status;
+pub mod subagent_lifecycle;
 pub mod subagents;
 pub mod supervision;
 pub mod supervisor;
@@ -143,6 +145,20 @@ pub use codex_runtime::{
 pub use config::{
     HARNESS_CONFIG_FILE_NAME, HarnessConfigValidationReport, HarnessConfigValidationStatus,
     harness_config_candidates, validate_harness_config,
+};
+pub use context_rollover::{
+    ContextCompactAttemptOptions, ContextCompactCounter, ContextCompactCounterOptions,
+    ContextRolloverBeforeTurnOptions, ContextRolloverConfig, ContextRolloverEpisode,
+    ContextRolloverLane, ContextRolloverMode, ContextRolloverPreparedRequeueReport,
+    ContextRolloverReceipt, ContextRolloverRequeuePreparedOptions, ContextRolloverStatus,
+    ContextStaticRecordRefs, ContextVirtualSessionRecord, ContextWorkingSetGoal,
+    ContextWorkingSetMemory, RuntimeContinuationMetadata, apply_context_rollover_before_turn,
+    context_compact_counter_file, context_rollover_episode_index_file,
+    context_rollover_prepared_requeues_file, context_rollover_receipts_file,
+    continuation_session_key, is_rollover_completion_kind, load_context_rollover_config,
+    load_or_create_context_compact_counter, load_working_set_continuity_section,
+    parse_rollover_mode, planned_session_files, record_context_compact_attempt,
+    requeue_prepared_context_rollover, root_working_session_key, working_set_session_index_file,
 };
 pub use cron::{
     NativeCronJob, NativeCronJobState, NativeCronPlan, NativeCronPlanAction, NativeCronPlanEntry,
@@ -449,6 +465,12 @@ pub use status::{
     HarnessMemoryStatus, HarnessOperationalLogStatus, HarnessOutboxStatus, HarnessPluginStatus,
     HarnessRuntimeReceiptStatus, HarnessRuntimeStatus, HarnessStatusOptions, HarnessStatusReport,
     collect_harness_status,
+};
+pub use subagent_lifecycle::{
+    SubagentLifecycleCleanup, SubagentLifecycleCloseOptions, SubagentLifecycleReceipt,
+    SubagentLifecycleRecordOptions, SubagentLifecycleShowOptions, SubagentLifecycleShowReport,
+    SubagentLifecycleState, close_subagent_lifecycle, record_subagent_lifecycle,
+    show_subagent_lifecycle, subagent_lifecycle_receipts_file, subagent_lifecycle_snapshot_file,
 };
 pub use subagents::{
     SubagentLedger, SubagentLedgerSummary, SubagentPlan, SubagentPlanAction, SubagentPlanEntry,

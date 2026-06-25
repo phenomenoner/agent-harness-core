@@ -15,10 +15,12 @@ use std::os::windows::fs::OpenOptionsExt;
 use crate::loop_health::process_alive_for_pid;
 use crate::{
     AgentSource, HarnessLogEvent, HarnessLogLevel, InboundMediaArtifact, PromptAssemblyOptions,
-    append_harness_log, assemble_prompt_bundle, build_runtime_skill_index, build_turn_plan,
+    RuntimeContinuationMetadata, append_harness_log, apply_context_rollover_before_turn,
+    assemble_prompt_bundle, build_runtime_skill_index, build_turn_plan,
     cron_run_runtime_dispatch_blocker, current_log_time_ms, load_agent_registry,
     load_worker_dispatch_config, write_json_atomic, write_prompt_bundle,
 };
+use crate::{ContextRolloverBeforeTurnOptions, ContextRolloverStatus};
 
 const RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA: &str = "agent-harness.runtime-queue-prepare.v1";
 const RUNTIME_QUEUE_LEASES_SCHEMA: &str = "agent-harness.runtime-queue-leases.v1";
@@ -138,6 +140,8 @@ pub struct RuntimeQueuePreparedItem {
     pub planned_transcript_file: PathBuf,
     pub planned_trajectory_file: PathBuf,
     pub selected_skill_ids: Vec<String>,
+    #[serde(default, flatten)]
+    pub continuation: RuntimeContinuationMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +164,8 @@ pub struct RuntimeExecutionReceipt {
     pub runtime_workspace: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inbound_media_artifacts: Vec<InboundMediaArtifact>,
+    #[serde(default, flatten)]
+    pub continuation: RuntimeContinuationMetadata,
     pub reason: String,
 }
 
@@ -213,6 +219,7 @@ struct PendingQueueItem {
     planned_transcript_file: PathBuf,
     planned_trajectory_file: PathBuf,
     selected_skill_ids: Vec<String>,
+    continuation: RuntimeContinuationMetadata,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -345,6 +352,7 @@ pub fn prepare_runtime_queue_item(
                 prompt_markdown: None,
                 runtime_workspace: None,
                 inbound_media_artifacts: Vec::new(),
+                continuation: RuntimeContinuationMetadata::legacy(),
                 reason: format!(
                     "runtime queue lease lock is busy for class `{lock_runtime_class}`"
                 ),
@@ -401,6 +409,10 @@ pub fn prepare_runtime_queue_item(
             prompt_markdown: None,
             runtime_workspace: None,
             inbound_media_artifacts: Vec::new(),
+            continuation: pending_by_id
+                .get(requested_queue_id)
+                .map(|item| item.continuation.clone())
+                .unwrap_or_else(RuntimeContinuationMetadata::legacy),
             reason: "requested runtime queue item already has a terminal run receipt".to_string(),
         };
         append_json_line(&execution_receipts_file, &receipt)?;
@@ -430,6 +442,7 @@ pub fn prepare_runtime_queue_item(
                 prompt_markdown: None,
                 runtime_workspace: None,
                 inbound_media_artifacts: Vec::new(),
+                continuation: prepared.continuation.clone(),
                 reason: "requested runtime queue item is already leased".to_string(),
             };
             write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
@@ -462,6 +475,7 @@ pub fn prepare_runtime_queue_item(
                     prompt_markdown: None,
                     runtime_workspace: None,
                     inbound_media_artifacts: Vec::new(),
+                    continuation: pending.continuation.clone(),
                     reason: format!("runtime queue item blocked by {blocker}"),
                 };
                 write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
@@ -491,6 +505,7 @@ pub fn prepare_runtime_queue_item(
                     prompt_markdown: None,
                     runtime_workspace: None,
                     inbound_media_artifacts: Vec::new(),
+                    continuation: pending.continuation.clone(),
                     reason: format!("runtime queue capacity blocked by {blocker}"),
                 };
                 write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
@@ -523,6 +538,7 @@ pub fn prepare_runtime_queue_item(
                     prompt_markdown: None,
                     runtime_workspace: None,
                     inbound_media_artifacts: Vec::new(),
+                    continuation: pending.continuation.clone(),
                     reason: format!("runtime queue item blocked by {blocker}"),
                 };
                 write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
@@ -562,6 +578,7 @@ pub fn prepare_runtime_queue_item(
             prompt_markdown: prepared.prompt_markdown.clone(),
             runtime_workspace: prepared.runtime_workspace.clone(),
             inbound_media_artifacts: prepared.inbound_media_artifacts.clone(),
+            continuation: prepared.continuation.clone(),
             reason: "requested runtime queue item was already prepared".to_string(),
         };
         append_json_line(&execution_receipts_file, &receipt)?;
@@ -643,6 +660,7 @@ pub fn prepare_runtime_queue_item(
                     prompt_markdown: prepared.prompt_markdown.clone(),
                     runtime_workspace: prepared.runtime_workspace.clone(),
                     inbound_media_artifacts: prepared.inbound_media_artifacts.clone(),
+                    continuation: prepared.continuation.clone(),
                     reason:
                         "resuming previously prepared runtime queue item without terminal run receipt"
                             .to_string(),
@@ -704,6 +722,7 @@ pub fn prepare_runtime_queue_item(
             prompt_markdown: None,
             runtime_workspace: None,
             inbound_media_artifacts: Vec::new(),
+            continuation: RuntimeContinuationMetadata::legacy(),
             reason: "no matching queued runtime item found".to_string(),
         };
         append_json_line(&execution_receipts_file, &receipt)?;
@@ -728,6 +747,13 @@ pub fn prepare_runtime_queue_item(
             warnings,
         });
     };
+    let pending = maybe_apply_context_rollover_before_turn(
+        &options.harness_home,
+        &queue_file,
+        pending,
+        now_ms,
+        &mut warnings,
+    )?;
     lease_runtime_queue_item(&mut lease_state, &pending, &lease_owner, now_ms);
     write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
     append_json_line(
@@ -816,6 +842,7 @@ pub fn prepare_runtime_queue_item(
         planned_transcript_file: pending.planned_transcript_file,
         planned_trajectory_file: pending.planned_trajectory_file,
         selected_skill_ids: actual_skill_ids,
+        continuation: pending.continuation.clone(),
     };
     let receipt = RuntimeExecutionReceipt {
         queue_id: Some(pending.queue_id),
@@ -829,6 +856,7 @@ pub fn prepare_runtime_queue_item(
         prompt_markdown: Some(prompt_files.markdown),
         runtime_workspace: pending.runtime_workspace,
         inbound_media_artifacts: item.inbound_media_artifacts.clone(),
+        continuation: item.continuation.clone(),
         reason: "prompt bundle prepared; Codex runtime adapter not invoked yet".to_string(),
     };
     write_json_atomic(&receipt_file, &receipt)?;
@@ -1939,6 +1967,7 @@ fn lease_acquired_receipt(item: &PendingQueueItem, reason: &str) -> RuntimeExecu
         prompt_markdown: None,
         runtime_workspace: item.runtime_workspace.clone(),
         inbound_media_artifacts: item.inbound_media_artifacts.clone(),
+        continuation: item.continuation.clone(),
         reason: reason.to_string(),
     }
 }
@@ -2447,7 +2476,30 @@ fn parse_pending_item(value: &Value) -> Option<PendingQueueItem> {
             &["plannedTrajectoryFile", "planned_trajectory_file"],
         )?,
         selected_skill_ids: string_array_field(value, &["selectedSkillIds", "selected_skill_ids"]),
+        continuation: continuation_metadata_from_value(value),
     })
+}
+
+fn continuation_metadata_from_value(value: &Value) -> RuntimeContinuationMetadata {
+    RuntimeContinuationMetadata {
+        virtual_session_id: string_field(value, &["virtualSessionId", "virtual_session_id"])
+            .map(ToString::to_string),
+        continuation_index: value
+            .get("continuationIndex")
+            .or_else(|| value.get("continuation_index"))
+            .and_then(Value::as_u64),
+        completion_kind: string_field(value, &["completionKind", "completion_kind"])
+            .map(ToString::to_string),
+        task_terminal: value
+            .get("taskTerminal")
+            .or_else(|| value.get("task_terminal"))
+            .and_then(Value::as_bool),
+        suppress_self_improvement: value
+            .get("suppressSelfImprovement")
+            .or_else(|| value.get("suppress_self_improvement"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
 }
 
 fn default_runtime_class_for(platform: &str) -> String {
@@ -2554,14 +2606,90 @@ fn normalize_key_part(value: &str) -> String {
     }
 }
 
+fn maybe_apply_context_rollover_before_turn(
+    harness_home: &Path,
+    queue_file: &Path,
+    pending: PendingQueueItem,
+    now_ms: i64,
+    warnings: &mut Vec<String>,
+) -> io::Result<PendingQueueItem> {
+    if pending.runtime_class != "interactive" || pending.origin != "channel" {
+        return Ok(pending);
+    }
+
+    let receipt = apply_context_rollover_before_turn(ContextRolloverBeforeTurnOptions {
+        harness_home: harness_home.to_path_buf(),
+        queue_id: pending.queue_id.clone(),
+        runtime_class: pending.runtime_class.clone(),
+        agent_id: pending.agent_id.clone(),
+        platform: pending.platform.clone(),
+        channel_id: pending.channel_id.clone(),
+        user_id: pending.user_id.clone(),
+        working_session_key: pending.session_key.clone(),
+        now_ms,
+    })?;
+
+    match receipt.status {
+        ContextRolloverStatus::Applied => {
+            warnings.push(format!(
+                "context rollover applied for runtime queue item `{}`: {} -> {}",
+                pending.queue_id,
+                pending.session_key,
+                receipt
+                    .new_working_session_key
+                    .as_deref()
+                    .unwrap_or("(unknown)")
+            ));
+            let mut reload_warnings = Vec::new();
+            let items = read_pending_items(queue_file, &mut reload_warnings)?;
+            warnings.extend(
+                reload_warnings
+                    .into_iter()
+                    .map(|warning| format!("after context rollover: {warning}")),
+            );
+            if let Some(updated) = items
+                .into_iter()
+                .find(|item| item.queue_id == pending.queue_id)
+            {
+                Ok(updated)
+            } else {
+                warnings.push(format!(
+                    "context rollover applied for `{}` but the rewritten pending item was not found; using original queue metadata",
+                    pending.queue_id
+                ));
+                Ok(pending)
+            }
+        }
+        ContextRolloverStatus::Disabled | ContextRolloverStatus::NotPending => Ok(pending),
+        ContextRolloverStatus::BlockedPrepared | ContextRolloverStatus::BlockedLeased => {
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "context rollover guard stopped runtime queue item `{}`: {:?}: {}",
+                    pending.queue_id, receipt.status, receipt.reason
+                ),
+            ))
+        }
+        status => {
+            warnings.push(format!(
+                "context rollover was not applied for runtime queue item `{}`: {:?}: {}",
+                pending.queue_id, status, receipt.reason
+            ));
+            Ok(pending)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
+        ChannelSessionState, ContextCompactAttemptOptions, ContextRolloverLane,
         InboundMediaArtifact, InboundMediaDownloadStatus, InboundMediaModelAttachmentStatus,
         InboundMediaSelectedVariant, RuntimeQueueEnqueueOptions, TurnPlanInput, build_channel_step,
-        build_source_skill_index, build_turn_plan, enqueue_channel_step,
-        inbound_media_attachment_root,
+        build_source_skill_index, build_turn_plan, channel_session_state_file,
+        enqueue_channel_step, inbound_media_attachment_root, read_channel_session_state,
+        record_context_compact_attempt,
     };
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3268,6 +3396,242 @@ mod tests {
         assert_eq!(report.receipt.queue_id.as_deref(), Some(cron_queue_id));
         assert_eq!(report.receipt.runtime_class.as_deref(), Some("cron"));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_runtime_queue_item_rekeys_pending_turn_when_rollover_is_pending() {
+        let root =
+            temp_root("prepare_runtime_queue_item_rekeys_pending_turn_when_rollover_pending");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"codexContext":{"maxSuccessfulCompactsBeforeRollover":1}}"#,
+        )
+        .unwrap();
+        let old_session = "telegram:dm-42:user-7:main";
+        enqueue_fixture_turn_with_session(
+            &source,
+            &harness_home,
+            "telegram",
+            "dm-42",
+            "user-7",
+            old_session,
+            "continue after compact",
+            1234,
+        );
+        let state_file = channel_session_state_file(&harness_home, "telegram", "dm-42", "user-7");
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        write_json_atomic(
+            &state_file,
+            &ChannelSessionState {
+                schema: "agent-harness.channel-session-state.v1".to_string(),
+                platform: "telegram".to_string(),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                active_session_key: old_session.to_string(),
+                agent_id: Some("main".to_string()),
+                provider: None,
+                model: None,
+                session_topic: None,
+                model_override: None,
+                model_override_provider: None,
+                model_override_model: None,
+                thinking_enabled: false,
+                thinking_level: None,
+                thinking_instruction: None,
+                stop_requested: false,
+                stop_reason: None,
+                steering_notes: Vec::new(),
+                btw_notes: Vec::new(),
+                last_command: None,
+                updated_at_ms: 1234,
+            },
+        )
+        .unwrap();
+        record_context_compact_attempt(ContextCompactAttemptOptions {
+            harness_home: harness_home.clone(),
+            lane: ContextRolloverLane {
+                runtime_class: "interactive".to_string(),
+                agent_id: "main".to_string(),
+                platform: "telegram".to_string(),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                working_session_key: old_session.to_string(),
+                virtual_session_id: None,
+                continuation_index: 0,
+            },
+            compact_succeeded: true,
+            rewrote_active_context: true,
+            compact_thread_id: Some("thread-after-compact".to_string()),
+            max_successful_compacts_before_rollover: 1,
+            now_ms: 1235,
+        })
+        .unwrap();
+
+        let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+        let item = report.item.unwrap();
+        assert_eq!(item.session_key, "telegram:dm-42:user-7:main:cont-1");
+        assert_eq!(item.continuation.continuation_index, Some(1));
+        assert_eq!(
+            item.continuation.completion_kind.as_deref(),
+            Some("continuation-rollover")
+        );
+        assert!(item.continuation.suppress_self_improvement);
+        assert_eq!(report.receipt.continuation, item.continuation);
+        let state = read_channel_session_state(&harness_home, "telegram", "dm-42", "user-7")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.active_session_key, item.session_key);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_rollover_blocked_leased_stops_prepare_path() {
+        let root = temp_root("context_rollover_blocked_leased_stops_prepare_path");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(queue_dir(&harness_home).join("classes").join("interactive")).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"codexContext":{"maxSuccessfulCompactsBeforeRollover":1}}"#,
+        )
+        .unwrap();
+        let old_session = "telegram:dm-42:user-7:main";
+        let queue_file = queue_dir(&harness_home).join("pending.jsonl");
+        append_json_line(
+            &queue_file,
+            &serde_json::json!({
+                "schema": "agent-harness.runtime-queue-item.v1",
+                "queueId": "queue-1",
+                "status": "queued",
+                "runtimeClass": "interactive",
+                "origin": "channel",
+                "source": {
+                    "kind": "channel",
+                    "sourceHome": source.home,
+                    "sourceWorkspace": source.workspace
+                },
+                "createdAtMs": 1234,
+                "agentId": "main",
+                "sessionKey": old_session,
+                "platform": "telegram",
+                "channelId": "dm-42",
+                "userId": "user-7",
+                "messageText": "continue after compact",
+                "plannedTranscriptFile": "old.jsonl",
+                "plannedTrajectoryFile": "old.trajectory.jsonl"
+            }),
+        )
+        .unwrap();
+        let state_file = channel_session_state_file(&harness_home, "telegram", "dm-42", "user-7");
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        write_json_atomic(
+            &state_file,
+            &ChannelSessionState {
+                schema: "agent-harness.channel-session-state.v1".to_string(),
+                platform: "telegram".to_string(),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                active_session_key: old_session.to_string(),
+                agent_id: Some("main".to_string()),
+                provider: None,
+                model: None,
+                session_topic: None,
+                model_override: None,
+                model_override_provider: None,
+                model_override_model: None,
+                thinking_enabled: false,
+                thinking_level: None,
+                thinking_instruction: None,
+                stop_requested: false,
+                stop_reason: None,
+                steering_notes: Vec::new(),
+                btw_notes: Vec::new(),
+                last_command: None,
+                updated_at_ms: 1234,
+            },
+        )
+        .unwrap();
+        write_json_atomic(
+            &queue_dir(&harness_home)
+                .join("classes")
+                .join("interactive")
+                .join("runtime-leases.json"),
+            &serde_json::json!({
+                "schema": "agent-harness.runtime-queue-leases.v1",
+                "leases": {"queue-1": {"queueId": "queue-1"}}
+            }),
+        )
+        .unwrap();
+        record_context_compact_attempt(ContextCompactAttemptOptions {
+            harness_home: harness_home.clone(),
+            lane: ContextRolloverLane {
+                runtime_class: "interactive".to_string(),
+                agent_id: "main".to_string(),
+                platform: "telegram".to_string(),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                working_session_key: old_session.to_string(),
+                virtual_session_id: None,
+                continuation_index: 0,
+            },
+            compact_succeeded: true,
+            rewrote_active_context: true,
+            compact_thread_id: Some("thread-after-compact".to_string()),
+            max_successful_compacts_before_rollover: 1,
+            now_ms: 1235,
+        })
+        .unwrap();
+        let pending = PendingQueueItem {
+            queue_id: "queue-1".to_string(),
+            created_at_ms: 1234,
+            agent_id: "main".to_string(),
+            session_key: old_session.to_string(),
+            runtime_class: "interactive".to_string(),
+            origin: "channel".to_string(),
+            cron_run_id: None,
+            scheduled_for_ms: None,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            message_text: "continue after compact".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            source_home: root.join(".openclaw"),
+            source_workspace: root.join(".openclaw").join("workspace"),
+            runtime_workspace: None,
+            planned_transcript_file: PathBuf::from("old.jsonl"),
+            planned_trajectory_file: PathBuf::from("old.trajectory.jsonl"),
+            selected_skill_ids: Vec::new(),
+            continuation: RuntimeContinuationMetadata::legacy(),
+        };
+
+        let error = maybe_apply_context_rollover_before_turn(
+            &harness_home,
+            &queue_file,
+            pending,
+            1236,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("BlockedLeased"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4187,6 +4551,7 @@ mod tests {
             planned_transcript_file: PathBuf::from(format!("{queue_id}.jsonl")),
             planned_trajectory_file: PathBuf::from(format!("{queue_id}.trajectory.jsonl")),
             selected_skill_ids: Vec::new(),
+            continuation: RuntimeContinuationMetadata::legacy(),
         }
     }
 

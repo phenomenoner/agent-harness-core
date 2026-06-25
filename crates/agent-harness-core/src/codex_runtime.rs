@@ -15,7 +15,8 @@ use serde_json::{Value, json};
 use crate::{
     AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
     HarnessLogEvent, HarnessLogLevel, InboundMediaArtifact, InboundMediaInputPlan,
-    InboundMediaInputPlanOptions, append_agent_progress_event, append_harness_log,
+    InboundMediaInputPlanOptions, RuntimeContinuationMetadata, append_agent_progress_event,
+    append_harness_log,
     config::{
         HarnessConfigValidationReport, HarnessConfigValidationStatus, validate_harness_config,
     },
@@ -53,7 +54,7 @@ const HARNESS_CONFIG_FILE_NAME: &str = "harness-config.json";
 pub(crate) const CODEX_APPROVAL_POLICY_ENV: &str = "AGENT_HARNESS_CODEX_APPROVAL_POLICY";
 pub(crate) const CODEX_SANDBOX_ENV: &str = "AGENT_HARNESS_CODEX_SANDBOX";
 pub(crate) const CODEX_SANDBOX_POLICY_ENV: &str = "AGENT_HARNESS_CODEX_SANDBOX_POLICY";
-const DEFAULT_CODEX_SANDBOX: &str = "elevated";
+const DEFAULT_CODEX_SANDBOX: CodexWindowsSandboxMode = CodexWindowsSandboxMode::Elevated;
 const DEFAULT_CODEX_SANDBOX_POLICY: &str = "workspaceWrite";
 const RUNTIME_CANCEL_REQUEST_MAX_AGE_MS: i64 = 60_000;
 const CODEX_CHILD_TERMINATE_TIMEOUT_MS: u64 = 2_000;
@@ -63,6 +64,38 @@ const CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT: u64 = 1_000_000;
 const CODEX_THREAD_INLINE_IMAGE_TOTAL_BYTES_LIMIT: u64 = 3_000_000;
 const CODEX_THREAD_TOOL_OUTPUT_BYTES_LIMIT: u64 = 1_000_000;
 const CODEX_ROLLOUT_SCAN_MAX_FILES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CodexWindowsSandboxMode {
+    Elevated,
+    Unelevated,
+    Disabled,
+}
+
+impl CodexWindowsSandboxMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Elevated => "elevated",
+            Self::Unelevated => "unelevated",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    fn windows_toml_value(self) -> Option<&'static str> {
+        match self {
+            Self::Elevated => Some("elevated"),
+            Self::Unelevated => Some("unelevated"),
+            Self::Disabled => None,
+        }
+    }
+}
+
+impl std::fmt::Display for CodexWindowsSandboxMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRuntimePlanOptions {
@@ -257,6 +290,8 @@ pub struct CodexRuntimePlan {
     pub queue_id: Option<String>,
     pub agent_id: Option<String>,
     pub session_key: String,
+    #[serde(default, flatten)]
+    pub continuation: RuntimeContinuationMetadata,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub prompt_bundle_json: PathBuf,
@@ -535,6 +570,9 @@ struct CodexContextPolicy {
     compact_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     experimental_compact_prompt_file: Option<PathBuf>,
+    max_successful_compacts_before_rollover: u64,
+    rollover_mode: String,
+    cooperative_mid_turn_drain: bool,
     source: String,
     configured: bool,
 }
@@ -573,6 +611,9 @@ impl Default for CodexContextPolicy {
             tool_output_token_limit: None,
             compact_prompt: None,
             experimental_compact_prompt_file: None,
+            max_successful_compacts_before_rollover: 2,
+            rollover_mode: "working-set-memory".to_string(),
+            cooperative_mid_turn_drain: false,
             source: "default".to_string(),
             configured: false,
         }
@@ -699,6 +740,8 @@ struct CodexRuntimePlanFile {
     pub queue_id: Option<String>,
     pub agent_id: Option<String>,
     pub session_key: String,
+    #[serde(default, flatten)]
+    pub continuation: RuntimeContinuationMetadata,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub prompt_bundle_json: PathBuf,
@@ -869,6 +912,9 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
     let bundle = read_json_file(&prompt_bundle_json)?;
     let queue_id =
         string_field(&prepared_receipt, &["queueId", "queue_id"]).map(ToString::to_string);
+    let continuation =
+        serde_json::from_value::<RuntimeContinuationMetadata>(prepared_receipt.clone())
+            .unwrap_or_else(|_| RuntimeContinuationMetadata::legacy());
     let session_key = string_field(&bundle, &["sessionKey", "session_key"])
         .unwrap_or("unknown")
         .to_string();
@@ -946,6 +992,7 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
         queue_id: queue_id.clone(),
         agent_id,
         session_key,
+        continuation,
         provider,
         model,
         prompt_bundle_json,
@@ -2670,6 +2717,26 @@ fn load_codex_context_policy(harness_home: &Path) -> io::Result<CodexContextPoli
             ],
         )
         .map(PathBuf::from);
+        if let Some(value) = context_u64(
+            context,
+            &[
+                "maxSuccessfulCompactsBeforeRollover",
+                "max_successful_compacts_before_rollover",
+            ],
+        )
+        .filter(|value| *value > 0)
+        {
+            policy.max_successful_compacts_before_rollover = value;
+        }
+        if let Some(value) = context_string(context, &["rolloverMode", "rollover_mode"]) {
+            policy.rollover_mode = normalize_context_rollover_mode(&value);
+        }
+        if let Some(value) = context_bool(
+            context,
+            &["cooperativeMidTurnDrain", "cooperative_mid_turn_drain"],
+        ) {
+            policy.cooperative_mid_turn_drain = value;
+        }
         break;
     }
     Ok(policy)
@@ -2707,6 +2774,13 @@ fn normalize_context_fallback_policy(value: &str) -> String {
             value.trim().to_ascii_lowercase().replace('_', "-")
         }
         _ => "checkpoint-and-new-thread".to_string(),
+    }
+}
+
+fn normalize_context_rollover_mode(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "disabled" => "disabled".to_string(),
+        _ => "working-set-memory".to_string(),
     }
 }
 
@@ -6858,7 +6932,7 @@ pub fn inspect_codex_sandbox(harness_home: &Path) -> CodexSandboxInspection {
     let (sandbox, source, configured) =
         resolve_codex_sandbox_with_source(harness_home, &mut warnings);
     CodexSandboxInspection {
-        sandbox,
+        sandbox: sandbox.to_string(),
         source,
         configured,
         config_file: harness_home.join(HARNESS_CONFIG_FILE_NAME),
@@ -6866,7 +6940,10 @@ pub fn inspect_codex_sandbox(harness_home: &Path) -> CodexSandboxInspection {
     }
 }
 
-fn resolve_codex_sandbox(harness_home: &Path, warnings: &mut Vec<String>) -> String {
+fn resolve_codex_sandbox(
+    harness_home: &Path,
+    warnings: &mut Vec<String>,
+) -> CodexWindowsSandboxMode {
     let (sandbox, _, _) = resolve_codex_sandbox_with_source(harness_home, warnings);
     sandbox
 }
@@ -6892,7 +6969,7 @@ fn resolve_codex_sandbox_policy(harness_home: &Path, warnings: &mut Vec<String>)
 fn resolve_codex_sandbox_with_source(
     harness_home: &Path,
     warnings: &mut Vec<String>,
-) -> (String, String, bool) {
+) -> (CodexWindowsSandboxMode, String, bool) {
     if let Ok(raw) = env::var(CODEX_SANDBOX_ENV) {
         return match parse_codex_sandbox(&raw) {
             Some(sandbox) => (sandbox, CODEX_SANDBOX_ENV.to_string(), true),
@@ -6900,11 +6977,7 @@ fn resolve_codex_sandbox_with_source(
                 warnings.push(format!(
                     "invalid {CODEX_SANDBOX_ENV}={raw:?}; defaulting Codex sandbox to {DEFAULT_CODEX_SANDBOX}"
                 ));
-                (
-                    DEFAULT_CODEX_SANDBOX.to_string(),
-                    CODEX_SANDBOX_ENV.to_string(),
-                    true,
-                )
+                (DEFAULT_CODEX_SANDBOX, CODEX_SANDBOX_ENV.to_string(), true)
             }
         };
     }
@@ -6913,11 +6986,7 @@ fn resolve_codex_sandbox_with_source(
     let text = match fs::read_to_string(&config_file) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return (
-                DEFAULT_CODEX_SANDBOX.to_string(),
-                "default".to_string(),
-                false,
-            );
+            return (DEFAULT_CODEX_SANDBOX, "default".to_string(), false);
         }
         Err(error) => {
             warnings.push(format!(
@@ -6925,7 +6994,7 @@ fn resolve_codex_sandbox_with_source(
                 config_file.display()
             ));
             return (
-                DEFAULT_CODEX_SANDBOX.to_string(),
+                DEFAULT_CODEX_SANDBOX,
                 config_file.display().to_string(),
                 false,
             );
@@ -6939,7 +7008,7 @@ fn resolve_codex_sandbox_with_source(
                 config_file.display()
             ));
             return (
-                DEFAULT_CODEX_SANDBOX.to_string(),
+                DEFAULT_CODEX_SANDBOX,
                 config_file.display().to_string(),
                 false,
             );
@@ -6965,44 +7034,41 @@ fn resolve_codex_sandbox_with_source(
                 config_file.display()
             ));
             return (
-                DEFAULT_CODEX_SANDBOX.to_string(),
+                DEFAULT_CODEX_SANDBOX,
                 format!("{}:{pointer}", config_file.display()),
                 true,
             );
         }
     }
     (
-        DEFAULT_CODEX_SANDBOX.to_string(),
+        DEFAULT_CODEX_SANDBOX,
         config_file.display().to_string(),
         false,
     )
 }
 
-fn codex_sandbox_from_json(value: &Value) -> Option<String> {
+fn codex_sandbox_from_json(value: &Value) -> Option<CodexWindowsSandboxMode> {
     match value {
         Value::String(text) => parse_codex_sandbox(text),
-        Value::Bool(true) => Some(DEFAULT_CODEX_SANDBOX.to_string()),
-        Value::Bool(false) => Some("danger-full-access".to_string()),
+        Value::Bool(true) => Some(DEFAULT_CODEX_SANDBOX),
+        Value::Bool(false) => Some(CodexWindowsSandboxMode::Disabled),
         _ => None,
     }
 }
 
-fn parse_codex_sandbox(value: &str) -> Option<String> {
+fn parse_codex_sandbox(value: &str) -> Option<CodexWindowsSandboxMode> {
     let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
     let sandbox = match normalized.as_str() {
         "" => return None,
-        "default" | "windows-elevated" => DEFAULT_CODEX_SANDBOX,
-        "readonly" => "read-only",
-        "workspace" | "workspace-write" => "workspace-write",
-        "full-access" | "full" | "none" | "off" | "disabled" | "false" => "danger-full-access",
-        "elevated" | "read-only" | "danger-full-access" => normalized.as_str(),
-        other if is_safe_codex_sandbox_value(other) => other,
+        "default" | "elevated" | "windows-elevated" => CodexWindowsSandboxMode::Elevated,
+        "unelevated" | "windows-unelevated" => CodexWindowsSandboxMode::Unelevated,
+        "disabled" | "off" | "none" | "false" => CodexWindowsSandboxMode::Disabled,
         _ => return None,
     };
-    Some(sandbox.to_string())
+    Some(sandbox)
 }
 
-fn is_safe_codex_sandbox_value(value: &str) -> bool {
+fn is_safe_codex_sandbox_policy_value(value: &str) -> bool {
     value.len() <= 64
         && value
             .bytes()
@@ -7119,7 +7185,7 @@ fn parse_codex_sandbox_policy(value: &str) -> Option<String> {
         "readonly" | "read-only" | "read" => "readOnly",
         "dangerfullaccess" | "danger-full-access" | "full-access" | "full" | "none" | "off"
         | "disabled" | "false" => "dangerFullAccess",
-        other if is_safe_codex_sandbox_value(other) => other,
+        other if is_safe_codex_sandbox_policy_value(other) => other,
         _ => return None,
     };
     Some(sandbox.to_string())
@@ -7803,6 +7869,23 @@ fn ensure_harness_codex_config(
     let config_file = codex_home.join("config.toml");
     if config_file.is_file() {
         let existing = fs::read_to_string(&config_file)?;
+        if is_generated_harness_codex_config(&existing) {
+            let desired = harness_codex_config_toml(
+                working_directory,
+                harness_home,
+                sandbox,
+                provider_config,
+                &context_policy,
+            );
+            if existing != desired {
+                fs::write(&config_file, desired)?;
+                warnings.push(format!(
+                    "updated generated harness-local Codex config at {}",
+                    config_file.display()
+                ));
+            }
+            return Ok(());
+        }
         if let Some(provider_config) = provider_config {
             let updated = ensure_codex_context_config_in_toml(
                 &ensure_provider_config_in_toml(&existing, provider_config),
@@ -7817,22 +7900,6 @@ fn ensure_harness_codex_config(
             }
             return Ok(());
         }
-        if is_generated_harness_codex_config(&existing) {
-            let desired = harness_codex_config_toml(
-                working_directory,
-                harness_home,
-                &sandbox,
-                provider_config,
-                &context_policy,
-            );
-            if existing != desired {
-                fs::write(&config_file, desired)?;
-                warnings.push(format!(
-                    "updated generated harness-local Codex config at {}",
-                    config_file.display()
-                ));
-            }
-        }
         return Ok(());
     }
 
@@ -7840,13 +7907,13 @@ fn ensure_harness_codex_config(
     let config = harness_codex_config_toml(
         working_directory,
         harness_home,
-        &sandbox,
+        sandbox,
         provider_config,
         &context_policy,
     );
     fs::write(&config_file, config)?;
     warnings.push(format!(
-        "created harness-local Codex config at {} with Windows sandbox={sandbox:?} and trusted runtime workspace",
+        "created harness-local Codex config at {} with Windows sandbox={sandbox} and trusted runtime workspace",
         config_file.display(),
     ));
     Ok(())
@@ -7981,7 +8048,7 @@ fn join_toml_lines(lines: Vec<String>, trailing_newline: bool) -> String {
 fn harness_codex_config_toml(
     working_directory: &Path,
     harness_home: &Path,
-    sandbox: &str,
+    sandbox: CodexWindowsSandboxMode,
     provider_config: Option<&CodexProviderConfig>,
     context_policy: &CodexContextPolicy,
 ) -> String {
@@ -8011,15 +8078,15 @@ fn harness_codex_config_toml(
     if !codex_context_toml_entries(context_policy).is_empty() {
         config.push('\n');
     }
-    config.push_str(&format!(
-        "[windows]\n\
-         sandbox = {}\n\
-         \n\
-         [features]\n\
-         multi_agent = true\n\
-         memories = true\n",
-        toml_basic_string(sandbox)
-    ));
+    if let Some(windows_sandbox) = sandbox.windows_toml_value() {
+        config.push_str("[windows]\n");
+        config.push_str("sandbox = ");
+        config.push_str(&toml_basic_string(windows_sandbox));
+        config.push_str("\n\n");
+    }
+    config.push_str("[features]\n");
+    config.push_str("multi_agent = true\n");
+    config.push_str("memories = true\n");
     if let Some(provider_config) = provider_config {
         config.push_str("\n[model_providers.");
         config.push_str(&provider_config.provider);
@@ -8507,6 +8574,75 @@ mod tests {
     }
 
     #[test]
+    fn plan_codex_runtime_preserves_continuation_metadata_from_prepared_receipt() {
+        let root = temp_root("plan_codex_runtime_preserves_continuation_metadata");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let execution_dir = latest_prepared_execution_dir(&harness_home);
+        let receipt_file = execution_dir.join("execution-receipt.json");
+        let mut receipt: Value = serde_json::from_slice(&fs::read(&receipt_file).unwrap()).unwrap();
+        receipt["virtualSessionId"] = json!("vsession-test");
+        receipt["continuationIndex"] = json!(1);
+        receipt["completionKind"] = json!("continuation-rollover");
+        receipt["taskTerminal"] = json!(false);
+        receipt["suppressSelfImprovement"] = json!(true);
+        fs::write(
+            &receipt_file,
+            serde_json::to_string_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+
+        let report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: Some(execution_dir),
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+
+        let plan = report.plan.as_ref().unwrap();
+        assert_eq!(
+            plan.continuation.virtual_session_id.as_deref(),
+            Some("vsession-test")
+        );
+        assert_eq!(plan.continuation.continuation_index, Some(1));
+        assert!(plan.continuation.should_suppress_self_improvement());
+        let plan_json: Value =
+            serde_json::from_slice(&fs::read(report.plan_file.unwrap()).unwrap()).unwrap();
+        assert_eq!(plan_json["completionKind"], "continuation-rollover");
+        assert_eq!(plan_json["suppressSelfImprovement"], true);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_context_policy_reads_rollover_counter_config() {
+        let root = temp_root("codex_context_policy_reads_rollover_counter_config");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "codexContext": {
+                "maxSuccessfulCompactsBeforeRollover": 3,
+                "rolloverMode": "disabled",
+                "cooperativeMidTurnDrain": true
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let policy = load_codex_context_policy(&harness_home).unwrap();
+
+        assert!(policy.configured);
+        assert_eq!(policy.max_successful_compacts_before_rollover, 3);
+        assert_eq!(policy.rollover_mode, "disabled");
+        assert!(policy.cooperative_mid_turn_drain);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn codex_media_plan_records_vision_fallback_from_prepared_receipt() {
         let root = temp_root("codex_media_plan_records_vision_fallback_from_prepared_receipt");
         let source = write_codex_runtime_source(&root);
@@ -8845,7 +8981,7 @@ mod tests {
         fs::write(codex_home.join("auth.json"), "{}").unwrap();
         fs::write(
             harness_home.join(HARNESS_CONFIG_FILE_NAME),
-            r#"{"security":{"codexSandbox":"read-only"}}"#,
+            r#"{"security":{"codexSandbox":"unelevated"}}"#,
         )
         .unwrap();
         enqueue_and_prepare(&source, &harness_home);
@@ -8866,7 +9002,241 @@ mod tests {
                 .join("config.toml"),
         )
         .unwrap();
-        assert!(config.contains("sandbox = \"read-only\""));
+        assert!(config.contains("sandbox = \"unelevated\""));
+        assert!(!config.contains("sandbox = \"read-only\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn plan_codex_runtime_with_security(
+        name: &str,
+        security_json: &str,
+    ) -> (PathBuf, CodexRuntimePlan, String) {
+        let root = temp_root(name);
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let codex_home = harness_home.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            format!(r#"{{"security":{security_json}}}"#),
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+
+        let report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home,
+            execution_dir: None,
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+
+        let plan = report.plan.unwrap();
+        let config = fs::read_to_string(
+            plan.invocation
+                .codex_home
+                .as_ref()
+                .unwrap()
+                .join("config.toml"),
+        )
+        .unwrap();
+        (root, plan, config)
+    }
+
+    fn assert_windows_sandbox_omitted(name: &str, security_json: &str) {
+        let (root, _plan, config) = plan_codex_runtime_with_security(name, security_json);
+
+        assert!(!config.contains("[windows]"));
+        assert!(!config.contains("sandbox = "));
+        assert!(config.contains("[features]"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_windows_sandbox_disabled_omits_windows_stanza() {
+        assert_windows_sandbox_omitted(
+            "codex_windows_sandbox_disabled_omits_windows_stanza",
+            r#"{"codexSandboxMode":"disabled"}"#,
+        );
+    }
+
+    #[test]
+    fn codex_windows_sandbox_off_omits_windows_stanza() {
+        assert_windows_sandbox_omitted(
+            "codex_windows_sandbox_off_omits_windows_stanza",
+            r#"{"codexSandbox":"off"}"#,
+        );
+    }
+
+    #[test]
+    fn codex_windows_sandbox_none_omits_windows_stanza() {
+        assert_windows_sandbox_omitted(
+            "codex_windows_sandbox_none_omits_windows_stanza",
+            r#"{"codexSandbox":"none"}"#,
+        );
+    }
+
+    #[test]
+    fn codex_windows_sandbox_false_bool_omits_windows_stanza() {
+        assert_windows_sandbox_omitted(
+            "codex_windows_sandbox_false_bool_omits_windows_stanza",
+            r#"{"codexSandbox":false}"#,
+        );
+    }
+
+    #[test]
+    fn codex_windows_sandbox_elevated_writes_elevated() {
+        let (root, _plan, config) = plan_codex_runtime_with_security(
+            "codex_windows_sandbox_elevated_writes_elevated",
+            r#"{"codexSandboxMode":"elevated"}"#,
+        );
+
+        assert!(config.contains("[windows]"));
+        assert!(config.contains("sandbox = \"elevated\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_windows_sandbox_unelevated_writes_unelevated() {
+        let (root, _plan, config) = plan_codex_runtime_with_security(
+            "codex_windows_sandbox_unelevated_writes_unelevated",
+            r#"{"codexSandboxMode":"unelevated"}"#,
+        );
+
+        assert!(config.contains("[windows]"));
+        assert!(config.contains("sandbox = \"unelevated\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_sandbox_policy_danger_full_access_stays_app_server_only() {
+        let (root, plan, config) = plan_codex_runtime_with_security(
+            "codex_sandbox_policy_danger_full_access_stays_app_server_only",
+            r#"{"codexSandboxMode":"disabled","codexSandboxPolicy":"dangerFullAccess"}"#,
+        );
+
+        assert_eq!(plan.invocation.app_server_sandbox, "dangerFullAccess");
+        assert!(!config.contains("[windows]"));
+        assert!(!config.contains("sandbox = \"danger-full-access\""));
+        assert!(!config.contains("sandbox = \"dangerFullAccess\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generated_config_rewrite_removes_windows_stanza_when_disabled() {
+        let root = temp_root("generated_config_rewrite_removes_windows_stanza_when_disabled");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let codex_home = harness_home.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        fs::write(
+            codex_home.join("config.toml"),
+            "# Generated by agent-harness. Contains no secrets.\n\
+             # Codex OAuth state stays in auth.json/auth.toml.\n\
+             \n\
+             [windows]\n\
+             sandbox = \"elevated\"\n\
+             \n\
+             [features]\n\
+             multi_agent = true\n\
+             memories = true\n",
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"security":{"codexSandboxMode":"disabled"}}"#,
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+
+        let report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home,
+            execution_dir: None,
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+        let plan = report.plan.unwrap();
+        let config = fs::read_to_string(
+            plan.invocation
+                .codex_home
+                .as_ref()
+                .unwrap()
+                .join("config.toml"),
+        )
+        .unwrap();
+
+        assert!(!config.contains("[windows]"));
+        assert!(!config.contains("sandbox = "));
+        assert!(config.contains("[features]"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generated_provider_config_rewrite_removes_windows_stanza_when_disabled() {
+        let root =
+            temp_root("generated_provider_config_rewrite_removes_windows_stanza_when_disabled");
+        let source = write_openrouter_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let codex_home = harness_home.join("codex-home-providers").join("openrouter");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(
+            codex_home.join("config.toml"),
+            "# Generated by agent-harness. Contains no secrets.\n\
+             # Codex OAuth state stays in auth.json/auth.toml.\n\
+             \n\
+             model_provider = \"openrouter\"\n\
+             \n\
+             [windows]\n\
+             sandbox = \"elevated\"\n\
+             \n\
+             [features]\n\
+             multi_agent = true\n\
+             memories = true\n\
+             \n\
+             [model_providers.openrouter]\n\
+             name = \"Old Router\"\n\
+             base_url = \"https://old.example/v1\"\n\
+             env_key = \"OLD_OPENROUTER_KEY\"\n\
+             wire_api = \"chat\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"security":{"codexSandboxMode":"disabled"}}"#,
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+
+        let report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home,
+            execution_dir: None,
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+        let plan = report.plan.unwrap();
+        let config = fs::read_to_string(
+            plan.invocation
+                .codex_home
+                .as_ref()
+                .unwrap()
+                .join("config.toml"),
+        )
+        .unwrap();
+
+        assert!(!config.contains("[windows]"));
+        assert!(!config.contains("sandbox = "));
+        assert!(config.contains("model_provider = \"openrouter\""));
+        assert!(config.contains("[model_providers.openrouter]"));
+        assert!(config.contains("base_url = \"https://openrouter.ai/api/v1\""));
+        assert!(!config.contains("Old Router"));
 
         let _ = fs::remove_dir_all(root);
     }

@@ -13,11 +13,11 @@ use crate::{
     CodexRuntimePlanReport, CodexRuntimeReceiptStatus, CodexRuntimeRunOptions,
     CodexRuntimeRunReport, CodexRuntimeRunStatus, HarnessLogEvent, HarnessLogLevel,
     InboundMediaArtifact, MemoryLifecycleTurnOptions, PromptAssemblyOptions, ResponseToneConfig,
-    ResponseToneContext, RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions,
-    RuntimeQueuePrepareReport, RuntimeQueuePreparedItem, SelfImprovementNotificationTarget,
-    SelfImprovementReviewHookOptions, append_agent_progress_event, append_harness_log,
-    apply_response_tone, current_log_time_ms, inspect_runtime_backoff_policy,
-    load_assistant_narration_config, load_response_tone_config,
+    ResponseToneContext, RuntimeContinuationMetadata, RuntimeExecutionReceiptStatus,
+    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeQueuePreparedItem,
+    SelfImprovementNotificationTarget, SelfImprovementReviewHookOptions,
+    append_agent_progress_event, append_harness_log, apply_response_tone, current_log_time_ms,
+    inspect_runtime_backoff_policy, load_assistant_narration_config, load_response_tone_config,
     mark_cron_run_runtime_status_by_queue_id, plan_codex_runtime, prepare_runtime_queue_item,
     read_channel_session_state, record_memory_lifecycle_turn,
     record_skill_usage_from_prompt_bundle, release_runtime_queue_lease, run_codex_runtime,
@@ -69,6 +69,8 @@ pub struct RuntimeRunOnceReceipt {
     pub execution_dir: Option<PathBuf>,
     pub transcript_file: Option<PathBuf>,
     pub outbox_file: Option<PathBuf>,
+    #[serde(default, flatten)]
+    pub continuation: RuntimeContinuationMetadata,
     pub reason: String,
 }
 
@@ -126,6 +128,18 @@ fn should_record_failed_memory_lifecycle(status: &RuntimeRunOnceStatus) -> bool 
     )
 }
 
+fn should_run_self_improvement_hook(
+    status: RuntimeRunOnceStatus,
+    continuation: &RuntimeContinuationMetadata,
+    codex_plan: Option<&CodexRuntimePlan>,
+) -> bool {
+    status == RuntimeRunOnceStatus::Completed
+        && !continuation.should_suppress_self_improvement()
+        && !codex_plan
+            .map(|plan| plan.continuation.should_suppress_self_improvement())
+            .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RuntimeDeadLetterReceipt {
@@ -155,6 +169,7 @@ struct RuntimeRunMetadata {
     origin: Option<String>,
     cron_run_id: Option<String>,
     scheduled_for_ms: Option<i64>,
+    continuation: RuntimeContinuationMetadata,
 }
 
 fn runtime_run_metadata(prepare: &RuntimeQueuePrepareReport) -> RuntimeRunMetadata {
@@ -164,6 +179,7 @@ fn runtime_run_metadata(prepare: &RuntimeQueuePrepareReport) -> RuntimeRunMetada
             origin: Some(item.origin.clone()),
             cron_run_id: item.cron_run_id.clone(),
             scheduled_for_ms: item.scheduled_for_ms,
+            continuation: item.continuation.clone(),
         };
     }
     RuntimeRunMetadata {
@@ -171,6 +187,7 @@ fn runtime_run_metadata(prepare: &RuntimeQueuePrepareReport) -> RuntimeRunMetada
         origin: prepare.receipt.origin.clone(),
         cron_run_id: prepare.receipt.cron_run_id.clone(),
         scheduled_for_ms: prepare.receipt.scheduled_for_ms,
+        continuation: prepare.receipt.continuation.clone(),
     }
 }
 
@@ -203,6 +220,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             execution_dir: None,
             transcript_file: None,
             outbox_file: None,
+            continuation: metadata.continuation,
             reason: "runtime queue lease lock is busy; retrying later".to_string(),
         };
         append_runtime_run_once_log(
@@ -243,6 +261,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             execution_dir: None,
             transcript_file: None,
             outbox_file: None,
+            continuation: metadata.continuation,
             reason: if requested_specific_queue {
                 "requested queue item was not pending or prepared".to_string()
             } else {
@@ -296,6 +315,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             execution_dir: plan.execution_dir.clone(),
             transcript_file: None,
             outbox_file: None,
+            continuation: prepare.receipt.continuation.clone(),
             reason: "no prepared runtime execution is available to run".to_string(),
         };
         append_runtime_run_once_log(
@@ -544,6 +564,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                 execution_dir: run.receipt.execution_dir.clone(),
                                 transcript_file: run.receipt.transcript_file.clone(),
                                 outbox_file: None,
+                                continuation: prepare.receipt.continuation.clone(),
                                 reason: run.receipt.reason.clone(),
                             };
                             append_runtime_run_once_log(
@@ -604,6 +625,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 execution_dir: run.receipt.execution_dir.clone(),
                 transcript_file: run.receipt.transcript_file.clone(),
                 outbox_file: None,
+                continuation: prepare.receipt.continuation.clone(),
                 reason: receipt_reason.clone(),
             };
             append_runtime_run_once_log(
@@ -635,6 +657,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         execution_dir: run.receipt.execution_dir.clone(),
         transcript_file: run.receipt.transcript_file.clone(),
         outbox_file: outbox_file.clone(),
+        continuation: prepare.receipt.continuation.clone(),
         reason: receipt_reason,
     };
     let log_level = match receipt.status {
@@ -684,8 +707,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             },
         )?;
     }
-    if receipt.status == RuntimeRunOnceStatus::Completed
-        && let Some(codex_plan) = plan.plan.as_ref()
+    if let Some(codex_plan) = plan.plan.as_ref()
+        && should_run_self_improvement_hook(receipt.status, &receipt.continuation, Some(codex_plan))
     {
         let notification_target = channel_context_for_self_improvement
             .as_ref()
@@ -2012,6 +2035,37 @@ mod tests {
         );
         assert!(reply.contains("Codex context limit"));
         assert!(reply.contains("queue-context"));
+    }
+
+    #[test]
+    fn self_improvement_hook_is_suppressed_for_rollover_continuations() {
+        let legacy = RuntimeContinuationMetadata::legacy();
+        assert!(should_run_self_improvement_hook(
+            RuntimeRunOnceStatus::Completed,
+            &legacy,
+            None
+        ));
+
+        let mut rollover = RuntimeContinuationMetadata::legacy();
+        rollover.completion_kind = Some("continuation-rollover".to_string());
+        assert!(!should_run_self_improvement_hook(
+            RuntimeRunOnceStatus::Completed,
+            &rollover,
+            None
+        ));
+
+        let mut explicit = RuntimeContinuationMetadata::legacy();
+        explicit.suppress_self_improvement = true;
+        assert!(!should_run_self_improvement_hook(
+            RuntimeRunOnceStatus::Completed,
+            &explicit,
+            None
+        ));
+        assert!(!should_run_self_improvement_hook(
+            RuntimeRunOnceStatus::RetryPending,
+            &legacy,
+            None
+        ));
     }
 
     #[test]

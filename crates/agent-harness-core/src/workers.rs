@@ -29,6 +29,10 @@ use crate::{
         MemoryEmbeddingBackfillLane, MemoryEmbeddingBackfillOptions, run_memory_embedding_backfill,
     },
     run_learning_review,
+    subagent_lifecycle::{
+        SubagentLifecycleRecordOptions, SubagentLifecycleShowOptions, SubagentLifecycleState,
+        record_subagent_lifecycle, show_subagent_lifecycle,
+    },
 };
 
 const WORKER_STORE_SCHEMA: &str = "agent-harness.worker-store.v1";
@@ -409,6 +413,11 @@ pub fn enqueue_worker_job(options: WorkerEnqueueOptions) -> io::Result<WorkerEnq
     });
 
     if let Some(existing) = find_job_by_idempotency(&conn, &idempotency_key)? {
+        ensure_llm_subagent_lifecycle_on_idempotency_hit(
+            &options.harness_home,
+            &existing,
+            options.now_ms,
+        )?;
         signal_worker_queue_wake(&options.harness_home, &lane, "worker job idempotency hit");
         return Ok(WorkerEnqueueReport {
             schema: WORKER_ENQUEUE_SCHEMA,
@@ -470,6 +479,13 @@ pub fn enqueue_worker_job(options: WorkerEnqueueOptions) -> io::Result<WorkerEnq
     .map_err(io::Error::other)?;
     let job = find_job_by_id(&conn, &job_id)?
         .ok_or_else(|| io::Error::other(format!("inserted worker job not found: {job_id}")))?;
+    record_llm_subagent_lifecycle_queued(
+        &options.harness_home,
+        &options.kind,
+        &options.payload,
+        &job,
+        options.now_ms,
+    )?;
     signal_worker_queue_wake(&options.harness_home, &lane, "worker job enqueue");
 
     Ok(WorkerEnqueueReport {
@@ -1735,7 +1751,7 @@ fn queue_llm_worker_turn(
     fs::create_dir_all(&sessions_dir)?;
     let queue_id = format!(
         "worker:{}:{}:{}",
-        now_ms,
+        job.created_at_ms,
         safe_file_part(&job.job_id),
         fnv1a_64_hex(message_text)
     );
@@ -1770,11 +1786,13 @@ fn queue_llm_worker_turn(
         selected_skill_ids: Vec::new(),
         planned_transcript_file: sessions_dir.join(format!("{file_safe_session}.jsonl")),
         planned_trajectory_file: sessions_dir.join(format!("{file_safe_session}.trajectory.jsonl")),
+        continuation: crate::RuntimeContinuationMetadata::legacy(),
     };
-    append_json_line(&queue_file, &item)?;
+    append_runtime_queue_item_if_missing(&queue_file, &item)?;
     if let Some(cron_run_id) = cron_run_id.as_deref() {
         mark_cron_run_runtime_enqueued(harness_home, cron_run_id, &queue_id, now_ms)?;
     }
+    record_llm_subagent_lifecycle_running(harness_home, job, &queue_id, now_ms)?;
     Ok(WorkerJobExecutionResult {
         status: WorkerJobStatus::Succeeded,
         reason: "LLM worker job queued as durable runtime turn".to_string(),
@@ -1789,6 +1807,143 @@ fn queue_llm_worker_turn(
         })),
         result: Some(json!({"runtimeQueueId": queue_id})),
     })
+}
+
+fn ensure_llm_subagent_lifecycle_on_idempotency_hit(
+    harness_home: &Path,
+    existing: &WorkerJob,
+    now_ms: i64,
+) -> io::Result<()> {
+    if existing.kind != WorkerJobKind::LlmSubagent {
+        return Ok(());
+    }
+    let Some(subagent_id) = subagent_id_from_worker_payload(&existing.payload) else {
+        return Ok(());
+    };
+    let current = show_subagent_lifecycle(SubagentLifecycleShowOptions {
+        harness_home: harness_home.to_path_buf(),
+        subagent_id: subagent_id.clone(),
+        now_ms,
+    })?;
+    if current.receipt.state != SubagentLifecycleState::Unknown {
+        return Ok(());
+    }
+    record_llm_subagent_lifecycle_queued(
+        harness_home,
+        &existing.kind,
+        &existing.payload,
+        existing,
+        now_ms,
+    )
+}
+
+fn record_llm_subagent_lifecycle_queued(
+    harness_home: &Path,
+    kind: &WorkerJobKind,
+    payload: &Value,
+    job: &WorkerJob,
+    now_ms: i64,
+) -> io::Result<()> {
+    if *kind != WorkerJobKind::LlmSubagent {
+        return Ok(());
+    }
+    let Some(subagent_id) = subagent_id_from_worker_payload(payload) else {
+        return Ok(());
+    };
+    record_subagent_lifecycle(SubagentLifecycleRecordOptions {
+        harness_home: harness_home.to_path_buf(),
+        subagent_id,
+        state: SubagentLifecycleState::Queued,
+        source: subagent_lifecycle_source(payload, job.source.as_deref()),
+        operation_plan_id: string_path_any(payload, &["operationPlanId", "operation_plan_id"])
+            .map(ToString::to_string),
+        operation_plan_item_id: string_path_any(
+            payload,
+            &["operationPlanItemId", "operation_plan_item_id"],
+        )
+        .map(ToString::to_string),
+        worker_job_id: Some(job.job_id.clone()),
+        runtime_queue_id: None,
+        requested_model: string_path_any(payload, &["requestedModel", "model"])
+            .map(ToString::to_string),
+        resolved_model: string_path_any(payload, &["resolvedModel", "resolved_model"])
+            .or_else(|| string_path(payload, "model"))
+            .map(ToString::to_string),
+        provider: string_path(payload, "provider").map(ToString::to_string),
+        auth_lane: string_path_any(payload, &["authLane", "auth_lane"]).map(ToString::to_string),
+        changed_files: Vec::new(),
+        terminal_receipt_file: None,
+        reason: "LLM subagent worker job queued before runtime dispatch".to_string(),
+        now_ms,
+    })?;
+    Ok(())
+}
+
+fn record_llm_subagent_lifecycle_running(
+    harness_home: &Path,
+    job: &WorkerJob,
+    runtime_queue_id: &str,
+    now_ms: i64,
+) -> io::Result<()> {
+    if job.kind != WorkerJobKind::LlmSubagent {
+        return Ok(());
+    }
+    let Some(subagent_id) = subagent_id_from_worker_payload(&job.payload) else {
+        return Ok(());
+    };
+    record_subagent_lifecycle(SubagentLifecycleRecordOptions {
+        harness_home: harness_home.to_path_buf(),
+        subagent_id,
+        state: SubagentLifecycleState::Running,
+        source: subagent_lifecycle_source(&job.payload, job.source.as_deref()),
+        operation_plan_id: string_path_any(&job.payload, &["operationPlanId", "operation_plan_id"])
+            .map(ToString::to_string),
+        operation_plan_item_id: string_path_any(
+            &job.payload,
+            &["operationPlanItemId", "operation_plan_item_id"],
+        )
+        .map(ToString::to_string),
+        worker_job_id: Some(job.job_id.clone()),
+        runtime_queue_id: Some(runtime_queue_id.to_string()),
+        requested_model: string_path_any(&job.payload, &["requestedModel", "model"])
+            .map(ToString::to_string),
+        resolved_model: string_path_any(&job.payload, &["resolvedModel", "resolved_model"])
+            .or_else(|| string_path(&job.payload, "model"))
+            .map(ToString::to_string),
+        provider: string_path(&job.payload, "provider").map(ToString::to_string),
+        auth_lane: string_path_any(&job.payload, &["authLane", "auth_lane"])
+            .map(ToString::to_string),
+        changed_files: Vec::new(),
+        terminal_receipt_file: None,
+        reason: "LLM worker job queued as durable runtime turn".to_string(),
+        now_ms,
+    })?;
+    Ok(())
+}
+
+fn subagent_id_from_worker_payload(payload: &Value) -> Option<String> {
+    if let Some(subagent_id) = string_path_any(payload, &["subagentId", "subagent_id"]) {
+        return Some(subagent_id.to_string());
+    }
+    if let Some(run_id) = string_path_any(payload, &["runId", "run_id"]) {
+        return Some(format!("subagent:{run_id}"));
+    }
+    let session_key = string_path(payload, "sessionKey")?;
+    let mut parts = session_key.split(':');
+    match (parts.next(), parts.next()) {
+        (Some("subagent"), Some(run_id)) if !run_id.is_empty() => {
+            Some(format!("subagent:{run_id}"))
+        }
+        _ => Some(session_key.to_string()),
+    }
+}
+
+fn subagent_lifecycle_source(payload: &Value, job_source: Option<&str>) -> Option<String> {
+    job_source
+        .or_else(|| string_path(payload, "source"))
+        .or_else(|| string_path(payload, "platform"))
+        .map(ToString::to_string)
+        .or_else(|| Some("worker-dispatch".to_string()))
 }
 
 fn run_watchdog_job(
@@ -2130,6 +2285,33 @@ fn value_to_nullable_string(value: &Value) -> io::Result<Option<String>> {
 
 fn append_json_line(path: &Path, value: &impl Serialize) -> io::Result<()> {
     crate::append_jsonl_value(path, value)
+}
+
+fn append_runtime_queue_item_if_missing(path: &Path, item: &RuntimeQueueItem) -> io::Result<()> {
+    if runtime_queue_contains_id(path, &item.queue_id)? {
+        return Ok(());
+    }
+    append_json_line(path, item)
+}
+
+fn runtime_queue_contains_id(path: &Path, queue_id: &str) -> io::Result<bool> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(path)?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if string_path_any(&value, &["queueId", "queue_id"]) == Some(queue_id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn string_path<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
@@ -2659,6 +2841,225 @@ mod tests {
         let updated = runs.runs.first().unwrap();
         assert_eq!(updated.status, crate::CronRunStatus::RuntimeEnqueued);
         assert!(updated.runtime_queue_id.is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subagent_lifecycle_receipt_created_for_llm_subagent_worker() {
+        let root = temp_root("subagent_lifecycle_receipt_created_for_llm_subagent_worker");
+        let harness_home = root.join(".agent-harness");
+        let source = root.join("source");
+        let workspace = source.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let mut options = llm_options(&harness_home, &source, &workspace, "subagent-worker", 1002);
+        options.kind = WorkerJobKind::LlmSubagent;
+        options.payload = json!({
+            "runId": "queued-1",
+            "sourceHome": source,
+            "sourceWorkspace": workspace,
+            "agentId": "researcher",
+            "sessionKey": "subagent:queued-1:researcher",
+            "messageText": "continue research",
+            "platform": "subagent-ledger",
+            "channelId": "queued-1",
+            "userId": "main",
+            "provider": "openai",
+            "model": "gpt-5.3-codex-spark",
+            "authLane": "codex-oauth"
+        });
+
+        let enqueue = enqueue_worker_job(options).unwrap();
+        let queued = crate::show_subagent_lifecycle(crate::SubagentLifecycleShowOptions {
+            harness_home: harness_home.clone(),
+            subagent_id: "subagent:queued-1".to_string(),
+            now_ms: 1002,
+        })
+        .unwrap();
+
+        assert_eq!(queued.receipt.state, crate::SubagentLifecycleState::Queued);
+        assert_eq!(
+            queued.receipt.worker_job_id.as_deref(),
+            Some(enqueue.job.job_id.as_str())
+        );
+        assert_eq!(
+            queued.receipt.requested_model.as_deref(),
+            Some("gpt-5.3-codex-spark")
+        );
+        assert_eq!(queued.receipt.provider.as_deref(), Some("openai"));
+        assert_eq!(queued.receipt.auth_lane.as_deref(), Some("codex-oauth"));
+        assert!(queued.snapshot_file.is_file());
+
+        let run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("llm".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1003,
+        })
+        .unwrap();
+        assert_eq!(run.status, WorkerRunOnceStatus::Completed);
+
+        let running = crate::show_subagent_lifecycle(crate::SubagentLifecycleShowOptions {
+            harness_home: harness_home.clone(),
+            subagent_id: "subagent:queued-1".to_string(),
+            now_ms: 1004,
+        })
+        .unwrap();
+        assert_eq!(
+            running.receipt.state,
+            crate::SubagentLifecycleState::Running
+        );
+        let queue_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("pending.jsonl");
+        let queue_text = fs::read_to_string(&queue_file).unwrap();
+        let item: Value = serde_json::from_str(queue_text.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            running.receipt.runtime_queue_id.as_deref(),
+            item["queueId"].as_str()
+        );
+        assert!(running.receipt.terminal_receipt_file.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subagent_lifecycle_idempotency_hit_repairs_persisted_job_payload() {
+        let root = temp_root("subagent_lifecycle_idempotency_hit_repairs_persisted_job_payload");
+        let harness_home = root.join(".agent-harness");
+        let source = root.join("source");
+        let workspace = source.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let mut first = llm_options(&harness_home, &source, &workspace, "same-key", 1002);
+        first.payload = json!({
+            "runId": "first",
+            "sourceHome": source,
+            "sourceWorkspace": workspace,
+            "agentId": "researcher",
+            "sessionKey": "subagent:first:researcher",
+            "messageText": "continue first",
+        });
+        enqueue_worker_job(first).unwrap();
+        fs::remove_dir_all(harness_home.join("state").join("subagents")).unwrap();
+
+        let second = WorkerEnqueueOptions {
+            harness_home: harness_home.clone(),
+            kind: WorkerJobKind::DeterministicShell,
+            lane: Some("shell".to_string()),
+            payload: json!({
+                "subagentId": "subagent:wrong",
+                "scriptPath": "noop.cmd",
+                "dryRun": true
+            }),
+            idempotency_key: Some("same-key".to_string()),
+            parent_job_id: None,
+            job_group_id: None,
+            master_agent_id: None,
+            master_session_key: None,
+            wake_policy: None,
+            source: Some("test".to_string()),
+            priority: 0,
+            available_at_ms: Some(1003),
+            max_attempts: 3,
+            timeout_ms: Some(DEFAULT_TIMEOUT_MS),
+            cascade_timeout_ms: None,
+            rate_key: None,
+            concurrency_group_key: None,
+            now_ms: 1003,
+        };
+        let duplicate = enqueue_worker_job(second).unwrap();
+        assert!(!duplicate.inserted);
+
+        let repaired = crate::show_subagent_lifecycle(crate::SubagentLifecycleShowOptions {
+            harness_home: harness_home.clone(),
+            subagent_id: "subagent:first".to_string(),
+            now_ms: 1004,
+        })
+        .unwrap();
+        let wrong = crate::show_subagent_lifecycle(crate::SubagentLifecycleShowOptions {
+            harness_home: harness_home.clone(),
+            subagent_id: "subagent:wrong".to_string(),
+            now_ms: 1004,
+        })
+        .unwrap();
+
+        assert_eq!(
+            repaired.receipt.state,
+            crate::SubagentLifecycleState::Queued
+        );
+        assert_eq!(repaired.receipt.worker_job_id, Some(duplicate.job.job_id));
+        assert_eq!(wrong.receipt.state, crate::SubagentLifecycleState::Unknown);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subagent_lifecycle_retry_does_not_duplicate_runtime_queue_item() {
+        let root = temp_root("subagent_lifecycle_retry_does_not_duplicate_runtime_queue_item");
+        let harness_home = root.join(".agent-harness");
+        let source = root.join("source");
+        let workspace = source.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let mut options = llm_options(&harness_home, &source, &workspace, "retry-subagent", 1002);
+        options.payload = json!({
+            "runId": "retry",
+            "sourceHome": source,
+            "sourceWorkspace": workspace,
+            "agentId": "researcher",
+            "sessionKey": "subagent:retry:researcher",
+            "messageText": "continue retry",
+        });
+        enqueue_worker_job(options).unwrap();
+
+        let lifecycle_dir = harness_home
+            .join("state")
+            .join("subagents")
+            .join("lifecycle");
+        fs::remove_dir_all(&lifecycle_dir).unwrap();
+        fs::write(&lifecycle_dir, "not a directory").unwrap();
+
+        let first = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("llm".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1003,
+        })
+        .unwrap();
+        assert_eq!(first.status, WorkerRunOnceStatus::Rescheduled);
+
+        fs::remove_file(&lifecycle_dir).unwrap();
+        fs::create_dir_all(&lifecycle_dir).unwrap();
+        let second = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("llm".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 10_000,
+        })
+        .unwrap();
+        assert_eq!(second.status, WorkerRunOnceStatus::Completed);
+
+        let queue_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("pending.jsonl");
+        let queue_text = fs::read_to_string(&queue_file).unwrap();
+        let lines = queue_text.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        let item: Value = serde_json::from_str(lines[0]).unwrap();
+        let running = crate::show_subagent_lifecycle(crate::SubagentLifecycleShowOptions {
+            harness_home: harness_home.clone(),
+            subagent_id: "subagent:retry".to_string(),
+            now_ms: 10_001,
+        })
+        .unwrap();
+        assert_eq!(
+            running.receipt.runtime_queue_id.as_deref(),
+            item["queueId"].as_str()
+        );
 
         let _ = fs::remove_dir_all(root);
     }

@@ -32,30 +32,30 @@ use agent_harness_core::{
     CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReport, CodexRuntimePlanOptions,
     CodexRuntimePlanReport, CodexRuntimePreflightOptions, CodexRuntimePreflightReport,
     CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy, ContextPackParseOptions,
-    CreateOperationPlanOptions, CronRunControlAction, CronRunControlOptions, CronRunListOptions,
-    CronSchedulerLintStatus, CronSchedulerRunOnceOptions, CronSchedulerTickStatus,
-    DEFAULT_MEMORY_BACKFILL_BATCH_SIZE, DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS,
-    DEFAULT_MEMORY_BACKFILL_MAX_ITEMS, DEFAULT_MEMORY_BACKFILL_RATE_LIMIT_PER_MINUTE,
-    DEFAULT_MEMORY_BACKFILL_RETRY_CAP, DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION,
-    DEFAULT_MEMORY_OWNER_HEARTBEAT_MAX_AGE_MS, DeterministicCronPlan, DeterministicCronPlanInput,
-    DeterministicCronWorkerEnqueueOptions, DriftCheckOptions, DryRunImportOptions,
-    ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel, HarnessLogRotationOptions,
-    HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport, HealthzOptions,
-    ImportPhaseStatus, ImportReport, LearningProposalOptions, LiveControlAction, McpRequestOptions,
-    MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport, MemoryCanvasWorkerStatus,
-    MemoryCredentialsExportOptions, MemoryCredentialsExportReport, MemoryEmbeddingBackfillLane,
-    MemoryEmbeddingBackfillOptions, MemoryEmbeddingBackfillReport, MemoryHookAdapterOptions,
-    MemoryHookKind, MemoryOwnerEndpointProbeOptions, MemoryOwnerEnsureOptions,
-    MemoryOwnerHeartbeatOptions, MemoryOwnerPromotionOptions, MemoryOwnerRecoveryOptions,
-    MemoryOwnerShadowKind, MemoryOwnerShadowOptions, MemoryOwnerTrustScopeOptions,
-    MemorySearchOptions, MemorySearchReport, MemoryVectorRecallOptions, MemoryVectorRecallReport,
-    MemoryVectorRecallStatus, NativeCronPlan, NativeCronPlanInput, NativeCronWorkerEnqueueOptions,
-    OpenClawMemLocalOwnerPrepareOptions, OpenClawMemReadPathSmokeOptions,
-    OpenClawMemServiceProposeOptions, OpenClawMemServiceRecallOptions, OpenClawMemServiceStatus,
-    OpenClawMemServiceStatusOptions, OpenClawMemServiceStoreOptions, OperationPlanAddItemOptions,
-    OperationPlanBlockOptions, OperationPlanCommentOptions, OperationPlanCompleteOptions,
-    OperationPlanDelegateItemOptions, OperationPlanItemStatus,
-    OperationPlanPromoteDependenciesOptions, OperationPlanShowOptions,
+    ContextRolloverRequeuePreparedOptions, CreateOperationPlanOptions, CronRunControlAction,
+    CronRunControlOptions, CronRunListOptions, CronSchedulerLintStatus,
+    CronSchedulerRunOnceOptions, CronSchedulerTickStatus, DEFAULT_MEMORY_BACKFILL_BATCH_SIZE,
+    DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS, DEFAULT_MEMORY_BACKFILL_MAX_ITEMS,
+    DEFAULT_MEMORY_BACKFILL_RATE_LIMIT_PER_MINUTE, DEFAULT_MEMORY_BACKFILL_RETRY_CAP,
+    DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION, DEFAULT_MEMORY_OWNER_HEARTBEAT_MAX_AGE_MS,
+    DeterministicCronPlan, DeterministicCronPlanInput, DeterministicCronWorkerEnqueueOptions,
+    DriftCheckOptions, DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel,
+    HarnessLogRotationOptions, HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport,
+    HealthzOptions, ImportPhaseStatus, ImportReport, LearningProposalOptions, LiveControlAction,
+    McpRequestOptions, MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport,
+    MemoryCanvasWorkerStatus, MemoryCredentialsExportOptions, MemoryCredentialsExportReport,
+    MemoryEmbeddingBackfillLane, MemoryEmbeddingBackfillOptions, MemoryEmbeddingBackfillReport,
+    MemoryHookAdapterOptions, MemoryHookKind, MemoryOwnerEndpointProbeOptions,
+    MemoryOwnerEnsureOptions, MemoryOwnerHeartbeatOptions, MemoryOwnerPromotionOptions,
+    MemoryOwnerRecoveryOptions, MemoryOwnerShadowKind, MemoryOwnerShadowOptions,
+    MemoryOwnerTrustScopeOptions, MemorySearchOptions, MemorySearchReport,
+    MemoryVectorRecallOptions, MemoryVectorRecallReport, MemoryVectorRecallStatus, NativeCronPlan,
+    NativeCronPlanInput, NativeCronWorkerEnqueueOptions, OpenClawMemLocalOwnerPrepareOptions,
+    OpenClawMemReadPathSmokeOptions, OpenClawMemServiceProposeOptions,
+    OpenClawMemServiceRecallOptions, OpenClawMemServiceStatus, OpenClawMemServiceStatusOptions,
+    OpenClawMemServiceStoreOptions, OperationPlanAddItemOptions, OperationPlanBlockOptions,
+    OperationPlanCommentOptions, OperationPlanCompleteOptions, OperationPlanDelegateItemOptions,
+    OperationPlanItemStatus, OperationPlanPromoteDependenciesOptions, OperationPlanShowOptions,
     OperationPlanUpdateItemOptions, OpsBackupOptions, OpsControlAction, OpsControlOptions,
     OpsCutoverApplyOptions, OpsCutoverApproveOptions, OpsCutoverReceiptOptions,
     OpsCutoverRequestOptions, OpsCutoverStatusOptions, PromptAssemblyOptions, PromptBundle,
@@ -67,16 +67,18 @@ use agent_harness_core::{
     SecurityScanOptions, SkillApplyOptions, SkillArchiveOptions, SkillIndex,
     SkillLearningProposalOperation, SkillLearningProposalStatus, SkillLearningSignal,
     SkillProposalActionOptions, SkillProposalListOptions, SkillProposeOptions, SkillSelectionQuery,
-    SubagentPlan, SubagentPlanInput, SubagentWorkerEnqueueOptions, SuperviseDeployCanaryOptions,
-    SupervisionEvaluateOptions, SupervisorChildState, SupervisorInventoryOptions,
-    SupervisorInventoryServiceConfig, SupervisorLaunchCommand, TaskEntityOptions, TaskStatus,
-    TokenEfficiencyOptions, TraceOptions, TurnPlan, TurnPlanInput, VaultGetOptions,
-    VaultPutOptions, WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport,
-    WorkerCancelOptions, WorkerEnqueueOptions, WorkerJobKind, WorkerReapStaleOptions,
-    WorkerRunOnceOptions, WorkerRunOnceStatus, WorkerStatusOptions, acquire_budget,
-    add_operation_plan_item, append_harness_log, append_jsonl_value, apply_channel_command_step,
-    apply_skill_proposal, assemble_prompt_bundle, block_operation_plan, build_channel_step,
-    build_dry_run_report, build_harness_skill_index, build_import_plan, build_runtime_skill_index,
+    SubagentLifecycleCloseOptions, SubagentLifecycleRecordOptions, SubagentLifecycleShowOptions,
+    SubagentLifecycleShowReport, SubagentLifecycleState, SubagentPlan, SubagentPlanInput,
+    SubagentWorkerEnqueueOptions, SuperviseDeployCanaryOptions, SupervisionEvaluateOptions,
+    SupervisorChildState, SupervisorInventoryOptions, SupervisorInventoryServiceConfig,
+    SupervisorLaunchCommand, TaskEntityOptions, TaskStatus, TokenEfficiencyOptions, TraceOptions,
+    TurnPlan, TurnPlanInput, VaultGetOptions, VaultPutOptions, WindowsSupervisorPlanOptions,
+    WindowsSupervisorPlanReport, WorkerCancelOptions, WorkerEnqueueOptions, WorkerEnqueueReport,
+    WorkerJobKind, WorkerReapStaleOptions, WorkerRunOnceOptions, WorkerRunOnceReport,
+    WorkerRunOnceStatus, WorkerStatusOptions, acquire_budget, add_operation_plan_item,
+    append_harness_log, append_jsonl_value, apply_channel_command_step, apply_skill_proposal,
+    assemble_prompt_bundle, block_operation_plan, build_channel_step, build_dry_run_report,
+    build_harness_skill_index, build_import_plan, build_runtime_skill_index,
     build_source_skill_index, build_turn_plan, cancel_worker_job, check_activation_readiness,
     check_config_drift, check_tool_description_pin, collect_harness_metrics,
     collect_harness_status, collect_healthz, collect_inbound_media_cache_report,
@@ -104,16 +106,19 @@ use agent_harness_core::{
     record_memory_owner_shadow_receipt, record_memory_owner_trust_scope_receipt,
     record_ops_control, record_ops_cutover_apply, record_ops_cutover_approval,
     record_ops_cutover_receipt, record_ops_cutover_request, record_scoped_stop,
-    record_supervise_deploy_canary, recover_memory_owner_state, reject_skill_proposal,
-    release_checklist, request_memory_owner_promotion, resolve_channel_identity,
-    rotate_harness_log_if_needed, run_channel_once, run_codex_runtime, run_cron_scheduler_once,
-    run_memory_canvas_worker, run_memory_embedding_backfill, run_memory_hook_adapter,
-    run_openclaw_mem_read_path_smoke, run_public_hygiene, run_runtime_queue_once, run_worker_once,
+    record_subagent_lifecycle, record_supervise_deploy_canary, recover_memory_owner_state,
+    reject_skill_proposal, release_checklist, request_memory_owner_promotion,
+    requeue_prepared_context_rollover, resolve_channel_identity, rotate_harness_log_if_needed,
+    run_channel_once, run_codex_runtime, run_cron_scheduler_once, run_memory_canvas_worker,
+    run_memory_embedding_backfill, run_memory_hook_adapter, run_openclaw_mem_read_path_smoke,
+    run_public_hygiene, run_runtime_queue_once, run_worker_once,
     runtime_worker::reconcile_runtime_queue_leases_for_generation, scan_security_boundaries,
     schema_registry_entries, search_imported_memory, search_imported_vector_memory, select_skills,
-    show_operation_plan, store_openclaw_mem_service_memory, sync_builtin_harness_skills,
-    tool_description_hash, trace_harness_event, update_operation_plan_item, upsert_background_task,
-    validate_harness_config, write_channel_step, write_deterministic_cron_plan, write_json_atomic,
+    show_operation_plan, show_subagent_lifecycle, store_openclaw_mem_service_memory,
+    subagent_lifecycle_receipts_file, subagent_lifecycle_snapshot_file,
+    sync_builtin_harness_skills, tool_description_hash, trace_harness_event,
+    update_operation_plan_item, upsert_background_task, validate_harness_config,
+    write_channel_step, write_deterministic_cron_plan, write_json_atomic,
     write_memory_search_receipt, write_memory_vector_recall_receipt, write_native_cron_plan,
     write_prompt_bundle, write_report_files, write_skill_index, write_subagent_plan,
     write_task_entity, write_turn_plan, write_windows_supervisor_plan,
@@ -259,8 +264,10 @@ fn main() {
         "cron-scheduler-lint" => run_cron_scheduler_lint(&rest),
         "cron-scheduler-run-once" => run_cron_scheduler_run_once(&rest),
         "cron-scheduler-loop" => run_cron_scheduler_loop(&rest),
+        "context-rollover" => run_context_rollover(&rest),
         "subagent-plan" => run_subagent_plan(&rest),
         "subagent-enqueue" => run_subagent_enqueue(&rest),
+        "subagent-lifecycle" => run_subagent_lifecycle(&rest),
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -7190,6 +7197,35 @@ fn cron_scheduler_loop_sleep_ms(idle_ms: Option<u64>, config_interval_ms: i64) -
     idle_ms.unwrap_or(0).clamp(0, 3_600_000).max(interval_ms)
 }
 
+fn run_context_rollover(args: &[String]) -> Result<(), String> {
+    let args = context_rollover_args_from_args(args)?;
+    match args.action.as_str() {
+        "requeue-prepared" => {
+            let queue_id = args.queue_id.ok_or_else(|| {
+                "context-rollover --action requeue-prepared requires --queue-id".to_string()
+            })?;
+            let new_working_session_key = args.new_working_session_key.ok_or_else(|| {
+                "context-rollover --action requeue-prepared requires --new-working-session-key"
+                    .to_string()
+            })?;
+            let report = requeue_prepared_context_rollover(ContextRolloverRequeuePreparedOptions {
+                harness_home: args.target_home,
+                queue_id,
+                new_working_session_key,
+                reason: args.reason.unwrap_or_else(|| {
+                    "operator requested context rollover prepared requeue".to_string()
+                }),
+                now_ms: args.now_ms,
+            })
+            .map_err(|err| err.to_string())?;
+            print_json(&report)
+        }
+        other => Err(format!(
+            "context-rollover: unknown --action {other}; expected requeue-prepared"
+        )),
+    }
+}
+
 fn run_subagent_plan(args: &[String]) -> Result<(), String> {
     let args = subagent_plan_args_from_args(args)?;
     let ledger = load_subagent_ledger(&args.source).map_err(|err| err.to_string())?;
@@ -7223,6 +7259,533 @@ fn run_subagent_enqueue(args: &[String]) -> Result<(), String> {
     })
     .map_err(|err| err.to_string())?;
     print_json(&report)
+}
+
+fn run_subagent_lifecycle(args: &[String]) -> Result<(), String> {
+    let args = subagent_lifecycle_args_from_args(args)?;
+    match args.action.as_str() {
+        "show" => {
+            let subagent_id = args.subagent_id.ok_or_else(|| {
+                "subagent-lifecycle --action show requires --subagent-id".to_string()
+            })?;
+            let report = show_subagent_lifecycle(SubagentLifecycleShowOptions {
+                harness_home: args.target_home,
+                subagent_id,
+                now_ms: args.now_ms,
+            })
+            .map_err(|err| err.to_string())?;
+            print_json(&report)
+        }
+        "close" => {
+            let subagent_id = args.subagent_id.ok_or_else(|| {
+                "subagent-lifecycle --action close requires --subagent-id".to_string()
+            })?;
+            let report =
+                agent_harness_core::close_subagent_lifecycle(SubagentLifecycleCloseOptions {
+                    harness_home: args.target_home,
+                    subagent_id,
+                    reason: args.reason.unwrap_or_else(|| {
+                        "operator requested subagent lifecycle close".to_string()
+                    }),
+                    now_ms: args.now_ms,
+                })
+                .map_err(|err| err.to_string())?;
+            print_json(&report)
+        }
+        "smoke" => {
+            let report = run_subagent_lifecycle_smoke(&args)?;
+            print_json(&report)?;
+            if !report.workspace_clean {
+                return Err(format!(
+                    "subagent-lifecycle smoke observed workspace changes: {} entries",
+                    report.workspace_diff.len()
+                ));
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "subagent-lifecycle: unknown --action {other}; expected smoke, show, or close"
+        )),
+    }
+}
+
+fn run_subagent_lifecycle_smoke(
+    args: &SubagentLifecycleArgs,
+) -> Result<SubagentLifecycleSmokeReport, String> {
+    if !args.no_write {
+        return Err("subagent-lifecycle --action smoke requires --no-write".to_string());
+    }
+    let workspace = absolute_path(&args.workspace)?;
+    let target_home = absolute_path(&args.target_home)?;
+    let source_home = absolute_path(&args.source_home)?;
+    if path_identity_key(&workspace) == path_identity_key(&target_home) {
+        return Err(
+            "subagent-lifecycle smoke requires --target-home to be outside or below --workspace, not equal to it"
+                .to_string(),
+        );
+    }
+    let subagent_id = args
+        .subagent_id
+        .clone()
+        .unwrap_or_else(|| format!("subagent:smoke-{}", args.now_ms));
+    let run_id = subagent_id
+        .strip_prefix("subagent:")
+        .unwrap_or(&subagent_id)
+        .to_string();
+    let prompt = subagent_lifecycle_no_write_prompt();
+    let idempotency_key = format!("subagent-lifecycle-smoke:{subagent_id}");
+
+    let workspace_before = workspace_status_snapshot(&workspace, &target_home)?;
+    let harness_before = filesystem_manifest_snapshot(&target_home, &[])?;
+
+    let enqueue = enqueue_worker_job(WorkerEnqueueOptions {
+        harness_home: target_home.clone(),
+        kind: WorkerJobKind::LlmSubagent,
+        lane: Some("llm".to_string()),
+        payload: serde_json::json!({
+            "runId": run_id,
+            "subagentId": subagent_id.clone(),
+            "sourceHome": source_home.clone(),
+            "sourceWorkspace": workspace.clone(),
+            "agentId": "subagent-lifecycle-smoke",
+            "sessionKey": format!("{}:smoke", subagent_id),
+            "messageText": prompt,
+            "platform": "subagent-lifecycle-smoke",
+            "channelId": "subagent-lifecycle-smoke",
+            "userId": "operator",
+            "model": args.model,
+            "workspaceWritePolicy": "no-write",
+            "timeoutMs": args.timeout_ms
+        }),
+        idempotency_key: Some(idempotency_key.clone()),
+        parent_job_id: None,
+        job_group_id: None,
+        master_agent_id: Some("operator".to_string()),
+        master_session_key: Some(format!("{}:smoke", subagent_id)),
+        wake_policy: None,
+        source: Some("subagent-lifecycle-smoke".to_string()),
+        priority: 0,
+        available_at_ms: Some(args.now_ms),
+        max_attempts: 1,
+        timeout_ms: Some(args.timeout_ms),
+        cascade_timeout_ms: None,
+        rate_key: None,
+        concurrency_group_key: None,
+        now_ms: args.now_ms,
+    })
+    .map_err(|err| err.to_string())?;
+
+    let run = run_worker_once(WorkerRunOnceOptions {
+        harness_home: target_home.clone(),
+        lane: Some("llm".to_string()),
+        worker_id: "subagent-lifecycle-smoke".to_string(),
+        lease_ms: i64::try_from(args.timeout_ms).unwrap_or(i64::MAX).max(1),
+        now_ms: args.now_ms.saturating_add(1),
+    })
+    .map_err(|err| err.to_string())?;
+
+    let initial_lifecycle = show_subagent_lifecycle(SubagentLifecycleShowOptions {
+        harness_home: target_home.clone(),
+        subagent_id: subagent_id.clone(),
+        now_ms: args.now_ms.saturating_add(2),
+    })
+    .map_err(|err| err.to_string())?;
+    let runtime_terminal_receipt_file = record_subagent_lifecycle_smoke_terminal_receipt(
+        &target_home,
+        &initial_lifecycle,
+        args.now_ms.saturating_add(3),
+    )?;
+    let lifecycle = show_subagent_lifecycle(SubagentLifecycleShowOptions {
+        harness_home: target_home.clone(),
+        subagent_id: subagent_id.clone(),
+        now_ms: args.now_ms.saturating_add(4),
+    })
+    .map_err(|err| err.to_string())?;
+    let workspace_after = workspace_status_snapshot(&workspace, &target_home)?;
+    let harness_after = filesystem_manifest_snapshot(&target_home, &[])?;
+    let workspace_diff = snapshot_diff(&workspace_before.entries, &workspace_after.entries);
+    let harness_state_writes = snapshot_diff(&harness_before.entries, &harness_after.entries);
+    let snapshot_id = subagent_id.clone();
+
+    Ok(SubagentLifecycleSmokeReport {
+        schema: "agent-harness.subagent-lifecycle-smoke.v1",
+        harness_home: target_home.clone(),
+        source_home,
+        workspace,
+        workspace_write_policy: "no-write".to_string(),
+        model: args.model.clone(),
+        timeout_ms: args.timeout_ms,
+        subagent_id,
+        idempotency_key,
+        enqueue,
+        run,
+        runtime_execution_mode:
+            "deterministic-terminal-receipt-no-model-execution".to_string(),
+        runtime_terminal_receipt_file: Some(runtime_terminal_receipt_file.clone()),
+        lifecycle,
+        workspace_status_method: workspace_after.method,
+        workspace_clean: workspace_diff.is_empty(),
+        workspace_diff,
+        harness_state_writes,
+        expected_harness_state_files: vec![
+            agent_harness_core::worker_db_file(&target_home),
+            subagent_lifecycle_receipts_file(&target_home),
+            subagent_lifecycle_snapshot_file(&target_home, &snapshot_id),
+            target_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+            runtime_terminal_receipt_file,
+            target_home.join("state").join("wake").join("worker.json"),
+            target_home
+                .join("state")
+                .join("wake")
+                .join("worker-llm.json"),
+        ],
+        prompt,
+        reason: "no-write smoke enqueued a deterministic llm_subagent runtime turn and recorded a terminal skipped receipt without invoking a model".to_string(),
+    })
+}
+
+fn record_subagent_lifecycle_smoke_terminal_receipt(
+    harness_home: &Path,
+    lifecycle: &SubagentLifecycleShowReport,
+    now_ms: i64,
+) -> Result<PathBuf, String> {
+    let receipt = &lifecycle.receipt;
+    let queue_id = receipt.runtime_queue_id.clone().ok_or_else(|| {
+        format!(
+            "subagent-lifecycle smoke missing runtime queue id for {}",
+            receipt.subagent_id
+        )
+    })?;
+    let receipt_file = runtime_run_once_receipts_file(harness_home);
+    append_jsonl_value(
+        &receipt_file,
+        &serde_json::json!({
+            "schema": "agent-harness.runtime-run-once.v1",
+            "queueId": queue_id,
+            "status": "skipped",
+            "runtimeClass": "worker",
+            "origin": "subagent-lifecycle-smoke",
+            "executionDir": null,
+            "transcriptFile": null,
+            "outboxFile": null,
+            "reason": "subagent lifecycle no-write smoke recorded deterministic terminal receipt without model execution"
+        }),
+    )
+    .map_err(|err| err.to_string())?;
+    record_subagent_lifecycle(SubagentLifecycleRecordOptions {
+        harness_home: harness_home.to_path_buf(),
+        subagent_id: receipt.subagent_id.clone(),
+        state: SubagentLifecycleState::Completed,
+        source: Some(receipt.source.clone()),
+        operation_plan_id: receipt.operation_plan_id.clone(),
+        operation_plan_item_id: receipt.operation_plan_item_id.clone(),
+        worker_job_id: receipt.worker_job_id.clone(),
+        runtime_queue_id: Some(queue_id),
+        requested_model: receipt.requested_model.clone(),
+        resolved_model: receipt.resolved_model.clone(),
+        provider: receipt.provider.clone(),
+        auth_lane: receipt.auth_lane.clone(),
+        changed_files: Vec::new(),
+        terminal_receipt_file: Some(receipt_file.clone()),
+        reason:
+            "subagent lifecycle no-write smoke recorded deterministic terminal receipt without model execution"
+                .to_string(),
+        now_ms,
+    })
+    .map_err(|err| err.to_string())?;
+
+    Ok(receipt_file)
+}
+
+fn runtime_run_once_receipts_file(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("run-once-receipts.jsonl")
+}
+
+fn subagent_lifecycle_args_from_args(args: &[String]) -> Result<SubagentLifecycleArgs, String> {
+    let options = SimpleOptions::parse(
+        args,
+        "subagent-lifecycle",
+        &[
+            "--action",
+            "--subagent-id",
+            "--source-home",
+            "--workspace",
+            "--model",
+            "--timeout-ms",
+            "--reason",
+            "--now-ms",
+        ],
+        &["--no-write"],
+    )?;
+    let action = options.required("--action")?;
+    let workspace = options
+        .optional("--workspace")
+        .map(PathBuf::from)
+        .unwrap_or(env::current_dir().map_err(|err| err.to_string())?);
+    let source_home = options
+        .optional("--source-home")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace.clone());
+    let timeout_ms = options.optional_u64("--timeout-ms")?.unwrap_or(180_000);
+    let now_ms = options
+        .optional_i64("--now-ms")?
+        .unwrap_or(current_time_ms()?);
+
+    Ok(SubagentLifecycleArgs {
+        target_home: options.target_home.clone(),
+        source_home,
+        workspace,
+        action,
+        subagent_id: options.optional("--subagent-id").map(ToString::to_string),
+        model: options
+            .optional("--model")
+            .unwrap_or("gpt-5.3-codex-spark")
+            .to_string(),
+        timeout_ms,
+        no_write: options.has_flag("--no-write"),
+        reason: options.optional("--reason").map(ToString::to_string),
+        now_ms,
+    })
+}
+
+fn context_rollover_args_from_args(args: &[String]) -> Result<ContextRolloverArgs, String> {
+    let options = SimpleOptions::parse(
+        args,
+        "context-rollover",
+        &[
+            "--action",
+            "--queue-id",
+            "--new-working-session-key",
+            "--reason",
+            "--now-ms",
+        ],
+        &[],
+    )?;
+    let now_ms = options
+        .optional_i64("--now-ms")?
+        .unwrap_or(current_time_ms()?);
+
+    Ok(ContextRolloverArgs {
+        target_home: options.target_home.clone(),
+        action: options.required("--action")?,
+        queue_id: options.optional("--queue-id").map(ToString::to_string),
+        new_working_session_key: options
+            .optional("--new-working-session-key")
+            .map(ToString::to_string),
+        reason: options.optional("--reason").map(ToString::to_string),
+        now_ms,
+    })
+}
+
+fn subagent_lifecycle_no_write_prompt() -> String {
+    [
+        "Subagent lifecycle no-write smoke.",
+        "Report cwd.",
+        "Report the first AGENTS.md heading you can read.",
+        "Report provider/auth visibility if available.",
+        "Report changed files as none.",
+        "Do not edit files.",
+    ]
+    .join("\n")
+}
+
+fn workspace_status_snapshot(
+    workspace: &Path,
+    harness_home: &Path,
+) -> Result<WorkspaceStatusSnapshot, String> {
+    if workspace.join(".git").is_dir() {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .arg("status")
+            .arg("--porcelain")
+            .arg("--untracked-files=all")
+            .output();
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            let target_prefix = harness_home
+                .strip_prefix(workspace)
+                .ok()
+                .map(|path| normalized_relative_path(path).replace('\\', "/"));
+            let entries = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let status_path = git_status_path_from_line(line);
+                    if let Some(prefix) = target_prefix.as_deref() {
+                        if git_status_path_is_under(&status_path, prefix) {
+                            return None;
+                        }
+                    }
+                    let signature = workspace_status_entry_signature(workspace, &status_path);
+                    Some((line.to_string(), format!("{line} | {signature}")))
+                })
+                .collect::<BTreeMap<_, _>>();
+            return Ok(WorkspaceStatusSnapshot {
+                method: "git-status-porcelain".to_string(),
+                entries,
+            });
+        }
+    }
+    filesystem_manifest_snapshot(workspace, &[harness_home.to_path_buf()])
+}
+
+fn git_status_path_from_line(line: &str) -> String {
+    let path = line.get(3..).unwrap_or(line).trim();
+    let path = path.rsplit(" -> ").next().unwrap_or(path).trim();
+    path.strip_prefix('"')
+        .and_then(|path| path.strip_suffix('"'))
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn git_status_path_is_under(path: &str, prefix: &str) -> bool {
+    !prefix.is_empty() && (path == prefix || path.starts_with(&format!("{prefix}/")))
+}
+
+fn workspace_status_entry_signature(workspace: &Path, git_path: &str) -> String {
+    let path = workspace.join(git_path);
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => match fs::read(&path) {
+            Ok(bytes) => format!(
+                "file len={} fnv64={}",
+                bytes.len(),
+                fnv1a_64_hex_bytes(&bytes)
+            ),
+            Err(err) => format!("file-read-error {err}"),
+        },
+        Ok(metadata) if metadata.is_dir() => {
+            format!("dir len={}", metadata.len())
+        }
+        Ok(metadata) => format!("other len={}", metadata.len()),
+        Err(_) => "missing".to_string(),
+    }
+}
+
+fn fnv1a_64_hex_bytes(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn filesystem_manifest_snapshot(
+    root: &Path,
+    excludes: &[PathBuf],
+) -> Result<WorkspaceStatusSnapshot, String> {
+    let root = absolute_path(root)?;
+    let excludes = excludes
+        .iter()
+        .map(|path| absolute_path(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut entries = BTreeMap::new();
+    if !root.exists() {
+        return Ok(WorkspaceStatusSnapshot {
+            method: "filesystem-manifest".to_string(),
+            entries,
+        });
+    }
+
+    let mut stack = vec![root.clone()];
+    while let Some(path) = stack.pop() {
+        if excludes.iter().any(|exclude| path.starts_with(exclude)) {
+            continue;
+        }
+        let metadata = fs::metadata(&path).map_err(|err| err.to_string())?;
+        if metadata.is_dir() {
+            let mut children = fs::read_dir(&path)
+                .map_err(|err| err.to_string())?
+                .map(|entry| {
+                    entry
+                        .map(|entry| entry.path())
+                        .map_err(|err| err.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            children.sort();
+            stack.extend(children.into_iter().rev());
+        } else if metadata.is_file() {
+            let rel = path
+                .strip_prefix(&root)
+                .map(normalized_relative_path)
+                .unwrap_or_else(|_| path.display().to_string());
+            let modified_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis())
+                .unwrap_or(0);
+            entries.insert(
+                rel,
+                format!("len={} modifiedMs={modified_ms}", metadata.len()),
+            );
+        }
+    }
+
+    Ok(WorkspaceStatusSnapshot {
+        method: "filesystem-manifest".to_string(),
+        entries,
+    })
+}
+
+fn snapshot_diff(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> Vec<SnapshotDiffEntry> {
+    let mut keys = BTreeSet::new();
+    keys.extend(before.keys().cloned());
+    keys.extend(after.keys().cloned());
+    keys.into_iter()
+        .filter_map(|path| {
+            let before_value = before.get(&path).cloned();
+            let after_value = after.get(&path).cloned();
+            (before_value != after_value).then_some(SnapshotDiffEntry {
+                path,
+                before: before_value,
+                after: after_value,
+            })
+        })
+        .collect()
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(env::current_dir()
+            .map_err(|err| err.to_string())?
+            .join(path))
+    }
+}
+
+fn path_identity_key(path: &Path) -> String {
+    let mut key = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    while key.ends_with('/') {
+        key.pop();
+    }
+    if cfg!(windows) {
+        key.to_ascii_lowercase()
+    } else {
+        key
+    }
+}
+
+fn normalized_relative_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn source_from_args(args: &[String]) -> Result<AgentSource, String> {
@@ -7632,6 +8195,68 @@ struct WorkerLoopArgs {
 
 struct WorkerStatusArgs {
     target_home: PathBuf,
+}
+
+struct ContextRolloverArgs {
+    target_home: PathBuf,
+    action: String,
+    queue_id: Option<String>,
+    new_working_session_key: Option<String>,
+    reason: Option<String>,
+    now_ms: i64,
+}
+
+struct SubagentLifecycleArgs {
+    target_home: PathBuf,
+    source_home: PathBuf,
+    workspace: PathBuf,
+    action: String,
+    subagent_id: Option<String>,
+    model: String,
+    timeout_ms: u64,
+    no_write: bool,
+    reason: Option<String>,
+    now_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentLifecycleSmokeReport {
+    schema: &'static str,
+    harness_home: PathBuf,
+    source_home: PathBuf,
+    workspace: PathBuf,
+    workspace_write_policy: String,
+    model: String,
+    timeout_ms: u64,
+    subagent_id: String,
+    idempotency_key: String,
+    enqueue: WorkerEnqueueReport,
+    run: WorkerRunOnceReport,
+    runtime_execution_mode: String,
+    runtime_terminal_receipt_file: Option<PathBuf>,
+    lifecycle: SubagentLifecycleShowReport,
+    workspace_status_method: String,
+    workspace_clean: bool,
+    workspace_diff: Vec<SnapshotDiffEntry>,
+    harness_state_writes: Vec<SnapshotDiffEntry>,
+    expected_harness_state_files: Vec<PathBuf>,
+    prompt: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceStatusSnapshot {
+    method: String,
+    entries: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotDiffEntry {
+    path: String,
+    before: Option<String>,
+    after: Option<String>,
 }
 
 struct WorkerCancelArgs {
@@ -18608,8 +19233,10 @@ fn print_help() {
     println!("  cron-run-control Skip, retry, quarantine, or unquarantine CronRun state");
     println!("  deterministic-cron-plan Dry-run deterministic cron without LLM access");
     println!("  deterministic-cron-enqueue Persist deterministic cron into worker dispatch");
+    println!("  context-rollover Requeue prepared context rollover items safely");
     println!("  subagent-plan   Dry-run subagent ledger cutover/resume planning");
     println!("  subagent-enqueue Persist resumable subagent work into worker dispatch");
+    println!("  subagent-lifecycle Show, close, or smoke-test subagent lifecycle receipts");
     println!();
     println!("Options:");
     println!(
@@ -18764,6 +19391,15 @@ mod tests {
         values.iter().map(|value| value.to_string()).collect()
     }
 
+    fn init_temp_git_repo(workspace: &Path) -> bool {
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(workspace)
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
     #[test]
     fn worker_loop_wake_lane_matches_enqueue_signal_names() {
         assert_eq!(worker_loop_wake_lane(None), "worker");
@@ -18804,6 +19440,333 @@ mod tests {
         .unwrap();
         assert_eq!(report.plan.agent_id, "main");
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn operation_plan_prompt_commands_match_cli_parser() {
+        let root = cli_temp_root("operation_plan_prompt_commands_match_cli_parser");
+        let harness_home = root.join(".agent-harness");
+
+        run_operation_plan(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+            "--action".to_string(),
+            "create".to_string(),
+            "--plan-id".to_string(),
+            "parser-plan".to_string(),
+            "--session-key".to_string(),
+            "session-1".to_string(),
+            "--agent".to_string(),
+            "main".to_string(),
+            "--goal".to_string(),
+            "Verify documented OperationPlan command shapes".to_string(),
+            "--now-ms".to_string(),
+            "1000".to_string(),
+        ])
+        .unwrap();
+        run_operation_plan(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+            "--action".to_string(),
+            "add-item".to_string(),
+            "--plan-id".to_string(),
+            "parser-plan".to_string(),
+            "--item-id".to_string(),
+            "parser-item".to_string(),
+            "--title".to_string(),
+            "Parser item".to_string(),
+            "--body".to_string(),
+            "Exercise documented update command.".to_string(),
+            "--now-ms".to_string(),
+            "1001".to_string(),
+        ])
+        .unwrap();
+        let show = show_operation_plan(OperationPlanShowOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "parser-plan".to_string(),
+        })
+        .unwrap();
+        let item = show
+            .items
+            .iter()
+            .find(|item| item.item_id == "parser-item")
+            .unwrap();
+        run_operation_plan(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+            "--action".to_string(),
+            "update-item".to_string(),
+            "--plan-id".to_string(),
+            "parser-plan".to_string(),
+            "--item-id".to_string(),
+            "parser-item".to_string(),
+            "--expected-version".to_string(),
+            item.version.to_string(),
+            "--status".to_string(),
+            "ready".to_string(),
+            "--add-evidence".to_string(),
+            "parser accepted documented update command".to_string(),
+            "--now-ms".to_string(),
+            "1002".to_string(),
+        ])
+        .unwrap();
+        run_operation_plan(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+            "--action".to_string(),
+            "add-item".to_string(),
+            "--plan-id".to_string(),
+            "parser-plan".to_string(),
+            "--item-id".to_string(),
+            "delegate-item".to_string(),
+            "--title".to_string(),
+            "Delegate item".to_string(),
+            "--body".to_string(),
+            "Exercise documented delegate command.".to_string(),
+            "--now-ms".to_string(),
+            "1003".to_string(),
+        ])
+        .unwrap();
+        let show = show_operation_plan(OperationPlanShowOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "parser-plan".to_string(),
+        })
+        .unwrap();
+        let delegate_item = show
+            .items
+            .iter()
+            .find(|item| item.item_id == "delegate-item")
+            .unwrap();
+        run_operation_plan(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+            "--action".to_string(),
+            "delegate".to_string(),
+            "--plan-id".to_string(),
+            "parser-plan".to_string(),
+            "--item-id".to_string(),
+            "delegate-item".to_string(),
+            "--expected-version".to_string(),
+            delegate_item.version.to_string(),
+            "--assignee".to_string(),
+            "subagent-reviewer".to_string(),
+            "--idempotency-key".to_string(),
+            "delegate-item:reviewer".to_string(),
+            "--now-ms".to_string(),
+            "1004".to_string(),
+        ])
+        .unwrap();
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn operation_plan_direct_todo_done_transition_is_rejected_by_cli() {
+        let root = cli_temp_root("operation_plan_direct_todo_done_transition_is_rejected_by_cli");
+        let harness_home = root.join(".agent-harness");
+
+        run_operation_plan(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+            "--action".to_string(),
+            "create".to_string(),
+            "--plan-id".to_string(),
+            "transition-plan".to_string(),
+            "--session-key".to_string(),
+            "session-1".to_string(),
+            "--agent".to_string(),
+            "main".to_string(),
+            "--goal".to_string(),
+            "Reject direct todo to done".to_string(),
+            "--now-ms".to_string(),
+            "1000".to_string(),
+        ])
+        .unwrap();
+        run_operation_plan(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+            "--action".to_string(),
+            "add-item".to_string(),
+            "--plan-id".to_string(),
+            "transition-plan".to_string(),
+            "--item-id".to_string(),
+            "todo-item".to_string(),
+            "--title".to_string(),
+            "Todo item".to_string(),
+            "--body".to_string(),
+            "This item must not jump straight to done.".to_string(),
+            "--now-ms".to_string(),
+            "1001".to_string(),
+        ])
+        .unwrap();
+        let show = show_operation_plan(OperationPlanShowOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "transition-plan".to_string(),
+        })
+        .unwrap();
+        let item = show.items.first().unwrap();
+        let error = run_operation_plan(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+            "--action".to_string(),
+            "update-item".to_string(),
+            "--plan-id".to_string(),
+            "transition-plan".to_string(),
+            "--item-id".to_string(),
+            "todo-item".to_string(),
+            "--expected-version".to_string(),
+            item.version.to_string(),
+            "--status".to_string(),
+            "done".to_string(),
+            "--now-ms".to_string(),
+            "1002".to_string(),
+        ])
+        .unwrap_err();
+        assert!(error.contains("invalid transition"), "{error}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subagent_no_write_smoke_records_harness_state_writes_and_no_workspace_diff() {
+        let root = cli_temp_root(
+            "subagent_no_write_smoke_records_harness_state_writes_and_no_workspace_diff",
+        );
+        let workspace = root.join("workspace");
+        let harness_home = workspace.join(".agent-harness");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("AGENTS.md"), "# Test Agents\n").unwrap();
+
+        let report = run_subagent_lifecycle_smoke(&SubagentLifecycleArgs {
+            target_home: harness_home.clone(),
+            source_home: workspace.clone(),
+            workspace: workspace.clone(),
+            action: "smoke".to_string(),
+            subagent_id: Some("subagent:smoke-test".to_string()),
+            model: "gpt-5.3-codex-spark".to_string(),
+            timeout_ms: 180_000,
+            no_write: true,
+            reason: None,
+            now_ms: 1000,
+        })
+        .unwrap();
+
+        assert_eq!(report.workspace_write_policy, "no-write");
+        assert!(report.workspace_clean, "{:?}", report.workspace_diff);
+        assert!(report.workspace_diff.is_empty());
+        assert!(!report.harness_state_writes.is_empty());
+        assert_eq!(report.run.status, WorkerRunOnceStatus::Completed);
+        assert_eq!(
+            report.runtime_execution_mode,
+            "deterministic-terminal-receipt-no-model-execution"
+        );
+        let terminal_file = report.runtime_terminal_receipt_file.as_ref().unwrap();
+        assert!(terminal_file.is_file());
+        let terminal_text = fs::read_to_string(terminal_file).unwrap();
+        assert!(terminal_text.contains("\"status\":\"skipped\""));
+        assert!(
+            report
+                .lifecycle
+                .receipt
+                .terminal_receipt_file
+                .as_ref()
+                .is_some_and(|path| path == terminal_file)
+        );
+        assert_eq!(
+            report.lifecycle.receipt.state,
+            agent_harness_core::SubagentLifecycleState::Completed
+        );
+        assert!(report.prompt.contains("Do not edit files."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subagent_no_write_smoke_rejects_workspace_as_target_home() {
+        let root = cli_temp_root("subagent_no_write_smoke_rejects_workspace_as_target_home");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let error = run_subagent_lifecycle_smoke(&SubagentLifecycleArgs {
+            target_home: workspace.clone(),
+            source_home: workspace.clone(),
+            workspace: workspace.clone(),
+            action: "smoke".to_string(),
+            subagent_id: Some("subagent:bad-smoke".to_string()),
+            model: "gpt-5.3-codex-spark".to_string(),
+            timeout_ms: 180_000,
+            no_write: true,
+            reason: None,
+            now_ms: 1000,
+        })
+        .unwrap_err();
+
+        assert!(error.contains("not equal"), "{error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_status_snapshot_detects_untracked_content_changes() {
+        let root = cli_temp_root("workspace_status_snapshot_detects_untracked_content_changes");
+        let workspace = root.join("workspace");
+        let harness_home = workspace.join(".agent-harness");
+        fs::create_dir_all(&workspace).unwrap();
+        if !init_temp_git_repo(&workspace) {
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let scratch = workspace.join("scratch.txt");
+        fs::write(&scratch, "before").unwrap();
+
+        let before = workspace_status_snapshot(&workspace, &harness_home).unwrap();
+        fs::write(&scratch, "after!").unwrap();
+        let after = workspace_status_snapshot(&workspace, &harness_home).unwrap();
+        let diff = snapshot_diff(&before.entries, &after.entries);
+
+        assert!(
+            diff.iter().any(|entry| entry.path.contains("scratch.txt")),
+            "{diff:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_status_snapshot_filters_only_exact_harness_path() {
+        let root = cli_temp_root("workspace_status_snapshot_filters_only_exact_harness_path");
+        let workspace = root.join("workspace");
+        let harness_home = workspace.join(".agent-harness");
+        fs::create_dir_all(harness_home.join("state")).unwrap();
+        fs::create_dir_all(workspace.join(".agent-harness-old")).unwrap();
+        if !init_temp_git_repo(&workspace) {
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        fs::write(harness_home.join("state").join("ignored.txt"), "harness").unwrap();
+        fs::write(
+            workspace.join(".agent-harness-old").join("visible.txt"),
+            "workspace",
+        )
+        .unwrap();
+
+        let snapshot = workspace_status_snapshot(&workspace, &harness_home).unwrap();
+
+        assert!(
+            snapshot
+                .entries
+                .keys()
+                .any(|path| path.contains(".agent-harness-old/visible.txt")),
+            "{:?}",
+            snapshot.entries
+        );
+        assert!(
+            !snapshot
+                .entries
+                .keys()
+                .any(|path| path.contains(".agent-harness/state/ignored.txt")),
+            "{:?}",
+            snapshot.entries
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -19443,6 +20406,7 @@ mod tests {
                     execution_dir: None,
                     transcript_file: None,
                     outbox_file: None,
+                    continuation: agent_harness_core::RuntimeContinuationMetadata::legacy(),
                     reason: "runtime queue lease lock is busy; retrying later".to_string(),
                 },
                 prepare: None,

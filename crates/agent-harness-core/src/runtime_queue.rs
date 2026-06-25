@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::latency::{LatencyStage, latency_receipts_file, record_latency_stage};
 use crate::wake::signal_wake;
-use crate::{ChannelStep, ChannelStepAction, InboundMediaArtifact};
+use crate::{ChannelStep, ChannelStepAction, InboundMediaArtifact, RuntimeContinuationMetadata};
 
 const RUNTIME_QUEUE_REPORT_SCHEMA: &str = "agent-harness.runtime-queue-enqueue.v1";
 const RUNTIME_QUEUE_CONTROL_SCHEMA: &str = "agent-harness.runtime-queue-control.v1";
@@ -64,6 +64,8 @@ pub struct RuntimeQueueItem {
     pub selected_skill_ids: Vec<String>,
     pub planned_transcript_file: PathBuf,
     pub planned_trajectory_file: PathBuf,
+    #[serde(default, flatten)]
+    pub continuation: RuntimeContinuationMetadata,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -361,6 +363,7 @@ fn build_queue_item(
         selected_skill_ids: agent_turn.selected_skill_ids.clone(),
         planned_transcript_file,
         planned_trajectory_file,
+        continuation: RuntimeContinuationMetadata::legacy(),
     }))
 }
 

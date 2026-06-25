@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::load_working_set_continuity_section;
 use crate::operation_plan::{
     OperationPlanItemStatus, OperationPlanShowOptions, OperationPlanShowReport,
     OperationPlanStatus, list_operation_plans, show_operation_plan,
@@ -183,6 +184,13 @@ pub fn assemble_prompt_bundle(
             match operation_plan_context_section(harness_home, plan, agent_id.as_deref()) {
                 Ok(section) => sections.push(section),
                 Err(error) => warnings.push(format!("operation plan context unavailable: {error}")),
+            }
+            match load_working_set_continuity_section(harness_home, &plan.session_key) {
+                Ok(Some(content)) => sections.push(working_set_continuity_section(content)),
+                Ok(None) => {}
+                Err(error) => warnings.push(format!(
+                    "working set continuity context unavailable: {error}"
+                )),
             }
         }
 
@@ -680,6 +688,23 @@ fn session_continuity_section(notes: Vec<String>) -> PromptSection {
         kind: PromptSectionKind::SessionContinuity,
         tier: PromptSectionTier::Continuity,
         title: "Prompt injection continuity".to_string(),
+        path: None,
+        bytes_original: bytes,
+        bytes_included: bytes,
+        truncated: false,
+        skill_id: None,
+        body_checksum: None,
+        delivery_mode: None,
+        content,
+    }
+}
+
+fn working_set_continuity_section(content: String) -> PromptSection {
+    let bytes = content.len();
+    PromptSection {
+        kind: PromptSectionKind::SessionContinuity,
+        tier: PromptSectionTier::Continuity,
+        title: "Working set continuity".to_string(),
         path: None,
         bytes_original: bytes,
         bytes_included: bytes,
@@ -2130,6 +2155,107 @@ mod tests {
             section.kind == PromptSectionKind::ChannelState
                 && section.content.contains("keep migration notes explicit")
                 && section.content.contains("user prefers Codex OAuth")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prompt_bundle_includes_working_set_continuity_section() {
+        let root = temp_root("prompt_bundle_includes_working_set_continuity_section");
+        let source = write_prompt_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let continuation_session = "telegram:dm:user:main:cont-1";
+        let working_set_file = harness_home
+            .join("state")
+            .join("context-rollover")
+            .join("working-sets")
+            .join("vsession-test")
+            .join("1.json");
+        fs::create_dir_all(working_set_file.parent().unwrap()).unwrap();
+        crate::write_json_atomic(
+            &working_set_file,
+            &serde_json::json!({
+                "schema": "agent-harness.working-set-memory.v1",
+                "virtualSessionId": "vsession-test",
+                "workingSessionKey": continuation_session,
+                "previousWorkingSessionKey": "telegram:dm:user:main",
+                "continuationIndex": 1,
+                "goal": {
+                    "objective": "finish context rollover",
+                    "status": "active",
+                    "budgetUsage": null,
+                    "completionCriteria": []
+                },
+                "activePlanRefs": [],
+                "pendingQueueItem": {"queueId": "turn:rollover"},
+                "constraints": [],
+                "decisions": [],
+                "recentFiles": [],
+                "validation": [],
+                "blockers": [],
+                "staticRecordRefs": {
+                    "transcriptFile": null,
+                    "trajectoryFile": null,
+                    "codexBindingFile": null,
+                    "promptBundleJson": null,
+                    "runtimeReceipts": []
+                },
+                "agentContinuationNote": null,
+                "createdAtMs": 1234
+            }),
+        )
+        .unwrap();
+        let index_file = crate::working_set_session_index_file(&harness_home, continuation_session);
+        crate::write_json_atomic(
+            &index_file,
+            &serde_json::json!({
+                "schema": "agent-harness.working-set-session-index.v1",
+                "sessionKey": continuation_session,
+                "virtualSessionId": "vsession-test",
+                "continuationIndex": 1,
+                "workingSetFile": working_set_file,
+                "updatedAtMs": 1235
+            }),
+        )
+        .unwrap();
+
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "continue rollover".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: Some(continuation_session.to_string()),
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        let bundle = assemble_prompt_bundle(
+            &plan,
+            PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(bundle.summary.session_continuity_sections_included, 1);
+        assert!(bundle.sections.iter().any(|section| {
+            section.kind == PromptSectionKind::SessionContinuity
+                && section.title == "Working set continuity"
+                && section.content.contains("virtualSessionId: vsession-test")
+                && section.content.contains("pendingQueueId: turn:rollover")
         }));
 
         let _ = fs::remove_dir_all(root);

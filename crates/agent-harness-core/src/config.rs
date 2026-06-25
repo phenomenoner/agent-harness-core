@@ -309,22 +309,12 @@ fn validate_security_object(path: &str, value: &Value, errors: &mut Vec<String>)
                 &["deny", "accept", "on-request", "on-failure", "never"],
                 errors,
             ),
-            "codexSandbox"
-            | "codexSandboxMode"
-            | "codexSandboxPolicy"
-            | "codexFilesystemSandbox" => expect_string_bool_or_enum(
-                path_key(path, key),
-                child,
-                &[
-                    "elevated",
-                    "read-only",
-                    "workspace-write",
-                    "workspaceWrite",
-                    "danger-full-access",
-                    "dangerFullAccess",
-                ],
-                errors,
-            ),
+            "codexSandbox" | "codexSandboxMode" => {
+                expect_codex_windows_sandbox_mode(path_key(path, key), child, errors)
+            }
+            "codexSandboxPolicy" | "codexFilesystemSandbox" => {
+                expect_codex_sandbox_policy(path_key(path, key), child, errors)
+            }
             other => errors.push(format!("unknown security config key `{other}` at {path}")),
         }
     }
@@ -342,20 +332,11 @@ fn validate_codex_object(path: &str, value: &Value, errors: &mut Vec<String>) {
                 &["deny", "accept", "on-request", "on-failure", "never"],
                 errors,
             ),
-            "sandbox" | "sandboxMode" | "sandboxPolicy" | "filesystemSandbox" => {
-                expect_string_bool_or_enum(
-                    path_key(path, key),
-                    child,
-                    &[
-                        "elevated",
-                        "read-only",
-                        "workspace-write",
-                        "workspaceWrite",
-                        "danger-full-access",
-                        "dangerFullAccess",
-                    ],
-                    errors,
-                )
+            "sandbox" | "sandboxMode" => {
+                expect_codex_windows_sandbox_mode(path_key(path, key), child, errors)
+            }
+            "sandboxPolicy" | "filesystemSandbox" => {
+                expect_codex_sandbox_policy(path_key(path, key), child, errors)
             }
             other => errors.push(format!("unknown codex config key `{other}` at {path}")),
         }
@@ -368,26 +349,14 @@ fn validate_runtime_object(path: &str, value: &Value, errors: &mut Vec<String>) 
     };
     for (key, child) in object {
         match key.as_str() {
-            "codexApprovalPolicy" | "codexSandbox" | "codexSandboxPolicy" => {
-                expect_string_bool_or_enum(
-                    path_key(path, key),
-                    child,
-                    &[
-                        "deny",
-                        "accept",
-                        "on-request",
-                        "on-failure",
-                        "never",
-                        "elevated",
-                        "read-only",
-                        "workspace-write",
-                        "workspaceWrite",
-                        "danger-full-access",
-                        "dangerFullAccess",
-                    ],
-                    errors,
-                )
-            }
+            "codexApprovalPolicy" => expect_string_bool_or_enum(
+                path_key(path, key),
+                child,
+                &["deny", "accept", "on-request", "on-failure", "never"],
+                errors,
+            ),
+            "codexSandbox" => expect_codex_windows_sandbox_mode(path_key(path, key), child, errors),
+            "codexSandboxPolicy" => expect_codex_sandbox_policy(path_key(path, key), child, errors),
             "backoff" => validate_runtime_backoff_object(&path_key(path, key), child, errors),
             other => errors.push(format!("unknown runtime config key `{other}` at {path}")),
         }
@@ -459,11 +428,19 @@ fn validate_codex_context_object(path: &str, value: &Value, errors: &mut Vec<Str
             | "retryOnceAfterCompact"
             | "retry_once_after_compact"
             | "manualRecoveryAllowed"
-            | "manual_recovery_allowed" => expect_bool(path_key(path, key), child, errors),
+            | "manual_recovery_allowed"
+            | "cooperativeMidTurnDrain"
+            | "cooperative_mid_turn_drain" => expect_bool(path_key(path, key), child, errors),
             "fallbackOnCompactFailure" | "fallback_on_compact_failure" => expect_enum(
                 path_key(path, key),
                 child,
                 &["checkpoint-and-new-thread", "manual", "disabled"],
+                errors,
+            ),
+            "rolloverMode" | "rollover_mode" => expect_enum(
+                path_key(path, key),
+                child,
+                &["working-set-memory", "disabled"],
                 errors,
             ),
             "warnAtActiveContextRatio"
@@ -474,6 +451,8 @@ fn validate_codex_context_object(path: &str, value: &Value, errors: &mut Vec<Str
             | "model_context_window"
             | "modelAutoCompactTokenLimit"
             | "model_auto_compact_token_limit"
+            | "maxSuccessfulCompactsBeforeRollover"
+            | "max_successful_compacts_before_rollover"
             | "toolOutputTokenLimit"
             | "tool_output_token_limit" => expect_positive_u64(path_key(path, key), child, errors),
             "modelAutoCompactTokenLimitScope"
@@ -917,6 +896,57 @@ fn expect_bool(path: impl Into<String>, value: &Value, errors: &mut Vec<String>)
     }
 }
 
+fn expect_codex_windows_sandbox_mode(
+    path: impl Into<String>,
+    value: &Value,
+    errors: &mut Vec<String>,
+) {
+    expect_string_bool_or_enum(
+        path,
+        value,
+        &[
+            "default",
+            "elevated",
+            "windows-elevated",
+            "unelevated",
+            "windows-unelevated",
+            "disabled",
+            "off",
+            "none",
+            "false",
+        ],
+        errors,
+    );
+}
+
+fn expect_codex_sandbox_policy(path: impl Into<String>, value: &Value, errors: &mut Vec<String>) {
+    expect_string_bool_or_enum(
+        path,
+        value,
+        &[
+            "default",
+            "workspace",
+            "workspace-write",
+            "workspaceWrite",
+            "workspacewrite",
+            "readonly",
+            "read-only",
+            "read",
+            "readOnly",
+            "dangerfullaccess",
+            "danger-full-access",
+            "dangerFullAccess",
+            "full-access",
+            "full",
+            "none",
+            "off",
+            "disabled",
+            "false",
+        ],
+        errors,
+    );
+}
+
 fn expect_enum(path: impl Into<String>, value: &Value, allowed: &[&str], errors: &mut Vec<String>) {
     let path = path.into();
     let Some(raw) = value.as_str() else {
@@ -1206,6 +1236,103 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.contains("applyMode"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validates_codex_sandbox_mode_and_policy_separately() {
+        let root = temp_root("validates_codex_sandbox_mode_and_policy_separately");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "security": {
+                "codexSandboxMode": "disabled",
+                "codexSandboxPolicy": "dangerFullAccess"
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let report = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(report.status, HarnessConfigValidationStatus::Valid);
+        assert!(report.errors.is_empty());
+
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "security": {
+                "codexSandbox": "read-only",
+                "codexSandboxPolicy": "readOnly"
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let report = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(report.status, HarnessConfigValidationStatus::Invalid);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| { error.contains("codexSandbox") && error.contains("read-only") })
+        );
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|error| error.contains("codexSandboxPolicy"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validates_codex_context_rollover_config_keys() {
+        let root = temp_root("validates_codex_context_rollover_config_keys");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "codexContext": {
+                "maxSuccessfulCompactsBeforeRollover": 2,
+                "rolloverMode": "working-set-memory",
+                "cooperativeMidTurnDrain": false
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let report = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(report.status, HarnessConfigValidationStatus::Valid);
+        assert!(report.errors.is_empty());
+
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "codexContext": {
+                "maxSuccessfulCompactsBeforeRollover": 0,
+                "rolloverMode": "fresh-thread"
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let report = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(report.status, HarnessConfigValidationStatus::Invalid);
+        assert!(report.errors.iter().any(|error| {
+            error.contains("maxSuccessfulCompactsBeforeRollover")
+                && error.contains("positive integer")
+        }));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| { error.contains("rolloverMode") && error.contains("fresh-thread") })
         );
 
         let _ = fs::remove_dir_all(root);
