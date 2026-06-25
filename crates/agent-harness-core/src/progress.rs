@@ -404,23 +404,12 @@ impl AgentProgressDeliveryCursor {
             AgentProgressDeliveryMessageKind::Body => {
                 self.body_terminal
                     || (self.terminal
-                        && (self.body_provider_message_id.is_some()
-                            || self.body_last_event_line > 0
-                            || !self.body_last_text_hash.is_empty()
-                            || self.body_last_sent_at_ms > 0
-                            || self.provider_message_id.is_some()
+                        && (self.provider_message_id.is_some()
                             || self.last_event_line > 0
                             || !self.last_text_hash.is_empty()
                             || self.last_sent_at_ms > 0))
             }
-            AgentProgressDeliveryMessageKind::Status => {
-                self.status_terminal
-                    || (self.terminal
-                        && (self.status_provider_message_id.is_some()
-                            || self.status_last_event_line > 0
-                            || !self.status_last_text_hash.is_empty()
-                            || self.status_last_sent_at_ms > 0))
-            }
+            AgentProgressDeliveryMessageKind::Status => self.status_terminal,
         }
     }
 
@@ -2316,6 +2305,18 @@ mod tests {
             &harness_home,
             &AgentProgressEvent::new(
                 &context,
+                AgentProgressKind::ToolCall,
+                "tool_call",
+                "cargo test",
+                AgentProgressStatus::Completed,
+                2500,
+            ),
+        )
+        .unwrap();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
                 AgentProgressKind::Runtime,
                 "run",
                 "completed",
@@ -2381,6 +2382,164 @@ mod tests {
             AgentProgressDeliveryMessageKind::Status
         );
         assert_eq!(retry.summary.delivered_current, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_status_delivery_does_not_suppress_failed_body_retry() {
+        let root = temp_root("terminal_status_delivery_does_not_suppress_failed_body_retry");
+        let harness_home = root.join(".agent-harness");
+        let context = context();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Terminal,
+                "terminal",
+                "cargo test -p agent-harness-core",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+        )
+        .unwrap();
+
+        let initial = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(initial.pending.len(), 2);
+        for pending in initial.pending {
+            record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+                harness_home: harness_home.clone(),
+                queue_id: pending.queue_id,
+                platform: pending.platform,
+                account_id: pending.account_id,
+                channel_id: pending.channel_id,
+                thread_id: pending.thread_id,
+                user_id: pending.user_id,
+                session_key: pending.session_key,
+                message_kind: pending.message_kind,
+                action: pending.action,
+                status: AgentProgressDeliveryStatus::Delivered,
+                provider_message_id: Some(format!("provider-{:?}", pending.message_kind)),
+                event_line: pending.event_line,
+                text_hash: pending.text_hash,
+                terminal: pending.terminal,
+                policy_decision: Some("test".to_string()),
+                error: None,
+                now_ms: 2000,
+            })
+            .unwrap();
+        }
+
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::ToolCall,
+                "tool_call",
+                "cargo test",
+                AgentProgressStatus::Completed,
+                2500,
+            ),
+        )
+        .unwrap();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Runtime,
+                "run",
+                "completed",
+                AgentProgressStatus::Completed,
+                3000,
+            ),
+        )
+        .unwrap();
+
+        let terminal = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 4000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(terminal.pending.len(), 2);
+        let terminal_status = terminal
+            .pending
+            .iter()
+            .find(|pending| pending.message_kind == AgentProgressDeliveryMessageKind::Status)
+            .unwrap()
+            .clone();
+        let terminal_body = terminal
+            .pending
+            .iter()
+            .find(|pending| pending.message_kind == AgentProgressDeliveryMessageKind::Body)
+            .unwrap()
+            .clone();
+
+        record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+            harness_home: harness_home.clone(),
+            queue_id: terminal_status.queue_id,
+            platform: terminal_status.platform,
+            account_id: terminal_status.account_id,
+            channel_id: terminal_status.channel_id,
+            thread_id: terminal_status.thread_id,
+            user_id: terminal_status.user_id,
+            session_key: terminal_status.session_key,
+            message_kind: terminal_status.message_kind,
+            action: terminal_status.action,
+            status: AgentProgressDeliveryStatus::Delivered,
+            provider_message_id: terminal_status.provider_message_id,
+            event_line: terminal_status.event_line,
+            text_hash: terminal_status.text_hash,
+            terminal: terminal_status.terminal,
+            policy_decision: Some("test".to_string()),
+            error: None,
+            now_ms: 4000,
+        })
+        .unwrap();
+        record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+            harness_home: harness_home.clone(),
+            queue_id: terminal_body.queue_id,
+            platform: terminal_body.platform,
+            account_id: terminal_body.account_id,
+            channel_id: terminal_body.channel_id,
+            thread_id: terminal_body.thread_id,
+            user_id: terminal_body.user_id,
+            session_key: terminal_body.session_key,
+            message_kind: terminal_body.message_kind,
+            action: terminal_body.action,
+            status: AgentProgressDeliveryStatus::Failed,
+            provider_message_id: terminal_body.provider_message_id,
+            event_line: terminal_body.event_line,
+            text_hash: terminal_body.text_hash,
+            terminal: terminal_body.terminal,
+            policy_decision: Some("test".to_string()),
+            error: Some("retryable provider failure".to_string()),
+            now_ms: 4000,
+        })
+        .unwrap();
+
+        let retry = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 5000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(retry.pending.len(), 1);
+        assert_eq!(
+            retry.pending[0].message_kind,
+            AgentProgressDeliveryMessageKind::Body
+        );
 
         let _ = fs::remove_dir_all(root);
     }

@@ -5,7 +5,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ChannelCommandEffect, ChannelOutboundMessage, ChannelStep, write_json_atomic};
+use crate::{
+    ChannelCommandEffect, ChannelOutboundMessage, ChannelStep,
+    codex_runtime::{CodexTurnSteerRequestOptions, queue_codex_turn_steer_request},
+    write_json_atomic,
+};
 
 const CHANNEL_COMMAND_APPLY_SCHEMA: &str = "agent-harness.channel-command-apply.v1";
 const CHANNEL_STATE_SCHEMA: &str = "agent-harness.channel-session-state.v1";
@@ -372,6 +376,21 @@ fn apply_effect(
                 at_ms: now_ms,
                 text: instruction.clone(),
             });
+            if let Err(error) = queue_codex_turn_steer_request(CodexTurnSteerRequestOptions {
+                harness_home: harness_home.to_path_buf(),
+                platform: state.platform.clone(),
+                channel_id: state.channel_id.clone(),
+                user_id: state.user_id.clone(),
+                session_key: state.active_session_key.clone(),
+                agent_id: state.agent_id.clone(),
+                text: instruction.clone(),
+                client_user_message_id: None,
+                now_ms,
+            }) {
+                warnings.push(format!(
+                    "codex turn/steer bridge request could not be recorded: {error}"
+                ));
+            }
         }
         ChannelCommandEffect::AddBtwNote { note } => {
             state.btw_notes.push(ChannelSessionNote {

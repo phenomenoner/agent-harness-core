@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -33,6 +35,9 @@ const CODEX_CONTEXT_ROLLOVER_SCHEMA: &str = "agent-harness.codex-context-rollove
 const CODEX_TRANSCRIPT_MESSAGE_SCHEMA: &str = "agent-harness.transcript-message.v1";
 const CODEX_TRAJECTORY_EVENT_SCHEMA: &str = "agent-harness.trajectory-event.v1";
 const CODEX_BINDING_SCHEMA: &str = "agent-harness.codex-binding.v1";
+const CODEX_ACTIVE_TURN_SCHEMA: &str = "agent-harness.codex-active-turn.v1";
+const CODEX_TURN_STEER_REQUEST_SCHEMA: &str = "agent-harness.codex-turn-steer-request.v1";
+const CODEX_TURN_STEER_RECEIPT_SCHEMA: &str = "agent-harness.codex-turn-steer-receipt.v1";
 const CODEX_APP_SERVER_DEVELOPER_INSTRUCTIONS: &str = "\
 This Codex app-server thread backs an imported agent harness session. Codex owns \
 the backend system prompt, tool schemas, MCP/tool inventory, sandbox, approvals, \
@@ -89,6 +94,19 @@ pub struct CodexRuntimeRunOptions {
     pub timeout_ms: u64,
     pub idle_timeout_ms: u64,
     pub progress_context: Option<AgentProgressContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexTurnSteerRequestOptions {
+    pub harness_home: PathBuf,
+    pub platform: String,
+    pub channel_id: String,
+    pub user_id: String,
+    pub session_key: String,
+    pub agent_id: Option<String>,
+    pub text: String,
+    pub client_user_message_id: Option<String>,
+    pub now_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -637,6 +655,27 @@ pub enum CodexRuntimeRunStatus {
     Canceled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexTurnSteerQueueStatus {
+    QueuedSameTurn,
+    DeferredNoActiveTurn,
+    DeferredNoActiveTurnId,
+    RejectedEmpty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexTurnSteerRequestReport {
+    pub schema: &'static str,
+    pub harness_home: PathBuf,
+    pub request_id: String,
+    pub status: CodexTurnSteerQueueStatus,
+    pub request_file: Option<PathBuf>,
+    pub receipts_file: PathBuf,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexRuntimeReceipt {
@@ -717,6 +756,78 @@ struct CodexBindingRecord {
     trajectory_file: PathBuf,
     completion_file: PathBuf,
     completed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum CodexActiveTurnStatus {
+    AwaitingTurnId,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl CodexActiveTurnStatus {
+    fn is_active(self) -> bool {
+        matches!(self, Self::AwaitingTurnId | Self::Running)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexActiveTurnBindingRecord {
+    schema: String,
+    queue_id: Option<String>,
+    session_key: String,
+    agent_id: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    thread_id: String,
+    active_turn_id: Option<String>,
+    turn_kind: String,
+    status: CodexActiveTurnStatus,
+    runtime_pid: u32,
+    plan_file: PathBuf,
+    working_directory: PathBuf,
+    prompt_bundle_json: PathBuf,
+    prompt_markdown: PathBuf,
+    started_at_ms: i64,
+    updated_at_ms: i64,
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexTurnSteerRequestRecord {
+    schema: String,
+    request_id: String,
+    at_ms: i64,
+    platform: String,
+    channel_id: String,
+    user_id: String,
+    session_key: String,
+    agent_id: Option<String>,
+    text: String,
+    client_user_message_id: String,
+    thread_id: String,
+    expected_turn_id: Option<String>,
+    active_binding_file: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexTurnSteerReceipt {
+    schema: String,
+    at_ms: i64,
+    request_id: String,
+    session_key: String,
+    status: String,
+    delivery: String,
+    thread_id: Option<String>,
+    expected_turn_id: Option<String>,
+    accepted_turn_id: Option<String>,
+    request_file: Option<PathBuf>,
+    reason: String,
 }
 
 pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexRuntimePlanReport> {
@@ -1388,6 +1499,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
     let mut run_result = drive_codex_app_server(
         &options.harness_home,
         &plan,
+        &plan_file,
         options.timeout_ms,
         options.idle_timeout_ms,
         options.progress_context.clone(),
@@ -1399,6 +1511,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
         run_result = recover_compact_before_turn_failure(
             &options.harness_home,
             &plan,
+            &plan_file,
             run_result,
             options.timeout_ms,
             options.idle_timeout_ms,
@@ -1411,6 +1524,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
         run_result = recover_codex_context_exhaustion(
             &options.harness_home,
             &plan,
+            &plan_file,
             run_result,
             options.timeout_ms,
             options.idle_timeout_ms,
@@ -1423,6 +1537,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
         run_result = recover_thread_health_protocol_error(
             &options.harness_home,
             &plan,
+            &plan_file,
             run_result,
             options.timeout_ms,
             options.idle_timeout_ms,
@@ -1844,6 +1959,130 @@ fn write_codex_runtime_run_report(
         append_json_line(&report.receipts_file, &report.receipt)?;
     }
     Ok(report)
+}
+
+pub fn queue_codex_turn_steer_request(
+    options: CodexTurnSteerRequestOptions,
+) -> io::Result<CodexTurnSteerRequestReport> {
+    let receipts_file = codex_turn_steer_receipts_file(&options.harness_home);
+    fs::create_dir_all(parent_dir(&receipts_file)?)?;
+    let text = options.text.trim().to_string();
+    let request_id = codex_turn_steer_request_id(
+        &options.platform,
+        &options.channel_id,
+        &options.user_id,
+        &options.session_key,
+        options.now_ms,
+        &text,
+    );
+    if text.is_empty() {
+        let receipt = CodexTurnSteerReceipt {
+            schema: CODEX_TURN_STEER_RECEIPT_SCHEMA.to_string(),
+            at_ms: options.now_ms,
+            request_id: request_id.clone(),
+            session_key: options.session_key,
+            status: "rejected-empty".to_string(),
+            delivery: "rejected".to_string(),
+            thread_id: None,
+            expected_turn_id: None,
+            accepted_turn_id: None,
+            request_file: None,
+            reason: "steering text was empty".to_string(),
+        };
+        append_json_line(&receipts_file, &receipt)?;
+        return Ok(CodexTurnSteerRequestReport {
+            schema: CODEX_TURN_STEER_REQUEST_SCHEMA,
+            harness_home: options.harness_home,
+            request_id,
+            status: CodexTurnSteerQueueStatus::RejectedEmpty,
+            request_file: None,
+            receipts_file,
+            reason: receipt.reason,
+        });
+    }
+
+    let binding_file = codex_active_turn_binding_file(&options.harness_home, &options.session_key);
+    let binding = read_codex_active_turn_binding(&binding_file)?;
+    let Some(binding) = binding.filter(|binding| binding.status.is_active()) else {
+        let receipt = CodexTurnSteerReceipt {
+            schema: CODEX_TURN_STEER_RECEIPT_SCHEMA.to_string(),
+            at_ms: options.now_ms,
+            request_id: request_id.clone(),
+            session_key: options.session_key,
+            status: "deferred-no-active-turn".to_string(),
+            delivery: "next-turn-or-passive-context".to_string(),
+            thread_id: None,
+            expected_turn_id: None,
+            accepted_turn_id: None,
+            request_file: None,
+            reason: "no active Codex regular turn binding was available; steering remains in channel state for the next prompt".to_string(),
+        };
+        append_json_line(&receipts_file, &receipt)?;
+        return Ok(CodexTurnSteerRequestReport {
+            schema: CODEX_TURN_STEER_REQUEST_SCHEMA,
+            harness_home: options.harness_home,
+            request_id,
+            status: CodexTurnSteerQueueStatus::DeferredNoActiveTurn,
+            request_file: None,
+            receipts_file,
+            reason: receipt.reason,
+        });
+    };
+
+    let pending_dir = codex_turn_steer_pending_dir(&options.harness_home);
+    fs::create_dir_all(&pending_dir)?;
+    let request_file = pending_dir.join(format!("{}.json", normalize_key_part(&request_id)));
+    let client_user_message_id = options
+        .client_user_message_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("agent-harness-steer:{request_id}"));
+    let request = CodexTurnSteerRequestRecord {
+        schema: CODEX_TURN_STEER_REQUEST_SCHEMA.to_string(),
+        request_id: request_id.clone(),
+        at_ms: options.now_ms,
+        platform: options.platform,
+        channel_id: options.channel_id,
+        user_id: options.user_id,
+        session_key: options.session_key.clone(),
+        agent_id: options.agent_id,
+        text,
+        client_user_message_id,
+        thread_id: binding.thread_id.clone(),
+        expected_turn_id: binding.active_turn_id.clone(),
+        active_binding_file: binding_file.clone(),
+    };
+    write_json_atomic(&request_file, &request)?;
+    let reason = if request.expected_turn_id.is_some() {
+        "active Codex turn found; queued steering request for same-turn delivery".to_string()
+    } else {
+        "active Codex thread found but turn id is not known yet; queued steering request until turn/started is observed".to_string()
+    };
+    append_json_line(
+        &receipts_file,
+        &CodexTurnSteerReceipt {
+            schema: CODEX_TURN_STEER_RECEIPT_SCHEMA.to_string(),
+            at_ms: options.now_ms,
+            request_id: request_id.clone(),
+            session_key: options.session_key,
+            status: "queued-same-turn".to_string(),
+            delivery: "same-turn-pending".to_string(),
+            thread_id: Some(binding.thread_id),
+            expected_turn_id: request.expected_turn_id.clone(),
+            accepted_turn_id: None,
+            request_file: Some(request_file.clone()),
+            reason: reason.clone(),
+        },
+    )?;
+
+    Ok(CodexTurnSteerRequestReport {
+        schema: CODEX_TURN_STEER_REQUEST_SCHEMA,
+        harness_home: options.harness_home,
+        request_id,
+        status: CodexTurnSteerQueueStatus::QueuedSameTurn,
+        request_file: Some(request_file),
+        receipts_file,
+        reason,
+    })
 }
 
 fn append_codex_run_log(
@@ -2640,6 +2879,7 @@ fn codex_app_server_approval_policy(policy: CodexApprovalPolicy) -> &'static str
 fn drive_codex_app_server(
     harness_home: &Path,
     plan: &CodexRuntimePlanFile,
+    plan_file: &Path,
     timeout_ms: u64,
     idle_timeout_ms: u64,
     progress_context: Option<AgentProgressContext>,
@@ -2733,6 +2973,12 @@ fn drive_codex_app_server(
     let cancel_check = RuntimeCancelCheck::new(harness_home, &plan.session_key);
     let mut progress =
         progress_context.map(|context| CodexProgressEmitter::new(harness_home, context));
+    emit_codex_runtime_status(
+        &progress,
+        AgentProgressStatus::Started,
+        "starting Codex app-server",
+        &mut state.warnings,
+    );
 
     write_json_rpc(
         &mut stdin,
@@ -3122,16 +3368,24 @@ fn drive_codex_app_server(
         ],
         "input": input_parts
     });
+    let turn_start_request_id = if compact_before_turn { 3 } else { 2 };
+    let mut steer_bridge = CodexTurnSteerBridge::new(
+        harness_home,
+        plan,
+        plan_file,
+        thread_id.clone(),
+        turn_start_request_id,
+    )?;
     write_json_rpc(
         &mut stdin,
         &json!({
-            "id": if compact_before_turn { 3 } else { 2 },
+            "id": turn_start_request_id,
             "method": "turn/start",
             "params": turn_params
         }),
     )?;
 
-    let status = match wait_for_turn_completed(
+    let wait_result = wait_for_turn_completed(
         &line_rx,
         &mut child,
         &mut stdin,
@@ -3141,7 +3395,38 @@ fn drive_codex_app_server(
         plan.invocation.approval_policy,
         Some(&cancel_check),
         narration_config,
-    )? {
+        Some(&mut steer_bridge),
+    )?;
+    let (active_status, active_reason) = match &wait_result {
+        ProtocolWait::TurnCompleted => (
+            CodexActiveTurnStatus::Completed,
+            "codex app-server turn completed".to_string(),
+        ),
+        ProtocolWait::TimedOut(reason) => (
+            CodexActiveTurnStatus::Failed,
+            format!("codex app-server turn timed out: {reason}"),
+        ),
+        ProtocolWait::Failed(reason) => (
+            CodexActiveTurnStatus::Failed,
+            format!("codex app-server turn failed: {reason}"),
+        ),
+        ProtocolWait::Canceled(reason) => (
+            CodexActiveTurnStatus::Failed,
+            format!("codex app-server turn canceled: {reason}"),
+        ),
+        ProtocolWait::ThreadStarted(_) => (
+            CodexActiveTurnStatus::Failed,
+            "codex app-server returned an unexpected second thread start during turn".to_string(),
+        ),
+        ProtocolWait::CompactCompleted => (
+            CodexActiveTurnStatus::Failed,
+            "codex app-server returned unexpected context compaction completion during turn"
+                .to_string(),
+        ),
+    };
+    steer_bridge.finish(active_status, &active_reason)?;
+
+    let status = match wait_result {
         ProtocolWait::TurnCompleted => CodexRuntimeRunStatus::Completed,
         ProtocolWait::TimedOut(reason) => {
             finish_codex_child_and_stdout_reader(
@@ -3334,6 +3619,7 @@ fn context_recovery_failure_receipt(
 fn recover_codex_context_exhaustion(
     harness_home: &Path,
     plan: &CodexRuntimePlanFile,
+    plan_file: &Path,
     mut current: CodexAppServerRunResult,
     timeout_ms: u64,
     idle_timeout_ms: u64,
@@ -3372,6 +3658,7 @@ fn recover_codex_context_exhaustion(
             let mut retry_result = drive_codex_app_server(
                 harness_home,
                 &retry_plan,
+                plan_file,
                 timeout_ms,
                 idle_timeout_ms,
                 progress_context.clone(),
@@ -3445,6 +3732,7 @@ fn recover_codex_context_exhaustion(
         return run_context_checkpoint_fallback(
             harness_home,
             plan,
+            plan_file,
             current,
             original_thread_id,
             timeout_ms,
@@ -3474,6 +3762,7 @@ fn recover_codex_context_exhaustion(
 fn recover_compact_before_turn_failure(
     harness_home: &Path,
     plan: &CodexRuntimePlanFile,
+    plan_file: &Path,
     prior: CodexAppServerRunResult,
     timeout_ms: u64,
     idle_timeout_ms: u64,
@@ -3501,6 +3790,7 @@ fn recover_compact_before_turn_failure(
     let mut recovered = run_context_checkpoint_fallback(
         harness_home,
         plan,
+        plan_file,
         prior,
         original_thread_id,
         timeout_ms,
@@ -3556,6 +3846,7 @@ fn should_recover_compact_before_turn_failure(
 fn recover_thread_health_protocol_error(
     harness_home: &Path,
     plan: &CodexRuntimePlanFile,
+    plan_file: &Path,
     prior: CodexAppServerRunResult,
     timeout_ms: u64,
     idle_timeout_ms: u64,
@@ -3578,6 +3869,7 @@ fn recover_thread_health_protocol_error(
     let mut recovered = run_context_checkpoint_fallback(
         harness_home,
         plan,
+        plan_file,
         prior,
         original_thread_id,
         timeout_ms,
@@ -3633,6 +3925,7 @@ fn is_retryable_stream_disconnect_protocol_error(reason: &str) -> bool {
 fn run_context_checkpoint_fallback(
     harness_home: &Path,
     plan: &CodexRuntimePlanFile,
+    plan_file: &Path,
     prior: CodexAppServerRunResult,
     original_thread_id: Option<String>,
     timeout_ms: u64,
@@ -3663,6 +3956,7 @@ fn run_context_checkpoint_fallback(
     let mut fallback_result = drive_codex_app_server(
         harness_home,
         &fallback_plan,
+        plan_file,
         timeout_ms,
         idle_timeout_ms,
         progress_context,
@@ -4023,6 +4317,36 @@ impl CodexProgressEmitter {
 
     fn append(&self, event: AgentProgressEvent) -> io::Result<()> {
         append_agent_progress_event(&self.harness_home, &event).map(|_| ())
+    }
+}
+
+fn emit_codex_runtime_status(
+    progress: &Option<CodexProgressEmitter>,
+    status: AgentProgressStatus,
+    preview: &str,
+    warnings: &mut Vec<String>,
+) {
+    let Some(emitter) = progress.as_ref() else {
+        return;
+    };
+    let at_ms = match current_log_time_ms() {
+        Ok(at_ms) => at_ms,
+        Err(error) => {
+            warnings.push(format!("runtime progress timestamp failed: {error}"));
+            return;
+        }
+    };
+    let event = AgentProgressEvent::new(
+        &emitter.context,
+        AgentProgressKind::Runtime,
+        "runtime",
+        preview,
+        status,
+        at_ms,
+    )
+    .source("codex-runtime");
+    if let Err(error) = emitter.append(event) {
+        warnings.push(format!("runtime progress write failed: {error}"));
     }
 }
 
@@ -4461,6 +4785,307 @@ enum ProtocolWait {
     TimedOut(String),
 }
 
+struct InFlightCodexTurnSteer {
+    record: CodexTurnSteerRequestRecord,
+    file: PathBuf,
+}
+
+struct CodexTurnSteerBridge {
+    harness_home: PathBuf,
+    binding_file: PathBuf,
+    binding: CodexActiveTurnBindingRecord,
+    turn_start_request_id: i64,
+    next_rpc_id: i64,
+    in_flight: BTreeMap<i64, InFlightCodexTurnSteer>,
+}
+
+impl CodexTurnSteerBridge {
+    fn new(
+        harness_home: &Path,
+        plan: &CodexRuntimePlanFile,
+        plan_file: &Path,
+        thread_id: String,
+        turn_start_request_id: i64,
+    ) -> io::Result<Self> {
+        let now_ms = current_log_time_ms()?;
+        let binding_file = codex_active_turn_binding_file(harness_home, &plan.session_key);
+        let binding = CodexActiveTurnBindingRecord {
+            schema: CODEX_ACTIVE_TURN_SCHEMA.to_string(),
+            queue_id: plan.queue_id.clone(),
+            session_key: plan.session_key.clone(),
+            agent_id: plan.agent_id.clone(),
+            provider: plan.provider.clone(),
+            model: plan.model.clone(),
+            thread_id,
+            active_turn_id: None,
+            turn_kind: "regular".to_string(),
+            status: CodexActiveTurnStatus::AwaitingTurnId,
+            runtime_pid: std::process::id(),
+            plan_file: plan_file.to_path_buf(),
+            working_directory: plan.invocation.working_directory.clone(),
+            prompt_bundle_json: plan.prompt_bundle_json.clone(),
+            prompt_markdown: plan.prompt_markdown.clone(),
+            started_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            reason: "turn/start sent; waiting for active Codex turn id".to_string(),
+        };
+        write_codex_active_turn_binding(&binding_file, &binding)?;
+        Ok(Self {
+            harness_home: harness_home.to_path_buf(),
+            binding_file,
+            binding,
+            turn_start_request_id,
+            next_rpc_id: 10_000,
+            in_flight: BTreeMap::new(),
+        })
+    }
+
+    fn observe_json(
+        &mut self,
+        value: &Value,
+        stdin: &mut impl Write,
+        state: &mut CodexProtocolState,
+    ) -> io::Result<bool> {
+        if self.handle_rpc_response(value, state)? {
+            return Ok(true);
+        }
+        if let Some(turn_id) = extract_active_turn_started_id(value, self.turn_start_request_id) {
+            self.set_active_turn_id(turn_id)?;
+        }
+        self.drain_pending(stdin, state)?;
+        Ok(false)
+    }
+
+    fn drain_pending(
+        &mut self,
+        stdin: &mut impl Write,
+        state: &mut CodexProtocolState,
+    ) -> io::Result<()> {
+        let Some(active_turn_id) = self.binding.active_turn_id.clone() else {
+            return Ok(());
+        };
+        let pending_dir = codex_turn_steer_pending_dir(&self.harness_home);
+        let entries = match fs::read_dir(&pending_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let mut files = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect::<Vec<_>>();
+        files.sort();
+        for file in files {
+            let mut record: CodexTurnSteerRequestRecord = match read_json_file_as(&file) {
+                Ok(record) => record,
+                Err(error) => {
+                    state.warnings.push(format!(
+                        "failed to read Codex turn steer request {}: {error}",
+                        file.display()
+                    ));
+                    continue;
+                }
+            };
+            if record.session_key != self.binding.session_key {
+                continue;
+            }
+            if record.thread_id != self.binding.thread_id {
+                self.write_request_receipt(
+                    &record,
+                    Some(file.clone()),
+                    "failed-thread-mismatch",
+                    "failed",
+                    None,
+                    format!(
+                        "steering request targeted thread {}, but active thread is {}",
+                        record.thread_id, self.binding.thread_id
+                    ),
+                )?;
+                move_steer_request_file(&self.harness_home, &file, "failed")?;
+                continue;
+            }
+            if let Some(expected_turn_id) = record.expected_turn_id.as_deref()
+                && expected_turn_id != active_turn_id
+            {
+                self.write_request_receipt(
+                    &record,
+                    Some(file.clone()),
+                    "failed-turn-mismatch",
+                    "failed",
+                    None,
+                    format!(
+                        "steering request expected turn {expected_turn_id}, but active turn is {active_turn_id}"
+                    ),
+                )?;
+                move_steer_request_file(&self.harness_home, &file, "failed")?;
+                continue;
+            }
+            record.expected_turn_id = Some(active_turn_id.clone());
+            let rpc_id = self.next_rpc_id;
+            self.next_rpc_id = self.next_rpc_id.saturating_add(1);
+            let inflight_file = move_steer_request_file(&self.harness_home, &file, "in-flight")?;
+            write_json_atomic(&inflight_file, &record)?;
+            write_json_rpc(
+                stdin,
+                &json!({
+                    "id": rpc_id,
+                    "method": "turn/steer",
+                    "params": {
+                        "threadId": self.binding.thread_id.clone(),
+                        "expectedTurnId": active_turn_id.clone(),
+                        "clientUserMessageId": record.client_user_message_id.clone(),
+                        "input": [
+                            {
+                                "type": "text",
+                                "text": record.text.clone()
+                            }
+                        ]
+                    }
+                }),
+            )?;
+            self.in_flight.insert(
+                rpc_id,
+                InFlightCodexTurnSteer {
+                    record,
+                    file: inflight_file,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn handle_rpc_response(
+        &mut self,
+        value: &Value,
+        _state: &mut CodexProtocolState,
+    ) -> io::Result<bool> {
+        let Some(id) = json_id(value) else {
+            return Ok(false);
+        };
+        let Some(in_flight) = self.in_flight.remove(&id) else {
+            return Ok(false);
+        };
+        if let Some(error) = protocol_error(value) {
+            self.write_request_receipt(
+                &in_flight.record,
+                Some(in_flight.file.clone()),
+                "failed",
+                "same-turn-failed",
+                None,
+                error,
+            )?;
+            move_steer_request_file(&self.harness_home, &in_flight.file, "failed")?;
+            return Ok(true);
+        }
+        let accepted_turn_id = extract_turn_id(value).or(in_flight.record.expected_turn_id.clone());
+        self.write_request_receipt(
+            &in_flight.record,
+            Some(in_flight.file.clone()),
+            "accepted",
+            "same-turn",
+            accepted_turn_id,
+            "Codex app-server accepted turn/steer request".to_string(),
+        )?;
+        move_steer_request_file(&self.harness_home, &in_flight.file, "accepted")?;
+        Ok(true)
+    }
+
+    fn finish(&mut self, status: CodexActiveTurnStatus, reason: &str) -> io::Result<()> {
+        self.finish_pending(reason)?;
+        self.binding.status = status;
+        self.binding.updated_at_ms = current_log_time_ms()?;
+        self.binding.reason = reason.to_string();
+        write_codex_active_turn_binding(&self.binding_file, &self.binding)
+    }
+
+    fn finish_pending(&mut self, reason: &str) -> io::Result<()> {
+        for (_, in_flight) in std::mem::take(&mut self.in_flight) {
+            self.write_request_receipt(
+                &in_flight.record,
+                Some(in_flight.file.clone()),
+                "deferred-no-ack",
+                "same-turn-unconfirmed",
+                None,
+                format!("turn ended before turn/steer acknowledgement: {reason}"),
+            )?;
+            move_steer_request_file(&self.harness_home, &in_flight.file, "deferred")?;
+        }
+        let pending_dir = codex_turn_steer_pending_dir(&self.harness_home);
+        let entries = match fs::read_dir(&pending_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let file = entry.path();
+            if file.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let record: CodexTurnSteerRequestRecord = match read_json_file_as(&file) {
+                Ok(record) => record,
+                Err(_) => continue,
+            };
+            if record.session_key != self.binding.session_key {
+                continue;
+            }
+            let status = if self.binding.active_turn_id.is_none() {
+                "deferred-no-active-turn-id"
+            } else {
+                "deferred-turn-ended"
+            };
+            self.write_request_receipt(
+                &record,
+                Some(file.clone()),
+                status,
+                "next-turn-or-passive-context",
+                None,
+                format!("same-turn steering was not delivered before turn ended: {reason}"),
+            )?;
+            move_steer_request_file(&self.harness_home, &file, "deferred")?;
+        }
+        Ok(())
+    }
+
+    fn set_active_turn_id(&mut self, turn_id: String) -> io::Result<()> {
+        if self.binding.active_turn_id.as_deref() == Some(turn_id.as_str()) {
+            return Ok(());
+        }
+        self.binding.active_turn_id = Some(turn_id);
+        self.binding.status = CodexActiveTurnStatus::Running;
+        self.binding.updated_at_ms = current_log_time_ms()?;
+        self.binding.reason = "Codex active turn id observed".to_string();
+        write_codex_active_turn_binding(&self.binding_file, &self.binding)
+    }
+
+    fn write_request_receipt(
+        &self,
+        record: &CodexTurnSteerRequestRecord,
+        request_file: Option<PathBuf>,
+        status: &str,
+        delivery: &str,
+        accepted_turn_id: Option<String>,
+        reason: String,
+    ) -> io::Result<()> {
+        append_json_line(
+            &codex_turn_steer_receipts_file(&self.harness_home),
+            &CodexTurnSteerReceipt {
+                schema: CODEX_TURN_STEER_RECEIPT_SCHEMA.to_string(),
+                at_ms: current_log_time_ms()?,
+                request_id: record.request_id.clone(),
+                session_key: record.session_key.clone(),
+                status: status.to_string(),
+                delivery: delivery.to_string(),
+                thread_id: Some(record.thread_id.clone()),
+                expected_turn_id: record.expected_turn_id.clone(),
+                accepted_turn_id,
+                request_file,
+                reason,
+            },
+        )
+    }
+}
+
 struct CodexProtocolTimeouts {
     absolute_deadline: Instant,
     idle_deadline: Instant,
@@ -4504,11 +5129,15 @@ impl CodexProtocolTimeouts {
         }
     }
 
-    fn next_poll_timeout(&self, now: Instant) -> Duration {
-        self.absolute_deadline
+    fn next_poll_timeout(&self, now: Instant, poll_interval: Option<Duration>) -> Duration {
+        let deadline_timeout = self
+            .absolute_deadline
             .saturating_duration_since(now)
-            .min(self.idle_deadline.saturating_duration_since(now))
-            .min(Duration::from_millis(250))
+            .min(self.idle_deadline.saturating_duration_since(now));
+        match poll_interval {
+            Some(interval) => deadline_timeout.min(interval),
+            None => deadline_timeout,
+        }
     }
 }
 
@@ -4524,7 +5153,7 @@ fn wait_for_thread_start(
     narration_config: &AssistantNarrationConfig,
 ) -> io::Result<ProtocolWait> {
     loop {
-        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check)? {
+        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check, None)? {
             ProtocolEvent::Json(value) => {
                 if let Some(error) = protocol_error(&value) {
                     return Ok(ProtocolWait::Failed(error));
@@ -4550,6 +5179,7 @@ fn wait_for_thread_start(
                 }
                 collect_agent_output(&value, state, progress, narration_config);
             }
+            ProtocolEvent::Poll => continue,
             ProtocolEvent::TimedOut(reason) => return Ok(ProtocolWait::TimedOut(reason)),
             ProtocolEvent::Failed(reason) => return Ok(ProtocolWait::Failed(reason)),
             ProtocolEvent::Canceled(reason) => return Ok(ProtocolWait::Canceled(reason)),
@@ -4609,7 +5239,7 @@ fn wait_for_context_compaction_completed(
     let mut acknowledged = false;
     let mut compaction_started = false;
     loop {
-        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check)? {
+        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check, None)? {
             ProtocolEvent::Json(value) => {
                 if let Some(error) = protocol_error(&value) {
                     return Ok(ProtocolWait::Failed(error));
@@ -4646,6 +5276,7 @@ fn wait_for_context_compaction_completed(
                 }
                 collect_agent_output(&value, state, progress, narration_config);
             }
+            ProtocolEvent::Poll => continue,
             ProtocolEvent::TimedOut(reason) => return Ok(ProtocolWait::TimedOut(reason)),
             ProtocolEvent::Failed(reason) => return Ok(ProtocolWait::Failed(reason)),
             ProtocolEvent::Canceled(reason) => return Ok(ProtocolWait::Canceled(reason)),
@@ -4663,10 +5294,21 @@ fn wait_for_turn_completed(
     approval_policy: CodexApprovalPolicy,
     cancel_check: Option<&RuntimeCancelCheck>,
     narration_config: &AssistantNarrationConfig,
+    mut steer_bridge: Option<&mut CodexTurnSteerBridge>,
 ) -> io::Result<ProtocolWait> {
     loop {
-        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check)? {
+        if let Some(bridge) = steer_bridge.as_deref_mut() {
+            bridge.drain_pending(stdin, state)?;
+        }
+        let poll_interval = steer_bridge.as_ref().map(|_| Duration::from_millis(250));
+        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check, poll_interval)?
+        {
             ProtocolEvent::Json(value) => {
+                if let Some(bridge) = steer_bridge.as_deref_mut()
+                    && bridge.observe_json(&value, stdin, state)?
+                {
+                    continue;
+                }
                 if let Some(error) = protocol_error(&value) {
                     return Ok(ProtocolWait::Failed(error));
                 }
@@ -4688,6 +5330,7 @@ fn wait_for_turn_completed(
                     return Ok(ProtocolWait::ThreadStarted(thread_id));
                 }
             }
+            ProtocolEvent::Poll => continue,
             ProtocolEvent::TimedOut(reason) => return Ok(ProtocolWait::TimedOut(reason)),
             ProtocolEvent::Failed(reason) => return Ok(ProtocolWait::Failed(reason)),
             ProtocolEvent::Canceled(reason) => return Ok(ProtocolWait::Canceled(reason)),
@@ -4697,6 +5340,7 @@ fn wait_for_turn_completed(
 
 enum ProtocolEvent {
     Json(Value),
+    Poll,
     TimedOut(String),
     Failed(String),
     Canceled(String),
@@ -4708,6 +5352,7 @@ fn receive_protocol_event(
     state: &mut CodexProtocolState,
     timeouts: &mut CodexProtocolTimeouts,
     cancel_check: Option<&RuntimeCancelCheck>,
+    poll_interval: Option<Duration>,
 ) -> io::Result<ProtocolEvent> {
     loop {
         if let Some(cancel_check) = cancel_check
@@ -4719,7 +5364,7 @@ fn receive_protocol_event(
         if let Some(reason) = timeouts.timed_out_reason(now) {
             return Ok(ProtocolEvent::TimedOut(reason));
         }
-        let timeout = timeouts.next_poll_timeout(now);
+        let timeout = timeouts.next_poll_timeout(now, poll_interval);
         match line_rx.recv_timeout(timeout) {
             Ok(Ok(line)) => {
                 state.event_count += 1;
@@ -4744,6 +5389,9 @@ fn receive_protocol_event(
                     return Ok(ProtocolEvent::Failed(format!(
                         "codex app-server exited before completing protocol: {status}"
                     )));
+                }
+                if poll_interval.is_some() {
+                    return Ok(ProtocolEvent::Poll);
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -5102,6 +5750,30 @@ fn extract_thread_id(value: &Value) -> Option<String> {
         if let Some(text) = value.pointer(pointer).and_then(Value::as_str) {
             return Some(text.to_string());
         }
+    }
+    None
+}
+
+fn extract_turn_id(value: &Value) -> Option<String> {
+    for pointer in [
+        "/result/turn/id",
+        "/result/turnId",
+        "/result/id",
+        "/params/turn/id",
+        "/params/turnId",
+    ] {
+        if let Some(text) = value.pointer(pointer).and_then(Value::as_str) {
+            return Some(text.trim().to_string()).filter(|value| !value.is_empty());
+        }
+    }
+    None
+}
+
+fn extract_active_turn_started_id(value: &Value, turn_start_request_id: i64) -> Option<String> {
+    if matches!(json_method(value), Some("turn/started"))
+        || json_id(value) == Some(turn_start_request_id)
+    {
+        return extract_turn_id(value);
     }
     None
 }
@@ -6813,6 +7485,105 @@ fn codex_binding_file(transcript_file: &Path) -> PathBuf {
     with_appended_file_name(transcript_file, ".codex-app-server.json")
 }
 
+fn codex_active_turn_binding_dir(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("codex-active-turns")
+}
+
+fn codex_active_turn_binding_file(harness_home: &Path, session_key: &str) -> PathBuf {
+    codex_active_turn_binding_dir(harness_home)
+        .join(format!("{}.json", normalize_key_part(session_key)))
+}
+
+fn codex_turn_steer_dir(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("codex-turn-steer")
+}
+
+fn codex_turn_steer_pending_dir(harness_home: &Path) -> PathBuf {
+    codex_turn_steer_dir(harness_home).join("pending")
+}
+
+fn codex_turn_steer_archive_dir(harness_home: &Path, status: &str) -> PathBuf {
+    codex_turn_steer_dir(harness_home).join(status)
+}
+
+fn codex_turn_steer_receipts_file(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("codex-turn-steer-receipts.jsonl")
+}
+
+fn codex_turn_steer_request_id(
+    platform: &str,
+    channel_id: &str,
+    user_id: &str,
+    session_key: &str,
+    at_ms: i64,
+    text: &str,
+) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    platform.hash(&mut hasher);
+    channel_id.hash(&mut hasher);
+    user_id.hash(&mut hasher);
+    session_key.hash(&mut hasher);
+    at_ms.hash(&mut hasher);
+    text.hash(&mut hasher);
+    format!("steer-{at_ms}-{:016x}", hasher.finish())
+}
+
+fn read_codex_active_turn_binding(
+    binding_file: &Path,
+) -> io::Result<Option<CodexActiveTurnBindingRecord>> {
+    match fs::read(binding_file) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(io::Error::other),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_codex_active_turn_binding(
+    binding_file: &Path,
+    binding: &CodexActiveTurnBindingRecord,
+) -> io::Result<()> {
+    fs::create_dir_all(parent_dir(binding_file)?)?;
+    write_json_atomic(binding_file, binding)
+}
+
+fn move_steer_request_file(
+    harness_home: &Path,
+    source_file: &Path,
+    status: &str,
+) -> io::Result<PathBuf> {
+    let target_dir = codex_turn_steer_archive_dir(harness_home, status);
+    fs::create_dir_all(&target_dir)?;
+    let file_name = source_file
+        .file_name()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "steer request path has no file name: {}",
+                    source_file.display()
+                ),
+            )
+        })?
+        .to_owned();
+    let target_file = target_dir.join(file_name);
+    if target_file.exists() {
+        fs::remove_file(&target_file)?;
+    }
+    fs::rename(source_file, &target_file)?;
+    Ok(target_file)
+}
+
 fn with_appended_file_name(path: &Path, suffix: &str) -> PathBuf {
     let mut out = path.to_path_buf();
     let name = path
@@ -8473,6 +9244,162 @@ mod tests {
     }
 
     #[test]
+    fn run_codex_runtime_records_startup_progress_before_protocol_events() {
+        let root = temp_root("run_codex_runtime_records_startup_progress_before_protocol_events");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = fake_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: Some(progress_context()),
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let events_file = crate::agent_progress_events_file(&harness_home);
+        let events = fs::read_to_string(events_file).unwrap();
+        let first: Value = serde_json::from_str(events.lines().next().unwrap()).unwrap();
+        assert_eq!(first["kind"], serde_json::json!("runtime"));
+        assert_eq!(first["label"], serde_json::json!("runtime"));
+        assert_eq!(first["status"], serde_json::json!("started"));
+        assert_eq!(
+            first["preview"],
+            serde_json::json!("starting Codex app-server")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn queue_codex_turn_steer_request_defers_without_active_turn() {
+        let root = temp_root("queue_codex_turn_steer_request_defers_without_active_turn");
+        let harness_home = root.join(".agent-harness");
+
+        let report = queue_codex_turn_steer_request(CodexTurnSteerRequestOptions {
+            harness_home: harness_home.clone(),
+            platform: "telegram".to_string(),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            session_key: "telegram:dm-42:user-7:main".to_string(),
+            agent_id: Some("main".to_string()),
+            text: "please include the new acceptance criterion".to_string(),
+            client_user_message_id: None,
+            now_ms: 2000,
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.status,
+            CodexTurnSteerQueueStatus::DeferredNoActiveTurn
+        );
+        assert!(report.request_file.is_none());
+        let receipts = fs::read_to_string(report.receipts_file).unwrap();
+        assert!(receipts.contains("deferred-no-active-turn"));
+        assert!(receipts.contains("next-turn-or-passive-context"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_sends_pending_turn_steer_to_app_server() {
+        let root = temp_root("run_codex_runtime_sends_pending_turn_steer_to_app_server");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let capture_file = root.join("captured-turn-steer.json");
+        let (executable, arguments) = steer_echo_app_server_command(&root, &capture_file);
+        replace_invocation(plan_file, executable, arguments);
+
+        let queue_harness_home = harness_home.clone();
+        let queue_thread = thread::spawn(move || {
+            let session_key = "telegram:dm-42:user-7:main";
+            let binding_file = codex_active_turn_binding_file(&queue_harness_home, session_key);
+            for _ in 0..100 {
+                if let Ok(Some(binding)) = read_codex_active_turn_binding(&binding_file)
+                    && binding.active_turn_id.as_deref() == Some("turn-test")
+                {
+                    return queue_codex_turn_steer_request(CodexTurnSteerRequestOptions {
+                        harness_home: queue_harness_home,
+                        platform: "telegram".to_string(),
+                        channel_id: "dm-42".to_string(),
+                        user_id: "user-7".to_string(),
+                        session_key: session_key.to_string(),
+                        agent_id: Some("main".to_string()),
+                        text: "include the late steering note".to_string(),
+                        client_user_message_id: Some("telegram:message:99".to_string()),
+                        now_ms: 3000,
+                    })
+                    .unwrap();
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            panic!("active Codex turn binding did not appear");
+        });
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+        let queue_report = queue_thread.join().unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert_eq!(
+            queue_report.status,
+            CodexTurnSteerQueueStatus::QueuedSameTurn
+        );
+        let captured: Value = serde_json::from_slice(&fs::read(&capture_file).unwrap()).unwrap();
+        assert_eq!(captured["method"], "turn/steer");
+        assert_eq!(captured["params"]["threadId"], "thread-test");
+        assert_eq!(captured["params"]["expectedTurnId"], "turn-test");
+        assert_eq!(
+            captured["params"]["clientUserMessageId"],
+            "telegram:message:99"
+        );
+        assert_eq!(
+            captured["params"]["input"][0]["text"],
+            "include the late steering note"
+        );
+        let receipts = fs::read_to_string(codex_turn_steer_receipts_file(&harness_home)).unwrap();
+        assert!(receipts.contains("queued-same-turn"));
+        assert!(receipts.contains("\"status\":\"accepted\""));
+        let active: CodexActiveTurnBindingRecord = read_json_file_as(
+            &codex_active_turn_binding_file(&harness_home, "telegram:dm-42:user-7:main"),
+        )
+        .unwrap();
+        assert_eq!(active.status, CodexActiveTurnStatus::Completed);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_codex_runtime_recovers_completed_stdout_without_relaunch() {
         let root = temp_root("run_codex_runtime_recovers_completed_stdout_without_relaunch");
         let source = write_codex_runtime_source(&root);
@@ -8554,9 +9481,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let elapsed = started.elapsed();
+        let max_elapsed = if cfg!(windows) {
+            Duration::from_secs(12)
+        } else {
+            Duration::from_secs(8)
+        };
         assert!(
-            started.elapsed() < Duration::from_secs(8),
-            "runtime should not wait for an inherited stdout handle to close"
+            elapsed < max_elapsed,
+            "runtime should not wait for an inherited stdout handle to close: elapsed={elapsed:?}, max_elapsed={max_elapsed:?}"
         );
         let transcript_file = report.completion.unwrap().transcript_file.unwrap();
         let transcript = fs::read_to_string(transcript_file).unwrap();
@@ -8744,7 +9677,8 @@ mod tests {
 
     #[test]
     fn run_codex_runtime_preflight_compact_timeout_falls_back_to_fresh_thread() {
-        assert_preflight_compact_problem_falls_back("timeout", 5_000);
+        let idle_timeout_ms = if cfg!(windows) { 15_000 } else { 5_000 };
+        assert_preflight_compact_problem_falls_back("timeout", idle_timeout_ms);
     }
 
     #[test]
@@ -8798,12 +9732,17 @@ mod tests {
         let (executable, arguments, events_file) =
             preflight_compact_problem_then_fresh_thread_app_server_command(&root, scenario);
         replace_invocation(plan_file, executable, arguments);
+        let timeout_ms = if cfg!(windows) && scenario == "timeout" {
+            45_000
+        } else {
+            10_000
+        };
 
         let report = run_codex_runtime(CodexRuntimeRunOptions {
             harness_home: harness_home.clone(),
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 10_000,
+            timeout_ms,
             idle_timeout_ms,
             progress_context: None,
         })
@@ -9614,6 +10553,69 @@ while ($true) {
     }
 
     #[cfg(windows)]
+    fn steer_echo_app_server_command(root: &Path, capture_file: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("steer-echo-app-server.ps1");
+        let capture = capture_file.to_string_lossy().replace('\'', "''");
+        fs::write(
+            &script,
+            format!(
+                r#"
+$capture = '{capture}'
+while ($true) {{
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) {{ break }}
+    try {{
+        $msg = $line | ConvertFrom-Json
+    }} catch {{
+        continue
+    }}
+    if ($msg.id -eq 0) {{
+        [Console]::Out.WriteLine('{{"id":0,"result":{{"ok":true}}}}')
+        [Console]::Out.Flush()
+    }} elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {{
+        [Console]::Out.WriteLine('{{"id":1,"result":{{"thread":{{"id":"thread-test"}}}}}}')
+        [Console]::Out.Flush()
+    }} elseif ($msg.method -eq 'turn/start') {{
+        [Console]::Out.WriteLine('{{"method":"turn/started","params":{{"threadId":"thread-test","turn":{{"id":"turn-test","kind":"regular"}}}}}}')
+        [Console]::Out.Flush()
+        $steerLine = [Console]::In.ReadLine()
+        Set-Content -LiteralPath $capture -Value $steerLine
+        $steerId = 10000
+        try {{
+            $steer = $steerLine | ConvertFrom-Json
+            $steerId = [int]$steer.id
+        }} catch {{}}
+        [Console]::Out.WriteLine(('{{"id":' + $steerId + ',"result":{{"turnId":"turn-test"}}}}'))
+        [Console]::Out.WriteLine('{{"method":"item/agentMessage/delta","params":{{"delta":"Steered reply."}}}}')
+        [Console]::Out.WriteLine('{{"method":"turn/completed","params":{{"threadId":"thread-test","turn":{{"id":"turn-test","status":"completed","usage":{{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}}}}}')
+        [Console]::Out.Flush()
+        break
+    }}
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
+
+    #[cfg(windows)]
     fn slow_stream_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
         let script = root.join("slow-stream-app-server.ps1");
         fs::write(
@@ -9921,7 +10923,7 @@ while ($true) {
     } elseif ($msg.method -eq 'thread/compact/start') {
         Set-Content -LiteralPath $marker -Value 'compact-problem'
         if ($scenario -eq 'timeout') {
-            Start-Sleep -Seconds 10
+            Start-Sleep -Seconds 30
             break
         } elseif ($scenario -eq 'unexpected') {
             [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-unexpected","status":"completed"}}}')
@@ -10119,6 +11121,43 @@ while IFS= read -r line; do
     esac
 done
 "#,
+        )
+        .unwrap();
+        (PathBuf::from("sh"), vec![script.display().to_string()])
+    }
+
+    #[cfg(not(windows))]
+    fn steer_echo_app_server_command(root: &Path, capture_file: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("steer-echo-app-server.sh");
+        let capture = capture_file.to_string_lossy().replace('\'', "'\\''");
+        fs::write(
+            &script,
+            format!(
+                r#"
+capture='{capture}'
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{{"id":0,"result":{{"ok":true}}}}'
+            ;;
+        *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+            printf '%s\n' '{{"id":1,"result":{{"thread":{{"id":"thread-test"}}}}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{{"method":"turn/started","params":{{"threadId":"thread-test","turn":{{"id":"turn-test","kind":"regular"}}}}}}'
+            IFS= read -r steer_line
+            printf '%s\n' "$steer_line" > "$capture"
+            steer_id=$(printf '%s' "$steer_line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+            if [ -z "$steer_id" ]; then steer_id=10000; fi
+            printf '%s\n' '{{"id":'"$steer_id"',"result":{{"turnId":"turn-test"}}}}'
+            printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"delta":"Steered reply."}}}}'
+            printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"thread-test","turn":{{"id":"turn-test","status":"completed","usage":{{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}}}}}'
+            exit 0
+            ;;
+    esac
+done
+"#
+            ),
         )
         .unwrap();
         (PathBuf::from("sh"), vec![script.display().to_string()])

@@ -978,6 +978,7 @@ fn run_operation_plan(args: &[String]) -> Result<(), String> {
             "--origin-queue-id",
             "--session-key",
             "--agent",
+            "--agent-id",
             "--goal",
             "--acceptance",
             "--constraints",
@@ -1022,7 +1023,11 @@ fn run_operation_plan(args: &[String]) -> Result<(), String> {
                     .optional("--session-key")
                     .unwrap_or("manual")
                     .to_string(),
-                agent_id: options.optional("--agent").unwrap_or("main").to_string(),
+                agent_id: options
+                    .optional("--agent")
+                    .or_else(|| options.optional("--agent-id"))
+                    .unwrap_or("main")
+                    .to_string(),
                 goal: options.required("--goal")?,
                 acceptance_criteria: options.optional("--acceptance").map(ToString::to_string),
                 constraints: options.optional("--constraints").map(ToString::to_string),
@@ -2984,7 +2989,9 @@ fn run_progress_delivery_loop(args: &[String]) -> Result<(), String> {
             iterations,
             "checking progress events",
         )?;
-        match execute_progress_delivery_once(&args.send) {
+        let mut send_args = args.send.clone();
+        send_args.preempt_after_wake_sequence = Some(progress_wake_sequence);
+        match execute_progress_delivery_once(&send_args) {
             Ok(report) => {
                 consecutive_errors = 0;
                 write_loop_heartbeat(
@@ -3572,7 +3579,7 @@ fn supervisor_service_priority(service: &str) -> &'static str {
 fn supervisor_delivery_lane(service: &str) -> Option<&'static str> {
     match service {
         "discord-outbox-loop" => Some("final-outbox"),
-        "progress-delivery-loop" => Some("progress"),
+        "progress-delivery-loop" => Some("progress-delivery"),
         _ => None,
     }
 }
@@ -3600,7 +3607,20 @@ fn execute_progress_delivery_once(
     let mut skipped_permanent = 0usize;
     let mut failed_deliveries = 0usize;
 
-    for pending in plan.pending {
+    let mut pending_items = plan.pending;
+    pending_items.sort_by_key(progress_delivery_pending_priority);
+    for pending in pending_items {
+        if let Some(sequence) = args.preempt_after_wake_sequence {
+            let current_sequence = read_loop_wake_sequence(&args.target_home, "progress-delivery");
+            if progress_delivery_should_preempt_stale_pending(&pending, sequence, current_sequence)
+            {
+                warnings.push(format!(
+                    "progress delivery plan for {} was preempted by a newer progress wake; replanning before non-terminal delivery",
+                    pending.queue_id
+                ));
+                break;
+            }
+        }
         let policy_decision = match progress_delivery_allowed(&policy, &pending, args) {
             Ok(decision) => decision,
             Err(reason) => {
@@ -3695,6 +3715,25 @@ fn execute_progress_delivery_once(
     )
     .map_err(|err| err.to_string())?;
     Ok(report)
+}
+
+fn progress_delivery_pending_priority(pending: &AgentProgressDeliveryPending) -> (u8, u8, usize) {
+    let terminal_rank = if pending.terminal { 0 } else { 1 };
+    let lane_rank = match (pending.terminal, pending.message_kind) {
+        (true, agent_harness_core::AgentProgressDeliveryMessageKind::Status) => 0,
+        (true, agent_harness_core::AgentProgressDeliveryMessageKind::Body) => 1,
+        (false, agent_harness_core::AgentProgressDeliveryMessageKind::Body) => 0,
+        (false, agent_harness_core::AgentProgressDeliveryMessageKind::Status) => 1,
+    };
+    (terminal_rank, lane_rank, pending.event_line)
+}
+
+fn progress_delivery_should_preempt_stale_pending(
+    pending: &AgentProgressDeliveryPending,
+    previous_sequence: u64,
+    current_sequence: u64,
+) -> bool {
+    !pending.terminal && current_sequence > previous_sequence
 }
 
 fn progress_delivery_account_id<'a>(
@@ -7899,6 +7938,7 @@ struct ProgressDeliveryOnceArgs {
     max_events_per_panel: usize,
     max_preview_chars: usize,
     current_step_max_chars: usize,
+    preempt_after_wake_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -10234,7 +10274,7 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
         .optional_i64("--heartbeat-timeout-ms")?
         .unwrap_or(120_000)
         .max(1);
-    let idle_ms = options.optional_u64("--idle-ms")?.unwrap_or(60_000).max(1);
+    let idle_ms = options.optional_u64("--idle-ms")?.unwrap_or(1_000).max(1);
     let iterations = options.optional_usize("--iterations")?.unwrap_or(1);
     let max_consecutive_errors = options
         .optional_usize("--max-consecutive-errors")?
@@ -10242,7 +10282,7 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
         .max(1);
     let runtime_concurrency = options
         .optional_usize("--runtime-concurrency")?
-        .unwrap_or(1)
+        .unwrap_or(12)
         .max(1);
     let timeout_ms = options
         .optional_u64("--timeout-ms")?
@@ -11686,6 +11726,7 @@ fn progress_delivery_once_args_from_args(
         max_events_per_panel,
         max_preview_chars,
         current_step_max_chars,
+        preempt_after_wake_sequence: None,
     })
 }
 
@@ -18734,6 +18775,39 @@ mod tests {
     }
 
     #[test]
+    fn operation_plan_cli_accepts_agent_id_alias_for_create() {
+        let root = cli_temp_root("operation_plan_cli_accepts_agent_id_alias_for_create");
+        let harness_home = root.join(".agent-harness");
+
+        run_operation_plan(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+            "--action".to_string(),
+            "create".to_string(),
+            "--plan-id".to_string(),
+            "alias-plan".to_string(),
+            "--session-key".to_string(),
+            "session-1".to_string(),
+            "--agent-id".to_string(),
+            "main".to_string(),
+            "--goal".to_string(),
+            "Verify operation plan CLI alias".to_string(),
+            "--now-ms".to_string(),
+            "1000".to_string(),
+        ])
+        .unwrap();
+
+        let report = show_operation_plan(OperationPlanShowOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "alias-plan".to_string(),
+        })
+        .unwrap();
+        assert_eq!(report.plan.agent_id, "main");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn supervisor_reconcile_default_services_include_stop_files() {
         let root = cli_temp_root("supervisor_reconcile_default_services_include_stop_files");
         let harness_home = root.join(".agent-harness");
@@ -18776,6 +18850,18 @@ mod tests {
                 .args
                 .windows(2)
                 .any(|pair| { pair[0] == "--stop-file" && pair[1] == runtime_stop })
+        );
+        assert!(
+            runtime
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--idle-ms" && pair[1] == "1000")
+        );
+        assert!(
+            runtime
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--runtime-concurrency" && pair[1] == "12")
         );
 
         let xiaoxiaoli = services
@@ -18875,7 +18961,55 @@ mod tests {
             max_events_per_panel: 8,
             max_preview_chars: 120,
             current_step_max_chars: 1200,
+            preempt_after_wake_sequence: None,
         }
+    }
+
+    #[test]
+    fn progress_delivery_prioritizes_terminal_status_edits() {
+        let mut nonterminal_status = progress_pending("telegram", "dm-1", "operator");
+        nonterminal_status.message_kind =
+            agent_harness_core::AgentProgressDeliveryMessageKind::Status;
+        nonterminal_status.action = AgentProgressDeliveryAction::Edit;
+        nonterminal_status.provider_message_id = Some("status-1".to_string());
+        nonterminal_status.event_line = 10;
+
+        let mut terminal_body = progress_pending("telegram", "dm-1", "operator");
+        terminal_body.action = AgentProgressDeliveryAction::Edit;
+        terminal_body.provider_message_id = Some("body-1".to_string());
+        terminal_body.terminal = true;
+        terminal_body.event_line = 11;
+
+        let mut terminal_status = terminal_body.clone();
+        terminal_status.message_kind = agent_harness_core::AgentProgressDeliveryMessageKind::Status;
+        terminal_status.provider_message_id = Some("status-1".to_string());
+        terminal_status.event_line = 12;
+
+        let mut pending = vec![nonterminal_status, terminal_body, terminal_status];
+        pending.sort_by_key(progress_delivery_pending_priority);
+
+        assert!(pending[0].terminal);
+        assert_eq!(
+            pending[0].message_kind,
+            agent_harness_core::AgentProgressDeliveryMessageKind::Status
+        );
+    }
+
+    #[test]
+    fn progress_delivery_preempts_nonterminal_pending_when_wake_advances() {
+        let stale = progress_pending("telegram", "dm-1", "operator");
+        assert!(progress_delivery_should_preempt_stale_pending(
+            &stale, 10, 11
+        ));
+
+        let mut terminal = stale.clone();
+        terminal.terminal = true;
+        assert!(!progress_delivery_should_preempt_stale_pending(
+            &terminal, 10, 11
+        ));
+        assert!(!progress_delivery_should_preempt_stale_pending(
+            &stale, 10, 10
+        ));
     }
 
     fn cli_temp_root(name: &str) -> PathBuf {
@@ -19057,6 +19191,11 @@ mod tests {
         assert_eq!(args.outbox_limit, 20);
         assert_eq!(args.discord_account, None);
         assert_eq!(args.stop_file.as_deref(), Some(stop_file.as_path()));
+        assert_eq!(supervisor_service_priority(&args.service), "telemetry");
+        assert_eq!(
+            supervisor_delivery_lane(&args.service),
+            Some("progress-delivery")
+        );
 
         let child_args = supervisor_child_args(&args);
         let has_pair = |flag: &str, value: String| {

@@ -134,9 +134,11 @@ pub use codex_runtime::{
     CodexRuntimePreflightReport, CodexRuntimePreflightStatus, CodexRuntimeReceipt,
     CodexRuntimeReceiptStatus, CodexRuntimeRunOptions, CodexRuntimeRunReceipt,
     CodexRuntimeRunReport, CodexRuntimeRunStatus, CodexSandboxInspection, CodexTransportPlan,
+    CodexTurnSteerQueueStatus, CodexTurnSteerRequestOptions, CodexTurnSteerRequestReport,
     inspect_codex_approval_policy, inspect_codex_sandbox, inspect_codex_sandbox_policy,
     load_assistant_narration_config, plan_codex_runtime, preflight_codex_runtime,
-    probe_codex_runtime_launch, record_codex_runtime_completion, run_codex_runtime,
+    probe_codex_runtime_launch, queue_codex_turn_steer_request, record_codex_runtime_completion,
+    run_codex_runtime,
 };
 pub use config::{
     HARNESS_CONFIG_FILE_NAME, HarnessConfigValidationReport, HarnessConfigValidationStatus,

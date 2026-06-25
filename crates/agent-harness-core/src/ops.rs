@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,16 @@ const OPS_CUTOVER_STATUS_SCHEMA: &str = "agent-harness.ops-cutover-status.v1";
 const OPS_CONTROL_RECEIPT_SCHEMA: &str = "agent-harness.ops-control-receipt.v1";
 const DEFAULT_BACKUP_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_LIVE_CONTROL_TOKEN_TTL_SECONDS: i64 = 15 * 60;
+const DIRECT_SUPERVISOR_STOP_COMPONENTS: &[&str] = &[
+    "cron-scheduler-loop",
+    "discord-gateway-loop",
+    "discord-outbox-loop",
+    "progress-delivery-loop",
+    "runtime-loop",
+    "telegram-loop",
+    "telegram-loop-xiaoxiaoli",
+    "worker-loop",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpsBackupOptions {
@@ -626,6 +637,7 @@ pub fn record_ops_control(options: OpsControlOptions) -> io::Result<OpsControlRe
                 });
                 crate::write_json_atomic(&stop.stop_file, &stop_file)?;
             }
+            signal_stop_wake_lanes(&options.harness_home, &stop_files);
         }
         OpsControlAction::Start => {
             for stop in &stop_files {
@@ -675,6 +687,33 @@ pub fn record_ops_control(options: OpsControlOptions) -> io::Result<OpsControlRe
     };
     append_json_line(&receipt_file, &report)?;
     Ok(report)
+}
+
+fn signal_stop_wake_lanes(harness_home: &Path, stop_files: &[OpsStopFileStatus]) {
+    let mut lanes = BTreeSet::new();
+    for stop in stop_files {
+        if let Some(lane) = wake_lane_for_stop_component(&stop.component) {
+            lanes.insert(lane);
+        }
+    }
+    for lane in lanes {
+        let wake_file = harness_home
+            .join("state")
+            .join("wake")
+            .join(format!("{lane}.json"));
+        let _ =
+            crate::wake::signal_wake(harness_home, wake_file, lane, "ops-control stop requested");
+    }
+}
+
+fn wake_lane_for_stop_component(component: &str) -> Option<&'static str> {
+    match component {
+        "discord-outbox-loop" => Some("final-outbox"),
+        "progress-delivery-loop" => Some("progress-delivery"),
+        "runtime-loop" => Some("runtime"),
+        "worker-loop" => Some("worker"),
+        _ => None,
+    }
 }
 
 fn copy_backup_path(
@@ -769,6 +808,14 @@ fn discover_stop_files(harness_home: &Path) -> io::Result<Vec<OpsStopFileStatus>
                     }),
             );
         }
+    }
+
+    let direct_stop_dir = harness_home.join("state").join("supervisor").join("stop");
+    for component in DIRECT_SUPERVISOR_STOP_COMPONENTS {
+        stops.push(stop_file_status(
+            (*component).to_string(),
+            direct_stop_dir.join(format!("{component}.stop")),
+        ));
     }
 
     let stop_dirs = [
@@ -940,9 +987,25 @@ mod tests {
         })
         .unwrap();
         assert_eq!(stop.status, "stop-requested");
-        assert!(stop.stop_files[0].present);
+        let scheduled_worker_stop = stop
+            .stop_files
+            .iter()
+            .find(|entry| entry.stop_file == stop_file)
+            .unwrap();
+        assert!(scheduled_worker_stop.present);
+        let direct_worker_stop_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("stop")
+            .join("worker-loop.stop");
+        let direct_worker_stop = stop
+            .stop_files
+            .iter()
+            .find(|entry| entry.stop_file == direct_worker_stop_file)
+            .unwrap();
+        assert!(direct_worker_stop.present);
         let stop_file_json: Value =
-            serde_json::from_slice(&fs::read(&stop.stop_files[0].stop_file).unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(&direct_worker_stop.stop_file).unwrap()).unwrap();
         assert_eq!(
             stop_file_json["schema"],
             "agent-harness.supervisor-stop-file.v1"
@@ -961,7 +1024,46 @@ mod tests {
         })
         .unwrap();
         assert_eq!(start.status, "start-ready");
-        assert!(!start.stop_files[0].present);
+        assert!(start.stop_files.iter().all(|entry| !entry.present));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ops_control_stop_signals_delivery_wake_lanes() {
+        let root = temp_root("ops_control_stop_signals_delivery_wake_lanes");
+        let harness_home = root.join("harness");
+
+        let stop = record_ops_control(OpsControlOptions {
+            harness_home: harness_home.clone(),
+            action: OpsControlAction::Stop,
+            reason: None,
+            live_control_token: None,
+            now_ms: 1000,
+        })
+        .unwrap();
+
+        assert_eq!(stop.status, "stop-requested");
+        assert_eq!(
+            crate::wake::read_wake_sequence(
+                harness_home
+                    .join("state")
+                    .join("wake")
+                    .join("progress-delivery.json")
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            crate::wake::read_wake_sequence(
+                harness_home
+                    .join("state")
+                    .join("wake")
+                    .join("final-outbox.json")
+            )
+            .unwrap(),
+            1
+        );
 
         let _ = fs::remove_dir_all(root);
     }

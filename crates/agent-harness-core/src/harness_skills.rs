@@ -144,7 +144,7 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - /new starts or switches to a fresh session key for the channel and agent.
 - /think records reasoning-mode preference or instruction in channel state for future turns.
 - /stop records a stop request and reason.
-- /steer appends steering notes that affect future skill matching and turn context.
+- /steer appends steering notes for future skill matching and turn context. During an active Codex app-server turn for the same session, channel-apply also queues a `turn/steer` request under `state/runtime-queue/codex-turn-steer/`; codex-run sends it only after it has the real active turn id and records accepted/deferred receipts. If no active turn or turn id is available, the note remains passive next-turn context.
 - /btw appends side notes without resetting the session.
 - /model records a per-channel or per-session model override.
 - /status reports session, queue, runtime, model, and activation state.
@@ -267,6 +267,9 @@ Use status for operator-facing health checks before and after handoff:
 
 - Use `operation-plan` when a user task has multiple subgoals, dynamic follow-ups, reviewer loops, or sub-agent work. Plans live under `state/operation-plans/<plan-id>/` and should be treated as durable operational state.
 - Use `operation-plan --action create`, `add-item`, `update-item`, `delegate`, `promote`, `comment`, `block`, and `complete` to keep the plan current. Completing an item or plan should include evidence such as a receipt path, test command, reviewer result, or cutover record.
+- Use `--agent <id>` for plan creation. `--agent-id` is accepted as a compatibility alias, but injected examples should prefer `--agent`.
+- Use `--expected-version <item-version>` for `update-item` and `delegate`; read the current item version from the active plan snapshot before mutating it.
+- Advance item status through `todo -> ready -> running -> review -> done`; use `blocked` for real blockers from active states and `canceled` when work is intentionally abandoned.
 - Progress `todo` events are telemetry/rendering hints only; they are not durable planning state and must not replace OperationPlan items for multi-step work.
 - When sub-agent tooling is available and the task is inside CK's authorized delegation envelope, use sub-agents by default for bounded sidecar inspection, plan/diff review, documentation gap checks, test matrix review, and disjoint implementation slices unless CK explicitly says not to delegate.
 - CK's authorized delegation envelope includes explicit requests for sub-agents, delegation, parallel work, reviewer loops, smoke checks, long-running ops work, or naturally split sidecar inspection/verification tasks. It excludes tiny single-answer replies, destructive/live-control operations, auth or permission changes, external posts/messages, purchases/trades/spend, and any task where CK explicitly says not to delegate.

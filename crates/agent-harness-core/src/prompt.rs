@@ -470,14 +470,15 @@ Hermes-style OperationPlan support is available for this turn.
 Use OperationPlan when a request has more than one meaningful step, may discover new subtasks, needs review gates, or should delegate bounded work to subagents. Treat OperationPlan as the durable task to-do source of truth; runtime queue items are execution units only.
 
 CLI command surface:
-- Create: agent-harness operation-plan --target-home \"{}\" --action create --plan-id <stable-id> --session-key \"{}\" --agent-id \"{}\" --goal <goal>
+- Create: agent-harness operation-plan --target-home \"{}\" --action create --plan-id <stable-id> --session-key \"{}\" --agent \"{}\" --goal <goal>
 - Add item: agent-harness operation-plan --target-home \"{}\" --action add-item --plan-id <plan-id> --item-id <item-id> --title <title> --body <body> [--depends-on a,b]
-- Update item: agent-harness operation-plan --target-home \"{}\" --action update-item --plan-id <plan-id> --item-id <item-id> --status <todo|ready|running|review|done|blocked|canceled> [--add-evidence <note>]
-- Delegate item: agent-harness operation-plan --target-home \"{}\" --action delegate --plan-id <plan-id> --item-id <item-id> --assignee <subagent-or-worker> --idempotency-key <stable-key>
+- Update item: agent-harness operation-plan --target-home \"{}\" --action update-item --plan-id <plan-id> --item-id <item-id> --expected-version <item-version> --status <todo|ready|running|review|done|blocked|canceled> [--add-evidence <note>]
+- Delegate item: agent-harness operation-plan --target-home \"{}\" --action delegate --plan-id <plan-id> --item-id <item-id> --expected-version <item-version> --assignee <subagent-or-worker> --idempotency-key <stable-key>
 - Promote ready dependencies: agent-harness operation-plan --target-home \"{}\" --action promote --plan-id <plan-id>
 - Comment/block/complete: use --action comment, block, or complete with the same --plan-id.
 
 Maintenance rule: keep the plan current as work changes. Add newly discovered tasks, mark dependencies ready/running/review/done, attach evidence before completion, and keep only truly active work open.
+Item transitions are ordered: todo -> ready -> running -> review -> done. Use blocked for real blockers from todo/ready/running/review, and canceled when work is intentionally abandoned.
 ",
         harness_home.display(),
         turn.session_key,
@@ -1604,7 +1605,24 @@ mod tests {
             .find(|section| section.title == "OperationPlan task list")
             .unwrap();
         assert!(section.content.contains("Hermes-style OperationPlan"));
+        assert!(section.content.contains("--agent \"main\""));
+        assert!(!section.content.contains("--agent-id"));
         assert!(section.content.contains("--action add-item"));
+        assert!(
+            section
+                .content
+                .contains("--expected-version <item-version> --status")
+        );
+        assert!(
+            section
+                .content
+                .contains("--expected-version <item-version> --assignee")
+        );
+        assert!(
+            section
+                .content
+                .contains("todo -> ready -> running -> review -> done")
+        );
         assert!(section.content.contains("planId=streamline-1"));
         assert!(section.content.contains("itemId=wake-runtime"));
 

@@ -1436,8 +1436,11 @@ fn run_learning_review_job(
                 let _ = append_self_improvement_notification(harness_home, &target, text);
             }
         }
-    } else if bool_payload(&job.payload, &["notify"], false)
-        && report.proposals_created > 0
+    } else if bool_payload(
+        &job.payload,
+        &["notifyProposals", "notify_proposals"],
+        mode == SelfImprovementReviewMode::ProposeOnly,
+    ) && report.proposals_created > 0
         && let Some(target) = notification_target_from_payload(&job.payload)
     {
         let skill_id = string_path_any(&job.payload, &["targetSkillId", "target_skill_id"])
@@ -3003,6 +3006,79 @@ mod tests {
         assert!(outbox_text.contains(
             "Self-improvement review: Patched SKILL.md in skill 'workspace:quiet-cron-watchdogs' (1 replacement)."
         ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn self_improvement_dispatch_replace_does_not_notify_when_signal_is_not_actionable() {
+        let root = temp_root(
+            "self_improvement_dispatch_replace_does_not_notify_when_signal_is_not_actionable",
+        );
+        let harness_home = root.join(".agent-harness");
+        let skill_dir = root.join("skills").join("openclaw-agent-optimize");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill_file = skill_dir.join("SKILL.md");
+        fs::write(&skill_file, "# OpenClaw Agent Optimize\n\nOriginal.\n").unwrap();
+
+        enqueue_worker_job(WorkerEnqueueOptions {
+            harness_home: harness_home.clone(),
+            kind: WorkerJobKind::LearningReview,
+            lane: Some("learning_review".to_string()),
+            payload: json!({
+                "mode": "dispatch-and-replace",
+                "notify": true,
+                "targetSkillId": "workspace:openclaw-agent-optimize",
+                "targetPath": skill_file,
+                "signalText": "post-turn self-improvement review signal: selected skill failed once during runtime without a verified reusable fix",
+                "sourceTurn": "queue-low-confidence-1",
+                "channelTrust": "operator",
+                "notificationTarget": {
+                    "platform": "telegram",
+                    "channelId": "dm-1",
+                    "userId": "operator",
+                    "sessionKey": "session-1"
+                }
+            }),
+            idempotency_key: Some("self-improvement:queue-low-confidence-1".to_string()),
+            parent_job_id: None,
+            job_group_id: None,
+            master_agent_id: Some("main".to_string()),
+            master_session_key: Some("session-1".to_string()),
+            wake_policy: None,
+            source: Some("self-improvement-review".to_string()),
+            priority: 0,
+            available_at_ms: Some(1000),
+            max_attempts: 1,
+            timeout_ms: Some(DEFAULT_TIMEOUT_MS),
+            cascade_timeout_ms: None,
+            rate_key: None,
+            concurrency_group_key: None,
+            now_ms: 1000,
+        })
+        .unwrap();
+
+        let run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("learning_review".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1001,
+        })
+        .unwrap();
+
+        assert_eq!(run.status, WorkerRunOnceStatus::Completed);
+        let result = run.result.unwrap();
+        assert_eq!(result.status, WorkerJobStatus::Succeeded);
+        assert!(crate::skill_proposals_file(&harness_home).is_file());
+        let outbox_file = harness_home
+            .join("state")
+            .join("channels")
+            .join("outbox.jsonl");
+        assert!(
+            !outbox_file.exists(),
+            "low-confidence dispatch-and-replace fallback must not emit channel noise"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
