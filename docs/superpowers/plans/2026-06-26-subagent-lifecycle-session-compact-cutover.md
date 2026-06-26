@@ -286,4 +286,22 @@ Run final status review, stage only intended files, commit with an accurate mess
 - Reviewer follow-up completed: a static reviewer found that harness safety notices could make an empty Codex final look non-empty; `run_codex_runtime_rejects_completed_turn_with_only_harness_notice` now covers and prevents that path.
 - Repo-local Codex CLI/backend updated to `0.142.2`, the latest stable release on `openai/codex`; `0.143.0-alpha.*` remains pre-release.
 - Fresh validation passed after the reviewer follow-up: focused regressions, full core/CLI suites, Python gateway helper tests, Round9-1 matrix `20260626-195937-matrix.json` with `allOk=true`, staged candidate build SHA-256 `84D0A2418127449B089C8D0158A1B4AC6A0DB8280FCB5A473BD3D5C4551E1F2D`, public hygiene `forbiddenHits=[]`, and `git diff --check`.
-- Live cutover is intentionally not yet applied: approval is required for the live config change that disables Codex Windows sandbox mode and enables unattended approval acceptance.
+- Live cutover was intentionally not applied during the pre-cutover pass: approval was required for the live config change that disables Codex Windows sandbox mode and enables unattended approval acceptance.
+
+## Execution Evidence - 2026-06-26 Live Cutover
+
+- Operator approval was received for the live config patch and restart.
+- Live config backup: `.debug\round9-1\subagent-lifecycle\cutover-backups\20260626-202742\harness-config.json.pre-round9-1-session-compact-codex-0.142.2-cutover`.
+- Live security block after patch: `codexApprovalPolicy=accept`, `codexSandboxMode=disabled`, `codexSandboxPolicy=dangerFullAccess`; legacy `codexSandbox` was removed. `config-validate --harness-home .\.agent-harness` returned `status=valid`.
+- Guarded cutover ticket: `cutover-1782477023513`; request/apply receipts were appended under `.agent-harness\state\cutover\`.
+- Previous live binary backup: `target\debug\agent-harness.pre-round9-1-session-compact-20260626-203023.exe`, SHA-256 `946D0AC01F6DF266D2D356A5A8342B3D87238E9E7D56C8C653CDEC079BACA908`.
+- Canonical live binary after copy: `target\debug\agent-harness.exe`, SHA-256 `84D0A2418127449B089C8D0158A1B4AC6A0DB8280FCB5A473BD3D5C4551E1F2D`, size `21623296`.
+- Post-restart repair: the generated scheduled-task start path initially restored seven direct runners, leaving stale `telegram-loop-xiaoxiaoli`; a scoped `supervisor-reconcile --desired-services-json ... --apply` launched only `telegram-loop-xiaoxiaoli` and verified supervisor/child command lines with `--agent xiaoxiaoli` and `--telegram-account xiaoxiaoli`.
+- Generated Codex config refresh: `codex-plan` rewrote both `.agent-harness\codex-home\config.toml` and `.agent-harness\codex-home-providers\openrouter\config.toml`; neither contains `[windows]` or `sandbox =`.
+- Sandbox log tail check: no new post-cutover `codex-windows-sandbox-setup.exe` refresh was observed; the latest matching tail entries were pre-cutover lines around 16:21.
+- Post-cutover validation:
+  - `healthz --harness-home .\.agent-harness --require-writable-state`: `ready=true`, `live=true`, `readinessReady=true`, eight live non-stale loop heartbeats.
+  - `status --harness-home .\.agent-harness --json`: readiness `passed=58`, `warnings=2`, `failed=0`.
+  - `worker-status --harness-home .\.agent-harness`: `pending=0`, `leased=0`, `running=0`, `failedRetryable=0`, `failedTerminal=5`, `runtimeOpenItems=0`, `activeCronRuns=0`.
+  - Post-cutover matrix receipt `.debug\round9-1\subagent-lifecycle\receipts\20260626-204739-matrix.json`: `allOk=true`, gates G1-G5 true.
+  - `ops-cutover-receipt --harness-home .\.agent-harness`: `status=ready`, readiness `passed=58`, `warnings=2`, `failed=0`.
