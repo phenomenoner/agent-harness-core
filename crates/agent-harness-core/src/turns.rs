@@ -134,13 +134,15 @@ pub fn build_turn_plan(
         apply_agent_override(&mut model_policy, &mut thinking_policy, &agent_override);
     }
 
+    let selected_agent_id = agent.as_ref().map(|agent| agent.id.as_str());
     let channel_state = load_channel_state(
         input.harness_home.as_deref(),
         &input.platform,
         &input.channel_id,
         &input.user_id,
         &mut warnings,
-    );
+    )
+    .and_then(|state| channel_state_for_selected_agent(state, selected_agent_id, &mut warnings));
     if let Some(state) = &channel_state {
         apply_model_override(&mut model_policy, state);
         apply_thinking_override(&mut thinking_policy, state);
@@ -298,6 +300,45 @@ fn load_channel_state(
     }
 }
 
+fn channel_state_for_selected_agent(
+    state: ChannelSessionState,
+    selected_agent_id: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Option<ChannelSessionState> {
+    let Some(selected_agent_id) = selected_agent_id else {
+        return Some(state);
+    };
+    let selected_agent = normalize_key_part(selected_agent_id);
+    let state_agent = state.agent_id.as_deref().map(normalize_key_part);
+    let session_agent =
+        active_session_key_agent_segment(&state.active_session_key).map(normalize_key_part);
+    let state_matches = state_agent
+        .as_deref()
+        .map(|agent_id| agent_id == selected_agent)
+        .unwrap_or(true);
+    let session_matches = session_agent
+        .as_deref()
+        .map(|agent_id| agent_id == selected_agent)
+        .unwrap_or(true);
+    if state_matches && session_matches {
+        return Some(state);
+    }
+    warnings.push(format!(
+        "ignored channel session state for selected agent `{}` because state agent `{}` and active session agent `{}` did not match",
+        selected_agent_id,
+        state_agent.as_deref().unwrap_or("<unset>"),
+        session_agent.as_deref().unwrap_or("<unset>")
+    ));
+    None
+}
+
+fn active_session_key_agent_segment(session_key: &str) -> Option<&str> {
+    session_key
+        .split(':')
+        .nth(3)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
 fn load_agent_override(
     harness_home: Option<&Path>,
     agent_id: Option<&str>,
@@ -731,6 +772,69 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn turn_plan_ignores_channel_state_session_for_different_agent() {
+        let root = temp_root("turn_plan_ignores_channel_state_session_for_different_agent");
+        let source = write_turn_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_channel_state(
+            &harness_home,
+            r#"{
+              "schema": "agent-harness.channel-session-state.v1",
+              "platform": "telegram",
+              "channelId": "dm",
+              "userId": "user",
+              "activeSessionKey": "telegram:dm:user:main:session-1",
+              "agentId": "main",
+              "provider": "openai",
+              "model": "gpt-5",
+              "sessionTopic": "main work",
+              "modelOverride": "openai/gpt-5",
+              "modelOverrideProvider": "openai",
+              "modelOverrideModel": "gpt-5",
+              "thinkingEnabled": true,
+              "thinkingLevel": "high",
+              "steeringNotes": [
+                { "atMs": 1000, "text": "main-only steering" }
+              ],
+              "updatedAtMs": 1000
+            }"#,
+        );
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+
+        let plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "hello".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("other".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.agent.as_ref().unwrap().id, "other");
+        assert_eq!(plan.session_key, "telegram:dm:user:other");
+        assert_eq!(plan.model_policy.model.as_deref(), Some("gpt-5.4"));
+        assert!(!plan.thinking_policy.enabled);
+        assert!(plan.channel_state.is_none());
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("ignored channel session state"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
     #[test]
     fn turn_plan_applies_per_agent_global_overrides() {
         let root = temp_root("turn_plan_applies_per_agent_global_overrides");

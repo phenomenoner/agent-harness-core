@@ -418,7 +418,7 @@ fn auth_visibility(
     auth_lane: Option<&str>,
 ) -> String {
     if provider.is_some() && auth_lane.is_some() {
-        "receipt-visible".to_string()
+        "verified".to_string()
     } else if provider.is_some() || auth_lane.is_some() {
         "partial".to_string()
     } else {
@@ -440,9 +440,7 @@ fn auth_visibility_reason(
     auth_lane: Option<&str>,
 ) -> String {
     match visibility {
-        "receipt-visible" => {
-            "provider and auth lane were recorded in lifecycle payload".to_string()
-        }
+        "verified" => "provider and auth lane verified from lifecycle payload".to_string(),
         "partial" => format!(
             "provider/auth lane partially recorded in lifecycle payload; providerVisible={} authLaneVisible={}",
             provider.is_some(),
@@ -728,12 +726,12 @@ mod tests {
 
         assert_eq!(report.receipt.provider.as_deref(), Some("openai"));
         assert_eq!(report.receipt.auth_lane.as_deref(), Some("codex-oauth"));
-        assert_eq!(report.receipt.auth_visibility, "receipt-visible");
+        assert_eq!(report.receipt.auth_visibility, "verified");
         assert!(
             report
                 .receipt
                 .auth_visibility_reason
-                .contains("provider and auth lane were recorded")
+                .contains("provider and auth lane verified")
         );
 
         let _ = fs::remove_dir_all(root);

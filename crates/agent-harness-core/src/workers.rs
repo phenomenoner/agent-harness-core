@@ -2888,6 +2888,7 @@ mod tests {
         );
         assert_eq!(queued.receipt.provider.as_deref(), Some("openai"));
         assert_eq!(queued.receipt.auth_lane.as_deref(), Some("codex-oauth"));
+        assert_eq!(queued.receipt.auth_visibility, "verified");
         assert!(queued.snapshot_file.is_file());
 
         let run = run_worker_once(WorkerRunOnceOptions {
@@ -2920,6 +2921,7 @@ mod tests {
             running.receipt.runtime_queue_id.as_deref(),
             item["queueId"].as_str()
         );
+        assert_eq!(running.receipt.auth_visibility, "verified");
         assert!(running.receipt.terminal_receipt_file.is_none());
 
         let _ = fs::remove_dir_all(root);

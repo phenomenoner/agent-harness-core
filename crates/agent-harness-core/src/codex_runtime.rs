@@ -1624,16 +1624,21 @@ fn finish_codex_runtime_run(
     narration_config: &AssistantNarrationConfig,
     mut warnings: Vec<String>,
 ) -> io::Result<CodexRuntimeRunReport> {
-    let status = run_result.status;
-    let reason = run_result.reason.clone();
+    let mut status = run_result.status;
+    let mut reason = run_result.reason.clone();
     warnings.append(&mut run_result.warnings);
+    let captured_assistant_output = if run_result.assistant_final_found {
+        !run_result.assistant_message.trim().is_empty()
+    } else {
+        !run_result.assistant_raw_message.trim().is_empty()
+    };
+    if status == CodexRuntimeRunStatus::Completed && !captured_assistant_output {
+        warnings.push("Codex app-server completed without captured assistant text".to_string());
+        status = CodexRuntimeRunStatus::ProtocolError;
+        reason = "codex app-server completed without captured assistant output".to_string();
+    }
     let completion = if status == CodexRuntimeRunStatus::Completed {
-        let assistant_message = if run_result.assistant_message.trim().is_empty() {
-            warnings.push("Codex app-server completed without captured assistant text".to_string());
-            "(no assistant text captured from Codex app-server events)".to_string()
-        } else {
-            std::mem::take(&mut run_result.assistant_message)
-        };
+        let assistant_message = std::mem::take(&mut run_result.assistant_message);
         if !run_result.assistant_final_found && !run_result.assistant_raw_message.trim().is_empty()
         {
             warnings.push(
@@ -3629,6 +3634,34 @@ fn drive_codex_app_server(
             });
         }
     };
+    let assistant_output = state.assistant_message();
+    let assistant_message = state.assistant_message_with_harness_notices();
+    let assistant_narration = state.assistant_narration_records();
+    let assistant_raw_message = state.assistant_raw_message();
+    let assistant_final_found = state.assistant_final_found();
+    if status == CodexRuntimeRunStatus::Completed && assistant_output.trim().is_empty() {
+        finish_codex_child_and_stdout_reader(
+            &mut child,
+            &mut reader_handle,
+            &mut state.warnings,
+            "turn completed without assistant output",
+        );
+        return Ok(CodexAppServerRunResult {
+            status: CodexRuntimeRunStatus::ProtocolError,
+            reason: "codex app-server completed turn without captured assistant output".to_string(),
+            assistant_message,
+            assistant_narration,
+            assistant_raw_message,
+            assistant_final_found,
+            thread_id: Some(thread_id),
+            event_count: state.event_count,
+            usage: state.usage.clone(),
+            stdout_log: Some(stdout_log),
+            stderr_log: Some(stderr_log),
+            context_recovery,
+            warnings: state.warnings,
+        });
+    }
     finish_codex_child_and_stdout_reader(
         &mut child,
         &mut reader_handle,
@@ -3638,10 +3671,10 @@ fn drive_codex_app_server(
     Ok(CodexAppServerRunResult {
         status,
         reason: "codex app-server turn completed and assistant output was captured".to_string(),
-        assistant_message: state.assistant_message_with_harness_notices(),
-        assistant_narration: state.assistant_narration_records(),
-        assistant_raw_message: state.assistant_raw_message(),
-        assistant_final_found: state.assistant_final_found(),
+        assistant_message,
+        assistant_narration,
+        assistant_raw_message,
+        assistant_final_found,
         thread_id: Some(thread_id),
         event_count: state.event_count,
         usage: state.usage.clone(),
@@ -4335,8 +4368,12 @@ struct CodexProtocolState {
 }
 
 impl CodexProtocolState {
+    fn assistant_message(&self) -> String {
+        self.assistant_output.final_text_or_raw()
+    }
+
     fn assistant_message_with_harness_notices(&self) -> String {
-        let mut message = self.assistant_output.final_text_or_raw();
+        let mut message = self.assistant_message();
         if self.denied_approval_requests.is_empty() {
             return message;
         }
@@ -5245,6 +5282,13 @@ fn wait_for_thread_start(
                     });
                 }
                 if is_turn_completed(&value) {
+                    if is_compact_only_turn_completed(&value) {
+                        state.warnings.push(
+                            "ignored stale compact-only Codex turn/completed before user turn completion"
+                                .to_string(),
+                        );
+                        continue;
+                    }
                     record_turn_usage(&value, state);
                     if let Some(reason) = turn_completed_failure_reason(&value) {
                         return Ok(ProtocolWait::Failed(reason));
@@ -5308,12 +5352,13 @@ fn wait_for_context_compaction_completed(
     approval_policy: CodexApprovalPolicy,
     cancel_check: Option<&RuntimeCancelCheck>,
     narration_config: &AssistantNarrationConfig,
-    request_id: i64,
+    _request_id: i64,
 ) -> io::Result<ProtocolWait> {
-    let mut acknowledged = false;
-    let mut compaction_started = false;
+    let mut compaction_item_completed = false;
     loop {
-        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check, None)? {
+        let poll_interval = compaction_item_completed.then_some(Duration::from_millis(100));
+        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check, poll_interval)?
+        {
             ProtocolEvent::Json(value) => {
                 if let Some(error) = protocol_error(&value) {
                     return Ok(ProtocolWait::Failed(error));
@@ -5322,33 +5367,42 @@ fn wait_for_context_compaction_completed(
                 if answer_unattended_server_request(&value, stdin, state, approval_policy)? {
                     continue;
                 }
-                if json_id(&value) == Some(request_id) {
-                    acknowledged = true;
-                }
                 if is_context_compaction_started(&value) {
-                    compaction_started = true;
                     state
                         .warnings
                         .push("Codex official context compaction started".to_string());
                     continue;
                 }
-                if is_context_compaction_completed(&value) || is_thread_compacted(&value) {
+                if is_thread_compacted(&value) {
                     state
                         .warnings
                         .push("Codex official context compaction completed".to_string());
                     return Ok(ProtocolWait::CompactCompleted);
+                }
+                if is_context_compaction_completed(&value) {
+                    compaction_item_completed = true;
+                    continue;
                 }
                 if is_turn_completed(&value) {
                     record_turn_usage(&value, state);
                     if let Some(reason) = turn_completed_failure_reason(&value) {
                         return Ok(ProtocolWait::Failed(reason));
                     }
-                    if acknowledged || compaction_started {
+                    if compaction_item_completed {
+                        state
+                            .warnings
+                            .push("Codex official context compaction completed".to_string());
                         return Ok(ProtocolWait::CompactCompleted);
                     }
                     return Ok(ProtocolWait::TurnCompleted);
                 }
                 collect_agent_output(&value, state, progress, narration_config);
+            }
+            ProtocolEvent::Poll if compaction_item_completed => {
+                state
+                    .warnings
+                    .push("Codex official context compaction completed".to_string());
+                return Ok(ProtocolWait::CompactCompleted);
             }
             ProtocolEvent::Poll => continue,
             ProtocolEvent::TimedOut(reason) => return Ok(ProtocolWait::TimedOut(reason)),
@@ -5392,6 +5446,13 @@ fn wait_for_turn_completed(
                 }
                 collect_agent_output(&value, state, progress, narration_config);
                 if is_turn_completed(&value) {
+                    if is_compact_only_turn_completed(&value) {
+                        state.warnings.push(
+                            "ignored stale compact-only Codex turn/completed before user turn completion"
+                                .to_string(),
+                        );
+                        continue;
+                    }
                     record_turn_usage(&value, state);
                     if let Some(reason) = turn_completed_failure_reason(&value) {
                         return Ok(ProtocolWait::Failed(reason));
@@ -6109,6 +6170,26 @@ fn normalize_compaction_kind(value: &str) -> String {
         .replace(['_', '-', ' '], "")
 }
 
+fn is_compact_only_turn_completed(value: &Value) -> bool {
+    if !is_turn_completed(value) {
+        return false;
+    }
+    if first_string_pointer(value, &["/params/turn/id", "/params/turnId"])
+        .map(|id| id.to_ascii_lowercase().contains("compact"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let items_empty = value
+        .pointer("/params/turn/items")
+        .and_then(Value::as_array)
+        .map(Vec::is_empty)
+        .unwrap_or(false);
+    let items_not_loaded = first_string_pointer(value, &["/params/turn/itemsView"])
+        .map(|items_view| items_view.eq_ignore_ascii_case("notLoaded"))
+        .unwrap_or(false);
+    items_empty && items_not_loaded
+}
 fn turn_completed_failure_reason(value: &Value) -> Option<String> {
     if !is_turn_completed(value) {
         return None;
@@ -10029,6 +10110,87 @@ mod tests {
     }
 
     #[test]
+    fn run_codex_runtime_rejects_completed_turn_without_assistant_text() {
+        let root = temp_root("run_codex_runtime_rejects_completed_turn_without_assistant_text");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = empty_completion_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 10_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+        assert!(report.completion.is_none());
+        let run_file = report.run_file.unwrap();
+        let run_json = fs::read_to_string(run_file).unwrap();
+        assert!(!run_json.contains("(no assistant text captured"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_rejects_completed_turn_with_only_harness_notice() {
+        let root = temp_root("run_codex_runtime_rejects_completed_turn_with_only_harness_notice");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = denied_approval_empty_completion_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 10_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+        assert!(
+            report
+                .receipt
+                .reason
+                .contains("without captured assistant output")
+        );
+        assert!(report.completion.is_none());
+        assert!(report.warnings.iter().any(|warning| warning.contains(
+            "auto-cancelled Codex app-server request item/commandExecution/requestApproval"
+        )));
+        let run_file = report.run_file.unwrap();
+        let run_json = fs::read_to_string(run_file).unwrap();
+        assert!(!run_json.contains("(no assistant text captured"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_codex_runtime_context_error_maps_to_context_exhausted_when_recovery_disabled() {
         let root = temp_root(
             "run_codex_runtime_context_error_maps_to_context_exhausted_when_recovery_disabled",
@@ -10163,6 +10325,83 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn run_codex_runtime_preflight_drains_compact_turn_completed_before_user_turn() {
+        let root =
+            temp_root("run_codex_runtime_preflight_drains_compact_turn_completed_before_user_turn");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"codexContext":{"modelContextWindow":1000,"compactAtActiveContextRatio":0.5,"modelAutoCompactTokenLimit":900}}"#,
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan = plan_report.plan.as_ref().unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        replace_invocation_thread_id(plan_file, Some("thread-existing"));
+        let receipts_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-runtime-run-receipts.jsonl");
+        fs::write(
+            &receipts_file,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "codexBindingFile": plan.outputs.codex_binding_file.to_string_lossy(),
+                    "usage": {
+                        "inputTokens": 920,
+                        "outputTokens": 10,
+                        "totalTokens": 930,
+                        "source": "test"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let (executable, arguments, events_file) =
+            compact_turn_completed_then_reply_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 10_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert_eq!(
+            report
+                .receipt
+                .context_recovery
+                .as_ref()
+                .map(|receipt| receipt.status.as_str()),
+            Some("compact-before-turn")
+        );
+        let completion = report.completion.as_ref().unwrap();
+        let transcript = fs::read_to_string(completion.transcript_file.as_ref().unwrap()).unwrap();
+        assert!(transcript.contains("Reply after compact turn boundary."));
+        assert!(!transcript.contains("(no assistant text captured"));
+        let events = fs::read_to_string(events_file).unwrap();
+        let compact_index = events.find("thread/compact/start").unwrap();
+        let turn_index = events.find("turn/start").unwrap();
+        assert!(compact_index < turn_index);
+
+        let _ = fs::remove_dir_all(root);
+    }
     #[test]
     fn run_codex_runtime_preflight_compact_failure_falls_back_to_fresh_thread() {
         assert_preflight_compact_problem_falls_back("failed", 10_000);
@@ -11389,6 +11628,152 @@ while ($true) {
     }
 
     #[cfg(windows)]
+    fn compact_turn_completed_then_reply_app_server_command(
+        root: &Path,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("compact-turn-boundary-app-server.ps1");
+        let events = root.join("compact-turn-boundary-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+$events = Join-Path $PSScriptRoot 'compact-turn-boundary-events.jsonl'
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.method) { Add-Content -LiteralPath $events -Value $msg.method }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/resume') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/compact/start') {
+        [Console]::Out.WriteLine('{"id":2,"result":{}}')
+        [Console]::Out.WriteLine('{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"compact-turn","status":"completed","items":[]}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Reply after compact turn boundary.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+            events,
+        )
+    }
+
+    #[cfg(windows)]
+    fn empty_completion_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("empty-completion-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","items":[]}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
+    #[cfg(windows)]
+    fn denied_approval_empty_completion_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("denied-approval-empty-completion-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"id":77,"method":"item/commandExecution/requestApproval","params":{}}')
+        [Console]::Out.Flush()
+        $null = [Console]::In.ReadLine()
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","items":[]}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
+    #[cfg(windows)]
     fn preflight_compact_problem_then_fresh_thread_app_server_command(
         root: &Path,
         scenario: &str,
@@ -11839,6 +12224,116 @@ done
         )
     }
 
+    #[cfg(not(windows))]
+    fn compact_turn_completed_then_reply_app_server_command(
+        root: &Path,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("compact-turn-boundary-app-server.sh");
+        let events = root.join("compact-turn-boundary-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+events="$(dirname "$0")/compact-turn-boundary-events.jsonl"
+while IFS= read -r line; do
+    method="$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')"
+    [ -n "$method" ] && printf '%s\n' "$method" >> "$events"
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/resume"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"thread/compact/start"'*)
+            printf '%s\n' '{"id":2,"result":{}}'
+            printf '%s\n' '{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}'
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"compact-turn","status":"completed","items":[]}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Reply after compact turn boundary.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let _ = std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&script)
+            .status();
+        (
+            PathBuf::from("sh"),
+            vec![script.display().to_string()],
+            events,
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn empty_completion_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("empty-completion-app-server.sh");
+        fs::write(
+            &script,
+            r#"
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","items":[]}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let _ = std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&script)
+            .status();
+        (PathBuf::from("sh"), vec![script.display().to_string()])
+    }
+    #[cfg(not(windows))]
+    fn denied_approval_empty_completion_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("denied-approval-empty-completion-app-server.sh");
+        fs::write(
+            &script,
+            r#"
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"id":77,"method":"item/commandExecution/requestApproval","params":{}}'
+            IFS= read -r _approval_response || true
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","items":[]}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let _ = std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&script)
+            .status();
+        (PathBuf::from("sh"), vec![script.display().to_string()])
+    }
     #[cfg(not(windows))]
     fn preflight_compact_problem_then_fresh_thread_app_server_command(
         root: &Path,

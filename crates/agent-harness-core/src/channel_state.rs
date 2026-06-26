@@ -327,6 +327,16 @@ fn apply_effect(
             topic,
             new_session_key,
         } => {
+            if let Some(agent_id) = active_session_key_agent_segment(new_session_key) {
+                if state.agent_id.as_deref() != Some(agent_id.as_str()) {
+                    state.provider = None;
+                    state.model = None;
+                    state.model_override = None;
+                    state.model_override_provider = None;
+                    state.model_override_model = None;
+                }
+                state.agent_id = Some(agent_id);
+            }
             state.active_session_key = new_session_key.clone();
             state.session_topic = topic.clone();
             state.thinking_enabled = false;
@@ -454,6 +464,14 @@ fn apply_effect(
     Ok(())
 }
 
+fn active_session_key_agent_segment(session_key: &str) -> Option<String> {
+    session_key
+        .split(':')
+        .nth(3)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
 fn update_model_context(
     state: &mut ChannelSessionState,
     agent_id: &Option<String>,
@@ -808,6 +826,37 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn new_session_records_agent_from_new_session_key() {
+        let root = temp_root("new_session_records_agent_from_new_session_key");
+        let harness_home = root.join(".agent-harness");
+        let new_step = command_step_with_session(
+            "telegram:dm:user:main",
+            ChannelCommandEffect::StartNewSession {
+                topic: Some("xiaoxiaoli lane".to_string()),
+                new_session_key: "telegram:dm:user:xiaoxiaoli:session-1".to_string(),
+            },
+        );
+
+        let report = apply_channel_command_step(
+            &new_step,
+            ChannelCommandApplyOptions {
+                harness_home,
+                now_ms: 1000,
+            },
+        )
+        .unwrap();
+
+        let state = report.state.unwrap();
+        assert_eq!(
+            state.active_session_key,
+            "telegram:dm:user:xiaoxiaoli:session-1"
+        );
+        assert_eq!(state.agent_id.as_deref(), Some("xiaoxiaoli"));
+        assert_eq!(report.receipt.session_key, state.active_session_key);
+
+        let _ = fs::remove_dir_all(root);
+    }
     #[test]
     fn skips_non_command_steps() {
         let root = temp_root("skips_non_command_steps");

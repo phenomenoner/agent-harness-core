@@ -439,6 +439,7 @@ fn operation_plan_context_section(
     let summaries = list_operation_plans(harness_home.to_path_buf())?;
     let mut matching = Vec::new();
     let mut fallback = Vec::new();
+    let allow_fallback = agent_id.map(|agent_id| agent_id == "main").unwrap_or(true);
 
     for summary in summaries
         .into_iter()
@@ -458,7 +459,7 @@ fn operation_plan_context_section(
         let agent_match = agent_id.is_some_and(|agent_id| report.plan.agent_id == agent_id);
         if session_match || agent_match {
             matching.push(report);
-        } else if fallback.len() < 3 {
+        } else if allow_fallback && fallback.len() < 3 {
             fallback.push(report);
         }
         if matching.len() >= 3 {
@@ -1655,6 +1656,87 @@ mod tests {
     }
 
     #[test]
+    fn prompt_bundle_hides_main_operation_plan_from_other_agent() {
+        let root = temp_root("prompt_bundle_hides_main_operation_plan_from_other_agent");
+        let source = write_prompt_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        crate::operation_plan::create_operation_plan(
+            crate::operation_plan::CreateOperationPlanOptions {
+                harness_home: harness_home.clone(),
+                plan_id: "main-plan".to_string(),
+                origin_queue_id: Some("queue-main".to_string()),
+                session_key: "telegram:dm:user:main:session-1".to_string(),
+                agent_id: "main".to_string(),
+                goal: "Keep main-only operational work isolated".to_string(),
+                acceptance_criteria: None,
+                constraints: None,
+                max_open_items: Some(3),
+                max_fanout: Some(1),
+                now_ms: 1000,
+            },
+        )
+        .unwrap();
+        crate::operation_plan::add_operation_plan_item(
+            crate::operation_plan::OperationPlanAddItemOptions {
+                harness_home: harness_home.clone(),
+                plan_id: "main-plan".to_string(),
+                item_id: "main-secret-context".to_string(),
+                title: "Main-only context".to_string(),
+                body: "This item must not appear in other-agent prompts.".to_string(),
+                depends_on: Vec::new(),
+                acceptance_criteria: None,
+                risk: None,
+                now_ms: 1001,
+            },
+        )
+        .unwrap();
+        let plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "hello from other lane".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("other".to_string()),
+                session_hint: Some("telegram:dm:user:other:session-1".to_string()),
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        let bundle = assemble_prompt_bundle(
+            &plan,
+            PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        )
+        .unwrap();
+
+        let section = bundle
+            .sections
+            .iter()
+            .find(|section| section.title == "OperationPlan task list")
+            .unwrap();
+        assert!(section.content.contains("Hermes-style OperationPlan"));
+        assert!(
+            section
+                .content
+                .contains("Active OperationPlans: none visible")
+        );
+        assert!(!section.content.contains("planId=main-plan"));
+        assert!(!section.content.contains("itemId=main-secret-context"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
     fn prompt_tiers_emit_skill_index_and_invocation_envelope() {
         let root = temp_root("prompt_tiers_emit_skill_index_and_invocation_envelope");
         let source = write_prompt_source(&root);
@@ -2498,6 +2580,7 @@ mod tests {
         fs::create_dir_all(&workspace).unwrap();
         fs::create_dir_all(&skill).unwrap();
         fs::create_dir_all(home.join("agents").join("main").join("sessions")).unwrap();
+        fs::create_dir_all(home.join("agents").join("other").join("sessions")).unwrap();
         fs::write(workspace.join("AGENTS.md"), "# Agent prompt").unwrap();
         fs::write(workspace.join("SOUL.md"), "# Soul prompt").unwrap();
         fs::write(
@@ -2511,7 +2594,8 @@ mod tests {
               "agents": {
                 "defaults": { "provider": "openai", "model": "codex" },
                 "list": [
-                  { "id": "main", "model": "gpt-5", "enabled": true }
+                  { "id": "main", "model": "gpt-5", "enabled": true },
+                  { "id": "other", "model": "gpt-5.4", "enabled": true }
                 ]
               }
             }"#,
@@ -2520,6 +2604,14 @@ mod tests {
         fs::write(
             home.join("agents")
                 .join("main")
+                .join("sessions")
+                .join("sessions.json"),
+            "{}",
+        )
+        .unwrap();
+        fs::write(
+            home.join("agents")
+                .join("other")
                 .join("sessions")
                 .join("sessions.json"),
             "{}",
