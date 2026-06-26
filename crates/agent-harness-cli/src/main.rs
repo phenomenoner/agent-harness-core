@@ -7395,12 +7395,20 @@ fn run_subagent_lifecycle_smoke(
         &initial_lifecycle,
         args.now_ms.saturating_add(3),
     )?;
-    let lifecycle = show_subagent_lifecycle(SubagentLifecycleShowOptions {
+    let completed_lifecycle = show_subagent_lifecycle(SubagentLifecycleShowOptions {
         harness_home: target_home.clone(),
         subagent_id: subagent_id.clone(),
         now_ms: args.now_ms.saturating_add(4),
     })
     .map_err(|err| err.to_string())?;
+    let close_report =
+        agent_harness_core::close_subagent_lifecycle(SubagentLifecycleCloseOptions {
+            harness_home: target_home.clone(),
+            subagent_id: subagent_id.clone(),
+            reason: "subagent lifecycle no-write smoke close after completed wait".to_string(),
+            now_ms: args.now_ms.saturating_add(5),
+        })
+        .map_err(|err| err.to_string())?;
     let workspace_after = workspace_status_snapshot(&workspace, &target_home)?;
     let harness_after = filesystem_manifest_snapshot(&target_home, &[])?;
     let workspace_diff = snapshot_diff(&workspace_before.entries, &workspace_after.entries);
@@ -7422,7 +7430,9 @@ fn run_subagent_lifecycle_smoke(
         runtime_execution_mode:
             "deterministic-terminal-receipt-no-model-execution".to_string(),
         runtime_terminal_receipt_file: Some(runtime_terminal_receipt_file.clone()),
-        lifecycle,
+        completed_lifecycle,
+        close_report: close_report.clone(),
+        lifecycle: close_report,
         workspace_status_method: workspace_after.method,
         workspace_clean: workspace_diff.is_empty(),
         workspace_diff,
@@ -7443,7 +7453,7 @@ fn run_subagent_lifecycle_smoke(
                 .join("worker-llm.json"),
         ],
         prompt,
-        reason: "no-write smoke enqueued a deterministic llm_subagent runtime turn and recorded a terminal skipped receipt without invoking a model".to_string(),
+        reason: "no-write smoke enqueued a deterministic llm_subagent runtime turn, recorded a completed terminal receipt, and closed the lifecycle idempotently without invoking a model".to_string(),
     })
 }
 
@@ -8235,6 +8245,8 @@ struct SubagentLifecycleSmokeReport {
     run: WorkerRunOnceReport,
     runtime_execution_mode: String,
     runtime_terminal_receipt_file: Option<PathBuf>,
+    completed_lifecycle: SubagentLifecycleShowReport,
+    close_report: SubagentLifecycleShowReport,
     lifecycle: SubagentLifecycleShowReport,
     workspace_status_method: String,
     workspace_clean: bool,
@@ -19674,8 +19686,34 @@ mod tests {
                 .is_some_and(|path| path == terminal_file)
         );
         assert_eq!(
-            report.lifecycle.receipt.state,
+            report.completed_lifecycle.receipt.state,
             agent_harness_core::SubagentLifecycleState::Completed
+        );
+        assert_eq!(
+            report.lifecycle.receipt.state,
+            agent_harness_core::SubagentLifecycleState::AlreadyClosed
+        );
+        assert_eq!(
+            report.close_report.receipt.state,
+            agent_harness_core::SubagentLifecycleState::AlreadyClosed
+        );
+        assert_eq!(report.lifecycle.receipt.auth_visibility, "unverified");
+        assert!(
+            report
+                .lifecycle
+                .receipt
+                .auth_visibility_reason
+                .contains("Codex-auth status is unverified")
+        );
+        assert!(
+            report
+                .close_report
+                .receipt
+                .cleanup
+                .diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("close accepted idempotently")
         );
         assert!(report.prompt.contains("Do not edit files."));
 
@@ -19782,7 +19820,7 @@ mod tests {
                 "enabled": true,
                 "manageAllLoops": true,
                 "telegramLoops": [
-                  {"serviceId":"telegram-loop-xiaoxiaoli", "account":"xiaoxiaoli", "enabled": true}
+                  {"serviceId":"telegram-loop-xiaoxiaoli", "account":"xiaoxiaoli", "agent": "xiaoxiaoli", "enabled": true}
                 ]
               },
               "cronScheduler": {"enabled": true}
@@ -19849,6 +19887,14 @@ mod tests {
                 .args
                 .windows(2)
                 .any(|pair| { pair[0] == "--telegram-account" && pair[1] == "xiaoxiaoli" })
+        );
+        assert!(
+            xiaoxiaoli
+                .args
+                .windows(2)
+                .any(|pair| { pair[0] == "--agent" && pair[1] == "xiaoxiaoli" }),
+            "{:?}",
+            xiaoxiaoli.args
         );
 
         let _ = fs::remove_dir_all(root);
@@ -19992,6 +20038,8 @@ mod tests {
     fn write_loop_heartbeat_replaces_json_atomically() {
         let root = cli_temp_root("write_loop_heartbeat_replaces_json_atomically");
         let harness_home = root.join(".agent-harness");
+        let expected_observed_only =
+            env_bool("AGENT_HARNESS_SUPERVISOR_OBSERVED_ONLY").unwrap_or(true);
 
         write_loop_heartbeat(&harness_home, "runtime-loop", "running", 1, "first").unwrap();
         write_loop_heartbeat(&harness_home, "runtime-loop", "no-work", 2, "second").unwrap();
@@ -20042,7 +20090,7 @@ mod tests {
         assert_eq!(service["iteration"], 2);
         assert_eq!(service["actualState"], "no-work");
         assert_eq!(service["desiredState"], "running");
-        assert_eq!(service["observedOnly"], true);
+        assert_eq!(service["observedOnly"], expected_observed_only);
         assert_eq!(
             service["heartbeatFile"],
             heartbeat_file.display().to_string()

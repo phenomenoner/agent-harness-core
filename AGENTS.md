@@ -4,6 +4,10 @@
 
 - For a new working session, read [docs/agent-harness-operations-handbook.md](docs/agent-harness-operations-handbook.md) first: it holds the live topology, current live validation, the full command walkthrough, and the documentation map. The root `README.md` is the public-facing overview, not the operational source of truth.
 
+## Documentation Language
+
+- Write technical documents in English by default, including design notes, implementation plans, technical proposals, runbooks, backlog documents, and review artifacts, unless the user explicitly asks for another language.
+
 ## Default Superpowers For Development
 
 - For programming or software-development tasks, default to enabling and following [$superpowers](C:\Users\user\.agents\skills\superpowers\SKILL.md) before implementation unless the user explicitly says not to use it.
@@ -20,6 +24,11 @@
 - Prefer a single focused command that gathers the needed context over several simultaneous reviewed commands.
 - If an automatic approval review times out, retry at most once as a single command, then continue with a safer local alternative or ask the user for direction.
 - Always set a reasonable shell `timeout_ms` for commands that need automatic approval review when the tool supports it; this limits command runtime, not the reviewer's wait time.
+
+## External Review Tools
+
+- CK authorizes `claude -p` as a whitelisted external review mechanism in this repository when the user explicitly requests Claude review, review loops, or `claude -p`. It may receive the scoped technical document, plan, diff, or code excerpt needed for that requested review.
+- Do not include secrets, credentials, private tokens, raw `.env` contents, or unrelated workspace data in `claude -p` prompts. Keep prompts scoped to the review target and record the review outcome in the relevant debug/review artifact when applicable.
 
 ## Live Harness Safety
 

@@ -108,6 +108,52 @@ Important core modules:
 - `supervisor.rs`: Windows scheduled task script generation with runtime-loop safe-mode restart flags.
 - `cron.rs`, `deterministic_cron.rs`, `subagents.rs`: import/dry-run planning lanes.
 
+First-citizen multi-agent invariant:
+
+- Agent identity is a routing boundary, not just a prompt/persona label. The
+  resolved `agentId` must control the provider/model defaults, generated Codex
+  home lane, memory namespace, transcript/session paths, command-state
+  overrides, prompt/skill surface, and channel policy used for a turn.
+- Account or channel loops for a named agent must preserve that named agent
+  through ingress, queueing, preparation, Codex planning, delivery receipts, and
+  supervisor/reconcile command generation. For example, a Telegram loop for
+  `xiaoxiaoli` must dispatch as agent `xiaoxiaoli`, not as `main`, so its
+  OpenRouter provider/model lane and agent-specific state remain isolated.
+- The preferred architecture is one upgraded/managed Codex backend binary and
+  runtime implementation shared by all agents, with per-agent profiles and
+  settings layered on top. Upgrading Codex should normally be one backend
+  maintenance action, not a per-agent binary migration.
+- Shared runtime components may reuse the same binary and worker machinery, but
+  they must not collapse provider-specific profiles/settings into the shared
+  default profile. OpenRouter-backed agents use provider-specific generated
+  Codex homes or equivalent per-agent profile directories such as
+  `codex-home-providers/openrouter`; the shared `codex-home` remains the
+  default OpenAI/Codex OAuth route.
+- If a route cannot prove the provider/auth lane used for a sub-agent or
+  delegated worker, receipts must explicitly mark the lane as unavailable or
+  unverified instead of implying that the main Codex/OAuth lane was used.
+- Regression tests for channel loops, supervisor reconciliation, runtime
+  planning, and sub-agent lifecycle should include at least one non-main agent
+  with a non-default provider path. A green `main` smoke is not sufficient proof
+  of multi-agent correctness.
+
+Nested image verification ops rule:
+
+- Social-image generation and refine checks are long-running nested tool lanes,
+  not good interactive-turn work. Route probes can pass while a later final or
+  bone-refine call returns `IMAGE_GENERATION_FAILED_NO_TOOL`; if that happens
+  inside a live channel turn and the outer Codex app-server does not emit a
+  final answer, the harness idle watchdog can mark the whole turn as timed out.
+- Prefer worker/long-task lanes for production image verification. If a manual
+  interactive run is unavoidable, runner scripts must fail fast with a
+  machine-readable terminal summary instead of relying on Python tracebacks or
+  longer outer timeouts. `workspace/tools/run_v12_21c_geo_sparse_manual.py`
+  writes `run-terminal-summary.json` and prints `RUNNER_TERMINAL_SUMMARY:{...}`
+  when `gateway_image_generate.py` records a nested image route failure.
+- Increasing the outer Codex timeout is not a primary fix for nested image
+  failures; use terminal summaries, worker receipts, and explicit route/failure
+  receipts so the live channel can close cleanly.
+
 Auxiliary tooling:
 
 - `tools/agent-discord-gateway/index.mjs`: Node Discord Gateway wrapper.

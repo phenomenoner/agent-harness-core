@@ -69,6 +69,8 @@ pub struct SubagentLifecycleReceipt {
     pub provider: Option<String>,
     pub auth_lane: Option<String>,
     pub auth_visibility: String,
+    #[serde(default = "default_auth_visibility_reason")]
+    pub auth_visibility_reason: String,
     pub state: SubagentLifecycleState,
     pub cleanup: SubagentLifecycleCleanup,
     pub changed_files: Vec<String>,
@@ -84,6 +86,8 @@ pub struct SubagentLifecycleCleanup {
     pub close_requested: bool,
     pub cleanup_proven: bool,
     pub owner_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -127,6 +131,9 @@ pub fn show_subagent_lifecycle(
     let receipt = if snapshot_file.is_file() {
         let text = fs::read_to_string(&snapshot_file)?;
         serde_json::from_str::<SubagentLifecycleReceipt>(&text).map_err(io::Error::other)?
+    } else if let Some(receipt) = latest_receipt_from_ledger(&receipts_file, &options.subagent_id)?
+    {
+        receipt
     } else {
         unknown_receipt(&options.harness_home, &options.subagent_id, options.now_ms)
     };
@@ -163,6 +170,12 @@ pub fn record_subagent_lifecycle(
     );
     let auth_visibility =
         auth_visibility(existing.as_ref(), provider.as_deref(), auth_lane.as_deref());
+    let auth_visibility_reason = auth_visibility_reason(
+        existing.as_ref(),
+        &auth_visibility,
+        provider.as_deref(),
+        auth_lane.as_deref(),
+    );
 
     let receipt = SubagentLifecycleReceipt {
         schema: SUBAGENT_LIFECYCLE_SCHEMA.to_string(),
@@ -210,6 +223,7 @@ pub fn record_subagent_lifecycle(
         provider,
         auth_lane,
         auth_visibility,
+        auth_visibility_reason,
         state: options.state,
         cleanup: existing
             .as_ref()
@@ -218,6 +232,7 @@ pub fn record_subagent_lifecycle(
                 close_requested: false,
                 cleanup_proven: false,
                 owner_path: worker_store_owner_path(&options.harness_home),
+                diagnostic: None,
             }),
         changed_files: if options.changed_files.is_empty() {
             existing
@@ -256,6 +271,7 @@ pub fn close_subagent_lifecycle(
         now_ms: options.now_ms,
     })?;
     let mut receipt = current.receipt;
+    let previous_state = receipt.state;
     let already_closed =
         receipt.cleanup.close_requested || receipt.state == SubagentLifecycleState::AlreadyClosed;
     let cleanup_proven = receipt.cleanup.cleanup_proven
@@ -266,6 +282,12 @@ pub fn close_subagent_lifecycle(
     receipt.schema = SUBAGENT_LIFECYCLE_SCHEMA.to_string();
     receipt.cleanup.close_requested = true;
     receipt.cleanup.cleanup_proven = cleanup_proven;
+    receipt.cleanup.diagnostic = Some(close_diagnostic(
+        previous_state,
+        cleanup_proven,
+        current.snapshot_file.is_file(),
+        receipt.terminal_receipt_file.as_ref(),
+    ));
     receipt.state = SubagentLifecycleState::AlreadyClosed;
     let mut reason = if already_closed {
         format!(
@@ -340,11 +362,13 @@ fn unknown_receipt(
         provider: None,
         auth_lane: None,
         auth_visibility: "unverified".to_string(),
+        auth_visibility_reason: default_auth_visibility_reason(),
         state: SubagentLifecycleState::Unknown,
         cleanup: SubagentLifecycleCleanup {
             close_requested: false,
             cleanup_proven: false,
             owner_path: worker_store_owner_path(harness_home),
+            diagnostic: None,
         },
         changed_files: Vec::new(),
         terminal_receipt_file: None,
@@ -359,6 +383,29 @@ fn worker_store_owner_path(harness_home: &Path) -> PathBuf {
         .join("state")
         .join("workers")
         .join("worker-jobs.sqlite")
+}
+
+fn latest_receipt_from_ledger(
+    receipts_file: &Path,
+    subagent_id: &str,
+) -> io::Result<Option<SubagentLifecycleReceipt>> {
+    if !receipts_file.is_file() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(receipts_file)?;
+    let mut latest = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let receipt =
+            serde_json::from_str::<SubagentLifecycleReceipt>(trimmed).map_err(io::Error::other)?;
+        if receipt.subagent_id == subagent_id {
+            latest = Some(receipt);
+        }
+    }
+    Ok(latest)
 }
 
 fn merge_option<T>(new_value: Option<T>, existing_value: Option<T>) -> Option<T> {
@@ -379,6 +426,65 @@ fn auth_visibility(
             .map(|receipt| receipt.auth_visibility.clone())
             .unwrap_or_else(|| "unverified".to_string())
     }
+}
+
+fn default_auth_visibility_reason() -> String {
+    "provider/auth lane unavailable in lifecycle payload; Codex-auth status is unverified"
+        .to_string()
+}
+
+fn auth_visibility_reason(
+    existing: Option<&SubagentLifecycleReceipt>,
+    visibility: &str,
+    provider: Option<&str>,
+    auth_lane: Option<&str>,
+) -> String {
+    match visibility {
+        "receipt-visible" => {
+            "provider and auth lane were recorded in lifecycle payload".to_string()
+        }
+        "partial" => format!(
+            "provider/auth lane partially recorded in lifecycle payload; providerVisible={} authLaneVisible={}",
+            provider.is_some(),
+            auth_lane.is_some()
+        ),
+        _ => existing
+            .map(|receipt| receipt.auth_visibility_reason.clone())
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or_else(default_auth_visibility_reason),
+    }
+}
+
+fn close_diagnostic(
+    previous_state: SubagentLifecycleState,
+    cleanup_proven: bool,
+    snapshot_exists: bool,
+    terminal_receipt_file: Option<&PathBuf>,
+) -> String {
+    if cleanup_proven {
+        return "close accepted idempotently; terminal receipt file exists".to_string();
+    }
+    if matches!(
+        previous_state,
+        SubagentLifecycleState::Completed
+            | SubagentLifecycleState::Expired
+            | SubagentLifecycleState::AlreadyClosed
+    ) {
+        return format!(
+            "close accepted idempotently for terminal state {previous_state:?}; cleanup proof unavailable; snapshotExists={snapshot_exists} terminalReceiptFile={}",
+            terminal_receipt_file
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".to_string())
+        );
+    }
+    if previous_state == SubagentLifecycleState::Unknown {
+        return format!(
+            "close accepted idempotently for unknown or already-cleaned worker id; no durable owner was found; snapshotExists={snapshot_exists}"
+        );
+    }
+    format!(
+        "close requested for non-terminal state {previous_state:?}; cleanup proof unavailable; snapshotExists={snapshot_exists}"
+    )
 }
 
 fn safe_file_part(value: &str) -> String {
@@ -434,6 +540,12 @@ mod tests {
         assert_eq!(report.receipt.state, SubagentLifecycleState::Unknown);
         assert_eq!(report.receipt.source, "external");
         assert_eq!(report.receipt.auth_visibility, "unverified");
+        assert!(
+            report
+                .receipt
+                .auth_visibility_reason
+                .contains("Codex-auth status is unverified")
+        );
         assert_eq!(
             report.receipt.cleanup.owner_path,
             harness_home
@@ -489,10 +601,102 @@ mod tests {
         assert_eq!(first.receipt.state, SubagentLifecycleState::AlreadyClosed);
         assert!(first.receipt.cleanup.close_requested);
         assert!(!first.receipt.cleanup.cleanup_proven);
+        assert!(
+            first
+                .receipt
+                .cleanup
+                .diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("non-terminal state Running")
+        );
         assert!(first.receipt.reason.contains("cleanup proof unavailable"));
         assert_eq!(second.receipt.state, SubagentLifecycleState::AlreadyClosed);
         assert!(second.receipt.reason.contains("already recorded"));
         assert!(second.receipt.reason.contains("cleanup proof unavailable"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subagent_lifecycle_close_uses_receipt_ledger_when_snapshot_was_cleaned() {
+        let root = temp_root("close_from_ledger");
+        let harness_home = root.join(".agent-harness");
+
+        let completed = record_subagent_lifecycle(SubagentLifecycleRecordOptions {
+            harness_home: harness_home.clone(),
+            subagent_id: "subagent:completed-cleaned".to_string(),
+            state: SubagentLifecycleState::Completed,
+            source: Some("worker-dispatch".to_string()),
+            operation_plan_id: None,
+            operation_plan_item_id: None,
+            worker_job_id: Some("job-1".to_string()),
+            runtime_queue_id: Some("worker:1".to_string()),
+            requested_model: Some("gpt-5.3-codex-spark".to_string()),
+            resolved_model: Some("gpt-5.3-codex-spark".to_string()),
+            provider: None,
+            auth_lane: None,
+            changed_files: Vec::new(),
+            terminal_receipt_file: None,
+            reason: "completed; provider/auth lane unavailable in worker receipt".to_string(),
+            now_ms: 11,
+        })
+        .unwrap();
+        fs::remove_file(&completed.snapshot_file).unwrap();
+
+        let closed = close_subagent_lifecycle(SubagentLifecycleCloseOptions {
+            harness_home: harness_home.clone(),
+            subagent_id: "subagent:completed-cleaned".to_string(),
+            reason: "operator close after completed worker disappeared".to_string(),
+            now_ms: 12,
+        })
+        .unwrap();
+
+        assert_eq!(closed.receipt.state, SubagentLifecycleState::AlreadyClosed);
+        assert_eq!(closed.receipt.worker_job_id.as_deref(), Some("job-1"));
+        assert_eq!(
+            closed.receipt.auth_visibility_reason,
+            default_auth_visibility_reason()
+        );
+        assert!(closed.receipt.cleanup.close_requested);
+        assert!(!closed.receipt.cleanup.cleanup_proven);
+        assert!(
+            closed
+                .receipt
+                .cleanup
+                .diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("terminal state Completed")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subagent_lifecycle_close_unknown_id_is_idempotent_diagnostic() {
+        let root = temp_root("close_unknown");
+        let harness_home = root.join(".agent-harness");
+
+        let closed = close_subagent_lifecycle(SubagentLifecycleCloseOptions {
+            harness_home: harness_home.clone(),
+            subagent_id: "subagent:already-cleaned".to_string(),
+            reason: "operator close for already-cleaned worker".to_string(),
+            now_ms: 12,
+        })
+        .unwrap();
+
+        assert_eq!(closed.receipt.state, SubagentLifecycleState::AlreadyClosed);
+        assert!(closed.receipt.cleanup.close_requested);
+        assert!(
+            closed
+                .receipt
+                .cleanup
+                .diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unknown or already-cleaned worker id")
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -525,6 +729,12 @@ mod tests {
         assert_eq!(report.receipt.provider.as_deref(), Some("openai"));
         assert_eq!(report.receipt.auth_lane.as_deref(), Some("codex-oauth"));
         assert_eq!(report.receipt.auth_visibility, "receipt-visible");
+        assert!(
+            report
+                .receipt
+                .auth_visibility_reason
+                .contains("provider and auth lane were recorded")
+        );
 
         let _ = fs::remove_dir_all(root);
     }
