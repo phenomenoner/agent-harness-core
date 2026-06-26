@@ -37,13 +37,15 @@ Primary topology:
 - Retired legacy source snapshot archive: `imports/openclaw-core-snapshot`
 - Retired previous activation harness backup: `imports/activation-harness`
 - Retired labels only: `.openclaw`, Docker gateway names, `/root/.openclaw`, `/home/agent/.openclaw`, and `/workspace`
-- Runtime workspace/Codex cwd for live loops: `D:\Warehouse\Research\OpenClaw_WSL`
+- Runtime workspace/Codex cwd for live loops: `.agent-harness`
 - Harness CLI: `target/debug/agent-harness.exe`
-- Codex CLI used by loops: `.tools/codex-cli/node_modules/.bin/codex.cmd`
+- Codex CLI used by loops: `.tools/codex-cli/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe`
 
 ## Current Baseline
 
-Latest local status after the 2026-06-10 repo-local harness-home rebase, round3 fixes, review remediation, round3-1 runtime/channel fixes, runtime UX hardening, durable supervisor fallback/log retention, assistant narration routing, supervisor regeneration, Round4 live-control, and Round4-3 live robustness work:
+The authoritative live baseline is the top `Current Live Validation` section in `docs/agent-harness-operations-handbook.md`. As of 2026-06-26, the live cutover is Round9-1 source commit `628fe36`, canonical binary SHA-256 `946D0AC01F6DF266D2D356A5A8342B3D87238E9E7D56C8C653CDEC079BACA908`, cutover ticket `cutover-1782447196301`, and post-cutover readiness `passed=58 warnings=2 failed=0` with eight supervisor-reconcile-owned services. `telegram-loop-xiaoxiaoli` must preserve `--agent xiaoxiaoli` through supervisor and child command lines.
+
+The older notes below are historical design context from earlier rounds. Do not use them as the current live validation source when they disagree with the operations handbook.
 
 - Round4-3 staged implementation adds runtime-loop Windows sharing-violation retry/serialization, runtime queue lease lock close-before-remove, retryable `lease-busy`, supervised safe-mode restart, cron scheduler lint/interval-floor/stale-lock handling, and bounded tail-sampled status/readiness scans.
 - Readiness after the Round4-2 cutover was `ready=true`, `passed=59`, `warnings=0`, `failed=0`. Exact pass counts may drift as checks are added; runtime-loop missing/stale/error/stopped/stopping is now a failed live/readiness state, while runtime-loop `safe-mode` is a degraded warning.
