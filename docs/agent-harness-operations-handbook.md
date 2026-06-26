@@ -138,6 +138,7 @@ Documentation map:
 - [TG/Discord DM Self-Check Guide](agent-harness-channel-self-check.md): operator prompt/checklist for asking `main` to self-check the live channel paths.
 - [Function Self-Check Guide](agent-harness-function-self-check-guide.md): agent checklist for proving new or changed Rust functions, CLI commands, receipts, and runtime paths before handoff.
 - [Worker Dispatch Strategy](agent-worker-dispatch-strategy.md): durable worker, cron, subagent, watchdog, and concurrency design.
+- [RLM Integration Design](rlm-integration-design.md): design boundary for using Recursive Language Model engines as bounded reasoning workers inside the harness, including adapter, Rust-native control loop, and trust-boundary guidance.
 - [Round3-2 Implementation And Upgrade Plan](round3-2-implementation-and-upgrade-plan.md): timeout/progress fixes, background-job contract, long-task contract, and Hermes-style learning-loop roadmap.
 - [Project Assessment](project-assessment.md): broader historical assessment; prefer the handoff/parity/readiness docs above for current live state.
 - [Doc Writing Guidelines](../DOC-GUIDELINES.md): document roles, style rules for public vs internal docs, hygiene hard rules, and update discipline.
