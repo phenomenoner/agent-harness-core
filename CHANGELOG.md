@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased - 2026-06-26
+
+### Changed
+
+- Completed the Round9-1 lifecycle and image-timeout follow-up live cutover. The live `agent-harness.exe` now runs source commit `628fe36` and preserves `telegram-loop-xiaoxiaoli` as agent `xiaoxiaoli` through supervisor reconciliation instead of falling back to `main`.
+- Tightened sub-agent lifecycle receipts so unknown or already-terminal close paths stay idempotent without claiming cleanup proof, and smoke receipts report provider/auth visibility as unverified when the lane is unavailable.
+- Documented nested social-image verification as worker/long-task work with terminal image-route summaries instead of relying on longer outer interactive Codex timeouts.
+
+### Verification
+
+- Round9-1 fresh validation passed `cargo fmt --all -- --check`, workspace check, `agent-harness-core` tests (431 unit tests plus 5 integration tests and doc tests), `agent-harness-cli` tests (53), image helper tests (14), sparse-runner tests (6), staged build, public export hygiene with `forbiddenHits=[]`, and `git diff --check`.
+- Live cutover ticket `cutover-1782447196301` advanced canonical `target\debug\agent-harness.exe` to SHA-256 `946D0AC01F6DF266D2D356A5A8342B3D87238E9E7D56C8C653CDEC079BACA908`, backed up the previous binary as `target\debug\agent-harness.pre-round9-1-followup-20260626-122051.exe`, and recorded `ops-cutover-receipt status=ready`.
+- Post-cutover validation reported `healthz ready=true live=true readinessReady=true`, readiness `passed=58 warnings=2 failed=0`, worker idle gate `pending=0 leased=0 running=0 failedRetryable=0 runtimeOpenItems=0 activeCronRuns=0`, and `telegram-loop-xiaoxiaoli` command lines containing `--agent xiaoxiaoli`.
+
 ## v0.1.2 - 2026-06-21
 
 ### Changed

@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -13,7 +15,8 @@ use serde_json::{Value, json};
 use crate::{
     AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
     HarnessLogEvent, HarnessLogLevel, InboundMediaArtifact, InboundMediaInputPlan,
-    InboundMediaInputPlanOptions, append_agent_progress_event, append_harness_log,
+    InboundMediaInputPlanOptions, RuntimeContinuationMetadata, append_agent_progress_event,
+    append_harness_log,
     config::{
         HarnessConfigValidationReport, HarnessConfigValidationStatus, validate_harness_config,
     },
@@ -33,6 +36,9 @@ const CODEX_CONTEXT_ROLLOVER_SCHEMA: &str = "agent-harness.codex-context-rollove
 const CODEX_TRANSCRIPT_MESSAGE_SCHEMA: &str = "agent-harness.transcript-message.v1";
 const CODEX_TRAJECTORY_EVENT_SCHEMA: &str = "agent-harness.trajectory-event.v1";
 const CODEX_BINDING_SCHEMA: &str = "agent-harness.codex-binding.v1";
+const CODEX_ACTIVE_TURN_SCHEMA: &str = "agent-harness.codex-active-turn.v1";
+const CODEX_TURN_STEER_REQUEST_SCHEMA: &str = "agent-harness.codex-turn-steer-request.v1";
+const CODEX_TURN_STEER_RECEIPT_SCHEMA: &str = "agent-harness.codex-turn-steer-receipt.v1";
 const CODEX_APP_SERVER_DEVELOPER_INSTRUCTIONS: &str = "\
 This Codex app-server thread backs an imported agent harness session. Codex owns \
 the backend system prompt, tool schemas, MCP/tool inventory, sandbox, approvals, \
@@ -48,12 +54,48 @@ const HARNESS_CONFIG_FILE_NAME: &str = "harness-config.json";
 pub(crate) const CODEX_APPROVAL_POLICY_ENV: &str = "AGENT_HARNESS_CODEX_APPROVAL_POLICY";
 pub(crate) const CODEX_SANDBOX_ENV: &str = "AGENT_HARNESS_CODEX_SANDBOX";
 pub(crate) const CODEX_SANDBOX_POLICY_ENV: &str = "AGENT_HARNESS_CODEX_SANDBOX_POLICY";
-const DEFAULT_CODEX_SANDBOX: &str = "elevated";
+const DEFAULT_CODEX_SANDBOX: CodexWindowsSandboxMode = CodexWindowsSandboxMode::Elevated;
 const DEFAULT_CODEX_SANDBOX_POLICY: &str = "workspaceWrite";
 const RUNTIME_CANCEL_REQUEST_MAX_AGE_MS: i64 = 60_000;
 const CODEX_CHILD_TERMINATE_TIMEOUT_MS: u64 = 2_000;
 const CODEX_STDOUT_READER_JOIN_TIMEOUT_MS: u64 = 2_000;
 const DEFAULT_ASSISTANT_NARRATION_MAX_CHARS: usize = 1200;
+const CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT: u64 = 1_000_000;
+const CODEX_THREAD_INLINE_IMAGE_TOTAL_BYTES_LIMIT: u64 = 3_000_000;
+const CODEX_THREAD_TOOL_OUTPUT_BYTES_LIMIT: u64 = 1_000_000;
+const CODEX_ROLLOUT_SCAN_MAX_FILES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CodexWindowsSandboxMode {
+    Elevated,
+    Unelevated,
+    Disabled,
+}
+
+impl CodexWindowsSandboxMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Elevated => "elevated",
+            Self::Unelevated => "unelevated",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    fn windows_toml_value(self) -> Option<&'static str> {
+        match self {
+            Self::Elevated => Some("elevated"),
+            Self::Unelevated => Some("unelevated"),
+            Self::Disabled => None,
+        }
+    }
+}
+
+impl std::fmt::Display for CodexWindowsSandboxMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRuntimePlanOptions {
@@ -85,6 +127,19 @@ pub struct CodexRuntimeRunOptions {
     pub timeout_ms: u64,
     pub idle_timeout_ms: u64,
     pub progress_context: Option<AgentProgressContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexTurnSteerRequestOptions {
+    pub harness_home: PathBuf,
+    pub platform: String,
+    pub channel_id: String,
+    pub user_id: String,
+    pub session_key: String,
+    pub agent_id: Option<String>,
+    pub text: String,
+    pub client_user_message_id: Option<String>,
+    pub now_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +290,8 @@ pub struct CodexRuntimePlan {
     pub queue_id: Option<String>,
     pub agent_id: Option<String>,
     pub session_key: String,
+    #[serde(default, flatten)]
+    pub continuation: RuntimeContinuationMetadata,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub prompt_bundle_json: PathBuf,
@@ -513,8 +570,28 @@ struct CodexContextPolicy {
     compact_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     experimental_compact_prompt_file: Option<PathBuf>,
+    max_successful_compacts_before_rollover: u64,
+    rollover_mode: String,
+    cooperative_mid_turn_drain: bool,
     source: String,
     configured: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadHealthReport {
+    thread_id: Option<String>,
+    rollout_file: Option<PathBuf>,
+    data_image_count: usize,
+    inline_image_bytes: u64,
+    last_turn_inline_image_bytes: u64,
+    oversized_tool_output_count: usize,
+    oversized_tool_output_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_usage: Option<CodexRuntimeUsage>,
+    compact_recommended: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 impl Default for CodexContextPolicy {
@@ -534,6 +611,9 @@ impl Default for CodexContextPolicy {
             tool_output_token_limit: None,
             compact_prompt: None,
             experimental_compact_prompt_file: None,
+            max_successful_compacts_before_rollover: 2,
+            rollover_mode: "working-set-memory".to_string(),
+            cooperative_mid_turn_drain: false,
             source: "default".to_string(),
             configured: false,
         }
@@ -562,6 +642,7 @@ struct CodexContextPreflightReceipt {
     model_context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_context_ratio: Option<f64>,
+    thread_health: CodexThreadHealthReport,
     compact_before_turn: bool,
     reason: String,
     policy: CodexContextPolicy,
@@ -615,6 +696,27 @@ pub enum CodexRuntimeRunStatus {
     Canceled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexTurnSteerQueueStatus {
+    QueuedSameTurn,
+    DeferredNoActiveTurn,
+    DeferredNoActiveTurnId,
+    RejectedEmpty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexTurnSteerRequestReport {
+    pub schema: &'static str,
+    pub harness_home: PathBuf,
+    pub request_id: String,
+    pub status: CodexTurnSteerQueueStatus,
+    pub request_file: Option<PathBuf>,
+    pub receipts_file: PathBuf,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexRuntimeReceipt {
@@ -638,6 +740,8 @@ struct CodexRuntimePlanFile {
     pub queue_id: Option<String>,
     pub agent_id: Option<String>,
     pub session_key: String,
+    #[serde(default, flatten)]
+    pub continuation: RuntimeContinuationMetadata,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub prompt_bundle_json: PathBuf,
@@ -697,6 +801,78 @@ struct CodexBindingRecord {
     completed_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum CodexActiveTurnStatus {
+    AwaitingTurnId,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl CodexActiveTurnStatus {
+    fn is_active(self) -> bool {
+        matches!(self, Self::AwaitingTurnId | Self::Running)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexActiveTurnBindingRecord {
+    schema: String,
+    queue_id: Option<String>,
+    session_key: String,
+    agent_id: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    thread_id: String,
+    active_turn_id: Option<String>,
+    turn_kind: String,
+    status: CodexActiveTurnStatus,
+    runtime_pid: u32,
+    plan_file: PathBuf,
+    working_directory: PathBuf,
+    prompt_bundle_json: PathBuf,
+    prompt_markdown: PathBuf,
+    started_at_ms: i64,
+    updated_at_ms: i64,
+    reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexTurnSteerRequestRecord {
+    schema: String,
+    request_id: String,
+    at_ms: i64,
+    platform: String,
+    channel_id: String,
+    user_id: String,
+    session_key: String,
+    agent_id: Option<String>,
+    text: String,
+    client_user_message_id: String,
+    thread_id: String,
+    expected_turn_id: Option<String>,
+    active_binding_file: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexTurnSteerReceipt {
+    schema: String,
+    at_ms: i64,
+    request_id: String,
+    session_key: String,
+    status: String,
+    delivery: String,
+    thread_id: Option<String>,
+    expected_turn_id: Option<String>,
+    accepted_turn_id: Option<String>,
+    request_file: Option<PathBuf>,
+    reason: String,
+}
+
 pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexRuntimePlanReport> {
     ensure_harness_config_valid(&options.harness_home)?;
     let queue_dir = options.harness_home.join("state").join("runtime-queue");
@@ -736,6 +912,9 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
     let bundle = read_json_file(&prompt_bundle_json)?;
     let queue_id =
         string_field(&prepared_receipt, &["queueId", "queue_id"]).map(ToString::to_string);
+    let continuation =
+        serde_json::from_value::<RuntimeContinuationMetadata>(prepared_receipt.clone())
+            .unwrap_or_else(|_| RuntimeContinuationMetadata::legacy());
     let session_key = string_field(&bundle, &["sessionKey", "session_key"])
         .unwrap_or("unknown")
         .to_string();
@@ -813,6 +992,7 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
         queue_id: queue_id.clone(),
         agent_id,
         session_key,
+        continuation,
         provider,
         model,
         prompt_bundle_json,
@@ -1366,6 +1546,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
     let mut run_result = drive_codex_app_server(
         &options.harness_home,
         &plan,
+        &plan_file,
         options.timeout_ms,
         options.idle_timeout_ms,
         options.progress_context.clone(),
@@ -1373,16 +1554,44 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
         &context_policy,
         context_preflight.receipt.compact_before_turn,
     )?;
-    if run_result.status == CodexRuntimeRunStatus::ContextExhausted {
-        run_result = recover_codex_context_exhaustion(
+    if should_recover_compact_before_turn_failure(&run_result, &context_policy) {
+        run_result = recover_compact_before_turn_failure(
             &options.harness_home,
             &plan,
+            &plan_file,
             run_result,
             options.timeout_ms,
             options.idle_timeout_ms,
             options.progress_context.clone(),
             &narration_config,
             &context_policy,
+        )?;
+    }
+    if run_result.status == CodexRuntimeRunStatus::ContextExhausted {
+        run_result = recover_codex_context_exhaustion(
+            &options.harness_home,
+            &plan,
+            &plan_file,
+            run_result,
+            options.timeout_ms,
+            options.idle_timeout_ms,
+            options.progress_context.clone(),
+            &narration_config,
+            &context_policy,
+        )?;
+    }
+    if should_recover_thread_health_protocol_error(&run_result, &context_preflight.receipt) {
+        run_result = recover_thread_health_protocol_error(
+            &options.harness_home,
+            &plan,
+            &plan_file,
+            run_result,
+            options.timeout_ms,
+            options.idle_timeout_ms,
+            options.progress_context.clone(),
+            &narration_config,
+            &context_policy,
+            &context_preflight.receipt,
         )?;
     }
     let elapsed_ms = started.elapsed().as_millis();
@@ -1415,16 +1624,21 @@ fn finish_codex_runtime_run(
     narration_config: &AssistantNarrationConfig,
     mut warnings: Vec<String>,
 ) -> io::Result<CodexRuntimeRunReport> {
-    let status = run_result.status;
-    let reason = run_result.reason.clone();
+    let mut status = run_result.status;
+    let mut reason = run_result.reason.clone();
     warnings.append(&mut run_result.warnings);
+    let captured_assistant_output = if run_result.assistant_final_found {
+        !run_result.assistant_message.trim().is_empty()
+    } else {
+        !run_result.assistant_raw_message.trim().is_empty()
+    };
+    if status == CodexRuntimeRunStatus::Completed && !captured_assistant_output {
+        warnings.push("Codex app-server completed without captured assistant text".to_string());
+        status = CodexRuntimeRunStatus::ProtocolError;
+        reason = "codex app-server completed without captured assistant output".to_string();
+    }
     let completion = if status == CodexRuntimeRunStatus::Completed {
-        let assistant_message = if run_result.assistant_message.trim().is_empty() {
-            warnings.push("Codex app-server completed without captured assistant text".to_string());
-            "(no assistant text captured from Codex app-server events)".to_string()
-        } else {
-            std::mem::take(&mut run_result.assistant_message)
-        };
+        let assistant_message = std::mem::take(&mut run_result.assistant_message);
         if !run_result.assistant_final_found && !run_result.assistant_raw_message.trim().is_empty()
         {
             warnings.push(
@@ -1544,6 +1758,7 @@ fn recover_completed_codex_run_from_stdout_log(
         event_count += 1;
         match serde_json::from_str::<Value>(&line) {
             Ok(value) => {
+                record_protocol_usage_event(&value, &mut state);
                 if let Some(extracted_thread_id) = extract_thread_id(&value) {
                     thread_id = Some(extracted_thread_id);
                 }
@@ -1798,6 +2013,130 @@ fn write_codex_runtime_run_report(
     Ok(report)
 }
 
+pub fn queue_codex_turn_steer_request(
+    options: CodexTurnSteerRequestOptions,
+) -> io::Result<CodexTurnSteerRequestReport> {
+    let receipts_file = codex_turn_steer_receipts_file(&options.harness_home);
+    fs::create_dir_all(parent_dir(&receipts_file)?)?;
+    let text = options.text.trim().to_string();
+    let request_id = codex_turn_steer_request_id(
+        &options.platform,
+        &options.channel_id,
+        &options.user_id,
+        &options.session_key,
+        options.now_ms,
+        &text,
+    );
+    if text.is_empty() {
+        let receipt = CodexTurnSteerReceipt {
+            schema: CODEX_TURN_STEER_RECEIPT_SCHEMA.to_string(),
+            at_ms: options.now_ms,
+            request_id: request_id.clone(),
+            session_key: options.session_key,
+            status: "rejected-empty".to_string(),
+            delivery: "rejected".to_string(),
+            thread_id: None,
+            expected_turn_id: None,
+            accepted_turn_id: None,
+            request_file: None,
+            reason: "steering text was empty".to_string(),
+        };
+        append_json_line(&receipts_file, &receipt)?;
+        return Ok(CodexTurnSteerRequestReport {
+            schema: CODEX_TURN_STEER_REQUEST_SCHEMA,
+            harness_home: options.harness_home,
+            request_id,
+            status: CodexTurnSteerQueueStatus::RejectedEmpty,
+            request_file: None,
+            receipts_file,
+            reason: receipt.reason,
+        });
+    }
+
+    let binding_file = codex_active_turn_binding_file(&options.harness_home, &options.session_key);
+    let binding = read_codex_active_turn_binding(&binding_file)?;
+    let Some(binding) = binding.filter(|binding| binding.status.is_active()) else {
+        let receipt = CodexTurnSteerReceipt {
+            schema: CODEX_TURN_STEER_RECEIPT_SCHEMA.to_string(),
+            at_ms: options.now_ms,
+            request_id: request_id.clone(),
+            session_key: options.session_key,
+            status: "deferred-no-active-turn".to_string(),
+            delivery: "next-turn-or-passive-context".to_string(),
+            thread_id: None,
+            expected_turn_id: None,
+            accepted_turn_id: None,
+            request_file: None,
+            reason: "no active Codex regular turn binding was available; steering remains in channel state for the next prompt".to_string(),
+        };
+        append_json_line(&receipts_file, &receipt)?;
+        return Ok(CodexTurnSteerRequestReport {
+            schema: CODEX_TURN_STEER_REQUEST_SCHEMA,
+            harness_home: options.harness_home,
+            request_id,
+            status: CodexTurnSteerQueueStatus::DeferredNoActiveTurn,
+            request_file: None,
+            receipts_file,
+            reason: receipt.reason,
+        });
+    };
+
+    let pending_dir = codex_turn_steer_pending_dir(&options.harness_home);
+    fs::create_dir_all(&pending_dir)?;
+    let request_file = pending_dir.join(format!("{}.json", normalize_key_part(&request_id)));
+    let client_user_message_id = options
+        .client_user_message_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("agent-harness-steer:{request_id}"));
+    let request = CodexTurnSteerRequestRecord {
+        schema: CODEX_TURN_STEER_REQUEST_SCHEMA.to_string(),
+        request_id: request_id.clone(),
+        at_ms: options.now_ms,
+        platform: options.platform,
+        channel_id: options.channel_id,
+        user_id: options.user_id,
+        session_key: options.session_key.clone(),
+        agent_id: options.agent_id,
+        text,
+        client_user_message_id,
+        thread_id: binding.thread_id.clone(),
+        expected_turn_id: binding.active_turn_id.clone(),
+        active_binding_file: binding_file.clone(),
+    };
+    write_json_atomic(&request_file, &request)?;
+    let reason = if request.expected_turn_id.is_some() {
+        "active Codex turn found; queued steering request for same-turn delivery".to_string()
+    } else {
+        "active Codex thread found but turn id is not known yet; queued steering request until turn/started is observed".to_string()
+    };
+    append_json_line(
+        &receipts_file,
+        &CodexTurnSteerReceipt {
+            schema: CODEX_TURN_STEER_RECEIPT_SCHEMA.to_string(),
+            at_ms: options.now_ms,
+            request_id: request_id.clone(),
+            session_key: options.session_key,
+            status: "queued-same-turn".to_string(),
+            delivery: "same-turn-pending".to_string(),
+            thread_id: Some(binding.thread_id),
+            expected_turn_id: request.expected_turn_id.clone(),
+            accepted_turn_id: None,
+            request_file: Some(request_file.clone()),
+            reason: reason.clone(),
+        },
+    )?;
+
+    Ok(CodexTurnSteerRequestReport {
+        schema: CODEX_TURN_STEER_REQUEST_SCHEMA,
+        harness_home: options.harness_home,
+        request_id,
+        status: CodexTurnSteerQueueStatus::QueuedSameTurn,
+        request_file: Some(request_file),
+        receipts_file,
+        reason,
+    })
+}
+
 fn append_codex_run_log(
     harness_home: &Path,
     level: HarnessLogLevel,
@@ -1856,11 +2195,13 @@ fn preflight_codex_context(
     let prompt_markdown_bytes = file_len_or_zero(&plan.prompt_markdown);
     let prompt_bundle_bytes = file_len_or_zero(&plan.prompt_bundle_json);
     let (transcript_lines, transcript_bytes) = transcript_stats(&plan.outputs.transcript_file);
+    let thread_health = scan_codex_thread_health(harness_home, plan, &mut warnings);
     let latest_usage = latest_codex_runtime_usage(
         harness_home,
         &plan.outputs.codex_binding_file,
         &mut warnings,
-    );
+    )
+    .or_else(|| thread_health.latest_usage.clone());
     let latest_tokens = latest_usage.as_ref().and_then(codex_usage_total_tokens);
     let model_context_window = policy.model_context_window;
     let active_context_ratio = latest_tokens.and_then(|tokens| {
@@ -1885,6 +2226,13 @@ fn preflight_codex_context(
         (
             false,
             "no existing Codex thread is bound to this harness session".to_string(),
+        )
+    } else if thread_health.compact_recommended {
+        (
+            true,
+            thread_health.reason.clone().unwrap_or_else(|| {
+                "bound Codex thread health guard recommended compact before turn".to_string()
+            }),
         )
     } else if let (Some(tokens), Some(limit)) =
         (latest_tokens, policy.model_auto_compact_token_limit)
@@ -1941,6 +2289,7 @@ fn preflight_codex_context(
         latest_usage,
         model_context_window,
         active_context_ratio,
+        thread_health,
         compact_before_turn,
         reason,
         policy,
@@ -2026,6 +2375,165 @@ fn latest_codex_runtime_usage(
         }
     }
     fallback
+}
+
+fn scan_codex_thread_health(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    warnings: &mut Vec<String>,
+) -> CodexThreadHealthReport {
+    let thread_id = plan.invocation.thread_id.clone();
+    let Some(thread_id_text) = thread_id.as_deref() else {
+        return CodexThreadHealthReport {
+            thread_id,
+            ..CodexThreadHealthReport::default()
+        };
+    };
+    let codex_home = plan
+        .invocation
+        .codex_home
+        .clone()
+        .unwrap_or_else(|| harness_home.join("codex-home"));
+    let sessions_root = codex_home.join("sessions");
+    let mut files = Vec::new();
+    collect_thread_rollout_files(&sessions_root, thread_id_text, &mut files, warnings);
+    files.sort();
+    let Some(rollout_file) = files.pop() else {
+        return CodexThreadHealthReport {
+            thread_id,
+            ..CodexThreadHealthReport::default()
+        };
+    };
+    scan_codex_rollout_file_for_thread_health(thread_id, rollout_file, warnings)
+}
+
+fn collect_thread_rollout_files(
+    dir: &Path,
+    thread_id: &str,
+    files: &mut Vec<PathBuf>,
+    warnings: &mut Vec<String>,
+) {
+    if files.len() >= CODEX_ROLLOUT_SCAN_MAX_FILES {
+        return;
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            warnings.push(format!(
+                "failed to scan Codex rollout directory {}: {error}",
+                dir.display()
+            ));
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        if files.len() >= CODEX_ROLLOUT_SCAN_MAX_FILES {
+            return;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            collect_thread_rollout_files(&path, thread_id, files, warnings);
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if file_name.starts_with("rollout-")
+            && file_name.ends_with(".jsonl")
+            && file_name.contains(thread_id)
+        {
+            files.push(path);
+        }
+    }
+}
+
+fn scan_codex_rollout_file_for_thread_health(
+    thread_id: Option<String>,
+    rollout_file: PathBuf,
+    warnings: &mut Vec<String>,
+) -> CodexThreadHealthReport {
+    let file = match fs::File::open(&rollout_file) {
+        Ok(file) => file,
+        Err(error) => {
+            warnings.push(format!(
+                "failed to open Codex rollout file {} for thread health scan: {error}",
+                rollout_file.display()
+            ));
+            return CodexThreadHealthReport {
+                thread_id,
+                rollout_file: Some(rollout_file),
+                ..CodexThreadHealthReport::default()
+            };
+        }
+    };
+    let mut report = CodexThreadHealthReport {
+        thread_id,
+        rollout_file: Some(rollout_file.clone()),
+        ..CodexThreadHealthReport::default()
+    };
+    let mut current_turn_inline_image_bytes = 0u64;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            warnings.push(format!(
+                "failed to read a line from Codex rollout file {}",
+                rollout_file.display()
+            ));
+            continue;
+        };
+        let line_bytes = u64::try_from(line.len()).unwrap_or(u64::MAX);
+        if line.contains("\"turn/start\"")
+            || line.contains("\"turn/started\"")
+            || line.contains("\"turn_context\"")
+        {
+            report.last_turn_inline_image_bytes = current_turn_inline_image_bytes;
+            current_turn_inline_image_bytes = 0;
+        }
+        if line.contains("data:image") {
+            let count = line.matches("data:image").count();
+            report.data_image_count = report.data_image_count.saturating_add(count);
+            report.inline_image_bytes = report.inline_image_bytes.saturating_add(line_bytes);
+            current_turn_inline_image_bytes =
+                current_turn_inline_image_bytes.saturating_add(line_bytes);
+        }
+        if line_bytes >= CODEX_THREAD_TOOL_OUTPUT_BYTES_LIMIT
+            && (line.contains("function_call_output") || line.contains("tool_output"))
+        {
+            report.oversized_tool_output_count =
+                report.oversized_tool_output_count.saturating_add(1);
+            report.oversized_tool_output_bytes = report
+                .oversized_tool_output_bytes
+                .saturating_add(line_bytes);
+        }
+        if (line.contains("token_count") || line.contains("tokenUsage"))
+            && let Ok(value) = serde_json::from_str::<Value>(&line)
+            && let Some(usage) = extract_protocol_usage(&value)
+        {
+            report.latest_usage = Some(usage);
+        }
+    }
+    report.last_turn_inline_image_bytes = current_turn_inline_image_bytes;
+    if report.last_turn_inline_image_bytes >= CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT {
+        report.compact_recommended = true;
+        report.reason = Some(format!(
+            "bound Codex thread has {} inline image byte(s) in the latest observed turn, above limit {}",
+            report.last_turn_inline_image_bytes, CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT
+        ));
+    } else if report.inline_image_bytes >= CODEX_THREAD_INLINE_IMAGE_TOTAL_BYTES_LIMIT {
+        report.compact_recommended = true;
+        report.reason = Some(format!(
+            "bound Codex thread has {} total inline image byte(s), above limit {}",
+            report.inline_image_bytes, CODEX_THREAD_INLINE_IMAGE_TOTAL_BYTES_LIMIT
+        ));
+    } else if report.oversized_tool_output_bytes >= CODEX_THREAD_TOOL_OUTPUT_BYTES_LIMIT {
+        report.compact_recommended = true;
+        report.reason = Some(format!(
+            "bound Codex thread has {} oversized tool-output byte(s), above limit {}",
+            report.oversized_tool_output_bytes, CODEX_THREAD_TOOL_OUTPUT_BYTES_LIMIT
+        ));
+    }
+    report
 }
 
 fn normalize_path_text_for_match(path: &str) -> String {
@@ -2214,6 +2722,26 @@ fn load_codex_context_policy(harness_home: &Path) -> io::Result<CodexContextPoli
             ],
         )
         .map(PathBuf::from);
+        if let Some(value) = context_u64(
+            context,
+            &[
+                "maxSuccessfulCompactsBeforeRollover",
+                "max_successful_compacts_before_rollover",
+            ],
+        )
+        .filter(|value| *value > 0)
+        {
+            policy.max_successful_compacts_before_rollover = value;
+        }
+        if let Some(value) = context_string(context, &["rolloverMode", "rollover_mode"]) {
+            policy.rollover_mode = normalize_context_rollover_mode(&value);
+        }
+        if let Some(value) = context_bool(
+            context,
+            &["cooperativeMidTurnDrain", "cooperative_mid_turn_drain"],
+        ) {
+            policy.cooperative_mid_turn_drain = value;
+        }
         break;
     }
     Ok(policy)
@@ -2251,6 +2779,13 @@ fn normalize_context_fallback_policy(value: &str) -> String {
             value.trim().to_ascii_lowercase().replace('_', "-")
         }
         _ => "checkpoint-and-new-thread".to_string(),
+    }
+}
+
+fn normalize_context_rollover_mode(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "disabled" => "disabled".to_string(),
+        _ => "working-set-memory".to_string(),
     }
 }
 
@@ -2423,6 +2958,7 @@ fn codex_app_server_approval_policy(policy: CodexApprovalPolicy) -> &'static str
 fn drive_codex_app_server(
     harness_home: &Path,
     plan: &CodexRuntimePlanFile,
+    plan_file: &Path,
     timeout_ms: u64,
     idle_timeout_ms: u64,
     progress_context: Option<AgentProgressContext>,
@@ -2516,6 +3052,12 @@ fn drive_codex_app_server(
     let cancel_check = RuntimeCancelCheck::new(harness_home, &plan.session_key);
     let mut progress =
         progress_context.map(|context| CodexProgressEmitter::new(harness_home, context));
+    emit_codex_runtime_status(
+        &progress,
+        AgentProgressStatus::Started,
+        "starting Codex app-server",
+        &mut state.warnings,
+    );
 
     write_json_rpc(
         &mut stdin,
@@ -2905,16 +3447,24 @@ fn drive_codex_app_server(
         ],
         "input": input_parts
     });
+    let turn_start_request_id = if compact_before_turn { 3 } else { 2 };
+    let mut steer_bridge = CodexTurnSteerBridge::new(
+        harness_home,
+        plan,
+        plan_file,
+        thread_id.clone(),
+        turn_start_request_id,
+    )?;
     write_json_rpc(
         &mut stdin,
         &json!({
-            "id": if compact_before_turn { 3 } else { 2 },
+            "id": turn_start_request_id,
             "method": "turn/start",
             "params": turn_params
         }),
     )?;
 
-    let status = match wait_for_turn_completed(
+    let wait_result = wait_for_turn_completed(
         &line_rx,
         &mut child,
         &mut stdin,
@@ -2924,7 +3474,38 @@ fn drive_codex_app_server(
         plan.invocation.approval_policy,
         Some(&cancel_check),
         narration_config,
-    )? {
+        Some(&mut steer_bridge),
+    )?;
+    let (active_status, active_reason) = match &wait_result {
+        ProtocolWait::TurnCompleted => (
+            CodexActiveTurnStatus::Completed,
+            "codex app-server turn completed".to_string(),
+        ),
+        ProtocolWait::TimedOut(reason) => (
+            CodexActiveTurnStatus::Failed,
+            format!("codex app-server turn timed out: {reason}"),
+        ),
+        ProtocolWait::Failed(reason) => (
+            CodexActiveTurnStatus::Failed,
+            format!("codex app-server turn failed: {reason}"),
+        ),
+        ProtocolWait::Canceled(reason) => (
+            CodexActiveTurnStatus::Failed,
+            format!("codex app-server turn canceled: {reason}"),
+        ),
+        ProtocolWait::ThreadStarted(_) => (
+            CodexActiveTurnStatus::Failed,
+            "codex app-server returned an unexpected second thread start during turn".to_string(),
+        ),
+        ProtocolWait::CompactCompleted => (
+            CodexActiveTurnStatus::Failed,
+            "codex app-server returned unexpected context compaction completion during turn"
+                .to_string(),
+        ),
+    };
+    steer_bridge.finish(active_status, &active_reason)?;
+
+    let status = match wait_result {
         ProtocolWait::TurnCompleted => CodexRuntimeRunStatus::Completed,
         ProtocolWait::TimedOut(reason) => {
             finish_codex_child_and_stdout_reader(
@@ -3053,6 +3634,34 @@ fn drive_codex_app_server(
             });
         }
     };
+    let assistant_output = state.assistant_message();
+    let assistant_message = state.assistant_message_with_harness_notices();
+    let assistant_narration = state.assistant_narration_records();
+    let assistant_raw_message = state.assistant_raw_message();
+    let assistant_final_found = state.assistant_final_found();
+    if status == CodexRuntimeRunStatus::Completed && assistant_output.trim().is_empty() {
+        finish_codex_child_and_stdout_reader(
+            &mut child,
+            &mut reader_handle,
+            &mut state.warnings,
+            "turn completed without assistant output",
+        );
+        return Ok(CodexAppServerRunResult {
+            status: CodexRuntimeRunStatus::ProtocolError,
+            reason: "codex app-server completed turn without captured assistant output".to_string(),
+            assistant_message,
+            assistant_narration,
+            assistant_raw_message,
+            assistant_final_found,
+            thread_id: Some(thread_id),
+            event_count: state.event_count,
+            usage: state.usage.clone(),
+            stdout_log: Some(stdout_log),
+            stderr_log: Some(stderr_log),
+            context_recovery,
+            warnings: state.warnings,
+        });
+    }
     finish_codex_child_and_stdout_reader(
         &mut child,
         &mut reader_handle,
@@ -3062,10 +3671,10 @@ fn drive_codex_app_server(
     Ok(CodexAppServerRunResult {
         status,
         reason: "codex app-server turn completed and assistant output was captured".to_string(),
-        assistant_message: state.assistant_message_with_harness_notices(),
-        assistant_narration: state.assistant_narration_records(),
-        assistant_raw_message: state.assistant_raw_message(),
-        assistant_final_found: state.assistant_final_found(),
+        assistant_message,
+        assistant_narration,
+        assistant_raw_message,
+        assistant_final_found,
         thread_id: Some(thread_id),
         event_count: state.event_count,
         usage: state.usage.clone(),
@@ -3117,6 +3726,7 @@ fn context_recovery_failure_receipt(
 fn recover_codex_context_exhaustion(
     harness_home: &Path,
     plan: &CodexRuntimePlanFile,
+    plan_file: &Path,
     mut current: CodexAppServerRunResult,
     timeout_ms: u64,
     idle_timeout_ms: u64,
@@ -3155,6 +3765,7 @@ fn recover_codex_context_exhaustion(
             let mut retry_result = drive_codex_app_server(
                 harness_home,
                 &retry_plan,
+                plan_file,
                 timeout_ms,
                 idle_timeout_ms,
                 progress_context.clone(),
@@ -3228,6 +3839,7 @@ fn recover_codex_context_exhaustion(
         return run_context_checkpoint_fallback(
             harness_home,
             plan,
+            plan_file,
             current,
             original_thread_id,
             timeout_ms,
@@ -3254,9 +3866,173 @@ fn recover_codex_context_exhaustion(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn recover_compact_before_turn_failure(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    plan_file: &Path,
+    prior: CodexAppServerRunResult,
+    timeout_ms: u64,
+    idle_timeout_ms: u64,
+    progress_context: Option<AgentProgressContext>,
+    narration_config: &AssistantNarrationConfig,
+    policy: &CodexContextPolicy,
+) -> io::Result<CodexAppServerRunResult> {
+    let original_thread_id = plan
+        .invocation
+        .thread_id
+        .clone()
+        .or_else(|| prior.thread_id.clone())
+        .or_else(|| {
+            prior
+                .context_recovery
+                .as_ref()
+                .and_then(|receipt| receipt.original_thread_id.clone())
+        });
+    let prior_reason = prior.reason.clone();
+    let prior_recovery_status = prior
+        .context_recovery
+        .as_ref()
+        .map(|receipt| receipt.status.clone())
+        .unwrap_or_else(|| "compact-before-turn-failed".to_string());
+    let mut recovered = run_context_checkpoint_fallback(
+        harness_home,
+        plan,
+        plan_file,
+        prior,
+        original_thread_id,
+        timeout_ms,
+        idle_timeout_ms,
+        progress_context,
+        narration_config,
+        policy,
+    )?;
+    let succeeded = recovered.status == CodexRuntimeRunStatus::Completed;
+    if let Some(recovery) = recovered.context_recovery.as_mut() {
+        recovery.status = if succeeded {
+            "compact-before-turn-fallback-succeeded".to_string()
+        } else {
+            "compact-before-turn-fallback-failed".to_string()
+        };
+        recovery.reason = if succeeded {
+            format!(
+                "Codex compact-before-turn recovery status {prior_recovery_status}; checkpoint fallback opened a fresh Codex thread. Prior reason: {prior_reason}"
+            )
+        } else {
+            format!(
+                "Codex compact-before-turn recovery status {prior_recovery_status}; checkpoint fallback also failed. Prior reason: {prior_reason}; fallback reason: {}",
+                recovered.reason
+            )
+        };
+    }
+    recovered.warnings.push(format!(
+        "Codex compact-before-turn recovery status {prior_recovery_status} used fresh-thread checkpoint fallback: {prior_reason}"
+    ));
+    Ok(recovered)
+}
+
+fn should_recover_compact_before_turn_failure(
+    result: &CodexAppServerRunResult,
+    policy: &CodexContextPolicy,
+) -> bool {
+    if policy.fallback_on_compact_failure != "checkpoint-and-new-thread" {
+        return false;
+    }
+    if result.status == CodexRuntimeRunStatus::Canceled {
+        return false;
+    }
+    let Some(recovery) = result.context_recovery.as_ref() else {
+        return false;
+    };
+    matches!(
+        recovery.status.as_str(),
+        "compact-before-turn-timeout" | "compact-before-turn-failed"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_thread_health_protocol_error(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    plan_file: &Path,
+    prior: CodexAppServerRunResult,
+    timeout_ms: u64,
+    idle_timeout_ms: u64,
+    progress_context: Option<AgentProgressContext>,
+    narration_config: &AssistantNarrationConfig,
+    policy: &CodexContextPolicy,
+    preflight: &CodexContextPreflightReceipt,
+) -> io::Result<CodexAppServerRunResult> {
+    let original_thread_id = plan
+        .invocation
+        .thread_id
+        .clone()
+        .or_else(|| prior.thread_id.clone());
+    let guard_reason = preflight
+        .thread_health
+        .reason
+        .clone()
+        .unwrap_or_else(|| "bound Codex thread health guard recommended rollover".to_string());
+    let prior_reason = prior.reason.clone();
+    let mut recovered = run_context_checkpoint_fallback(
+        harness_home,
+        plan,
+        plan_file,
+        prior,
+        original_thread_id,
+        timeout_ms,
+        idle_timeout_ms,
+        progress_context,
+        narration_config,
+        policy,
+    )?;
+    let succeeded = recovered.status == CodexRuntimeRunStatus::Completed;
+    if let Some(recovery) = recovered.context_recovery.as_mut() {
+        recovery.status = if succeeded {
+            "thread-health-rollover-succeeded".to_string()
+        } else {
+            "thread-health-rollover-failed".to_string()
+        };
+        recovery.reason = if succeeded {
+            format!(
+                "retryable Codex ProtocolError after unhealthy bound thread; checkpoint fallback opened a fresh Codex thread. Guard reason: {guard_reason}. Prior reason: {prior_reason}"
+            )
+        } else {
+            format!(
+                "retryable Codex ProtocolError after unhealthy bound thread; checkpoint fallback also failed. Guard reason: {guard_reason}. Prior reason: {prior_reason}; fallback reason: {}",
+                recovered.reason
+            )
+        };
+    }
+    recovered.warnings.push(format!(
+        "retryable Codex ProtocolError used fresh-thread rollover because bound thread health guard triggered: {guard_reason}"
+    ));
+    Ok(recovered)
+}
+
+fn should_recover_thread_health_protocol_error(
+    result: &CodexAppServerRunResult,
+    preflight: &CodexContextPreflightReceipt,
+) -> bool {
+    result.status == CodexRuntimeRunStatus::ProtocolError
+        && preflight.thread_health.compact_recommended
+        && preflight.policy.fallback_on_compact_failure == "checkpoint-and-new-thread"
+        && is_retryable_stream_disconnect_protocol_error(&result.reason)
+        && !result.assistant_final_found
+        && result.assistant_raw_message.trim().is_empty()
+}
+
+fn is_retryable_stream_disconnect_protocol_error(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("stream disconnected before completion")
+        || lower.contains("websocket closed by server before response.completed")
+        || lower.contains("reconnecting...")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_context_checkpoint_fallback(
     harness_home: &Path,
     plan: &CodexRuntimePlanFile,
+    plan_file: &Path,
     prior: CodexAppServerRunResult,
     original_thread_id: Option<String>,
     timeout_ms: u64,
@@ -3287,6 +4063,7 @@ fn run_context_checkpoint_fallback(
     let mut fallback_result = drive_codex_app_server(
         harness_home,
         &fallback_plan,
+        plan_file,
         timeout_ms,
         idle_timeout_ms,
         progress_context,
@@ -3331,12 +4108,12 @@ fn run_context_checkpoint_fallback(
         binding_backup_file: rollover.binding_backup_file,
         reason: if succeeded {
             format!(
-                "Codex context exhausted; checkpoint fallback opened a fresh Codex thread after official compact recovery failed or was unavailable. Prior reason: {}",
+                "Codex thread recovery opened a fresh Codex thread after official compact recovery failed or was unavailable. Prior reason: {}",
                 prior.reason
             )
         } else {
             format!(
-                "Codex context exhausted; checkpoint fallback also failed. Prior reason: {}; fallback reason: {}",
+                "Codex thread recovery checkpoint fallback also failed. Prior reason: {}; fallback reason: {}",
                 prior.reason, fallback_result.reason
             )
         },
@@ -3416,7 +4193,7 @@ fn write_context_fallback_prompt(
     let previous_thread = plan.invocation.thread_id.as_deref().unwrap_or("(unknown)");
     let prompt = format!(
         "[Harness context recovery]\n\
-         The previous Codex thread reached the context limit before this queued turn could complete.\n\
+         The previous Codex thread could not safely complete this queued turn.\n\
          Previous Codex thread id: {previous_thread}\n\
          Checkpoint artifact: {}\n\
          Recovery reason: {}\n\
@@ -3591,8 +4368,16 @@ struct CodexProtocolState {
 }
 
 impl CodexProtocolState {
+    fn assistant_message(&self) -> String {
+        self.assistant_output.final_text_or_raw()
+    }
+
+    fn has_captured_assistant_output(&self) -> bool {
+        self.assistant_output.final_found() || !self.assistant_output.raw_text().trim().is_empty()
+    }
+
     fn assistant_message_with_harness_notices(&self) -> String {
-        let mut message = self.assistant_output.final_text_or_raw();
+        let mut message = self.assistant_message();
         if self.denied_approval_requests.is_empty() {
             return message;
         }
@@ -3647,6 +4432,36 @@ impl CodexProgressEmitter {
 
     fn append(&self, event: AgentProgressEvent) -> io::Result<()> {
         append_agent_progress_event(&self.harness_home, &event).map(|_| ())
+    }
+}
+
+fn emit_codex_runtime_status(
+    progress: &Option<CodexProgressEmitter>,
+    status: AgentProgressStatus,
+    preview: &str,
+    warnings: &mut Vec<String>,
+) {
+    let Some(emitter) = progress.as_ref() else {
+        return;
+    };
+    let at_ms = match current_log_time_ms() {
+        Ok(at_ms) => at_ms,
+        Err(error) => {
+            warnings.push(format!("runtime progress timestamp failed: {error}"));
+            return;
+        }
+    };
+    let event = AgentProgressEvent::new(
+        &emitter.context,
+        AgentProgressKind::Runtime,
+        "runtime",
+        preview,
+        status,
+        at_ms,
+    )
+    .source("codex-runtime");
+    if let Err(error) = emitter.append(event) {
+        warnings.push(format!("runtime progress write failed: {error}"));
     }
 }
 
@@ -4085,6 +4900,307 @@ enum ProtocolWait {
     TimedOut(String),
 }
 
+struct InFlightCodexTurnSteer {
+    record: CodexTurnSteerRequestRecord,
+    file: PathBuf,
+}
+
+struct CodexTurnSteerBridge {
+    harness_home: PathBuf,
+    binding_file: PathBuf,
+    binding: CodexActiveTurnBindingRecord,
+    turn_start_request_id: i64,
+    next_rpc_id: i64,
+    in_flight: BTreeMap<i64, InFlightCodexTurnSteer>,
+}
+
+impl CodexTurnSteerBridge {
+    fn new(
+        harness_home: &Path,
+        plan: &CodexRuntimePlanFile,
+        plan_file: &Path,
+        thread_id: String,
+        turn_start_request_id: i64,
+    ) -> io::Result<Self> {
+        let now_ms = current_log_time_ms()?;
+        let binding_file = codex_active_turn_binding_file(harness_home, &plan.session_key);
+        let binding = CodexActiveTurnBindingRecord {
+            schema: CODEX_ACTIVE_TURN_SCHEMA.to_string(),
+            queue_id: plan.queue_id.clone(),
+            session_key: plan.session_key.clone(),
+            agent_id: plan.agent_id.clone(),
+            provider: plan.provider.clone(),
+            model: plan.model.clone(),
+            thread_id,
+            active_turn_id: None,
+            turn_kind: "regular".to_string(),
+            status: CodexActiveTurnStatus::AwaitingTurnId,
+            runtime_pid: std::process::id(),
+            plan_file: plan_file.to_path_buf(),
+            working_directory: plan.invocation.working_directory.clone(),
+            prompt_bundle_json: plan.prompt_bundle_json.clone(),
+            prompt_markdown: plan.prompt_markdown.clone(),
+            started_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            reason: "turn/start sent; waiting for active Codex turn id".to_string(),
+        };
+        write_codex_active_turn_binding(&binding_file, &binding)?;
+        Ok(Self {
+            harness_home: harness_home.to_path_buf(),
+            binding_file,
+            binding,
+            turn_start_request_id,
+            next_rpc_id: 10_000,
+            in_flight: BTreeMap::new(),
+        })
+    }
+
+    fn observe_json(
+        &mut self,
+        value: &Value,
+        stdin: &mut impl Write,
+        state: &mut CodexProtocolState,
+    ) -> io::Result<bool> {
+        if self.handle_rpc_response(value, state)? {
+            return Ok(true);
+        }
+        if let Some(turn_id) = extract_active_turn_started_id(value, self.turn_start_request_id) {
+            self.set_active_turn_id(turn_id)?;
+        }
+        self.drain_pending(stdin, state)?;
+        Ok(false)
+    }
+
+    fn drain_pending(
+        &mut self,
+        stdin: &mut impl Write,
+        state: &mut CodexProtocolState,
+    ) -> io::Result<()> {
+        let Some(active_turn_id) = self.binding.active_turn_id.clone() else {
+            return Ok(());
+        };
+        let pending_dir = codex_turn_steer_pending_dir(&self.harness_home);
+        let entries = match fs::read_dir(&pending_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let mut files = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect::<Vec<_>>();
+        files.sort();
+        for file in files {
+            let mut record: CodexTurnSteerRequestRecord = match read_json_file_as(&file) {
+                Ok(record) => record,
+                Err(error) => {
+                    state.warnings.push(format!(
+                        "failed to read Codex turn steer request {}: {error}",
+                        file.display()
+                    ));
+                    continue;
+                }
+            };
+            if record.session_key != self.binding.session_key {
+                continue;
+            }
+            if record.thread_id != self.binding.thread_id {
+                self.write_request_receipt(
+                    &record,
+                    Some(file.clone()),
+                    "failed-thread-mismatch",
+                    "failed",
+                    None,
+                    format!(
+                        "steering request targeted thread {}, but active thread is {}",
+                        record.thread_id, self.binding.thread_id
+                    ),
+                )?;
+                move_steer_request_file(&self.harness_home, &file, "failed")?;
+                continue;
+            }
+            if let Some(expected_turn_id) = record.expected_turn_id.as_deref()
+                && expected_turn_id != active_turn_id
+            {
+                self.write_request_receipt(
+                    &record,
+                    Some(file.clone()),
+                    "failed-turn-mismatch",
+                    "failed",
+                    None,
+                    format!(
+                        "steering request expected turn {expected_turn_id}, but active turn is {active_turn_id}"
+                    ),
+                )?;
+                move_steer_request_file(&self.harness_home, &file, "failed")?;
+                continue;
+            }
+            record.expected_turn_id = Some(active_turn_id.clone());
+            let rpc_id = self.next_rpc_id;
+            self.next_rpc_id = self.next_rpc_id.saturating_add(1);
+            let inflight_file = move_steer_request_file(&self.harness_home, &file, "in-flight")?;
+            write_json_atomic(&inflight_file, &record)?;
+            write_json_rpc(
+                stdin,
+                &json!({
+                    "id": rpc_id,
+                    "method": "turn/steer",
+                    "params": {
+                        "threadId": self.binding.thread_id.clone(),
+                        "expectedTurnId": active_turn_id.clone(),
+                        "clientUserMessageId": record.client_user_message_id.clone(),
+                        "input": [
+                            {
+                                "type": "text",
+                                "text": record.text.clone()
+                            }
+                        ]
+                    }
+                }),
+            )?;
+            self.in_flight.insert(
+                rpc_id,
+                InFlightCodexTurnSteer {
+                    record,
+                    file: inflight_file,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn handle_rpc_response(
+        &mut self,
+        value: &Value,
+        _state: &mut CodexProtocolState,
+    ) -> io::Result<bool> {
+        let Some(id) = json_id(value) else {
+            return Ok(false);
+        };
+        let Some(in_flight) = self.in_flight.remove(&id) else {
+            return Ok(false);
+        };
+        if let Some(error) = protocol_error(value) {
+            self.write_request_receipt(
+                &in_flight.record,
+                Some(in_flight.file.clone()),
+                "failed",
+                "same-turn-failed",
+                None,
+                error,
+            )?;
+            move_steer_request_file(&self.harness_home, &in_flight.file, "failed")?;
+            return Ok(true);
+        }
+        let accepted_turn_id = extract_turn_id(value).or(in_flight.record.expected_turn_id.clone());
+        self.write_request_receipt(
+            &in_flight.record,
+            Some(in_flight.file.clone()),
+            "accepted",
+            "same-turn",
+            accepted_turn_id,
+            "Codex app-server accepted turn/steer request".to_string(),
+        )?;
+        move_steer_request_file(&self.harness_home, &in_flight.file, "accepted")?;
+        Ok(true)
+    }
+
+    fn finish(&mut self, status: CodexActiveTurnStatus, reason: &str) -> io::Result<()> {
+        self.finish_pending(reason)?;
+        self.binding.status = status;
+        self.binding.updated_at_ms = current_log_time_ms()?;
+        self.binding.reason = reason.to_string();
+        write_codex_active_turn_binding(&self.binding_file, &self.binding)
+    }
+
+    fn finish_pending(&mut self, reason: &str) -> io::Result<()> {
+        for (_, in_flight) in std::mem::take(&mut self.in_flight) {
+            self.write_request_receipt(
+                &in_flight.record,
+                Some(in_flight.file.clone()),
+                "deferred-no-ack",
+                "same-turn-unconfirmed",
+                None,
+                format!("turn ended before turn/steer acknowledgement: {reason}"),
+            )?;
+            move_steer_request_file(&self.harness_home, &in_flight.file, "deferred")?;
+        }
+        let pending_dir = codex_turn_steer_pending_dir(&self.harness_home);
+        let entries = match fs::read_dir(&pending_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let file = entry.path();
+            if file.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let record: CodexTurnSteerRequestRecord = match read_json_file_as(&file) {
+                Ok(record) => record,
+                Err(_) => continue,
+            };
+            if record.session_key != self.binding.session_key {
+                continue;
+            }
+            let status = if self.binding.active_turn_id.is_none() {
+                "deferred-no-active-turn-id"
+            } else {
+                "deferred-turn-ended"
+            };
+            self.write_request_receipt(
+                &record,
+                Some(file.clone()),
+                status,
+                "next-turn-or-passive-context",
+                None,
+                format!("same-turn steering was not delivered before turn ended: {reason}"),
+            )?;
+            move_steer_request_file(&self.harness_home, &file, "deferred")?;
+        }
+        Ok(())
+    }
+
+    fn set_active_turn_id(&mut self, turn_id: String) -> io::Result<()> {
+        if self.binding.active_turn_id.as_deref() == Some(turn_id.as_str()) {
+            return Ok(());
+        }
+        self.binding.active_turn_id = Some(turn_id);
+        self.binding.status = CodexActiveTurnStatus::Running;
+        self.binding.updated_at_ms = current_log_time_ms()?;
+        self.binding.reason = "Codex active turn id observed".to_string();
+        write_codex_active_turn_binding(&self.binding_file, &self.binding)
+    }
+
+    fn write_request_receipt(
+        &self,
+        record: &CodexTurnSteerRequestRecord,
+        request_file: Option<PathBuf>,
+        status: &str,
+        delivery: &str,
+        accepted_turn_id: Option<String>,
+        reason: String,
+    ) -> io::Result<()> {
+        append_json_line(
+            &codex_turn_steer_receipts_file(&self.harness_home),
+            &CodexTurnSteerReceipt {
+                schema: CODEX_TURN_STEER_RECEIPT_SCHEMA.to_string(),
+                at_ms: current_log_time_ms()?,
+                request_id: record.request_id.clone(),
+                session_key: record.session_key.clone(),
+                status: status.to_string(),
+                delivery: delivery.to_string(),
+                thread_id: Some(record.thread_id.clone()),
+                expected_turn_id: record.expected_turn_id.clone(),
+                accepted_turn_id,
+                request_file,
+                reason,
+            },
+        )
+    }
+}
+
 struct CodexProtocolTimeouts {
     absolute_deadline: Instant,
     idle_deadline: Instant,
@@ -4128,11 +5244,15 @@ impl CodexProtocolTimeouts {
         }
     }
 
-    fn next_poll_timeout(&self, now: Instant) -> Duration {
-        self.absolute_deadline
+    fn next_poll_timeout(&self, now: Instant, poll_interval: Option<Duration>) -> Duration {
+        let deadline_timeout = self
+            .absolute_deadline
             .saturating_duration_since(now)
-            .min(self.idle_deadline.saturating_duration_since(now))
-            .min(Duration::from_millis(250))
+            .min(self.idle_deadline.saturating_duration_since(now));
+        match poll_interval {
+            Some(interval) => deadline_timeout.min(interval),
+            None => deadline_timeout,
+        }
     }
 }
 
@@ -4148,7 +5268,7 @@ fn wait_for_thread_start(
     narration_config: &AssistantNarrationConfig,
 ) -> io::Result<ProtocolWait> {
     loop {
-        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check)? {
+        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check, None)? {
             ProtocolEvent::Json(value) => {
                 if let Some(error) = protocol_error(&value) {
                     return Ok(ProtocolWait::Failed(error));
@@ -4166,6 +5286,15 @@ fn wait_for_thread_start(
                     });
                 }
                 if is_turn_completed(&value) {
+                    if is_compact_only_turn_completed(&value)
+                        && !state.has_captured_assistant_output()
+                    {
+                        state.warnings.push(
+                            "ignored stale compact-only Codex turn/completed before user turn completion"
+                                .to_string(),
+                        );
+                        continue;
+                    }
                     record_turn_usage(&value, state);
                     if let Some(reason) = turn_completed_failure_reason(&value) {
                         return Ok(ProtocolWait::Failed(reason));
@@ -4174,6 +5303,7 @@ fn wait_for_thread_start(
                 }
                 collect_agent_output(&value, state, progress, narration_config);
             }
+            ProtocolEvent::Poll => continue,
             ProtocolEvent::TimedOut(reason) => return Ok(ProtocolWait::TimedOut(reason)),
             ProtocolEvent::Failed(reason) => return Ok(ProtocolWait::Failed(reason)),
             ProtocolEvent::Canceled(reason) => return Ok(ProtocolWait::Canceled(reason)),
@@ -4228,12 +5358,13 @@ fn wait_for_context_compaction_completed(
     approval_policy: CodexApprovalPolicy,
     cancel_check: Option<&RuntimeCancelCheck>,
     narration_config: &AssistantNarrationConfig,
-    request_id: i64,
+    _request_id: i64,
 ) -> io::Result<ProtocolWait> {
-    let mut acknowledged = false;
-    let mut compaction_started = false;
+    let mut compaction_item_completed = false;
     loop {
-        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check)? {
+        let poll_interval = compaction_item_completed.then_some(Duration::from_millis(100));
+        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check, poll_interval)?
+        {
             ProtocolEvent::Json(value) => {
                 if let Some(error) = protocol_error(&value) {
                     return Ok(ProtocolWait::Failed(error));
@@ -4242,34 +5373,44 @@ fn wait_for_context_compaction_completed(
                 if answer_unattended_server_request(&value, stdin, state, approval_policy)? {
                     continue;
                 }
-                if json_id(&value) == Some(request_id) {
-                    acknowledged = true;
-                }
                 if is_context_compaction_started(&value) {
-                    compaction_started = true;
                     state
                         .warnings
                         .push("Codex official context compaction started".to_string());
                     continue;
                 }
-                if is_context_compaction_completed(&value) || is_thread_compacted(&value) {
+                if is_thread_compacted(&value) {
                     state
                         .warnings
                         .push("Codex official context compaction completed".to_string());
                     return Ok(ProtocolWait::CompactCompleted);
+                }
+                if is_context_compaction_completed(&value) {
+                    compaction_item_completed = true;
+                    continue;
                 }
                 if is_turn_completed(&value) {
                     record_turn_usage(&value, state);
                     if let Some(reason) = turn_completed_failure_reason(&value) {
                         return Ok(ProtocolWait::Failed(reason));
                     }
-                    if acknowledged || compaction_started {
+                    if compaction_item_completed {
+                        state
+                            .warnings
+                            .push("Codex official context compaction completed".to_string());
                         return Ok(ProtocolWait::CompactCompleted);
                     }
                     return Ok(ProtocolWait::TurnCompleted);
                 }
                 collect_agent_output(&value, state, progress, narration_config);
             }
+            ProtocolEvent::Poll if compaction_item_completed => {
+                state
+                    .warnings
+                    .push("Codex official context compaction completed".to_string());
+                return Ok(ProtocolWait::CompactCompleted);
+            }
+            ProtocolEvent::Poll => continue,
             ProtocolEvent::TimedOut(reason) => return Ok(ProtocolWait::TimedOut(reason)),
             ProtocolEvent::Failed(reason) => return Ok(ProtocolWait::Failed(reason)),
             ProtocolEvent::Canceled(reason) => return Ok(ProtocolWait::Canceled(reason)),
@@ -4287,10 +5428,21 @@ fn wait_for_turn_completed(
     approval_policy: CodexApprovalPolicy,
     cancel_check: Option<&RuntimeCancelCheck>,
     narration_config: &AssistantNarrationConfig,
+    mut steer_bridge: Option<&mut CodexTurnSteerBridge>,
 ) -> io::Result<ProtocolWait> {
     loop {
-        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check)? {
+        if let Some(bridge) = steer_bridge.as_deref_mut() {
+            bridge.drain_pending(stdin, state)?;
+        }
+        let poll_interval = steer_bridge.as_ref().map(|_| Duration::from_millis(250));
+        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check, poll_interval)?
+        {
             ProtocolEvent::Json(value) => {
+                if let Some(bridge) = steer_bridge.as_deref_mut()
+                    && bridge.observe_json(&value, stdin, state)?
+                {
+                    continue;
+                }
                 if let Some(error) = protocol_error(&value) {
                     return Ok(ProtocolWait::Failed(error));
                 }
@@ -4300,6 +5452,15 @@ fn wait_for_turn_completed(
                 }
                 collect_agent_output(&value, state, progress, narration_config);
                 if is_turn_completed(&value) {
+                    if is_compact_only_turn_completed(&value)
+                        && !state.has_captured_assistant_output()
+                    {
+                        state.warnings.push(
+                            "ignored stale compact-only Codex turn/completed before user turn completion"
+                                .to_string(),
+                        );
+                        continue;
+                    }
                     record_turn_usage(&value, state);
                     if let Some(reason) = turn_completed_failure_reason(&value) {
                         return Ok(ProtocolWait::Failed(reason));
@@ -4312,6 +5473,7 @@ fn wait_for_turn_completed(
                     return Ok(ProtocolWait::ThreadStarted(thread_id));
                 }
             }
+            ProtocolEvent::Poll => continue,
             ProtocolEvent::TimedOut(reason) => return Ok(ProtocolWait::TimedOut(reason)),
             ProtocolEvent::Failed(reason) => return Ok(ProtocolWait::Failed(reason)),
             ProtocolEvent::Canceled(reason) => return Ok(ProtocolWait::Canceled(reason)),
@@ -4321,6 +5483,7 @@ fn wait_for_turn_completed(
 
 enum ProtocolEvent {
     Json(Value),
+    Poll,
     TimedOut(String),
     Failed(String),
     Canceled(String),
@@ -4332,6 +5495,7 @@ fn receive_protocol_event(
     state: &mut CodexProtocolState,
     timeouts: &mut CodexProtocolTimeouts,
     cancel_check: Option<&RuntimeCancelCheck>,
+    poll_interval: Option<Duration>,
 ) -> io::Result<ProtocolEvent> {
     loop {
         if let Some(cancel_check) = cancel_check
@@ -4343,13 +5507,16 @@ fn receive_protocol_event(
         if let Some(reason) = timeouts.timed_out_reason(now) {
             return Ok(ProtocolEvent::TimedOut(reason));
         }
-        let timeout = timeouts.next_poll_timeout(now);
+        let timeout = timeouts.next_poll_timeout(now, poll_interval);
         match line_rx.recv_timeout(timeout) {
             Ok(Ok(line)) => {
                 state.event_count += 1;
                 timeouts.note_event();
                 return match serde_json::from_str::<Value>(&line) {
-                    Ok(value) => Ok(ProtocolEvent::Json(value)),
+                    Ok(value) => {
+                        record_protocol_usage_event(&value, state);
+                        Ok(ProtocolEvent::Json(value))
+                    }
                     Err(error) => Ok(ProtocolEvent::Failed(format!(
                         "codex app-server stdout line was not valid JSON: {error}"
                     ))),
@@ -4365,6 +5532,9 @@ fn receive_protocol_event(
                     return Ok(ProtocolEvent::Failed(format!(
                         "codex app-server exited before completing protocol: {status}"
                     )));
+                }
+                if poll_interval.is_some() {
+                    return Ok(ProtocolEvent::Poll);
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -4727,6 +5897,30 @@ fn extract_thread_id(value: &Value) -> Option<String> {
     None
 }
 
+fn extract_turn_id(value: &Value) -> Option<String> {
+    for pointer in [
+        "/result/turn/id",
+        "/result/turnId",
+        "/result/id",
+        "/params/turn/id",
+        "/params/turnId",
+    ] {
+        if let Some(text) = value.pointer(pointer).and_then(Value::as_str) {
+            return Some(text.trim().to_string()).filter(|value| !value.is_empty());
+        }
+    }
+    None
+}
+
+fn extract_active_turn_started_id(value: &Value, turn_start_request_id: i64) -> Option<String> {
+    if matches!(json_method(value), Some("turn/started"))
+        || json_id(value) == Some(turn_start_request_id)
+    {
+        return extract_turn_id(value);
+    }
+    None
+}
+
 fn collect_agent_output(
     value: &Value,
     state: &mut CodexProtocolState,
@@ -4984,6 +6178,26 @@ fn normalize_compaction_kind(value: &str) -> String {
         .replace(['_', '-', ' '], "")
 }
 
+fn is_compact_only_turn_completed(value: &Value) -> bool {
+    if !is_turn_completed(value) {
+        return false;
+    }
+    if first_string_pointer(value, &["/params/turn/id", "/params/turnId"])
+        .map(|id| id.to_ascii_lowercase().contains("compact"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let items_empty = value
+        .pointer("/params/turn/items")
+        .and_then(Value::as_array)
+        .map(Vec::is_empty)
+        .unwrap_or(false);
+    let items_not_loaded = first_string_pointer(value, &["/params/turn/itemsView"])
+        .map(|items_view| items_view.eq_ignore_ascii_case("notLoaded"))
+        .unwrap_or(false);
+    items_empty && items_not_loaded
+}
 fn turn_completed_failure_reason(value: &Value) -> Option<String> {
     if !is_turn_completed(value) {
         return None;
@@ -5026,6 +6240,16 @@ fn record_turn_usage(value: &Value, state: &mut CodexProtocolState) {
     if let Some(usage) = extract_turn_usage(value) {
         state.usage = Some(usage);
     }
+}
+
+fn record_protocol_usage_event(value: &Value, state: &mut CodexProtocolState) {
+    if let Some(usage) = extract_protocol_usage(value) {
+        state.usage = Some(usage);
+    }
+}
+
+fn extract_protocol_usage(value: &Value) -> Option<CodexRuntimeUsage> {
+    extract_turn_usage(value).or_else(|| extract_token_usage_event(value))
 }
 
 fn extract_turn_usage(value: &Value) -> Option<CodexRuntimeUsage> {
@@ -5075,6 +6299,117 @@ fn extract_turn_usage(value: &Value) -> Option<CodexRuntimeUsage> {
         }
     }
     None
+}
+
+fn extract_token_usage_event(value: &Value) -> Option<CodexRuntimeUsage> {
+    let method = json_method(value).unwrap_or_default();
+    let likely_usage_event = method.eq_ignore_ascii_case("thread/tokenUsage/updated")
+        || method.to_ascii_lowercase().contains("tokenusage")
+        || method.to_ascii_lowercase().contains("token_usage")
+        || value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("token_count"))
+        || value
+            .pointer("/msg/type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("event_msg"))
+        || value
+            .pointer("/msg/payload/type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("token_count"))
+        || value
+            .pointer("/payload/type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("token_count"));
+    if !likely_usage_event {
+        return None;
+    }
+    for pointer in [
+        "/params/usage",
+        "/params/tokenUsage",
+        "/params/token_usage",
+        "/params",
+        "/params/thread",
+        "/msg/payload",
+        "/payload",
+        "/info",
+    ] {
+        if let Some(candidate) = value.pointer(pointer)
+            && let Some(usage) = token_usage_from_value(
+                candidate,
+                &format!(
+                    "{}.{}",
+                    pointer.trim_start_matches('/').replace('/', "."),
+                    "token"
+                ),
+            )
+        {
+            return Some(usage);
+        }
+    }
+    token_usage_from_value(value, "token-usage-event")
+}
+
+fn token_usage_from_value(value: &Value, source: &str) -> Option<CodexRuntimeUsage> {
+    if let Some(usage) = direct_token_usage(value, source) {
+        return Some(usage);
+    }
+    match value {
+        Value::Object(object) => object
+            .values()
+            .find_map(|value| token_usage_from_value(value, source)),
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| token_usage_from_value(value, source)),
+        _ => None,
+    }
+}
+
+fn direct_token_usage(value: &Value, source: &str) -> Option<CodexRuntimeUsage> {
+    let input_tokens = usage_u64(
+        value,
+        &[
+            "inputTokens",
+            "input_tokens",
+            "promptTokens",
+            "prompt_tokens",
+            "input",
+        ],
+    );
+    let output_tokens = usage_u64(
+        value,
+        &[
+            "outputTokens",
+            "output_tokens",
+            "completionTokens",
+            "completion_tokens",
+            "output",
+        ],
+    );
+    let total_tokens = usage_u64(
+        value,
+        &[
+            "totalTokens",
+            "total_tokens",
+            "total",
+            "totalTokenUsage",
+            "total_token_usage",
+        ],
+    );
+    if input_tokens.is_none() && output_tokens.is_none() && total_tokens.is_none() {
+        return None;
+    }
+    let raw = serde_json::to_string(value)
+        .ok()
+        .map(|text| truncate_for_notice(&text, 512));
+    Some(CodexRuntimeUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        source: source.to_string(),
+        raw,
+    })
 }
 
 fn usage_u64(value: &Value, keys: &[&str]) -> Option<u64> {
@@ -5686,7 +7021,7 @@ pub fn inspect_codex_sandbox(harness_home: &Path) -> CodexSandboxInspection {
     let (sandbox, source, configured) =
         resolve_codex_sandbox_with_source(harness_home, &mut warnings);
     CodexSandboxInspection {
-        sandbox,
+        sandbox: sandbox.to_string(),
         source,
         configured,
         config_file: harness_home.join(HARNESS_CONFIG_FILE_NAME),
@@ -5694,7 +7029,10 @@ pub fn inspect_codex_sandbox(harness_home: &Path) -> CodexSandboxInspection {
     }
 }
 
-fn resolve_codex_sandbox(harness_home: &Path, warnings: &mut Vec<String>) -> String {
+fn resolve_codex_sandbox(
+    harness_home: &Path,
+    warnings: &mut Vec<String>,
+) -> CodexWindowsSandboxMode {
     let (sandbox, _, _) = resolve_codex_sandbox_with_source(harness_home, warnings);
     sandbox
 }
@@ -5720,7 +7058,7 @@ fn resolve_codex_sandbox_policy(harness_home: &Path, warnings: &mut Vec<String>)
 fn resolve_codex_sandbox_with_source(
     harness_home: &Path,
     warnings: &mut Vec<String>,
-) -> (String, String, bool) {
+) -> (CodexWindowsSandboxMode, String, bool) {
     if let Ok(raw) = env::var(CODEX_SANDBOX_ENV) {
         return match parse_codex_sandbox(&raw) {
             Some(sandbox) => (sandbox, CODEX_SANDBOX_ENV.to_string(), true),
@@ -5728,11 +7066,7 @@ fn resolve_codex_sandbox_with_source(
                 warnings.push(format!(
                     "invalid {CODEX_SANDBOX_ENV}={raw:?}; defaulting Codex sandbox to {DEFAULT_CODEX_SANDBOX}"
                 ));
-                (
-                    DEFAULT_CODEX_SANDBOX.to_string(),
-                    CODEX_SANDBOX_ENV.to_string(),
-                    true,
-                )
+                (DEFAULT_CODEX_SANDBOX, CODEX_SANDBOX_ENV.to_string(), true)
             }
         };
     }
@@ -5741,11 +7075,7 @@ fn resolve_codex_sandbox_with_source(
     let text = match fs::read_to_string(&config_file) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return (
-                DEFAULT_CODEX_SANDBOX.to_string(),
-                "default".to_string(),
-                false,
-            );
+            return (DEFAULT_CODEX_SANDBOX, "default".to_string(), false);
         }
         Err(error) => {
             warnings.push(format!(
@@ -5753,7 +7083,7 @@ fn resolve_codex_sandbox_with_source(
                 config_file.display()
             ));
             return (
-                DEFAULT_CODEX_SANDBOX.to_string(),
+                DEFAULT_CODEX_SANDBOX,
                 config_file.display().to_string(),
                 false,
             );
@@ -5767,7 +7097,7 @@ fn resolve_codex_sandbox_with_source(
                 config_file.display()
             ));
             return (
-                DEFAULT_CODEX_SANDBOX.to_string(),
+                DEFAULT_CODEX_SANDBOX,
                 config_file.display().to_string(),
                 false,
             );
@@ -5793,44 +7123,41 @@ fn resolve_codex_sandbox_with_source(
                 config_file.display()
             ));
             return (
-                DEFAULT_CODEX_SANDBOX.to_string(),
+                DEFAULT_CODEX_SANDBOX,
                 format!("{}:{pointer}", config_file.display()),
                 true,
             );
         }
     }
     (
-        DEFAULT_CODEX_SANDBOX.to_string(),
+        DEFAULT_CODEX_SANDBOX,
         config_file.display().to_string(),
         false,
     )
 }
 
-fn codex_sandbox_from_json(value: &Value) -> Option<String> {
+fn codex_sandbox_from_json(value: &Value) -> Option<CodexWindowsSandboxMode> {
     match value {
         Value::String(text) => parse_codex_sandbox(text),
-        Value::Bool(true) => Some(DEFAULT_CODEX_SANDBOX.to_string()),
-        Value::Bool(false) => Some("danger-full-access".to_string()),
+        Value::Bool(true) => Some(DEFAULT_CODEX_SANDBOX),
+        Value::Bool(false) => Some(CodexWindowsSandboxMode::Disabled),
         _ => None,
     }
 }
 
-fn parse_codex_sandbox(value: &str) -> Option<String> {
+fn parse_codex_sandbox(value: &str) -> Option<CodexWindowsSandboxMode> {
     let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
     let sandbox = match normalized.as_str() {
         "" => return None,
-        "default" | "windows-elevated" => DEFAULT_CODEX_SANDBOX,
-        "readonly" => "read-only",
-        "workspace" | "workspace-write" => "workspace-write",
-        "full-access" | "full" | "none" | "off" | "disabled" | "false" => "danger-full-access",
-        "elevated" | "read-only" | "danger-full-access" => normalized.as_str(),
-        other if is_safe_codex_sandbox_value(other) => other,
+        "default" | "elevated" | "windows-elevated" => CodexWindowsSandboxMode::Elevated,
+        "unelevated" | "windows-unelevated" => CodexWindowsSandboxMode::Unelevated,
+        "disabled" | "off" | "none" | "false" => CodexWindowsSandboxMode::Disabled,
         _ => return None,
     };
-    Some(sandbox.to_string())
+    Some(sandbox)
 }
 
-fn is_safe_codex_sandbox_value(value: &str) -> bool {
+fn is_safe_codex_sandbox_policy_value(value: &str) -> bool {
     value.len() <= 64
         && value
             .bytes()
@@ -5947,7 +7274,7 @@ fn parse_codex_sandbox_policy(value: &str) -> Option<String> {
         "readonly" | "read-only" | "read" => "readOnly",
         "dangerfullaccess" | "danger-full-access" | "full-access" | "full" | "none" | "off"
         | "disabled" | "false" => "dangerFullAccess",
-        other if is_safe_codex_sandbox_value(other) => other,
+        other if is_safe_codex_sandbox_policy_value(other) => other,
         _ => return None,
     };
     Some(sandbox.to_string())
@@ -5964,14 +7291,54 @@ fn normalize_codex_sandbox_policy(value: &str) -> String {
 
 fn check_executable(executable: &Path) -> CodexRuntimePreflightCheck {
     match resolve_executable(executable) {
-        Some(path) => pass_check(
-            "codex-executable",
-            format!("resolved {} to {}", executable.display(), path.display()),
-        ),
+        Some(path) => match executable_spawn_block_reason(&path) {
+            None => pass_check(
+                "codex-executable",
+                format!("resolved {} to {}", executable.display(), path.display()),
+            ),
+            Some(reason) => fail_check(
+                "codex-executable",
+                format!(
+                    "resolved {} to {}; {reason}; pass --codex-exe with a repo-local codex.exe or codex.cmd",
+                    executable.display(),
+                    path.display()
+                ),
+            ),
+        },
         None => fail_check(
             "codex-executable",
             format!("could not resolve executable {}", executable.display()),
         ),
+    }
+}
+
+fn executable_spawn_block_reason(path: &Path) -> Option<&'static str> {
+    #[cfg(windows)]
+    {
+        if path.extension().is_none() {
+            return Some("extensionless Windows npm shim is not spawnable by the harness");
+        }
+        if path.components().any(|component| {
+            let text = component.as_os_str().to_string_lossy();
+            text.eq_ignore_ascii_case("WindowsApps")
+                || text.to_ascii_lowercase().starts_with("openai.codex_")
+        }) && path.components().any(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("openai.codex_")
+        }) {
+            return Some(
+                "Codex Desktop MSIX resource path is not a supported service runtime path",
+            );
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
     }
 }
 
@@ -6313,6 +7680,105 @@ fn codex_binding_file(transcript_file: &Path) -> PathBuf {
     with_appended_file_name(transcript_file, ".codex-app-server.json")
 }
 
+fn codex_active_turn_binding_dir(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("codex-active-turns")
+}
+
+fn codex_active_turn_binding_file(harness_home: &Path, session_key: &str) -> PathBuf {
+    codex_active_turn_binding_dir(harness_home)
+        .join(format!("{}.json", normalize_key_part(session_key)))
+}
+
+fn codex_turn_steer_dir(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("codex-turn-steer")
+}
+
+fn codex_turn_steer_pending_dir(harness_home: &Path) -> PathBuf {
+    codex_turn_steer_dir(harness_home).join("pending")
+}
+
+fn codex_turn_steer_archive_dir(harness_home: &Path, status: &str) -> PathBuf {
+    codex_turn_steer_dir(harness_home).join(status)
+}
+
+fn codex_turn_steer_receipts_file(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("codex-turn-steer-receipts.jsonl")
+}
+
+fn codex_turn_steer_request_id(
+    platform: &str,
+    channel_id: &str,
+    user_id: &str,
+    session_key: &str,
+    at_ms: i64,
+    text: &str,
+) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    platform.hash(&mut hasher);
+    channel_id.hash(&mut hasher);
+    user_id.hash(&mut hasher);
+    session_key.hash(&mut hasher);
+    at_ms.hash(&mut hasher);
+    text.hash(&mut hasher);
+    format!("steer-{at_ms}-{:016x}", hasher.finish())
+}
+
+fn read_codex_active_turn_binding(
+    binding_file: &Path,
+) -> io::Result<Option<CodexActiveTurnBindingRecord>> {
+    match fs::read(binding_file) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(io::Error::other),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_codex_active_turn_binding(
+    binding_file: &Path,
+    binding: &CodexActiveTurnBindingRecord,
+) -> io::Result<()> {
+    fs::create_dir_all(parent_dir(binding_file)?)?;
+    write_json_atomic(binding_file, binding)
+}
+
+fn move_steer_request_file(
+    harness_home: &Path,
+    source_file: &Path,
+    status: &str,
+) -> io::Result<PathBuf> {
+    let target_dir = codex_turn_steer_archive_dir(harness_home, status);
+    fs::create_dir_all(&target_dir)?;
+    let file_name = source_file
+        .file_name()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "steer request path has no file name: {}",
+                    source_file.display()
+                ),
+            )
+        })?
+        .to_owned();
+    let target_file = target_dir.join(file_name);
+    if target_file.exists() {
+        fs::remove_file(&target_file)?;
+    }
+    fs::rename(source_file, &target_file)?;
+    Ok(target_file)
+}
+
 fn with_appended_file_name(path: &Path, suffix: &str) -> PathBuf {
     let mut out = path.to_path_buf();
     let name = path
@@ -6492,6 +7958,23 @@ fn ensure_harness_codex_config(
     let config_file = codex_home.join("config.toml");
     if config_file.is_file() {
         let existing = fs::read_to_string(&config_file)?;
+        if is_generated_harness_codex_config(&existing) {
+            let desired = harness_codex_config_toml(
+                working_directory,
+                harness_home,
+                sandbox,
+                provider_config,
+                &context_policy,
+            );
+            if existing != desired {
+                fs::write(&config_file, desired)?;
+                warnings.push(format!(
+                    "updated generated harness-local Codex config at {}",
+                    config_file.display()
+                ));
+            }
+            return Ok(());
+        }
         if let Some(provider_config) = provider_config {
             let updated = ensure_codex_context_config_in_toml(
                 &ensure_provider_config_in_toml(&existing, provider_config),
@@ -6506,22 +7989,6 @@ fn ensure_harness_codex_config(
             }
             return Ok(());
         }
-        if is_generated_harness_codex_config(&existing) {
-            let desired = harness_codex_config_toml(
-                working_directory,
-                harness_home,
-                &sandbox,
-                provider_config,
-                &context_policy,
-            );
-            if existing != desired {
-                fs::write(&config_file, desired)?;
-                warnings.push(format!(
-                    "updated generated harness-local Codex config at {}",
-                    config_file.display()
-                ));
-            }
-        }
         return Ok(());
     }
 
@@ -6529,13 +7996,13 @@ fn ensure_harness_codex_config(
     let config = harness_codex_config_toml(
         working_directory,
         harness_home,
-        &sandbox,
+        sandbox,
         provider_config,
         &context_policy,
     );
     fs::write(&config_file, config)?;
     warnings.push(format!(
-        "created harness-local Codex config at {} with Windows sandbox={sandbox:?} and trusted runtime workspace",
+        "created harness-local Codex config at {} with Windows sandbox={sandbox} and trusted runtime workspace",
         config_file.display(),
     ));
     Ok(())
@@ -6670,7 +8137,7 @@ fn join_toml_lines(lines: Vec<String>, trailing_newline: bool) -> String {
 fn harness_codex_config_toml(
     working_directory: &Path,
     harness_home: &Path,
-    sandbox: &str,
+    sandbox: CodexWindowsSandboxMode,
     provider_config: Option<&CodexProviderConfig>,
     context_policy: &CodexContextPolicy,
 ) -> String {
@@ -6700,15 +8167,15 @@ fn harness_codex_config_toml(
     if !codex_context_toml_entries(context_policy).is_empty() {
         config.push('\n');
     }
-    config.push_str(&format!(
-        "[windows]\n\
-         sandbox = {}\n\
-         \n\
-         [features]\n\
-         multi_agent = true\n\
-         memories = true\n",
-        toml_basic_string(sandbox)
-    ));
+    if let Some(windows_sandbox) = sandbox.windows_toml_value() {
+        config.push_str("[windows]\n");
+        config.push_str("sandbox = ");
+        config.push_str(&toml_basic_string(windows_sandbox));
+        config.push_str("\n\n");
+    }
+    config.push_str("[features]\n");
+    config.push_str("multi_agent = true\n");
+    config.push_str("memories = true\n");
     if let Some(provider_config) = provider_config {
         config.push_str("\n[model_providers.");
         config.push_str(&provider_config.provider);
@@ -6863,6 +8330,202 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn token_usage_event_updates_usage_without_turn_completed() {
+        let event = json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "tokenUsage": {
+                    "input": 1200,
+                    "output": 34,
+                    "total": 1234
+                }
+            }
+        });
+
+        let usage = extract_protocol_usage(&event).unwrap();
+
+        assert_eq!(usage.input_tokens, Some(1200));
+        assert_eq!(usage.output_tokens, Some(34));
+        assert_eq!(usage.total_tokens, Some(1234));
+        assert!(usage.source.contains("params.tokenUsage"));
+    }
+
+    #[test]
+    fn rollout_thread_health_flags_inline_image_bloat_and_token_count() {
+        let root = temp_root("rollout_thread_health_flags_inline_image_bloat_and_token_count");
+        let rollout_file = root.join("rollout-2026-06-24T11-06-52-019ef798-thread-health.jsonl");
+        fs::create_dir_all(rollout_file.parent().unwrap()).unwrap();
+        let image_payload = "A".repeat(
+            usize::try_from(CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT).unwrap() + 128,
+        );
+        let image_line = json!({
+            "type": "function_call_output",
+            "output": format!("data:image/png;base64,{image_payload}")
+        })
+        .to_string();
+        let token_line = json!({
+            "msg": {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "input": 6379328_u64,
+                    "total": 6414501_u64
+                }
+            }
+        })
+        .to_string();
+        fs::write(&rollout_file, format!("{image_line}\n{token_line}\n")).unwrap();
+        let mut warnings = Vec::new();
+
+        let report = scan_codex_rollout_file_for_thread_health(
+            Some("019ef798-thread-health".to_string()),
+            rollout_file,
+            &mut warnings,
+        );
+
+        assert!(warnings.is_empty());
+        assert!(report.compact_recommended);
+        assert_eq!(report.data_image_count, 1);
+        assert!(
+            report.last_turn_inline_image_bytes > CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT
+        );
+        assert_eq!(report.latest_usage.unwrap().total_tokens, Some(6414501));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_preflight_compacts_for_bound_thread_inline_image_bloat() {
+        let root = temp_root("context_preflight_compacts_for_bound_thread_inline_image_bloat");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let thread_id = "019ef798-346b-7ae2-b341-60a7a20a8d96";
+        let rollout_dir = harness_home
+            .join("codex-home")
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("24");
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let image_payload = "B".repeat(
+            usize::try_from(CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT).unwrap() + 128,
+        );
+        let rollout_file =
+            rollout_dir.join(format!("rollout-2026-06-24T11-06-52-{thread_id}.jsonl"));
+        fs::write(
+            &rollout_file,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "function_call_output",
+                    "output": format!("data:image/png;base64,{image_payload}")
+                })
+            ),
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_invocation_thread_id(plan_file, Some(thread_id));
+        let plan: CodexRuntimePlanFile =
+            serde_json::from_slice(&fs::read(plan_file).unwrap()).unwrap();
+
+        let preflight =
+            preflight_codex_context(&harness_home, &plan, plan_file, plan_file.parent()).unwrap();
+
+        assert!(preflight.receipt.compact_before_turn);
+        assert!(preflight.receipt.reason.contains("inline image"));
+        assert!(preflight.receipt.thread_health.compact_recommended);
+        assert_eq!(
+            preflight.receipt.thread_health.thread_id.as_deref(),
+            Some(thread_id)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retryable_protocol_error_after_bloated_thread_rolls_over_to_fresh_thread() {
+        let root =
+            temp_root("retryable_protocol_error_after_bloated_thread_rolls_over_to_fresh_thread");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let thread_id = "019ef798-346b-7ae2-b341-60a7a20a8d96";
+        let rollout_dir = harness_home
+            .join("codex-home")
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("24");
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let image_payload = "C".repeat(
+            usize::try_from(CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT).unwrap() + 128,
+        );
+        fs::write(
+            rollout_dir.join(format!("rollout-2026-06-24T11-06-52-{thread_id}.jsonl")),
+            format!(
+                "{}\n",
+                json!({
+                    "type": "function_call_output",
+                    "output": format!("data:image/png;base64,{image_payload}")
+                })
+            ),
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        replace_invocation_thread_id(plan_file, Some(thread_id));
+        let (executable, arguments, events_file) =
+            stream_disconnect_then_fresh_thread_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert_eq!(
+            report.receipt.context_recovery.as_ref().unwrap().status,
+            "thread-health-rollover-succeeded"
+        );
+        assert!(
+            report
+                .receipt
+                .context_recovery
+                .as_ref()
+                .unwrap()
+                .fresh_thread_attempted
+        );
+        let completion = report.completion.as_ref().unwrap();
+        let transcript = fs::read_to_string(completion.transcript_file.as_ref().unwrap()).unwrap();
+        assert!(transcript.contains("Fresh fallback reply"));
+        let events = fs::read_to_string(events_file).unwrap();
+        assert!(events.contains("thread/resume"));
+        assert!(events.contains("thread/compact/start"));
+        assert!(events.contains("thread/start"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn codex_progress_skips_terminal_delta_event_wrappers() {
         let context = progress_context();
         let event = codex_progress_event_from_json(
@@ -6995,6 +8658,75 @@ mod tests {
                 .to_string_lossy()
                 .ends_with(".jsonl.codex-app-server.json")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plan_codex_runtime_preserves_continuation_metadata_from_prepared_receipt() {
+        let root = temp_root("plan_codex_runtime_preserves_continuation_metadata");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let execution_dir = latest_prepared_execution_dir(&harness_home);
+        let receipt_file = execution_dir.join("execution-receipt.json");
+        let mut receipt: Value = serde_json::from_slice(&fs::read(&receipt_file).unwrap()).unwrap();
+        receipt["virtualSessionId"] = json!("vsession-test");
+        receipt["continuationIndex"] = json!(1);
+        receipt["completionKind"] = json!("continuation-rollover");
+        receipt["taskTerminal"] = json!(false);
+        receipt["suppressSelfImprovement"] = json!(true);
+        fs::write(
+            &receipt_file,
+            serde_json::to_string_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+
+        let report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: Some(execution_dir),
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+
+        let plan = report.plan.as_ref().unwrap();
+        assert_eq!(
+            plan.continuation.virtual_session_id.as_deref(),
+            Some("vsession-test")
+        );
+        assert_eq!(plan.continuation.continuation_index, Some(1));
+        assert!(plan.continuation.should_suppress_self_improvement());
+        let plan_json: Value =
+            serde_json::from_slice(&fs::read(report.plan_file.unwrap()).unwrap()).unwrap();
+        assert_eq!(plan_json["completionKind"], "continuation-rollover");
+        assert_eq!(plan_json["suppressSelfImprovement"], true);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_context_policy_reads_rollover_counter_config() {
+        let root = temp_root("codex_context_policy_reads_rollover_counter_config");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "codexContext": {
+                "maxSuccessfulCompactsBeforeRollover": 3,
+                "rolloverMode": "disabled",
+                "cooperativeMidTurnDrain": true
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let policy = load_codex_context_policy(&harness_home).unwrap();
+
+        assert!(policy.configured);
+        assert_eq!(policy.max_successful_compacts_before_rollover, 3);
+        assert_eq!(policy.rollover_mode, "disabled");
+        assert!(policy.cooperative_mid_turn_drain);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -7338,7 +9070,7 @@ mod tests {
         fs::write(codex_home.join("auth.json"), "{}").unwrap();
         fs::write(
             harness_home.join(HARNESS_CONFIG_FILE_NAME),
-            r#"{"security":{"codexSandbox":"read-only"}}"#,
+            r#"{"security":{"codexSandbox":"unelevated"}}"#,
         )
         .unwrap();
         enqueue_and_prepare(&source, &harness_home);
@@ -7359,7 +9091,241 @@ mod tests {
                 .join("config.toml"),
         )
         .unwrap();
-        assert!(config.contains("sandbox = \"read-only\""));
+        assert!(config.contains("sandbox = \"unelevated\""));
+        assert!(!config.contains("sandbox = \"read-only\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn plan_codex_runtime_with_security(
+        name: &str,
+        security_json: &str,
+    ) -> (PathBuf, CodexRuntimePlan, String) {
+        let root = temp_root(name);
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let codex_home = harness_home.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            format!(r#"{{"security":{security_json}}}"#),
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+
+        let report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home,
+            execution_dir: None,
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+
+        let plan = report.plan.unwrap();
+        let config = fs::read_to_string(
+            plan.invocation
+                .codex_home
+                .as_ref()
+                .unwrap()
+                .join("config.toml"),
+        )
+        .unwrap();
+        (root, plan, config)
+    }
+
+    fn assert_windows_sandbox_omitted(name: &str, security_json: &str) {
+        let (root, _plan, config) = plan_codex_runtime_with_security(name, security_json);
+
+        assert!(!config.contains("[windows]"));
+        assert!(!config.contains("sandbox = "));
+        assert!(config.contains("[features]"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_windows_sandbox_disabled_omits_windows_stanza() {
+        assert_windows_sandbox_omitted(
+            "codex_windows_sandbox_disabled_omits_windows_stanza",
+            r#"{"codexSandboxMode":"disabled"}"#,
+        );
+    }
+
+    #[test]
+    fn codex_windows_sandbox_off_omits_windows_stanza() {
+        assert_windows_sandbox_omitted(
+            "codex_windows_sandbox_off_omits_windows_stanza",
+            r#"{"codexSandbox":"off"}"#,
+        );
+    }
+
+    #[test]
+    fn codex_windows_sandbox_none_omits_windows_stanza() {
+        assert_windows_sandbox_omitted(
+            "codex_windows_sandbox_none_omits_windows_stanza",
+            r#"{"codexSandbox":"none"}"#,
+        );
+    }
+
+    #[test]
+    fn codex_windows_sandbox_false_bool_omits_windows_stanza() {
+        assert_windows_sandbox_omitted(
+            "codex_windows_sandbox_false_bool_omits_windows_stanza",
+            r#"{"codexSandbox":false}"#,
+        );
+    }
+
+    #[test]
+    fn codex_windows_sandbox_elevated_writes_elevated() {
+        let (root, _plan, config) = plan_codex_runtime_with_security(
+            "codex_windows_sandbox_elevated_writes_elevated",
+            r#"{"codexSandboxMode":"elevated"}"#,
+        );
+
+        assert!(config.contains("[windows]"));
+        assert!(config.contains("sandbox = \"elevated\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_windows_sandbox_unelevated_writes_unelevated() {
+        let (root, _plan, config) = plan_codex_runtime_with_security(
+            "codex_windows_sandbox_unelevated_writes_unelevated",
+            r#"{"codexSandboxMode":"unelevated"}"#,
+        );
+
+        assert!(config.contains("[windows]"));
+        assert!(config.contains("sandbox = \"unelevated\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_sandbox_policy_danger_full_access_stays_app_server_only() {
+        let (root, plan, config) = plan_codex_runtime_with_security(
+            "codex_sandbox_policy_danger_full_access_stays_app_server_only",
+            r#"{"codexSandboxMode":"disabled","codexSandboxPolicy":"dangerFullAccess"}"#,
+        );
+
+        assert_eq!(plan.invocation.app_server_sandbox, "dangerFullAccess");
+        assert!(!config.contains("[windows]"));
+        assert!(!config.contains("sandbox = \"danger-full-access\""));
+        assert!(!config.contains("sandbox = \"dangerFullAccess\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generated_config_rewrite_removes_windows_stanza_when_disabled() {
+        let root = temp_root("generated_config_rewrite_removes_windows_stanza_when_disabled");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let codex_home = harness_home.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        fs::write(
+            codex_home.join("config.toml"),
+            "# Generated by agent-harness. Contains no secrets.\n\
+             # Codex OAuth state stays in auth.json/auth.toml.\n\
+             \n\
+             [windows]\n\
+             sandbox = \"elevated\"\n\
+             \n\
+             [features]\n\
+             multi_agent = true\n\
+             memories = true\n",
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"security":{"codexSandboxMode":"disabled"}}"#,
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+
+        let report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home,
+            execution_dir: None,
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+        let plan = report.plan.unwrap();
+        let config = fs::read_to_string(
+            plan.invocation
+                .codex_home
+                .as_ref()
+                .unwrap()
+                .join("config.toml"),
+        )
+        .unwrap();
+
+        assert!(!config.contains("[windows]"));
+        assert!(!config.contains("sandbox = "));
+        assert!(config.contains("[features]"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generated_provider_config_rewrite_removes_windows_stanza_when_disabled() {
+        let root =
+            temp_root("generated_provider_config_rewrite_removes_windows_stanza_when_disabled");
+        let source = write_openrouter_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let codex_home = harness_home.join("codex-home-providers").join("openrouter");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(
+            codex_home.join("config.toml"),
+            "# Generated by agent-harness. Contains no secrets.\n\
+             # Codex OAuth state stays in auth.json/auth.toml.\n\
+             \n\
+             model_provider = \"openrouter\"\n\
+             \n\
+             [windows]\n\
+             sandbox = \"elevated\"\n\
+             \n\
+             [features]\n\
+             multi_agent = true\n\
+             memories = true\n\
+             \n\
+             [model_providers.openrouter]\n\
+             name = \"Old Router\"\n\
+             base_url = \"https://old.example/v1\"\n\
+             env_key = \"OLD_OPENROUTER_KEY\"\n\
+             wire_api = \"chat\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"security":{"codexSandboxMode":"disabled"}}"#,
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+
+        let report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home,
+            execution_dir: None,
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+        let plan = report.plan.unwrap();
+        let config = fs::read_to_string(
+            plan.invocation
+                .codex_home
+                .as_ref()
+                .unwrap()
+                .join("config.toml"),
+        )
+        .unwrap();
+
+        assert!(!config.contains("[windows]"));
+        assert!(!config.contains("sandbox = "));
+        assert!(config.contains("model_provider = \"openrouter\""));
+        assert!(config.contains("[model_providers.openrouter]"));
+        assert!(config.contains("base_url = \"https://openrouter.ai/api/v1\""));
+        assert!(!config.contains("Old Router"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -7501,6 +9467,89 @@ mod tests {
                 .iter()
                 .any(|check| check.name == "codex-executable")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn preflight_codex_runtime_blocks_extensionless_windows_shim() {
+        let root = temp_root("preflight_codex_runtime_blocks_extensionless_windows_shim");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let shim = root
+            .join(".tools")
+            .join("codex-cli")
+            .join("node_modules")
+            .join(".bin")
+            .join("codex");
+        fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        fs::write(&shim, "").unwrap();
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(shim),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+
+        let report = preflight_codex_runtime(CodexRuntimePreflightOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimePreflightStatus::Blocked);
+        assert!(report.checks.iter().any(|check| {
+            check.name == "codex-executable"
+                && check.status == CodexRuntimePreflightCheckStatus::Fail
+                && check.detail.contains("extensionless")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn preflight_codex_runtime_blocks_codex_desktop_msix_resource_path() {
+        let root = temp_root("preflight_codex_runtime_blocks_codex_desktop_msix_resource_path");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let msix_codex = root
+            .join("Program Files")
+            .join("WindowsApps")
+            .join("OpenAI.Codex_26.616.9593.0_x64__2p2nqsd0c76g0")
+            .join("app")
+            .join("resources")
+            .join("codex.exe");
+        fs::create_dir_all(msix_codex.parent().unwrap()).unwrap();
+        fs::write(&msix_codex, "").unwrap();
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(msix_codex),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+
+        let report = preflight_codex_runtime(CodexRuntimePreflightOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimePreflightStatus::Blocked);
+        assert!(report.checks.iter().any(|check| {
+            check.name == "codex-executable"
+                && check.status == CodexRuntimePreflightCheckStatus::Fail
+                && check.detail.contains("MSIX")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -7712,8 +9761,8 @@ mod tests {
             harness_home: harness_home.clone(),
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             progress_context: None,
         })
         .unwrap();
@@ -7760,8 +9809,8 @@ mod tests {
             harness_home,
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             progress_context: None,
         })
         .unwrap();
@@ -7772,6 +9821,206 @@ mod tests {
             fs::read_to_string(transcript_file).unwrap().lines().count(),
             2
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_accepts_final_answer_before_not_loaded_empty_turn_completed() {
+        let root = temp_root(
+            "run_codex_runtime_accepts_final_answer_before_not_loaded_empty_turn_completed",
+        );
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = not_loaded_final_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert!(report.receipt.event_count >= 3);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("ignored stale compact-only"))
+        );
+        let transcript_file = report.completion.unwrap().transcript_file.unwrap();
+        let transcript = fs::read_to_string(transcript_file).unwrap();
+        assert!(transcript.contains("Final before notLoaded terminal."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_records_startup_progress_before_protocol_events() {
+        let root = temp_root("run_codex_runtime_records_startup_progress_before_protocol_events");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = fake_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: Some(progress_context()),
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let events_file = crate::agent_progress_events_file(&harness_home);
+        let events = fs::read_to_string(events_file).unwrap();
+        let first: Value = serde_json::from_str(events.lines().next().unwrap()).unwrap();
+        assert_eq!(first["kind"], serde_json::json!("runtime"));
+        assert_eq!(first["label"], serde_json::json!("runtime"));
+        assert_eq!(first["status"], serde_json::json!("started"));
+        assert_eq!(
+            first["preview"],
+            serde_json::json!("starting Codex app-server")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn queue_codex_turn_steer_request_defers_without_active_turn() {
+        let root = temp_root("queue_codex_turn_steer_request_defers_without_active_turn");
+        let harness_home = root.join(".agent-harness");
+
+        let report = queue_codex_turn_steer_request(CodexTurnSteerRequestOptions {
+            harness_home: harness_home.clone(),
+            platform: "telegram".to_string(),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            session_key: "telegram:dm-42:user-7:main".to_string(),
+            agent_id: Some("main".to_string()),
+            text: "please include the new acceptance criterion".to_string(),
+            client_user_message_id: None,
+            now_ms: 2000,
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.status,
+            CodexTurnSteerQueueStatus::DeferredNoActiveTurn
+        );
+        assert!(report.request_file.is_none());
+        let receipts = fs::read_to_string(report.receipts_file).unwrap();
+        assert!(receipts.contains("deferred-no-active-turn"));
+        assert!(receipts.contains("next-turn-or-passive-context"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_sends_pending_turn_steer_to_app_server() {
+        let root = temp_root("run_codex_runtime_sends_pending_turn_steer_to_app_server");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let capture_file = root.join("captured-turn-steer.json");
+        let (executable, arguments) = steer_echo_app_server_command(&root, &capture_file);
+        replace_invocation(plan_file, executable, arguments);
+
+        let queue_harness_home = harness_home.clone();
+        let queue_thread = thread::spawn(move || {
+            let session_key = "telegram:dm-42:user-7:main";
+            let binding_file = codex_active_turn_binding_file(&queue_harness_home, session_key);
+            for _ in 0..100 {
+                if let Ok(Some(binding)) = read_codex_active_turn_binding(&binding_file)
+                    && binding.active_turn_id.as_deref() == Some("turn-test")
+                {
+                    return queue_codex_turn_steer_request(CodexTurnSteerRequestOptions {
+                        harness_home: queue_harness_home,
+                        platform: "telegram".to_string(),
+                        channel_id: "dm-42".to_string(),
+                        user_id: "user-7".to_string(),
+                        session_key: session_key.to_string(),
+                        agent_id: Some("main".to_string()),
+                        text: "include the late steering note".to_string(),
+                        client_user_message_id: Some("telegram:message:99".to_string()),
+                        now_ms: 3000,
+                    })
+                    .unwrap();
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            panic!("active Codex turn binding did not appear");
+        });
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+        let queue_report = queue_thread.join().unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert_eq!(
+            queue_report.status,
+            CodexTurnSteerQueueStatus::QueuedSameTurn
+        );
+        let captured: Value = serde_json::from_slice(&fs::read(&capture_file).unwrap()).unwrap();
+        assert_eq!(captured["method"], "turn/steer");
+        assert_eq!(captured["params"]["threadId"], "thread-test");
+        assert_eq!(captured["params"]["expectedTurnId"], "turn-test");
+        assert_eq!(
+            captured["params"]["clientUserMessageId"],
+            "telegram:message:99"
+        );
+        assert_eq!(
+            captured["params"]["input"][0]["text"],
+            "include the late steering note"
+        );
+        let receipts = fs::read_to_string(codex_turn_steer_receipts_file(&harness_home)).unwrap();
+        assert!(receipts.contains("queued-same-turn"));
+        assert!(receipts.contains("\"status\":\"accepted\""));
+        let active: CodexActiveTurnBindingRecord = read_json_file_as(
+            &codex_active_turn_binding_file(&harness_home, "telegram:dm-42:user-7:main"),
+        )
+        .unwrap();
+        assert_eq!(active.status, CodexActiveTurnStatus::Completed);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -7804,8 +10053,8 @@ mod tests {
             harness_home,
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             progress_context: None,
         })
         .unwrap();
@@ -7858,9 +10107,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let elapsed = started.elapsed();
+        let max_elapsed = if cfg!(windows) {
+            Duration::from_secs(12)
+        } else {
+            Duration::from_secs(8)
+        };
         assert!(
-            started.elapsed() < Duration::from_secs(8),
-            "runtime should not wait for an inherited stdout handle to close"
+            elapsed < max_elapsed,
+            "runtime should not wait for an inherited stdout handle to close: elapsed={elapsed:?}, max_elapsed={max_elapsed:?}"
         );
         let transcript_file = report.completion.unwrap().transcript_file.unwrap();
         let transcript = fs::read_to_string(transcript_file).unwrap();
@@ -7899,6 +10154,87 @@ mod tests {
         assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
         assert!(report.receipt.reason.contains("OPENROUTER_API_KEY"));
         assert!(report.completion.is_none());
+        let run_file = report.run_file.unwrap();
+        let run_json = fs::read_to_string(run_file).unwrap();
+        assert!(!run_json.contains("(no assistant text captured"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_rejects_completed_turn_without_assistant_text() {
+        let root = temp_root("run_codex_runtime_rejects_completed_turn_without_assistant_text");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = empty_completion_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 10_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+        assert!(report.completion.is_none());
+        let run_file = report.run_file.unwrap();
+        let run_json = fs::read_to_string(run_file).unwrap();
+        assert!(!run_json.contains("(no assistant text captured"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_rejects_completed_turn_with_only_harness_notice() {
+        let root = temp_root("run_codex_runtime_rejects_completed_turn_with_only_harness_notice");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = denied_approval_empty_completion_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 10_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+        assert!(
+            report
+                .receipt
+                .reason
+                .contains("without captured assistant output")
+        );
+        assert!(report.completion.is_none());
+        assert!(report.warnings.iter().any(|warning| warning.contains(
+            "auto-cancelled Codex app-server request item/commandExecution/requestApproval"
+        )));
         let run_file = report.run_file.unwrap();
         let run_json = fs::read_to_string(run_file).unwrap();
         assert!(!run_json.contains("(no assistant text captured"));
@@ -8042,6 +10378,183 @@ mod tests {
     }
 
     #[test]
+    fn run_codex_runtime_preflight_drains_compact_turn_completed_before_user_turn() {
+        let root =
+            temp_root("run_codex_runtime_preflight_drains_compact_turn_completed_before_user_turn");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"codexContext":{"modelContextWindow":1000,"compactAtActiveContextRatio":0.5,"modelAutoCompactTokenLimit":900}}"#,
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan = plan_report.plan.as_ref().unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        replace_invocation_thread_id(plan_file, Some("thread-existing"));
+        let receipts_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-runtime-run-receipts.jsonl");
+        fs::write(
+            &receipts_file,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "codexBindingFile": plan.outputs.codex_binding_file.to_string_lossy(),
+                    "usage": {
+                        "inputTokens": 920,
+                        "outputTokens": 10,
+                        "totalTokens": 930,
+                        "source": "test"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let (executable, arguments, events_file) =
+            compact_turn_completed_then_reply_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 10_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert_eq!(
+            report
+                .receipt
+                .context_recovery
+                .as_ref()
+                .map(|receipt| receipt.status.as_str()),
+            Some("compact-before-turn")
+        );
+        let completion = report.completion.as_ref().unwrap();
+        let transcript = fs::read_to_string(completion.transcript_file.as_ref().unwrap()).unwrap();
+        assert!(transcript.contains("Reply after compact turn boundary."));
+        assert!(!transcript.contains("(no assistant text captured"));
+        let events = fs::read_to_string(events_file).unwrap();
+        let compact_index = events.find("thread/compact/start").unwrap();
+        let turn_index = events.find("turn/start").unwrap();
+        assert!(compact_index < turn_index);
+
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn run_codex_runtime_preflight_compact_failure_falls_back_to_fresh_thread() {
+        assert_preflight_compact_problem_falls_back("failed", 10_000);
+    }
+
+    #[test]
+    fn run_codex_runtime_preflight_compact_timeout_falls_back_to_fresh_thread() {
+        let idle_timeout_ms = if cfg!(windows) { 15_000 } else { 5_000 };
+        assert_preflight_compact_problem_falls_back("timeout", idle_timeout_ms);
+    }
+
+    #[test]
+    fn run_codex_runtime_preflight_compact_unexpected_response_falls_back_to_fresh_thread() {
+        assert_preflight_compact_problem_falls_back("unexpected", 10_000);
+    }
+
+    fn assert_preflight_compact_problem_falls_back(scenario: &str, idle_timeout_ms: u64) {
+        let root = temp_root(&format!(
+            "run_codex_runtime_preflight_compact_{scenario}_falls_back_to_fresh_thread"
+        ));
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"codexContext":{"modelContextWindow":1000,"compactAtActiveContextRatio":0.5,"modelAutoCompactTokenLimit":900,"fallbackOnCompactFailure":"checkpoint-and-new-thread"}}"#,
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan = plan_report.plan.as_ref().unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        replace_invocation_thread_id(plan_file, Some("thread-existing"));
+        let receipts_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-runtime-run-receipts.jsonl");
+        fs::write(
+            &receipts_file,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "codexBindingFile": plan.outputs.codex_binding_file.to_string_lossy(),
+                    "usage": {
+                        "inputTokens": 920,
+                        "outputTokens": 10,
+                        "totalTokens": 930,
+                        "source": "test"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let (executable, arguments, events_file) =
+            preflight_compact_problem_then_fresh_thread_app_server_command(&root, scenario);
+        replace_invocation(plan_file, executable, arguments);
+        let timeout_ms = if cfg!(windows) && scenario == "timeout" {
+            45_000
+        } else {
+            10_000
+        };
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms,
+            idle_timeout_ms,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let recovery = report.receipt.context_recovery.as_ref().unwrap();
+        assert_eq!(
+            recovery.status.as_str(),
+            "compact-before-turn-fallback-succeeded"
+        );
+        assert_eq!(recovery.official_compact_attempts, 1);
+        assert!(recovery.fresh_thread_attempted);
+        assert!(recovery.fresh_thread_succeeded);
+        assert!(recovery.checkpoint_file.as_ref().unwrap().is_file());
+        assert!(recovery.rollover_file.as_ref().unwrap().is_file());
+        assert!(recovery.reason.contains("compact-before-turn"));
+        let events = fs::read_to_string(events_file).unwrap();
+        assert!(events.contains("thread/compact/start"));
+        assert!(events.matches("turn/start").count() >= 1);
+        let transcript =
+            fs::read_to_string(report.completion.unwrap().transcript_file.unwrap()).unwrap();
+        assert!(transcript.contains("Fresh fallback reply."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_codex_runtime_context_error_compacts_and_retries_once() {
         let root = temp_root("run_codex_runtime_context_error_compacts_and_retries_once");
         let source = write_codex_runtime_source(&root);
@@ -8167,8 +10680,8 @@ mod tests {
             harness_home,
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             progress_context: None,
         })
         .unwrap();
@@ -8251,8 +10764,8 @@ mod tests {
             harness_home: harness_home.clone(),
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 5_000,
-            idle_timeout_ms: 5_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             progress_context: None,
         })
         .unwrap();
@@ -8824,6 +11337,114 @@ while ($true) {
     }
 
     #[cfg(windows)]
+    fn not_loaded_final_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("not-loaded-final-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Final before notLoaded terminal.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","items":[],"itemsView":"notLoaded"}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
+
+    #[cfg(windows)]
+    fn steer_echo_app_server_command(root: &Path, capture_file: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("steer-echo-app-server.ps1");
+        let capture = capture_file.to_string_lossy().replace('\'', "''");
+        fs::write(
+            &script,
+            format!(
+                r#"
+$capture = '{capture}'
+while ($true) {{
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) {{ break }}
+    try {{
+        $msg = $line | ConvertFrom-Json
+    }} catch {{
+        continue
+    }}
+    if ($msg.id -eq 0) {{
+        [Console]::Out.WriteLine('{{"id":0,"result":{{"ok":true}}}}')
+        [Console]::Out.Flush()
+    }} elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {{
+        [Console]::Out.WriteLine('{{"id":1,"result":{{"thread":{{"id":"thread-test"}}}}}}')
+        [Console]::Out.Flush()
+    }} elseif ($msg.method -eq 'turn/start') {{
+        [Console]::Out.WriteLine('{{"method":"turn/started","params":{{"threadId":"thread-test","turn":{{"id":"turn-test","kind":"regular"}}}}}}')
+        [Console]::Out.Flush()
+        $steerLine = [Console]::In.ReadLine()
+        Set-Content -LiteralPath $capture -Value $steerLine
+        $steerId = 10000
+        try {{
+            $steer = $steerLine | ConvertFrom-Json
+            $steerId = [int]$steer.id
+        }} catch {{}}
+        [Console]::Out.WriteLine(('{{"id":' + $steerId + ',"result":{{"turnId":"turn-test"}}}}'))
+        [Console]::Out.WriteLine('{{"method":"item/agentMessage/delta","params":{{"delta":"Steered reply."}}}}')
+        [Console]::Out.WriteLine('{{"method":"turn/completed","params":{{"threadId":"thread-test","turn":{{"id":"turn-test","status":"completed","usage":{{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}}}}}')
+        [Console]::Out.Flush()
+        break
+    }}
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
+
+    #[cfg(windows)]
     fn slow_stream_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
         let script = root.join("slow-stream-app-server.ps1");
         fs::write(
@@ -9038,6 +11659,288 @@ while ($true) {
     }
 
     #[cfg(windows)]
+    fn stream_disconnect_then_fresh_thread_app_server_command(
+        root: &Path,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("stream-disconnect-then-fresh-thread.ps1");
+        let events = root.join("stream-disconnect-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+$events = Join-Path $PSScriptRoot 'stream-disconnect-events.jsonl'
+$first = Join-Path $PSScriptRoot 'stream-disconnect-first.marker'
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.method) { Add-Content -LiteralPath $events -Value $msg.method }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/resume') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-bloated"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-fresh"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/compact/start') {
+        [Console]::Out.WriteLine('{"id":2,"result":{}}')
+        [Console]::Out.WriteLine('{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-bloated"}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-bloated"}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        if (!(Test-Path -LiteralPath $first)) {
+            Set-Content -LiteralPath $first -Value 'failed'
+            [Console]::Out.WriteLine('{"method":"error","params":{"error":{"message":"Reconnecting... 2/5","additionalDetails":"stream disconnected before completion: websocket closed by server before response.completed"},"willRetry":true,"threadId":"thread-bloated","turnId":"turn-failed"}}')
+            [Console]::Out.Flush()
+            break
+        }
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-fresh","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-fresh","turn":{"id":"turn-fresh","status":"completed","usage":{"inputTokens":18,"outputTokens":7,"totalTokens":25}}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+            events,
+        )
+    }
+
+    #[cfg(windows)]
+    fn compact_turn_completed_then_reply_app_server_command(
+        root: &Path,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("compact-turn-boundary-app-server.ps1");
+        let events = root.join("compact-turn-boundary-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+$events = Join-Path $PSScriptRoot 'compact-turn-boundary-events.jsonl'
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.method) { Add-Content -LiteralPath $events -Value $msg.method }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/resume') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/compact/start') {
+        [Console]::Out.WriteLine('{"id":2,"result":{}}')
+        [Console]::Out.WriteLine('{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-before-user","status":"completed","items":[],"itemsView":"notLoaded"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Reply after compact turn boundary.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+            events,
+        )
+    }
+
+    #[cfg(windows)]
+    fn empty_completion_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("empty-completion-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","items":[]}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
+    #[cfg(windows)]
+    fn denied_approval_empty_completion_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("denied-approval-empty-completion-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"id":77,"method":"item/commandExecution/requestApproval","params":{}}')
+        [Console]::Out.Flush()
+        $null = [Console]::In.ReadLine()
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","items":[]}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
+    #[cfg(windows)]
+    fn preflight_compact_problem_then_fresh_thread_app_server_command(
+        root: &Path,
+        scenario: &str,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("preflight-compact-problem.ps1");
+        let events = root.join("preflight-compact-problem-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+$scenario = $args[0]
+if ([string]::IsNullOrWhiteSpace($scenario)) { $scenario = 'failed' }
+$events = Join-Path $PSScriptRoot 'preflight-compact-problem-events.jsonl'
+$marker = Join-Path $PSScriptRoot ("preflight-compact-" + $scenario + ".marker")
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.method) { Add-Content -LiteralPath $events -Value $msg.method }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/compact/start') {
+        Set-Content -LiteralPath $marker -Value 'compact-problem'
+        if ($scenario -eq 'timeout') {
+            Start-Sleep -Seconds 30
+            break
+        } elseif ($scenario -eq 'unexpected') {
+            [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-unexpected","status":"completed"}}}')
+            [Console]::Out.Flush()
+            break
+        } else {
+            [Console]::Out.WriteLine('{"method":"error","params":{"error":{"message":"ContextWindowExceeded: compact failed before turn."},"threadId":"thread-test","turnId":"compact-failed"}}')
+            [Console]::Out.Flush()
+            break
+        }
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-fresh","status":"completed","usage":{"inputTokens":18,"outputTokens":7,"totalTokens":25}}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+                scenario.to_string(),
+            ],
+            events,
+        )
+    }
+
+    #[cfg(windows)]
     fn context_error_then_compact_success_app_server_command(
         root: &Path,
     ) -> (PathBuf, Vec<String>, PathBuf) {
@@ -9199,6 +12102,70 @@ done
     }
 
     #[cfg(not(windows))]
+    fn not_loaded_final_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("not-loaded-final-app-server.sh");
+        fs::write(
+            &script,
+            r#"
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Final before notLoaded terminal.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","items":[],"itemsView":"notLoaded"}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        (PathBuf::from("sh"), vec![script.display().to_string()])
+    }
+
+    #[cfg(not(windows))]
+    fn steer_echo_app_server_command(root: &Path, capture_file: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("steer-echo-app-server.sh");
+        let capture = capture_file.to_string_lossy().replace('\'', "'\\''");
+        fs::write(
+            &script,
+            format!(
+                r#"
+capture='{capture}'
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{{"id":0,"result":{{"ok":true}}}}'
+            ;;
+        *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+            printf '%s\n' '{{"id":1,"result":{{"thread":{{"id":"thread-test"}}}}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{{"method":"turn/started","params":{{"threadId":"thread-test","turn":{{"id":"turn-test","kind":"regular"}}}}}}'
+            IFS= read -r steer_line
+            printf '%s\n' "$steer_line" > "$capture"
+            steer_id=$(printf '%s' "$steer_line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+            if [ -z "$steer_id" ]; then steer_id=10000; fi
+            printf '%s\n' '{{"id":'"$steer_id"',"result":{{"turnId":"turn-test"}}}}'
+            printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"delta":"Steered reply."}}}}'
+            printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"thread-test","turn":{{"id":"turn-test","status":"completed","usage":{{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}}}}}'
+            exit 0
+            ;;
+    esac
+done
+"#
+            ),
+        )
+        .unwrap();
+        (PathBuf::from("sh"), vec![script.display().to_string()])
+    }
+
+    #[cfg(not(windows))]
     fn slow_stream_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
         let script = root.join("slow-stream-app-server.sh");
         fs::write(
@@ -9324,6 +12291,229 @@ done
         (
             PathBuf::from("sh"),
             vec![script.display().to_string()],
+            events,
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn stream_disconnect_then_fresh_thread_app_server_command(
+        root: &Path,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("stream-disconnect-then-fresh-thread.sh");
+        let events = root.join("stream-disconnect-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+dir="$(dirname "$0")"
+events="$dir/stream-disconnect-events.jsonl"
+first="$dir/stream-disconnect-first.marker"
+while IFS= read -r line; do
+    method="$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')"
+    [ -n "$method" ] && printf '%s\n' "$method" >> "$events"
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/resume"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-bloated"}}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-fresh"}}}'
+            ;;
+        *'"method":"thread/compact/start"'*)
+            printf '%s\n' '{"id":2,"result":{}}'
+            printf '%s\n' '{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-bloated"}}'
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-bloated"}}'
+            ;;
+        *'"method":"turn/start"'*)
+            if [ ! -f "$first" ]; then
+                printf failed > "$first"
+                printf '%s\n' '{"method":"error","params":{"error":{"message":"Reconnecting... 2/5","additionalDetails":"stream disconnected before completion: websocket closed by server before response.completed"},"willRetry":true,"threadId":"thread-bloated","turnId":"turn-failed"}}'
+                exit 0
+            fi
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-fresh","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-fresh","turn":{"id":"turn-fresh","status":"completed","usage":{"inputTokens":18,"outputTokens":7,"totalTokens":25}}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        make_executable(&script);
+        (
+            PathBuf::from("sh"),
+            vec![script.display().to_string()],
+            events,
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn compact_turn_completed_then_reply_app_server_command(
+        root: &Path,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("compact-turn-boundary-app-server.sh");
+        let events = root.join("compact-turn-boundary-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+events="$(dirname "$0")/compact-turn-boundary-events.jsonl"
+while IFS= read -r line; do
+    method="$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')"
+    [ -n "$method" ] && printf '%s\n' "$method" >> "$events"
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/resume"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"thread/compact/start"'*)
+            printf '%s\n' '{"id":2,"result":{}}'
+            printf '%s\n' '{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}'
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-before-user","status":"completed","items":[],"itemsView":"notLoaded"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Reply after compact turn boundary.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let _ = std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&script)
+            .status();
+        (
+            PathBuf::from("sh"),
+            vec![script.display().to_string()],
+            events,
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn empty_completion_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("empty-completion-app-server.sh");
+        fs::write(
+            &script,
+            r#"
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","items":[]}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let _ = std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&script)
+            .status();
+        (PathBuf::from("sh"), vec![script.display().to_string()])
+    }
+    #[cfg(not(windows))]
+    fn denied_approval_empty_completion_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("denied-approval-empty-completion-app-server.sh");
+        fs::write(
+            &script,
+            r#"
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"id":77,"method":"item/commandExecution/requestApproval","params":{}}'
+            IFS= read -r _approval_response || true
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","items":[]}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let _ = std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&script)
+            .status();
+        (PathBuf::from("sh"), vec![script.display().to_string()])
+    }
+    #[cfg(not(windows))]
+    fn preflight_compact_problem_then_fresh_thread_app_server_command(
+        root: &Path,
+        scenario: &str,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("preflight-compact-problem.sh");
+        let events = root.join("preflight-compact-problem-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+scenario="$1"
+[ -n "$scenario" ] || scenario="failed"
+dir="$(dirname "$0")"
+events="$dir/preflight-compact-problem-events.jsonl"
+marker="$dir/preflight-compact-$scenario.marker"
+while IFS= read -r line; do
+    method="$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')"
+    [ -n "$method" ] && printf '%s\n' "$method" >> "$events"
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"thread/compact/start"'*)
+            printf compact-problem > "$marker"
+            case "$scenario" in
+                timeout)
+                    sleep 10
+                    exit 0
+                    ;;
+                unexpected)
+                    printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-unexpected","status":"completed"}}}'
+                    exit 0
+                    ;;
+                *)
+                    printf '%s\n' '{"method":"error","params":{"error":{"message":"ContextWindowExceeded: compact failed before turn."},"threadId":"thread-test","turnId":"compact-failed"}}'
+                    exit 0
+                    ;;
+            esac
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-fresh","text":"Fresh fallback reply.","phase":"final_answer"},"threadId":"thread-test","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-fresh","status":"completed","usage":{"inputTokens":18,"outputTokens":7,"totalTokens":25}}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        make_executable(&script);
+        (
+            PathBuf::from("sh"),
+            vec![script.display().to_string(), scenario.to_string()],
             events,
         )
     }

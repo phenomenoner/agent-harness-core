@@ -15,6 +15,7 @@ pub mod channel_runtime;
 pub mod channel_state;
 pub mod codex_runtime;
 pub mod config;
+pub mod context_rollover;
 pub mod cron;
 pub mod cron_runs;
 pub mod cron_scheduler;
@@ -24,6 +25,7 @@ pub mod harness_registry;
 pub mod harness_skills;
 pub mod health;
 pub mod importer;
+pub mod latency;
 pub mod live_control;
 pub mod logging;
 pub mod loop_health;
@@ -35,6 +37,7 @@ pub mod memory_contracts;
 pub mod memory_owner;
 pub mod memory_pack;
 pub mod metrics;
+pub mod operation_plan;
 pub mod ops;
 pub mod progress;
 pub mod prompt;
@@ -47,6 +50,7 @@ pub mod runtime_policy;
 pub mod runtime_queue;
 pub mod runtime_worker;
 pub mod security;
+pub mod self_improvement;
 pub mod skill_apply;
 pub mod skill_envelope;
 pub mod skill_learning;
@@ -54,13 +58,16 @@ pub mod skill_matcher;
 pub mod skill_usage;
 pub mod skills;
 pub mod status;
+pub mod subagent_lifecycle;
 pub mod subagents;
 pub mod supervision;
 pub mod supervisor;
+pub mod supervisor_inventory;
 pub mod token_efficiency;
 pub mod trace;
 pub mod turns;
 pub mod vault;
+pub mod wake;
 pub mod worker_adapters;
 pub mod workers;
 
@@ -129,13 +136,29 @@ pub use codex_runtime::{
     CodexRuntimePreflightReport, CodexRuntimePreflightStatus, CodexRuntimeReceipt,
     CodexRuntimeReceiptStatus, CodexRuntimeRunOptions, CodexRuntimeRunReceipt,
     CodexRuntimeRunReport, CodexRuntimeRunStatus, CodexSandboxInspection, CodexTransportPlan,
+    CodexTurnSteerQueueStatus, CodexTurnSteerRequestOptions, CodexTurnSteerRequestReport,
     inspect_codex_approval_policy, inspect_codex_sandbox, inspect_codex_sandbox_policy,
     load_assistant_narration_config, plan_codex_runtime, preflight_codex_runtime,
-    probe_codex_runtime_launch, record_codex_runtime_completion, run_codex_runtime,
+    probe_codex_runtime_launch, queue_codex_turn_steer_request, record_codex_runtime_completion,
+    run_codex_runtime,
 };
 pub use config::{
     HARNESS_CONFIG_FILE_NAME, HarnessConfigValidationReport, HarnessConfigValidationStatus,
     harness_config_candidates, validate_harness_config,
+};
+pub use context_rollover::{
+    ContextCompactAttemptOptions, ContextCompactCounter, ContextCompactCounterOptions,
+    ContextRolloverBeforeTurnOptions, ContextRolloverConfig, ContextRolloverEpisode,
+    ContextRolloverLane, ContextRolloverMode, ContextRolloverPreparedRequeueReport,
+    ContextRolloverReceipt, ContextRolloverRequeuePreparedOptions, ContextRolloverStatus,
+    ContextStaticRecordRefs, ContextVirtualSessionRecord, ContextWorkingSetGoal,
+    ContextWorkingSetMemory, RuntimeContinuationMetadata, apply_context_rollover_before_turn,
+    context_compact_counter_file, context_rollover_episode_index_file,
+    context_rollover_prepared_requeues_file, context_rollover_receipts_file,
+    continuation_session_key, is_rollover_completion_kind, load_context_rollover_config,
+    load_or_create_context_compact_counter, load_working_set_continuity_section,
+    parse_rollover_mode, planned_session_files, record_context_compact_attempt,
+    requeue_prepared_context_rollover, root_working_session_key, working_set_session_index_file,
 };
 pub use cron::{
     NativeCronJob, NativeCronJobState, NativeCronPlan, NativeCronPlanAction, NativeCronPlanEntry,
@@ -321,6 +344,21 @@ pub use memory_pack::{
     retrieve_pack_artifact, validate_pack_canary_schema, write_pack_strategy_config,
 };
 pub use metrics::{HarnessMetricsOptions, HarnessMetricsReport, collect_harness_metrics};
+pub use operation_plan::{
+    CreateOperationPlanOptions, OperationPlan, OperationPlanAddItemOptions,
+    OperationPlanAddItemReport, OperationPlanBlockOptions, OperationPlanBlockReport,
+    OperationPlanComment, OperationPlanCommentOptions, OperationPlanCommentReport,
+    OperationPlanCompleteOptions, OperationPlanCompleteReport, OperationPlanCreateReport,
+    OperationPlanDelegateItemOptions, OperationPlanEvent, OperationPlanEventKind,
+    OperationPlanItem, OperationPlanItemStatus, OperationPlanPromoteDependenciesOptions,
+    OperationPlanPromoteDependenciesReport, OperationPlanReceipt, OperationPlanReceiptAction,
+    OperationPlanShowOptions, OperationPlanShowReport, OperationPlanStatus, OperationPlanSummary,
+    OperationPlanUpdateItemOptions, OperationPlanUpdateItemReport, add_operation_plan_item,
+    block_operation_plan, comment_on_operation_plan, complete_operation_plan,
+    create_operation_plan, delegate_operation_plan_item, list_operation_plans,
+    promote_operation_plan_items_from_dependencies, show_operation_plan,
+    update_operation_plan_item,
+};
 pub use ops::{
     OpsBackupEntry, OpsBackupOptions, OpsBackupReport, OpsControlAction, OpsControlOptions,
     OpsControlReport, OpsCutoverApplyOptions, OpsCutoverApplyReport, OpsCutoverApproveOptions,
@@ -384,6 +422,12 @@ pub use runtime_worker::{
     prepare_runtime_queue_item, release_runtime_queue_lease,
 };
 pub use security::{SecurityScanOptions, SecurityScanReport, scan_security_boundaries};
+pub use self_improvement::{
+    SelfImprovementNotificationTarget, SelfImprovementReviewConfig,
+    SelfImprovementReviewHookOptions, SelfImprovementReviewHookReport, SelfImprovementReviewMode,
+    append_self_improvement_notification, load_self_improvement_review_config,
+    run_self_improvement_review_hook, self_improvement_review_receipts_file,
+};
 pub use skill_apply::{
     SkillApplyOptions, SkillApplyReport, SkillApplyStatus, SkillProposalActionOptions,
     SkillProposalActionReport, SkillProposalActionStatus, SkillProposalListOptions,
@@ -399,8 +443,8 @@ pub use skill_learning::{
     LearningReviewOptions, LearningReviewReport, SkillArchiveOptions, SkillCuratorOptions,
     SkillLearningProposal, SkillLearningProposalOperation, SkillLearningProposalStatus,
     SkillLearningSignal, SkillProposeOptions, SkillStructuredPatch, SkillSupportFileOperation,
-    create_skill_archive_proposal, create_skill_learning_proposal, run_learning_review,
-    run_skill_curator, skill_proposals_file,
+    build_self_improvement_replacement_body, create_skill_archive_proposal,
+    create_skill_learning_proposal, run_learning_review, run_skill_curator, skill_proposals_file,
 };
 pub use skill_matcher::{SkillMatcherInfo, skill_matcher_info};
 pub use skill_usage::{
@@ -422,6 +466,12 @@ pub use status::{
     HarnessRuntimeReceiptStatus, HarnessRuntimeStatus, HarnessStatusOptions, HarnessStatusReport,
     collect_harness_status,
 };
+pub use subagent_lifecycle::{
+    SubagentLifecycleCleanup, SubagentLifecycleCloseOptions, SubagentLifecycleReceipt,
+    SubagentLifecycleRecordOptions, SubagentLifecycleShowOptions, SubagentLifecycleShowReport,
+    SubagentLifecycleState, close_subagent_lifecycle, record_subagent_lifecycle,
+    show_subagent_lifecycle, subagent_lifecycle_receipts_file, subagent_lifecycle_snapshot_file,
+};
 pub use subagents::{
     SubagentLedger, SubagentLedgerSummary, SubagentPlan, SubagentPlanAction, SubagentPlanEntry,
     SubagentPlanFile, SubagentPlanInput, SubagentPlanSummary, SubagentRun, SubagentRunStatus,
@@ -435,6 +485,11 @@ pub use supervision::{
 pub use supervisor::{
     WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport, WindowsSupervisorScript,
     WindowsSupervisorTask, write_windows_supervisor_plan,
+};
+pub use supervisor_inventory::{
+    SupervisorInventoryOptions, SupervisorInventoryReport, SupervisorInventoryServiceConfig,
+    SupervisorInventoryServiceSummary, SupervisorInventoryStatus, SupervisorLaunchCommand,
+    reconcile_supervisor_inventory,
 };
 pub use token_efficiency::{
     PromptReductionOptions, PromptReductionReport, TokenEfficiencyOptions, TokenEfficiencyReport,

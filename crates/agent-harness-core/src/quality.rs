@@ -111,6 +111,16 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "operator report for generation lease reaping; additive fields only in v1",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.runtime-queue-latency.v1",
+            owner_module: "latency",
+            compatibility: "append-only per-stage queue latency receipts; additive stages and timestamps only in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.latency-status.v1",
+            owner_module: "agent-harness-cli",
+            compatibility: "read-only CLI summary over latency receipts; additive summary fields only in v1",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.progress-delivery-state.v1",
             owner_module: "progress",
             compatibility: "state JSON may add cursor/cache fields in v1; existing lane cursors remain readable",
@@ -149,6 +159,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             schema: "agent-harness.channel-restart-request.v1",
             owner_module: "channel_runtime",
             compatibility: "append-only restart receipts; stop-file envelope action remains additive in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.gateway-restart-request.v1",
+            owner_module: "channel_state",
+            compatibility: "append-only protected gateway restart requests; command effect remains request-only in v1",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.cron-scheduler.run-once.v1",
@@ -206,6 +221,16 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "service state JSON may add diagnostic fields in v1; launchOwner/servicePriority distinguish observe-only external runners from rust-supervisor-run children",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.supervisor-inventory.v1",
+            owner_module: "supervisor_inventory",
+            compatibility: "desired-service inventory reports may add health fields in v1; missing/stale/launch action semantics remain stable",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.supervisor-reconcile.v1",
+            owner_module: "agent-harness-cli",
+            compatibility: "CLI reconcile output may add launch diagnostics in v1; apply remains explicit and never implied by dry-run",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.queue-shadow-compare.v1",
             owner_module: "queue_shadow",
             compatibility: "additive divergence fields only in v1",
@@ -256,6 +281,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "additive fields only in v1",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.wake-sequence.v1",
+            owner_module: "wake",
+            compatibility: "per-lane wake sequence files may add diagnostic fields in v1; sequence remains monotonic best-effort",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.task-entity.v1",
             owner_module: "autonomy",
             compatibility: "additive fields only in v1; checkpoints remain append-only",
@@ -274,6 +304,31 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             schema: "agent-harness.learning-proposal.v1",
             owner_module: "autonomy",
             compatibility: "proposal JSON may add review fields in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.operation-plan.v1",
+            owner_module: "operation_plan",
+            compatibility: "plan JSON may add metadata in v1; plan id and status semantics remain stable",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.operation-plan-item.v1",
+            owner_module: "operation_plan",
+            compatibility: "item JSON may add metadata in v1; evidence-required completion remains stable",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.operation-plan-event.v1",
+            owner_module: "operation_plan",
+            compatibility: "append-only plan event records; additive fields only in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.operation-plan-comment.v1",
+            owner_module: "operation_plan",
+            compatibility: "append-only comments; additive fields only in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.operation-plan-receipt.v1",
+            owner_module: "operation_plan",
+            compatibility: "append-only receipts; idempotency keys and action names remain stable in v1",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.skill-invocation-envelope.v1",
@@ -314,6 +369,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             schema: "agent-harness.learning-review.v1",
             owner_module: "skill_learning",
             compatibility: "deterministic review reports only; worker must not mutate skill files directly",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.self-improvement-review.v1",
+            owner_module: "self_improvement",
+            compatibility: "append-only review hook receipts; apply mode aliases are additive and replacements remain checksum-guarded",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.drift-report.v1",

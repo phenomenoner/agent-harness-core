@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    SkillUsageAction, SkillUsageEventOptions, append_jsonl_value, current_log_time_ms,
-    record_skill_usage_event, skill_body_checksum,
+    SKILL_FILE_NAME, SkillUsageAction, SkillUsageEventOptions, append_jsonl_value,
+    current_log_time_ms, record_skill_usage_event, skill_body_checksum,
 };
 
 const SKILL_PROPOSAL_SCHEMA: &str = "agent-harness.skill-proposal.v1";
@@ -174,7 +174,12 @@ pub fn skill_proposals_file(harness_home: impl AsRef<Path>) -> PathBuf {
 pub fn create_skill_learning_proposal(
     options: SkillProposeOptions,
 ) -> io::Result<SkillLearningProposal> {
-    let base_checksum = file_checksum_or_missing(&options.target_path)?;
+    let target_path = validate_skill_target_path(
+        &options.harness_home,
+        &options.target_skill_id,
+        &options.target_path,
+    )?;
+    let base_checksum = file_checksum_or_missing(&target_path)?;
     let base_version = base_checksum.clone();
     let structured_patch = (options.replacement_body.is_some()
         || !options.support_files.is_empty())
@@ -193,7 +198,7 @@ pub fn create_skill_learning_proposal(
         schema: SKILL_PROPOSAL_SCHEMA.to_string(),
         proposal_id: proposal_id.clone(),
         target_skill_id: options.target_skill_id.clone(),
-        target_path: options.target_path,
+        target_path,
         base_checksum,
         base_version,
         operation: options.operation,
@@ -327,6 +332,85 @@ pub fn run_learning_review(options: LearningReviewOptions) -> io::Result<Learnin
     })
 }
 
+pub fn build_self_improvement_replacement_body(
+    target_path: &Path,
+    signal_text: &str,
+    source_turn: Option<&str>,
+    now_ms: i64,
+) -> io::Result<Option<String>> {
+    let signal = classify_learning_signal(signal_text);
+    if !self_improvement_signal_is_replace_candidate(&signal.kind) {
+        return Ok(None);
+    }
+    let current = fs::read_to_string(target_path)?;
+    if current.contains(&format!("signal `{}`", signal.signal_hash)) {
+        return Ok(None);
+    }
+    let summary = self_improvement_note_summary(signal_text);
+    if summary.is_empty() {
+        return Ok(None);
+    }
+
+    let mut updated = current.trim_end().to_string();
+    if !updated.contains("\n## Self-Improvement Notes") {
+        updated.push_str("\n\n## Self-Improvement Notes\n");
+    } else if !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    let source = source_turn
+        .map(|turn| format!(" sourceTurn `{}`", sanitize_inline_note(turn, 80)))
+        .unwrap_or_default();
+    updated.push_str(&format!(
+        "- review-ms `{now_ms}`{source}: {} (kind `{}`, signal `{}`)\n",
+        summary, signal.kind, signal.signal_hash
+    ));
+    Ok(Some(updated))
+}
+
+fn self_improvement_signal_is_replace_candidate(kind: &str) -> bool {
+    matches!(
+        kind,
+        "explicit-save-request"
+            | "explicit-update-request"
+            | "verified-complex-task"
+            | "repeated-error-signature"
+            | "workflow-correction"
+    )
+}
+
+fn self_improvement_note_summary(signal_text: &str) -> String {
+    let trimmed = signal_text.trim();
+    let without_prefix = trimmed
+        .strip_prefix("post-turn self-improvement review signal:")
+        .unwrap_or(trimmed)
+        .trim();
+    sanitize_inline_note(without_prefix, 240)
+}
+
+fn sanitize_inline_note(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut previous_space = false;
+    for ch in text.chars() {
+        let normalized = if ch.is_control() || ch == '`' {
+            ' '
+        } else {
+            ch
+        };
+        if normalized.is_whitespace() {
+            if !previous_space && !out.is_empty() {
+                out.push(' ');
+                previous_space = true;
+            }
+        } else {
+            out.push(normalized);
+            previous_space = false;
+        }
+        if out.chars().count() >= max_chars {
+            break;
+        }
+    }
+    out.trim().to_string()
+}
 pub fn run_skill_curator(options: SkillCuratorOptions) -> io::Result<LearningReviewReport> {
     let usage_text = fs::read_to_string(crate::skill_usage_events_file(&options.harness_home))
         .unwrap_or_default();
@@ -424,6 +508,80 @@ pub fn normalize_error_signature(stage: &str, error: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     stable_text_hash("error-signature", &format!("{stage}|{class}|{excerpt}"))
+}
+
+pub fn validate_skill_target_path(
+    harness_home: &Path,
+    target_skill_id: &str,
+    target_path: &Path,
+) -> io::Result<PathBuf> {
+    if target_path.file_name().and_then(|value| value.to_str()) != Some(SKILL_FILE_NAME) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("skill target path must end with {SKILL_FILE_NAME}"),
+        ));
+    }
+    let skill_dir = target_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "skill target path has no parent directory",
+        )
+    })?;
+    let skill_leaf = target_skill_id_leaf(target_skill_id);
+    if skill_dir.file_name().and_then(|value| value.to_str()) != Some(skill_leaf) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("skill target directory must match skill id leaf `{skill_leaf}`"),
+        ));
+    }
+    if !skill_dir.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "skill target directory does not exist",
+        ));
+    }
+    let skill_dir = fs::canonicalize(skill_dir)?;
+    let validated_target = if target_path.exists() {
+        fs::canonicalize(target_path)?
+    } else {
+        skill_dir.join(SKILL_FILE_NAME)
+    };
+    let target_parent = validated_target.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "validated skill target has no parent directory",
+        )
+    })?;
+    for root in approved_skill_roots(harness_home) {
+        if let Ok(root) = fs::canonicalize(root) {
+            if target_parent.starts_with(&root) {
+                return Ok(validated_target);
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "skill target path is outside approved skill roots",
+    ))
+}
+
+fn approved_skill_roots(harness_home: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![
+        harness_home.join("skills"),
+        harness_home.join("workspace").join("skills"),
+    ];
+    if let Some(parent) = harness_home.parent() {
+        roots.push(parent.join("skills"));
+        roots.push(parent.join("workspace").join("skills"));
+    }
+    roots
+}
+
+fn target_skill_id_leaf(skill_id: &str) -> &str {
+    skill_id
+        .rsplit(|ch| ch == ':' || ch == '/' || ch == '\\')
+        .find(|part| !part.trim().is_empty())
+        .unwrap_or(skill_id)
 }
 
 fn file_checksum_or_missing(path: &Path) -> io::Result<String> {
@@ -536,11 +694,59 @@ mod tests {
     }
 
     #[test]
+    fn self_improvement_replacement_body_is_bounded_and_deduped() {
+        let root = temp_root("self_improvement_replacement_body_is_bounded_and_deduped");
+        let skill = root
+            .join("skills")
+            .join("quiet-cron-watchdogs")
+            .join(SKILL_FILE_NAME);
+        fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        fs::write(&skill, "# Quiet Cron Watchdogs\n\nOriginal.\n").unwrap();
+
+        assert!(
+            build_self_improvement_replacement_body(
+                &skill,
+                "completed an ordinary turn without a reusable learning",
+                Some("turn-low"),
+                1,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let updated = build_self_improvement_replacement_body(
+            &skill,
+            "remember to keep cron watchdog fixes in this skill after repeated scheduler errors",
+            Some("turn-high"),
+            2,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(updated.contains("## Self-Improvement Notes"));
+        assert!(updated.contains("remember to keep cron watchdog fixes"));
+        assert!(updated.contains("sourceTurn `turn-high`"));
+        assert!(updated.contains("signal `"));
+        fs::write(&skill, updated).unwrap();
+        assert!(
+            build_self_improvement_replacement_body(
+                &skill,
+                "remember to keep cron watchdog fixes in this skill after repeated scheduler errors",
+                Some("turn-high"),
+                3,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn learning_review_debounces_signal_and_quarantines_lower_trust() {
         let root = temp_root("learning_review_debounces_signal_and_quarantines_lower_trust");
         let home = root.join(".openclaw");
-        let skill = root.join("skill.md");
-        fs::create_dir_all(&root).unwrap();
+        let skill = root.join("skills").join("skill").join(SKILL_FILE_NAME);
+        fs::create_dir_all(skill.parent().unwrap()).unwrap();
         fs::write(&skill, "# Skill\n").unwrap();
         let options = LearningReviewOptions {
             harness_home: home.clone(),
@@ -564,11 +770,40 @@ mod tests {
     }
 
     #[test]
+    fn skill_target_validation_rejects_external_or_non_skill_md_paths() {
+        let root = temp_root("skill_target_validation_rejects_external_or_non_skill_md_paths");
+        let home = root.join(".openclaw");
+        let skill = root.join("skills").join("triage").join(SKILL_FILE_NAME);
+        fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        fs::write(&skill, "# Triage\n").unwrap();
+
+        assert!(validate_skill_target_path(&home, "workspace:triage", &skill).is_ok());
+        assert!(
+            validate_skill_target_path(
+                &home,
+                "workspace:triage",
+                &root.join("skills").join("triage").join("README.md")
+            )
+            .is_err()
+        );
+        assert!(
+            validate_skill_target_path(
+                &home,
+                "workspace:triage",
+                &root.join("outside").join("triage").join(SKILL_FILE_NAME)
+            )
+            .is_err()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn skill_curator_creates_archive_proposal_from_stale_usage() {
         let root = temp_root("skill_curator_creates_archive_proposal_from_stale_usage");
         let home = root.join(".openclaw");
-        let skill = root.join("skill.md");
-        fs::create_dir_all(&root).unwrap();
+        let skill = root.join("skills").join("old").join(SKILL_FILE_NAME);
+        fs::create_dir_all(skill.parent().unwrap()).unwrap();
         fs::write(&skill, "# Skill\n").unwrap();
         for index in 0..2 {
             record_skill_usage_event(SkillUsageEventOptions {

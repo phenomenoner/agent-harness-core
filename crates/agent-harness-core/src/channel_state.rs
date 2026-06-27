@@ -5,7 +5,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ChannelCommandEffect, ChannelOutboundMessage, ChannelStep, write_json_atomic};
+use crate::{
+    ChannelCommandEffect, ChannelOutboundMessage, ChannelStep,
+    codex_runtime::{CodexTurnSteerRequestOptions, queue_codex_turn_steer_request},
+    write_json_atomic,
+};
 
 const CHANNEL_COMMAND_APPLY_SCHEMA: &str = "agent-harness.channel-command-apply.v1";
 const CHANNEL_STATE_SCHEMA: &str = "agent-harness.channel-session-state.v1";
@@ -323,6 +327,16 @@ fn apply_effect(
             topic,
             new_session_key,
         } => {
+            if let Some(agent_id) = active_session_key_agent_segment(new_session_key) {
+                if state.agent_id.as_deref() != Some(agent_id.as_str()) {
+                    state.provider = None;
+                    state.model = None;
+                    state.model_override = None;
+                    state.model_override_provider = None;
+                    state.model_override_model = None;
+                }
+                state.agent_id = Some(agent_id);
+            }
             state.active_session_key = new_session_key.clone();
             state.session_topic = topic.clone();
             state.thinking_enabled = false;
@@ -366,11 +380,27 @@ fn apply_effect(
             write_runtime_cancel_request(harness_home, state, reason.clone(), now_ms)?;
         }
         ChannelCommandEffect::RestartChannel { .. } => {}
+        ChannelCommandEffect::RestartGateway { .. } => {}
         ChannelCommandEffect::AddSteering { instruction } => {
             state.steering_notes.push(ChannelSessionNote {
                 at_ms: now_ms,
                 text: instruction.clone(),
             });
+            if let Err(error) = queue_codex_turn_steer_request(CodexTurnSteerRequestOptions {
+                harness_home: harness_home.to_path_buf(),
+                platform: state.platform.clone(),
+                channel_id: state.channel_id.clone(),
+                user_id: state.user_id.clone(),
+                session_key: state.active_session_key.clone(),
+                agent_id: state.agent_id.clone(),
+                text: instruction.clone(),
+                client_user_message_id: None,
+                now_ms,
+            }) {
+                warnings.push(format!(
+                    "codex turn/steer bridge request could not be recorded: {error}"
+                ));
+            }
         }
         ChannelCommandEffect::AddBtwNote { note } => {
             state.btw_notes.push(ChannelSessionNote {
@@ -434,6 +464,14 @@ fn apply_effect(
     Ok(())
 }
 
+fn active_session_key_agent_segment(session_key: &str) -> Option<String> {
+    session_key
+        .split(':')
+        .nth(3)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
 fn update_model_context(
     state: &mut ChannelSessionState,
     agent_id: &Option<String>,
@@ -458,6 +496,7 @@ fn command_name(effect: &ChannelCommandEffect) -> &'static str {
         ChannelCommandEffect::SwitchThinking { .. } => "think",
         ChannelCommandEffect::StopCurrentRun { .. } => "stop",
         ChannelCommandEffect::RestartChannel { .. } => "restart",
+        ChannelCommandEffect::RestartGateway { .. } => "restart",
         ChannelCommandEffect::AddSteering { .. } => "steer",
         ChannelCommandEffect::AddBtwNote { .. } => "btw",
         ChannelCommandEffect::ShowModel { .. } => "model",
@@ -788,6 +827,37 @@ mod tests {
     }
 
     #[test]
+    fn new_session_records_agent_from_new_session_key() {
+        let root = temp_root("new_session_records_agent_from_new_session_key");
+        let harness_home = root.join(".agent-harness");
+        let new_step = command_step_with_session(
+            "telegram:dm:user:main",
+            ChannelCommandEffect::StartNewSession {
+                topic: Some("xiaoxiaoli lane".to_string()),
+                new_session_key: "telegram:dm:user:xiaoxiaoli:session-1".to_string(),
+            },
+        );
+
+        let report = apply_channel_command_step(
+            &new_step,
+            ChannelCommandApplyOptions {
+                harness_home,
+                now_ms: 1000,
+            },
+        )
+        .unwrap();
+
+        let state = report.state.unwrap();
+        assert_eq!(
+            state.active_session_key,
+            "telegram:dm:user:xiaoxiaoli:session-1"
+        );
+        assert_eq!(state.agent_id.as_deref(), Some("xiaoxiaoli"));
+        assert_eq!(report.receipt.session_key, state.active_session_key);
+
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
     fn skips_non_command_steps() {
         let root = temp_root("skips_non_command_steps");
         let harness_home = root.join(".agent-harness");
@@ -875,6 +945,8 @@ mod tests {
                 user_id: "user".to_string(),
                 session_key: session_key.to_string(),
                 kind: ChannelOutboundMessageKind::CommandReply,
+                source_queue_id: None,
+                source_completion_file: None,
                 text: "ok".to_string(),
                 delivery_intent: None,
                 attachments: Vec::new(),

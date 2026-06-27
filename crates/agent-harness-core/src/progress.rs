@@ -15,6 +15,7 @@ const AGENT_PROGRESS_DELIVERY_STATE_SCHEMA: &str = "agent-harness.progress-deliv
 const AGENT_PROGRESS_DELIVERY_RECEIPT_SCHEMA: &str = "agent-harness.progress-delivery-receipt.v1";
 const DEFAULT_PREVIEW_CHARS: usize = 120;
 const DEFAULT_CURRENT_STEP_CHARS: usize = 1200;
+const TERMINAL_PROGRESS_STATE_RETENTION_MS: i64 = 10 * 60 * 1000;
 const SENSITIVE_PREVIEW: &str = "[redacted sensitive preview]";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,23 +405,12 @@ impl AgentProgressDeliveryCursor {
             AgentProgressDeliveryMessageKind::Body => {
                 self.body_terminal
                     || (self.terminal
-                        && (self.body_provider_message_id.is_some()
-                            || self.body_last_event_line > 0
-                            || !self.body_last_text_hash.is_empty()
-                            || self.body_last_sent_at_ms > 0
-                            || self.provider_message_id.is_some()
+                        && (self.provider_message_id.is_some()
                             || self.last_event_line > 0
                             || !self.last_text_hash.is_empty()
                             || self.last_sent_at_ms > 0))
             }
-            AgentProgressDeliveryMessageKind::Status => {
-                self.status_terminal
-                    || (self.terminal
-                        && (self.status_provider_message_id.is_some()
-                            || self.status_last_event_line > 0
-                            || !self.status_last_text_hash.is_empty()
-                            || self.status_last_sent_at_ms > 0))
-            }
+            AgentProgressDeliveryMessageKind::Status => self.status_terminal,
         }
     }
 
@@ -572,8 +562,19 @@ pub fn append_agent_progress_event(
     harness_home: impl AsRef<Path>,
     event: &AgentProgressEvent,
 ) -> io::Result<PathBuf> {
+    let harness_home = harness_home.as_ref();
     let file = agent_progress_events_file(harness_home);
     append_json_line(&file, event)?;
+    let wake_file = harness_home
+        .join("state")
+        .join("wake")
+        .join("progress-delivery.json");
+    let _ = crate::wake::signal_wake(
+        harness_home,
+        wake_file,
+        "progress-delivery",
+        "agent progress event appended",
+    );
     Ok(file)
 }
 
@@ -586,6 +587,7 @@ pub fn plan_agent_progress_delivery(
     let mut warnings = Vec::new();
     let mute_config = load_progress_delivery_mute_config(&options.harness_home, &mut warnings)?;
     let mut state = read_delivery_state(&state_file, &mut warnings)?;
+    prune_old_terminal_delivery_state(&mut state, options.now_ms);
     let read_result =
         read_progress_events_since_cursor(&events_file, &state.ledger, &mut warnings)?;
     let cached_events = if read_result.reset {
@@ -1316,6 +1318,29 @@ fn read_delivery_state(
     }
 }
 
+fn prune_old_terminal_delivery_state(state: &mut AgentProgressDeliveryState, now_ms: i64) {
+    if now_ms <= 0 {
+        return;
+    }
+    let cutoff_ms = now_ms.saturating_sub(TERMINAL_PROGRESS_STATE_RETENTION_MS);
+    let old_terminal_queues = state
+        .queues
+        .iter()
+        .filter_map(|(queue_id, cursor)| {
+            let latest_sent_at_ms = cursor
+                .body_last_sent_at_ms
+                .max(cursor.status_last_sent_at_ms)
+                .max(cursor.last_sent_at_ms);
+            (cursor.terminal && latest_sent_at_ms > 0 && latest_sent_at_ms <= cutoff_ms)
+                .then(|| queue_id.clone())
+        })
+        .collect::<Vec<_>>();
+    for queue_id in old_terminal_queues {
+        state.queues.remove(&queue_id);
+        state.compacted_events.remove(&queue_id);
+    }
+}
+
 fn write_delivery_state(state_file: &Path, state: &AgentProgressDeliveryState) -> io::Result<()> {
     write_json_atomic(state_file, state)
 }
@@ -1513,6 +1538,47 @@ mod tests {
     use super::*;
     use crate::config::HARNESS_CONFIG_FILE_NAME;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn append_agent_progress_event_signals_delivery_wake() {
+        let root = temp_root("append_agent_progress_event_signals_delivery_wake");
+        let harness_home = root.join(".agent-harness");
+        let wake_file = harness_home
+            .join("state")
+            .join("wake")
+            .join("progress-delivery.json");
+        let context = context();
+
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Terminal,
+                "terminal",
+                "cargo test",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+        )
+        .unwrap();
+        assert_eq!(crate::wake::read_wake_sequence(&wake_file).unwrap(), 1);
+
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Runtime,
+                "runtime",
+                "completed",
+                AgentProgressStatus::Completed,
+                2000,
+            ),
+        )
+        .unwrap();
+        assert_eq!(crate::wake::read_wake_sequence(&wake_file).unwrap(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn renders_safe_operation_action_stream_separate_from_status_by_default() {
@@ -2264,6 +2330,18 @@ mod tests {
             &harness_home,
             &AgentProgressEvent::new(
                 &context,
+                AgentProgressKind::ToolCall,
+                "tool_call",
+                "cargo test",
+                AgentProgressStatus::Completed,
+                2500,
+            ),
+        )
+        .unwrap();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
                 AgentProgressKind::Runtime,
                 "run",
                 "completed",
@@ -2329,6 +2407,164 @@ mod tests {
             AgentProgressDeliveryMessageKind::Status
         );
         assert_eq!(retry.summary.delivered_current, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_status_delivery_does_not_suppress_failed_body_retry() {
+        let root = temp_root("terminal_status_delivery_does_not_suppress_failed_body_retry");
+        let harness_home = root.join(".agent-harness");
+        let context = context();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Terminal,
+                "terminal",
+                "cargo test -p agent-harness-core",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+        )
+        .unwrap();
+
+        let initial = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(initial.pending.len(), 2);
+        for pending in initial.pending {
+            record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+                harness_home: harness_home.clone(),
+                queue_id: pending.queue_id,
+                platform: pending.platform,
+                account_id: pending.account_id,
+                channel_id: pending.channel_id,
+                thread_id: pending.thread_id,
+                user_id: pending.user_id,
+                session_key: pending.session_key,
+                message_kind: pending.message_kind,
+                action: pending.action,
+                status: AgentProgressDeliveryStatus::Delivered,
+                provider_message_id: Some(format!("provider-{:?}", pending.message_kind)),
+                event_line: pending.event_line,
+                text_hash: pending.text_hash,
+                terminal: pending.terminal,
+                policy_decision: Some("test".to_string()),
+                error: None,
+                now_ms: 2000,
+            })
+            .unwrap();
+        }
+
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::ToolCall,
+                "tool_call",
+                "cargo test",
+                AgentProgressStatus::Completed,
+                2500,
+            ),
+        )
+        .unwrap();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Runtime,
+                "run",
+                "completed",
+                AgentProgressStatus::Completed,
+                3000,
+            ),
+        )
+        .unwrap();
+
+        let terminal = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 4000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(terminal.pending.len(), 2);
+        let terminal_status = terminal
+            .pending
+            .iter()
+            .find(|pending| pending.message_kind == AgentProgressDeliveryMessageKind::Status)
+            .unwrap()
+            .clone();
+        let terminal_body = terminal
+            .pending
+            .iter()
+            .find(|pending| pending.message_kind == AgentProgressDeliveryMessageKind::Body)
+            .unwrap()
+            .clone();
+
+        record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+            harness_home: harness_home.clone(),
+            queue_id: terminal_status.queue_id,
+            platform: terminal_status.platform,
+            account_id: terminal_status.account_id,
+            channel_id: terminal_status.channel_id,
+            thread_id: terminal_status.thread_id,
+            user_id: terminal_status.user_id,
+            session_key: terminal_status.session_key,
+            message_kind: terminal_status.message_kind,
+            action: terminal_status.action,
+            status: AgentProgressDeliveryStatus::Delivered,
+            provider_message_id: terminal_status.provider_message_id,
+            event_line: terminal_status.event_line,
+            text_hash: terminal_status.text_hash,
+            terminal: terminal_status.terminal,
+            policy_decision: Some("test".to_string()),
+            error: None,
+            now_ms: 4000,
+        })
+        .unwrap();
+        record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+            harness_home: harness_home.clone(),
+            queue_id: terminal_body.queue_id,
+            platform: terminal_body.platform,
+            account_id: terminal_body.account_id,
+            channel_id: terminal_body.channel_id,
+            thread_id: terminal_body.thread_id,
+            user_id: terminal_body.user_id,
+            session_key: terminal_body.session_key,
+            message_kind: terminal_body.message_kind,
+            action: terminal_body.action,
+            status: AgentProgressDeliveryStatus::Failed,
+            provider_message_id: terminal_body.provider_message_id,
+            event_line: terminal_body.event_line,
+            text_hash: terminal_body.text_hash,
+            terminal: terminal_body.terminal,
+            policy_decision: Some("test".to_string()),
+            error: Some("retryable provider failure".to_string()),
+            now_ms: 4000,
+        })
+        .unwrap();
+
+        let retry = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 5000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(retry.pending.len(), 1);
+        assert_eq!(
+            retry.pending[0].message_kind,
+            AgentProgressDeliveryMessageKind::Body
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2452,6 +2688,118 @@ mod tests {
                 .any(|stored| is_terminal_event(&stored.event))
         );
         assert_eq!(state.ledger.line_number, 81);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn progress_delivery_prunes_old_delivered_terminal_queue_cache() {
+        let root = temp_root("progress_delivery_prunes_old_delivered_terminal_queue_cache");
+        let harness_home = root.join(".agent-harness");
+        let mut state = AgentProgressDeliveryState::default();
+        for index in 0..40 {
+            let mut old_context = context();
+            old_context.queue_id = format!("turn:old:{index}");
+            old_context.session_key = format!("telegram:dm:user:main:old-{index}");
+            let line_number = index + 1;
+            let event = AgentProgressEvent::new(
+                &old_context,
+                AgentProgressKind::Runtime,
+                "runtime",
+                "completed",
+                AgentProgressStatus::Completed,
+                1_000 + index as i64,
+            );
+            state.compacted_events.insert(
+                old_context.queue_id.clone(),
+                vec![StoredProgressEvent { line_number, event }],
+            );
+            let mut cursor = AgentProgressDeliveryCursor::new(
+                old_context.platform.clone(),
+                old_context.channel_id.clone(),
+                old_context.user_id.clone(),
+                old_context.session_key.clone(),
+            );
+            cursor.record_lane(
+                AgentProgressDeliveryMessageKind::Body,
+                Some(format!("body-{index}")),
+                line_number,
+                format!("body-hash-{index}"),
+                2_000 + index as i64,
+                true,
+            );
+            cursor.record_lane(
+                AgentProgressDeliveryMessageKind::Status,
+                Some(format!("status-{index}")),
+                line_number,
+                format!("status-hash-{index}"),
+                2_000 + index as i64,
+                true,
+            );
+            state.queues.insert(old_context.queue_id.clone(), cursor);
+        }
+
+        let mut active_context = context();
+        active_context.queue_id = "turn:active".to_string();
+        let active_event = AgentProgressEvent::new(
+            &active_context,
+            AgentProgressKind::Todo,
+            "todo",
+            "planning 1 task(s)",
+            AgentProgressStatus::Started,
+            9_900_000,
+        );
+        state.compacted_events.insert(
+            active_context.queue_id.clone(),
+            vec![StoredProgressEvent {
+                line_number: 41,
+                event: active_event,
+            }],
+        );
+        state.queues.insert(
+            active_context.queue_id.clone(),
+            AgentProgressDeliveryCursor::new(
+                active_context.platform.clone(),
+                active_context.channel_id.clone(),
+                active_context.user_id.clone(),
+                active_context.session_key.clone(),
+            ),
+        );
+        let state_file = agent_progress_delivery_state_file(&harness_home);
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        write_delivery_state(&state_file, &state).unwrap();
+
+        let plan = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 10_000_000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+
+        assert_eq!(plan.summary.queues, 1);
+        let mut warnings = Vec::new();
+        let pruned = read_delivery_state(&state_file, &mut warnings).unwrap();
+        assert!(warnings.is_empty());
+        assert!(pruned.compacted_events.contains_key("turn:active"));
+        assert!(pruned.queues.contains_key("turn:active"));
+        assert!(
+            pruned
+                .compacted_events
+                .keys()
+                .all(|queue_id| !queue_id.starts_with("turn:old:")),
+            "{:?}",
+            pruned.compacted_events.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            pruned
+                .queues
+                .keys()
+                .all(|queue_id| !queue_id.starts_with("turn:old:")),
+            "{:?}",
+            pruned.queues.keys().collect::<Vec<_>>()
+        );
 
         let _ = fs::remove_dir_all(root);
     }

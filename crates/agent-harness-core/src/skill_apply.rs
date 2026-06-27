@@ -181,6 +181,28 @@ pub fn apply_skill_proposal(options: SkillApplyOptions) -> io::Result<SkillApply
         append_jsonl_value(&report.receipts_file, &report)?;
         return Ok(report);
     }
+    let validated_target_path = match crate::skill_learning::validate_skill_target_path(
+        &options.harness_home,
+        &proposal.target_skill_id,
+        &proposal.target_path,
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            let report = SkillApplyReport {
+                schema: SKILL_APPLY_RECEIPT_SCHEMA,
+                harness_home: options.harness_home,
+                proposal_id: options.proposal_id,
+                status: SkillApplyStatus::Blocked,
+                reason: format!("invalid skill target path: {error}"),
+                target_path: Some(proposal.target_path),
+                backup_dir: None,
+                receipts_file,
+            };
+            append_jsonl_value(&report.receipts_file, &report)?;
+            return Ok(report);
+        }
+    };
+    proposal.target_path = validated_target_path;
     let _lock = ApplyLock::acquire(&options.harness_home, &proposal.target_path)?;
     let current_checksum = file_checksum_or_missing(&proposal.target_path)?;
     if current_checksum != proposal.base_checksum {
@@ -520,7 +542,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::{SkillProposeOptions, create_skill_learning_proposal};
+    use crate::{
+        SkillLearningProposal, SkillProposeOptions, SkillStructuredPatch, append_jsonl_value,
+        create_skill_learning_proposal, skill_body_checksum,
+    };
 
     use super::*;
 
@@ -587,6 +612,54 @@ mod tests {
         .unwrap();
         assert_eq!(stale_report.status, SkillApplyStatus::Quarantined);
         assert!(fs::read_to_string(&skill).unwrap().contains("User edit"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_apply_blocks_legacy_proposal_outside_approved_skill_roots() {
+        let root = temp_root("skill_apply_blocks_legacy_proposal_outside_approved_skill_roots");
+        let home = root.join(".openclaw");
+        let outside = root.join("outside").join("triage").join("SKILL.md");
+        fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        let original = "# Triage\n\nDo not overwrite.\n";
+        fs::write(&outside, original).unwrap();
+        let checksum = skill_body_checksum(original);
+        let proposal = SkillLearningProposal {
+            schema: "agent-harness.skill-proposal.v1".to_string(),
+            proposal_id: "bad-proposal".to_string(),
+            target_skill_id: "workspace:triage".to_string(),
+            target_path: outside.clone(),
+            base_checksum: checksum.clone(),
+            base_version: checksum,
+            operation: SkillLearningProposalOperation::Replace,
+            diff: Some("malicious replacement".to_string()),
+            structured_patch: Some(SkillStructuredPatch {
+                replacement_body: Some("# Triage\n\nOverwritten.\n".to_string()),
+                support_files: Vec::new(),
+            }),
+            signals: Vec::new(),
+            source_turn: None,
+            risk_class: "low".to_string(),
+            status: SkillLearningProposalStatus::Proposed,
+            created_at_ms: 1,
+        };
+        append_jsonl_value(&skill_proposals_file(&home), &proposal).unwrap();
+
+        let report = apply_skill_proposal(SkillApplyOptions {
+            harness_home: home.clone(),
+            proposal_id: proposal.proposal_id,
+            operator: Some("self-improvement-review".to_string()),
+            now_ms: 2,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, SkillApplyStatus::Blocked);
+        assert!(
+            fs::read_to_string(&outside)
+                .unwrap()
+                .contains("Do not overwrite")
+        );
 
         let _ = fs::remove_dir_all(root);
     }

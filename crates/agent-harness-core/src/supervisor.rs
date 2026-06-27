@@ -81,11 +81,14 @@ pub fn write_windows_supervisor_plan(
         None => harness_home.clone(),
     };
     let harness_cli = absolutize_path(&options.harness_cli)?;
-    let codex_executable = options
+    let explicit_codex_executable = options
         .codex_executable
         .as_deref()
         .map(absolutize_path)
         .transpose()?;
+    let codex_executable = explicit_codex_executable.or_else(|| {
+        discover_repo_local_codex_executable(&harness_cli, &harness_home, &source_home)
+    });
     let node_executable = absolutize_command_path(&options.node_executable)?;
     let discord_gateway_script = absolutize_path(&options.discord_gateway_script)?;
     let output_dir = match &options.output_dir {
@@ -858,6 +861,57 @@ fn count_files_containing_legacy_roots(root: &Path) -> io::Result<usize> {
     Ok(count)
 }
 
+fn discover_repo_local_codex_executable(
+    harness_cli: &Path,
+    harness_home: &Path,
+    source_home: &Path,
+) -> Option<PathBuf> {
+    let mut roots = Vec::<PathBuf>::new();
+    collect_candidate_roots(harness_cli, &mut roots);
+    collect_candidate_roots(harness_home, &mut roots);
+    collect_candidate_roots(source_home, &mut roots);
+    for root in roots {
+        for candidate in repo_local_codex_candidates(&root) {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn collect_candidate_roots(path: &Path, roots: &mut Vec<PathBuf>) {
+    for ancestor in path.ancestors() {
+        let candidate = ancestor.to_path_buf();
+        if !roots.iter().any(|existing| existing == &candidate) {
+            roots.push(candidate);
+        }
+    }
+}
+
+fn repo_local_codex_candidates(root: &Path) -> Vec<PathBuf> {
+    let tools = root.join(".tools").join("codex-cli").join("node_modules");
+    let mut candidates = Vec::new();
+    #[cfg(windows)]
+    {
+        candidates.push(
+            tools
+                .join("@openai")
+                .join("codex-win32-x64")
+                .join("vendor")
+                .join("x86_64-pc-windows-msvc")
+                .join("bin")
+                .join("codex.exe"),
+        );
+        candidates.push(tools.join(".bin").join("codex.cmd"));
+    }
+    #[cfg(not(windows))]
+    {
+        candidates.push(tools.join(".bin").join("codex"));
+    }
+    candidates
+}
+
 fn file_contains_legacy_root(path: &Path) -> io::Result<bool> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -1027,6 +1081,79 @@ mod tests {
         assert!(stop_script.contains("Stop-ScheduledTask"));
         assert!(stop_script.contains("AGENT_HARNESS_LIVE_SESSION"));
         assert!(stop_script.contains("ops-cutover-status"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn defaults_unpinned_codex_to_repo_local_windows_executable() {
+        let root = temp_root("defaults_unpinned_codex_to_repo_local_windows_executable");
+        let harness_home = root.join(".agent-harness");
+        let output_dir = root.join("supervisor");
+        let harness_cli = root.join("target").join("debug").join("agent-harness.exe");
+        let codex_exe = root
+            .join(".tools")
+            .join("codex-cli")
+            .join("node_modules")
+            .join("@openai")
+            .join("codex-win32-x64")
+            .join("vendor")
+            .join("x86_64-pc-windows-msvc")
+            .join("bin")
+            .join("codex.exe");
+        fs::create_dir_all(codex_exe.parent().unwrap()).unwrap();
+        fs::write(&codex_exe, "").unwrap();
+
+        let report = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
+            harness_home: harness_home.clone(),
+            source_home: harness_home,
+            workspace: Some(root.join(".agent-harness").join("workspace")),
+            runtime_workspace: None,
+            harness_cli,
+            codex_executable: None,
+            node_executable: PathBuf::from("node"),
+            discord_gateway_script: root.join("tools").join("discord").join("index.mjs"),
+            agent_id: Some("main".to_string()),
+            output_dir: Some(output_dir.clone()),
+            task_prefix: "AgentHarness".to_string(),
+            include_runtime: true,
+            runtime_workers: 12,
+            include_worker: false,
+            include_cron_scheduler: false,
+            include_progress: false,
+            include_telegram: true,
+            include_discord: true,
+            idle_ms: 1000,
+            runtime_timeout_ms: 1_800_000,
+            runtime_idle_timeout_ms: 300_000,
+            max_consecutive_errors: 5,
+            telegram_poll_timeout_seconds: 1,
+            telegram_max_updates: 10,
+            telegram_outbox_limit: 20,
+        })
+        .unwrap();
+
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("codex executable was not pinned")),
+            "warnings: {:?}",
+            report.warnings
+        );
+        for script_name in [
+            "runtime-loop.ps1",
+            "telegram-loop.ps1",
+            "discord-gateway-loop.ps1",
+        ] {
+            let script = fs::read_to_string(output_dir.join("scripts").join(script_name)).unwrap();
+            assert!(script.contains("--codex-exe"), "{script_name}: {script}");
+            assert!(
+                script.contains(&codex_exe.display().to_string()),
+                "{script_name}: {script}"
+            );
+        }
 
         let _ = fs::remove_dir_all(root);
     }

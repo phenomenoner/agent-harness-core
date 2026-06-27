@@ -125,7 +125,7 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
                 )?;
                 let outbound =
                     with_account_id(apply.outbound_messages.clone(), options.account_id.clone());
-                append_outbound_messages(&outbox_file, &outbound)?;
+                append_outbound_messages(&options.harness_home, &outbox_file, &outbound)?;
                 (
                     ChannelReceiveStatus::CommandApplied,
                     Some(apply.clone()),
@@ -158,7 +158,7 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
             ChannelStepAction::NoAgentAvailable => {
                 let outbound =
                     with_account_id(step.outbound_messages.clone(), options.account_id.clone());
-                append_outbound_messages(&outbox_file, &outbound)?;
+                append_outbound_messages(&options.harness_home, &outbox_file, &outbound)?;
                 (
                     ChannelReceiveStatus::ErrorReplied,
                     None,
@@ -229,9 +229,25 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
     })
 }
 
-fn append_outbound_messages(path: &Path, messages: &[ChannelOutboundMessage]) -> io::Result<()> {
+fn append_outbound_messages(
+    harness_home: &Path,
+    path: &Path,
+    messages: &[ChannelOutboundMessage],
+) -> io::Result<()> {
     for message in messages {
         append_json_line(path, message)?;
+    }
+    if !messages.is_empty() {
+        let wake_file = harness_home
+            .join("state")
+            .join("wake")
+            .join("final-outbox.json");
+        let _ = crate::wake::signal_wake(
+            harness_home,
+            wake_file,
+            "final-outbox",
+            "channel ingress outbound messages appended",
+        );
     }
     Ok(())
 }
