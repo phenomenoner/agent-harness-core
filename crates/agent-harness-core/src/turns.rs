@@ -164,7 +164,8 @@ pub fn build_turn_plan(
             )
         });
 
-    let (prompt_workspace, prompt_files) = prompt_files_for_source(source, &mut warnings)?;
+    let (prompt_workspace, prompt_files) =
+        prompt_files_for_selected_agent(source, selected_agent, &mut warnings)?;
     let skill_query_text = channel_state_query_text(&input.text, channel_state.as_ref());
     let skill_query = SkillSelectionQuery {
         text: skill_query_text,
@@ -467,6 +468,57 @@ fn prompt_files_for_source(
     Ok((source.workspace.clone(), files))
 }
 
+fn prompt_files_for_selected_agent(
+    source: &AgentSource,
+    agent: Option<&AgentProfile>,
+    warnings: &mut Vec<String>,
+) -> io::Result<(PathBuf, Vec<TurnPromptFile>)> {
+    let Some(agent) = agent.filter(|agent| is_independent_agent(agent)) else {
+        return prompt_files_for_source(source, warnings);
+    };
+
+    let workspace = independent_agent_workspace(source, agent);
+    let files = prompt_files(&workspace)?;
+    if !files.iter().any(|file| file.exists) {
+        warnings.push(format!(
+            "independent agent `{}` has no prompt files in isolated workspace {}; shared source workspace {} was not used",
+            agent.id,
+            workspace.display(),
+            source.workspace.display()
+        ));
+    }
+    Ok((workspace, files))
+}
+
+fn is_independent_agent(agent: &AgentProfile) -> bool {
+    agent.id != "main" && agent.directory_exists
+}
+
+fn independent_agent_workspace(source: &AgentSource, agent: &AgentProfile) -> PathBuf {
+    if let Some(workspace) = agent
+        .workspace
+        .as_deref()
+        .and_then(independent_workspace_value)
+    {
+        let workspace = PathBuf::from(workspace);
+        let candidate = if workspace.is_absolute() {
+            workspace
+        } else {
+            source.home.join(workspace)
+        };
+        if candidate != source.workspace {
+            return candidate;
+        }
+    }
+
+    agent.directory.join("workspace")
+}
+
+fn independent_workspace_value(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() { None } else { Some(value) }
+}
+
 fn session_key(platform: &str, channel_id: &str, user_id: &str, agent_id: Option<&str>) -> String {
     format!(
         "{}:{}:{}:{}",
@@ -621,6 +673,101 @@ mod tests {
             plan.warnings
                 .iter()
                 .any(|warning| warning.contains("using imported source workspace"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn turn_plan_uses_independent_agent_workspace_for_prompt_files() {
+        let root = temp_root("turn_plan_uses_independent_agent_workspace_for_prompt_files");
+        let source = write_turn_source(&root);
+        let agent_workspace = add_directory_agent(&source, "xiaoxiaoli");
+        fs::create_dir_all(&agent_workspace).unwrap();
+        fs::write(
+            agent_workspace.join("AGENTS.md"),
+            "# Xiaoxiaoli\n\nIndependent prompt.",
+        )
+        .unwrap();
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+
+        let plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "hello".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("xiaoxiaoli".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.agent.as_ref().unwrap().id, "xiaoxiaoli");
+        assert_eq!(plan.source_workspace, agent_workspace);
+        assert_eq!(prompt_files_present_for_test(&plan), 1);
+        assert!(plan.prompt_files.iter().any(|file| file.name == "AGENTS.md"
+            && file.exists
+            && file.path == agent_workspace.join("AGENTS.md")));
+        assert!(
+            !plan
+                .prompt_files
+                .iter()
+                .any(|file| file.path.starts_with(&source.workspace))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn turn_plan_skips_shared_prompt_files_for_independent_agent_without_workspace_files() {
+        let root = temp_root(
+            "turn_plan_skips_shared_prompt_files_for_independent_agent_without_workspace_files",
+        );
+        let source = write_turn_source(&root);
+        let agent_workspace = add_directory_agent(&source, "xiaoxiaoli");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+
+        let plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "hello".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("xiaoxiaoli".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.agent.as_ref().unwrap().id, "xiaoxiaoli");
+        assert_eq!(plan.source_workspace, agent_workspace);
+        assert_eq!(prompt_files_present_for_test(&plan), 0);
+        assert!(
+            plan.prompt_files
+                .iter()
+                .all(|file| !file.exists && file.path.starts_with(&agent_workspace))
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("independent agent `xiaoxiaoli`"))
         );
 
         let _ = fs::remove_dir_all(root);
@@ -946,6 +1093,15 @@ mod tests {
         )
         .unwrap();
         AgentSource::with_workspace(home, workspace)
+    }
+
+    fn add_directory_agent(source: &AgentSource, id: &str) -> PathBuf {
+        let agent_dir = source.home.join("agents").join(id);
+        fs::create_dir_all(agent_dir.join("agent")).unwrap();
+        fs::create_dir_all(agent_dir.join("sessions")).unwrap();
+        fs::write(agent_dir.join("agent").join("models.json"), "{}").unwrap();
+        fs::write(agent_dir.join("sessions").join("sessions.json"), "{}").unwrap();
+        agent_dir.join("workspace")
     }
 
     fn prompt_files_present_for_test(plan: &TurnPlan) -> usize {

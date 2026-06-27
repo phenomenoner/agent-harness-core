@@ -900,6 +900,7 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
             warnings,
         });
     };
+    let execution_dir = absolute_runtime_path(&execution_dir, &mut warnings, "execution dir");
 
     let prepared_receipt = read_json_file(&execution_dir.join("execution-receipt.json"))?;
     let prompt_bundle_json = path_field(
@@ -909,6 +910,10 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
     .unwrap_or_else(|| execution_dir.join("prompt-bundle.json"));
     let prompt_markdown = path_field(&prepared_receipt, &["promptMarkdown", "prompt_markdown"])
         .unwrap_or_else(|| execution_dir.join("prompt.md"));
+    let prompt_bundle_json =
+        absolute_runtime_path(&prompt_bundle_json, &mut warnings, "prompt bundle file");
+    let prompt_markdown =
+        absolute_runtime_path(&prompt_markdown, &mut warnings, "prompt markdown file");
     let bundle = read_json_file(&prompt_bundle_json)?;
     let queue_id =
         string_field(&prepared_receipt, &["queueId", "queue_id"]).map(ToString::to_string);
@@ -7914,8 +7919,10 @@ fn runtime_working_directory(
     warnings: &mut Vec<String>,
 ) -> PathBuf {
     if let Some(runtime_workspace) = runtime_workspace {
+        let runtime_workspace =
+            absolute_runtime_path(runtime_workspace, warnings, "runtime workspace");
         if runtime_workspace.is_dir() {
-            return runtime_workspace.to_path_buf();
+            return runtime_workspace;
         }
         warnings.push(format!(
             "runtime workspace does not exist; falling back to prompt source workspace: {}",
@@ -7923,6 +7930,8 @@ fn runtime_working_directory(
         ));
     }
     if let Some(source_workspace) = path_field(bundle, &["sourceWorkspace", "source_workspace"]) {
+        let source_workspace =
+            absolute_runtime_path(&source_workspace, warnings, "prompt source workspace");
         if source_workspace.is_dir() {
             return source_workspace;
         }
@@ -7936,7 +7945,20 @@ fn runtime_working_directory(
                 .to_string(),
         );
     }
-    execution_dir.to_path_buf()
+    absolute_runtime_path(execution_dir, warnings, "execution dir")
+}
+
+fn absolute_runtime_path(path: &Path, warnings: &mut Vec<String>, label: &str) -> PathBuf {
+    match absolute_lexical_path(path) {
+        Ok(path) => path,
+        Err(error) => {
+            warnings.push(format!(
+                "could not resolve {label} as an absolute path: {} ({error})",
+                path.display()
+            ));
+            path.to_path_buf()
+        }
+    }
 }
 
 fn read_existing_codex_thread_id(
@@ -9497,6 +9519,39 @@ mod tests {
             source.workspace.to_string_lossy().to_string()
         );
         assert_eq!(bundle["summary"]["promptFilesIncluded"], 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plan_codex_runtime_absolutizes_relative_app_server_paths() {
+        let root = PathBuf::from("target").join(format!(
+            "tmp-agent-harness-relative-codex-plan-{}",
+            current_log_time_ms().unwrap()
+        ));
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+
+        let report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+
+        assert!(report.execution_dir.as_ref().unwrap().is_absolute());
+        let plan = report.plan.unwrap();
+        assert!(plan.prompt_bundle_json.is_absolute());
+        assert!(plan.prompt_markdown.is_absolute());
+        assert!(plan.invocation.working_directory.is_absolute());
+        assert!(plan.invocation.prompt_input_file.is_absolute());
+        assert!(
+            plan.invocation
+                .working_directory
+                .ends_with(&source.workspace)
+        );
+        assert!(plan.invocation.prompt_input_file.ends_with("prompt.md"));
 
         let _ = fs::remove_dir_all(root);
     }
