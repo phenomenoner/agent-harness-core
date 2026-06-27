@@ -83,8 +83,24 @@ Staged validation:
 - Staging binary `supervisor-reconcile --all` against live state: `launchCommands=[]`, `missing=[]`, `stale=[]`.
 - Staging binary `codex-preflight` against the latest failed Discord plan: `Receipt: Ready`, `codex-executable` resolved to `D:\Users\user\AppData\Roaming\npm\codex.CMD`.
 
-Live cutover for this follow-up is pending until the source commit is pushed.
+Live cutover for this follow-up was performed after source commit `4317c6e` was pushed to `main`.
+
+- Ticket: `cutover-1782572988490`
+- Live binary: `target\debug\agent-harness.exe`
+- Live SHA-256: `BADBD93BD18788DF3FB7A435CD0B8CF374F12C12F0FE9CF06FD3BCFC27E0E48D`
+- Retained candidate: `target\debug\agent-harness.live-channel-runtime-hotpatch-candidate-20260627-231038.exe`
+- Previous live backup: `target\debug\agent-harness.pre-live-channel-runtime-hotpatch-20260627-231038.exe`
+
+Post-cutover validation:
+
+- `healthz --target-home .agent-harness --require-writable-state`: `ready=true`, `live=true`, `readinessReady=true`, eight live loops, stale loops `0`, stop files `0`.
+- `worker-status --target-home .agent-harness`: `pending=0`, `leased=0`, `running=0`, `failedRetryable=0`, `failedTerminal=5`.
+- `channel-outbox-plan --target-home .agent-harness --platform discord`: `pending=0`.
+- `channel-outbox-plan --target-home .agent-harness --platform telegram`: `pending=0`.
+- `supervisor-reconcile --harness-home .agent-harness --all`: `launchCommands=[]`, `missing=[]`, `stale=[]`, eight running services under `inventory.running`.
+- Live `codex-preflight` against the latest failed Discord plan: `Receipt: Ready`, `codex-executable` resolved to `D:\Users\user\AppData\Roaming\npm\codex.CMD`.
+- `ops-cutover-receipt`: `status=ready`, readiness `passed=59`, `warnings=1`, `failed=0`.
 
 Rollback:
 
-- Restore `target\debug\agent-harness.pre-r9-2-completion-outbox-20260627-180314.exe` to `target\debug\agent-harness.exe` and restart through the same live-control path if rollback is needed.
+- Restore `target\debug\agent-harness.pre-live-channel-runtime-hotpatch-20260627-231038.exe` to `target\debug\agent-harness.exe` and restart through the same live-control path if rollback is needed. If a deeper rollback is required, the prior R9-2 backup remains `target\debug\agent-harness.pre-r9-2-completion-outbox-20260627-180314.exe`.
