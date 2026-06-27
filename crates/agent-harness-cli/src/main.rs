@@ -10901,6 +10901,20 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
         .optional("--source-home")
         .map(PathBuf::from)
         .unwrap_or_else(|| options.target_home.clone());
+    let inferred_workspace =
+        infer_supervisor_reconcile_workspace(&options.target_home, &source_home)?;
+    let workspace = options
+        .optional("--workspace")
+        .map(PathBuf::from)
+        .map(|path| absolute_path(&path))
+        .transpose()?
+        .or(inferred_workspace);
+    let runtime_workspace = options
+        .optional("--runtime-workspace")
+        .map(PathBuf::from)
+        .map(|path| absolute_path(&path))
+        .transpose()?
+        .or_else(|| workspace.clone());
     let restart_delay_ms = options
         .optional_i64("--restart-delay-ms")?
         .unwrap_or(60_000);
@@ -10946,8 +10960,8 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
     Ok(SupervisorReconcileArgs {
         target_home: options.target_home.clone(),
         source_home,
-        workspace: options.optional("--workspace").map(PathBuf::from),
-        runtime_workspace: options.optional("--runtime-workspace").map(PathBuf::from),
+        workspace,
+        runtime_workspace,
         harness_cli: options
             .optional("--harness-cli")
             .map(PathBuf::from)
@@ -10999,6 +11013,19 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
         max_updates,
         outbox_limit,
     })
+}
+
+fn infer_supervisor_reconcile_workspace(
+    target_home: &Path,
+    source_home: &Path,
+) -> Result<Option<PathBuf>, String> {
+    for home in [source_home, target_home] {
+        let home = absolute_path(home)?;
+        if home.file_name().and_then(|name| name.to_str()) == Some(".agent-harness") {
+            return Ok(home.parent().map(Path::to_path_buf));
+        }
+    }
+    Ok(None)
 }
 
 fn supervisor_reconcile_desired_services(
@@ -20032,6 +20059,76 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&path);
         path
+    }
+
+    #[test]
+    fn supervisor_reconcile_defaults_live_workspace_to_harness_parent() {
+        let root = cli_temp_root("supervisor_reconcile_defaults_live_workspace_to_harness_parent");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            serde_json::json!({
+                "supervisor": {
+                    "enabled": true,
+                    "manageAllLoops": true,
+                    "telegramLoops": [{
+                        "serviceId": "telegram-loop-xiaoxiaoli",
+                        "account": "xiaoxiaoli",
+                        "agent": "xiaoxiaoli",
+                        "enabled": true
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let args = supervisor_reconcile_args_from_args(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+            "--all".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(args.workspace.as_deref(), Some(root.as_path()));
+        assert_eq!(args.runtime_workspace.as_deref(), Some(root.as_path()));
+
+        let root_text = root.to_string_lossy().to_string();
+        let services = supervisor_reconcile_desired_services(&args).unwrap();
+        let runtime = services
+            .iter()
+            .find(|service| service.service_id == "runtime-loop")
+            .unwrap();
+        let runtime_workspace = arg_value(&runtime.args, "--runtime-workspace");
+        let workspace = arg_value(&runtime.args, "--workspace");
+        assert_eq!(workspace.as_deref(), Some(root_text.as_str()));
+        assert_eq!(runtime_workspace.as_deref(), Some(root_text.as_str()));
+
+        let xiaoxiaoli = services
+            .iter()
+            .find(|service| service.service_id == "telegram-loop-xiaoxiaoli")
+            .unwrap();
+        assert_eq!(
+            arg_value(&xiaoxiaoli.args, "--runtime-workspace").as_deref(),
+            Some(root_text.as_str())
+        );
+        assert_eq!(
+            arg_value(&xiaoxiaoli.args, "--agent").as_deref(),
+            Some("xiaoxiaoli")
+        );
+        assert_eq!(
+            arg_value(&xiaoxiaoli.args, "--telegram-account").as_deref(),
+            Some("xiaoxiaoli")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn arg_value(args: &[String], flag: &str) -> Option<String> {
+        args.windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| pair[1].clone())
     }
 
     #[test]
