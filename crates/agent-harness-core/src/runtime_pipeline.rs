@@ -1,8 +1,10 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, SystemTime};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
@@ -26,6 +28,7 @@ use crate::{
 
 const RUNTIME_RUN_ONCE_SCHEMA: &str = "agent-harness.runtime-run-once.v1";
 const RUNTIME_DEAD_LETTER_SCHEMA: &str = "agent-harness.runtime-dead-letter.v1";
+const FINAL_OUTBOX_RECEIPT_SCHEMA: &str = "agent-harness.runtime-final-outbox.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeRunOnceOptions {
@@ -150,6 +153,21 @@ struct RuntimeDeadLetterReceipt {
     transcript_file: Option<PathBuf>,
     outbox_file: Option<PathBuf>,
     reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FinalOutboxReceipt {
+    schema: String,
+    queue_id: Option<String>,
+    completion_file: Option<PathBuf>,
+    outbox_file: PathBuf,
+    platform: String,
+    account_id: Option<String>,
+    channel_id: String,
+    user_id: String,
+    session_key: String,
+    kind: ChannelOutboundMessageKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -464,10 +482,11 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
     if run.receipt.status == CodexRuntimeRunStatus::Completed {
         if run.receipt.event_count == 0 && run.receipt.reason.contains("already recorded") {
             warnings.push(
-                "codex-run reported an already recorded completion; outbox write skipped to avoid duplicate delivery"
+                "codex-run reported an already recorded completion; checking final outbox idempotency"
                     .to_string(),
             );
-        } else if let Some(context) = channel_context {
+        }
+        if let Some(context) = channel_context {
             if let Some(transcript_file) = run.receipt.transcript_file.as_ref() {
                 let narration_config = match load_assistant_narration_config(&options.harness_home)
                 {
@@ -489,20 +508,6 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                             &context,
                             &mut warnings,
                         )? {
-                            if let Some(codex_plan) = plan.plan.as_ref() {
-                                match record_memory_lifecycle_turn(MemoryLifecycleTurnOptions {
-                                    harness_home: options.harness_home.clone(),
-                                    prompt_bundle_json: codex_plan.prompt_bundle_json.clone(),
-                                    assistant_text: response.final_text.clone(),
-                                    success: true,
-                                    now_ms: current_log_time_ms()?,
-                                }) {
-                                    Ok(memory) => warnings.extend(memory.warnings),
-                                    Err(error) => warnings.push(format!(
-                                        "memory lifecycle recording failed: {error}"
-                                    )),
-                                }
-                            }
                             let (mut text, attachments) =
                                 split_outbound_media_directives(&response.outbound_text);
                             let tone_config = match load_response_tone_config(&options.harness_home)
@@ -542,6 +547,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                 user_id: context.user_id.clone(),
                                 session_key: context.session_key.clone(),
                                 kind: ChannelOutboundMessageKind::AgentReply,
+                                source_queue_id: run.receipt.queue_id.clone(),
+                                source_completion_file: run.receipt.completion_file.clone(),
                                 text,
                                 delivery_intent: delivery_intent_from_inbound_context(
                                     &context.platform,
@@ -550,9 +557,31 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                 ),
                                 attachments,
                             };
-                            let file = append_outbound_message(&options.harness_home, &message)?;
+                            let (file, appended) = append_final_outbound_message_once(
+                                &options.harness_home,
+                                run.receipt.execution_dir.as_deref(),
+                                run.receipt.completion_file.as_deref(),
+                                &message,
+                                &mut warnings,
+                            )?;
                             outbox_file = Some(file);
-                            outbound_message = Some(message);
+                            if appended {
+                                if let Some(codex_plan) = plan.plan.as_ref() {
+                                    match record_memory_lifecycle_turn(MemoryLifecycleTurnOptions {
+                                        harness_home: options.harness_home.clone(),
+                                        prompt_bundle_json: codex_plan.prompt_bundle_json.clone(),
+                                        assistant_text: response.final_text.clone(),
+                                        success: true,
+                                        now_ms: current_log_time_ms()?,
+                                    }) {
+                                        Ok(memory) => warnings.extend(memory.warnings),
+                                        Err(error) => warnings.push(format!(
+                                            "memory lifecycle recording failed: {error}"
+                                        )),
+                                    }
+                                }
+                                outbound_message = Some(message);
+                            }
                         } else {
                             let receipt = RuntimeRunOnceReceipt {
                                 queue_id: run.receipt.queue_id.clone(),
@@ -599,6 +628,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 user_id: context.user_id.clone(),
                 session_key: context.session_key.clone(),
                 kind: ChannelOutboundMessageKind::ErrorReply,
+                source_queue_id: run.receipt.queue_id.clone(),
+                source_completion_file: run.receipt.completion_file.clone(),
                 text: runtime_failure_reply_text(
                     status,
                     &receipt_reason,
@@ -707,7 +738,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             },
         )?;
     }
-    if let Some(codex_plan) = plan.plan.as_ref()
+    if outbound_message.is_some()
+        && let Some(codex_plan) = plan.plan.as_ref()
         && should_run_self_improvement_hook(receipt.status, &receipt.continuation, Some(codex_plan))
     {
         let notification_target = channel_context_for_self_improvement
@@ -1503,6 +1535,247 @@ fn append_outbound_message(
     Ok(outbox_file)
 }
 
+fn append_final_outbound_message_once(
+    harness_home: &Path,
+    execution_dir: Option<&Path>,
+    completion_file: Option<&Path>,
+    message: &ChannelOutboundMessage,
+    warnings: &mut Vec<String>,
+) -> io::Result<(PathBuf, bool)> {
+    let _lock = acquire_final_outbox_lock(execution_dir, warnings)?;
+    if let Some(receipt) = read_final_outbox_receipt(execution_dir, warnings)? {
+        if final_outbox_receipt_matches(&receipt, message, completion_file) {
+            warnings.push(format!(
+                "runtime final outbox already enqueued for queue {}; skipping duplicate append",
+                receipt.queue_id.as_deref().unwrap_or("-")
+            ));
+            return Ok((receipt.outbox_file, false));
+        }
+        warnings.push(format!(
+            "runtime final outbox receipt did not match queue/completion {}; falling back to outbox scan",
+            message.source_queue_id.as_deref().unwrap_or("-")
+        ));
+    }
+    if let Some(outbox_file) = find_existing_source_outbox_message(harness_home, message)? {
+        if let Some(execution_dir) = execution_dir {
+            record_final_outbox_receipt(
+                execution_dir,
+                completion_file,
+                message,
+                &outbox_file,
+                warnings,
+            )?;
+        }
+        warnings.push(format!(
+            "runtime final outbox already present for queue {}; recorded marker without duplicate append",
+            message.source_queue_id.as_deref().unwrap_or("-")
+        ));
+        return Ok((outbox_file, false));
+    }
+
+    let outbox_file = append_outbound_message(harness_home, message)?;
+    if let Some(execution_dir) = execution_dir {
+        record_final_outbox_receipt(
+            execution_dir,
+            completion_file,
+            message,
+            &outbox_file,
+            warnings,
+        )?;
+    }
+    Ok((outbox_file, true))
+}
+
+struct FinalOutboxLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for FinalOutboxLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_final_outbox_lock(
+    execution_dir: Option<&Path>,
+    warnings: &mut Vec<String>,
+) -> io::Result<Option<FinalOutboxLockGuard>> {
+    let Some(execution_dir) = execution_dir else {
+        return Ok(None);
+    };
+    let lock_file = execution_dir.join("channel-final-outbox.lock");
+    for attempt in 0..25 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_file)
+        {
+            Ok(_) => return Ok(Some(FinalOutboxLockGuard { path: lock_file })),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if final_outbox_lock_is_stale(&lock_file) {
+                    match fs::remove_file(&lock_file) {
+                        Ok(()) => {
+                            warnings.push(
+                                "removed stale runtime final outbox lock before enqueue"
+                                    .to_string(),
+                            );
+                            continue;
+                        }
+                        Err(remove_error) if remove_error.kind() == io::ErrorKind::NotFound => {
+                            continue;
+                        }
+                        Err(remove_error) => return Err(remove_error),
+                    }
+                }
+                if attempt == 24 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!("runtime final outbox lock is busy: {}", lock_file.display()),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+fn final_outbox_lock_is_stale(lock_file: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(lock_file) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age > Duration::from_secs(60))
+        .unwrap_or(false)
+}
+
+fn final_outbox_receipt_matches(
+    receipt: &FinalOutboxReceipt,
+    message: &ChannelOutboundMessage,
+    completion_file: Option<&Path>,
+) -> bool {
+    receipt.queue_id == message.source_queue_id
+        && receipt.completion_file.as_deref() == completion_file
+        && receipt.platform == message.platform
+        && receipt.account_id == message.account_id
+        && receipt.channel_id == message.channel_id
+        && receipt.user_id == message.user_id
+        && receipt.session_key == message.session_key
+        && receipt.kind == message.kind
+}
+
+fn final_outbox_receipt_file(execution_dir: &Path) -> PathBuf {
+    execution_dir.join("channel-final-outbox-receipt.json")
+}
+
+fn read_final_outbox_receipt(
+    execution_dir: Option<&Path>,
+    warnings: &mut Vec<String>,
+) -> io::Result<Option<FinalOutboxReceipt>> {
+    let Some(execution_dir) = execution_dir else {
+        return Ok(None);
+    };
+    let receipt_file = final_outbox_receipt_file(execution_dir);
+    if !receipt_file.is_file() {
+        return Ok(None);
+    }
+    match fs::read(&receipt_file).and_then(|bytes| {
+        serde_json::from_slice::<FinalOutboxReceipt>(&bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }) {
+        Ok(receipt) => Ok(Some(receipt)),
+        Err(error) => {
+            warnings.push(format!(
+                "runtime final outbox receipt could not be read; falling back to outbox scan: {error}"
+            ));
+            Ok(None)
+        }
+    }
+}
+
+fn record_final_outbox_receipt(
+    execution_dir: &Path,
+    completion_file: Option<&Path>,
+    message: &ChannelOutboundMessage,
+    outbox_file: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    let receipt = FinalOutboxReceipt {
+        schema: FINAL_OUTBOX_RECEIPT_SCHEMA.to_string(),
+        queue_id: message.source_queue_id.clone(),
+        completion_file: completion_file.map(Path::to_path_buf),
+        outbox_file: outbox_file.to_path_buf(),
+        platform: message.platform.clone(),
+        account_id: message.account_id.clone(),
+        channel_id: message.channel_id.clone(),
+        user_id: message.user_id.clone(),
+        session_key: message.session_key.clone(),
+        kind: message.kind,
+    };
+    let receipt_file = final_outbox_receipt_file(execution_dir);
+    if let Err(error) = write_json_atomic(&receipt_file, &receipt) {
+        warnings.push(format!(
+            "runtime final outbox receipt write failed; duplicate suppression will rely on outbox scan: {error}"
+        ));
+    }
+    Ok(())
+}
+
+fn find_existing_source_outbox_message(
+    harness_home: &Path,
+    message: &ChannelOutboundMessage,
+) -> io::Result<Option<PathBuf>> {
+    let Some(source_queue_id) = message.source_queue_id.as_deref() else {
+        return Ok(None);
+    };
+    let outbox_file = harness_home
+        .join("state")
+        .join("channels")
+        .join("outbox.jsonl");
+    let text = match fs::read_to_string(&outbox_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(existing) = serde_json::from_str::<ChannelOutboundMessage>(trimmed) else {
+            continue;
+        };
+        if existing.source_queue_id.as_deref() == Some(source_queue_id)
+            && existing.kind == message.kind
+            && (existing.source_completion_file == message.source_completion_file
+                || same_outbound_message_without_source(&existing, message))
+        {
+            return Ok(Some(outbox_file));
+        }
+    }
+    Ok(None)
+}
+
+fn same_outbound_message_without_source(
+    left: &ChannelOutboundMessage,
+    right: &ChannelOutboundMessage,
+) -> bool {
+    left.platform == right.platform
+        && left.account_id == right.account_id
+        && left.channel_id == right.channel_id
+        && left.user_id == right.user_id
+        && left.session_key == right.session_key
+        && left.kind == right.kind
+        && left.text == right.text
+        && left.delivery_intent == right.delivery_intent
+        && left.attachments == right.attachments
+}
+
 fn append_json_line(path: &Path, value: &impl Serialize) -> io::Result<()> {
     crate::append_jsonl_value(path, value)
 }
@@ -1728,6 +2001,110 @@ mod tests {
         )
         .unwrap();
         assert_eq!(episodes.lines().count(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_runtime_queue_once_repairs_outbox_for_already_recorded_completion() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root =
+            temp_root("run_runtime_queue_once_repairs_outbox_for_already_recorded_completion");
+        let (harness_home, queue_id, execution_dir, _env) =
+            prepare_already_recorded_completion_without_outbox(&root);
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: Some(fake_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        let run = report.run.as_ref().unwrap();
+        assert_eq!(run.receipt.event_count, 0);
+        assert!(run.receipt.reason.contains("already recorded"));
+        assert!(report.outbox_file.is_some());
+        let outbound = report.outbound_message.unwrap();
+        assert_eq!(outbound.source_queue_id.as_deref(), Some(queue_id.as_str()));
+        assert_eq!(outbound.text, "Pipeline fake reply.");
+        let outbox = fs::read_to_string(report.outbox_file.unwrap()).unwrap();
+        assert_eq!(outbox.lines().count(), 1);
+        assert!(outbox.contains(r#""sourceQueueId""#));
+        assert!(outbox.contains("Pipeline fake reply."));
+        assert!(final_outbox_receipt_file(&execution_dir).is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_runtime_queue_once_skips_duplicate_for_existing_final_outbox_marker() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root =
+            temp_root("run_runtime_queue_once_skips_duplicate_for_existing_final_outbox_marker");
+        let (harness_home, queue_id, execution_dir, _env) =
+            prepare_already_recorded_completion_without_outbox(&root);
+        let outbox_file = harness_home
+            .join("state")
+            .join("channels")
+            .join("outbox.jsonl");
+        fs::create_dir_all(outbox_file.parent().unwrap()).unwrap();
+        let seeded = ChannelOutboundMessage {
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            session_key: "telegram:dm-42:user-7:main".to_string(),
+            kind: ChannelOutboundMessageKind::AgentReply,
+            source_queue_id: Some(queue_id.clone()),
+            source_completion_file: Some(
+                execution_dir.join("codex-runtime-completion-receipt.json"),
+            ),
+            text: "Pipeline fake reply.".to_string(),
+            delivery_intent: None,
+            attachments: Vec::new(),
+        };
+        append_json_line(&outbox_file, &seeded).unwrap();
+        record_final_outbox_receipt(
+            &execution_dir,
+            seeded.source_completion_file.as_deref(),
+            &seeded,
+            &outbox_file,
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id),
+            codex_executable: Some(fake_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert!(report.outbound_message.is_none());
+        assert_eq!(report.outbox_file.as_ref(), Some(&outbox_file));
+        let outbox = fs::read_to_string(outbox_file).unwrap();
+        assert_eq!(outbox.lines().count(), 1);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("already enqueued")
+                    || warning.contains("already present"))
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2365,6 +2742,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn prepare_already_recorded_completion_without_outbox(
+        root: &Path,
+    ) -> (PathBuf, String, PathBuf, EnvGuard) {
+        let source = write_pipeline_source(root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "repair memory cron".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+
+        let prepare = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            prepare.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+        let queue_id = prepare.receipt.queue_id.clone().unwrap();
+        let plan = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: prepare.receipt.execution_dir.clone(),
+            codex_executable: Some(fake_codex_executable(root)),
+        })
+        .unwrap();
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+        let first = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: plan.execution_dir.clone(),
+            plan_file: plan.plan_file.clone(),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+        assert_eq!(first.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert!(first.receipt.completion_file.as_ref().unwrap().is_file());
+        assert!(
+            !harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl")
+                .exists()
+        );
+        release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
+        (
+            harness_home,
+            queue_id,
+            first.receipt.execution_dir.unwrap(),
+            env,
+        )
     }
 
     #[cfg(windows)]

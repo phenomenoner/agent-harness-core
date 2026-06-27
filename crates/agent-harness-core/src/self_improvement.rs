@@ -299,6 +299,8 @@ pub fn append_self_improvement_notification(
         user_id: target.user_id.clone(),
         session_key: target.session_key.clone(),
         kind: ChannelOutboundMessageKind::CommandReply,
+        source_queue_id: None,
+        source_completion_file: None,
         text,
         delivery_intent: None,
         attachments: Vec::new(),

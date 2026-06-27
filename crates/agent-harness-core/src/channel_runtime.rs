@@ -187,6 +187,10 @@ pub struct ChannelOutboundMessage {
     pub user_id: String,
     pub session_key: String,
     pub kind: ChannelOutboundMessageKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_queue_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_completion_file: Option<PathBuf>,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_intent: Option<ChannelDeliveryIntent>,
@@ -1217,6 +1221,8 @@ fn outbound(
         user_id: turn.user_id.clone(),
         session_key: turn.session_key.clone(),
         kind,
+        source_queue_id: None,
+        source_completion_file: None,
         text,
         delivery_intent: None,
         attachments: Vec::new(),

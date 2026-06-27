@@ -4372,6 +4372,10 @@ impl CodexProtocolState {
         self.assistant_output.final_text_or_raw()
     }
 
+    fn has_captured_assistant_output(&self) -> bool {
+        self.assistant_output.final_found() || !self.assistant_output.raw_text().trim().is_empty()
+    }
+
     fn assistant_message_with_harness_notices(&self) -> String {
         let mut message = self.assistant_message();
         if self.denied_approval_requests.is_empty() {
@@ -5282,7 +5286,9 @@ fn wait_for_thread_start(
                     });
                 }
                 if is_turn_completed(&value) {
-                    if is_compact_only_turn_completed(&value) {
+                    if is_compact_only_turn_completed(&value)
+                        && !state.has_captured_assistant_output()
+                    {
                         state.warnings.push(
                             "ignored stale compact-only Codex turn/completed before user turn completion"
                                 .to_string(),
@@ -5446,7 +5452,9 @@ fn wait_for_turn_completed(
                 }
                 collect_agent_output(&value, state, progress, narration_config);
                 if is_turn_completed(&value) {
-                    if is_compact_only_turn_completed(&value) {
+                    if is_compact_only_turn_completed(&value)
+                        && !state.has_captured_assistant_output()
+                    {
                         state.warnings.push(
                             "ignored stale compact-only Codex turn/completed before user turn completion"
                                 .to_string(),
@@ -9818,6 +9826,50 @@ mod tests {
     }
 
     #[test]
+    fn run_codex_runtime_accepts_final_answer_before_not_loaded_empty_turn_completed() {
+        let root = temp_root(
+            "run_codex_runtime_accepts_final_answer_before_not_loaded_empty_turn_completed",
+        );
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = not_loaded_final_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert!(report.receipt.event_count >= 3);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("ignored stale compact-only"))
+        );
+        let transcript_file = report.completion.unwrap().transcript_file.unwrap();
+        let transcript = fs::read_to_string(transcript_file).unwrap();
+        assert!(transcript.contains("Final before notLoaded terminal."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_codex_runtime_records_startup_progress_before_protocol_events() {
         let root = temp_root("run_codex_runtime_records_startup_progress_before_protocol_events");
         let source = write_codex_runtime_source(&root);
@@ -11285,6 +11337,51 @@ while ($true) {
     }
 
     #[cfg(windows)]
+    fn not_loaded_final_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("not-loaded-final-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Final before notLoaded terminal.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","items":[],"itemsView":"notLoaded"}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
+
+    #[cfg(windows)]
     fn steer_echo_app_server_command(root: &Path, capture_file: &Path) -> (PathBuf, Vec<String>) {
         let script = root.join("steer-echo-app-server.ps1");
         let capture = capture_file.to_string_lossy().replace('\'', "''");
@@ -11652,7 +11749,7 @@ while ($true) {
         [Console]::Out.WriteLine('{"id":2,"result":{}}')
         [Console]::Out.WriteLine('{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}')
         [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}')
-        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"compact-turn","status":"completed","items":[]}}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-before-user","status":"completed","items":[],"itemsView":"notLoaded"}}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
         [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Reply after compact turn boundary.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}')
@@ -12005,6 +12102,33 @@ done
     }
 
     #[cfg(not(windows))]
+    fn not_loaded_final_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("not-loaded-final-app-server.sh");
+        fs::write(
+            &script,
+            r#"
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Final before notLoaded terminal.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","items":[],"itemsView":"notLoaded"}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        (PathBuf::from("sh"), vec![script.display().to_string()])
+    }
+
+    #[cfg(not(windows))]
     fn steer_echo_app_server_command(root: &Path, capture_file: &Path) -> (PathBuf, Vec<String>) {
         let script = root.join("steer-echo-app-server.sh");
         let capture = capture_file.to_string_lossy().replace('\'', "'\\''");
@@ -12248,7 +12372,7 @@ while IFS= read -r line; do
             printf '%s\n' '{"id":2,"result":{}}'
             printf '%s\n' '{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}'
             printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}'
-            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"compact-turn","status":"completed","items":[]}}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-before-user","status":"completed","items":[],"itemsView":"notLoaded"}}}'
             ;;
         *'"method":"turn/start"'*)
             printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Reply after compact turn boundary.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}'

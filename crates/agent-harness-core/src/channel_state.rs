@@ -945,6 +945,8 @@ mod tests {
                 user_id: "user".to_string(),
                 session_key: session_key.to_string(),
                 kind: ChannelOutboundMessageKind::CommandReply,
+                source_queue_id: None,
+                source_completion_file: None,
                 text: "ok".to_string(),
                 delivery_intent: None,
                 attachments: Vec::new(),
