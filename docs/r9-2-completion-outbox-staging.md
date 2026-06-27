@@ -33,18 +33,9 @@ Staged candidate binary:
 
 ## Review Notes
 
-The requested `claude -p` review loops were attempted with scoped prompts, but the local Claude CLI returned:
+The requested `claude -p` review loops were attempted with scoped prompts, but the local Claude CLI was unavailable in this environment. Fallback subagent reviews were used for the action-plan critique. Their P0/P1 findings drove the source-correlated outbox scan, marker validation, and duplicate side-effect gating. A fallback evidence-review subagent timed out and was closed before returning findings.
 
-```text
-Failed to authenticate. API Error: 401 Invalid authentication credentials
-```
-
-Fallback subagent reviews were used for the action-plan critique. Their P0/P1 findings drove the source-correlated outbox scan, marker validation, and duplicate side-effect gating. A fallback evidence-review subagent timed out and was closed before returning findings.
-
-Local detailed evidence remains under:
-
-- `.debug/round9-2/completion-outbox/action-plan-2026-06-27.md`
-- `.debug/round9-2/completion-outbox/staging-evidence-and-cutover-pointer-2026-06-27.md`
+Detailed operator evidence was kept in ignored local receipts and is not part of the public repository export.
 
 ## Live Cutover Pointer
 
