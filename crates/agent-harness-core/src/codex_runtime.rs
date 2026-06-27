@@ -948,9 +948,11 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
         &mut warnings,
     );
     let thread_id = read_existing_codex_thread_id(&codex_binding_file, &mut warnings)?;
-    let executable = options
-        .codex_executable
-        .unwrap_or_else(|| PathBuf::from("codex"));
+    let executable = resolve_runtime_plan_executable(
+        options
+            .codex_executable
+            .unwrap_or_else(|| PathBuf::from("codex")),
+    );
     let approval_policy = resolve_codex_approval_policy(&options.harness_home, &mut warnings);
     let app_server_approval_policy = if is_live_harness_home(&options.harness_home) {
         "on-request".to_string()
@@ -7312,6 +7314,18 @@ fn check_executable(executable: &Path) -> CodexRuntimePreflightCheck {
     }
 }
 
+fn resolve_runtime_plan_executable(executable: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(resolved) = resolve_executable(&executable) {
+            if executable_spawn_block_reason(&resolved).is_none() {
+                return resolved;
+            }
+        }
+    }
+    executable
+}
+
 fn executable_spawn_block_reason(path: &Path) -> Option<&'static str> {
     #[cfg(windows)]
     {
@@ -7343,19 +7357,76 @@ fn executable_spawn_block_reason(path: &Path) -> Option<&'static str> {
 }
 
 fn resolve_executable(executable: &Path) -> Option<PathBuf> {
-    if executable.components().count() > 1 || executable.is_absolute() {
-        return executable.is_file().then(|| executable.to_path_buf());
+    let resolved = if executable.components().count() > 1 || executable.is_absolute() {
+        executable.is_file().then(|| executable.to_path_buf())?
+    } else {
+        let paths = env::var_os("PATH")?;
+        let mut resolved = None;
+        for dir in env::split_paths(&paths) {
+            for candidate in executable_candidates(&dir, executable) {
+                if candidate.is_file() {
+                    resolved = Some(candidate);
+                    break;
+                }
+            }
+            if resolved.is_some() {
+                break;
+            }
+        }
+        resolved?
+    };
+
+    #[cfg(windows)]
+    {
+        if let Some(spawnable_sibling) = spawnable_windows_sibling(&resolved) {
+            return Some(spawnable_sibling);
+        }
     }
 
-    let paths = env::var_os("PATH")?;
-    for dir in env::split_paths(&paths) {
-        for candidate in executable_candidates(&dir, executable) {
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+    Some(resolved)
+}
+
+#[cfg(windows)]
+fn spawnable_windows_sibling(path: &Path) -> Option<PathBuf> {
+    if path.extension().is_some() {
+        return None;
+    }
+    let parent = path.parent()?;
+    let name = path.file_name()?.to_string_lossy();
+    for ext in windows_executable_extensions() {
+        let candidate = parent.join(format!("{name}{ext}"));
+        if candidate.is_file() && executable_spawn_block_reason(&candidate).is_none() {
+            return Some(candidate);
         }
     }
     None
+}
+
+#[cfg(windows)]
+fn windows_executable_extensions() -> Vec<String> {
+    let mut extensions = env::var_os("PATHEXT")
+        .map(|value| {
+            value
+                .to_string_lossy()
+                .split(';')
+                .filter(|ext| !ext.is_empty())
+                .flat_map(|ext| {
+                    let mut variants = vec![ext.to_string()];
+                    let lowercase = ext.to_ascii_lowercase();
+                    if lowercase != ext {
+                        variants.push(lowercase);
+                    }
+                    variants
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    extensions.extend(
+        [".exe", ".cmd", ".bat"]
+            .into_iter()
+            .map(ToString::to_string),
+    );
+    extensions
 }
 
 fn executable_candidates(dir: &Path, executable: &Path) -> Vec<PathBuf> {
@@ -9507,6 +9578,50 @@ mod tests {
             check.name == "codex-executable"
                 && check.status == CodexRuntimePreflightCheckStatus::Fail
                 && check.detail.contains("extensionless")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn preflight_codex_runtime_uses_spawnable_sibling_for_extensionless_windows_shim() {
+        let root = temp_root(
+            "preflight_codex_runtime_uses_spawnable_sibling_for_extensionless_windows_shim",
+        );
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let shim = root
+            .join(".tools")
+            .join("codex-cli")
+            .join("node_modules")
+            .join(".bin")
+            .join("codex");
+        fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        fs::write(&shim, "").unwrap();
+        fs::write(shim.with_extension("cmd"), "").unwrap();
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(shim),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+
+        let report = preflight_codex_runtime(CodexRuntimePreflightOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimePreflightStatus::Ready);
+        assert!(report.checks.iter().any(|check| {
+            check.name == "codex-executable"
+                && check.status == CodexRuntimePreflightCheckStatus::Pass
+                && check.detail.to_ascii_lowercase().contains("codex.cmd")
         }));
 
         let _ = fs::remove_dir_all(root);

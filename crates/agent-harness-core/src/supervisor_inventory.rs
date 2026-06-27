@@ -286,16 +286,42 @@ fn build_summary(
         .and_then(|state| state.service_kind.clone())
         .unwrap_or_else(|| desired.service_kind.clone());
 
-    let process_id = service_state
-        .and_then(|state| state.process_id)
-        .or(heartbeat.process_id);
+    let service_process_id = service_state.and_then(|state| state.process_id);
+    let service_process_alive = service_process_id.and_then(process_alive_for_pid);
+    let service_last_heartbeat_at_ms = service_state.and_then(|state| state.last_heartbeat_at_ms);
+    let heartbeat_is_newer = match (heartbeat.at_ms, service_last_heartbeat_at_ms) {
+        (Some(heartbeat_at_ms), Some(service_at_ms)) => heartbeat_at_ms > service_at_ms,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    let process_id = if heartbeat_is_newer {
+        heartbeat.process_id.or(service_process_id)
+    } else {
+        service_process_id.or(heartbeat.process_id)
+    };
     let process_alive = process_id
         .and_then(process_alive_for_pid)
-        .or(heartbeat.process_alive);
-    let last_heartbeat_at_ms = service_state
-        .and_then(|state| state.last_heartbeat_at_ms)
-        .or(heartbeat.at_ms);
+        .or(if heartbeat_is_newer {
+            heartbeat.process_alive.or(service_process_alive)
+        } else {
+            service_process_alive.or(heartbeat.process_alive)
+        });
+    let last_heartbeat_at_ms = if heartbeat_is_newer {
+        heartbeat.at_ms.or(service_last_heartbeat_at_ms)
+    } else {
+        service_last_heartbeat_at_ms.or(heartbeat.at_ms)
+    };
     let age_ms = last_heartbeat_at_ms.map(|at_ms| now_ms.saturating_sub(at_ms));
+    let status = if heartbeat_is_newer {
+        heartbeat
+            .status
+            .clone()
+            .or_else(|| service_state.and_then(|state| state.status.clone()))
+    } else {
+        service_state
+            .and_then(|state| state.status.clone())
+            .or_else(|| heartbeat.status.clone())
+    };
 
     SupervisorInventoryServiceSummary {
         service_id: desired.service_id.clone(),
@@ -311,9 +337,7 @@ fn build_summary(
         heartbeat_parse_error: heartbeat.parse_error.clone(),
         process_id,
         process_alive,
-        status: service_state
-            .and_then(|state| state.status.clone())
-            .or_else(|| heartbeat.status.clone()),
+        status,
         desired_state: service_state.and_then(|state| state.desired_state.clone()),
         actual_state: service_state.and_then(|state| state.actual_state.clone()),
         last_heartbeat_at_ms,
@@ -804,6 +828,64 @@ mod tests {
             report.running.first().map(|item| item.service_id.as_str()),
             Some("worker-loop")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inventory_prefers_fresh_loop_heartbeat_over_stale_service_state() {
+        let root = temp_root("inventory_prefers_fresh_loop_heartbeat_over_stale_service_state");
+        let harness_home = root.join(".agent-harness");
+        let pid = i64::from(std::process::id());
+        let now_ms = 10_000;
+        write_service_state(
+            &harness_home,
+            "discord-gateway-loop",
+            serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "discord-gateway-loop",
+                "serviceKind": "discord-gateway",
+                "status": "spawning",
+                "desiredState": "running",
+                "actualState": "spawning",
+                "pid": pid,
+                "lastHeartbeatAtMs": now_ms - 10_000,
+            }),
+        );
+        write_heartbeat_state(
+            &harness_home,
+            "discord-gateway-loop",
+            serde_json::json!({
+                "status": "heartbeat",
+                "processId": pid,
+                "atMs": now_ms - 100,
+                "detail": "fresh gateway loop heartbeat",
+            }),
+        );
+
+        let report = reconcile_supervisor_inventory(SupervisorInventoryOptions {
+            harness_home: harness_home.clone(),
+            desired_services: vec![SupervisorInventoryServiceConfig {
+                enabled: true,
+                service_id: "discord-gateway-loop".to_string(),
+                service_kind: "discord-gateway".to_string(),
+                args: Vec::new(),
+                priority: "standard".to_string(),
+                restart_delay_ms: 15_000,
+                heartbeat_timeout_ms: Some(1_000),
+            }],
+            now_ms: Some(now_ms),
+            default_heartbeat_timeout_ms: Some(120_000),
+        })
+        .unwrap();
+
+        assert_eq!(report.running.len(), 1);
+        assert!(report.stale.is_empty());
+        assert!(report.launch_commands.is_empty());
+        let summary = report.running.first().unwrap();
+        assert_eq!(summary.last_heartbeat_at_ms, Some(now_ms - 100));
+        assert_eq!(summary.age_ms, Some(100));
+        assert_eq!(summary.status.as_deref(), Some("heartbeat"));
 
         let _ = fs::remove_dir_all(root);
     }
