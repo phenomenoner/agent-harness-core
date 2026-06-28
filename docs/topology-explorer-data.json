@@ -4,11 +4,11 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "649ed00fe689c61be583b9238feedc94e72eee84f575706ba8cfee525fccd14e"
+      "sha256": "e98f9eb7d6df91499a7dcd97c92682894206fd1c7a4e02e242d3bb93cb4eff43"
     },
     {
-      "path": "docs/agent-harness-operations-handbook.md",
-      "sha256": "4a12e9ca2fa5c35df444a8a5be3b4c92e69704fe473ef10e99d5f9a3e3ed8539"
+      "path": "docs/.private/agent-harness-operations-handbook.md",
+      "sha256": "local-only"
     }
   ],
   "syncCommand": "python tools/generate_topology_explorer.py",
@@ -28,9 +28,9 @@
       "label": "Current Live Validation",
       "group": "canon",
       "state": "live",
-      "summary": "Round10 Discord attachment artifact extraction cutover is live as of 2026-06-29. This live build promotes the candidate from .debug\\round10\\discord-attachment-artifact-extraction-candidate-2026-06-29\\live-cutover-handoff.md: Discord Gateway text, markdown, and JSON-like attachments are downloaded only after access-policy and channel-identity checks pass, stored under harness-managed inbound media artifacts, and rendered to prompts as bounded extraction summaries plus agent-harness://inbound-media/discord/... refs; Discord image attachments are stored as artifact refs without raw bytes/base64/provider URLs; attachment downloads fail closed to supported Discord CDN/media attachment paths; download-failure warnings are sanitized; declared image attachments require supported image magic bytes before being written; Codex progress/tool preview redaction and status/final-surface follow-up behavior from the previous live build remain included.",
+      "summary": "Live validation evidence is intentionally local-only and is not embedded in the public topology explorer.",
       "refs": [
-        "docs/agent-harness-operations-handbook.md"
+        "docs/.private/agent-harness-operations-handbook.md (local-only, optional)"
       ]
     },
     {
@@ -270,7 +270,7 @@
       "group": "gate",
       "state": "release-gate",
       "summary": "allowed vs blocked ingress; ambiguous binding fail-closed; non-main agent binding",
-      "reviewDocs": "docs/trust-boundaries.md, docs/agent-harness-channel-self-check.md, this file",
+      "reviewDocs": "docs/trust-boundaries.md, local docs/.private/agent-harness-channel-self-check.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -281,7 +281,7 @@
       "group": "gate",
       "state": "release-gate",
       "summary": "/new, /model, /think, /stop; same agent stale-session suppression; different agent non-suppression; fresh /new prompt/memory task boundary",
-      "reviewDocs": "docs/agent-harness-dev-handoff.md, this file",
+      "reviewDocs": "local docs/.private/agent-harness-dev-handoff.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -303,7 +303,7 @@
       "group": "gate",
       "state": "release-gate",
       "summary": "real final plus empty completion; already-recorded completion outbox repair; protocol error classification; active tool-use idle timeout recovery",
-      "reviewDocs": "docs/agent-harness-dev-handoff.md, docs/r9-2-completion-outbox-staging.md, this file",
+      "reviewDocs": "local docs/.private/agent-harness-dev-handoff.md, local docs/.private/r9-2-completion-outbox-staging.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -314,7 +314,7 @@
       "group": "gate",
       "state": "release-gate",
       "summary": "completed turn has exactly one final outbox or terminal notification; duplicate suppression by source queue/completion; final agent-reply excludes progress/narration stream content; Telegram and Discord delivery receipt trace",
-      "reviewDocs": "docs/agent-harness-channel-self-check.md, docs/invariants.md, docs/release-checklist.md, this file",
+      "reviewDocs": "local docs/.private/agent-harness-channel-self-check.md, docs/invariants.md, local docs/.private/release-checklist.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -325,7 +325,7 @@
       "group": "gate",
       "state": "release-gate",
       "summary": "bounded body/status edit volume; repeated text-hash suppression; terminal progress convergence; progress/narration stays out of final agent-reply; compact-before-turn fallback or fresh-thread recovery path when completion recovery is touched",
-      "reviewDocs": "docs/agent-harness-assistant-narration-tech-note.md, docs/agent-harness-channel-self-check.md, docs/invariants.md, docs/release-checklist.md, this file",
+      "reviewDocs": "docs/agent-harness-assistant-narration-tech-note.md, local docs/.private/agent-harness-channel-self-check.md, docs/invariants.md, local docs/.private/release-checklist.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -336,7 +336,7 @@
       "group": "gate",
       "state": "release-gate",
       "summary": "image, audio/transcript, generated speech/media, browser capture, document/download, long tool-log/review transcript, worker-report, provider-native attachment fixtures, and Discord text/image attachments render as artifact refs plus bounded extraction summaries; raw bytes/base64/provider URLs/tool blobs are absent from main-thread prompt/continuity and Codex progress previews",
-      "reviewDocs": ".debug/round10/image-artifact-context-hygiene-tech-note-2026-06-28.md, docs/invariants.md, docs/release-checklist.md, this file",
+      "reviewDocs": "local .debug/round10/image-artifact-context-hygiene-tech-note-2026-06-28.md, docs/invariants.md, local docs/.private/release-checklist.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -347,7 +347,7 @@
       "group": "gate",
       "state": "release-gate",
       "summary": "main and non-main prompt isolation; provider/Codex home selection; prompt file role headers; fresh /new request does not inject previous-task memory context",
-      "reviewDocs": "docs/agent-harness-dev-handoff.md, this file",
+      "reviewDocs": "local docs/.private/agent-harness-dev-handoff.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -358,7 +358,7 @@
       "group": "gate",
       "state": "release-gate",
       "summary": "per-agent memory namespace; source-scope/filter telemetry; graph freshness receipt; no canonical writes through read-index caches",
-      "reviewDocs": "docs/ops/memory-importance-maintenance-contract.md, this file",
+      "reviewDocs": "local docs/.private/ops/memory-importance-maintenance-contract.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -369,7 +369,7 @@
       "group": "gate",
       "state": "release-gate",
       "summary": "staging build, idle gate, backup/rollback receipt, post-cutover health/status/outbox checks",
-      "reviewDocs": "docs/agent-harness-operations-handbook.md, docs/release-checklist.md, this file",
+      "reviewDocs": "local docs/.private/agent-harness-operations-handbook.md, local docs/.private/release-checklist.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]

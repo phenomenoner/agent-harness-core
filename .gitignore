@@ -17,10 +17,13 @@ secrets/
 **/secrets/channel-credentials.env
 .tools/
 .debug/
+.external/
 .review/
 .public-export/
 .agent-harness/
 .agent-harness-*/
+docs/.private/
+tools/.private/
 
 # Imported legacy source state should be staged intentionally.
 imports/

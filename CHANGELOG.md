@@ -1,9 +1,14 @@
 # Changelog
 
-## Unreleased - 2026-06-28
+## Unreleased - 2026-06-29
 
 ### Changed
 
+- Merged all non-web development branches back to `main`; `gh-pages` remains the separate website branch.
+- Made the public repository surface explicit: GitHub-facing docs and tools now stay limited to project architecture, configuration, usage, public status, and reproducible helper utilities.
+- Moved live operations handbooks, release/checkpoint handoffs, validation scratch notes, Superpowers plans, staging/cutover notes, `.debug` evidence, and owner-machine helper tools to ignored local-only private paths (`docs/.private/`, `tools/.private/`, `.debug/`).
+- Updated `AGENTS.md`, `DOC-GUIDELINES.md`, and the README documentation table with the public/private disclosure rule for future docs and tools.
+- Regenerated the topology explorer so public artifacts no longer embed local live-validation evidence from the private operations handbook.
 - Preserved agent identity across final outbox freshness checks: a same-agent stale session is still suppressed after `/new`, but a completed non-main agent turn sharing the same platform/channel/user is not suppressed solely because shared channel state currently points at another agent.
 - Added `docs/agent-harness-topology-contract.md` as the public-safe topology contract and impact matrix for channel, runtime, prompt, outbox, delivery, memory, and cutover changes.
 - Added invariant I8 to the docs and machine-readable invariant catalog: `agentId` is a routing boundary across channel state, session freshness, prompt, runtime, outbox, delivery, and memory.
@@ -90,7 +95,7 @@
 - Made loop heartbeat writes atomic and surfaced corrupt/NUL heartbeat files through explicit `corrupt` / `parseError` status and health fields; `healthz` now warns for degraded progress delivery without marking final reply delivery not live when runtime, ingress, and final outbox loops are otherwise healthy.
 - Bounded progress delivery planning with a persisted progress-ledger byte cursor plus compacted per-queue cached state, preserving first/terminal events while coalescing repeated low-value cached events.
 - Changed generated long-running Windows runner scripts to write process streams directly to per-loop log files instead of using `Tee-Object`; `ops-control stop` now writes structured JSON stop files while preserving legacy plain-text stop-file readability.
-- Reworked `README.md` into a public-facing overview (positioning, architecture diagram, CLI family table, FAQ, dual-license section); moved the internal live-validation, topology, full command walkthrough, and capability ledger content verbatim to `docs/agent-harness-operations-handbook.md`, now referenced from `AGENTS.md` as the session entry point.
+- Reworked `README.md` into a public-facing overview (positioning, architecture diagram, CLI family table, FAQ, dual-license section); moved the internal live-validation, topology, full command walkthrough, and capability ledger content into the operations handbook. That handbook is now kept local-only under `docs/.private/`.
 - Replaced the condensed `LICENSE-APACHE` text with the canonical Apache License 2.0 text so GitHub license detection no longer reports "Other".
 - Fixed the placeholder workspace `repository` URL in `Cargo.toml` and added crate `description` metadata.
 - Added root `DOC-GUIDELINES.md` documentation writing guideline, linked from the README documentation table and the operations handbook documentation map.

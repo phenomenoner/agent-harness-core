@@ -2,7 +2,7 @@
 
 ## Start Here
 
-- For a new working session, read [docs/agent-harness-operations-handbook.md](docs/agent-harness-operations-handbook.md) first: it holds the live topology, current live validation, the full command walkthrough, and the documentation map. The root `README.md` is the public-facing overview, not the operational source of truth.
+- For a new local working session, read `docs/.private/agent-harness-operations-handbook.md` first when it exists: it holds the live topology, current live validation, the full command walkthrough, and the private documentation map. The root `README.md` is the public-facing overview, not the operational source of truth.
 - Treat the handbook as task-scoped repo-development orientation, not ambient prompt material. Read only the sections needed for the current repo task, keep excerpts bounded, and do not keep the handbook resident for ordinary channel/chat turns or active harness-home operations that do not need repo-development context.
 
 ## Documentation Language
@@ -12,11 +12,19 @@
 ## Topology And Change Gates
 
 - Before behavior-changing edits, review [docs/agent-harness-topology-contract.md](docs/agent-harness-topology-contract.md) for identity axes, component ownership, and the required impact matrix. Treat `agentId` as a routing boundary across channel state, session freshness, prompt assembly, runtime, outbox, delivery, and memory.
-- If a change touches channel identity/state/ingress, runtime queue/pipeline, prompt assembly, final outbox/delivery, memory, or supervisor/cutover behavior, update the topology contract, [docs/invariants.md](docs/invariants.md), [docs/release-checklist.md](docs/release-checklist.md), and the relevant operator/self-check doc when their expectations change.
+- If a change touches channel identity/state/ingress, runtime queue/pipeline, prompt assembly, final outbox/delivery, memory, or supervisor/cutover behavior, update the topology contract, [docs/invariants.md](docs/invariants.md), the local release checklist at `docs/.private/release-checklist.md` when present, and the relevant local operator/self-check doc when their expectations change.
 - For channel/runtime/session changes, include the agent-boundary scenario pack: same-agent stale-session suppression still works, and a non-main agent sharing the same platform/channel/user is not suppressed by another agent's active session state.
 - Treat platform/channel as a task-continuity boundary when reconnecting prior work. Before claiming a "previous session" state, verify receipts by exact `platform`, `accountId`, `channelId`, `userId`, `agentId`, and `sessionKey`; do not substitute Telegram DM evidence for Discord DM work, or vice versa, even when artifacts, topics, or user intent look related.
 - For gaps where design intent is broader than current implementation, use the topology contract's Expected Vs Actual Gaps table and Promotion Gate column as the source of missing regressions to add before claiming parity. Current examples include progress delivery volume, progress/final-surface separation, openclaw-mem full parity, multi-agent full matrix, virtual-session continuity, repo code graph support, and scenario-matrix coverage.
 - For implementation-completeness and test-case synthesis, use [.debug/test-synthesis-and-completeness-sop-2026-06-28.md](.debug/test-synthesis-and-completeness-sop-2026-06-28.md) as the local guide until it is promoted or superseded. It defines maturity tiers, blast-radius-to-test-tier mapping, fail-first replay expectations, and the completeness verdict table required before claiming a topology-sensitive change is done.
+
+## Public / Private Repo Surface
+
+- Treat `README.md`, `CHANGELOG.md`, `SECURITY.md`, `DOC-GUIDELINES.md`, root `AGENTS.md`, and public `docs/` / `tools/` entries as GitHub-facing. They must explain architecture, configuration, usage, or public project status without exposing local ops receipts, private handoffs, debug evidence, channel/user identifiers, or machine-specific runbooks.
+- Keep non-public documents under ignored `docs/.private/`. This includes live operations handbooks, release/checkpoint handoffs, cutover evidence, validation scratch notes, Superpowers plans, and owner/operator-only runbooks.
+- Keep non-public tools under ignored `tools/.private/`. This includes local environment wrappers, one-off maintenance scripts, private evidence collectors, and tools that only make sense for the owner machine.
+- Keep `.debug/` local-only. If a file under `.debug/` was ever tracked, remove it from the index while preserving the local copy when it is still useful.
+- When adding new docs or tools, choose the public location only if a new user or contributor benefits from reading or running it from GitHub. Otherwise put it directly in the matching `.private` folder.
 
 ## Default Superpowers For Development
 

@@ -41,16 +41,16 @@ Use this table whenever a diff touches one of the listed areas. The listed docs 
 
 | Changed Area | Review These Docs | Minimum Scenario Pack |
 |---|---|---|
-| Channel identity, allow-list, or bindings | `docs/trust-boundaries.md`, `docs/agent-harness-channel-self-check.md`, this file | allowed vs blocked ingress; ambiguous binding fail-closed; non-main agent binding |
-| Channel commands or state | `docs/agent-harness-dev-handoff.md`, this file | `/new`, `/model`, `/think`, `/stop`; same agent stale-session suppression; different agent non-suppression; fresh `/new` prompt/memory task boundary |
+| Channel identity, allow-list, or bindings | `docs/trust-boundaries.md`, local `docs/.private/agent-harness-channel-self-check.md`, this file | allowed vs blocked ingress; ambiguous binding fail-closed; non-main agent binding |
+| Channel commands or state | local `docs/.private/agent-harness-dev-handoff.md`, this file | `/new`, `/model`, `/think`, `/stop`; same agent stale-session suppression; different agent non-suppression; fresh `/new` prompt/memory task boundary |
 | Runtime queue or leases | `docs/agent-worker-dispatch-strategy.md`, `docs/configuration.md`, this file | same-session FIFO; runtime class isolation; stale lease recovery; terminal state selection |
-| Codex runtime or completion recording | `docs/agent-harness-dev-handoff.md`, `docs/r9-2-completion-outbox-staging.md`, this file | real final plus empty completion; already-recorded completion outbox repair; protocol error classification; active tool-use idle timeout recovery |
-| Final outbox or delivery | `docs/agent-harness-channel-self-check.md`, `docs/invariants.md`, `docs/release-checklist.md`, this file | completed turn has exactly one final outbox or terminal notification; duplicate suppression by source queue/completion; final `agent-reply` excludes progress/narration stream content; Telegram and Discord delivery receipt trace |
-| Progress delivery or narration | `docs/agent-harness-assistant-narration-tech-note.md`, `docs/agent-harness-channel-self-check.md`, `docs/invariants.md`, `docs/release-checklist.md`, this file | bounded body/status edit volume; repeated text-hash suppression; terminal progress convergence; progress/narration stays out of final `agent-reply`; compact-before-turn fallback or fresh-thread recovery path when completion recovery is touched |
-| Artifact or media prompt hygiene | `.debug/round10/image-artifact-context-hygiene-tech-note-2026-06-28.md`, `docs/invariants.md`, `docs/release-checklist.md`, this file | image, audio/transcript, generated speech/media, browser capture, document/download, long tool-log/review transcript, worker-report, provider-native attachment fixtures, and Discord text/image attachments render as artifact refs plus bounded extraction summaries; raw bytes/base64/provider URLs/tool blobs are absent from main-thread prompt/continuity and Codex progress previews |
-| Prompt assembly or agent selection | `docs/agent-harness-dev-handoff.md`, this file | main and non-main prompt isolation; provider/Codex home selection; prompt file role headers; fresh `/new` request does not inject previous-task memory context |
-| Memory or graph recall | `docs/ops/memory-importance-maintenance-contract.md`, this file | per-agent memory namespace; source-scope/filter telemetry; graph freshness receipt; no canonical writes through read-index caches |
-| Supervisor or live cutover | `docs/agent-harness-operations-handbook.md`, `docs/release-checklist.md`, this file | staging build, idle gate, backup/rollback receipt, post-cutover health/status/outbox checks |
+| Codex runtime or completion recording | local `docs/.private/agent-harness-dev-handoff.md`, local `docs/.private/r9-2-completion-outbox-staging.md`, this file | real final plus empty completion; already-recorded completion outbox repair; protocol error classification; active tool-use idle timeout recovery |
+| Final outbox or delivery | local `docs/.private/agent-harness-channel-self-check.md`, `docs/invariants.md`, local `docs/.private/release-checklist.md`, this file | completed turn has exactly one final outbox or terminal notification; duplicate suppression by source queue/completion; final `agent-reply` excludes progress/narration stream content; Telegram and Discord delivery receipt trace |
+| Progress delivery or narration | `docs/agent-harness-assistant-narration-tech-note.md`, local `docs/.private/agent-harness-channel-self-check.md`, `docs/invariants.md`, local `docs/.private/release-checklist.md`, this file | bounded body/status edit volume; repeated text-hash suppression; terminal progress convergence; progress/narration stays out of final `agent-reply`; compact-before-turn fallback or fresh-thread recovery path when completion recovery is touched |
+| Artifact or media prompt hygiene | local `.debug/round10/image-artifact-context-hygiene-tech-note-2026-06-28.md`, `docs/invariants.md`, local `docs/.private/release-checklist.md`, this file | image, audio/transcript, generated speech/media, browser capture, document/download, long tool-log/review transcript, worker-report, provider-native attachment fixtures, and Discord text/image attachments render as artifact refs plus bounded extraction summaries; raw bytes/base64/provider URLs/tool blobs are absent from main-thread prompt/continuity and Codex progress previews |
+| Prompt assembly or agent selection | local `docs/.private/agent-harness-dev-handoff.md`, this file | main and non-main prompt isolation; provider/Codex home selection; prompt file role headers; fresh `/new` request does not inject previous-task memory context |
+| Memory or graph recall | local `docs/.private/ops/memory-importance-maintenance-contract.md`, this file | per-agent memory namespace; source-scope/filter telemetry; graph freshness receipt; no canonical writes through read-index caches |
+| Supervisor or live cutover | local `docs/.private/agent-harness-operations-handbook.md`, local `docs/.private/release-checklist.md`, this file | staging build, idle gate, backup/rollback receipt, post-cutover health/status/outbox checks |
 
 ## Agent-Boundary Scenario Pack
 
@@ -91,7 +91,7 @@ Recommended staged adoption:
 4. Record a compact memory/graph freshness receipt that links the graph commit hash, topology contract version, and source docs used for generation.
 5. Use the graph to support impact review, while keeping `docs/agent-harness-topology-contract.md`, `docs/invariants.md`, and tests as the release gates.
 
-`docs/topology-explorer.html` is the lightweight human-facing companion view for this contract. It is generated from this file and the current live-validation section of `docs/agent-harness-operations-handbook.md` by running:
+`docs/topology-explorer.html` is the lightweight human-facing companion view for this contract. It is generated from this file and, when present, the local current live-validation section of `docs/.private/agent-harness-operations-handbook.md` by running:
 
 ```powershell
 python tools\generate_topology_explorer.py
@@ -123,9 +123,9 @@ Use this table for topology and knowledge-graph work whenever a design target is
 ## Documentation Update Rules
 
 - If a behavior change alters a component row above, update this file in the same change.
-- If the public capability or operator command surface changes, update `README.md` and `docs/agent-harness-operations-handbook.md`.
-- If a release gate changes, update both `docs/release-checklist.md` and `agent_harness_core::quality::release_checklist`.
+- If the public capability or operator command surface changes, update `README.md` and the local operator handbook at `docs/.private/agent-harness-operations-handbook.md` when present.
+- If a release gate changes, update both local `docs/.private/release-checklist.md` and `agent_harness_core::quality::release_checklist`.
 - If an invariant changes, update both `docs/invariants.md` and `agent_harness_core::quality::invariant_catalog`.
-- If a channel smoke expectation changes, update `docs/agent-harness-channel-self-check.md`.
+- If a channel smoke expectation changes, update local `docs/.private/agent-harness-channel-self-check.md`.
 - If this file or the current live-validation summary changes in a way that affects human topology review, run `python tools\generate_topology_explorer.py` and review `docs/topology-explorer.html`.
 - If the change creates local-only evidence, keep it under `.debug/` or `.agent-harness/state/` and summarize it without raw private IDs in tracked docs.

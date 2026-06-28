@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +20,7 @@ from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 TOPOLOGY_DOC = ROOT / "docs" / "agent-harness-topology-contract.md"
-OPERATIONS_DOC = ROOT / "docs" / "agent-harness-operations-handbook.md"
+OPERATIONS_DOC = ROOT / "docs" / ".private" / "agent-harness-operations-handbook.md"
 OUT_JSON = ROOT / "docs" / "topology-explorer-data.json"
 OUT_HTML = ROOT / "docs" / "topology-explorer.html"
 
@@ -90,6 +91,8 @@ def find_table(tables: Iterable[Table], heading: str, first_header: str) -> Tabl
 
 
 def doc_hash(path: Path) -> str:
+    if not path.exists():
+        return "missing"
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
@@ -113,6 +116,14 @@ def extract_operations_summary(markdown: str) -> str:
     body = markdown[start + len(marker) :].strip()
     paragraphs = [p.strip().replace("\n", " ") for p in body.split("\n\n") if p.strip()]
     return paragraphs[0] if paragraphs else ""
+
+
+def read_operations_summary() -> str:
+    if os.environ.get("AGENT_HARNESS_INCLUDE_PRIVATE_TOPOLOGY_SUMMARY") != "1":
+        return "Live validation evidence is intentionally local-only and is not embedded in the public topology explorer."
+    if not OPERATIONS_DOC.exists():
+        return "Local operations handbook is not present in this public checkout; live validation evidence is kept under docs/.private/ in operator workspaces."
+    return extract_operations_summary(OPERATIONS_DOC.read_text(encoding="utf-8"))
 
 
 def build_journeys(nodes: dict[str, dict]) -> list[dict]:
@@ -252,7 +263,7 @@ def build_journeys(nodes: dict[str, dict]) -> list[dict]:
 
 def build_payload() -> dict:
     topology_md = TOPOLOGY_DOC.read_text(encoding="utf-8")
-    operations_md = OPERATIONS_DOC.read_text(encoding="utf-8")
+    operations_summary = read_operations_summary()
     tables = parse_tables(topology_md)
 
     axis_table = find_table(tables, "Identity Axes", "Axis")
@@ -278,8 +289,8 @@ def build_payload() -> dict:
         label="Current Live Validation",
         group="canon",
         state="live",
-        summary=strip_markdown(extract_operations_summary(operations_md)),
-        refs=[rel(OPERATIONS_DOC)],
+        summary=strip_markdown(operations_summary),
+        refs=["docs/.private/agent-harness-operations-handbook.md (local-only, optional)"],
     )
     add_edge(edges, "ops-current-live-validation", "canon-topology-contract", "live evidence maps to")
 
@@ -374,7 +385,7 @@ def build_payload() -> dict:
         "title": "Agent Harness Topology Explorer",
         "sourceFiles": [
             {"path": rel(TOPOLOGY_DOC), "sha256": doc_hash(TOPOLOGY_DOC)},
-            {"path": rel(OPERATIONS_DOC), "sha256": doc_hash(OPERATIONS_DOC)},
+            {"path": "docs/.private/agent-harness-operations-handbook.md", "sha256": "local-only"},
         ],
         "syncCommand": "python tools/generate_topology_explorer.py",
         "nodes": list(nodes.values()),

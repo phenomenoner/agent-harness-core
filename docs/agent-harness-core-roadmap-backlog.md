@@ -126,7 +126,7 @@ Latest staging evidence:
 | P7.1 CI | Scaffold implemented; pending broader fixtures | Local workspace test command and release checklist documented. | Add GitHub Actions or chosen CI runner. |
 | P7.2 Code Structure Split | Mechanism implemented; pending live gate | New roadmap modules are split by concern in `agent-harness-core`; CLI remains large but operator commands are grouped. | Continue splitting CLI/runtime modules in low-risk follow-up PRs. |
 | P7.3 Codex Version Pin and Wire Fixtures | Scaffold implemented; pending broader fixtures | Existing Codex app-server schema tests remain; MCP fixtures added. | Pin real Codex version and store sanitized wire fixtures. |
-| P7.4 Release and Changelog Discipline | Implemented/staging-tested | `CHANGELOG.md`, `docs/release-checklist.md`, `release-checklist` CLI. | Apply checklist on first tagged release. |
+| P7.4 Release and Changelog Discipline | Implemented/staging-tested | `CHANGELOG.md`, local `docs/.private/release-checklist.md`, `release-checklist` CLI. | Apply checklist on first tagged release. |
 | P7.5 Schema Registry | Implemented/staging-tested | `schema_registry_entries`, `schema-registry` CLI, `docs/schema-registry.md`. | Expand registry whenever new schemas land. |
 
 ### Pending Live/Soak Evidence

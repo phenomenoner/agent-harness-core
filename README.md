@@ -93,7 +93,7 @@ cargo run -p agent-harness-cli -- status --target-home C:\path\to\.agent-harness
 
 Want to smoke-test the full pipeline offline? Pass `--codex-exe tools\agent-fake-codex-app-server\fake-codex-app-server.cmd` to `channel-run-once` and exercise prompt assembly, receipts, transcripts, and outbox delivery without a single model request.
 
-The full ~70-command walkthrough — every importer, channel, queue, runtime, worker, cron, subagent, memory, and ops command with arguments — lives in the [Operations Handbook](docs/agent-harness-operations-handbook.md).
+The public command families are summarized below. Owner-machine deployment runbooks and live cutover receipts are intentionally kept out of the public repository surface.
 
 ## CLI at a Glance
 
@@ -121,23 +121,19 @@ One binary, `agent-harness`, grouped into clear families:
 
 Pre-release, under active development, and **live-validated daily**: the reference deployment runs a single supervised runtime loop (concurrency 12) plus worker, progress, Telegram, Discord, and scheduler loops, with hundreds of delivered turns on record. Current staged work adds CronRunStore, dedicated cron worker/runtime lanes, one-shot and namespaced sticky cron sessions, and dispatch guards so cron LLM turns are observable, retryable, recoverable, and isolated from interactive channel turns.
 
-See the [Changelog](CHANGELOG.md), the [Roadmap & Backlog](docs/agent-harness-core-roadmap-backlog.md), and the [Activation Readiness Plan](docs/activation-readiness-plan.md) for what's done, gated, and next.
+See the [Changelog](CHANGELOG.md) and the [Roadmap & Backlog](docs/agent-harness-core-roadmap-backlog.md) for what's done, gated, and next.
 
 ## Documentation
 
 | Document | What's inside |
 |---|---|
-| [Operations Handbook](docs/agent-harness-operations-handbook.md) | **Start here for operating the harness** — live topology, full command walkthrough, capability ledger. |
-| [Development Handoff](docs/agent-harness-dev-handoff.md) | Architecture, runtime flow, module map, implementation priorities. |
 | [Topology Contract](docs/agent-harness-topology-contract.md) | Identity axes, component ownership, impact matrix, and scenario packs for behavior-changing code reviews. |
 | [Topology Explorer](docs/topology-explorer.html) | Generated interactive browser view of the topology contract, ownership graph, release gates, and open implementation gaps. |
 | [Configuration](docs/configuration.md) | `harness-config.json` reference. |
 | [Worker Dispatch Strategy](docs/agent-worker-dispatch-strategy.md) | Durable workers, cron lanes, subagents, watchdog design. |
 | [Trust Boundaries](docs/trust-boundaries.md) | Where untrusted input enters and how it's bounded. |
 | [Invariants](docs/invariants.md) & [Schema Registry](docs/schema-registry.md) | The contracts the test suite enforces. |
-| [Test Handoff](docs/agent-harness-test-handoff.md) | Step-by-step live Telegram/Discord test plan. |
-| [Function Self-Check Guide](docs/agent-harness-function-self-check-guide.md) | Agent checklist for proving new functions, CLI commands, receipt writers, and runtime paths before handoff. |
-| [Release Checklist](docs/release-checklist.md) & [SECURITY.md](SECURITY.md) | Release gates and security policy. |
+| [SECURITY.md](SECURITY.md) | Security policy and reporting process. |
 | [Doc Writing Guidelines](DOC-GUIDELINES.md) | How documentation in this repo is written and kept honest. |
 
 ## FAQ
