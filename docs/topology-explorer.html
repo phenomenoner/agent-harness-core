@@ -219,11 +219,11 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "9d21f07a58b8f8a7477e3618d66b57d7ac8c4bc480bb838d68ca01a118018d99"
+      "sha256": "649ed00fe689c61be583b9238feedc94e72eee84f575706ba8cfee525fccd14e"
     },
     {
       "path": "docs/agent-harness-operations-handbook.md",
-      "sha256": "2d02780b73790eb6f81e40d6d7a657004416da0363d4b4c20ba727fbd3a74734"
+      "sha256": "4a12e9ca2fa5c35df444a8a5be3b4c92e69704fe473ef10e99d5f9a3e3ed8539"
     }
   ],
   "syncCommand": "python tools/generate_topology_explorer.py",
@@ -243,7 +243,7 @@
       "label": "Current Live Validation",
       "group": "canon",
       "state": "live",
-      "summary": "Round10 tool-timeout/progress cutover is live as of 2026-06-28. This live build enables the Round10 staging line: Discord DM vs Telegram DM continuity stays separated by platform/channel/session identity, already-recorded completion repair keeps progress-panel narration out of final agent-reply payloads, progress delivery caps provider-visible non-terminal body/status update volume while preserving terminal convergence, image gateway receipts distinguish route-unavailable from input-specific no-tool failures after a canary route probe, and Codex active tool-use idle timeouts record toolUseTimeout before one bounded fresh-thread recovery attempt. These are initial guards only; the topology contract still tracks progress-delivery-volume-gap, progress-final-surface-gap, tool-use-timeout-recovery-gap, broader Telegram/Discord replay coverage, and per-tool supervisor/cancellation/resume parity as open promotion gates.",
+      "summary": "Round10 Discord attachment artifact extraction cutover is live as of 2026-06-29. This live build promotes the candidate from .debug\\round10\\discord-attachment-artifact-extraction-candidate-2026-06-29\\live-cutover-handoff.md: Discord Gateway text, markdown, and JSON-like attachments are downloaded only after access-policy and channel-identity checks pass, stored under harness-managed inbound media artifacts, and rendered to prompts as bounded extraction summaries plus agent-harness://inbound-media/discord/... refs; Discord image attachments are stored as artifact refs without raw bytes/base64/provider URLs; attachment downloads fail closed to supported Discord CDN/media attachment paths; download-failure warnings are sanitized; declared image attachments require supported image magic bytes before being written; Codex progress/tool preview redaction and status/final-surface follow-up behavior from the previous live build remain included.",
       "refs": [
         "docs/agent-harness-operations-handbook.md"
       ]
@@ -550,7 +550,7 @@
       "label": "Artifact or media prompt hygiene",
       "group": "gate",
       "state": "release-gate",
-      "summary": "image, audio/transcript, generated speech/media, browser capture, document/download, long tool-log/review transcript, worker-report, and provider-native attachment fixtures render as artifact refs plus bounded extraction summaries; raw bytes/base64/provider URLs/tool blobs are absent from main-thread prompt/continuity",
+      "summary": "image, audio/transcript, generated speech/media, browser capture, document/download, long tool-log/review transcript, worker-report, provider-native attachment fixtures, and Discord text/image attachments render as artifact refs plus bounded extraction summaries; raw bytes/base64/provider URLs/tool blobs are absent from main-thread prompt/continuity and Codex progress previews",
       "reviewDocs": ".debug/round10/image-artifact-context-hygiene-tech-note-2026-06-28.md, docs/invariants.md, docs/release-checklist.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -647,9 +647,9 @@
       "group": "gap",
       "state": "open-gap",
       "summary": "Progress delivery and final-reply UX",
-      "designTarget": "A long-running channel turn should show bounded progress updates, then converge to one final reply or terminal notification without excessive provider edits, repeated body/status churn, or non-terminal progress after completion. The body/action lane is an event-history stream and may be capped; the status/current-step lane is a heartbeat surface and must remain editable at low frequency after the body cap.",
-      "currentEvidence": "A 2026-06-28 Telegram DM audit after 02:57 Taipei found one completed turn with one final outbox but more than 100 progress edit receipts, and a later in-flight turn with dozens of progress edits before any final outbox. A Discord long-running turn then showed the inverse UX failure: body/status counters reached 6 while internal events and typing indicators continued, making the visible panel look frozen. Round10 adds response.progressDeliveryMaxNonterminalUpdatesPerLane / progressDeliveryMaxNonterminalBodyUpdatesPerQueue, tracks delivered non-terminal lane counters in agent-harness.progress-delivery-state.v1, exposes volume_limited, keeps terminal convergence outside the volume cap, and adds status heartbeat after body cap via progressDeliveryStatusHeartbeatAfterBodyCapMs. progress::tests::delivery_plan_status_heartbeat_after_body_cap_is_channel_agnostic proves the same behavior for Telegram and Discord fixtures.",
-      "promotionGate": "Promote only after a replay/scenario gate proves per-queue body/action edit caps, status/current-step heartbeat after body cap, repeated text-hash suppression, terminal progress convergence, final-outbox presence, and no post-terminal edit churn across Telegram and Discord.",
+      "designTarget": "A long-running channel turn should show bounded progress updates, then converge to one final reply or terminal notification without excessive provider edits, repeated body/status churn, or non-terminal progress after completion. The body/action lane is an event-history stream and may be capped; the status/current-step lane is a heartbeat/current-summary surface and must remain editable after the body cap.",
+      "currentEvidence": "A 2026-06-28 Telegram DM audit after 02:57 Taipei found one completed turn with one final outbox but more than 100 progress edit receipts, and a later in-flight turn with dozens of progress edits before any final outbox. A Discord long-running turn then showed the inverse UX failure: body/status counters reached 6 while internal events and typing indicators continued, making the visible panel look frozen. Round10 adds response.progressDeliveryMaxNonterminalUpdatesPerLane / progressDeliveryMaxNonterminalBodyUpdatesPerQueue, tracks delivered non-terminal lane counters in agent-harness.progress-delivery-state.v1, exposes volume_limited, keeps terminal convergence outside the volume cap, and adds status heartbeat after body cap via progressDeliveryStatusHeartbeatAfterBodyCapMs. progress::tests::delivery_plan_status_heartbeat_after_body_cap_is_channel_agnostic proves the same behavior for Telegram and Discord fixtures. Follow-up staging adds progress::tests::delivery_plan_status_updates_immediately_for_new_current_step_after_body_cap, proving a newly appended assistant execution summary bypasses the post-body-cap heartbeat interval and edits the status/current-step lane immediately.",
+      "promotionGate": "Promote only after a replay/scenario gate proves per-queue body/action edit caps, status/current-step heartbeat after body cap, immediate current-step updates for new assistant execution summaries, repeated text-hash suppression, terminal progress convergence, final-outbox presence, and no post-terminal edit churn across Telegram and Discord.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -661,7 +661,7 @@
       "state": "open-gap",
       "summary": "Progress narration and final surface separation",
       "designTarget": "When assistantNarrationMode=progress_panel, progress/narration deltas should be visible only through progress panels or audit receipts. Final agent-reply outbox payloads should contain the final answer or terminal notification, not the in-progress diagnostic stream.",
-      "currentEvidence": "A 2026-06-28 local Telegram DM probe found a prior long progress stream written to channel outbox as agent-reply even though the completion receipt recorded assistantNarrationMode=progress_panel, assistantFinalChars=140, and assistantNarrationItems=0. Round10 adds runtime-pipeline replay gates for already-recorded completion repair proving progress-panel narration stays out of repaired final outbox payloads for both Telegram and Discord.",
+      "currentEvidence": "A 2026-06-28 local Telegram DM probe found a prior long progress stream written to channel outbox as agent-reply even though the completion receipt recorded assistantNarrationMode=progress_panel, assistantFinalChars=140, and assistantNarrationItems=0. Round10 adds runtime-pipeline replay gates for already-recorded completion repair proving progress-panel narration stays out of repaired final outbox payloads for both Telegram and Discord. A later Telegram DM imagegen turn exposed the stdout-recovery subcase: a recovered completed turn had no final_answer, only progress-panel narration, and wrote that narration as final agent-reply; local follow-up staging adds codex_runtime::tests::run_codex_runtime_rejects_stdout_recovery_narration_without_final_answer, which fails closed instead of using narration/raw assistant text as final.",
       "promotionGate": "Promote only after the replay/scenario pack also covers compact-before-turn fallback or fresh-thread recovery and asserts Telegram and Discord final outbox payloads contain only the final answer while progress text stays in progress receipts/panels.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -712,8 +712,8 @@
       "group": "gap",
       "state": "open-gap",
       "summary": "Generic artifact/context hygiene",
-      "designTarget": "Binary and bulky artifacts should be stored and referenced through harness artifact metadata after extraction. Durable main-session prompt, memory, continuity, and final replies should receive bounded extracted facts plus artifact refs, not raw bytes/base64/provider URLs/document bodies/tool blobs.",
-      "currentEvidence": "Round10 now extends agent-harness.inbound-media-artifact.v1 with optional lifecycleStatus and extractionSummary, adds generic prompt redaction for raw payload signatures/provider URLs/tokens/cookies, and covers Hermes-style classes with media::tests::artifact_prompt_hygiene_renders_generic_bounded_summaries_not_payloads plus runtime queue prompt coverage. This is prompt-surface hygiene, not a complete artifact lifecycle service.",
+      "designTarget": "Binary and bulky artifacts should be stored and referenced through harness artifact metadata after extraction. Durable main-session prompt, memory, continuity, progress previews, and final replies should receive bounded extracted facts plus artifact refs, not raw bytes/base64/provider URLs/document bodies/tool blobs.",
+      "currentEvidence": "Round10 now extends agent-harness.inbound-media-artifact.v1 with optional lifecycleStatus and extractionSummary, adds generic prompt redaction for raw payload signatures/provider URLs/tokens/cookies, and covers Hermes-style classes with media::tests::artifact_prompt_hygiene_renders_generic_bounded_summaries_not_payloads plus runtime queue prompt coverage. Follow-up staging adds codex_runtime::tests::codex_progress_redacts_artifact_payloads_from_tool_previews, proving generated image/tool output previews do not persist raw data:image, base64, provider URLs, or token-bearing strings in progress events. Discord attachment extraction follow-up adds agent-harness-cli::tests::discord_gateway_text_attachment_becomes_bounded_artifact_metadata, agent-harness-cli::tests::discord_gateway_image_attachment_is_artifact_reference_without_payload, agent-harness-cli::tests::discord_gateway_rejects_non_discord_attachment_url_without_fetching, agent-harness-cli::tests::discord_gateway_attachment_download_failure_redacts_provider_url, agent-harness-cli::tests::discord_gateway_image_attachment_requires_supported_image_bytes, agent-harness-cli::tests::discord_gateway_json_like_attachment_uses_json_artifact_extension, and media::tests::discord_text_artifact_uri_resolves_and_passes_generic_safety, proving Discord text/image attachments are copied into artifact storage and prompt-rendered through artifact refs plus bounded text summaries without raw CDN URLs/tokens, while non-Discord URLs, raw provider-error strings, fake image bodies, and JSON-like extension gaps fail closed. This is prompt/progress/ingress-surface hygiene, not a complete artifact lifecycle service.",
       "promotionGate": "Promote only after an end-to-end artifact-heavy Telegram/Discord replay proves extraction writes bounded facts, raw artifacts remain retrievable by pointer, memory/continuity do not persist blobs, generated media/tool outputs are stored as artifacts/receipts with capped previews, and image-only compact is not used as proof for audio/browser/document/log classes.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -752,7 +752,7 @@
       "state": "open-gap",
       "summary": "Supervisor service health precedence",
       "designTarget": "healthz, status --json, and supervisor-reconcile should present one canonical managed-service health view or explicitly label when service registry metadata is non-authoritative behind a fresher loop heartbeat.",
-      "currentEvidence": "A 2026-06-28 Round10 post-cutover readback showed healthz ready=true live=true, fresh discord-gateway-loop heartbeat, and supervisor-reconcile --all --dry-run with no missing/stale services, while healthz.supervisorServices still exposed an older discord-gateway-loop service record as status=spawning / stale=true.",
+      "currentEvidence": "A 2026-06-28 Round10 post-cutover readback showed healthz ready=true live=true, fresh discord-gateway-loop heartbeat, and supervisor-reconcile --all --dry-run with no missing/stale services, while healthz.supervisorServices still exposed an older discord-gateway-loop service record as status=spawning / stale=true. Local follow-up staging adds status::tests::loop_status_prefers_fresh_loop_heartbeat_over_spawning_service_state and health::tests::healthz_prefers_fresh_loop_heartbeat_over_spawning_service_state, aligning status/healthz read models with reconcile precedence for a fresh alive Discord gateway heartbeat.",
       "promotionGate": "Promote only after service-state, loop-heartbeat, healthz, status --json, and reconcile output use the same precedence rules or surface stale service metadata as historical/non-authoritative, with a Discord gateway spawn-boundary scenario proving no false stale alarm when the Node heartbeat is fresh.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -1339,6 +1339,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-media-artifact-hygiene",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-channel-delivery",
       "target": "gap-progress-delivery-volume-gap",
       "label": "has gap"
@@ -1509,6 +1514,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-progress",
+      "target": "gap-generic-artifact-context-hygiene-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-memory",
       "target": "gap-generic-artifact-context-hygiene-gap",
       "label": "has gap"
@@ -1537,6 +1547,11 @@
       "source": "gap-supervisor-service-health-precedence-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-supervisor-service-health-precedence-gap",
+      "label": "has gap"
     },
     {
       "source": "gap-scenario-matrix-coverage-gap",

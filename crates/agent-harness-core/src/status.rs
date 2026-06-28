@@ -437,7 +437,8 @@ fn loop_status(harness_home: &Path) -> io::Result<HarnessLoopStatus> {
         .join("state")
         .join("supervisor")
         .join("services");
-    let services = read_supervisor_services(&services_dir, now_ms)?;
+    let mut services = read_supervisor_services(&services_dir, now_ms)?;
+    apply_fresh_heartbeat_precedence_to_services(&mut services, &heartbeats, now_ms);
     Ok(HarnessLoopStatus {
         heartbeat_dir,
         heartbeats,
@@ -553,6 +554,47 @@ fn read_supervisor_services(
     }
 
     Ok(services)
+}
+
+fn apply_fresh_heartbeat_precedence_to_services(
+    services: &mut [HarnessSupervisorServiceStatus],
+    heartbeats: &[HarnessLoopHeartbeatStatus],
+    now_ms: i64,
+) {
+    let heartbeats_by_name: BTreeMap<&str, &HarnessLoopHeartbeatStatus> = heartbeats
+        .iter()
+        .map(|heartbeat| (heartbeat.name.as_str(), heartbeat))
+        .collect();
+
+    for service in services {
+        let Some(heartbeat) = heartbeats_by_name.get(service.service_id.as_str()) else {
+            continue;
+        };
+        if !heartbeat.present || heartbeat.corrupt || heartbeat.process_alive != Some(true) {
+            continue;
+        }
+        let heartbeat_is_newer = match (heartbeat.at_ms, service.last_heartbeat_at_ms) {
+            (Some(heartbeat_at_ms), Some(service_at_ms)) => heartbeat_at_ms > service_at_ms,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if !heartbeat_is_newer {
+            continue;
+        }
+
+        service.process_id = heartbeat.process_id.or(service.process_id);
+        service.process_alive = heartbeat.process_alive.or(service.process_alive);
+        service.last_heartbeat_at_ms = heartbeat.at_ms.or(service.last_heartbeat_at_ms);
+        service.age_ms = service
+            .last_heartbeat_at_ms
+            .map(|at_ms| now_ms.saturating_sub(at_ms));
+        if heartbeat.status.is_some() {
+            service.status = heartbeat.status.clone();
+        }
+        if service.actual_state.as_deref() == Some("spawning") {
+            service.actual_state = Some("running".to_string());
+        }
+    }
 }
 
 fn extra_loop_names(harness_home: &Path, heartbeat_dir: &Path) -> io::Result<BTreeSet<String>> {
@@ -2174,6 +2216,76 @@ mod tests {
     }
 
     #[test]
+    fn loop_status_prefers_fresh_loop_heartbeat_over_spawning_service_state() {
+        let root =
+            temp_root("loop_status_prefers_fresh_loop_heartbeat_over_spawning_service_state");
+        let harness_home = root.join(".agent-harness");
+        let state = harness_home.join("state");
+        let services_dir = state.join("supervisor").join("services");
+        let heartbeat_dir = state.join("supervisor").join("loop-heartbeats");
+        fs::create_dir_all(&services_dir).unwrap();
+        fs::create_dir_all(&heartbeat_dir).unwrap();
+        let pid = i64::from(std::process::id());
+        let now_ms = current_ms_for_test();
+        fs::write(
+            services_dir.join("discord-gateway-loop.json"),
+            serde_json::to_string(&serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "discord-gateway-loop",
+                "serviceKind": "discord-gateway",
+                "generationId": "discord-gateway-loop-supervised-test",
+                "pid": 0,
+                "processId": 0,
+                "supervisorPid": pid,
+                "startedAtMs": now_ms - 10_000,
+                "processStartTimeMs": now_ms - 10_000,
+                "lastHeartbeatAtMs": now_ms - 10_000,
+                "status": "spawning",
+                "desiredState": "running",
+                "actualState": "spawning",
+                "detail": "starting Discord gateway subprocess",
+                "launchOwner": "rust-supervisor-run",
+                "observedOnly": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            heartbeat_dir.join("discord-gateway-loop.json"),
+            serde_json::to_string(&serde_json::json!({
+                "schema": "agent-harness.loop-heartbeat.v1",
+                "name": "discord-gateway-loop",
+                "status": "heartbeat",
+                "processId": pid,
+                "atMs": now_ms - 100,
+                "detail": "Discord heartbeat ack"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loops = loop_status(&harness_home).unwrap();
+        let service = loops
+            .services
+            .iter()
+            .find(|service| service.service_id == "discord-gateway-loop")
+            .unwrap();
+
+        assert_eq!(service.process_id, Some(pid));
+        assert_eq!(service.process_alive, Some(true));
+        assert_eq!(service.status.as_deref(), Some("heartbeat"));
+        assert_eq!(service.actual_state.as_deref(), Some("running"));
+        assert_eq!(service.last_heartbeat_at_ms, Some(now_ms - 100));
+        assert!(
+            service
+                .age_ms
+                .is_some_and(|age_ms| (100..120_000).contains(&age_ms))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn loop_status_reports_nul_heartbeat_as_corrupt() {
         let root = temp_root("loop_status_reports_nul_heartbeat_as_corrupt");
         let harness_home = root.join(".agent-harness");
@@ -2668,5 +2780,12 @@ mod tests {
             "agent-harness-status-{test_name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn current_ms_for_test() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
     }
 }

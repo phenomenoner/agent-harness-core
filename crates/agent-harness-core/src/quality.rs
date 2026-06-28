@@ -476,11 +476,11 @@ pub fn release_checklist() -> ReleaseChecklist {
             "topology contract impact matrix reviewed for changed modules",
             "channel/runtime changes passed the agent-boundary scenario matrix",
             "prompt/memory changes passed /new task-boundary and per-agent memory recall checks",
-            "response/runtime changes passed final-surface separation checks",
+            "response/runtime changes passed final-surface separation checks, including stdout recovery without final_answer",
             "progress delivery changes passed edit-volume replay checks",
-            "progress panel lane-cap heartbeat checks passed across channel platforms",
+            "progress panel lane-cap heartbeat/current-step checks passed across channel platforms",
             "Codex tool-use timeout changes passed bounded recovery checks",
-            "artifact/context hygiene changes passed generic artifact prompt redaction checks",
+            "artifact/context hygiene changes passed generic artifact prompt/progress redaction and Discord attachment extraction checks",
             "public hygiene report passed",
             "rollback notes recorded",
             "staging healthz and trace samples captured",
@@ -546,25 +546,23 @@ mod tests {
         assert!(
             release_checklist()
                 .required_items
-                .contains(&"response/runtime changes passed final-surface separation checks")
+                .contains(&"response/runtime changes passed final-surface separation checks, including stdout recovery without final_answer")
         );
         assert!(
             release_checklist()
                 .required_items
                 .contains(&"progress delivery changes passed edit-volume replay checks")
         );
-        assert!(
-            release_checklist().required_items.contains(
-                &"progress panel lane-cap heartbeat checks passed across channel platforms"
-            )
-        );
+        assert!(release_checklist().required_items.contains(
+            &"progress panel lane-cap heartbeat/current-step checks passed across channel platforms"
+        ));
         assert!(
             release_checklist()
                 .required_items
                 .contains(&"Codex tool-use timeout changes passed bounded recovery checks")
         );
         assert!(release_checklist().required_items.contains(
-            &"artifact/context hygiene changes passed generic artifact prompt redaction checks"
+            &"artifact/context hygiene changes passed generic artifact prompt/progress redaction and Discord attachment extraction checks"
         ));
 
         let root = temp_root("quality_catalogs_and_hygiene_report_are_actionable");

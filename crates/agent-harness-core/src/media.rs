@@ -396,17 +396,17 @@ pub fn validate_inbound_media_safety(
                     "artifact {index} localPath is outside attachment root"
                 ));
             }
-            if !allowed_image_extension(local_path) {
+            if !allowed_artifact_extension(local_path) {
                 violations.push(format!(
-                    "artifact {index} localPath extension is not allowed"
+                    "artifact {index} localPath extension is not in the allowed artifact set"
                 ));
             }
         }
         if artifact.download_status == InboundMediaDownloadStatus::Downloaded
-            && !is_supported_image_mime(artifact.mime.as_deref())
+            && !is_supported_artifact_mime(artifact.mime.as_deref())
         {
             violations.push(format!(
-                "artifact {index} MIME is not in the allowed image set"
+                "artifact {index} MIME is not in the allowed artifact set"
             ));
         }
     }
@@ -447,9 +447,15 @@ pub fn resolve_inbound_media_artifact_reference(
         return Err("artifact reference is empty".to_string());
     }
     let path = if let Some(relative) = trimmed.strip_prefix("agent-harness://inbound-media/") {
-        let relative = relative.strip_prefix("telegram/").ok_or_else(|| {
-            "artifact URI platform is not supported by this attachment root".to_string()
-        })?;
+        let relative = if let Some(relative) = relative.strip_prefix("telegram/") {
+            relative
+        } else if relative.starts_with("discord/") {
+            relative
+        } else {
+            return Err(
+                "artifact URI platform is not supported by this attachment root".to_string(),
+            );
+        };
         let relative_path = safe_relative_artifact_path(relative)?;
         root.join(relative_path)
     } else {
@@ -836,13 +842,49 @@ fn is_supported_image_mime(mime: Option<&str>) -> bool {
     })
 }
 
-fn allowed_image_extension(path: &Path) -> bool {
+fn is_supported_artifact_mime(mime: Option<&str>) -> bool {
+    mime.is_some_and(|mime| {
+        matches!(
+            mime.to_ascii_lowercase().as_str(),
+            "image/jpeg"
+                | "image/jpg"
+                | "image/png"
+                | "image/gif"
+                | "image/webp"
+                | "text/plain"
+                | "text/markdown"
+                | "application/json"
+                | "application/pdf"
+                | "audio/mpeg"
+                | "audio/mp3"
+                | "audio/wav"
+                | "audio/x-wav"
+                | "video/mp4"
+                | "video/webm"
+        )
+    })
+}
+
+fn allowed_artifact_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
-                "jpg" | "jpeg" | "png" | "gif" | "webp"
+                "jpg"
+                    | "jpeg"
+                    | "png"
+                    | "gif"
+                    | "webp"
+                    | "txt"
+                    | "md"
+                    | "log"
+                    | "json"
+                    | "pdf"
+                    | "mp3"
+                    | "wav"
+                    | "mp4"
+                    | "webm"
             )
         })
 }
@@ -1245,6 +1287,55 @@ mod tests {
         assert!(rendered.contains("source=redacted-source"));
         assert!(!rendered.contains("botTOKEN"));
         assert!(!rendered.contains("file_id=secret"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discord_text_artifact_uri_resolves_and_passes_generic_safety() {
+        let root = temp_media_root("discord_text_artifact_uri_resolves_and_passes_generic_safety");
+        let harness_home = root.join(".agent-harness");
+        let attachment = inbound_media_attachment_root(&harness_home)
+            .join("discord")
+            .join("message-1")
+            .join("0.txt");
+        fs::create_dir_all(attachment.parent().unwrap()).unwrap();
+        fs::write(&attachment, b"bounded text").unwrap();
+        let artifacts = vec![InboundMediaArtifact {
+            platform: "discord".to_string(),
+            kind: "attachment-text".to_string(),
+            local_path: Some(attachment.clone()),
+            artifact_uri: Some("agent-harness://inbound-media/discord/message-1/0.txt".to_string()),
+            mime: Some("text/plain".to_string()),
+            byte_len: Some(12),
+            source: "discord.attachment".to_string(),
+            download_status: InboundMediaDownloadStatus::Downloaded,
+            model_attachment_status: InboundMediaModelAttachmentStatus::PromptOnly,
+            ..InboundMediaArtifact::default()
+        }];
+
+        let resolved = resolve_inbound_media_artifact_reference(
+            &harness_home,
+            "agent-harness://inbound-media/discord/message-1/0.txt",
+        )
+        .unwrap();
+        assert_eq!(resolved, attachment);
+
+        let report = validate_inbound_media_safety(
+            &harness_home,
+            &artifacts,
+            InboundMediaSafetyPolicy::default(),
+        );
+        assert!(report.within_limits, "{:?}", report.violations);
+
+        let rendered = render_inbound_media_artifacts_for_prompt(&artifacts, Some(&harness_home));
+        assert!(
+            rendered.contains("artifactUri=agent-harness://inbound-media/discord/message-1/0.txt")
+        );
+        assert!(
+            rendered
+                .contains("localPath=state/channels/telegram-attachments/discord/message-1/0.txt")
+        );
 
         let _ = fs::remove_dir_all(root);
     }

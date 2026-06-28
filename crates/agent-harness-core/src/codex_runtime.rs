@@ -1671,15 +1671,32 @@ fn finish_codex_runtime_run(
     let mut status = run_result.status;
     let mut reason = run_result.reason.clone();
     warnings.append(&mut run_result.warnings);
+    let raw_fallback_forbidden = !run_result.assistant_final_found
+        && !run_result.assistant_raw_message.trim().is_empty()
+        && narration_config.mode == AssistantNarrationMode::ProgressPanel
+        && !run_result.assistant_narration.is_empty();
     let captured_assistant_output = if run_result.assistant_final_found {
         !run_result.assistant_message.trim().is_empty()
+    } else if raw_fallback_forbidden {
+        false
     } else {
         !run_result.assistant_raw_message.trim().is_empty()
     };
     if status == CodexRuntimeRunStatus::Completed && !captured_assistant_output {
-        warnings.push("Codex app-server completed without captured assistant text".to_string());
-        status = CodexRuntimeRunStatus::ProtocolError;
-        reason = "codex app-server completed without captured assistant output".to_string();
+        if raw_fallback_forbidden {
+            warnings.push(
+                "Codex app-server completed without final_answer; progress-panel narration was not used as final reply fallback"
+                    .to_string(),
+            );
+            status = CodexRuntimeRunStatus::ProtocolError;
+            reason =
+                "codex app-server completed without final_answer while progress-panel narration was active"
+                    .to_string();
+        } else {
+            warnings.push("Codex app-server completed without captured assistant text".to_string());
+            status = CodexRuntimeRunStatus::ProtocolError;
+            reason = "codex app-server completed without captured assistant output".to_string();
+        }
     }
     let completion = if status == CodexRuntimeRunStatus::Completed {
         let assistant_message = std::mem::take(&mut run_result.assistant_message);
@@ -5212,7 +5229,42 @@ fn compact_codex_progress_preview(kind: AgentProgressKind, preview: &str) -> Str
     } else {
         flattened
     };
+    if progress_preview_contains_artifact_payload(&compact) {
+        return "redacted-artifact-payload".to_string();
+    }
     truncate_for_notice(&compact, 96)
+}
+
+fn progress_preview_contains_artifact_payload(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    normalized.contains("data:image")
+        || normalized.contains("data:audio")
+        || normalized.contains("data:video")
+        || normalized.contains(";base64,")
+        || normalized.contains("api.telegram.org")
+        || normalized.contains("cdn.discordapp.com")
+        || normalized.contains("discord.com/api")
+        || normalized.contains("file_id=")
+        || normalized.contains("fileid=")
+        || normalized.contains("token=")
+        || normalized.contains("authorization:")
+        || normalized.contains("cookie:")
+        || progress_preview_looks_like_large_base64(value)
+}
+
+fn progress_preview_looks_like_large_base64(value: &str) -> bool {
+    let mut run = 0usize;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=') {
+            run += 1;
+            if run >= 160 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
 }
 
 fn compact_shell_command_preview(value: &str) -> Option<String> {
@@ -9252,6 +9304,36 @@ mod tests {
     }
 
     #[test]
+    fn codex_progress_redacts_artifact_payloads_from_tool_previews() {
+        let context = progress_context();
+        let image_payload = "A".repeat(220);
+        let event = codex_progress_event_from_json(
+            &context,
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "function_call_output",
+                        "summary": format!(
+                            "generated image data:image/png;base64,{image_payload} https://cdn.discordapp.com/attachments/private/raw.png?token=secret"
+                        )
+                    }
+                }
+            }),
+            1000,
+        )
+        .unwrap();
+
+        assert_eq!(event.kind, AgentProgressKind::ToolCall);
+        assert_eq!(event.preview, "redacted-artifact-payload");
+        assert!(!event.preview.contains("data:image"));
+        assert!(!event.preview.contains("base64"));
+        assert!(!event.preview.contains("cdn.discordapp.com"));
+        assert!(!event.preview.contains("token=secret"));
+        assert!(!event.preview.contains(&image_payload));
+    }
+
+    #[test]
     fn plan_codex_runtime_writes_plan_and_receipts() {
         let root = temp_root("plan_codex_runtime_writes_plan_and_receipts");
         let source = write_codex_runtime_source(&root);
@@ -10793,6 +10875,61 @@ mod tests {
         let transcript_file = report.completion.unwrap().transcript_file.unwrap();
         let transcript = fs::read_to_string(transcript_file).unwrap();
         assert!(transcript.contains("Recovered final reply."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_rejects_stdout_recovery_narration_without_final_answer() {
+        let root =
+            temp_root("run_codex_runtime_rejects_stdout_recovery_narration_without_final_answer");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let execution_dir = plan_report.execution_dir.as_ref().unwrap();
+        fs::write(
+            execution_dir.join("codex-runtime-run.stdout.jsonl"),
+            r#"{"id":1,"result":{"thread":{"id":"thread-narration-only"}}}
+{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-progress-1","text":"I will generate six separate images.","phase":"commentary"},"threadId":"thread-narration-only","completedAtMs":1234}}
+{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-progress-2","text":"Six images are generated; checking local receipts.","phase":"commentary"},"threadId":"thread-narration-only","completedAtMs":1235}}
+{"method":"turn/completed","params":{"threadId":"thread-narration-only","turn":{"id":"turn-narration-only","status":"completed","usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15}}}}
+"#,
+        )
+        .unwrap();
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+        assert!(report.completion.is_none());
+        assert!(report.receipt.completion_file.is_none());
+        assert!(
+            report
+                .receipt
+                .reason
+                .contains("completed without final_answer")
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("progress-panel narration was not used"))
+        );
 
         let _ = fs::remove_dir_all(root);
     }
