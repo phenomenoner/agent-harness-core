@@ -42,6 +42,7 @@ Born as a ground-up Rust rebuild of a Docker-based legacy agent gateway ("OpenCl
 | 📨 **Chat-native agents** | First-class Telegram Bot API and Discord (REST + Gateway) adapters: replies, media, attachments, message splitting, edit-in-place progress panels, default-off opt-in final-reply tone, and `/new` `/model` `/think` `/steer` `/stop` `/status` commands. |
 | 🔐 **Fail-closed by default** | DMs require explicit admin allow-lists, and ingress must resolve a platform/account/channel identity binding before dispatch. Unknown senders or ambiguous channel bindings never reach the model. |
 | ⚙️ **Durable, bounded work** | SQLite-backed worker dispatch with leases, retry/backoff, stale reaping, watchdogs, and concurrency limits per global / agent / channel / lane. Runtime dispatch classes isolate interactive, cron, worker, and maintenance turns so noisy cron work does not block channel agents. |
+| 🧵 **Long-task continuity** | A turn's session lives inside a stable **virtual session**. When the model context compacts past a threshold, the runtime rolls over into a *fresh* Codex session under the same virtual id, carrying a bounded **working set** (goal, plan refs, decisions, open files, validation, blockers) so long tasks survive repeated compaction instead of silently drifting — and `/new` is a hard task boundary that never inherits the previous task's context. *(Mechanism is live-wired into every turn; the end-to-end forced-rollover proof is a tracked release gate.)* |
 | 🤖 **Model-agnostic routing** | Codex app-server executes turns; OpenRouter routing switches any conversation to e.g. `anthropic/claude-sonnet-4` with one `/model` command. Provider-specific Codex homes keep OpenRouter config out of the default Codex/OAuth path; secrets are checked at preflight, never written to disk. |
 | 🧠 **Memory-aware** | OpenClaw-compatible memory hooks (recall, lifecycle capture, store proposals) with vector recall over imported SQLite embeddings — integrated via adapters, not forks. |
 | 📦 **Skills as runtime state** | Versioned, indexed `SKILL.md` runbooks are matched per turn and injected once per session via an injection ledger — no prompt bloat, no stale docs. Imported skill indexes cover both legacy and current OpenClaw namespace layouts. |
@@ -69,7 +70,7 @@ flowchart LR
     ALL[every stage] -.appends.-> LOG[(JSONL logs, receipts,\ntranscripts, trajectories)]
 ```
 
-The harness owns ingress, permissions, queuing, prompt assembly, delivery, and audit. **Codex owns the model**: system prompt, tool schemas, MCP, sandbox, approvals, and session continuity. That split keeps the harness small, deterministic, and testable — 200+ tests run without any model call, using a bundled fake Codex app-server.
+The harness owns ingress, permissions, queuing, prompt assembly, delivery, long-task continuity, and audit. **Codex owns the model**: system prompt, tool schemas, MCP, sandbox, approvals, and session continuity. That split keeps the harness small, deterministic, and testable — 500+ tests run without any model call, using a bundled fake Codex app-server.
 
 ## Quick Start
 
@@ -119,7 +120,7 @@ One binary, `agent-harness`, grouped into clear families:
 
 ## Project Status
 
-Pre-release, under active development, and **live-validated daily**: the reference deployment runs a single supervised runtime loop (concurrency 12) plus worker, progress, Telegram, Discord, and scheduler loops, with hundreds of delivered turns on record. Current staged work adds CronRunStore, dedicated cron worker/runtime lanes, one-shot and namespaced sticky cron sessions, and dispatch guards so cron LLM turns are observable, retryable, recoverable, and isolated from interactive channel turns.
+Pre-release, under active development, and **live-validated daily**: the reference deployment runs a single supervised runtime loop (concurrency 12) plus worker, progress, Telegram, Discord, and scheduler loops, with tens of thousands of delivered messages and hundreds of completed model turns on record. Current staged work adds CronRunStore, dedicated cron worker/runtime lanes, one-shot and namespaced sticky cron sessions, and dispatch guards so cron LLM turns are observable, retryable, recoverable, and isolated from interactive channel turns.
 
 See the [Changelog](CHANGELOG.md) and the [Roadmap & Backlog](docs/agent-harness-core-roadmap-backlog.md) for what's done, gated, and next.
 

@@ -9,6 +9,7 @@
 - Moved live operations handbooks, release/checkpoint handoffs, validation scratch notes, Superpowers plans, staging/cutover notes, `.debug` evidence, and owner-machine helper tools to ignored local-only private paths (`docs/.private/`, `tools/.private/`, `.debug/`).
 - Updated `AGENTS.md`, `DOC-GUIDELINES.md`, and the README documentation table with the public/private disclosure rule for future docs and tools.
 - Regenerated the topology explorer so public artifacts no longer embed local live-validation evidence from the private operations handbook.
+- Updated the README public overview to describe virtual-session long-task continuity, the `/new` task-boundary guarantee, and the current test scale.
 - Preserved agent identity across final outbox freshness checks: a same-agent stale session is still suppressed after `/new`, but a completed non-main agent turn sharing the same platform/channel/user is not suppressed solely because shared channel state currently points at another agent.
 - Added `docs/agent-harness-topology-contract.md` as the public-safe topology contract and impact matrix for channel, runtime, prompt, outbox, delivery, memory, and cutover changes.
 - Added invariant I8 to the docs and machine-readable invariant catalog: `agentId` is a routing boundary across channel state, session freshness, prompt, runtime, outbox, delivery, and memory.
