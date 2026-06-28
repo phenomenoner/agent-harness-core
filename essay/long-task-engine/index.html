@@ -320,6 +320,78 @@
     <figcaption>FIG. 3 — continuity keeps the task coherent; reasoning goes deep when it has to. Each feeds the other, and the harness receipts both.</figcaption>
   </figure>
 
+  <h2>"But isn't that what a vector database is for?"</h2>
+  <p>It's the first objection every engineer raises, and it deserves a straight answer. Long-term memory systems — vector databases like <b>Qdrant</b>, and the agent-memory layers built on top of them (<b>openclaw-mem</b>, <b>MemPalace</b>, <b>Mem0</b>, Letta/MemGPT-style archives) — are genuinely useful. They are also solving a <em>different</em> problem, and they do not fix the forgetting this essay is about.</p>
+  <p>Here's the distinction that matters. A vector memory answers <strong>"what do I know from before?"</strong> — it retrieves the top-k semantically <em>similar</em> fragments from everything the agent has ever seen. The working set answers <strong>"where am I right now in this task?"</strong> — the current goal, the live decisions, the open blockers. Recall is about <em>similarity</em>; continuity is about <em>state</em>. One genuinely cannot stand in for the other.</p>
+  <p>Try to use retrieval as continuity and the seams show immediately:</p>
+  <ul>
+    <li><strong>Similarity is not state.</strong> The decision you made an hour ago — "we ruled out approach X because of constraint Y" — may not be the most semantically similar chunk to your current query, so it isn't retrieved, and the agent cheerfully re-walks the dead end. Continuity needs the authoritative current state present <em>deterministically</em>, not the probabilistically-nearest fragment.</li>
+    <li><strong>An archive has no "now."</strong> A vector store is a pile of past fragments. Even with perfect recall you get relevant snippets, not a coherent, bounded picture of the live task. The working set is a single mutable source of truth — a different <em>shape</em> of data than an embedding index.</li>
+    <li><strong>Old truths and new truths look equally relevant.</strong> In a long task, decisions get reversed. A vector store happily returns both the superseded decision and its replacement — both score as "relevant" — and the model can't reliably tell which is current. The working set is overwritten: last-write-wins, not retrieve-everything.</li>
+    <li><strong>It isn't even in the loop when forgetting happens.</strong> The silent loss occurs <em>inside</em> a session's context-window compaction. A memory layer fires on a <em>query</em>; it never learns that a compaction just dropped the constraint you needed. The virtual session is triggered <em>by</em> the compaction event — a completely different control point.</li>
+    <li><strong>Recall is untrusted; state must be trusted.</strong> Retrieved memory is bounded, fuzzy, fail-open context — it can be stale, off-topic, or even poisoned, so the harness treats it as untrusted input. You do not want the agent's notion of "what I decided" to be a fuzzy retrieval that might be wrong. Authoritative task state has to be harness-owned and deterministic.</li>
+  </ul>
+  <p>None of this is an argument <em>against</em> long-term memory — Agent Harness Core integrates it, externally and fail-open, with citations. It's an argument against asking it to do a job it was never shaped for. The two memories we opened with run <em>this</em> task; long-term memory is a third, orthogonal concern — knowledge <em>across</em> tasks — and a serious long-task agent needs all three:</p>
+
+  <figure>
+    <svg viewBox="0 0 1200 620" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,Segoe UI,sans-serif" role="img" aria-label="Three complementary memory layers: knowledge, continuity, reasoning">
+      <rect width="1200" height="620" fill="#0a0d13"/>
+      <text x="80" y="60" fill="#fbbf24" font-size="20" letter-spacing="4" font-family="Consolas,monospace">THREE LAYERS — COMPLEMENTS, NOT SUBSTITUTES</text>
+
+      <rect x="70" y="100" width="340" height="470" rx="16" fill="#121927" stroke="#34d399" stroke-opacity="0.45"/>
+      <text x="96" y="146" fill="#34d399" font-size="18" font-weight="700" font-family="Consolas,monospace">KNOWLEDGE MEMORY</text>
+      <text x="96" y="178" fill="#dbe4f0" font-size="16" font-style="italic">"what do I know from before?"</text>
+      <line x1="96" y1="198" x2="384" y2="198" stroke="#1f2a3d"/>
+      <g font-family="Consolas,monospace">
+        <text x="96" y="234" fill="#8fa0b8" font-size="15">vector / semantic recall</text>
+        <text x="96" y="260" fill="#8fa0b8" font-size="15">Qdrant · openclaw-mem</text>
+        <text x="96" y="286" fill="#8fa0b8" font-size="15">MemPalace · Mem0 · Letta</text>
+        <text x="96" y="330" fill="#5c6b82" font-size="15">scope: ACROSS tasks &amp; time</text>
+        <text x="96" y="356" fill="#5c6b82" font-size="15">top-k similarity · fail-open</text>
+      </g>
+      <line x1="96" y1="470" x2="384" y2="470" stroke="#1f2a3d"/>
+      <text x="96" y="506" fill="#f87171" font-size="15" font-family="Consolas,monospace">✗ without it:</text>
+      <text x="96" y="530" fill="#8fa0b8" font-size="14.5">amnesiac across sessions —</text>
+      <text x="96" y="550" fill="#8fa0b8" font-size="14.5">re-learns prefs &amp; lessons</text>
+
+      <rect x="430" y="100" width="340" height="470" rx="16" fill="#121927" stroke="#fbbf24" stroke-opacity="0.5"/>
+      <text x="456" y="146" fill="#fbbf24" font-size="18" font-weight="700" font-family="Consolas,monospace">CONTINUITY MEMORY</text>
+      <text x="456" y="178" fill="#dbe4f0" font-size="16" font-style="italic">"where am I now in this task?"</text>
+      <line x1="456" y1="198" x2="744" y2="198" stroke="#1f2a3d"/>
+      <g font-family="Consolas,monospace">
+        <text x="456" y="234" fill="#8fa0b8" font-size="15">virtual session · working set</text>
+        <text x="456" y="260" fill="#8fa0b8" font-size="15">goal · decisions · blockers</text>
+        <text x="456" y="286" fill="#8fa0b8" font-size="15">authoritative current state</text>
+        <text x="456" y="330" fill="#5c6b82" font-size="15">scope: WITHIN the task</text>
+        <text x="456" y="356" fill="#5c6b82" font-size="15">last-write-wins · receipted</text>
+      </g>
+      <line x1="456" y1="470" x2="744" y2="470" stroke="#1f2a3d"/>
+      <text x="456" y="506" fill="#f87171" font-size="15" font-family="Consolas,monospace">✗ without it:</text>
+      <text x="456" y="530" fill="#8fa0b8" font-size="14.5">forgets mid-task the moment</text>
+      <text x="456" y="550" fill="#8fa0b8" font-size="14.5">context compacts</text>
+
+      <rect x="790" y="100" width="340" height="470" rx="16" fill="#121927" stroke="#67e8f9" stroke-opacity="0.5"/>
+      <text x="816" y="146" fill="#67e8f9" font-size="18" font-weight="700" font-family="Consolas,monospace">REASONING MEMORY</text>
+      <text x="816" y="178" fill="#dbe4f0" font-size="16" font-style="italic">"how do I think over this pile?"</text>
+      <line x1="816" y1="198" x2="1104" y2="198" stroke="#1f2a3d"/>
+      <g font-family="Consolas,monospace">
+        <text x="816" y="234" fill="#8fa0b8" font-size="15">RLM · sandboxed worker job</text>
+        <text x="816" y="260" fill="#8fa0b8" font-size="15">iterate · predict() subcalls</text>
+        <text x="816" y="286" fill="#8fa0b8" font-size="15">vars · files · full trace</text>
+        <text x="816" y="330" fill="#5c6b82" font-size="15">scope: RIGHT NOW</text>
+        <text x="816" y="356" fill="#5c6b82" font-size="15">bounded · budgeted</text>
+      </g>
+      <line x1="816" y1="470" x2="1104" y2="470" stroke="#1f2a3d"/>
+      <text x="816" y="506" fill="#f87171" font-size="15" font-family="Consolas,monospace">✗ without it:</text>
+      <text x="816" y="530" fill="#8fa0b8" font-size="14.5">shallow on big evidence —</text>
+      <text x="816" y="550" fill="#8fa0b8" font-size="14.5">summarizes away the answer</text>
+    </svg>
+    <figcaption>FIG. 4 — three orthogonal memory concerns. Retrieval recalls the past; the working set holds the present; RLM reasons over the pile in front of you.</figcaption>
+  </figure>
+
+  <p>Pull any one and you get a characteristic failure. Drop long-term memory and the agent is an amnesiac across sessions, re-learning your preferences and last week's lessons every time. Drop the virtual session and it forgets <em>within</em> the task the moment context compacts — the failure we started with. Drop RLM and it goes shallow on the evidence-heavy steps, summarizing away the very thing it needed to compute over.</p>
+  <blockquote>Retrieval recalls the past. The working set holds the present. RLM reasons over the pile in front of you. They are complements, not substitutes — swap any one for another and you've made a category error.</blockquote>
+
   <h2>What "engineering grade" actually means</h2>
   <p>It's a phrase people throw around, so let me make it concrete. A long-task agent is engineering-grade when these properties hold <em>across both layers</em>:</p>
   <ul>
@@ -336,6 +408,7 @@
     <div class="row"><span class="pill p-mech">shipped</span><span>Virtual sessions, working-set rollover, guards, and receipts — live-wired into every turn; tested without a model call.</span></div>
     <div class="row"><span class="pill p-spec">gated</span><span>The end-to-end forced-rollover proof under live traffic — a named, published release gate, not yet earned.</span></div>
     <div class="row"><span class="pill p-design">design note</span><span>RLM integration — the boundary, the job spec, the failure classes, the phased plan are specified in the repo; the engine is not built yet.</span></div>
+    <div class="row"><span class="pill p-mech">integrated</span><span>Long-term memory — openclaw-mem hooks with vector recall over imported embeddings, external and fail-open with citations; full autonomous-graph parity is itself a tracked gate.</span></div>
   </div>
 
   <p>That split — shipped vs. gated vs. designed — is deliberate, and it's the same discipline the rest of this project runs on. In a world where anyone can generate an impressive architecture diagram in an afternoon, the differentiator isn't the diagram. It's whether each box points at code, a receipt, or an honest "not yet."</p>
