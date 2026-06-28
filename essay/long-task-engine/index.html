@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Agent That Doesn't Forget — Virtual Sessions, RLM &amp; the Engineering of Long Tasks · Agent Harness Core</title>
+<meta name="description" content="Long tasks break agents by making them forget — silently. A two-layer architecture: virtual sessions for durable continuity, RLM for bounded deep reasoning, and a control plane that writes a receipt for both.">
+<meta property="og:title" content="The Agent That Doesn't Forget">
+<meta property="og:description" content="Continuity is not intelligence, and intelligence is not continuity. Long tasks need both — as separate, bounded, receipted engineering layers. Here is the architecture.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://phenomenoner.github.io/agent-harness-core/essay/long-task-engine/">
+<style>
+  :root{
+    --bg:#0a0d13; --bg2:#0f141d; --panel:#121927; --line:#1f2a3d;
+    --txt:#dbe4f0; --dim:#8fa0b8; --faint:#5c6b82;
+    --amber:#fbbf24; --amber-dim:#b98a10; --green:#34d399; --red:#f87171; --cyan:#67e8f9;
+    --mono:ui-monospace,'Cascadia Code','SF Mono',Consolas,monospace;
+    --sans:system-ui,-apple-system,'Segoe UI',Roboto,'Noto Sans',sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--txt);font-family:var(--sans);line-height:1.75;font-size:18px}
+  a{color:var(--amber);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .nav{max-width:780px;margin:0 auto;padding:26px 24px;display:flex;justify-content:space-between;font-family:var(--mono);font-size:.85rem}
+  .nav a{color:var(--dim)} .nav a:hover{color:var(--amber)}
+  .wrap{max-width:780px;margin:0 auto;padding:0 24px 100px}
+
+  header.hero{padding:30px 0 10px}
+  .eyebrow{font-family:var(--mono);font-size:.78rem;letter-spacing:.18em;text-transform:uppercase;color:var(--amber);margin-bottom:18px}
+  h1{font-size:clamp(2rem,5vw,2.9rem);line-height:1.15;letter-spacing:-.02em;margin-bottom:18px}
+  .standfirst{font-size:1.18rem;color:var(--dim);font-style:italic;margin-bottom:26px}
+  .byline{font-family:var(--mono);font-size:.82rem;color:var(--faint);padding-bottom:30px;border-bottom:1px solid var(--line)}
+  .byline b{color:var(--dim)}
+
+  article{padding-top:10px}
+  article h2{font-size:1.5rem;margin:52px 0 16px;letter-spacing:-.01em}
+  article h3{font-size:1.1rem;margin:30px 0 10px;font-family:var(--mono);color:var(--amber)}
+  article p{margin:0 0 20px;color:var(--txt)}
+  article p.dim{color:var(--dim)}
+  article strong{color:#fff}
+  article em{color:var(--dim)}
+  article ul{margin:0 0 20px;padding-left:26px;color:var(--txt)}
+  article li{margin-bottom:10px}
+  blockquote{margin:30px 0;padding:22px 28px;background:var(--panel);border-left:4px solid var(--amber);border-radius:0 12px 12px 0;font-size:1.15rem;font-weight:600}
+  hr{border:none;border-top:1px solid var(--line);margin:48px 0}
+  figure{margin:38px 0}
+  figure svg{display:block;width:100%;height:auto;border-radius:14px;border:1px solid var(--line)}
+  figcaption{font-family:var(--mono);font-size:.75rem;color:var(--faint);margin-top:10px;letter-spacing:.05em}
+  .mono{font-family:var(--mono)}
+
+  .statusbox{margin:40px 0;padding:24px 28px;border:1px dashed var(--amber-dim);border-radius:14px;background:rgba(251,191,36,.04)}
+  .statusbox h3{margin:0 0 14px;font-family:var(--mono);font-size:.95rem;color:var(--amber)}
+  .statusbox .row{display:flex;gap:12px;align-items:baseline;padding:7px 0;border-bottom:1px solid var(--line);font-size:.95rem;color:var(--dim)}
+  .statusbox .row:last-child{border-bottom:none}
+  .pill{flex:0 0 auto;font-family:var(--mono);font-size:.7rem;letter-spacing:.06em;text-transform:uppercase;padding:3px 10px;border-radius:999px}
+  .p-mech{background:rgba(52,211,153,.12);color:var(--green);border:1px solid rgba(52,211,153,.35)}
+  .p-design{background:rgba(103,232,249,.1);color:var(--cyan);border:1px solid rgba(103,232,249,.3)}
+  .p-spec{background:rgba(143,160,184,.1);color:var(--dim);border:1px solid var(--line)}
+  .pill-inline{font-family:var(--mono);font-size:.7rem;letter-spacing:.04em;text-transform:uppercase;padding:2px 8px;border-radius:999px;background:rgba(103,232,249,.1);color:var(--cyan);border:1px solid rgba(103,232,249,.3);white-space:nowrap}
+
+  .cta-box{margin:48px 0;padding:28px 30px;border:1px solid var(--line);border-radius:14px;background:var(--bg2)}
+  .cta-box .btn{display:inline-block;margin:10px 12px 0 0;padding:12px 20px;border-radius:10px;font-weight:600;font-size:.92rem}
+  .btn-primary{background:var(--amber);color:#1a1206}
+  .btn-primary:hover{background:#ffd34d;text-decoration:none}
+  .btn-ghost{border:1px solid var(--line);color:var(--txt)}
+  .btn-ghost:hover{border-color:var(--amber);text-decoration:none}
+
+  footer.site{max-width:780px;margin:0 auto;padding:34px 24px 80px;border-top:1px solid var(--line);color:var(--faint);font-size:.85rem}
+  footer.site a{margin-right:18px}
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <a href="../../">← agent-harness-core</a>
+  <a href="../">← the first essay</a>
+</nav>
+
+<div class="wrap">
+
+<header class="hero">
+  <div class="eyebrow">Field notes · The architecture, long form</div>
+  <h1>The Agent That Doesn't Forget</h1>
+  <p class="standfirst">Every agent demo is a sprint. Real work is a marathon. The distance between them is memory — and almost nobody engineers it. Here is the two-layer architecture I'm building so a long, hard task survives the run: virtual sessions for continuity, RLM for deep reasoning, and a control plane that writes a receipt for both.</p>
+  <p class="byline"><b>phenomenoner</b> · software PM &amp; AI observer · drafted in pair with Claude (Fable&nbsp;5) · 2026-06-29</p>
+</header>
+
+<article>
+
+  <p>There's a failure mode of AI agents that never makes it into a screenshot.</p>
+  <p>Hour three of a long task, the agent confidently redoes something it already finished. Or it contradicts a decision it made an hour ago. Or it re-reads the same file for the fifth time, having lost the note it wrote itself about what was in it. It didn't crash. It didn't error. It <strong>forgot</strong> — and it forgot <em>silently</em>.</p>
+  <p>This is the single biggest reason "autonomous agents" demo beautifully and disappoint in production. A demo is short enough to fit in one context window. A real task — refactor this subsystem, triage this incident, work through this spec — is not. And the moment a task outgrows the window, something has to give.</p>
+
+  <h2>Why agents forget</h2>
+  <p>A model has a bounded context window. When a long conversation approaches it, the usual fix is <strong>compaction</strong>: summarize the history, drop the detail, continue. It works once. The problem is what happens the third and fourth time.</p>
+  <p>Compaction is <strong>lossy</strong> and it is <strong>silent</strong>. Each pass throws away detail the model judged less important <em>at that moment</em> — and "less important right now" is exactly how a constraint set six hours ago, or a dead-end already explored, quietly disappears. Compress a compression of a compression and task state doesn't just shrink; it <em>drifts</em>. The agent ends up confidently wrong about its own history.</p>
+  <p>Most frameworks hand this problem straight back to the model: "summarize yourself and keep going." Which means the most dangerous failure in long-horizon work is both invisible (no error is raised) and unrecoverable (the dropped detail is gone). That's not a prompting bug. That's a missing engineering layer.</p>
+
+  <blockquote>Continuity is not a property you can prompt for. It's a data structure you have to own.</blockquote>
+
+  <h2>Two things a long task actually needs</h2>
+  <p>Before reaching for a fix, it's worth separating two needs people constantly conflate — because they require completely different machinery:</p>
+  <ul>
+    <li><strong>Continuity</strong> — staying coherent about the task <em>across time</em>: across model-session churn, across process restarts, across days. Knowing what the task is, what's been decided, what's blocked, where we are.</li>
+    <li><strong>Reasoning depth</strong> — thinking <em>hard over evidence</em> too large for one prompt: a 500-page spec, 12,000 lines of CI logs, a change whose blast radius spans a whole codebase.</li>
+  </ul>
+  <p>"Just use a bigger context window" fails both. "Just summarize and continue" sacrifices the first to fake the second. The honest answer is two layers, each doing one job well.</p>
+
+  <h2>Layer one: virtual sessions — continuity as a structure</h2>
+  <p>The conceptual move is small and it changes everything: <strong>separate the logical identity of the task from the physical session of the model.</strong></p>
+  <ul>
+    <li>A <strong>concrete session</strong> is one model thread. It is disposable. It can be compacted, it can die, it can be replaced.</li>
+    <li>A <strong>virtual session</strong> is a stable id that <em>spans</em> many concrete sessions. It is the task's spine — the thing that persists while the model threads underneath it churn.</li>
+  </ul>
+  <p>The mechanism, exactly as it runs in the harness today:</p>
+  <ul>
+    <li>Count only the compactions that actually <em>cost</em> you — the ones where the compaction succeeded <em>and</em> rewrote the active context. Not every turn. Only the lossy ones.</li>
+    <li>Past a threshold, <strong>stop degrading</strong>. Instead of compressing a fifth time, <strong>roll over</strong>: open a <em>fresh</em> concrete session under the <em>same</em> virtual id, continuation index incremented.</li>
+    <li>Carry forward a bounded, explicit, structured <strong>working set</strong> — goal and completion criteria, active plan refs, decisions, recent files, validation results, open blockers, a continuation note — injected into the fresh session as a first-class "working-set continuity" block.</li>
+    <li><strong>Guard the in-flight work.</strong> Rollover refuses to rewrite a queue item that's already been prepared or leased by a runtime worker — so a clean restart never corrupts a turn that's mid-execution.</li>
+    <li><strong>Respect task boundaries.</strong> <span class="mono">/new</span> is a hard boundary: a new task does not inherit the previous task's working set. Continuity is scoped to the task, not leaked across tasks.</li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 1200 640" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,Segoe UI,sans-serif" role="img" aria-label="Concrete sessions are disposable; the virtual session is the spine">
+      <rect width="1200" height="640" fill="#0a0d13"/>
+      <text x="80" y="64" fill="#fbbf24" font-size="20" letter-spacing="4" font-family="Consolas,monospace">PHYSICAL SESSIONS ARE DISPOSABLE — THE VIRTUAL SESSION IS THE SPINE</text>
+
+      <!-- virtual session bar -->
+      <rect x="80" y="110" width="1040" height="74" rx="14" fill="#121927" stroke="#fbbf24" stroke-opacity="0.6"/>
+      <text x="104" y="143" fill="#fbbf24" font-size="20" font-weight="700" font-family="Consolas,monospace">VIRTUAL SESSION</text>
+      <text x="104" y="168" fill="#8fa0b8" font-size="15" font-family="Consolas,monospace">vsession-… · one stable task identity across every roll-over</text>
+      <text x="1096" y="155" fill="#fbbf24" font-size="22" text-anchor="end">⟶</text>
+
+      <!-- connectors -->
+      <g stroke="#1f2a3d" stroke-width="2" stroke-dasharray="4 4">
+        <line x1="210" y1="184" x2="210" y2="300"/>
+        <line x1="600" y1="184" x2="600" y2="300"/>
+        <line x1="990" y1="184" x2="990" y2="300"/>
+      </g>
+
+      <!-- concrete sessions -->
+      <g font-family="Consolas,monospace">
+        <rect x="80"  y="300" width="260" height="150" rx="12" fill="#0f141d" stroke="#1f2a3d"/>
+        <rect x="470" y="300" width="260" height="150" rx="12" fill="#0f141d" stroke="#1f2a3d"/>
+        <rect x="860" y="300" width="260" height="150" rx="12" fill="#0f141d" stroke="#34d399" stroke-opacity="0.5"/>
+
+        <text x="100" y="332" fill="#dbe4f0" font-size="17" font-weight="700">concrete S1</text>
+        <text x="100" y="356" fill="#5c6b82" font-size="14">continuationIndex 0</text>
+        <text x="100" y="392" fill="#f87171" font-size="15">✂ compact</text>
+        <text x="100" y="416" fill="#f87171" font-size="15">✂ compact  → threshold</text>
+
+        <text x="490" y="332" fill="#dbe4f0" font-size="17" font-weight="700">concrete S2</text>
+        <text x="490" y="356" fill="#5c6b82" font-size="14">continuationIndex 1</text>
+        <text x="490" y="392" fill="#f87171" font-size="15">✂ compact</text>
+        <text x="490" y="416" fill="#f87171" font-size="15">✂ compact  → threshold</text>
+
+        <text x="880" y="332" fill="#dbe4f0" font-size="17" font-weight="700">concrete S3</text>
+        <text x="880" y="356" fill="#5c6b82" font-size="14">continuationIndex 2</text>
+        <text x="880" y="392" fill="#34d399" font-size="15">fresh context</text>
+        <text x="880" y="416" fill="#8fa0b8" font-size="15">work continues</text>
+      </g>
+
+      <!-- rollover arrows + working set -->
+      <g>
+        <path d="M340 375 L470 375" stroke="#fbbf24" stroke-width="2.5" marker-end="url(#ah)"/>
+        <path d="M730 375 L860 375" stroke="#fbbf24" stroke-width="2.5" marker-end="url(#ah)"/>
+        <text x="405" y="500" fill="#fbbf24" font-size="14" text-anchor="middle" font-family="Consolas,monospace">ROLL OVER</text>
+        <text x="795" y="500" fill="#fbbf24" font-size="14" text-anchor="middle" font-family="Consolas,monospace">ROLL OVER</text>
+        <rect x="318" y="520" width="174" height="80" rx="9" fill="#121927" stroke="#fbbf24" stroke-opacity="0.4"/>
+        <rect x="708" y="520" width="174" height="80" rx="9" fill="#121927" stroke="#fbbf24" stroke-opacity="0.4"/>
+        <text x="405" y="546" fill="#fbbf24" font-size="13" text-anchor="middle" font-family="Consolas,monospace">WORKING SET →</text>
+        <text x="405" y="568" fill="#8fa0b8" font-size="12.5" text-anchor="middle">goal · decisions</text>
+        <text x="405" y="586" fill="#8fa0b8" font-size="12.5" text-anchor="middle">files · blockers</text>
+        <text x="795" y="546" fill="#fbbf24" font-size="13" text-anchor="middle" font-family="Consolas,monospace">WORKING SET →</text>
+        <text x="795" y="568" fill="#8fa0b8" font-size="12.5" text-anchor="middle">goal · decisions</text>
+        <text x="795" y="586" fill="#8fa0b8" font-size="12.5" text-anchor="middle">files · blockers</text>
+      </g>
+      <defs>
+        <marker id="ah" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+          <path d="M0,0 L8,3 L0,6 z" fill="#fbbf24"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption>FIG. 1 — at the compaction threshold, the task rolls into a fresh session under the same virtual id, carrying a bounded working set instead of a degraded one.</figcaption>
+  </figure>
+
+  <h3>// the design philosophy</h3>
+  <p>Four principles fall out of this, and they're the whole point:</p>
+  <ul>
+    <li><strong>Explicit over implicit.</strong> Continuity is a structure the harness owns and writes down — not a summary the model hopes it kept. You can read the working set. You can diff it. You can audit what the agent believes about the task right now.</li>
+    <li><strong>Bounded over unbounded.</strong> The working set is size-bounded by design. That keeps the prompt prefix stable and cache-friendly, and — crucially — it means compression doesn't <em>compound</em>. You reset to a clean, bounded state instead of summarizing a summary.</li>
+    <li><strong>Durable and auditable.</strong> Every rollover writes a receipt. The continuity chain — which concrete session, which index, what was carried — is reconstructable after the fact. Continuity you can't audit is just hope with extra steps.</li>
+    <li><strong>The model is a contractor, not the owner of its own memory.</strong> The harness owns the task's spine. The model does a turn and hands back work. If it dies, the task doesn't.</li>
+  </ul>
+
+  <div class="statusbox">
+    <h3>// honest status — because this whole project is about that</h3>
+    <div class="row"><span class="pill p-mech">live-wired</span><span>The rollover check runs on <em>every</em> turn in the reference deployment. The mechanism, the working set, the guards, the receipts — all shipped, all tested without a model call.</span></div>
+    <div class="row"><span class="pill p-spec">proof gated</span><span>But daily chat rarely compacts twice, so a real rollover hasn't fired in production yet. The end-to-end forced-rollover proof — fresh session, same virtual id, working-set injection, no unsafe rewrite, traced through to final delivery — is a <em>published gate</em>, not a claim. The honest gap is the point.</span></div>
+  </div>
+
+  <h2>But continuity isn't intelligence</h2>
+  <p>Here's the trap. Virtual sessions keep a task <em>alive and coherent</em>. They do not make the model <em>think harder</em>. And a lot of long tasks are hard not because they're long, but because the evidence is enormous:</p>
+  <ul>
+    <li>Read a 500-page spec and find the three places it contradicts itself.</li>
+    <li>Triage a flaky CI failure whose cause is scattered across long logs and many files.</li>
+    <li>Trace the blast radius of a change through a codebase before you touch shared runtime, schema, or queue behavior.</li>
+    <li>QA a generated artifact — a report, a spreadsheet, a benchmark — against its own source data.</li>
+  </ul>
+  <p>A bounded working set is precisely the <em>wrong</em> tool here. You don't want to summarize the evidence away — you want to <strong>compute over it</strong>: filter, chunk, cross-check, map, reduce. That's a different engine.</p>
+
+  <h2>Layer two: RLM — reasoning as a bounded engine</h2>
+  <p>This is where <strong>Recursive Language Models</strong> come in. The idea: instead of stuffing everything into one prompt, the root model writes code in a REPL-like loop — it keeps variables and files across iterations, it calls a typed sub-model (<span class="mono">predict(...)</span>) recursively for bounded sub-work, and it keeps going until it explicitly <span class="mono">SUBMIT</span>s a structured answer. Every iteration, subcall, tool call, and token is captured in a trace.</p>
+  <p>Why it fits evidence-heavy work: programmatic map/reduce over huge inputs, persistent intermediate state, typed recursive subcalls, and an auditable reasoning trace instead of a black-box monologue. It is, in effect, a <em>reasoning</em> memory — the way the virtual session is a <em>continuity</em> memory.</p>
+  <p class="dim"><em>Full disclosure, in this project's house style: RLM here is a <span class="pill-inline">design note</span>, not yet built. What follows is the blueprint — and the entire value of the blueprint is the boundary it draws.</em></p>
+
+  <h2>The boundary is the design</h2>
+  <p>The temptation, once you have a recursive reasoning engine, is to let it run the show. That's the mistake. The rule that makes this engineering-grade rather than a clever toy:</p>
+  <blockquote>The harness is the outer <span style="color:var(--amber)">durable control plane</span>. RLM is an inner <span style="color:var(--cyan)">bounded reasoning engine</span> — a worker job, not an autonomous agent.</blockquote>
+  <ul>
+    <li><strong>The harness owns</strong> lifecycle, the durable queue, leases, watchdogs, receipts, permissions, human steering, context rollover — and every side effect that touches the real world.</li>
+    <li><strong>RLM owns</strong> bounded reasoning over staged evidence, recursive subcalls, and a structured result plus trace. It owns <em>no</em> live side effects.</li>
+    <li><strong>RLM may recommend; only the harness executes</strong> — with a receipt. The reasoning engine never directly controls the gateway, never changes auth or identity, never does destructive filesystem work, never pushes, never sends an external message, never spends.</li>
+    <li><strong>Model-written code is untrusted.</strong> Least privilege by default: a staged workspace, only declared files and tools, network denied unless explicitly allowed, every host call recorded in the trace.</li>
+    <li><strong>Failures normalize into harness-visible classes</strong> — budget exhausted, sandbox fatal, tool-policy denied, output invalid, partial success — so an RLM run is just another durable, classifiable, recoverable job attempt, not a mystery.</li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 1200 600" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,Segoe UI,sans-serif" role="img" aria-label="Outer durable control plane wrapping an inner bounded reasoning engine">
+      <rect width="1200" height="600" fill="#0a0d13"/>
+      <text x="80" y="58" fill="#fbbf24" font-size="20" letter-spacing="4" font-family="Consolas,monospace">TWO LAYERS — THE BOUNDARY IS THE PRODUCT</text>
+
+      <!-- outer control plane -->
+      <rect x="70" y="90" width="1060" height="470" rx="18" fill="#0f141d" stroke="#fbbf24" stroke-opacity="0.45"/>
+      <text x="98" y="128" fill="#fbbf24" font-size="19" font-weight="700" font-family="Consolas,monospace">AGENT HARNESS · durable control plane</text>
+      <g fill="#8fa0b8" font-size="17" font-family="Consolas,monospace">
+        <text x="98" y="176">▸ lifecycle &amp; virtual-session rollover</text>
+        <text x="98" y="212">▸ durable queue · leases · watchdogs</text>
+        <text x="98" y="248">▸ permissions · fail-closed gates</text>
+        <text x="98" y="284">▸ human steering · /stop · /steer</text>
+        <text x="98" y="320">▸ receipts for every step</text>
+        <text x="98" y="356">▸ side effects (the only layer that has them)</text>
+      </g>
+
+      <!-- inner RLM -->
+      <rect x="610" y="150" width="470" height="320" rx="16" fill="#121927" stroke="#67e8f9" stroke-opacity="0.5"/>
+      <text x="636" y="186" fill="#67e8f9" font-size="18" font-weight="700" font-family="Consolas,monospace">RLM WORKER JOB · reasoning engine</text>
+      <g fill="#8fa0b8" font-size="16" font-family="Consolas,monospace">
+        <text x="636" y="224">▸ iterate in a REPL loop</text>
+        <text x="636" y="256">▸ predict() typed subcalls</text>
+        <text x="636" y="288">▸ persist vars &amp; files</text>
+        <text x="636" y="320">▸ map / reduce over evidence</text>
+        <text x="636" y="352">▸ structured result + full trace</text>
+      </g>
+
+      <!-- return arrow -->
+      <path d="M636 410 L300 410" stroke="#34d399" stroke-width="2.5" marker-end="url(#g)"/>
+      <text x="468" y="398" fill="#34d399" font-size="14" text-anchor="middle" font-family="Consolas,monospace">returns result + trace →</text>
+      <text x="468" y="432" fill="#5c6b82" font-size="13" text-anchor="middle" font-family="Consolas,monospace">harness executes side effects, not RLM</text>
+
+      <!-- cannot touch -->
+      <rect x="636" y="372" width="420" height="78" rx="10" fill="rgba(248,113,113,0.06)" stroke="#f87171" stroke-opacity="0.4"/>
+      <text x="650" y="398" fill="#f87171" font-size="14" font-family="Consolas,monospace">✗ RLM cannot touch:</text>
+      <text x="650" y="420" fill="#8fa0b8" font-size="13.5" font-family="Consolas,monospace">gateway control · auth/identity · destructive fs</text>
+      <text x="650" y="440" fill="#8fa0b8" font-size="13.5" font-family="Consolas,monospace">external send · spend · live cutover</text>
+
+      <text x="98" y="520" fill="#5c6b82" font-size="15" font-family="Consolas,monospace">untrusted model code → staged workspace · declared tools only · network off by default · every call traced</text>
+      <defs>
+        <marker id="g" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+          <path d="M0,0 L8,3 L0,6 z" fill="#34d399"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption>FIG. 2 — RLM is a sandboxed worker job inside the harness, not an agent above it. It reasons; the harness acts.</figcaption>
+  </figure>
+
+  <h2>Two memories, one long task</h2>
+  <p>Now put both layers together and a complex, multi-day task stops being a gamble.</p>
+  <p>The <strong>virtual session is the spine</strong> — the <em>continuity memory</em>: what the task is, where we are, what we decided, what's blocked. It survives compaction, process death, and restarts, because it's a durable structure with receipts, not a context window.</p>
+  <p>When a turn hits something that needs deep evidence work, it dispatches an <strong>RLM worker job</strong> — the <em>reasoning memory</em>: bounded iteration and subcall state over large evidence, sandboxed and budget-capped. Its structured result flows <em>back into the working set</em> as a decision, a validation, or an artifact reference. The continuity memory records the conclusion; the reasoning memory keeps the receipts of how it got there.</p>
+
+  <figure>
+    <svg viewBox="0 0 1200 560" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,Segoe UI,sans-serif" role="img" aria-label="Continuity memory and reasoning memory serving one long task">
+      <rect width="1200" height="560" fill="#0a0d13"/>
+      <text x="600" y="64" fill="#dbe4f0" font-size="30" font-weight="800" text-anchor="middle">Two memories for one long task</text>
+
+      <!-- continuity -->
+      <rect x="70" y="120" width="490" height="300" rx="16" fill="#121927" stroke="#fbbf24" stroke-opacity="0.45"/>
+      <text x="100" y="166" fill="#fbbf24" font-size="20" font-weight="700" font-family="Consolas,monospace">CONTINUITY MEMORY</text>
+      <text x="100" y="194" fill="#5c6b82" font-size="15" font-family="Consolas,monospace">virtual session · working set</text>
+      <g fill="#8fa0b8" font-size="18">
+        <text x="100" y="240">▸ what the task is</text>
+        <text x="100" y="276">▸ where we are · what's decided</text>
+        <text x="100" y="312">▸ open files · blockers</text>
+      </g>
+      <text x="100" y="372" fill="#fbbf24" font-size="16" font-family="Consolas,monospace">survives compaction · death · restart</text>
+
+      <!-- reasoning -->
+      <rect x="640" y="120" width="490" height="300" rx="16" fill="#121927" stroke="#67e8f9" stroke-opacity="0.5"/>
+      <text x="670" y="166" fill="#67e8f9" font-size="20" font-weight="700" font-family="Consolas,monospace">REASONING MEMORY</text>
+      <text x="670" y="194" fill="#5c6b82" font-size="15" font-family="Consolas,monospace">RLM trace · vars · subcalls</text>
+      <g fill="#8fa0b8" font-size="18">
+        <text x="670" y="240">▸ iterate over huge evidence</text>
+        <text x="670" y="276">▸ typed recursive subcalls</text>
+        <text x="670" y="312">▸ structured result + trace</text>
+      </g>
+      <text x="670" y="372" fill="#67e8f9" font-size="16" font-family="Consolas,monospace">bounded · sandboxed · budgeted</text>
+
+      <!-- flow between -->
+      <path d="M640 300 L560 300" stroke="#34d399" stroke-width="3" marker-end="url(#g2)"/>
+      <text x="600" y="452" fill="#34d399" font-size="16" text-anchor="middle" font-family="Consolas,monospace">RLM result → folded back into the working set</text>
+      <text x="600" y="492" fill="#5c6b82" font-size="15" text-anchor="middle" font-family="Consolas,monospace">conclusion stored in continuity · how-we-got-there kept in the trace</text>
+      <defs>
+        <marker id="g2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+          <path d="M0,0 L8,3 L0,6 z" fill="#34d399"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption>FIG. 3 — continuity keeps the task coherent; reasoning goes deep when it has to. Each feeds the other, and the harness receipts both.</figcaption>
+  </figure>
+
+  <h2>What "engineering grade" actually means</h2>
+  <p>It's a phrase people throw around, so let me make it concrete. A long-task agent is engineering-grade when these properties hold <em>across both layers</em>:</p>
+  <ul>
+    <li><strong>Durable</strong> — it survives process death and reboots without losing or duplicating work.</li>
+    <li><strong>Bounded</strong> — budgets, leases, caps, and depth limits mean nothing runs away, neither a chatty session nor a recursive reasoner.</li>
+    <li><strong>Gated</strong> — fail-closed permissions and an explicit side-effect boundary mean nothing dangerous happens by accident.</li>
+    <li><strong>Receipted</strong> — every continuity rollover and every reasoning subcall writes an auditable record. If it isn't in a ledger, it didn't happen.</li>
+    <li><strong>Recoverable</strong> — any step can be reconstructed, resumed, or replayed from those receipts.</li>
+  </ul>
+  <p>Long-task capability isn't one clever feature. It's these five properties holding while the model threads churn underneath and the reasoning goes deep on demand. The model is a contractor. The harness is the general contractor that keeps the receipts — and a task you can leave running for a week is the deliverable.</p>
+
+  <div class="statusbox">
+    <h3>// the honest ledger for this essay</h3>
+    <div class="row"><span class="pill p-mech">shipped</span><span>Virtual sessions, working-set rollover, guards, and receipts — live-wired into every turn; tested without a model call.</span></div>
+    <div class="row"><span class="pill p-spec">gated</span><span>The end-to-end forced-rollover proof under live traffic — a named, published release gate, not yet earned.</span></div>
+    <div class="row"><span class="pill p-design">design note</span><span>RLM integration — the boundary, the job spec, the failure classes, the phased plan are specified in the repo; the engine is not built yet.</span></div>
+  </div>
+
+  <p>That split — shipped vs. gated vs. designed — is deliberate, and it's the same discipline the rest of this project runs on. In a world where anyone can generate an impressive architecture diagram in an afternoon, the differentiator isn't the diagram. It's whether each box points at code, a receipt, or an honest "not yet."</p>
+
+  <div class="cta-box">
+    <strong>An agent you can leave running on something hard is worth more than one that dazzles for five minutes.</strong> That's the whole bet.
+    <br>
+    <a class="btn btn-primary" href="https://github.com/phenomenoner/agent-harness-core">★ Star the repo</a>
+    <a class="btn btn-ghost" href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/rlm-integration-design.md">Read the RLM design note →</a>
+    <a class="btn btn-ghost" href="../">The first essay →</a>
+  </div>
+
+  <p class="dim">And yes — like the code it describes, this essay was drafted in pair with the same family of models it runs. Welcome to 2026.</p>
+
+  <hr>
+  <p class="dim"><em>Agent Harness Core: a self-hosted AI agent runtime in Rust. Six dependencies. No async runtime. 500+ tests without a model call. Every step gated, every step receipted. Pre-release, Windows-first, dual-licensed MIT/Apache-2.0.</em></p>
+
+</article>
+</div>
+
+<footer class="site">
+  <a href="../../">Home</a>
+  <a href="../">First Essay</a>
+  <a href="https://github.com/phenomenoner/agent-harness-core">GitHub</a>
+  <a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/rlm-integration-design.md">RLM Design Note</a>
+  <a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/agent-harness-core-roadmap-backlog.md">Roadmap &amp; Backlog</a>
+  <p style="margin-top:18px">Drafted in pair with Claude (Fable&nbsp;5, Anthropic), 2026-06-29. Dual-licensed MIT OR Apache-2.0.</p>
+</footer>
+
+</body>
+</html>

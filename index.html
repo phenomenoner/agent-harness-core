@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agent Harness Core — Engineering is table stakes. Community is the moat.</title>
-<meta name="description" content="A one-person, AI-paired Rust agent harness that reached mechanism-level parity with 100k★+ agent platforms in under a day — as reviewed by Claude (Fable 5). A craftsmanship pursuit, and a social experiment in software engineering.">
-<meta property="og:title" content="Agent Harness Core — Engineering is table stakes. Community is the moat.">
-<meta property="og:description" content="In under a day, an AI-paired solo project matched multi-month, 100k★+ agent platforms on most core engineering dimensions — says an AI reviewer. The part AI can't compress? Operation time, trust, community. That's the experiment.">
+<title>Agent Harness Core — An engineering-grade agent harness for long tasks</title>
+<meta name="description" content="A self-hosted Rust agent runtime built for long-horizon tasks: virtual sessions for durable continuity, RLM for bounded deep reasoning, and a receipt for every step. Independently reviewed by a frontier AI; honestly labeled mechanism vs. proven.">
+<meta property="og:title" content="Agent Harness Core — built for long tasks">
+<meta property="og:description" content="Continuity is not intelligence. Long tasks need both — as separate, bounded, receipted engineering layers. A self-hosted Rust agent harness, independently AI-reviewed and honestly scored.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://phenomenoner.github.io/agent-harness-core/">
 <style>
@@ -36,7 +36,7 @@
     radial-gradient(900px 400px at 10% 10%, rgba(103,232,249,.05), transparent 60%)}
   .hero h1{font-size:clamp(2.6rem,6vw,4.2rem);line-height:1.05;letter-spacing:-.02em}
   .hero h1 .accent{color:var(--amber)}
-  .hook{margin:26px 0 8px;font-size:clamp(1.15rem,2.4vw,1.5rem);max-width:30ch;font-weight:600;line-height:1.35}
+  .hook{margin:26px 0 8px;font-size:clamp(1.15rem,2.4vw,1.5rem);max-width:32ch;font-weight:600;line-height:1.35}
   .hook em{color:var(--amber);font-style:normal}
   .sub{color:var(--dim);max-width:64ch;margin-top:14px}
   .cta{display:flex;gap:14px;flex-wrap:wrap;margin-top:34px}
@@ -51,7 +51,7 @@
   .stat b{display:block;font-family:var(--mono);font-size:1.25rem;color:var(--amber)}
   .stat span{font-size:.82rem;color:var(--faint)}
 
-  /* experiment */
+  /* thesis / split */
   .thesis{margin:34px 0;padding:28px 30px;border-left:3px solid var(--amber);background:var(--panel);border-radius:0 12px 12px 0;font-size:1.18rem;font-weight:600;line-height:1.5}
   .thesis .q{color:var(--amber)}
   .timeline{margin-top:40px;display:grid;gap:0}
@@ -65,10 +65,13 @@
   .half h3{font-family:var(--mono);font-size:.95rem}
   .half.compressed h3{color:var(--green)}
   .half.not h3{color:var(--red)}
+  .half.design h3{color:var(--cyan)}
   .half ul{list-style:none;margin-top:12px}
   .half li{padding:5px 0 5px 22px;position:relative;color:var(--dim);font-size:.95rem}
   .half.compressed li::before{content:"▸";position:absolute;left:0;color:var(--green)}
   .half.not li::before{content:"▸";position:absolute;left:0;color:var(--red)}
+  .half.design li::before{content:"▸";position:absolute;left:0;color:var(--cyan)}
+  .half b{color:var(--txt)}
 
   /* verdict */
   .reviewer{display:flex;align-items:center;gap:14px;margin:26px 0}
@@ -136,74 +139,132 @@
 <!-- ============ HERO ============ -->
 <header class="hero">
   <div class="wrap">
-    <div class="eyebrow">A craftsmanship pursuit · A social experiment in software engineering</div>
+    <div class="eyebrow">Self-hosted · Rust · built for long-horizon agent tasks</div>
     <h1>Agent Harness <span class="accent">Core</span></h1>
-    <p class="hook">Engineering is now <em>table stakes</em>.<br>Community is the moat.<br>This repo is the experiment.</p>
-    <p class="sub">A self-hosted AI agent runtime in Rust — every step gated, every step receipted. On <span class="mono">2026-06-12</span>, this one-person, AI-paired project reached mechanism-level parity — or better — with agent platforms carrying hundreds of thousands of GitHub stars, across most core engineering dimensions. <b>In under a day.</b> This page is about what that means — and, just as honestly, what it doesn't yet.</p>
+    <p class="hook">An agent you can leave running on something <em>hard</em>.<br>Because continuity and reasoning are <em>separate, receipted</em> layers.</p>
+    <p class="sub">A self-hosted AI agent runtime in Rust that treats long-task survival as an engineering problem. A stable <b>virtual session</b> keeps a task coherent across context compaction, process death, and restarts; deep evidence-work runs as bounded, sandboxed reasoning jobs — and every step writes an auditable receipt. Independently reviewed by a frontier AI, and honestly labeled <span class="mono">mechanism</span> vs. <span class="mono">proven</span> throughout.</p>
     <div class="cta">
-      <a class="btn btn-primary" href="https://github.com/phenomenoner/agent-harness-core">★ Star the experiment</a>
-      <a class="btn btn-ghost" href="#verdict">Read the AI's verdict ↓</a>
-      <a class="btn btn-ghost" href="#proving">The proving ground ↓</a>
-      <a class="btn btn-ghost" href="essay/">The essay →</a>
+      <a class="btn btn-primary" href="https://github.com/phenomenoner/agent-harness-core">★ Star the repo</a>
+      <a class="btn btn-ghost" href="#design">The design ↓</a>
+      <a class="btn btn-ghost" href="essay/long-task-engine/">The long-task engine →</a>
+      <a class="btn btn-ghost" href="#verdict">The AI's verdict ↓</a>
     </div>
     <div class="stats">
       <div class="stat"><b>6</b><span>dependencies, total</span></div>
       <div class="stat"><b>0</b><span>async runtimes</span></div>
-      <div class="stat"><b>207+16</b><span>tests, zero model calls</span></div>
-      <div class="stat"><b>&lt; 1 day</b><span>review → roadmap → mechanisms</span></div>
-      <div class="stat"><b>1 + 1</b><span>human + AI</span></div>
+      <div class="stat"><b>500+</b><span>tests, zero model calls</span></div>
+      <div class="stat"><b>1:1</b><span>steps to receipts</span></div>
+      <div class="stat"><b>2</b><span>frontier-AI review rounds</span></div>
     </div>
   </div>
 </header>
 
-<!-- ============ THE EXPERIMENT ============ -->
-<section id="experiment">
+<!-- ============ THE PROBLEM ============ -->
+<section id="problem">
   <div class="wrap">
-    <div class="eyebrow">01 · The Experiment</div>
-    <h2>What happens when engineering stops being scarce?</h2>
-    <p class="lead">For decades, engineering depth was the moat: months of queue design, supervision trees, audit trails. AI pair-engineering just collapsed that cost. This project tests the consequence in public.</p>
+    <div class="eyebrow">01 · The Problem</div>
+    <h2>Agents don't crash on long tasks. They forget.</h2>
+    <p class="lead">A demo fits in one context window. Real work — refactor this subsystem, triage this incident, work through this spec — does not. The moment a task outgrows the window, something quietly breaks.</p>
 
-    <div class="timeline">
-      <div class="tl"><time>06-12 morning</time><p><b>The review.</b> An AI architect — Claude (Fable&nbsp;5) — reviewed three agent harnesses side by side: OpenClaw (378k★), Hermes Agent by Nous Research (191k★), and this repo (then 4 commits, 0 stars). The verdict was blunt: best-in-trio security posture and observability — worst-in-trio supervision, ecosystem, maturity.</p></div>
-      <div class="tl"><time>06-12 midday</time><p><b>The roadmap.</b> The same reviewer wrote an overtaking plan: ~50 work items across ten dimensions — SRE-grade SLOs, deterministic-simulation testing, shadow migrations, canary deploys, an invariants catalog. Sequenced by dependency, importance, ROI.</p></div>
-      <div class="tl"><time>06-12 evening</time><p><b>The build.</b> A staging pass implemented essentially all of it at mechanism level: dead-letter retry policy, end-to-end trace IDs, admission control, encrypted secret vault, MCP tool-description pinning, schema registry, queue shadow dual-writes. <span class="mono">207</span> core tests. Hours, not months.</p></div>
-      <div class="tl"><time>06-12 night</time><p><b>The re-review.</b> Same AI, second pass, deliberately harsher: a dual <i>mechanism / proven</i> scoring system, because code that exists is not code that has survived production. Scores below.</p></div>
+    <div class="thesis">
+      Hour three of a long task, the agent confidently redoes finished work, or contradicts a decision it made an hour ago. It didn't error. It <span class="q">forgot</span> — and it forgot <span class="q">silently</span>.
     </div>
+
+    <p class="lead">The usual fix is compaction: summarize the history, drop the detail, continue. It works once. But compaction is <b>lossy</b> and <b>silent</b> — compress a compression a few times and task state doesn't just shrink, it <i>drifts</i>. Most frameworks hand this straight back to the model ("summarize yourself and keep going"), which makes the most dangerous failure in long-horizon work both invisible and unrecoverable. That's not a prompting bug. It's a missing engineering layer.</p>
+  </div>
+</section>
+
+<!-- ============ THE DESIGN ============ -->
+<section id="design">
+  <div class="wrap">
+    <div class="eyebrow">02 · The Design</div>
+    <h2>Two memories for one long task.</h2>
+    <p class="lead">Continuity and reasoning are different problems, and conflating them is why "bigger context window" and "just summarize" both fail. Agent Harness Core gives a long task two distinct, bounded, receipted memory layers.</p>
 
     <div class="split">
       <div class="half compressed">
-        <h3>// what AI compressed</h3>
+        <h3>// virtual session — continuity memory</h3>
         <ul>
-          <li>Months of mechanism design → hours</li>
-          <li>Queue, supervision, vault, tracing subsystems</li>
-          <li>Test scaffolding, invariants, schema registry</li>
-          <li>The entire distance from "gap identified" to "code + tests exist"</li>
+          <li>A stable <b>virtual session</b> id spans many disposable model sessions — the task's spine.</li>
+          <li>Past a compaction threshold, the runtime stops degrading and <b>rolls over</b> into a fresh session.</li>
+          <li>It carries a bounded <b>working set</b> — goal, decisions, open files, validation, blockers — not a summary of a summary.</li>
+          <li>Guards refuse to rewrite prepared or leased in-flight work; <span class="mono">/new</span> is a hard task boundary.</li>
         </ul>
       </div>
-      <div class="half not">
-        <h3>// what AI cannot compress</h3>
+      <div class="half design">
+        <h3>// RLM — reasoning memory</h3>
         <ul>
-          <li>A 7-day shadow soak takes 7 days</li>
-          <li>A 30-day unattended SLO takes 30 days</li>
-          <li>Trust, scrutiny, third-party verification</li>
-          <li>Community — which accrues at human speed</li>
+          <li>Some long tasks are hard from <b>evidence volume</b>: a 500-page spec, 12k log lines, a codebase blast radius.</li>
+          <li>A Recursive Language Model reasons in a REPL loop with persistent vars, typed recursive subcalls, and a full trace.</li>
+          <li>It runs as a <b>sandboxed worker job</b> — staged evidence, declared tools, network off by default.</li>
+          <li>It returns a structured result and owns <b>no</b> side effects of its own.</li>
         </ul>
       </div>
     </div>
 
     <div class="thesis">
-      If a solo developer with an AI can match the <span class="q">engineering</span> of 100k★ projects in a day —<br>
-      then engineering is no longer what decides how far a project goes. <span class="q">People are.</span><br>
-      This repo runs that hypothesis in public. The star button is the dependent variable.
+      The harness is the outer <span class="q">durable control plane</span>. RLM is an inner <span class="q">bounded reasoning engine</span> — a worker job, not an agent above it.<br>It reasons; the harness acts — and receipts both.
+    </div>
+
+    <p class="lead">That is the difference between an agent that dazzles for five minutes and one you can leave running for a week: continuity is a durable structure, deep reasoning is a bounded sandbox, and every rollover and subcall is auditable. <a href="essay/long-task-engine/">Read the full architecture, with diagrams →</a></p>
+
+    <p class="receipt-note"><b>Honest status, in this project's house style:</b> the virtual-session mechanism is <span class="mono">live-wired</span> into every turn and tested without a model call, but the end-to-end forced-rollover proof under live traffic is a <span class="mono">published gate</span>, not yet earned. RLM integration is a <span class="mono">design note</span> in the repo — boundary, job spec, and failure classes specified; the engine is not built yet. Labeled, not blurred.</p>
+  </div>
+</section>
+
+<!-- ============ THE PRODUCT ============ -->
+<section id="product">
+  <div class="wrap">
+    <div class="eyebrow">03 · The Product</div>
+    <h2>The operations layer your agent framework forgot.</h2>
+    <p class="lead">Agent Harness Core is not another prompt-orchestration library. It sits <i>around</i> your agents — ingress, permissions, durable queuing, concurrency, delivery, long-task continuity, audit, recovery — and answers the questions frameworks leave to you:</p>
+
+    <div class="qgrid">
+      <div class="qcard"><h3>"The task outlived its context window. Now what?"</h3><p>A stable <i>virtual session</i> rolls the turn into a fresh model session past a compaction threshold, carrying a bounded working set — goal, decisions, open files, blockers — forward. Long tasks survive compaction instead of drifting. <span class="mono">→ working-set continuity · /new = task boundary</span></p></div>
+      <div class="qcard"><h3>"The process died mid-turn. Now what?"</h3><p>Durable queue + completed-turn recovery. The turn is not lost. <span class="mono">→ pending.jsonl, leases, receipts</span></p></div>
+      <div class="qcard"><h3>"Who is allowed to talk to my agent?"</h3><p>Fail-closed allow-lists per user, chat, channel, and guild. Unknown senders never reach the model. <span class="mono">→ admin / limited / open-limited tiers</span></p></div>
+      <div class="qcard"><h3>"What exactly did it do at 03:12?"</h3><p>Append-only JSONL logs, receipts, transcripts and trajectories for everything. One command rebuilds the causal chain. <span class="mono">→ trace &lt;id&gt;</span></p></div>
+      <div class="qcard"><h3>"How do I stop a runaway turn?"</h3><p>Scoped cancellation honored by the runtime poll loop — the turn, the job, or everything in the session. <span class="mono">→ /stop · /stop turn · /stop job &lt;id&gt;</span></p></div>
+    </div>
+
+    <pre><span class="c"># build and verify — no model account needed</span>
+cargo test                                      <span class="g"># 500+ tests, zero model calls</span>
+cargo run -p agent-harness-cli -- doctor
+
+<span class="c"># smoke the full pipeline offline with the bundled fake Codex app-server</span>
+cargo run -p agent-harness-cli -- channel-run-once <span class="a">--codex-exe tools\agent-fake-codex-app-server\fake-codex-app-server.cmd</span> ...
+
+<span class="c"># then go live: Telegram / Discord ingress → durable queue → Codex/OpenRouter → receipts</span>
+cargo run -p agent-harness-cli -- enable-check --target-home C:\path\to\.agent-harness</pre>
+  </div>
+</section>
+
+<!-- ============ THE CRAFT ============ -->
+<section id="craft">
+  <div class="wrap">
+    <div class="eyebrow">04 · The Craft</div>
+    <h2>Boring code. Radical accountability.</h2>
+    <p class="lead">The craftsmanship challenge: how much operational rigor fits into a codebase one person can fully audit?</p>
+    <div class="feat">
+      <div class="f"><b>Six dependencies. Total.</b> serde, serde_json, ureq, rusqlite, ring, base64. No tokio, no clap, no framework. Synchronous Rust you can read in an afternoon.</div>
+      <div class="f"><b>Receipts over trust.</b> Two-phase persistence: intent written before side effects, results after. If it isn't in a ledger, it didn't happen.</div>
+      <div class="f"><b>Fail-closed everything.</b> No allow-list match → no model access. Missing credentials fail at preflight, not mid-turn. Unknown config keys refuse to boot.</div>
+      <div class="f"><b>Long tasks that don't drift.</b> A stable <span class="mono">virtual session</span> spans many concrete model sessions, rolling over past a compaction threshold with a bounded working set — and guarding in-flight queued work from unsafe rewrite.</div>
+      <div class="f"><b>Invariants as a CLI command.</b> <span class="mono">invariants</span> and <span class="mono">schema-registry</span> are executable contracts, not wiki pages — the test suite enforces them.</div>
+      <div class="f"><b>Encrypted vault.</b> PBKDF2-HMAC-SHA256 + ChaCha20-Poly1305, repo-local. <span class="mono">vault-get</span> reports presence and length — never plaintext.</div>
+      <div class="f"><b>MCP, natively.</b> In-process Rust MCP server scaffold with per-agent tool allow-lists — plus hash-pinned tool descriptions, because tool poisoning is a real attack class.</div>
+      <div class="f"><b>Model-agnostic by one command.</b> Codex app-server executes; <span class="mono">/model openrouter/anthropic/claude-sonnet-4</span> reroutes a conversation without redeploying.</div>
+      <div class="f"><b>Memory, governed.</b> openclaw-mem integration is external, contract-tested, and fail-open — citations in, silent corruption out.</div>
     </div>
   </div>
 </section>
 
-<!-- ============ THE VERDICT ============ -->
+<!-- ============ THE VERDICT (credibility) ============ -->
 <section id="verdict">
   <div class="wrap">
-    <div class="eyebrow">02 · The Verdict</div>
+    <div class="eyebrow">05 · The Verdict</div>
     <h2>Reviewed by an AI. Scored without mercy.</h2>
+    <p class="lead">Before it was a product page, this was an experiment. In a single day, an AI architect — Claude (Fable&nbsp;5) — reviewed this repo against OpenClaw (378k★) and Hermes (191k★), wrote the overtaking roadmap, watched it get built, then re-scored it harder, splitting every score into <i>mechanism</i> (code + tests exist) and <i>proven</i> (survived live traffic). The point isn't the speed. It's that an independent frontier model audited the engineering — and the gaps are published, not hidden.</p>
 
     <div class="reviewer">
       <div class="avatar">F5</div>
@@ -249,16 +310,16 @@
 <!-- ============ PROVING GROUND ============ -->
 <section id="proving">
   <div class="wrap">
-    <div class="eyebrow">03 · The Proving Ground</div>
+    <div class="eyebrow">06 · The Proving Ground</div>
     <h2>Don't believe the scores. Watch us earn them.</h2>
     <p class="lead">Everything still standing between "mechanism" and "proven" is published as a roadmap of public proofs. Each one lands as receipts in the repo — JSONL you can read, not claims you have to trust.</p>
 
     <div class="proofs">
       <div class="proof">
         <div class="num">PROOF 01</div>
-        <h3>Seven-Day Shadow Parity</h3>
-        <p>Every channel turn dual-writes to the new SQLite worker-store lane while the old queue keeps executing. Seven live days of <b>zero divergence</b> — receipt-compared — before cutover. A database migration conducted like an experiment.</p>
-        <span class="badge b-mech">SHADOW MECHANISM LIVE-GATED</span>
+        <h3>Forced-Rollover Continuity</h3>
+        <p>The signature design, proven end to end: force the compaction threshold, verify a fresh session under the same virtual id, the working set injected, no unsafe rewrite of in-flight work, traced through to final delivery. The unique advantage, earned not asserted.</p>
+        <span class="badge b-mech">MECHANISM LIVE-WIRED · PROOF GATED</span>
       </div>
       <div class="proof">
         <div class="num">PROOF 02</div>
@@ -275,6 +336,7 @@
     </div>
 
     <div class="gates">
+      <span class="gate">seven-day shadow-queue parity</span>
       <span class="gate">CI pipeline</span>
       <span class="gate">deterministic simulation — seeded crash/interleave replays</span>
       <span class="gate">sanitized real-traffic replay corpus</span>
@@ -284,53 +346,9 @@
       <span class="gate">first tagged release</span>
     </div>
 
+    <p class="receipt-note"><b>Evidence accruing, honestly:</b> the reference deployment now has tens of thousands of delivered messages and hundreds of completed model turns on record, with fewer than two dozen dead-letters — all from known transient provider stream disconnects, each retried before dead-lettering. That is real soak, not a passed gate: the formal forced-rollover, shadow-parity, and 30-day SLO clocks above stay open until their exact criteria are met.</p>
+
     <p class="receipt-note">Progress is tracked item-by-item in the repo's <a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/agent-harness-core-roadmap-backlog.md">roadmap &amp; backlog</a> with a four-tier honesty vocabulary — <span class="mono">staging-tested · pending live gate · pending fixtures · deferred by policy</span> — and a named remaining gate for every single item. Few projects of any size publish their uncertainty this precisely. That, too, is the product.</p>
-  </div>
-</section>
-
-<!-- ============ WHAT IT IS ============ -->
-<section id="product">
-  <div class="wrap">
-    <div class="eyebrow">04 · The Product</div>
-    <h2>The operations layer your agent framework forgot.</h2>
-    <p class="lead">Agent Harness Core is not another prompt-orchestration library. It sits <i>around</i> your agents — ingress, permissions, durable queuing, concurrency, delivery, audit, recovery — and answers the questions frameworks leave to you:</p>
-
-    <div class="qgrid">
-      <div class="qcard"><h3>"The process died mid-turn. Now what?"</h3><p>Durable queue + completed-turn recovery. The turn is not lost. <span class="mono">→ pending.jsonl, leases, receipts</span></p></div>
-      <div class="qcard"><h3>"Who is allowed to talk to my agent?"</h3><p>Fail-closed allow-lists per user, chat, channel, and guild. Unknown senders never reach the model. <span class="mono">→ admin / limited / open-limited tiers</span></p></div>
-      <div class="qcard"><h3>"What exactly did it do at 03:12?"</h3><p>Append-only JSONL logs, receipts, transcripts and trajectories for everything. One command rebuilds the causal chain. <span class="mono">→ trace &lt;id&gt;</span></p></div>
-      <div class="qcard"><h3>"How do I stop a runaway turn?"</h3><p>Scoped cancellation honored by the runtime poll loop — the turn, the job, or everything in the session. <span class="mono">→ /stop · /stop turn · /stop job &lt;id&gt;</span></p></div>
-    </div>
-
-    <pre><span class="c"># build and verify — no model account needed</span>
-cargo test                                      <span class="g"># 207 core + 16 CLI, zero model calls</span>
-cargo run -p agent-harness-cli -- doctor
-
-<span class="c"># smoke the full pipeline offline with the bundled fake Codex app-server</span>
-cargo run -p agent-harness-cli -- channel-run-once <span class="a">--codex-exe tools\agent-fake-codex-app-server\fake-codex-app-server.cmd</span> ...
-
-<span class="c"># then go live: Telegram / Discord ingress → durable queue → Codex/OpenRouter → receipts</span>
-cargo run -p agent-harness-cli -- enable-check --target-home C:\path\to\.agent-harness</pre>
-  </div>
-</section>
-
-<!-- ============ BUILT DIFFERENT ============ -->
-<section id="craft">
-  <div class="wrap">
-    <div class="eyebrow">05 · The Craft</div>
-    <h2>Boring code. Radical accountability.</h2>
-    <p class="lead">The craftsmanship challenge: how much operational rigor fits into a codebase one person can fully audit?</p>
-    <div class="feat">
-      <div class="f"><b>Six dependencies. Total.</b> serde, serde_json, ureq, rusqlite, ring, base64. No tokio, no clap, no framework. Synchronous Rust you can read in an afternoon.</div>
-      <div class="f"><b>Receipts over trust.</b> Two-phase persistence: intent written before side effects, results after. If it isn't in a ledger, it didn't happen.</div>
-      <div class="f"><b>Fail-closed everything.</b> No allow-list match → no model access. Missing credentials fail at preflight, not mid-turn. Unknown config keys refuse to boot.</div>
-      <div class="f"><b>Invariants as a CLI command.</b> <span class="mono">invariants</span> and <span class="mono">schema-registry</span> are executable contracts, not wiki pages — the test suite enforces them.</div>
-      <div class="f"><b>Encrypted vault.</b> PBKDF2-HMAC-SHA256 + ChaCha20-Poly1305, repo-local. <span class="mono">vault-get</span> reports presence and length — never plaintext.</div>
-      <div class="f"><b>MCP, natively.</b> In-process Rust MCP server scaffold with per-agent tool allow-lists — plus hash-pinned tool descriptions, because tool poisoning is a real attack class.</div>
-      <div class="f"><b>Model-agnostic by one command.</b> Codex app-server executes; <span class="mono">/model openrouter/anthropic/claude-sonnet-4</span> reroutes a conversation without redeploying.</div>
-      <div class="f"><b>Memory, governed.</b> openclaw-mem integration is external, contract-tested, and fail-open — citations in, silent corruption out.</div>
-      <div class="f"><b>Windows-first, honestly.</b> Exclusive file-handle locks, Task Scheduler / service-wrapper supervision plans. Cross-platform is roadmap, not marketing.</div>
-    </div>
   </div>
 </section>
 
@@ -338,17 +356,19 @@ cargo run -p agent-harness-cli -- enable-check --target-home C:\path\to\.agent-h
 <footer class="site">
   <div class="wrap">
     <div class="links">
-      <a href="essay/">The Essay</a>
+      <a href="essay/long-task-engine/">The Long-Task Engine</a>
+      <a href="essay/">The Experiment Essay</a>
       <a href="https://github.com/phenomenoner/agent-harness-core">GitHub</a>
       <a href="https://github.com/phenomenoner/agent-harness-core#readme">README</a>
+      <a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/rlm-integration-design.md">RLM Design Note</a>
       <a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/agent-harness-core-roadmap-backlog.md">Roadmap &amp; Backlog</a>
-      <a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/agent-harness-operations-handbook.md">Operations Handbook</a>
+      <a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/agent-harness-topology-contract.md">Topology Contract</a>
       <a href="https://github.com/phenomenoner/agent-harness-core/blob/main/SECURITY.md">Security</a>
     </div>
-    <p>Opinions quoted on this page are from two architecture reviews authored by <b>Claude (Fable&nbsp;5, Anthropic)</b> on 2026-06-12 — an AI reviewing a codebase built in pair with AI, scoring it against platforms built by thousands of humans. Welcome to 2026.</p>
+    <p>The scorecard quoted here is from two architecture reviews authored by <b>Claude (Fable&nbsp;5, Anthropic)</b> on 2026-06-12 — an AI reviewing a codebase built in pair with AI, scoring it against platforms built by thousands of humans. Welcome to 2026.</p>
     <p style="margin-top:10px">Dual-licensed MIT OR Apache-2.0 · Pre-release · Windows-first · Live-validated daily on a real deployment.</p>
     <div class="starline">
-      <b>The experiment needs its variable.</b> If a one-day engineering sprint matching 100k★ platforms made you curious whether community really is the last moat — <a href="https://github.com/phenomenoner/agent-harness-core">star the repo</a>. Either outcome proves something.
+      <b>An agent you can leave running on something hard</b> — built in the open, reviewed independently, every step receipted. If that's the kind of thing worth depending on, <a href="https://github.com/phenomenoner/agent-harness-core">star the repo</a>. Engineering is getting cheap; the trust around it still isn't — and that's the part worth building together.
     </div>
   </div>
 </footer>
