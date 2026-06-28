@@ -231,17 +231,17 @@ pub use logging::{
 };
 pub use mcp::{McpRequestOptions, McpToolReceipt, handle_mcp_request};
 pub use media::{
-    DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM, DEFAULT_INBOUND_MEDIA_MAX_ITEMS_PER_TURN,
-    INBOUND_MEDIA_ARTIFACT_SCHEMA, INBOUND_MEDIA_CACHE_REPORT_SCHEMA,
-    INBOUND_MEDIA_INPUT_PLAN_SCHEMA, INBOUND_MEDIA_SAFETY_REPORT_SCHEMA,
-    INBOUND_MEDIA_VISION_ANALYSIS_SCHEMA, InboundMediaArtifact, InboundMediaCacheReport,
-    InboundMediaDownloadStatus, InboundMediaInputPlan, InboundMediaInputPlanOptions,
-    InboundMediaModelAttachmentStatus, InboundMediaNativeInputPart, InboundMediaSafetyPolicy,
-    InboundMediaSafetyReport, InboundMediaSelectedVariant, InboundMediaVisionAnalysis,
-    analyze_inbound_media_file, collect_inbound_media_cache_report, inbound_media_attachment_root,
-    plan_inbound_media_inputs, render_inbound_media_artifacts_for_prompt,
-    resolve_inbound_media_artifact_reference, validate_inbound_media_artifact_paths,
-    validate_inbound_media_safety,
+    ArtifactExtractionSummary, DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM,
+    DEFAULT_INBOUND_MEDIA_MAX_ITEMS_PER_TURN, INBOUND_MEDIA_ARTIFACT_SCHEMA,
+    INBOUND_MEDIA_CACHE_REPORT_SCHEMA, INBOUND_MEDIA_INPUT_PLAN_SCHEMA,
+    INBOUND_MEDIA_SAFETY_REPORT_SCHEMA, INBOUND_MEDIA_VISION_ANALYSIS_SCHEMA, InboundMediaArtifact,
+    InboundMediaCacheReport, InboundMediaDownloadStatus, InboundMediaInputPlan,
+    InboundMediaInputPlanOptions, InboundMediaModelAttachmentStatus, InboundMediaNativeInputPart,
+    InboundMediaSafetyPolicy, InboundMediaSafetyReport, InboundMediaSelectedVariant,
+    InboundMediaVisionAnalysis, analyze_inbound_media_file, collect_inbound_media_cache_report,
+    inbound_media_attachment_root, plan_inbound_media_inputs,
+    render_inbound_media_artifacts_for_prompt, resolve_inbound_media_artifact_reference,
+    validate_inbound_media_artifact_paths, validate_inbound_media_safety,
 };
 pub use memory::{
     MemoryAdapterReadinessReport, MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport,

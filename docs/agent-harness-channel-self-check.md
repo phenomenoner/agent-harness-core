@@ -19,6 +19,7 @@ Current activation baseline:
 - Supervisor plan: canonical generated entries cover the always-on runtime, worker, progress, Telegram, Discord outbox/gateway, and cron loops; the preserved `telegram-loop-xiaoxiaoli` runner is started with the same pinned Codex executable. `runtime-loop` is a single process with bounded in-process runtime concurrency via `--runtime-concurrency 12`; in supervised infinite mode it should keep safe-mode restart enabled.
 - Channel identity: when a binding registry is configured, the platform/account/channel tuple must resolve to `main` before the DM reaches the model.
 - Same-session runtime ordering: ordinary channel-origin `main` turns are serialized per `agent + platform + channel + user + sessionKey`; `workerDispatch.channelConcurrencyLimit=3` is still a broader worker/fan-out cap and must not be interpreted as permission for the same DM session to run multiple main-agent Codex turns at once.
+- Agent-boundary freshness: channel/session/runtime changes must preserve `agentId` as a routing boundary. A same-agent old session may be suppressed after `/new`; a completed turn for another agent on the same platform/channel/user must not be suppressed only because the shared channel state currently points at `main` or another agent. The full scenario pack is in `docs/agent-harness-topology-contract.md`.
 - Codex context recovery: context preflight writes `state/runtime-queue/codex-context-preflight-receipts.jsonl` plus per-execution `codex-context-preflight.json`; hard context-window failures should surface as `context-exhausted` with official compact retry or checkpoint/fresh-thread recovery metadata instead of a generic failed-terminal reply.
 - Runtime-loop liveness rule: missing/stale/error/stopped/stopping runtime-loop heartbeat is FAIL for live readiness. `safe-mode` is WARN/degraded because the loop is still alive but has reduced runtime concurrency to 1.
 - Large-ledger rule: `status`, `healthz`, and readiness may report sampled log/outbox/runtime counts after tail-sampling large JSONL files. Treat sampled counts as an operational window and check the warning text before comparing historical totals.
@@ -197,6 +198,7 @@ Pass criteria:
 - `channels.outbox.all.pending=0` after delivery settles.
 - `delivery-receipts.jsonl` has delivered entries for the new Telegram and Discord self-check replies.
 - Native attachment delivery should work for structured outbox attachments: Telegram uses `sendPhoto`/`sendDocument`; Discord uses multipart upload. Plain `MEDIA:<path>` lines from assistant output should be converted into structured attachments by runtime before delivery.
+- Final `agent-reply` payloads contain the final answer or terminal notification only. Progress-panel narration, repeated in-progress notes, and diagnostic working narration must remain in progress receipts/panels and must not be delivered as a normal Telegram or Discord reply.
 - No new `workers.totals.failedTerminal` entries.
 - No sensitive values appeared in the agent replies.
 

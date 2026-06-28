@@ -52,7 +52,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I2",
-            statement: "every completed turn has exactly one delivery or dead-letter notification",
+            statement: "every completed turn has exactly one delivery, explicit error notification, or dead-letter notification",
             owner: "runtime_pipeline/channel_delivery",
         },
         InvariantEntry {
@@ -80,6 +80,26 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
             statement: "ingress always has a terminal trace chain",
             owner: "trace",
         },
+        InvariantEntry {
+            id: "I8",
+            statement: "agent identity and /new task boundaries are routing boundaries across channel state, session freshness, prompt, runtime, outbox, delivery, and memory namespaces",
+            owner: "channel_state/runtime_pipeline/prompt/memory",
+        },
+        InvariantEntry {
+            id: "I9",
+            statement: "final channel replies exclude progress and narration stream content when progress-panel narration is active",
+            owner: "runtime_pipeline/progress/channel_delivery",
+        },
+        InvariantEntry {
+            id: "I10",
+            statement: "active Codex tool-use idle timeouts are stopped and routed through bounded recovery or an explicit terminal trace instead of directly dead-lettering the parent task",
+            owner: "codex_runtime/runtime_pipeline/trace",
+        },
+        InvariantEntry {
+            id: "I11",
+            statement: "binary and bulky artifacts enter durable main-session context only as harness artifact references plus bounded extraction summaries; raw bytes, base64, provider URLs, and large tool blobs stay in artifact storage or receipts",
+            owner: "media/prompt/runtime_worker/codex_runtime/workers/memory",
+        },
     ]
 }
 
@@ -89,6 +109,21 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             schema: "agent-harness.runtime-run-once.v1",
             owner_module: "runtime_pipeline",
             compatibility: "append-only JSONL, additive fields only in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.codex-runtime-run.v1",
+            owner_module: "codex_runtime",
+            compatibility: "append-only JSONL plus per-execution JSON; v1 accepts additive recovery fields such as toolUseTimeout",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.external-review-evidence.v1",
+            owner_module: "codex_runtime",
+            compatibility: "per-execution recovery artifact; additive fields only in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.inbound-media-artifact.v1",
+            owner_module: "media",
+            compatibility: "artifact metadata is additive in v1; Round10 adds lifecycleStatus and extractionSummary for bounded prompt hygiene",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.runtime-dead-letter.v1",
@@ -123,7 +158,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.progress-delivery-state.v1",
             owner_module: "progress",
-            compatibility: "state JSON may add cursor/cache fields in v1; existing lane cursors remain readable",
+            compatibility: "state JSON may add cursor/cache/counter fields in v1; existing lane cursors remain readable",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.codex-context-preflight.v1",
@@ -438,6 +473,14 @@ pub fn release_checklist() -> ReleaseChecklist {
             "schema registry updated",
             "CHANGELOG.md updated",
             "docs/skills/help stale guidance review completed",
+            "topology contract impact matrix reviewed for changed modules",
+            "channel/runtime changes passed the agent-boundary scenario matrix",
+            "prompt/memory changes passed /new task-boundary and per-agent memory recall checks",
+            "response/runtime changes passed final-surface separation checks",
+            "progress delivery changes passed edit-volume replay checks",
+            "progress panel lane-cap heartbeat checks passed across channel platforms",
+            "Codex tool-use timeout changes passed bounded recovery checks",
+            "artifact/context hygiene changes passed generic artifact prompt redaction checks",
             "public hygiene report passed",
             "rollback notes recorded",
             "staging healthz and trace samples captured",
@@ -466,7 +509,7 @@ mod tests {
 
     #[test]
     fn quality_catalogs_and_hygiene_report_are_actionable() {
-        assert!(invariant_catalog().len() >= 7);
+        assert!(invariant_catalog().len() >= 11);
         assert!(
             schema_registry_entries()
                 .iter()
@@ -487,6 +530,42 @@ mod tests {
                 .required_items
                 .contains(&"docs/skills/help stale guidance review completed")
         );
+        assert!(
+            release_checklist()
+                .required_items
+                .contains(&"topology contract impact matrix reviewed for changed modules")
+        );
+        assert!(
+            release_checklist()
+                .required_items
+                .contains(&"channel/runtime changes passed the agent-boundary scenario matrix")
+        );
+        assert!(release_checklist().required_items.contains(
+            &"prompt/memory changes passed /new task-boundary and per-agent memory recall checks"
+        ));
+        assert!(
+            release_checklist()
+                .required_items
+                .contains(&"response/runtime changes passed final-surface separation checks")
+        );
+        assert!(
+            release_checklist()
+                .required_items
+                .contains(&"progress delivery changes passed edit-volume replay checks")
+        );
+        assert!(
+            release_checklist().required_items.contains(
+                &"progress panel lane-cap heartbeat checks passed across channel platforms"
+            )
+        );
+        assert!(
+            release_checklist()
+                .required_items
+                .contains(&"Codex tool-use timeout changes passed bounded recovery checks")
+        );
+        assert!(release_checklist().required_items.contains(
+            &"artifact/context hygiene changes passed generic artifact prompt redaction checks"
+        ));
 
         let root = temp_root("quality_catalogs_and_hygiene_report_are_actionable");
         fs::create_dir_all(root.join(".agent-harness").join("secrets")).unwrap();

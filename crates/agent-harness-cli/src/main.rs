@@ -3599,6 +3599,10 @@ fn execute_progress_delivery_once(
         platform: args.platform.clone(),
         now_ms: current_time_ms()?,
         min_update_interval_ms: args.min_update_interval_ms,
+        max_nonterminal_updates_per_lane: AgentProgressDeliveryPlanOptions::default()
+            .max_nonterminal_updates_per_lane,
+        status_heartbeat_after_body_cap_ms: AgentProgressDeliveryPlanOptions::default()
+            .status_heartbeat_after_body_cap_ms,
         max_events_per_panel: args.max_events_per_panel,
         max_preview_chars: args.max_preview_chars,
         current_step_max_chars: args.current_step_max_chars,
@@ -3608,6 +3612,7 @@ fn execute_progress_delivery_once(
     let policy = channel_access_policy(&args.target_home)?;
     let pending_count = plan.pending.len();
     let skipped_muted = plan.summary.skipped_muted;
+    let volume_limited = plan.summary.volume_limited;
     let mut sent_messages = 0usize;
     let mut edited_messages = 0usize;
     let mut skipped_denied = 0usize;
@@ -3690,6 +3695,7 @@ fn execute_progress_delivery_once(
     let report = ProgressDeliveryOnceReport {
         pending_count,
         skipped_muted,
+        volume_limited,
         sent_messages,
         edited_messages,
         skipped_denied,
@@ -8591,6 +8597,7 @@ struct ProgressDeliveryLoopArgs {
 struct ProgressDeliveryOnceReport {
     pending_count: usize,
     skipped_muted: usize,
+    volume_limited: usize,
     sent_messages: usize,
     edited_messages: usize,
     skipped_denied: usize,
@@ -18289,6 +18296,7 @@ fn print_progress_delivery_once_report(report: &ProgressDeliveryOnceReport) {
     println!("Agent progress delivery once");
     println!("Pending panels: {}", report.pending_count);
     println!("Muted events: {}", report.skipped_muted);
+    println!("Volume-limited panels: {}", report.volume_limited);
     println!("Sent panels: {}", report.sent_messages);
     println!("Edited panels: {}", report.edited_messages);
     println!("Denied panels: {}", report.skipped_denied);

@@ -64,6 +64,7 @@ const CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT: u64 = 1_000_000;
 const CODEX_THREAD_INLINE_IMAGE_TOTAL_BYTES_LIMIT: u64 = 3_000_000;
 const CODEX_THREAD_TOOL_OUTPUT_BYTES_LIMIT: u64 = 1_000_000;
 const CODEX_ROLLOUT_SCAN_MAX_FILES: usize = 256;
+const DEFAULT_HIGH_CONTEXT_USAGE_COMPACT_TOKEN_LIMIT: u64 = 120_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -512,6 +513,8 @@ pub struct CodexRuntimeRunReceipt {
     pub media_plan: InboundMediaInputPlan,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_recovery: Option<CodexContextRecoveryReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_timeout: Option<CodexToolUseTimeout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -547,6 +550,21 @@ pub struct CodexContextRecoveryReceipt {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexToolUseTimeout {
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexContextPolicy {
@@ -562,6 +580,7 @@ struct CodexContextPolicy {
     model_context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_auto_compact_token_limit: Option<u64>,
+    high_context_usage_compact_token_limit: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_auto_compact_token_limit_scope: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -607,6 +626,7 @@ impl Default for CodexContextPolicy {
             manual_recovery_allowed: true,
             model_context_window: None,
             model_auto_compact_token_limit: None,
+            high_context_usage_compact_token_limit: DEFAULT_HIGH_CONTEXT_USAGE_COMPACT_TOKEN_LIMIT,
             model_auto_compact_token_limit_scope: None,
             tool_output_token_limit: None,
             compact_prompt: None,
@@ -1339,6 +1359,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 usage: None,
                 media_plan: InboundMediaInputPlan::default(),
                 context_recovery: None,
+                tool_use_timeout: None,
             };
             append_codex_run_log(
                 &options.harness_home,
@@ -1382,6 +1403,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 usage: None,
                 media_plan: InboundMediaInputPlan::default(),
                 context_recovery: None,
+                tool_use_timeout: None,
             };
             append_codex_run_log(
                 &options.harness_home,
@@ -1429,6 +1451,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             usage: None,
             media_plan: InboundMediaInputPlan::default(),
             context_recovery: None,
+            tool_use_timeout: None,
         };
         append_codex_run_log(
             &options.harness_home,
@@ -1480,6 +1503,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             usage: None,
             media_plan: plan.media_plan.clone(),
             context_recovery: None,
+            tool_use_timeout: None,
         };
         append_codex_run_log(
             &options.harness_home,
@@ -1576,6 +1600,19 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
     }
     if run_result.status == CodexRuntimeRunStatus::ContextExhausted {
         run_result = recover_codex_context_exhaustion(
+            &options.harness_home,
+            &plan,
+            &plan_file,
+            run_result,
+            options.timeout_ms,
+            options.idle_timeout_ms,
+            options.progress_context.clone(),
+            &narration_config,
+            &context_policy,
+        )?;
+    }
+    if should_recover_tool_use_timeout(&run_result, &context_policy) {
+        run_result = recover_tool_use_timeout(
             &options.harness_home,
             &plan,
             &plan_file,
@@ -1692,6 +1729,7 @@ fn finish_codex_runtime_run(
         usage: run_result.usage,
         media_plan: plan.media_plan.clone(),
         context_recovery: run_result.context_recovery,
+        tool_use_timeout: run_result.tool_use_timeout,
     };
     let log_level = match receipt.status {
         CodexRuntimeRunStatus::Completed => HarnessLogLevel::Info,
@@ -1807,6 +1845,7 @@ fn recover_completed_codex_run_from_stdout_log(
                 stdout_log: Some(stdout_log.to_path_buf()),
                 stderr_log,
                 context_recovery: None,
+                tool_use_timeout: None,
                 warnings: state.warnings,
             }));
         }
@@ -1826,6 +1865,7 @@ fn recover_completed_codex_run_from_stdout_log(
         stdout_log: Some(stdout_log.to_path_buf()),
         stderr_log,
         context_recovery: None,
+        tool_use_timeout: None,
         warnings: state.warnings,
     }))
 }
@@ -2249,6 +2289,16 @@ fn preflight_codex_context(
             true,
             format!(
                 "latest usage {tokens} token(s) is at or above model_auto_compact_token_limit {limit}"
+            ),
+        )
+    } else if let Some(tokens) = latest_tokens
+        && tokens >= policy.high_context_usage_compact_token_limit
+    {
+        (
+            true,
+            format!(
+                "latest absolute usage {tokens} token(s) is at or above highContextUsageCompactTokenLimit {}",
+                policy.high_context_usage_compact_token_limit
             ),
         )
     } else if let Some(ratio) = active_context_ratio
@@ -2708,6 +2758,17 @@ fn load_codex_context_policy(harness_home: &Path) -> io::Result<CodexContextPoli
             ],
         )
         .filter(|value| *value > 0);
+        if let Some(value) = context_u64(
+            context,
+            &[
+                "highContextUsageCompactTokenLimit",
+                "high_context_usage_compact_token_limit",
+            ],
+        )
+        .filter(|value| *value > 0)
+        {
+            policy.high_context_usage_compact_token_limit = value;
+        }
         policy.model_auto_compact_token_limit_scope = context_string(
             context,
             &[
@@ -2843,6 +2904,7 @@ struct CodexAppServerRunResult {
     stdout_log: Option<PathBuf>,
     stderr_log: Option<PathBuf>,
     context_recovery: Option<CodexContextRecoveryReceipt>,
+    tool_use_timeout: Option<CodexToolUseTimeout>,
     warnings: Vec<String>,
 }
 
@@ -3013,6 +3075,7 @@ fn drive_codex_app_server(
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
                 context_recovery: None,
+                tool_use_timeout: None,
                 warnings: Vec::new(),
             });
         }
@@ -3032,6 +3095,7 @@ fn drive_codex_app_server(
             stdout_log: Some(stdout_log),
             stderr_log: Some(stderr_log),
             context_recovery: None,
+            tool_use_timeout: None,
             warnings: Vec::new(),
         });
     };
@@ -3050,6 +3114,7 @@ fn drive_codex_app_server(
             stdout_log: Some(stdout_log),
             stderr_log: Some(stderr_log),
             context_recovery: None,
+            tool_use_timeout: None,
             warnings: Vec::new(),
         });
     };
@@ -3156,6 +3221,31 @@ fn drive_codex_app_server(
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
                 context_recovery: None,
+                tool_use_timeout: None,
+                warnings: state.warnings,
+            });
+        }
+        ProtocolWait::ToolUseTimedOut { reason, tool } => {
+            finish_codex_child_and_stdout_reader(
+                &mut child,
+                &mut reader_handle,
+                &mut state.warnings,
+                "thread start tool use timed out",
+            );
+            return Ok(CodexAppServerRunResult {
+                status: CodexRuntimeRunStatus::Timeout,
+                reason,
+                assistant_message: state.assistant_message_with_harness_notices(),
+                assistant_narration: state.assistant_narration_records(),
+                assistant_raw_message: state.assistant_raw_message(),
+                assistant_final_found: state.assistant_final_found(),
+                thread_id: None,
+                event_count: state.event_count,
+                usage: state.usage.clone(),
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                context_recovery: None,
+                tool_use_timeout: Some(tool),
                 warnings: state.warnings,
             });
         }
@@ -3179,6 +3269,7 @@ fn drive_codex_app_server(
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
                 context_recovery: None,
+                tool_use_timeout: None,
                 warnings: state.warnings,
             });
         }
@@ -3202,6 +3293,7 @@ fn drive_codex_app_server(
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
                 context_recovery: None,
+                tool_use_timeout: None,
                 warnings: state.warnings,
             });
         }
@@ -3226,6 +3318,7 @@ fn drive_codex_app_server(
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
                 context_recovery: None,
+                tool_use_timeout: None,
                 warnings: state.warnings,
             });
         }
@@ -3249,6 +3342,7 @@ fn drive_codex_app_server(
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
                 context_recovery: None,
+                tool_use_timeout: None,
                 warnings: state.warnings,
             });
         }
@@ -3317,6 +3411,41 @@ fn drive_codex_app_server(
                     stdout_log: Some(stdout_log),
                     stderr_log: Some(stderr_log),
                     context_recovery: Some(recovery),
+                    tool_use_timeout: None,
+                    warnings: state.warnings,
+                });
+            }
+            ProtocolWait::ToolUseTimedOut { reason, tool } => {
+                finish_codex_child_and_stdout_reader(
+                    &mut child,
+                    &mut reader_handle,
+                    &mut state.warnings,
+                    "context compact tool use timed out",
+                );
+                let recovery = context_recovery_failure_receipt(
+                    plan,
+                    Some(thread_id.clone()),
+                    None,
+                    context_policy,
+                    "compact-before-turn-timeout",
+                    format!("Codex official context compact tool use timed out: {reason}"),
+                    1,
+                    false,
+                );
+                return Ok(CodexAppServerRunResult {
+                    status: CodexRuntimeRunStatus::Timeout,
+                    reason,
+                    assistant_message: state.assistant_message_with_harness_notices(),
+                    assistant_narration: state.assistant_narration_records(),
+                    assistant_raw_message: state.assistant_raw_message(),
+                    assistant_final_found: state.assistant_final_found(),
+                    thread_id: Some(thread_id.clone()),
+                    event_count: state.event_count,
+                    usage: state.usage.clone(),
+                    stdout_log: Some(stdout_log),
+                    stderr_log: Some(stderr_log),
+                    context_recovery: Some(recovery),
+                    tool_use_timeout: Some(tool),
                     warnings: state.warnings,
                 });
             }
@@ -3351,6 +3480,7 @@ fn drive_codex_app_server(
                     stdout_log: Some(stdout_log),
                     stderr_log: Some(stderr_log),
                     context_recovery: Some(recovery),
+                    tool_use_timeout: None,
                     warnings: state.warnings,
                 });
             }
@@ -3384,6 +3514,7 @@ fn drive_codex_app_server(
                     stdout_log: Some(stdout_log),
                     stderr_log: Some(stderr_log),
                     context_recovery: Some(recovery),
+                    tool_use_timeout: None,
                     warnings: state.warnings,
                 });
             }
@@ -3420,6 +3551,7 @@ fn drive_codex_app_server(
                     stdout_log: Some(stdout_log),
                     stderr_log: Some(stderr_log),
                     context_recovery: Some(recovery),
+                    tool_use_timeout: None,
                     warnings: state.warnings,
                 });
             }
@@ -3492,6 +3624,17 @@ fn drive_codex_app_server(
             CodexActiveTurnStatus::Failed,
             format!("codex app-server turn timed out: {reason}"),
         ),
+        ProtocolWait::ToolUseTimedOut { reason, tool } => (
+            CodexActiveTurnStatus::Failed,
+            format!(
+                "codex app-server tool use timed out: {}; tool={}",
+                reason,
+                tool.preview
+                    .as_deref()
+                    .or(tool.item_type.as_deref())
+                    .unwrap_or(&tool.method)
+            ),
+        ),
         ProtocolWait::Failed(reason) => (
             CodexActiveTurnStatus::Failed,
             format!("codex app-server turn failed: {reason}"),
@@ -3534,6 +3677,31 @@ fn drive_codex_app_server(
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
                 context_recovery: context_recovery.clone(),
+                tool_use_timeout: None,
+                warnings: state.warnings,
+            });
+        }
+        ProtocolWait::ToolUseTimedOut { reason, tool } => {
+            finish_codex_child_and_stdout_reader(
+                &mut child,
+                &mut reader_handle,
+                &mut state.warnings,
+                "turn tool use timed out",
+            );
+            return Ok(CodexAppServerRunResult {
+                status: CodexRuntimeRunStatus::Timeout,
+                reason,
+                assistant_message: state.assistant_message_with_harness_notices(),
+                assistant_narration: state.assistant_narration_records(),
+                assistant_raw_message: state.assistant_raw_message(),
+                assistant_final_found: state.assistant_final_found(),
+                thread_id: Some(thread_id.clone()),
+                event_count: state.event_count,
+                usage: state.usage.clone(),
+                stdout_log: Some(stdout_log),
+                stderr_log: Some(stderr_log),
+                context_recovery: context_recovery.clone(),
+                tool_use_timeout: Some(tool),
                 warnings: state.warnings,
             });
         }
@@ -3557,6 +3725,7 @@ fn drive_codex_app_server(
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
                 context_recovery: context_recovery.clone(),
+                tool_use_timeout: None,
                 warnings: state.warnings,
             });
         }
@@ -3581,6 +3750,7 @@ fn drive_codex_app_server(
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
                 context_recovery: context_recovery.clone(),
+                tool_use_timeout: None,
                 warnings: state.warnings,
             });
         }
@@ -3605,6 +3775,7 @@ fn drive_codex_app_server(
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
                 context_recovery: context_recovery.clone(),
+                tool_use_timeout: None,
                 warnings: state.warnings,
             });
         }
@@ -3637,6 +3808,7 @@ fn drive_codex_app_server(
                 stdout_log: Some(stdout_log),
                 stderr_log: Some(stderr_log),
                 context_recovery: context_recovery.clone(),
+                tool_use_timeout: None,
                 warnings: state.warnings,
             });
         }
@@ -3666,6 +3838,7 @@ fn drive_codex_app_server(
             stdout_log: Some(stdout_log),
             stderr_log: Some(stderr_log),
             context_recovery,
+            tool_use_timeout: None,
             warnings: state.warnings,
         });
     }
@@ -3688,6 +3861,7 @@ fn drive_codex_app_server(
         stdout_log: Some(stdout_log),
         stderr_log: Some(stderr_log),
         context_recovery,
+        tool_use_timeout: None,
         warnings: state.warnings,
     })
 }
@@ -4035,6 +4209,133 @@ fn is_retryable_stream_disconnect_protocol_error(reason: &str) -> bool {
         || lower.contains("reconnecting...")
 }
 
+fn should_recover_tool_use_timeout(
+    result: &CodexAppServerRunResult,
+    policy: &CodexContextPolicy,
+) -> bool {
+    result.status == CodexRuntimeRunStatus::Timeout
+        && result.tool_use_timeout.is_some()
+        && policy.fallback_on_compact_failure == "checkpoint-and-new-thread"
+        && !result.assistant_final_found
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_tool_use_timeout(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    plan_file: &Path,
+    prior: CodexAppServerRunResult,
+    timeout_ms: u64,
+    idle_timeout_ms: u64,
+    progress_context: Option<AgentProgressContext>,
+    narration_config: &AssistantNarrationConfig,
+    policy: &CodexContextPolicy,
+) -> io::Result<CodexAppServerRunResult> {
+    let original_thread_id = prior
+        .thread_id
+        .clone()
+        .or_else(|| plan.invocation.thread_id.clone());
+    let execution_dir = runtime_execution_dir(plan);
+    fs::create_dir_all(&execution_dir)?;
+    let tool = prior.tool_use_timeout.clone();
+    let checkpoint_file = write_context_checkpoint(
+        plan,
+        original_thread_id.clone(),
+        &prior.reason,
+        &execution_dir,
+    )?;
+    let rollover = write_context_rollover_receipt(
+        plan,
+        original_thread_id.clone(),
+        &prior.reason,
+        &execution_dir,
+    )?;
+    let fallback_prompt_file =
+        write_tool_timeout_fallback_prompt(plan, &prior.reason, tool.as_ref(), &execution_dir)?;
+    let mut fallback_plan = plan.clone();
+    fallback_plan.invocation.thread_id = None;
+    fallback_plan.invocation.prompt_input_file = fallback_prompt_file;
+    let original_events = prior.event_count;
+    let prior_reason = prior.reason.clone();
+    let mut fallback_result = drive_codex_app_server(
+        harness_home,
+        &fallback_plan,
+        plan_file,
+        timeout_ms,
+        idle_timeout_ms,
+        progress_context,
+        narration_config,
+        policy,
+        false,
+    )?;
+    fallback_result.event_count = fallback_result.event_count.saturating_add(original_events);
+    let succeeded = fallback_result.status == CodexRuntimeRunStatus::Completed;
+    fallback_result.warnings.push(format!(
+        "Codex tool-use timeout recovery stopped the prior app-server/tool process and opened a fresh Codex thread after: {prior_reason}"
+    ));
+    fallback_result.context_recovery = Some(CodexContextRecoveryReceipt {
+        status: if succeeded {
+            "tool-timeout-fallback-succeeded".to_string()
+        } else {
+            "tool-timeout-fallback-failed".to_string()
+        },
+        queue_id: plan.queue_id.clone(),
+        session_key: plan.session_key.clone(),
+        original_thread_id,
+        recovered_thread_id: fallback_result.thread_id.clone(),
+        official_compact_attempts: prior
+            .context_recovery
+            .as_ref()
+            .map(|receipt| receipt.official_compact_attempts)
+            .unwrap_or(0),
+        retry_attempted: true,
+        fallback_policy: policy.fallback_on_compact_failure.clone(),
+        fresh_thread_attempted: true,
+        fresh_thread_succeeded: succeeded,
+        checkpoint_file: Some(checkpoint_file),
+        rollover_file: Some(rollover.rollover_file),
+        binding_backup_file: rollover.binding_backup_file,
+        reason: if succeeded {
+            format!(
+                "Codex tool-use idle timeout was converted into a bounded fresh-thread recovery. Prior reason: {prior_reason}"
+            )
+        } else {
+            format!(
+                "Codex tool-use idle timeout fallback also failed. Prior reason: {prior_reason}; fallback reason: {}",
+                fallback_result.reason
+            )
+        },
+    });
+    if fallback_result.tool_use_timeout.is_none() {
+        fallback_result.tool_use_timeout = tool.clone();
+    }
+    if should_capture_external_review_recovery_as_evidence(tool.as_ref(), &fallback_result) {
+        let evidence_file = write_external_review_evidence(
+            plan,
+            tool.as_ref(),
+            &fallback_result.assistant_message,
+            &prior_reason,
+            &execution_dir,
+        )?;
+        fallback_result.status = CodexRuntimeRunStatus::ProtocolError;
+        fallback_result.reason =
+            "external review evidence without parent workflow completion; parent task remains resumable"
+                .to_string();
+        fallback_result.warnings.push(format!(
+            "external review recovery output was captured as evidence at {}; parent workflow was not marked complete",
+            evidence_file.display()
+        ));
+        if let Some(recovery) = fallback_result.context_recovery.as_mut() {
+            recovery.status = "external-review-evidence-captured".to_string();
+            recovery.fresh_thread_succeeded = false;
+            recovery.reason =
+                "External review output was captured as evidence, not final parent workflow completion"
+                    .to_string();
+        }
+    }
+    Ok(fallback_result)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_context_checkpoint_fallback(
     harness_home: &Path,
@@ -4214,6 +4515,108 @@ fn write_context_fallback_prompt(
     Ok(fallback_prompt_file)
 }
 
+fn write_tool_timeout_fallback_prompt(
+    plan: &CodexRuntimePlanFile,
+    reason: &str,
+    tool: Option<&CodexToolUseTimeout>,
+    execution_dir: &Path,
+) -> io::Result<PathBuf> {
+    let original_prompt = fs::read_to_string(&plan.invocation.prompt_input_file)?;
+    let fallback_prompt_file = execution_dir.join("prompt.tool-timeout-fallback.md");
+    let previous_thread = plan.invocation.thread_id.as_deref().unwrap_or("(unknown)");
+    let tool_summary = tool
+        .map(tool_timeout_summary)
+        .unwrap_or_else(|| "active tool use was not captured".to_string());
+    let prompt = format!(
+        "[Harness tool-use timeout recovery]\n\
+         The previous Codex app-server turn was stopped because an active tool use produced no JSONL progress before the idle timeout.\n\
+         Previous Codex thread id: {previous_thread}\n\
+         Timeout reason: {}\n\
+         Timed-out tool: {tool_summary}\n\
+         Continue the same queued task. Decide whether to retry the timed-out tool once with a tighter bound, use a cheaper/read-only alternative, or report a real blocker. Do not blindly repeat the same long-running command.\n\n\
+         [Original queued prompt]\n\
+         {original_prompt}",
+        truncate_for_notice(reason, 600)
+    );
+    fs::write(&fallback_prompt_file, prompt)?;
+    Ok(fallback_prompt_file)
+}
+
+fn tool_timeout_summary(tool: &CodexToolUseTimeout) -> String {
+    let mut parts = vec![format!("method={}", tool.method)];
+    if let Some(item_type) = tool.item_type.as_deref() {
+        parts.push(format!("type={}", truncate_for_notice(item_type, 80)));
+    }
+    if let Some(item_id) = tool.item_id.as_deref() {
+        parts.push(format!("id={}", truncate_for_notice(item_id, 80)));
+    }
+    if let Some(preview) = tool.preview.as_deref() {
+        parts.push(format!("preview={}", truncate_for_notice(preview, 200)));
+    }
+    parts.push(format!("reason={}", truncate_for_notice(&tool.reason, 300)));
+    parts.join("; ")
+}
+
+fn should_capture_external_review_recovery_as_evidence(
+    tool: Option<&CodexToolUseTimeout>,
+    result: &CodexAppServerRunResult,
+) -> bool {
+    result.status == CodexRuntimeRunStatus::Completed
+        && tool.is_some_and(is_external_review_tool)
+        && looks_like_review_evidence_without_parent_completion(&result.assistant_message)
+}
+
+fn is_external_review_tool(tool: &CodexToolUseTimeout) -> bool {
+    let preview = tool
+        .preview
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let item_type = tool.item_type.as_deref().unwrap_or_default();
+    item_type.eq_ignore_ascii_case("commandExecution")
+        && ((preview.contains("claude") && preview.contains("-p"))
+            || preview.contains("second brain")
+            || preview.contains("second-brain"))
+        && (preview.contains("review") || preview.contains("second brain"))
+}
+
+fn looks_like_review_evidence_without_parent_completion(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let review_signal = (lower.contains("claude") && lower.contains("review"))
+        || lower.contains("second brain")
+        || lower.contains("second-brain");
+    let evidence_only_signal = lower.contains("findings only")
+        || lower.contains("implementation still needs to continue")
+        || lower.contains("parent workflow")
+        || lower.contains("review only")
+        || lower.contains("review-only");
+    review_signal && evidence_only_signal
+}
+
+fn write_external_review_evidence(
+    plan: &CodexRuntimePlanFile,
+    tool: Option<&CodexToolUseTimeout>,
+    assistant_message: &str,
+    prior_reason: &str,
+    execution_dir: &Path,
+) -> io::Result<PathBuf> {
+    let evidence_file = execution_dir.join("external-review-evidence.json");
+    write_json_atomic(
+        &evidence_file,
+        &json!({
+            "schema": "agent-harness.external-review-evidence.v1",
+            "queueId": plan.queue_id,
+            "sessionKey": plan.session_key,
+            "agentId": plan.agent_id,
+            "toolUseTimeout": tool,
+            "priorReason": prior_reason,
+            "assistantText": assistant_message,
+            "createdAtMs": current_log_time_ms()?
+        }),
+    )?;
+    Ok(evidence_file)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AssistantOutputCapture {
     raw_text: String,
@@ -4368,10 +4771,33 @@ impl AssistantOutputCapture {
 #[derive(Default)]
 struct CodexProtocolState {
     assistant_output: AssistantOutputCapture,
+    active_tool_use: Option<CodexActiveToolUse>,
     event_count: usize,
     usage: Option<CodexRuntimeUsage>,
     warnings: Vec<String>,
     denied_approval_requests: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexActiveToolUse {
+    method: String,
+    item_id: Option<String>,
+    item_type: Option<String>,
+    preview: Option<String>,
+    started_at_ms: Option<i64>,
+}
+
+impl CodexActiveToolUse {
+    fn timeout(&self, reason: String) -> CodexToolUseTimeout {
+        CodexToolUseTimeout {
+            method: self.method.clone(),
+            item_id: self.item_id.clone(),
+            item_type: self.item_type.clone(),
+            preview: self.preview.clone(),
+            started_at_ms: self.started_at_ms,
+            reason,
+        }
+    }
 }
 
 impl CodexProtocolState {
@@ -4494,6 +4920,116 @@ fn emit_codex_progress(
             .warnings
             .push(format!("progress event write failed: {error}"));
     }
+}
+
+fn observe_codex_active_tool_use(value: &Value, state: &mut CodexProtocolState) {
+    let Some(method) = json_method(value) else {
+        return;
+    };
+    let method_lower = method.to_ascii_lowercase();
+    let item_id = value
+        .pointer("/params/item/id")
+        .or_else(|| value.pointer("/params/itemId"))
+        .and_then(Value::as_str)
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    let item_type = value
+        .pointer("/params/item/type")
+        .or_else(|| value.pointer("/params/type"))
+        .and_then(Value::as_str)
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+
+    if method == "item/completed" {
+        if should_clear_active_tool(
+            &state.active_tool_use,
+            item_id.as_deref(),
+            item_type.as_deref(),
+        ) {
+            state.active_tool_use = None;
+        }
+        return;
+    }
+
+    if method == "item/started" {
+        if !is_tool_like_item(item_type.as_deref(), &method_lower) {
+            return;
+        }
+        let kind = codex_progress_kind_and_label(method, &method_lower)
+            .map(|(kind, _)| kind)
+            .unwrap_or(AgentProgressKind::ToolCall);
+        let preview = codex_progress_preview(value, kind)
+            .map(|preview| compact_codex_progress_preview(kind, &preview));
+        let started_at_ms = current_log_time_ms().ok();
+        state.active_tool_use = Some(CodexActiveToolUse {
+            method: method.to_string(),
+            item_id,
+            item_type,
+            preview,
+            started_at_ms,
+        });
+        return;
+    }
+
+    if codex_progress_kind_and_label(method, &method_lower).is_some()
+        && state.active_tool_use.is_none()
+        && is_tool_like_item(item_type.as_deref(), &method_lower)
+    {
+        let kind = codex_progress_kind_and_label(method, &method_lower)
+            .map(|(kind, _)| kind)
+            .unwrap_or(AgentProgressKind::ToolCall);
+        let preview = codex_progress_preview(value, kind)
+            .map(|preview| compact_codex_progress_preview(kind, &preview));
+        state.active_tool_use = Some(CodexActiveToolUse {
+            method: method.to_string(),
+            item_id,
+            item_type,
+            preview,
+            started_at_ms: current_log_time_ms().ok(),
+        });
+    }
+}
+
+fn should_clear_active_tool(
+    active: &Option<CodexActiveToolUse>,
+    item_id: Option<&str>,
+    item_type: Option<&str>,
+) -> bool {
+    let Some(active) = active.as_ref() else {
+        return false;
+    };
+    if let (Some(active_id), Some(item_id)) = (active.item_id.as_deref(), item_id) {
+        return active_id == item_id;
+    }
+    is_tool_like_item(item_type, "item/completed")
+}
+
+fn is_tool_like_item(item_type: Option<&str>, method_lower: &str) -> bool {
+    if let Some(item_type) = item_type {
+        let normalized = item_type.to_ascii_lowercase();
+        if normalized.contains("agentmessage")
+            || normalized.contains("agent_message")
+            || normalized.contains("contextcompaction")
+            || normalized.contains("context_compaction")
+        {
+            return false;
+        }
+        return normalized.contains("command")
+            || normalized.contains("terminal")
+            || normalized.contains("tool")
+            || normalized.contains("function")
+            || normalized.contains("mcp")
+            || normalized.contains("filechange")
+            || normalized.contains("file_change");
+    }
+    method_lower.contains("commandexecution")
+        || method_lower.contains("exec_command")
+        || method_lower.contains("execcommand")
+        || method_lower.contains("terminal")
+        || method_lower.contains("shell")
+        || method_lower.contains("tool")
+        || method_lower.contains("mcp")
+        || method_lower.contains("function")
 }
 
 fn codex_progress_event_from_json(
@@ -4905,6 +5441,10 @@ enum ProtocolWait {
     Canceled(String),
     Failed(String),
     TimedOut(String),
+    ToolUseTimedOut {
+        reason: String,
+        tool: CodexToolUseTimeout,
+    },
 }
 
 struct InFlightCodexTurnSteer {
@@ -5450,6 +5990,7 @@ fn wait_for_turn_completed(
                 {
                     continue;
                 }
+                observe_codex_active_tool_use(&value, state);
                 if let Some(error) = protocol_error(&value) {
                     return Ok(ProtocolWait::Failed(error));
                 }
@@ -5481,7 +6022,16 @@ fn wait_for_turn_completed(
                 }
             }
             ProtocolEvent::Poll => continue,
-            ProtocolEvent::TimedOut(reason) => return Ok(ProtocolWait::TimedOut(reason)),
+            ProtocolEvent::TimedOut(reason) => {
+                if let Some(tool) = state
+                    .active_tool_use
+                    .as_ref()
+                    .map(|tool| tool.timeout(reason.clone()))
+                {
+                    return Ok(ProtocolWait::ToolUseTimedOut { reason, tool });
+                }
+                return Ok(ProtocolWait::TimedOut(reason));
+            }
             ProtocolEvent::Failed(reason) => return Ok(ProtocolWait::Failed(reason)),
             ProtocolEvent::Canceled(reason) => return Ok(ProtocolWait::Canceled(reason)),
         }
@@ -10467,6 +11017,106 @@ mod tests {
     }
 
     #[test]
+    fn run_codex_runtime_recovers_tool_use_idle_timeout_with_fresh_thread() {
+        let root = temp_root("run_codex_runtime_recovers_tool_use_idle_timeout_with_fresh_thread");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = tool_timeout_then_success_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 3_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert_eq!(
+            report
+                .receipt
+                .context_recovery
+                .as_ref()
+                .map(|receipt| receipt.status.as_str()),
+            Some("tool-timeout-fallback-succeeded")
+        );
+        let tool = report.receipt.tool_use_timeout.as_ref().unwrap();
+        assert_eq!(tool.item_type.as_deref(), Some("commandExecution"));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("tool-use timeout recovery"))
+        );
+        let transcript_file = report.completion.unwrap().transcript_file.unwrap();
+        let transcript = fs::read_to_string(transcript_file).unwrap();
+        assert!(transcript.contains("Recovered after tool timeout."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_keeps_external_review_recovery_as_evidence_not_final() {
+        let root =
+            temp_root("run_codex_runtime_keeps_external_review_recovery_as_evidence_not_final");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = tool_timeout_then_review_only_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 3_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+        assert!(
+            report
+                .receipt
+                .reason
+                .contains("external review evidence without parent workflow completion")
+        );
+        assert!(report.completion.is_none());
+        let evidence = report
+            .receipt
+            .execution_dir
+            .as_ref()
+            .unwrap()
+            .join("external-review-evidence.json");
+        assert!(evidence.is_file());
+        let evidence_text = fs::read_to_string(evidence).unwrap();
+        assert!(evidence_text.contains("Claude second brain review"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_codex_runtime_preflight_compacts_existing_thread_before_turn() {
         let root = temp_root("run_codex_runtime_preflight_compacts_existing_thread_before_turn");
         let source = write_codex_runtime_source(&root);
@@ -10543,6 +11193,87 @@ mod tests {
         )
         .unwrap();
         assert!(preflight.contains(r#""compactBeforeTurn": true"#));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_preflight_compacts_high_usage_bound_thread_without_model_window() {
+        let root = temp_root(
+            "run_codex_runtime_preflight_compacts_high_usage_bound_thread_without_model_window",
+        );
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan = plan_report.plan.as_ref().unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        replace_invocation_thread_id(plan_file, Some("thread-bloated"));
+        let receipts_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-runtime-run-receipts.jsonl");
+        fs::write(
+            &receipts_file,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "codexBindingFile": plan.outputs.codex_binding_file.to_string_lossy(),
+                    "usage": {
+                        "inputTokens": 134421,
+                        "outputTokens": 2181,
+                        "totalTokens": 136602,
+                        "source": "telegram-image-context-root-cause-replay"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let (executable, arguments, events_file) = compact_tracking_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 10_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert_eq!(
+            report
+                .receipt
+                .context_recovery
+                .as_ref()
+                .map(|receipt| receipt.status.as_str()),
+            Some("compact-before-turn")
+        );
+        let events = fs::read_to_string(events_file).unwrap();
+        let compact_index = events.find("thread/compact/start").unwrap();
+        let turn_index = events.find("turn/start").unwrap();
+        assert!(
+            compact_index < turn_index,
+            "I10/T3 replay: high prior bound-thread usage must compact before the next turn"
+        );
+        let preflight = fs::read_to_string(
+            plan_report
+                .execution_dir
+                .as_ref()
+                .unwrap()
+                .join("codex-context-preflight.json"),
+        )
+        .unwrap();
+        assert!(preflight.contains(r#""compactBeforeTurn": true"#));
+        assert!(preflight.contains("absolute"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -11645,6 +12376,134 @@ while ($true) {
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"turn":{"id":"turn-test","status":"completed"}}}')
         [Console]::Out.Flush()
         break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
+
+    #[cfg(windows)]
+    fn tool_timeout_then_success_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("tool-timeout-then-success-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+$countFile = Join-Path $PSScriptRoot 'tool-timeout-attempt.txt'
+$attempt = 0
+if (Test-Path -LiteralPath $countFile) {
+    $raw = Get-Content -LiteralPath $countFile -Raw
+    [void][int]::TryParse($raw.Trim(), [ref]$attempt)
+}
+Set-Content -LiteralPath $countFile -Value ([string]($attempt + 1))
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try {
+        $msg = $line | ConvertFrom-Json
+    } catch {
+        continue
+    }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-tool-timeout"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        if ($attempt -eq 0) {
+            [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-tool-timeout","turn":{"id":"turn-tool-timeout","kind":"regular"}}}')
+            [Console]::Out.WriteLine('{"method":"item/started","params":{"item":{"type":"commandExecution","id":"cmd-timeout","command":"claude -p review prompt"},"threadId":"thread-tool-timeout","turnId":"turn-tool-timeout"}}')
+            [Console]::Out.Flush()
+            Start-Sleep -Seconds 10
+        } else {
+            [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-tool-timeout","turn":{"id":"turn-recovered","kind":"regular"}}}')
+            [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-recovered","text":"Recovered after tool timeout.","phase":"final_answer"},"threadId":"thread-tool-timeout","turnId":"turn-recovered","completedAtMs":1234}}')
+            [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-tool-timeout","turn":{"id":"turn-recovered","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}')
+            [Console]::Out.Flush()
+            break
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
+
+    #[cfg(windows)]
+    fn tool_timeout_then_review_only_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("tool-timeout-then-review-only-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+$countFile = Join-Path $PSScriptRoot 'tool-timeout-review-only-attempt.txt'
+$attempt = 0
+if (Test-Path -LiteralPath $countFile) {
+    $raw = Get-Content -LiteralPath $countFile -Raw
+    [void][int]::TryParse($raw.Trim(), [ref]$attempt)
+}
+Set-Content -LiteralPath $countFile -Value ([string]($attempt + 1))
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try {
+        $msg = $line | ConvertFrom-Json
+    } catch {
+        continue
+    }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-review-evidence"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        if ($attempt -eq 0) {
+            [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-timeout","kind":"regular"}}}')
+            [Console]::Out.WriteLine('{"method":"item/started","params":{"item":{"type":"commandExecution","id":"cmd-review-timeout","command":"claude -p review prompt"},"threadId":"thread-review-evidence","turnId":"turn-review-timeout"}}')
+            [Console]::Out.Flush()
+            Start-Sleep -Seconds 10
+        } else {
+            [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-only","kind":"regular"}}}')
+            [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-review-only","text":"Claude second brain review: PASS. Findings only; implementation still needs to continue.","phase":"final_answer"},"threadId":"thread-review-evidence","turnId":"turn-review-only","completedAtMs":1234}}')
+            [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-only","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}')
+            [Console]::Out.Flush()
+            break
+        }
     }
 }
 "#,

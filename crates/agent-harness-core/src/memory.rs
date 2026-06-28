@@ -727,6 +727,9 @@ pub struct MemoryPromptContextReport {
     pub hit_count: usize,
     pub searched_files: usize,
     pub skipped_files: usize,
+    pub source_scope: String,
+    pub global_imported_snapshot_allowed: bool,
+    pub filtered_global_imported_hits: usize,
     pub context: Option<String>,
     pub warnings: Vec<String>,
 }
@@ -1566,14 +1569,18 @@ fn parse_lenient_jsonl_value(line: &str) -> Option<Value> {
 }
 
 fn memory_scope_policy(agent_id: Option<String>) -> MemoryScopePolicyReport {
+    let global_imported_snapshot_allowed =
+        memory_global_imported_snapshot_allowed(agent_id.as_deref());
     MemoryScopePolicyReport {
-        default_scope: if agent_id.is_some() {
+        default_scope: if agent_id.is_some() && !global_imported_snapshot_allowed {
+            "agent-private-with-public-opt-in".to_string()
+        } else if agent_id.is_some() {
             "agent-plus-global-imported".to_string()
         } else {
             "global-imported".to_string()
         },
         agent_id,
-        global_imported_snapshot_allowed: true,
+        global_imported_snapshot_allowed,
         per_agent_writeback_required: true,
         cross_agent_private_recall_allowed: false,
         receipts_include_scope: true,
@@ -2489,6 +2496,7 @@ fn recall_openclaw_mem_migration_fallback(
     let mut skipped_files = 0usize;
     let mut warnings = telemetry.warnings;
     let mut backend = "snapshot-text+service-writeback".to_string();
+    let scope_policy = memory_scope_policy(agent_id.clone());
     if env::var_os(OPENCLAW_MEM_SERVICE_URL_ENV).is_some() {
         warnings.push(
             "live openclaw-mem service endpoint is configured, but no remote recall wire contract is available in the imported artifacts; using local snapshot/writeback adapter"
@@ -2509,25 +2517,60 @@ fn recall_openclaw_mem_migration_fallback(
         }
     }
 
-    let vector = search_imported_vector_memory(MemoryVectorRecallOptions {
-        harness_home: options.harness_home.clone(),
-        query: query.clone(),
-        limit: options.limit.max(1).min(DEFAULT_VECTOR_CONTEXT_LIMIT),
-    })?;
-    write_memory_vector_recall_receipt(&vector)?;
-    warnings.extend(vector.warnings.clone());
-    if vector.status == MemoryVectorRecallStatus::Ready {
-        backend = "sqlite-vector+service-writeback".to_string();
-        hits.extend(vector.hits.iter().map(|hit| OpenClawMemServiceHit {
-            lane: hit.lane.clone(),
-            id: hit.id.clone(),
-            score: hit.score,
-            title: hit.title.clone(),
-            text: hit.text.clone(),
-            source: hit.source.clone(),
-        }));
+    if scope_policy.global_imported_snapshot_allowed {
+        let vector = search_imported_vector_memory(MemoryVectorRecallOptions {
+            harness_home: options.harness_home.clone(),
+            query: query.clone(),
+            limit: options.limit.max(1).min(DEFAULT_VECTOR_CONTEXT_LIMIT),
+        })?;
+        write_memory_vector_recall_receipt(&vector)?;
+        warnings.extend(vector.warnings.clone());
+        if vector.status == MemoryVectorRecallStatus::Ready {
+            backend = "sqlite-vector+service-writeback".to_string();
+            hits.extend(vector.hits.iter().map(|hit| OpenClawMemServiceHit {
+                lane: hit.lane.clone(),
+                id: hit.id.clone(),
+                score: hit.score,
+                title: hit.title.clone(),
+                text: hit.text.clone(),
+                source: hit.source.clone(),
+            }));
+        } else {
+            let search = search_imported_memory(MemorySearchOptions {
+                harness_home: options.harness_home.clone(),
+                query: query.clone(),
+                limit: options.limit.max(1).min(DEFAULT_MEMORY_CONTEXT_LIMIT),
+                max_file_bytes: if options.max_file_bytes == 0 {
+                    DEFAULT_CONTEXT_MAX_FILE_BYTES
+                } else {
+                    options.max_file_bytes
+                },
+            })?;
+            searched_files = search.searched_files;
+            skipped_files = search.skipped_files;
+            warnings.extend(search.warnings);
+            hits.extend(search.hits.iter().map(|hit| {
+                OpenClawMemServiceHit {
+                    lane: "memory-file".to_string(),
+                    id: format!("{}:{}", hit.path.display(), hit.line),
+                    score: hit.score as f32,
+                    title: hit
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("memory")
+                        .to_string(),
+                    text: hit.snippet.clone(),
+                    source: Some(hit.path.display().to_string()),
+                }
+            }));
+        }
     } else {
-        let search = search_imported_memory(MemorySearchOptions {
+        warnings.push(format!(
+            "global imported memory skipped by per-agent recall policy for agent `{}`",
+            agent_id.as_deref().unwrap_or("unknown")
+        ));
+        let search_options = MemorySearchOptions {
             harness_home: options.harness_home.clone(),
             query: query.clone(),
             limit: options.limit.max(1).min(DEFAULT_MEMORY_CONTEXT_LIMIT),
@@ -2536,10 +2579,23 @@ fn recall_openclaw_mem_migration_fallback(
             } else {
                 options.max_file_bytes
             },
-        })?;
+        };
+        let search = if let Some(agent_id) = agent_id.as_deref() {
+            search_agent_memory(search_options.clone(), agent_id)?
+        } else {
+            search_imported_memory(search_options.clone())?
+        };
+        let global_search = search_imported_memory(search_options)?;
+        if global_search.status == MemorySearchStatus::Ready && !global_search.hits.is_empty() {
+            warnings.push(format!(
+                "filteredGlobalImportedHits={}",
+                global_search.hits.len()
+            ));
+        }
         searched_files = search.searched_files;
         skipped_files = search.skipped_files;
         warnings.extend(search.warnings);
+        warnings.extend(global_search.warnings);
         hits.extend(search.hits.iter().map(|hit| {
             OpenClawMemServiceHit {
                 lane: "memory-file".to_string(),
@@ -2617,7 +2673,7 @@ fn recall_openclaw_mem_migration_fallback(
         policy_source: "harness-legacy".to_string(),
         service_mode,
         query_length,
-        scope_policy: memory_scope_policy(agent_id.clone()),
+        scope_policy,
         trust_policy: memory_trust_policy(),
         hit_count: hits.len(),
         searched_files,
@@ -3034,6 +3090,22 @@ pub fn run_memory_hook_adapter(options: MemoryHookAdapterOptions) -> io::Result<
 
 pub fn search_imported_memory(options: MemorySearchOptions) -> io::Result<MemorySearchReport> {
     let memory_dir = options.harness_home.join("memory");
+    search_memory_dir(options, memory_dir, "imported memory directory")
+}
+
+fn search_agent_memory(
+    options: MemorySearchOptions,
+    agent_id: &str,
+) -> io::Result<MemorySearchReport> {
+    let memory_dir = memory_root_for_agent(&options.harness_home, Some(agent_id)).join("memory");
+    search_memory_dir(options, memory_dir, "agent memory directory")
+}
+
+fn search_memory_dir(
+    options: MemorySearchOptions,
+    memory_dir: PathBuf,
+    missing_label: &str,
+) -> io::Result<MemorySearchReport> {
     let query = options.query.trim().to_string();
     if query.is_empty() {
         return Ok(MemorySearchReport {
@@ -3055,10 +3127,7 @@ pub fn search_imported_memory(options: MemorySearchOptions) -> io::Result<Memory
             harness_home: options.harness_home,
             memory_dir: memory_dir.clone(),
             status: MemorySearchStatus::Failed,
-            reason: format!(
-                "imported memory directory not found at {}",
-                memory_dir.display()
-            ),
+            reason: format!("{missing_label} not found at {}", memory_dir.display()),
             query,
             searched_files: 0,
             skipped_files: 0,
@@ -3109,7 +3178,10 @@ pub fn search_imported_memory(options: MemorySearchOptions) -> io::Result<Memory
                 stack.push(path);
                 continue;
             }
-            if !file_type.is_file() || !is_searchable_memory_file(&path) {
+            if !file_type.is_file()
+                || !is_searchable_memory_file(&path)
+                || is_service_writeback_store_file(&path)
+            {
                 continue;
             }
             let metadata = match entry.metadata() {
@@ -3430,6 +3502,8 @@ pub fn build_memory_prompt_context(
 ) -> io::Result<MemoryPromptContextReport> {
     let query = options.query.trim().to_string();
     let query_length = query.chars().count();
+    let global_policy_allowed =
+        memory_global_imported_snapshot_allowed(options.agent_id.as_deref());
     if query.is_empty() {
         return Ok(MemoryPromptContextReport {
             schema: MEMORY_PROMPT_CONTEXT_RECEIPT_SCHEMA,
@@ -3442,6 +3516,9 @@ pub fn build_memory_prompt_context(
             hit_count: 0,
             searched_files: 0,
             skipped_files: 0,
+            source_scope: "skipped".to_string(),
+            global_imported_snapshot_allowed: global_policy_allowed,
+            filtered_global_imported_hits: 0,
             context: None,
             warnings: Vec::new(),
         });
@@ -3463,12 +3540,19 @@ pub fn build_memory_prompt_context(
                 "memory prompt context prepared from {} openclaw-mem service hit(s)",
                 service.hits.len()
             ),
-            agent_id: options.agent_id,
+            agent_id: options.agent_id.clone(),
             session_key: options.session_key,
             query_length,
             hit_count: service.hits.len(),
             searched_files: service.searched_files,
             skipped_files: service.skipped_files,
+            source_scope: if options.agent_id.is_some() {
+                "agent-service-recall".to_string()
+            } else {
+                "global-service-recall".to_string()
+            },
+            global_imported_snapshot_allowed: global_policy_allowed,
+            filtered_global_imported_hits: 0,
             context: Some(render_openclaw_mem_service_context(
                 &service.hits,
                 service.qdrant_edge_dir.as_deref(),
@@ -3477,16 +3561,53 @@ pub fn build_memory_prompt_context(
         });
     }
 
-    let search = search_imported_memory(MemorySearchOptions {
+    let global_imported_snapshot_allowed = global_policy_allowed;
+    let max_file_bytes = if options.max_file_bytes == 0 {
+        DEFAULT_CONTEXT_MAX_FILE_BYTES
+    } else {
+        options.max_file_bytes
+    };
+    let search_options = MemorySearchOptions {
         harness_home: options.harness_home.clone(),
-        query,
+        query: query.clone(),
         limit: options.limit.max(1).min(DEFAULT_MEMORY_CONTEXT_LIMIT),
-        max_file_bytes: if options.max_file_bytes == 0 {
-            DEFAULT_CONTEXT_MAX_FILE_BYTES
+        max_file_bytes,
+    };
+    let (search, source_scope, filtered_global_imported_hits, mut policy_warnings) =
+        if global_imported_snapshot_allowed {
+            (
+                search_imported_memory(search_options)?,
+                "global-imported".to_string(),
+                0,
+                Vec::new(),
+            )
+        } else if let Some(agent_id) = options.agent_id.as_deref() {
+            let agent_search = search_agent_memory(search_options.clone(), agent_id)?;
+            let global_search = search_imported_memory(search_options)?;
+            let filtered_hits = if global_search.status == MemorySearchStatus::Ready {
+                global_search.hits.len()
+            } else {
+                0
+            };
+            let mut warnings = Vec::new();
+            warnings.push(format!(
+                "global imported memory skipped by per-agent recall policy for agent `{agent_id}`; filteredGlobalImportedHits={filtered_hits}"
+            ));
+            warnings.extend(global_search.warnings);
+            (
+                agent_search,
+                "agent-private".to_string(),
+                filtered_hits,
+                warnings,
+            )
         } else {
-            options.max_file_bytes
-        },
-    })?;
+            (
+                search_imported_memory(search_options)?,
+                "global-imported".to_string(),
+                0,
+                Vec::new(),
+            )
+        };
     let status = match search.status {
         MemorySearchStatus::Failed => MemoryPromptContextStatus::Failed,
         MemorySearchStatus::Ready if search.hits.is_empty() => MemoryPromptContextStatus::NoHits,
@@ -3518,13 +3639,24 @@ pub fn build_memory_prompt_context(
         hit_count: search.hits.len(),
         searched_files: search.searched_files,
         skipped_files: search.skipped_files,
+        source_scope,
+        global_imported_snapshot_allowed,
+        filtered_global_imported_hits,
         context,
         warnings: {
             let mut warnings = service.warnings;
             warnings.extend(search.warnings);
+            warnings.append(&mut policy_warnings);
             warnings
         },
     })
+}
+
+fn memory_global_imported_snapshot_allowed(agent_id: Option<&str>) -> bool {
+    match normalized_agent_id(agent_id) {
+        Some(agent_id) => agent_id == "main",
+        None => true,
+    }
 }
 
 pub fn write_memory_search_receipt(report: &MemorySearchReport) -> io::Result<()> {
@@ -3580,6 +3712,9 @@ pub fn write_memory_prompt_context_receipt(report: &MemoryPromptContextReport) -
         "hitCount": report.hit_count,
         "searchedFiles": report.searched_files,
         "skippedFiles": report.skipped_files,
+        "sourceScope": report.source_scope,
+        "globalImportedSnapshotAllowed": report.global_imported_snapshot_allowed,
+        "filteredGlobalImportedHits": report.filtered_global_imported_hits,
         "warnings": report.warnings,
     });
     fs::write(&last_file, serde_json::to_string_pretty(&value)?)?;
@@ -5594,6 +5729,12 @@ fn is_searchable_memory_file(path: &Path) -> bool {
         })
 }
 
+fn is_service_writeback_store_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "openclaw-mem-service-store.jsonl")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5694,6 +5835,70 @@ mod tests {
         let receipt = fs::read_to_string(memory_prompt_context_latest_file(&harness_home)).unwrap();
         assert!(receipt.contains(r#""hitCount": 1"#));
         assert!(!receipt.contains("Qdrant edge memory"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn non_main_memory_prompt_context_excludes_global_imported_snapshot_by_default() {
+        let root = temp_root(
+            "non_main_memory_prompt_context_excludes_global_imported_snapshot_by_default",
+        );
+        let harness_home = root.join("harness");
+        let global_memory = harness_home.join("memory");
+        let xiao_li_memory =
+            memory_path_for_agent(&harness_home, Some("小小梨"), Path::new("memory/MEMORY.md"));
+        fs::create_dir_all(&global_memory).unwrap();
+        fs::create_dir_all(xiao_li_memory.parent().unwrap()).unwrap();
+        fs::write(
+            global_memory.join("MEMORY.md"),
+            "main-private agent memory: do not show this to public agents.",
+        )
+        .unwrap();
+        fs::write(
+            &xiao_li_memory,
+            "xiao-li public agent memory: allowed non-main recall.",
+        )
+        .unwrap();
+
+        let report = build_memory_prompt_context(MemoryPromptContextOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("小小梨".to_string()),
+            session_key: "telegram:dm:user:xiao-li".to_string(),
+            query: "agent memory".to_string(),
+            limit: 5,
+            max_file_bytes: 0,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, MemoryPromptContextStatus::Ready);
+        assert_eq!(report.source_scope, "agent-service-recall");
+        assert!(!report.global_imported_snapshot_allowed);
+        assert_eq!(report.filtered_global_imported_hits, 0);
+        let context = report.context.as_deref().unwrap();
+        assert!(context.contains("xiao-li public agent memory"));
+        assert!(!context.contains("main-private agent memory"));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("global imported memory skipped"))
+        );
+        write_memory_prompt_context_receipt(&report).unwrap();
+        let prompt_receipt = fs::read_to_string(memory_prompt_context_latest_file_for_agent(
+            &harness_home,
+            Some("小小梨"),
+        ))
+        .unwrap();
+        assert!(prompt_receipt.contains(r#""globalImportedSnapshotAllowed": false"#));
+        assert!(prompt_receipt.contains(r#""sourceScope": "agent-service-recall""#));
+        assert!(!prompt_receipt.contains("main-private agent memory"));
+        let service_receipt = fs::read_to_string(
+            openclaw_mem_service_recall_latest_file_for_agent(&harness_home, Some("小小梨")),
+        )
+        .unwrap();
+        assert!(service_receipt.contains(r#""globalImportedSnapshotAllowed": false"#));
+        assert!(!service_receipt.contains("main-private agent memory"));
 
         let _ = fs::remove_dir_all(root);
     }

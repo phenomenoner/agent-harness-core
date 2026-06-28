@@ -18,6 +18,10 @@ Use `--source-home` for imported prompt files, registry, skills, and legacy cont
 
 `timeout` run-once receipts are terminal for the parent queue id. Runtime selection, status open-item counts, native typing context, and progress delivery all treat the parent turn as closed after a timeout. To retry work, enqueue a new turn or explicit retry id rather than reusing the old queue id.
 
+Round10 adds one guarded exception before terminal timeout selection: when Codex runtime observes an active tool-use item and then hits the idle JSONL timeout, the harness stops the prior app-server/tool path, records `toolUseTimeout` in `agent-harness.codex-runtime-run.v1`, and opens one bounded fresh-thread recovery prompt so the model can decide whether to retry narrowly, use an alternative, or report a blocker. If that recovery output is only external review evidence, it is recorded as `agent-harness.external-review-evidence.v1` and does not close the parent workflow as a final reply. If recovery fails, the resulting timeout remains terminal for the parent queue id. This is an initial guard, not full per-tool supervisor parity.
+
+Context preflight also applies an absolute high-usage guard through `codexContext.highContextUsageCompactTokenLimit` (default `120000`). This covers bound-thread incidents where prompt bytes are modest but prior recorded usage is already very high and no `modelContextWindow` ratio can be computed; the guard forces official compact before the next turn when an existing thread is bound.
+
 Progress delivery state is terminal-monotonic. Once a parent queue id has delivered terminal runtime progress, later stray events for that same queue id must not downgrade the status panel back to non-terminal working state.
 
 Long-running jobs or local services that intentionally outlive the chat turn should be represented as managed worker/background jobs with independent accepted, heartbeat, status, completion, and cancellation receipts.
@@ -154,6 +158,9 @@ Native cron LLM turns use CronRunStore before worker enqueue:
       "telegram:12345": "subtle"
     },
     "progressDeliveryMode": "on",
+    "progressDeliveryMaxNonterminalUpdatesPerLane": 6,
+    "progressDeliveryMaxNonterminalBodyUpdatesPerQueue": 6,
+    "progressDeliveryStatusHeartbeatAfterBodyCapMs": 300000,
     "progressDeliveryAgentModes": {
       "ops": "off"
     },
@@ -183,6 +190,10 @@ Progress delivery modes:
 - `off`: mute eligible progress panels while final `agent-reply` delivery remains unchanged.
 
 `progressDeliveryMode` sets the global default, `progressDeliveryAgentModes` overrides by agent id, and `progressDeliveryChannelModes` overrides by channel selector. Channel selectors use the same progress event identity order as delivery: `platform:channelId:thread:threadId`, `platform:channelId`, `channelId:thread:threadId`, then `channelId`, so a group/topic-specific mute can be narrower than a whole channel mute. Channel overrides win over agent overrides, which win over the global setting. Supported off aliases are `off`, `none`, `hidden`, `disabled`, `disable`, `false`, `mute`, and `muted`; supported on aliases are `on`, `enabled`, `enable`, `true`, `progress_panel`, and `progress-panel`.
+
+`progressDeliveryMaxNonterminalUpdatesPerLane` is the backward-compatible body/action lane cap. `progressDeliveryMaxNonterminalBodyUpdatesPerQueue` is the clearer alias for the same setting. The default is `6`; set it to `0` only for staging when provider-visible churn is acceptable. This cap applies to the event-history body/action lane, not the status/current-step lane.
+
+`progressDeliveryStatusHeartbeatAfterBodyCapMs` controls low-frequency status/current-step heartbeat edits after the body/action lane reaches its cap. The default is `300000` milliseconds. Status heartbeats still obey text-hash dedupe and terminal `Done`/`Failed` convergence bypasses all non-terminal caps.
 
 ## Prompt Files
 

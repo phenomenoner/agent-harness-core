@@ -199,6 +199,14 @@ fn validate_response_object(path: &str, value: &Value, errors: &mut Vec<String>)
             "progressDeliveryMode" | "progress_delivery_mode" => {
                 expect_progress_delivery_mode(path_key(path, key), child, errors)
             }
+            "progressDeliveryMaxNonterminalUpdatesPerLane"
+            | "progress_delivery_max_nonterminal_updates_per_lane"
+            | "progressDeliveryMaxNonterminalBodyUpdatesPerQueue"
+            | "progress_delivery_max_nonterminal_body_updates_per_queue"
+            | "progressDeliveryStatusHeartbeatAfterBodyCapMs"
+            | "progress_delivery_status_heartbeat_after_body_cap_ms" => {
+                expect_u64(path_key(path, key), child, errors)
+            }
             "progressDeliveryAgentModes" | "progress_delivery_agent_modes" => {
                 validate_progress_delivery_mode_map(path_key(path, key), child, errors)
             }

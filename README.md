@@ -129,6 +129,8 @@ See the [Changelog](CHANGELOG.md), the [Roadmap & Backlog](docs/agent-harness-co
 |---|---|
 | [Operations Handbook](docs/agent-harness-operations-handbook.md) | **Start here for operating the harness** — live topology, full command walkthrough, capability ledger. |
 | [Development Handoff](docs/agent-harness-dev-handoff.md) | Architecture, runtime flow, module map, implementation priorities. |
+| [Topology Contract](docs/agent-harness-topology-contract.md) | Identity axes, component ownership, impact matrix, and scenario packs for behavior-changing code reviews. |
+| [Topology Explorer](docs/topology-explorer.html) | Generated interactive browser view of the topology contract, ownership graph, release gates, and open implementation gaps. |
 | [Configuration](docs/configuration.md) | `harness-config.json` reference. |
 | [Worker Dispatch Strategy](docs/agent-worker-dispatch-strategy.md) | Durable workers, cron lanes, subagents, watchdog design. |
 | [Trust Boundaries](docs/trust-boundaries.md) | Where untrusted input enters and how it's bounded. |
