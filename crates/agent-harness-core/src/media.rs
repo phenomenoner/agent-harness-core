@@ -40,6 +40,10 @@ pub struct InboundMediaArtifact {
     pub byte_len: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caption_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction_summary: Option<ArtifactExtractionSummary>,
     pub source: String,
     #[serde(default)]
     pub download_status: InboundMediaDownloadStatus,
@@ -65,12 +69,29 @@ impl Default for InboundMediaArtifact {
             sha256: None,
             byte_len: None,
             caption_preview: None,
+            lifecycle_status: None,
+            extraction_summary: None,
             source: String::new(),
             download_status: InboundMediaDownloadStatus::default(),
             model_attachment_status: InboundMediaModelAttachmentStatus::default(),
             warnings: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactExtractionSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncertainty: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,17 +396,17 @@ pub fn validate_inbound_media_safety(
                     "artifact {index} localPath is outside attachment root"
                 ));
             }
-            if !allowed_image_extension(local_path) {
+            if !allowed_artifact_extension(local_path) {
                 violations.push(format!(
-                    "artifact {index} localPath extension is not allowed"
+                    "artifact {index} localPath extension is not in the allowed artifact set"
                 ));
             }
         }
         if artifact.download_status == InboundMediaDownloadStatus::Downloaded
-            && !is_supported_image_mime(artifact.mime.as_deref())
+            && !is_supported_artifact_mime(artifact.mime.as_deref())
         {
             violations.push(format!(
-                "artifact {index} MIME is not in the allowed image set"
+                "artifact {index} MIME is not in the allowed artifact set"
             ));
         }
     }
@@ -426,9 +447,15 @@ pub fn resolve_inbound_media_artifact_reference(
         return Err("artifact reference is empty".to_string());
     }
     let path = if let Some(relative) = trimmed.strip_prefix("agent-harness://inbound-media/") {
-        let relative = relative.strip_prefix("telegram/").ok_or_else(|| {
-            "artifact URI platform is not supported by this attachment root".to_string()
-        })?;
+        let relative = if let Some(relative) = relative.strip_prefix("telegram/") {
+            relative
+        } else if relative.starts_with("discord/") {
+            relative
+        } else {
+            return Err(
+                "artifact URI platform is not supported by this attachment root".to_string(),
+            );
+        };
         let relative_path = safe_relative_artifact_path(relative)?;
         root.join(relative_path)
     } else {
@@ -549,6 +576,14 @@ fn render_inbound_media_artifact_line(
         "captionPreview",
         artifact.caption_preview.as_deref(),
     );
+    push_optional_field(
+        &mut fields,
+        "lifecycleStatus",
+        artifact.lifecycle_status.as_deref(),
+    );
+    if let Some(summary) = artifact.extraction_summary.as_ref() {
+        push_extraction_summary_fields(&mut fields, summary);
+    }
     fields.push(format!(
         "source={}",
         sanitize_prompt_source_label(&artifact.source)
@@ -570,6 +605,35 @@ fn render_inbound_media_artifact_line(
 fn push_optional_field(fields: &mut Vec<String>, key: &str, value: Option<&str>) {
     if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
         fields.push(format!("{key}={}", sanitize_prompt_field(value)));
+    }
+}
+
+fn push_extraction_summary_fields(fields: &mut Vec<String>, summary: &ArtifactExtractionSummary) {
+    push_optional_field(fields, "artifactClass", summary.artifact_class.as_deref());
+    push_optional_field(fields, "modality", summary.modality.as_deref());
+    if let Some(text) = summary.summary.as_deref() {
+        fields.push(format!(
+            "extractionSummary={}",
+            sanitize_bounded_summary_field(text, 320)
+        ));
+    }
+    if !summary.facts.is_empty() {
+        let facts = summary
+            .facts
+            .iter()
+            .take(6)
+            .map(|fact| sanitize_bounded_summary_field(fact, 160))
+            .filter(|fact| !fact.is_empty())
+            .collect::<Vec<_>>();
+        if !facts.is_empty() {
+            fields.push(format!("extractedFacts={}", facts.join("|")));
+        }
+    }
+    if let Some(text) = summary.uncertainty.as_deref() {
+        fields.push(format!(
+            "uncertainty={}",
+            sanitize_bounded_summary_field(text, 180)
+        ));
     }
 }
 
@@ -659,11 +723,59 @@ fn sanitize_prompt_field(value: &str) -> String {
         .collect::<String>();
     out = out.replace(char::is_whitespace, " ");
     let trimmed = out.trim();
-    if trimmed.len() > 256 {
-        format!("{}...", &trimmed[..256])
+    if prompt_field_contains_artifact_payload(trimmed) {
+        "redacted-artifact-payload".to_string()
+    } else if trimmed.chars().count() > 256 {
+        format!("{}...", truncate_chars(trimmed, 256))
     } else {
         trimmed.to_string()
     }
+}
+
+fn sanitize_bounded_summary_field(value: &str, max_chars: usize) -> String {
+    let sanitized = sanitize_prompt_field(value);
+    if sanitized.chars().count() <= max_chars {
+        sanitized
+    } else {
+        format!("{}...", truncate_chars(&sanitized, max_chars))
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn prompt_field_contains_artifact_payload(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    normalized.contains("data:image")
+        || normalized.contains("data:audio")
+        || normalized.contains("data:video")
+        || normalized.contains(";base64,")
+        || normalized.contains("api.telegram.org")
+        || normalized.contains("cdn.discordapp.com")
+        || normalized.contains("discord.com/api")
+        || normalized.contains("file_id=")
+        || normalized.contains("fileid=")
+        || normalized.contains("bot_token")
+        || normalized.contains("bottoken")
+        || normalized.contains("authorization:")
+        || normalized.contains("cookie:")
+        || looks_like_large_base64(value)
+}
+
+fn looks_like_large_base64(value: &str) -> bool {
+    let mut run = 0usize;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=') {
+            run += 1;
+            if run >= 160 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
 }
 
 fn sanitize_prompt_source_label(value: &str) -> String {
@@ -673,6 +785,8 @@ fn sanitize_prompt_source_label(value: &str) -> String {
         || normalized.contains("token")
         || normalized.contains("file_id")
         || normalized.contains("fileid")
+        || normalized.contains("cookie")
+        || normalized.contains("authorization")
     {
         "redacted-source".to_string()
     } else {
@@ -682,10 +796,11 @@ fn sanitize_prompt_source_label(value: &str) -> String {
 
 fn is_prompt_safe_artifact_uri(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase();
-    !normalized.starts_with("http://")
-        && !normalized.starts_with("https://")
-        && !normalized.contains("bot")
+    (normalized.starts_with("agent-harness://inbound-media/")
+        || normalized.starts_with("agent-harness://artifact/"))
+        && !prompt_field_contains_artifact_payload(value)
         && !normalized.contains("token")
+        && !normalized.contains("bot")
 }
 
 fn title_case_ascii(value: &str) -> String {
@@ -727,13 +842,49 @@ fn is_supported_image_mime(mime: Option<&str>) -> bool {
     })
 }
 
-fn allowed_image_extension(path: &Path) -> bool {
+fn is_supported_artifact_mime(mime: Option<&str>) -> bool {
+    mime.is_some_and(|mime| {
+        matches!(
+            mime.to_ascii_lowercase().as_str(),
+            "image/jpeg"
+                | "image/jpg"
+                | "image/png"
+                | "image/gif"
+                | "image/webp"
+                | "text/plain"
+                | "text/markdown"
+                | "application/json"
+                | "application/pdf"
+                | "audio/mpeg"
+                | "audio/mp3"
+                | "audio/wav"
+                | "audio/x-wav"
+                | "video/mp4"
+                | "video/webm"
+        )
+    })
+}
+
+fn allowed_artifact_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
-                "jpg" | "jpeg" | "png" | "gif" | "webp"
+                "jpg"
+                    | "jpeg"
+                    | "png"
+                    | "gif"
+                    | "webp"
+                    | "txt"
+                    | "md"
+                    | "log"
+                    | "json"
+                    | "pdf"
+                    | "mp3"
+                    | "wav"
+                    | "mp4"
+                    | "webm"
             )
         })
 }
@@ -1138,6 +1289,229 @@ mod tests {
         assert!(!rendered.contains("file_id=secret"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discord_text_artifact_uri_resolves_and_passes_generic_safety() {
+        let root = temp_media_root("discord_text_artifact_uri_resolves_and_passes_generic_safety");
+        let harness_home = root.join(".agent-harness");
+        let attachment = inbound_media_attachment_root(&harness_home)
+            .join("discord")
+            .join("message-1")
+            .join("0.txt");
+        fs::create_dir_all(attachment.parent().unwrap()).unwrap();
+        fs::write(&attachment, b"bounded text").unwrap();
+        let artifacts = vec![InboundMediaArtifact {
+            platform: "discord".to_string(),
+            kind: "attachment-text".to_string(),
+            local_path: Some(attachment.clone()),
+            artifact_uri: Some("agent-harness://inbound-media/discord/message-1/0.txt".to_string()),
+            mime: Some("text/plain".to_string()),
+            byte_len: Some(12),
+            source: "discord.attachment".to_string(),
+            download_status: InboundMediaDownloadStatus::Downloaded,
+            model_attachment_status: InboundMediaModelAttachmentStatus::PromptOnly,
+            ..InboundMediaArtifact::default()
+        }];
+
+        let resolved = resolve_inbound_media_artifact_reference(
+            &harness_home,
+            "agent-harness://inbound-media/discord/message-1/0.txt",
+        )
+        .unwrap();
+        assert_eq!(resolved, attachment);
+
+        let report = validate_inbound_media_safety(
+            &harness_home,
+            &artifacts,
+            InboundMediaSafetyPolicy::default(),
+        );
+        assert!(report.within_limits, "{:?}", report.violations);
+
+        let rendered = render_inbound_media_artifacts_for_prompt(&artifacts, Some(&harness_home));
+        assert!(
+            rendered.contains("artifactUri=agent-harness://inbound-media/discord/message-1/0.txt")
+        );
+        assert!(
+            rendered
+                .contains("localPath=state/channels/telegram-attachments/discord/message-1/0.txt")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn artifact_prompt_hygiene_renders_generic_bounded_summaries_not_payloads() {
+        let root = temp_media_root("artifact_prompt_hygiene_renders_generic_summaries");
+        let harness_home = root.join(".agent-harness");
+        let attachment_root = inbound_media_attachment_root(&harness_home).join("queue-artifacts");
+        fs::create_dir_all(&attachment_root).unwrap();
+        let huge_base64 = "A".repeat(220);
+        let artifacts = vec![
+            generic_artifact(
+                &attachment_root,
+                "0.jpg",
+                "photo",
+                "image",
+                "image/jpeg",
+                "Subject pose, wardrobe, composition, and style constraints extracted.",
+            ),
+            generic_artifact(
+                &attachment_root,
+                "1.wav",
+                "voice-memo",
+                "audio-transcript",
+                "audio/wav",
+                "Two speakers discussed the release gate and one follow-up action.",
+            ),
+            generic_artifact(
+                &attachment_root,
+                "2.mp3",
+                "generated-speech",
+                "generated-speech",
+                "audio/mpeg",
+                "Generated speech output stored as media with only duration and intent summarized.",
+            ),
+            generic_artifact(
+                &attachment_root,
+                "3.png",
+                "browser-capture",
+                "browser-capture",
+                "image/png",
+                "Browser capture summarized by title, capture time, and relevant claims.",
+            ),
+            generic_artifact(
+                &attachment_root,
+                "4.pdf",
+                "downloaded-document",
+                "downloaded-document",
+                "application/pdf",
+                "Downloaded document summarized by title, source label, and extracted claims.",
+            ),
+            generic_artifact(
+                &attachment_root,
+                "5.log",
+                "tool-log",
+                "tool-log",
+                "text/plain",
+                "Large tool log summarized by command, exit status, findings, and next action.",
+            ),
+            generic_artifact(
+                &attachment_root,
+                "6.json",
+                "worker-report",
+                "worker-report",
+                "application/json",
+                "Worker dataset and report summarized with artifact pointers and result counts.",
+            ),
+            InboundMediaArtifact {
+                platform: "discord".to_string(),
+                kind: "provider-native-media".to_string(),
+                artifact_uri: Some(
+                    "https://cdn.discordapp.com/attachments/private/raw.png".to_string(),
+                ),
+                mime: Some("image/png".to_string()),
+                sha256: Some("sha-provider".to_string()),
+                byte_len: Some(4096),
+                caption_preview: Some(format!("data:image/png;base64,{huge_base64}")),
+                lifecycle_status: Some("summarized".to_string()),
+                extraction_summary: Some(ArtifactExtractionSummary {
+                    artifact_class: Some("provider-native-media".to_string()),
+                    modality: Some("image".to_string()),
+                    summary: Some(
+                        "Provider-native attachment was copied into artifact storage before use."
+                            .to_string(),
+                    ),
+                    facts: vec![
+                        "raw provider URL intentionally withheld from main prompt".to_string(),
+                    ],
+                    uncertainty: Some("raw bytes require artifact lookup".to_string()),
+                }),
+                source: "https://cdn.discordapp.com/attachments/private/raw.png?token=secret"
+                    .to_string(),
+                download_status: InboundMediaDownloadStatus::Downloaded,
+                model_attachment_status: InboundMediaModelAttachmentStatus::PromptOnly,
+                warnings: vec!["Cookie: secret".to_string()],
+                ..InboundMediaArtifact::default()
+            },
+        ];
+
+        let rendered = render_inbound_media_artifacts_for_prompt(&artifacts, Some(&harness_home));
+
+        for expected in [
+            "artifactClass=image",
+            "artifactClass=audio-transcript",
+            "artifactClass=generated-speech",
+            "artifactClass=browser-capture",
+            "artifactClass=downloaded-document",
+            "artifactClass=tool-log",
+            "artifactClass=worker-report",
+            "artifactClass=provider-native-media",
+            "lifecycleStatus=summarized",
+            "extractionSummary=Subject pose",
+            "Large tool log summarized by command",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing `{expected}` in {rendered}"
+            );
+        }
+        for forbidden in [
+            "data:image",
+            "base64",
+            "cdn.discordapp.com",
+            "token=secret",
+            "Cookie: secret",
+            &huge_base64,
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "artifact prompt hygiene leaked `{forbidden}` in {rendered}"
+            );
+        }
+        assert!(rendered.contains("artifactUri=redacted-provider-uri"));
+        assert!(rendered.contains("captionPreview=redacted-artifact-payload"));
+        assert!(rendered.contains("source=redacted-source"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn generic_artifact(
+        attachment_root: &Path,
+        file_name: &str,
+        kind: &str,
+        artifact_class: &str,
+        mime: &str,
+        summary: &str,
+    ) -> InboundMediaArtifact {
+        let local_path = attachment_root.join(file_name);
+        fs::write(&local_path, b"artifact placeholder").unwrap();
+        InboundMediaArtifact {
+            platform: "telegram".to_string(),
+            kind: kind.to_string(),
+            local_path: Some(local_path),
+            artifact_uri: Some(format!(
+                "agent-harness://inbound-media/telegram/queue-artifacts/{file_name}"
+            )),
+            mime: Some(mime.to_string()),
+            sha256: Some(format!("sha-{file_name}")),
+            byte_len: Some(20),
+            lifecycle_status: Some("summarized".to_string()),
+            extraction_summary: Some(ArtifactExtractionSummary {
+                artifact_class: Some(artifact_class.to_string()),
+                modality: Some(kind.to_string()),
+                summary: Some(summary.to_string()),
+                facts: vec![
+                    format!("{artifact_class} bounded fact one"),
+                    "artifact reference retained for raw inspection".to_string(),
+                ],
+                uncertainty: Some("details beyond summary require artifact lookup".to_string()),
+            }),
+            source: format!("{artifact_class}-artifact-store"),
+            download_status: InboundMediaDownloadStatus::Downloaded,
+            model_attachment_status: InboundMediaModelAttachmentStatus::PromptOnly,
+            ..InboundMediaArtifact::default()
+        }
     }
 
     fn temp_media_root(test_name: &str) -> PathBuf {

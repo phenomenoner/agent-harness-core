@@ -263,27 +263,34 @@ pub fn assemble_prompt_bundle(
                 now_ms: current_log_time_ms().unwrap_or(0),
             })?;
             warnings.extend(recall_plan.warnings.clone());
-            let memory = build_memory_prompt_context(MemoryPromptContextOptions {
-                harness_home: harness_home.clone(),
-                agent_id: agent_id.clone(),
-                session_key: plan.session_key.clone(),
-                query: plan.message_text.clone(),
-                limit: 5,
-                max_file_bytes: 0,
-            })?;
-            write_memory_prompt_context_receipt(&memory)?;
-            warnings.extend(memory.warnings.clone());
-            if memory.status == MemoryPromptContextStatus::Ready
-                && let Some(mut context) = memory.context
-            {
-                context = maybe_pack_memory_context(
-                    context,
-                    harness_home,
-                    agent_id.as_deref(),
-                    &plan.session_key,
-                    &options.memory_pack,
-                )?;
-                sections.push(memory_context_section(context));
+            if is_new_task_memory_boundary(plan) {
+                warnings.push(
+                    "/new task boundary suppressed imported memory context for fresh session"
+                        .to_string(),
+                );
+            } else {
+                let memory = build_memory_prompt_context(MemoryPromptContextOptions {
+                    harness_home: harness_home.clone(),
+                    agent_id: agent_id.clone(),
+                    session_key: plan.session_key.clone(),
+                    query: plan.message_text.clone(),
+                    limit: 5,
+                    max_file_bytes: 0,
+                })?;
+                write_memory_prompt_context_receipt(&memory)?;
+                warnings.extend(memory.warnings.clone());
+                if memory.status == MemoryPromptContextStatus::Ready
+                    && let Some(mut context) = memory.context
+                {
+                    context = maybe_pack_memory_context(
+                        context,
+                        harness_home,
+                        agent_id.as_deref(),
+                        &plan.session_key,
+                        &options.memory_pack,
+                    )?;
+                    sections.push(memory_context_section(context));
+                }
             }
         }
 
@@ -673,6 +680,12 @@ fn prompt_file_role(name: &str) -> &'static str {
             "Imported workspace prompt file; follow its instructions according to the file title and content."
         }
     }
+}
+
+fn is_new_task_memory_boundary(plan: &TurnPlan) -> bool {
+    plan.channel_state.as_ref().is_some_and(|state| {
+        state.last_command.as_deref() == Some("new") && state.active_session_key == plan.session_key
+    })
 }
 
 fn session_continuity_section(notes: Vec<String>) -> PromptSection {
@@ -2017,6 +2030,84 @@ mod tests {
                 .join("prompt-context-receipts.jsonl")
                 .is_file()
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prompt_bundle_new_command_boundary_skips_prior_task_memory_context() {
+        let root = temp_root("prompt_bundle_new_command_boundary_skips_prior_task_memory_context");
+        let source = write_prompt_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let memory = harness_home.join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        fs::write(
+            memory.join("MEMORY.md"),
+            "old-social-image-continuation: keep working on the previous new six-image set.",
+        )
+        .unwrap();
+        write_channel_state(
+            &harness_home,
+            r#"{
+              "schema": "agent-harness.channel-session-state.v1",
+              "platform": "telegram",
+              "channelId": "dm",
+              "userId": "user",
+              "activeSessionKey": "telegram:dm:user:main:session-new",
+              "agentId": "main",
+              "provider": "openai",
+              "model": "gpt-5",
+              "sessionTopic": null,
+              "modelOverride": null,
+              "modelOverrideProvider": null,
+              "modelOverrideModel": null,
+              "thinkingEnabled": false,
+              "thinkingInstruction": null,
+              "stopRequested": false,
+              "stopReason": null,
+              "steeringNotes": [],
+              "btwNotes": [],
+              "lastCommand": "new",
+              "updatedAtMs": 1001
+            }"#,
+        );
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "new six-image set".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: Some("telegram:dm:user:main:session-new".to_string()),
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        let bundle = assemble_prompt_bundle(
+            &plan,
+            PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!bundle.sections.iter().any(|section| {
+            section.kind == PromptSectionKind::MemoryContext
+                && section.content.contains("old-social-image-continuation")
+        }));
+        assert!(bundle.warnings.iter().any(|warning| {
+            warning.contains("/new task boundary suppressed imported memory context")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }

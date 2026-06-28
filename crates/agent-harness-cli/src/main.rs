@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -12,6 +12,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ring::digest;
 use serde::Serialize;
 
 mod telegram_media;
@@ -20,29 +21,31 @@ use agent_harness_core::{
     ActivationReadinessOptions, ActivationReadinessReport, AdmissionDecisionOptions,
     AgentProgressDeliveryAction, AgentProgressDeliveryPending, AgentProgressDeliveryPlanOptions,
     AgentProgressDeliveryRecordOptions, AgentProgressDeliveryStatus, AgentRegistry, AgentSource,
-    AssistantNarrationMode, BackgroundTaskListOptions, BackgroundTaskRecord,
-    BackgroundTaskUpsertOptions, BudgetAcquireOptions, BuiltinHarnessSkillSyncOptions,
-    BuiltinHarnessSkillSyncReport, ChannelCommand, ChannelCommandApplyOptions,
-    ChannelCommandApplyReport, ChannelDeliveryIntentKind, ChannelDeliveryReceipt,
-    ChannelDeliveryRecordOptions, ChannelDeliveryStatus, ChannelIdentityLookup,
-    ChannelIdentityResolutionStatus, ChannelOutboundAttachment, ChannelOutboundAttachmentKind,
-    ChannelOutboundMessage, ChannelOutboxPlanOptions, ChannelOutboxPlanReport,
-    ChannelReceiveOptions, ChannelReceiveReport, ChannelRunOnceOptions, ChannelRunOnceReport,
-    ChannelStep, CodexRuntimeCompletionOptions, CodexRuntimeCompletionReport,
+    ArtifactExtractionSummary, AssistantNarrationMode, BackgroundTaskListOptions,
+    BackgroundTaskRecord, BackgroundTaskUpsertOptions, BudgetAcquireOptions,
+    BuiltinHarnessSkillSyncOptions, BuiltinHarnessSkillSyncReport, ChannelCommand,
+    ChannelCommandApplyOptions, ChannelCommandApplyReport, ChannelDeliveryIntentKind,
+    ChannelDeliveryReceipt, ChannelDeliveryRecordOptions, ChannelDeliveryStatus,
+    ChannelIdentityLookup, ChannelIdentityResolutionStatus, ChannelOutboundAttachment,
+    ChannelOutboundAttachmentKind, ChannelOutboundMessage, ChannelOutboxPlanOptions,
+    ChannelOutboxPlanReport, ChannelReceiveOptions, ChannelReceiveReport, ChannelRunOnceOptions,
+    ChannelRunOnceReport, ChannelStep, CodexRuntimeCompletionOptions, CodexRuntimeCompletionReport,
     CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReport, CodexRuntimePlanOptions,
     CodexRuntimePlanReport, CodexRuntimePreflightOptions, CodexRuntimePreflightReport,
     CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy, ContextPackParseOptions,
     ContextRolloverRequeuePreparedOptions, CreateOperationPlanOptions, CronRunControlAction,
     CronRunControlOptions, CronRunListOptions, CronSchedulerLintStatus,
-    CronSchedulerRunOnceOptions, CronSchedulerTickStatus, DEFAULT_MEMORY_BACKFILL_BATCH_SIZE,
-    DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS, DEFAULT_MEMORY_BACKFILL_MAX_ITEMS,
-    DEFAULT_MEMORY_BACKFILL_RATE_LIMIT_PER_MINUTE, DEFAULT_MEMORY_BACKFILL_RETRY_CAP,
-    DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION, DEFAULT_MEMORY_OWNER_HEARTBEAT_MAX_AGE_MS,
-    DeterministicCronPlan, DeterministicCronPlanInput, DeterministicCronWorkerEnqueueOptions,
-    DriftCheckOptions, DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel,
-    HarnessLogRotationOptions, HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport,
-    HealthzOptions, ImportPhaseStatus, ImportReport, LearningProposalOptions, LiveControlAction,
-    McpRequestOptions, MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport,
+    CronSchedulerRunOnceOptions, CronSchedulerTickStatus, DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM,
+    DEFAULT_MEMORY_BACKFILL_BATCH_SIZE, DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS,
+    DEFAULT_MEMORY_BACKFILL_MAX_ITEMS, DEFAULT_MEMORY_BACKFILL_RATE_LIMIT_PER_MINUTE,
+    DEFAULT_MEMORY_BACKFILL_RETRY_CAP, DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION,
+    DEFAULT_MEMORY_OWNER_HEARTBEAT_MAX_AGE_MS, DeterministicCronPlan, DeterministicCronPlanInput,
+    DeterministicCronWorkerEnqueueOptions, DriftCheckOptions, DryRunImportOptions,
+    ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel, HarnessLogRotationOptions,
+    HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport, HealthzOptions,
+    ImportPhaseStatus, ImportReport, InboundMediaArtifact, InboundMediaDownloadStatus,
+    InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant, LearningProposalOptions,
+    LiveControlAction, McpRequestOptions, MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport,
     MemoryCanvasWorkerStatus, MemoryCredentialsExportOptions, MemoryCredentialsExportReport,
     MemoryEmbeddingBackfillLane, MemoryEmbeddingBackfillOptions, MemoryEmbeddingBackfillReport,
     MemoryHookAdapterOptions, MemoryHookKind, MemoryOwnerEndpointProbeOptions,
@@ -127,6 +130,9 @@ use agent_harness_core::{
 const DEFAULT_CODEX_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 const DEFAULT_CODEX_IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 const DEFAULT_RUNTIME_SAFE_MODE_RESTART_MS: u64 = 60_000;
+const DISCORD_ATTACHMENT_TEXT_EXTRACT_MAX_BYTES: usize = 16 * 1024;
+const DISCORD_ATTACHMENT_DOWNLOAD_MAX_BYTES: usize =
+    DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM as usize;
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -3599,6 +3605,10 @@ fn execute_progress_delivery_once(
         platform: args.platform.clone(),
         now_ms: current_time_ms()?,
         min_update_interval_ms: args.min_update_interval_ms,
+        max_nonterminal_updates_per_lane: AgentProgressDeliveryPlanOptions::default()
+            .max_nonterminal_updates_per_lane,
+        status_heartbeat_after_body_cap_ms: AgentProgressDeliveryPlanOptions::default()
+            .status_heartbeat_after_body_cap_ms,
         max_events_per_panel: args.max_events_per_panel,
         max_preview_chars: args.max_preview_chars,
         current_step_max_chars: args.current_step_max_chars,
@@ -3608,6 +3618,7 @@ fn execute_progress_delivery_once(
     let policy = channel_access_policy(&args.target_home)?;
     let pending_count = plan.pending.len();
     let skipped_muted = plan.summary.skipped_muted;
+    let volume_limited = plan.summary.volume_limited;
     let mut sent_messages = 0usize;
     let mut edited_messages = 0usize;
     let mut skipped_denied = 0usize;
@@ -3690,6 +3701,7 @@ fn execute_progress_delivery_once(
     let report = ProgressDeliveryOnceReport {
         pending_count,
         skipped_muted,
+        volume_limited,
         sent_messages,
         edited_messages,
         skipped_denied,
@@ -5370,7 +5382,7 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
             write_discord_event_receipt(&report)?;
             report
         }
-        Some(message) => {
+        Some(mut message) => {
             let message_text = discord_message_text(&message);
             let report = match discord_access_decision(&access_policy, &message) {
                 ChannelAccessDecision::Denied(reason) => DiscordEventRunOnceReport {
@@ -5432,6 +5444,11 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
                                 run: None,
                             }
                         } else {
+                            attach_discord_message_artifacts(
+                                &args.target_home,
+                                &mut message,
+                                &HttpDiscordAttachmentFetcher,
+                            )?;
                             if let Ok(token) = discord_bot_token(
                                 &args.target_home,
                                 args.discord_account.as_deref(),
@@ -5461,7 +5478,7 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
                                 session_key: None,
                                 message: message_text,
                                 inbound_context: message.inbound_context.clone(),
-                                inbound_media_artifacts: Vec::new(),
+                                inbound_media_artifacts: message.inbound_media_artifacts.clone(),
                                 skill_limit: args.skill_limit,
                                 now_ms: current_time_ms()?,
                                 codex_executable: args.codex_exe.clone(),
@@ -8591,6 +8608,7 @@ struct ProgressDeliveryLoopArgs {
 struct ProgressDeliveryOnceReport {
     pending_count: usize,
     skipped_muted: usize,
+    volume_limited: usize,
     sent_messages: usize,
     edited_messages: usize,
     skipped_denied: usize,
@@ -8729,8 +8747,21 @@ struct DiscordGatewayMessage {
     user_id: String,
     content: String,
     inbound_context: Option<String>,
+    inbound_media_artifacts: Vec<InboundMediaArtifact>,
+    attachments: Vec<DiscordAttachmentMetadata>,
     reply_context: Option<DiscordReplyContext>,
     author_is_bot: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscordAttachmentMetadata {
+    id: Option<String>,
+    filename: Option<String>,
+    content_type: Option<String>,
+    size: Option<u64>,
+    width: Option<u32>,
+    height: Option<u32>,
+    url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14454,6 +14485,7 @@ fn parse_discord_gateway_message(
         .get("bot")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let attachments = discord_attachment_metadata(payload);
     let reply_context = discord_reply_context(payload);
     let inbound_context = discord_inbound_context(payload);
 
@@ -14464,6 +14496,8 @@ fn parse_discord_gateway_message(
         user_id: user_id.to_string(),
         content: content.to_string(),
         inbound_context,
+        inbound_media_artifacts: Vec::new(),
+        attachments,
         reply_context,
         author_is_bot,
     }))
@@ -14642,6 +14676,369 @@ fn discord_attachment_context_lines(payload: &serde_json::Value) -> Vec<String> 
             ));
             format!("- {}", parts.join(" "))
         })
+        .collect()
+}
+
+fn discord_attachment_metadata(payload: &serde_json::Value) -> Vec<DiscordAttachmentMetadata> {
+    let Some(attachments) = payload
+        .get("attachments")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    attachments
+        .iter()
+        .take(12)
+        .map(|attachment| DiscordAttachmentMetadata {
+            id: attachment
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string),
+            filename: attachment
+                .get("filename")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string),
+            content_type: attachment
+                .get("content_type")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string),
+            size: attachment.get("size").and_then(serde_json::Value::as_u64),
+            width: attachment
+                .get("width")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok()),
+            height: attachment
+                .get("height")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok()),
+            url: attachment
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string),
+        })
+        .collect()
+}
+
+trait DiscordAttachmentFetcher {
+    fn fetch_attachment(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>, String>;
+}
+
+struct HttpDiscordAttachmentFetcher;
+
+impl DiscordAttachmentFetcher for HttpDiscordAttachmentFetcher {
+    fn fetch_attachment(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+        let response = channel_http_short_agent()
+            .get(url)
+            .call()
+            .map_err(discord_http_error)?;
+        read_response_with_limit(response, max_bytes)
+    }
+}
+
+fn read_response_with_limit(response: ureq::Response, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut reader = response.into_reader().take((max_bytes + 1) as u64);
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("Discord attachment response could not be read: {err}"))?;
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "Discord attachment exceeded maxBytesPerItem={max_bytes}"
+        ));
+    }
+    Ok(bytes)
+}
+
+fn attach_discord_message_artifacts<F: DiscordAttachmentFetcher>(
+    harness_home: &Path,
+    message: &mut DiscordGatewayMessage,
+    fetcher: &F,
+) -> Result<(), String> {
+    let mut artifacts = Vec::new();
+    for (index, attachment) in message.attachments.iter().enumerate() {
+        artifacts.push(discord_attachment_artifact(
+            harness_home,
+            &message.message_id,
+            index,
+            attachment,
+            fetcher,
+        )?);
+    }
+    message.inbound_media_artifacts = artifacts;
+    Ok(())
+}
+
+fn discord_attachment_artifact<F: DiscordAttachmentFetcher>(
+    harness_home: &Path,
+    message_id: &str,
+    index: usize,
+    attachment: &DiscordAttachmentMetadata,
+    fetcher: &F,
+) -> Result<InboundMediaArtifact, String> {
+    let expected_mime = normalized_discord_attachment_mime(attachment.content_type.as_deref());
+    let filename = attachment.filename.as_deref().unwrap_or("attachment");
+    let mut artifact = InboundMediaArtifact {
+        platform: "discord".to_string(),
+        kind: discord_attachment_kind(expected_mime.as_deref()),
+        message_id: Some(message_id.to_string()),
+        selected_variant: Some(InboundMediaSelectedVariant {
+            width: attachment.width,
+            height: attachment.height,
+            file_size: attachment.size,
+        }),
+        mime: expected_mime.clone(),
+        byte_len: attachment.size,
+        source: "discord.attachment".to_string(),
+        model_attachment_status: InboundMediaModelAttachmentStatus::PromptOnly,
+        ..InboundMediaArtifact::default()
+    };
+    if let Some(size) = attachment.size
+        && size > DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM
+    {
+        artifact.download_status = InboundMediaDownloadStatus::DownloadFailed;
+        artifact.warnings.push(format!(
+            "discord attachment metadata exceeded maxBytesPerItem={DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM}"
+        ));
+        return Ok(artifact);
+    }
+    let Some(url) = attachment.url.as_deref() else {
+        artifact.download_status = InboundMediaDownloadStatus::DetectedSkipped;
+        artifact
+            .warnings
+            .push("discord attachment URL was not present in gateway payload".to_string());
+        return Ok(artifact);
+    };
+    if !discord_attachment_url_allowed(url) {
+        artifact.download_status = InboundMediaDownloadStatus::DownloadFailed;
+        artifact.warnings.push(
+            "discord attachment URL was outside the supported Discord media attachment hosts"
+                .to_string(),
+        );
+        return Ok(artifact);
+    }
+    let bytes = match fetcher.fetch_attachment(url, DISCORD_ATTACHMENT_DOWNLOAD_MAX_BYTES) {
+        Ok(bytes) => bytes,
+        Err(_error) => {
+            artifact.download_status = InboundMediaDownloadStatus::DownloadFailed;
+            artifact.warnings.push(
+                "discord attachment download failed; attachment content was not included"
+                    .to_string(),
+            );
+            return Ok(artifact);
+        }
+    };
+    artifact.byte_len = Some(bytes.len() as u64);
+    let image_mime_from_bytes = discord_image_mime_from_bytes(&bytes);
+    let detected_mime = detect_discord_attachment_mime(&bytes, expected_mime.as_deref());
+    if let Some(mime) = detected_mime.as_deref() {
+        artifact.mime = Some(mime.to_string());
+        artifact.kind = discord_attachment_kind(Some(mime));
+    }
+    if expected_mime
+        .as_deref()
+        .is_some_and(|mime| mime.starts_with("image/"))
+    {
+        match image_mime_from_bytes {
+            Some(mime) if Some(mime) == expected_mime.as_deref() => {}
+            Some(_) => {
+                artifact.download_status = InboundMediaDownloadStatus::DownloadFailed;
+                artifact
+                    .warnings
+                    .push("downloaded image MIME did not match Discord metadata".to_string());
+                return Ok(artifact);
+            }
+            None => {
+                artifact.download_status = InboundMediaDownloadStatus::DownloadFailed;
+                artifact
+                    .warnings
+                    .push("downloaded image bytes were not a supported image".to_string());
+                return Ok(artifact);
+            }
+        }
+    }
+    let extension = discord_attachment_extension(filename, detected_mime.as_deref());
+    let relative_name = format!(
+        "discord/{}/{}.{}",
+        safe_discord_artifact_segment(message_id),
+        index,
+        extension
+    );
+    let local_path = agent_harness_core::inbound_media_attachment_root(harness_home)
+        .join(relative_name.replace('/', std::path::MAIN_SEPARATOR_STR));
+    if let Some(parent) = local_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    fs::write(&local_path, &bytes).map_err(|err| err.to_string())?;
+
+    artifact.download_status = InboundMediaDownloadStatus::Downloaded;
+    artifact.local_path = Some(local_path);
+    artifact.artifact_uri = Some(format!(
+        "agent-harness://inbound-media/discord/{}/{}.{}",
+        safe_discord_artifact_segment(message_id),
+        index,
+        extension
+    ));
+    artifact.sha256 = Some(sha256_hex(&bytes));
+    if is_discord_text_mime(detected_mime.as_deref()) {
+        artifact.extraction_summary = Some(discord_text_attachment_extraction_summary(&bytes));
+    }
+    Ok(artifact)
+}
+
+fn discord_attachment_url_allowed(url: &str) -> bool {
+    let trimmed = url.trim();
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let host_end = rest
+        .find(|ch| matches!(ch, '/' | '?' | '#'))
+        .unwrap_or(rest.len());
+    let host = rest[..host_end].to_ascii_lowercase();
+    if !matches!(host.as_str(), "cdn.discordapp.com" | "media.discordapp.net") {
+        return false;
+    }
+    let path = &rest[host_end..];
+    path.starts_with("/attachments/") || path.starts_with("/ephemeral-attachments/")
+}
+
+fn normalized_discord_attachment_mime(content_type: Option<&str>) -> Option<String> {
+    content_type
+        .and_then(|mime| mime.split(';').next())
+        .map(str::trim)
+        .filter(|mime| !mime.is_empty())
+        .map(|mime| match mime.to_ascii_lowercase().as_str() {
+            "image/jpg" => "image/jpeg".to_string(),
+            normalized => normalized.to_string(),
+        })
+}
+
+fn detect_discord_attachment_mime(bytes: &[u8], expected_mime: Option<&str>) -> Option<String> {
+    discord_image_mime_from_bytes(bytes)
+        .map(ToString::to_string)
+        .or_else(|| {
+            expected_mime
+                .filter(|mime| is_discord_text_mime(Some(mime)))
+                .map(ToString::to_string)
+        })
+        .or_else(|| expected_mime.map(ToString::to_string))
+}
+
+fn discord_attachment_kind(mime: Option<&str>) -> String {
+    if is_discord_image_mime(mime) {
+        "attachment-image".to_string()
+    } else if is_discord_text_mime(mime) {
+        "attachment-text".to_string()
+    } else {
+        "attachment-document".to_string()
+    }
+}
+
+fn is_discord_image_mime(mime: Option<&str>) -> bool {
+    matches!(
+        mime,
+        Some("image/jpeg" | "image/jpg" | "image/png" | "image/gif" | "image/webp")
+    )
+}
+
+fn is_discord_text_mime(mime: Option<&str>) -> bool {
+    mime.is_some_and(|mime| {
+        mime == "text/plain"
+            || mime == "text/markdown"
+            || mime == "application/json"
+            || mime.ends_with("+json")
+    })
+}
+
+fn discord_image_mime_from_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+fn discord_attachment_extension(filename: &str, mime: Option<&str>) -> String {
+    match mime {
+        Some("image/jpeg" | "image/jpg") => "jpg".to_string(),
+        Some("image/png") => "png".to_string(),
+        Some("image/gif") => "gif".to_string(),
+        Some("image/webp") => "webp".to_string(),
+        Some("text/plain") => "txt".to_string(),
+        Some("text/markdown") => "md".to_string(),
+        Some("application/json") => "json".to_string(),
+        Some(mime) if mime.ends_with("+json") => "json".to_string(),
+        _ => Path::new(filename)
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(safe_discord_artifact_segment)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "bin".to_string()),
+    }
+}
+
+fn safe_discord_artifact_segment(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
+}
+
+fn discord_text_attachment_extraction_summary(bytes: &[u8]) -> ArtifactExtractionSummary {
+    let included = bytes
+        .get(..bytes.len().min(DISCORD_ATTACHMENT_TEXT_EXTRACT_MAX_BYTES))
+        .unwrap_or(bytes);
+    let text = String::from_utf8_lossy(included);
+    let mut summary = text
+        .chars()
+        .map(|ch| {
+            if ch.is_control() && ch != '\n' && ch != '\t' {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated = bytes.len() > DISCORD_ATTACHMENT_TEXT_EXTRACT_MAX_BYTES;
+    if truncated {
+        summary.push_str(" [truncated]");
+    }
+    ArtifactExtractionSummary {
+        artifact_class: Some("document".to_string()),
+        modality: Some("text".to_string()),
+        summary: Some(summary),
+        facts: Vec::new(),
+        uncertainty: Some(
+            "bounded text extraction from Discord attachment; attachment content is untrusted"
+                .to_string(),
+        ),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = digest::digest(&digest::SHA256, bytes);
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
         .collect()
 }
 
@@ -18289,6 +18686,7 @@ fn print_progress_delivery_once_report(report: &ProgressDeliveryOnceReport) {
     println!("Agent progress delivery once");
     println!("Pending panels: {}", report.pending_count);
     println!("Muted events: {}", report.skipped_muted);
+    println!("Volume-limited panels: {}", report.volume_limited);
     println!("Sent panels: {}", report.sent_messages);
     println!("Edited panels: {}", report.edited_messages);
     println!("Denied panels: {}", report.skipped_denied);
@@ -19425,6 +19823,30 @@ mod tests {
     use super::*;
     use agent_harness_core::{AGENT_HARNESS_CONTEXT_PACK_SCHEMA, OPENCLAW_MEM_CONTEXT_PACK_SCHEMA};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct StaticDiscordAttachmentFetcher {
+        bytes_by_url: BTreeMap<String, Vec<u8>>,
+    }
+
+    impl StaticDiscordAttachmentFetcher {
+        fn new(entries: Vec<(&str, Vec<u8>)>) -> Self {
+            Self {
+                bytes_by_url: entries
+                    .into_iter()
+                    .map(|(url, bytes)| (url.to_string(), bytes))
+                    .collect(),
+            }
+        }
+    }
+
+    impl DiscordAttachmentFetcher for StaticDiscordAttachmentFetcher {
+        fn fetch_attachment(&self, url: &str, _max_bytes: usize) -> Result<Vec<u8>, String> {
+            self.bytes_by_url
+                .get(url)
+                .cloned()
+                .ok_or_else(|| format!("missing fixture for {url}"))
+        }
+    }
 
     fn set(values: &[&str]) -> BTreeSet<String> {
         values.iter().map(|value| value.to_string()).collect()
@@ -20671,6 +21093,8 @@ mod tests {
             user_id: user_id.to_string(),
             content: "hello".to_string(),
             inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            attachments: Vec::new(),
             reply_context: None,
             author_is_bot: false,
         }
@@ -21149,6 +21573,340 @@ mod tests {
                 .and_then(serde_json::Value::as_bool),
             Some(true)
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discord_gateway_text_attachment_becomes_bounded_artifact_metadata() {
+        let root =
+            cli_temp_root("discord_gateway_text_attachment_becomes_bounded_artifact_metadata");
+        let harness_home = root.join("harness");
+        let payload = serde_json::json!({
+            "id": "message-1",
+            "channel_id": "channel-1",
+            "content": "",
+            "author": { "id": "user-1" },
+            "attachments": [{
+                "id": "att-1",
+                "filename": "message.txt",
+                "content_type": "text/plain; charset=utf-8",
+                "size": 38,
+                "url": "https://cdn.discordapp.com/attachments/private/message.txt?token=secret"
+            }]
+        });
+        let mut message = parse_discord_gateway_message(&payload).unwrap().unwrap();
+        let bytes = b"hello from attachment\nsecond line".to_vec();
+
+        attach_discord_message_artifacts(
+            &harness_home,
+            &mut message,
+            &StaticDiscordAttachmentFetcher::new(vec![(
+                "https://cdn.discordapp.com/attachments/private/message.txt?token=secret",
+                bytes.clone(),
+            )]),
+        )
+        .unwrap();
+
+        assert_eq!(message.inbound_media_artifacts.len(), 1);
+        let artifact = &message.inbound_media_artifacts[0];
+        assert_eq!(artifact.platform, "discord");
+        assert_eq!(artifact.kind, "attachment-text");
+        assert_eq!(artifact.message_id.as_deref(), Some("message-1"));
+        assert_eq!(artifact.mime.as_deref(), Some("text/plain"));
+        assert_eq!(artifact.byte_len, Some(bytes.len() as u64));
+        assert_eq!(
+            artifact.download_status,
+            InboundMediaDownloadStatus::Downloaded
+        );
+        assert_eq!(
+            artifact.model_attachment_status,
+            InboundMediaModelAttachmentStatus::PromptOnly
+        );
+        assert_eq!(
+            artifact
+                .extraction_summary
+                .as_ref()
+                .and_then(|summary| summary.summary.as_deref()),
+            Some("hello from attachment second line")
+        );
+        let local_path = artifact.local_path.as_ref().unwrap();
+        assert!(local_path.is_file());
+        assert_eq!(fs::read(local_path).unwrap(), bytes);
+        let rendered = agent_harness_core::render_inbound_media_artifacts_for_prompt(
+            &message.inbound_media_artifacts,
+            Some(&harness_home),
+        );
+        assert!(
+            rendered.contains("artifactUri=agent-harness://inbound-media/discord/message-1/0.txt")
+        );
+        assert!(rendered.contains("extractionSummary=hello from attachment second line"));
+        assert!(!rendered.contains("cdn.discordapp.com"));
+        assert!(!rendered.contains("token=secret"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discord_gateway_rejects_non_discord_attachment_url_without_fetching() {
+        let root = cli_temp_root("discord_gateway_rejects_non_discord_attachment_url");
+        let harness_home = root.join("harness");
+        let payload = serde_json::json!({
+            "id": "message-untrusted-url",
+            "channel_id": "channel-1",
+            "content": "",
+            "author": { "id": "user-1" },
+            "attachments": [{
+                "id": "att-untrusted-url",
+                "filename": "message.txt",
+                "content_type": "text/plain",
+                "size": 15,
+                "url": "https://example.com/attachments/private/message.txt?token=secret"
+            }]
+        });
+        let mut message = parse_discord_gateway_message(&payload).unwrap().unwrap();
+
+        attach_discord_message_artifacts(
+            &harness_home,
+            &mut message,
+            &StaticDiscordAttachmentFetcher::new(vec![(
+                "https://example.com/attachments/private/message.txt?token=secret",
+                b"should not be fetched".to_vec(),
+            )]),
+        )
+        .unwrap();
+
+        let artifact = &message.inbound_media_artifacts[0];
+        assert_eq!(
+            artifact.download_status,
+            InboundMediaDownloadStatus::DownloadFailed
+        );
+        assert!(artifact.local_path.is_none());
+        assert!(artifact.artifact_uri.is_none());
+        let warnings = artifact.warnings.join(" ");
+        assert!(warnings.contains("outside the supported Discord media attachment hosts"));
+        assert!(!warnings.contains("example.com"));
+        assert!(!warnings.contains("token=secret"));
+        let rendered = agent_harness_core::render_inbound_media_artifacts_for_prompt(
+            &message.inbound_media_artifacts,
+            Some(&harness_home),
+        );
+        assert!(rendered.contains("warningsCount=1"));
+        assert!(!rendered.contains("example.com"));
+        assert!(!rendered.contains("token=secret"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discord_gateway_attachment_download_failure_redacts_provider_url() {
+        let root =
+            cli_temp_root("discord_gateway_attachment_download_failure_redacts_provider_url");
+        let harness_home = root.join("harness");
+        let payload = serde_json::json!({
+            "id": "message-download-failed",
+            "channel_id": "channel-1",
+            "content": "",
+            "author": { "id": "user-1" },
+            "attachments": [{
+                "id": "att-download-failed",
+                "filename": "message.txt",
+                "content_type": "text/plain",
+                "size": 15,
+                "url": "https://cdn.discordapp.com/attachments/private/message.txt?token=secret"
+            }]
+        });
+        let mut message = parse_discord_gateway_message(&payload).unwrap().unwrap();
+
+        attach_discord_message_artifacts(
+            &harness_home,
+            &mut message,
+            &StaticDiscordAttachmentFetcher::new(vec![]),
+        )
+        .unwrap();
+
+        let artifact = &message.inbound_media_artifacts[0];
+        assert_eq!(
+            artifact.download_status,
+            InboundMediaDownloadStatus::DownloadFailed
+        );
+        assert!(artifact.local_path.is_none());
+        assert!(artifact.artifact_uri.is_none());
+        let warnings = artifact.warnings.join(" ");
+        assert!(warnings.contains("download failed"));
+        assert!(!warnings.contains("cdn.discordapp.com"));
+        assert!(!warnings.contains("token=secret"));
+        let rendered = agent_harness_core::render_inbound_media_artifacts_for_prompt(
+            &message.inbound_media_artifacts,
+            Some(&harness_home),
+        );
+        assert!(!rendered.contains("cdn.discordapp.com"));
+        assert!(!rendered.contains("token=secret"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discord_gateway_image_attachment_is_artifact_reference_without_payload() {
+        let root =
+            cli_temp_root("discord_gateway_image_attachment_is_artifact_reference_without_payload");
+        let harness_home = root.join("harness");
+        let payload = serde_json::json!({
+            "id": "message-2",
+            "channel_id": "channel-1",
+            "content": "",
+            "author": { "id": "user-1" },
+            "attachments": [{
+                "id": "att-2",
+                "filename": "photo.png",
+                "content_type": "image/png",
+                "size": 24,
+                "width": 2,
+                "height": 3,
+                "url": "https://cdn.discordapp.com/attachments/private/photo.png?token=secret"
+            }]
+        });
+        let mut message = parse_discord_gateway_message(&payload).unwrap().unwrap();
+        let bytes = vec![
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 0,
+        ];
+
+        attach_discord_message_artifacts(
+            &harness_home,
+            &mut message,
+            &StaticDiscordAttachmentFetcher::new(vec![(
+                "https://cdn.discordapp.com/attachments/private/photo.png?token=secret",
+                bytes.clone(),
+            )]),
+        )
+        .unwrap();
+
+        assert_eq!(message.inbound_media_artifacts.len(), 1);
+        let artifact = &message.inbound_media_artifacts[0];
+        assert_eq!(artifact.kind, "attachment-image");
+        assert_eq!(artifact.mime.as_deref(), Some("image/png"));
+        assert_eq!(artifact.selected_variant.as_ref().unwrap().width, Some(2));
+        assert_eq!(artifact.selected_variant.as_ref().unwrap().height, Some(3));
+        assert!(artifact.extraction_summary.is_none());
+        assert_eq!(
+            fs::read(artifact.local_path.as_ref().unwrap()).unwrap(),
+            bytes
+        );
+        let rendered = agent_harness_core::render_inbound_media_artifacts_for_prompt(
+            &message.inbound_media_artifacts,
+            Some(&harness_home),
+        );
+        assert!(
+            rendered.contains("artifactUri=agent-harness://inbound-media/discord/message-2/0.png")
+        );
+        assert!(rendered.contains("mime=image/png"));
+        assert!(!rendered.contains("cdn.discordapp.com"));
+        assert!(!rendered.contains("token=secret"));
+        assert!(!rendered.contains("data:image"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discord_gateway_image_attachment_requires_supported_image_bytes() {
+        let root = cli_temp_root("discord_gateway_image_attachment_requires_supported_image_bytes");
+        let harness_home = root.join("harness");
+        let payload = serde_json::json!({
+            "id": "message-invalid-image",
+            "channel_id": "channel-1",
+            "content": "",
+            "author": { "id": "user-1" },
+            "attachments": [{
+                "id": "att-invalid-image",
+                "filename": "photo.png",
+                "content_type": "image/png",
+                "size": 9,
+                "width": 2,
+                "height": 3,
+                "url": "https://cdn.discordapp.com/attachments/private/photo.png?token=secret"
+            }]
+        });
+        let mut message = parse_discord_gateway_message(&payload).unwrap().unwrap();
+
+        attach_discord_message_artifacts(
+            &harness_home,
+            &mut message,
+            &StaticDiscordAttachmentFetcher::new(vec![(
+                "https://cdn.discordapp.com/attachments/private/photo.png?token=secret",
+                b"not-image".to_vec(),
+            )]),
+        )
+        .unwrap();
+
+        let artifact = &message.inbound_media_artifacts[0];
+        assert_eq!(
+            artifact.download_status,
+            InboundMediaDownloadStatus::DownloadFailed
+        );
+        assert_eq!(artifact.mime.as_deref(), Some("image/png"));
+        assert!(artifact.local_path.is_none());
+        assert!(artifact.artifact_uri.is_none());
+        assert!(
+            artifact
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("not a supported image"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discord_gateway_json_like_attachment_uses_json_artifact_extension() {
+        let root =
+            cli_temp_root("discord_gateway_json_like_attachment_uses_json_artifact_extension");
+        let harness_home = root.join("harness");
+        let payload = serde_json::json!({
+            "id": "message-json-like",
+            "channel_id": "channel-1",
+            "content": "",
+            "author": { "id": "user-1" },
+            "attachments": [{
+                "id": "att-json-like",
+                "filename": "payload",
+                "content_type": "application/activity+json",
+                "size": 11,
+                "url": "https://cdn.discordapp.com/attachments/private/payload?token=secret"
+            }]
+        });
+        let mut message = parse_discord_gateway_message(&payload).unwrap().unwrap();
+
+        attach_discord_message_artifacts(
+            &harness_home,
+            &mut message,
+            &StaticDiscordAttachmentFetcher::new(vec![(
+                "https://cdn.discordapp.com/attachments/private/payload?token=secret",
+                br#"{"ok":true}"#.to_vec(),
+            )]),
+        )
+        .unwrap();
+
+        let artifact = &message.inbound_media_artifacts[0];
+        assert_eq!(
+            artifact.download_status,
+            InboundMediaDownloadStatus::Downloaded
+        );
+        assert_eq!(artifact.kind, "attachment-text");
+        assert_eq!(artifact.mime.as_deref(), Some("application/activity+json"));
+        assert!(
+            artifact
+                .artifact_uri
+                .as_deref()
+                .is_some_and(|uri| uri.ends_with("/0.json"))
+        );
+        assert_eq!(
+            artifact
+                .local_path
+                .as_deref()
+                .and_then(Path::extension)
+                .and_then(|extension| extension.to_str()),
+            Some("json")
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 

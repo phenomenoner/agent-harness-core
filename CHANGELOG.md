@@ -1,18 +1,43 @@
 # Changelog
 
-## Unreleased - 2026-06-26
+## Unreleased - 2026-06-28
 
 ### Changed
 
+- Preserved agent identity across final outbox freshness checks: a same-agent stale session is still suppressed after `/new`, but a completed non-main agent turn sharing the same platform/channel/user is not suppressed solely because shared channel state currently points at another agent.
+- Added `docs/agent-harness-topology-contract.md` as the public-safe topology contract and impact matrix for channel, runtime, prompt, outbox, delivery, memory, and cutover changes.
+- Added invariant I8 to the docs and machine-readable invariant catalog: `agentId` is a routing boundary across channel state, session freshness, prompt, runtime, outbox, delivery, and memory.
+- Tightened the release checklist so channel/runtime/session changes must run the agent-boundary scenario pack.
+- Documented explicit ideal-vs-actual gap labels for `openclaw-mem-full-parity-gap`, `multi-agent-full-matrix-gap`, and `virtual-session-continuity-gap` so support-plane graph/readiness evidence is not mistaken for full design parity.
+- Added `progress-delivery-volume-gap` after Telegram DM receipts showed provider-visible progress edit storms even when final outbox delivery exists.
+- Added invariant I9 and `progress-final-surface-gap` after a Telegram DM probe showed `assistantNarrationMode=progress_panel` narration could be written as a normal final `agent-reply` during recovery.
+- Routed progress delivery/narration changes through the topology impact matrix and mirrored the edit-volume plus final-surface gates in the release checklist.
 - Completed the Round9-1 lifecycle and image-timeout follow-up live cutover. The live `agent-harness.exe` now runs source commit `628fe36` and preserves `telegram-loop-xiaoxiaoli` as agent `xiaoxiaoli` through supervisor reconciliation instead of falling back to `main`.
 - Tightened sub-agent lifecycle receipts so unknown or already-terminal close paths stay idempotent without claiming cleanup proof, and smoke receipts report provider/auth visibility as unverified when the lane is unavailable.
 - Documented nested social-image verification as worker/long-task work with terminal image-route summaries instead of relying on longer outer interactive Codex timeouts.
+- Added a Round10 completion-repair regression gate for `progress-final-surface-gap`, proving already-recorded completion repair keeps progress-panel narration out of final channel outbox payloads.
+- Added `response.progressDeliveryMaxNonterminalUpdatesPerLane` and persisted delivered non-terminal body/status counters so progress delivery can cap provider-visible intermediate sends/edits per queue while still allowing terminal `Done`/`Failed` convergence.
+- Extended progress delivery planning and CLI reports with `volume_limited` so edit-volume suppression is visible in operator output instead of silently dropping progress updates.
+- Refined Codex image gateway failure classification so an input-specific no-tool result after a successful route probe reports `image_tool_not_called_for_input` instead of misclassifying the global image route as unavailable.
+- Added initial Codex tool-use idle-timeout recovery: active tool-use timeouts now record `toolUseTimeout`, stop the stalled app-server/tool path, and hand the task to one bounded fresh-thread recovery prompt instead of immediately dragging the parent queue item to dead-letter.
+- Captured review-only tool-timeout recovery output as `agent-harness.external-review-evidence.v1` instead of final parent workflow completion.
+- Added `codexContext.highContextUsageCompactTokenLimit` so context preflight compacts an existing bound thread with very high recorded usage even when no `modelContextWindow` ratio is configured.
+- Added `docs/topology-explorer.html` and `tools/generate_topology_explorer.py` as a generated interactive topology/canvas view synced from the topology contract and current live-validation summary.
+- Upgraded the topology explorer from a raw node browser into a guided big-picture surface with journey cards, step-by-step focus, impact explanations, and an open-gap queue.
+- Documented `per-agent-memory-recall-compartment-gap`: Xiaoxiaoli has per-agent memory artifacts, but live recall still allows global imported fallback context under `agent-plus-global-imported` while the mem-engine bridge is absent.
 
 ### Verification
 
+- Added regression coverage: `runtime_pipeline::tests::channel_session_freshness_does_not_cross_suppress_other_agent`.
 - Round9-1 fresh validation passed `cargo fmt --all -- --check`, workspace check, `agent-harness-core` tests (431 unit tests plus 5 integration tests and doc tests), `agent-harness-cli` tests (53), image helper tests (14), sparse-runner tests (6), staged build, public export hygiene with `forbiddenHits=[]`, and `git diff --check`.
 - Live cutover ticket `cutover-1782447196301` advanced canonical `target\debug\agent-harness.exe` to SHA-256 `946D0AC01F6DF266D2D356A5A8342B3D87238E9E7D56C8C653CDEC079BACA908`, backed up the previous binary as `target\debug\agent-harness.pre-round9-1-followup-20260626-122051.exe`, and recorded `ops-cutover-receipt status=ready`.
 - Post-cutover validation reported `healthz ready=true live=true readinessReady=true`, readiness `passed=58 warnings=2 failed=0`, worker idle gate `pending=0 leased=0 running=0 failedRetryable=0 runtimeOpenItems=0 activeCronRuns=0`, and `telegram-loop-xiaoxiaoli` command lines containing `--agent xiaoxiaoli`.
+- Round10 staging validation passed `cargo fmt --all -- --check`, `cargo check --workspace --target-dir target\staging-round10-check`, focused progress volume-limit tests, focused config validation tests, the completion-repair final-surface regression, and the image gateway helper test suite.
+- Tool-timeout guard validation passed `cargo test -p agent-harness-core run_codex_runtime_recovers_tool_use_idle_timeout_with_fresh_thread --target-dir target\staging-round10-tool-timeout-test -- --test-threads=1`.
+- External review/context preflight validation passed focused `agent-harness-core` tests for review-only evidence capture, normal tool-timeout recovery, high-usage preflight compact, stream-disconnect fresh-thread rollover, and compact-failure checkpoint fallback under `target\staging-round10-gap-closure-external-review-green` and `target\staging-round10-context-preflight-green`.
+- Round10 full pre-cutover validation passed full core tests (450 unit tests plus 5 integration tests and doc tests), full CLI tests (54), image helper tests (15), staged build, public export hygiene, `invariants`, `schema-registry`, and `git diff --check`.
+- Live cutover ticket `cutover-1782619189243` advanced canonical `target\debug\agent-harness.exe` to SHA-256 `229656F71806605650D5D7293F6B37F4362F511A18EBA386C22D06F5E45A4D2D`, backed up the previous live binary as `target\debug\agent-harness.pre-round10-tool-timeout-progress-20260628-120311.exe`, and post-cutover validation reported `healthz ready=true live=true`, worker/outbox idle, clean supervisor reconcile, and `ops-cutover-receipt status=ready`.
+- Follow-up Round10 live readback confirmed `healthz ready=true live=true readinessReady=true`, targeted Discord and Telegram outbox `pending=0 failed_retryable=0 invalid=0`, worker queue clear except the current interactive channel item, `supervisor-reconcile --all --dry-run` clean, and memory read-path `Ready` through documented migration fallback; it also documented `supervisor-service-health-precedence-gap` for stale `discord-gateway-loop` service metadata that can remain visible behind a fresh loop heartbeat.
 
 ## v0.1.2 - 2026-06-21
 

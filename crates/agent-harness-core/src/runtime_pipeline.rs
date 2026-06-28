@@ -1041,6 +1041,17 @@ fn final_run_once_status(
         CodexRuntimeRunStatus::ProtocolError if is_retryable_codex_protocol_error(reason) => {
             RuntimeRunOnceStatus::DeadLetter
         }
+        CodexRuntimeRunStatus::ProtocolError
+            if is_external_review_evidence_protocol_error(reason)
+                && failure_attempts < max_failure_attempts =>
+        {
+            RuntimeRunOnceStatus::RetryPending
+        }
+        CodexRuntimeRunStatus::ProtocolError
+            if is_external_review_evidence_protocol_error(reason) =>
+        {
+            RuntimeRunOnceStatus::DeadLetter
+        }
         CodexRuntimeRunStatus::PreflightBlocked
         | CodexRuntimeRunStatus::NoRuntimePlan
         | CodexRuntimeRunStatus::SpawnFailed
@@ -1053,6 +1064,12 @@ fn is_retryable_codex_protocol_error(reason: &str) -> bool {
     lower.contains("stream disconnected before completion")
         || lower.contains("websocket closed by server before response.completed")
         || lower.contains("reconnecting...")
+}
+
+fn is_external_review_evidence_protocol_error(reason: &str) -> bool {
+    reason
+        .to_ascii_lowercase()
+        .contains("external review evidence without parent workflow completion")
 }
 
 fn final_run_once_reason(
@@ -1227,12 +1244,33 @@ fn channel_session_is_current(
     if state.active_session_key == context.session_key {
         return Ok(true);
     }
+    let active_agent = session_key_agent_segment(&state.active_session_key);
+    let context_agent = session_key_agent_segment(&context.session_key);
+    if let (Some(active_agent), Some(context_agent)) =
+        (active_agent.as_deref(), context_agent.as_deref())
+        && active_agent != context_agent
+    {
+        warnings.push(format!(
+            "assistant reply session {} is not suppressed by active session {} because active state belongs to agent `{}` while the reply belongs to agent `{}`",
+            context.session_key, state.active_session_key, active_agent, context_agent
+        ));
+        return Ok(true);
+    }
 
     warnings.push(format!(
         "assistant reply for stale session {} suppressed because active session is {}",
         context.session_key, state.active_session_key
     ));
     Ok(false)
+}
+
+fn session_key_agent_segment(session_key: &str) -> Option<String> {
+    session_key
+        .split(':')
+        .nth(3)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 fn find_queue_channel_context(
@@ -2044,6 +2082,143 @@ mod tests {
     }
 
     #[test]
+    fn already_recorded_completion_repair_keeps_progress_panel_out_of_final_outbox() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root(
+            "already_recorded_completion_repair_keeps_progress_panel_out_of_final_outbox",
+        );
+        let (harness_home, queue_id, execution_dir, _env) =
+            prepare_already_recorded_completion_without_outbox_for_platform(
+                &root, "telegram", "dm-42", "user-7",
+            );
+        let completion_receipt: Value = serde_json::from_str(
+            &fs::read_to_string(execution_dir.join("codex-runtime-completion-receipt.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        let transcript = PathBuf::from(
+            completion_receipt
+                .get("transcriptFile")
+                .and_then(Value::as_str)
+                .unwrap(),
+        );
+        append_json_line(
+            &transcript,
+            &serde_json::json!({
+                "schema": "agent-harness.transcript-message.v1",
+                "role": "assistant_narration",
+                "content": "progress: step 1\nprogress: step 2\nprogress: step 3"
+            }),
+        )
+        .unwrap();
+        append_json_line(
+            &transcript,
+            &serde_json::json!({
+                "schema": "agent-harness.transcript-message.v1",
+                "role": "assistant",
+                "content": "Final answer only."
+            }),
+        )
+        .unwrap();
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: Some(fake_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        let outbound = report.outbound_message.unwrap();
+        assert_eq!(outbound.source_queue_id.as_deref(), Some(queue_id.as_str()));
+        assert_eq!(outbound.text, "Final answer only.");
+        assert!(!outbound.text.contains("progress:"));
+        let outbox = fs::read_to_string(report.outbox_file.unwrap()).unwrap();
+        assert!(outbox.contains("Final answer only."));
+        assert!(!outbox.contains("progress:"));
+        assert!(final_outbox_receipt_file(&execution_dir).is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn already_recorded_completion_repair_keeps_progress_panel_out_of_discord_final_outbox() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root(
+            "already_recorded_completion_repair_keeps_progress_panel_out_of_discord_final_outbox",
+        );
+        let (harness_home, queue_id, execution_dir, _env) =
+            prepare_already_recorded_completion_without_outbox_for_platform(
+                &root,
+                "discord",
+                "discord-dm-42",
+                "discord-user-7",
+            );
+        let completion_receipt: Value = serde_json::from_str(
+            &fs::read_to_string(execution_dir.join("codex-runtime-completion-receipt.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        let transcript = PathBuf::from(
+            completion_receipt
+                .get("transcriptFile")
+                .and_then(Value::as_str)
+                .unwrap(),
+        );
+        append_json_line(
+            &transcript,
+            &serde_json::json!({
+                "schema": "agent-harness.transcript-message.v1",
+                "role": "assistant_narration",
+                "content": "progress: discord step 1\nprogress: discord step 2"
+            }),
+        )
+        .unwrap();
+        append_json_line(
+            &transcript,
+            &serde_json::json!({
+                "schema": "agent-harness.transcript-message.v1",
+                "role": "assistant",
+                "content": "Discord final answer only."
+            }),
+        )
+        .unwrap();
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: Some(fake_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        let outbound = report.outbound_message.unwrap();
+        assert_eq!(outbound.platform, "discord");
+        assert_eq!(outbound.source_queue_id.as_deref(), Some(queue_id.as_str()));
+        assert_eq!(outbound.text, "Discord final answer only.");
+        assert!(!outbound.text.contains("progress:"));
+        let outbox = fs::read_to_string(report.outbox_file.unwrap()).unwrap();
+        assert!(outbox.contains(r#""platform":"discord""#));
+        assert!(outbox.contains("Discord final answer only."));
+        assert!(!outbox.contains("progress:"));
+        assert!(final_outbox_receipt_file(&execution_dir).is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_runtime_queue_once_skips_duplicate_for_existing_final_outbox_marker() {
         let _guard = ENV_LOCK.lock().unwrap();
         let root =
@@ -2363,6 +2538,28 @@ mod tests {
     }
 
     #[test]
+    fn external_review_evidence_protocol_error_stays_retryable_until_budget_exhausted() {
+        let reason = "external review evidence without parent workflow completion";
+
+        assert!(is_external_review_evidence_protocol_error(reason));
+        assert_eq!(
+            final_run_once_status(CodexRuntimeRunStatus::ProtocolError, 1, reason, 3),
+            RuntimeRunOnceStatus::RetryPending
+        );
+        assert_eq!(
+            final_run_once_status(CodexRuntimeRunStatus::ProtocolError, 2, reason, 3),
+            RuntimeRunOnceStatus::RetryPending
+        );
+        assert_eq!(
+            final_run_once_status(CodexRuntimeRunStatus::ProtocolError, 3, reason, 3),
+            RuntimeRunOnceStatus::DeadLetter
+        );
+        assert!(!should_write_failure_outbox(
+            RuntimeRunOnceStatus::RetryPending
+        ));
+    }
+
+    #[test]
     fn retryable_protocol_error_policy_retries_then_dead_letters() {
         let reason = "Reconnecting... 2/5; stream disconnected before completion: websocket closed by server before response.completed";
 
@@ -2552,6 +2749,91 @@ mod tests {
     }
 
     #[test]
+    fn run_runtime_queue_once_keeps_external_review_evidence_resumable_without_final_outbox() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root(
+            "run_runtime_queue_once_keeps_external_review_evidence_resumable_without_final_outbox",
+        );
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "discord".to_string(),
+            account_id: None,
+            channel_id: "discord-dm-42".to_string(),
+            user_id: "discord-user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "run claude second brain review then continue implementation".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+        let queue_id = receive.queue_id.unwrap();
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: Some(fake_external_review_only_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 3_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::RetryPending);
+        assert_eq!(report.receipt.queue_id.as_deref(), Some(queue_id.as_str()));
+        assert_eq!(
+            report.run.as_ref().unwrap().receipt.status,
+            CodexRuntimeRunStatus::ProtocolError
+        );
+        assert!(report.outbound_message.is_none());
+        assert!(report.outbox_file.is_none());
+        let execution_dir = report
+            .run
+            .as_ref()
+            .unwrap()
+            .receipt
+            .execution_dir
+            .as_ref()
+            .unwrap();
+        let evidence = execution_dir.join("external-review-evidence.json");
+        assert!(evidence.is_file());
+        let evidence_text = fs::read_to_string(evidence).unwrap();
+        assert!(evidence_text.contains("agent-harness.external-review-evidence.v1"));
+        assert!(evidence_text.contains("Claude second brain review"));
+        assert!(
+            !execution_dir
+                .join("codex-runtime-completion-receipt.json")
+                .exists(),
+            "review-only evidence must not masquerade as a parent workflow completion"
+        );
+        assert!(
+            !harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl")
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_runtime_queue_once_suppresses_stale_session_reply_after_new() {
         let _guard = ENV_LOCK.lock().unwrap();
         let root = temp_root("run_runtime_queue_once_suppresses_stale_session_reply_after_new");
@@ -2634,6 +2916,69 @@ mod tests {
         .unwrap();
         assert!(outbox.contains("New session planned"));
         assert!(!outbox.contains("Pipeline fake reply."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_session_freshness_does_not_cross_suppress_other_agent() {
+        let root = temp_root("channel_session_freshness_does_not_cross_suppress_other_agent");
+        let harness_home = root.join(".agent-harness");
+        let state_file = crate::channel_session_state_file(
+            &harness_home,
+            "telegram",
+            "dm-agent-boundary",
+            "user-agent-boundary",
+        );
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        write_json_atomic(
+            &state_file,
+            &crate::ChannelSessionState {
+                schema: "agent-harness.channel-session-state.v1".to_string(),
+                platform: "telegram".to_string(),
+                channel_id: "dm-agent-boundary".to_string(),
+                user_id: "user-agent-boundary".to_string(),
+                active_session_key:
+                    "telegram:dm-agent-boundary:user-agent-boundary:main:session-live-main"
+                        .to_string(),
+                agent_id: Some("main".to_string()),
+                provider: None,
+                model: None,
+                session_topic: None,
+                model_override: None,
+                model_override_provider: None,
+                model_override_model: None,
+                thinking_enabled: false,
+                thinking_level: None,
+                thinking_instruction: None,
+                stop_requested: false,
+                stop_reason: None,
+                steering_notes: Vec::new(),
+                btw_notes: Vec::new(),
+                last_command: None,
+                updated_at_ms: 1234,
+            },
+        )
+        .unwrap();
+        let context = QueueChannelContext {
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-agent-boundary".to_string(),
+            user_id: "user-agent-boundary".to_string(),
+            session_key:
+                "telegram:dm-agent-boundary:user-agent-boundary:xiaoxiaoli:session-completed"
+                    .to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+        };
+        let mut warnings = Vec::new();
+
+        assert!(channel_session_is_current(&harness_home, &context, &mut warnings).unwrap());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("belongs to agent `main`"))
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2747,6 +3092,17 @@ mod tests {
     fn prepare_already_recorded_completion_without_outbox(
         root: &Path,
     ) -> (PathBuf, String, PathBuf, EnvGuard) {
+        prepare_already_recorded_completion_without_outbox_for_platform(
+            root, "telegram", "dm-42", "user-7",
+        )
+    }
+
+    fn prepare_already_recorded_completion_without_outbox_for_platform(
+        root: &Path,
+        platform: &str,
+        channel_id: &str,
+        user_id: &str,
+    ) -> (PathBuf, String, PathBuf, EnvGuard) {
         let source = write_pipeline_source(root);
         let harness_home = root.join(".agent-harness");
         let skills = build_source_skill_index(&source).unwrap();
@@ -2755,10 +3111,10 @@ mod tests {
             runtime_workspace: None,
             harness_home: harness_home.clone(),
             skill_index: skills,
-            platform: "telegram".to_string(),
+            platform: platform.to_string(),
             account_id: None,
-            channel_id: "dm-42".to_string(),
-            user_id: "user-7".to_string(),
+            channel_id: channel_id.to_string(),
+            user_id: user_id.to_string(),
             agent_id: Some("main".to_string()),
             session_key: None,
             message: "repair memory cron".to_string(),
@@ -2852,6 +3208,63 @@ while ($true) {
         )
         .unwrap();
         let cmd = root.join("fake-codex.cmd");
+        fs::write(
+            &cmd,
+            format!(
+                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        cmd
+    }
+
+    #[cfg(windows)]
+    fn fake_external_review_only_codex_executable(root: &Path) -> PathBuf {
+        let script = root.join("fake-external-review-only-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+$countFile = Join-Path $PSScriptRoot 'external-review-only-attempt.txt'
+$attempt = 0
+if (Test-Path -LiteralPath $countFile) {
+    $raw = Get-Content -LiteralPath $countFile -Raw
+    [void][int]::TryParse($raw.Trim(), [ref]$attempt)
+}
+Set-Content -LiteralPath $countFile -Value ([string]($attempt + 1))
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try {
+        $msg = $line | ConvertFrom-Json
+    } catch {
+        continue
+    }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-review-evidence"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        if ($attempt -eq 0) {
+            [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-timeout","kind":"regular"}}}')
+            [Console]::Out.WriteLine('{"method":"item/started","params":{"item":{"type":"commandExecution","id":"cmd-review-timeout","command":"claude -p review prompt"},"threadId":"thread-review-evidence","turnId":"turn-review-timeout"}}')
+            [Console]::Out.Flush()
+            Start-Sleep -Seconds 10
+        } else {
+            [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-only","kind":"regular"}}}')
+            [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-review-only","text":"Claude second brain review: PASS. Findings only; implementation still needs to continue.","phase":"final_answer"},"threadId":"thread-review-evidence","turnId":"turn-review-only","completedAtMs":1234}}')
+            [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-only","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}')
+            [Console]::Out.Flush()
+            break
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+        let cmd = root.join("fake-external-review-only-codex.cmd");
         fs::write(
             &cmd,
             format!(
@@ -3023,6 +3436,54 @@ while IFS= read -r line; do
         *'"method":"turn/start"'*)
             printf '%s\n' '{"method":"error","params":{"message":"Reconnecting... 2/5","additionalDetails":"stream disconnected before completion: websocket closed by server before response.completed"}}'
             exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+        script
+    }
+
+    #[cfg(not(windows))]
+    fn fake_external_review_only_codex_executable(root: &Path) -> PathBuf {
+        let script = root.join("fake-external-review-only-codex");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+count_file="$(dirname "$0")/external-review-only-attempt.txt"
+attempt=0
+if [ -f "$count_file" ]; then
+    attempt="$(cat "$count_file")"
+fi
+next=$((attempt + 1))
+printf '%s\n' "$next" > "$count_file"
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-review-evidence"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            if [ "$attempt" = "0" ]; then
+                printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-timeout","kind":"regular"}}}'
+                printf '%s\n' '{"method":"item/started","params":{"item":{"type":"commandExecution","id":"cmd-review-timeout","command":"claude -p review prompt"},"threadId":"thread-review-evidence","turnId":"turn-review-timeout"}}'
+                sleep 10
+            else
+                printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-only","kind":"regular"}}}'
+                printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-review-only","text":"Claude second brain review: PASS. Findings only; implementation still needs to continue.","phase":"final_answer"},"threadId":"thread-review-evidence","turnId":"turn-review-only","completedAtMs":1234}}'
+                printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-only","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}'
+                exit 0
+            fi
             ;;
     esac
 done

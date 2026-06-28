@@ -1,10 +1,12 @@
 # Activation Readiness Plan
 
-Date: 2026-06-15
+Date: 2026-06-28
 
 This is the working checklist for operating the Rust Windows Agent Harness as the active live gateway. Older Docker/OpenClaw gateway names and container paths are retired historical labels kept only for import and rollback context.
 
 ## Latest Verified State
+
+2026-06-28 Round10 live cutover is the current live state. Canonical `target\debug\agent-harness.exe` is SHA-256 `229656F71806605650D5D7293F6B37F4362F511A18EBA386C22D06F5E45A4D2D` (size `21768192`), cut over with ticket `cutover-1782619189243` after full staging validation. Post-cutover validation reports `healthz ready=true live=true readinessReady=true`, readiness `passed=59 warnings=1 failed=0`, all eight supervisor-reconcile-owned loops live, `worker-status pending=0 leased=0 running=0 failedRetryable=0`, downstream runtime open items `0`, active cron runs `0`, Telegram/Discord outbox pending `0`, `supervisor-reconcile --all --dry-run` clean, and `ops-cutover-receipt status=ready`. The operations handbook remains the operational source of truth for the detailed current live evidence and rollback artifacts.
 
 2026-06-12 repo-local harness-home baseline after round3-2 timeout/progress reconciliation:
 

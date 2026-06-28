@@ -468,6 +468,88 @@ mod tests {
     }
 
     #[test]
+    fn healthz_prefers_fresh_loop_heartbeat_over_spawning_service_state() {
+        let root = temp_root("healthz_prefers_fresh_loop_heartbeat_over_spawning_service_state");
+        let harness_home = root.join(".agent-harness");
+        let state = harness_home.join("state");
+        fs::create_dir_all(state.join("runtime-queue")).unwrap();
+        fs::create_dir_all(state.join("channels")).unwrap();
+        fs::create_dir_all(state.join("logs")).unwrap();
+        fs::create_dir_all(state.join("plugin-sidecar")).unwrap();
+        fs::create_dir_all(state.join("memory")).unwrap();
+        let services_dir = state.join("supervisor").join("services");
+        let heartbeat_dir = state.join("supervisor").join("loop-heartbeats");
+        fs::create_dir_all(&services_dir).unwrap();
+        fs::create_dir_all(&heartbeat_dir).unwrap();
+        let pid = i64::from(std::process::id());
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        write_json_atomic(
+            &services_dir.join("discord-gateway-loop.json"),
+            &serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "discord-gateway-loop",
+                "serviceKind": "discord-gateway",
+                "generationId": "discord-gateway-loop-supervised-test",
+                "pid": 0,
+                "processId": 0,
+                "supervisorPid": pid,
+                "startedAtMs": now_ms - 10_000,
+                "processStartTimeMs": now_ms - 10_000,
+                "lastHeartbeatAtMs": now_ms - 10_000,
+                "status": "spawning",
+                "desiredState": "running",
+                "actualState": "spawning",
+                "detail": "starting Discord gateway subprocess",
+                "launchOwner": "rust-supervisor-run",
+                "observedOnly": false
+            }),
+        )
+        .unwrap();
+        write_json_atomic(
+            &heartbeat_dir.join("discord-gateway-loop.json"),
+            &serde_json::json!({
+                "schema": "agent-harness.loop-heartbeat.v1",
+                "name": "discord-gateway-loop",
+                "status": "heartbeat",
+                "processId": pid,
+                "atMs": now_ms - 100,
+                "detail": "Discord heartbeat ack"
+            }),
+        )
+        .unwrap();
+
+        let report = collect_healthz(HealthzOptions {
+            harness_home,
+            now_ms,
+            loop_stale_ms: 1_000,
+            require_writable_state: false,
+        })
+        .unwrap();
+
+        let gateway_service = report
+            .supervisor_services
+            .iter()
+            .find(|service| service.service_id == "discord-gateway-loop")
+            .unwrap();
+        assert!(!gateway_service.stale);
+        assert_eq!(gateway_service.process_id, Some(pid));
+        assert_eq!(gateway_service.process_alive, Some(true));
+        assert_eq!(gateway_service.status.as_deref(), Some("heartbeat"));
+        assert_eq!(gateway_service.actual_state.as_deref(), Some("running"));
+        assert_eq!(gateway_service.last_heartbeat_at_ms, Some(now_ms - 100));
+        assert!(
+            gateway_service
+                .age_ms
+                .is_some_and(|age_ms| (100..120_000).contains(&age_ms))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn healthz_reports_error_loop_as_not_live_even_when_fresh() {
         let root = temp_root("healthz_reports_error_loop_as_not_live_even_when_fresh");
         let harness_home = root.join(".agent-harness");

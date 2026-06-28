@@ -15,6 +15,8 @@ const AGENT_PROGRESS_DELIVERY_STATE_SCHEMA: &str = "agent-harness.progress-deliv
 const AGENT_PROGRESS_DELIVERY_RECEIPT_SCHEMA: &str = "agent-harness.progress-delivery-receipt.v1";
 const DEFAULT_PREVIEW_CHARS: usize = 120;
 const DEFAULT_CURRENT_STEP_CHARS: usize = 1200;
+const DEFAULT_MAX_NONTERMINAL_UPDATES_PER_LANE: usize = 6;
+const DEFAULT_STATUS_HEARTBEAT_AFTER_BODY_CAP_MS: i64 = 5 * 60 * 1000;
 const TERMINAL_PROGRESS_STATE_RETENTION_MS: i64 = 10 * 60 * 1000;
 const SENSITIVE_PREVIEW: &str = "[redacted sensitive preview]";
 
@@ -92,6 +94,8 @@ pub struct AgentProgressDeliveryPlanOptions {
     pub platform: Option<String>,
     pub now_ms: i64,
     pub min_update_interval_ms: i64,
+    pub max_nonterminal_updates_per_lane: usize,
+    pub status_heartbeat_after_body_cap_ms: i64,
     pub max_events_per_panel: usize,
     pub max_preview_chars: usize,
     pub current_step_max_chars: usize,
@@ -104,6 +108,8 @@ impl Default for AgentProgressDeliveryPlanOptions {
             platform: None,
             now_ms: 0,
             min_update_interval_ms: 2_500,
+            max_nonterminal_updates_per_lane: DEFAULT_MAX_NONTERMINAL_UPDATES_PER_LANE,
+            status_heartbeat_after_body_cap_ms: DEFAULT_STATUS_HEARTBEAT_AFTER_BODY_CAP_MS,
             max_events_per_panel: 8,
             max_preview_chars: DEFAULT_PREVIEW_CHARS,
             current_step_max_chars: DEFAULT_CURRENT_STEP_CHARS,
@@ -134,6 +140,7 @@ pub struct AgentProgressDeliveryPlanSummary {
     pub pending: usize,
     pub delivered_current: usize,
     pub rate_limited: usize,
+    pub volume_limited: usize,
     pub invalid_lines: usize,
     pub skipped_platform: usize,
     pub skipped_muted: usize,
@@ -254,6 +261,8 @@ struct AgentProgressDeliveryMuteConfig {
     default_mode: AgentProgressDeliveryMode,
     agent_modes: BTreeMap<String, AgentProgressDeliveryMode>,
     channel_modes: BTreeMap<String, AgentProgressDeliveryMode>,
+    max_nonterminal_updates_per_lane: Option<usize>,
+    status_heartbeat_after_body_cap_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,6 +324,10 @@ struct AgentProgressDeliveryCursor {
     body_last_sent_at_ms: i64,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     status_last_sent_at_ms: i64,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    body_nonterminal_deliveries: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    status_nonterminal_deliveries: usize,
     #[serde(default, skip_serializing_if = "is_false")]
     body_terminal: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -350,6 +363,8 @@ impl AgentProgressDeliveryCursor {
             status_last_text_hash: String::new(),
             body_last_sent_at_ms: 0,
             status_last_sent_at_ms: 0,
+            body_nonterminal_deliveries: 0,
+            status_nonterminal_deliveries: 0,
             body_terminal: false,
             status_terminal: false,
             terminal_event_line: 0,
@@ -441,6 +456,7 @@ impl AgentProgressDeliveryCursor {
         text_hash: String,
         sent_at_ms: i64,
         terminal: bool,
+        delivered: bool,
     ) {
         match message_kind {
             AgentProgressDeliveryMessageKind::Body => {
@@ -448,6 +464,10 @@ impl AgentProgressDeliveryCursor {
                 self.body_last_event_line = event_line;
                 self.body_last_text_hash = text_hash;
                 self.body_last_sent_at_ms = sent_at_ms;
+                if delivered && !terminal {
+                    self.body_nonterminal_deliveries =
+                        self.body_nonterminal_deliveries.saturating_add(1);
+                }
                 self.body_terminal = self.body_terminal || terminal;
             }
             AgentProgressDeliveryMessageKind::Status => {
@@ -455,6 +475,10 @@ impl AgentProgressDeliveryCursor {
                 self.status_last_event_line = event_line;
                 self.status_last_text_hash = text_hash;
                 self.status_last_sent_at_ms = sent_at_ms;
+                if delivered && !terminal {
+                    self.status_nonterminal_deliveries =
+                        self.status_nonterminal_deliveries.saturating_add(1);
+                }
                 self.status_terminal = self.status_terminal || terminal;
             }
         }
@@ -586,6 +610,13 @@ pub fn plan_agent_progress_delivery(
     let receipts_file = agent_progress_delivery_receipts_file(&options.harness_home);
     let mut warnings = Vec::new();
     let mute_config = load_progress_delivery_mute_config(&options.harness_home, &mut warnings)?;
+    let max_nonterminal_updates_per_lane = mute_config
+        .max_nonterminal_updates_per_lane
+        .unwrap_or(options.max_nonterminal_updates_per_lane);
+    let status_heartbeat_after_body_cap_ms = mute_config
+        .status_heartbeat_after_body_cap_ms
+        .unwrap_or(options.status_heartbeat_after_body_cap_ms)
+        .max(0);
     let mut state = read_delivery_state(&state_file, &mut warnings)?;
     prune_old_terminal_delivery_state(&mut state, options.now_ms);
     let read_result =
@@ -661,6 +692,15 @@ pub fn plan_agent_progress_delivery(
             .collect::<Vec<_>>();
         let terminal = latest_terminal_event(event_refs.as_slice()).is_some();
         let cursor = state.queues.get(&queue_id);
+        let body_cap_reached = cursor.is_some_and(|cursor| {
+            !terminal
+                && max_nonterminal_updates_per_lane > 0
+                && cursor.body_nonterminal_deliveries >= max_nonterminal_updates_per_lane
+                && cursor
+                    .provider_message_id_for(AgentProgressDeliveryMessageKind::Body)
+                    .is_some()
+        });
+        let latest_current_step_line = latest_current_step_stored_line(&queue_events);
         let lanes = [
             (
                 AgentProgressDeliveryMessageKind::Body,
@@ -677,6 +717,7 @@ pub fn plan_agent_progress_delivery(
                     options.now_ms,
                     options.max_preview_chars,
                     options.current_step_max_chars,
+                    body_cap_reached,
                 ),
             ),
         ];
@@ -713,9 +754,30 @@ pub fn plan_agent_progress_delivery(
                 && options
                     .now_ms
                     .saturating_sub(cursor.last_sent_at_ms_for(message_kind))
-                    < options.min_update_interval_ms
+                    < progress_delivery_min_interval_for_lane(
+                        message_kind,
+                        body_cap_reached,
+                        options.min_update_interval_ms,
+                        status_heartbeat_after_body_cap_ms,
+                    )
+                && !status_has_new_current_step_after_body_cap(
+                    message_kind,
+                    body_cap_reached,
+                    latest_current_step_line,
+                    cursor,
+                )
             {
                 summary.rate_limited += 1;
+                continue;
+            }
+            if let Some(cursor) = cursor
+                && provider_message_id.is_some()
+                && !terminal
+                && message_kind == AgentProgressDeliveryMessageKind::Body
+                && max_nonterminal_updates_per_lane > 0
+                && cursor.body_nonterminal_deliveries >= max_nonterminal_updates_per_lane
+            {
+                summary.volume_limited += 1;
                 continue;
             }
             let action = if provider_message_id.is_some() {
@@ -816,7 +878,69 @@ fn load_progress_delivery_mute_config(
         &config_file,
         warnings,
     );
+    if let Some(value) = response
+        .get("progressDeliveryMaxNonterminalUpdatesPerLane")
+        .or_else(|| response.get("progress_delivery_max_nonterminal_updates_per_lane"))
+        .or_else(|| response.get("progressDeliveryMaxNonterminalBodyUpdatesPerQueue"))
+        .or_else(|| response.get("progress_delivery_max_nonterminal_body_updates_per_queue"))
+    {
+        match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
+            Some(value) => config.max_nonterminal_updates_per_lane = Some(value),
+            None => warnings.push(format!(
+                "response.progressDeliveryMaxNonterminalUpdatesPerLane in {} must be a non-negative integer; using {}",
+                config_file.display(),
+                DEFAULT_MAX_NONTERMINAL_UPDATES_PER_LANE
+            )),
+        }
+    }
+    if let Some(value) = response
+        .get("progressDeliveryStatusHeartbeatAfterBodyCapMs")
+        .or_else(|| response.get("progress_delivery_status_heartbeat_after_body_cap_ms"))
+    {
+        match value.as_i64().or_else(|| value.as_u64().and_then(|v| i64::try_from(v).ok())) {
+            Some(value) if value >= 0 => {
+                config.status_heartbeat_after_body_cap_ms = Some(value);
+            }
+            _ => warnings.push(format!(
+                "response.progressDeliveryStatusHeartbeatAfterBodyCapMs in {} must be a non-negative integer; using {}",
+                config_file.display(),
+                DEFAULT_STATUS_HEARTBEAT_AFTER_BODY_CAP_MS
+            )),
+        }
+    }
     Ok(config)
+}
+
+fn latest_current_step_stored_line(queue_events: &[StoredProgressEvent]) -> Option<usize> {
+    queue_events
+        .iter()
+        .rev()
+        .find(|stored| stored.event.kind == AgentProgressKind::AssistantNarration)
+        .map(|stored| stored.line_number)
+}
+
+fn status_has_new_current_step_after_body_cap(
+    message_kind: AgentProgressDeliveryMessageKind,
+    body_cap_reached: bool,
+    latest_current_step_line: Option<usize>,
+    cursor: &AgentProgressDeliveryCursor,
+) -> bool {
+    message_kind == AgentProgressDeliveryMessageKind::Status
+        && body_cap_reached
+        && latest_current_step_line.is_some_and(|line| line > cursor.status_last_event_line)
+}
+
+fn progress_delivery_min_interval_for_lane(
+    message_kind: AgentProgressDeliveryMessageKind,
+    body_cap_reached: bool,
+    min_update_interval_ms: i64,
+    status_heartbeat_after_body_cap_ms: i64,
+) -> i64 {
+    if message_kind == AgentProgressDeliveryMessageKind::Status && body_cap_reached {
+        status_heartbeat_after_body_cap_ms
+    } else {
+        min_update_interval_ms
+    }
 }
 
 fn load_progress_delivery_mode_map(
@@ -985,6 +1109,7 @@ pub fn record_agent_progress_delivery(
             receipt.text_hash.clone(),
             receipt.at_ms,
             receipt.terminal,
+            receipt.status == AgentProgressDeliveryStatus::Delivered,
         );
         write_delivery_state(&state_file, &state)?;
     }
@@ -1004,6 +1129,7 @@ pub fn render_agent_progress_panel(
         now_ms,
         max_preview_chars,
         DEFAULT_CURRENT_STEP_CHARS,
+        false,
     );
     if actions.trim().is_empty() {
         status
@@ -1051,6 +1177,7 @@ fn render_agent_progress_status(
     now_ms: i64,
     max_preview_chars: usize,
     current_step_max_chars: usize,
+    body_cap_reached: bool,
 ) -> String {
     if events.is_empty() {
         return "⏳ Working — <1 min — starting".to_string();
@@ -1087,6 +1214,13 @@ fn render_agent_progress_status(
             status.push_str(&quote_safe_preview(
                 &narration.preview,
                 current_step_max_chars,
+            ));
+        }
+        if body_cap_reached {
+            status.push_str("\nUpdates capped; still working.");
+            status.push_str(&format!(
+                "\nLatest internal event: {}ms",
+                events.last().map(|event| event.at_ms).unwrap_or(now_ms)
             ));
         }
         status
@@ -1611,7 +1745,7 @@ mod tests {
         ];
         let refs = events.iter().collect::<Vec<_>>();
         let actions = render_agent_progress_actions(&refs, 8, 120);
-        let status = render_agent_progress_status(&refs, 9 * 60_000 + 1000, 120, 1200);
+        let status = render_agent_progress_status(&refs, 9 * 60_000 + 1000, 120, 1200, false);
         let panel = render_agent_progress_panel(&refs, 9 * 60_000 + 1000, 8, 120);
 
         assert!(actions.contains("skill_view: \"codebase-inspection\""));
@@ -1698,11 +1832,11 @@ mod tests {
         let refs = events.iter().collect::<Vec<_>>();
 
         assert_eq!(
-            render_agent_progress_status(&refs, 44 * 60_000 + 1000, 120, 1200),
+            render_agent_progress_status(&refs, 44 * 60_000 + 1000, 120, 1200, false),
             "✅ Done — 1 min"
         );
         assert_eq!(
-            render_agent_progress_status(&refs, 45 * 60_000 + 1000, 120, 1200),
+            render_agent_progress_status(&refs, 45 * 60_000 + 1000, 120, 1200, false),
             "✅ Done — 1 min"
         );
     }
@@ -1730,7 +1864,7 @@ mod tests {
         ];
         let refs = events.iter().collect::<Vec<_>>();
         let actions = render_agent_progress_actions(&refs, 8, 120);
-        let status = render_agent_progress_status(&refs, 61_000, 120, 1200);
+        let status = render_agent_progress_status(&refs, 61_000, 120, 1200, false);
 
         assert_eq!(actions, "💻 terminal: \"pwsh: agent-harness status\"");
         assert!(!actions.contains("verifying skills-index"));
@@ -1764,7 +1898,7 @@ mod tests {
         let refs = events.iter().collect::<Vec<_>>();
 
         assert_eq!(
-            render_agent_progress_status(&refs, 65_000, 120, 1200),
+            render_agent_progress_status(&refs, 65_000, 120, 1200, false),
             "⏳ Working — 1 min — working"
         );
     }
@@ -1783,7 +1917,7 @@ mod tests {
         let refs = events.iter().collect::<Vec<_>>();
 
         assert_eq!(
-            render_agent_progress_status(&refs, 61_000, 120, 1200),
+            render_agent_progress_status(&refs, 61_000, 120, 1200, false),
             "⏳ Working — 1 min — running tools"
         );
     }
@@ -1800,7 +1934,7 @@ mod tests {
             1000,
         )];
         let refs = events.iter().collect::<Vec<_>>();
-        let status = render_agent_progress_status(&refs, 61_000, 120, 1200);
+        let status = render_agent_progress_status(&refs, 61_000, 120, 1200, false);
 
         assert_eq!(status, "⏳ Working — 1 min — running tools");
         assert!(!status.contains("Current step"));
@@ -1831,7 +1965,7 @@ mod tests {
 
         assert_eq!(narration_event.preview, long_step);
         let refs = vec![&tool_event, &narration_event];
-        let status = render_agent_progress_status(&refs, 61_000, 24, 1200);
+        let status = render_agent_progress_status(&refs, 61_000, 24, 1200, false);
         assert!(status.contains("complete"));
         assert!(!status.contains("..."));
     }
@@ -1878,7 +2012,7 @@ mod tests {
         ];
         let refs = events.iter().collect::<Vec<_>>();
 
-        let status = render_agent_progress_status(&refs, 61_000, 24, 200);
+        let status = render_agent_progress_status(&refs, 61_000, 24, 200, false);
 
         assert!(status.contains(long_step));
         assert!(!status.contains("..."));
@@ -1995,6 +2129,479 @@ mod tests {
             edit.pending[1].provider_message_id.as_deref(),
             Some("provider-2")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delivery_plan_volume_limits_nonterminal_updates_but_allows_terminal_convergence() {
+        let root = temp_root(
+            "delivery_plan_volume_limits_nonterminal_updates_but_allows_terminal_convergence",
+        );
+        let harness_home = root.join(".agent-harness");
+        let context = context();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Todo,
+                "todo",
+                "planning 1 task(s)",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+        )
+        .unwrap();
+
+        let initial = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2000,
+            min_update_interval_ms: 0,
+            max_nonterminal_updates_per_lane: 1,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(initial.pending.len(), 2);
+        for (index, pending) in initial.pending.into_iter().enumerate() {
+            record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+                harness_home: harness_home.clone(),
+                queue_id: pending.queue_id,
+                platform: pending.platform,
+                account_id: pending.account_id,
+                channel_id: pending.channel_id,
+                thread_id: pending.thread_id,
+                user_id: pending.user_id,
+                session_key: pending.session_key,
+                message_kind: pending.message_kind,
+                action: pending.action,
+                status: AgentProgressDeliveryStatus::Delivered,
+                provider_message_id: Some(format!("provider-{}", index + 1)),
+                event_line: pending.event_line,
+                text_hash: pending.text_hash,
+                terminal: pending.terminal,
+                policy_decision: Some("test".to_string()),
+                error: None,
+                now_ms: 2000,
+            })
+            .unwrap();
+        }
+
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::ToolCall,
+                "tool_call",
+                "cargo test -p agent-harness-core",
+                AgentProgressStatus::Progress,
+                3000,
+            ),
+        )
+        .unwrap();
+        let limited = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 4000,
+            min_update_interval_ms: 0,
+            max_nonterminal_updates_per_lane: 1,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert!(limited.pending.is_empty());
+        assert_eq!(limited.summary.volume_limited, 1);
+        assert_eq!(limited.summary.rate_limited, 1);
+
+        let heartbeat = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 302_000,
+            min_update_interval_ms: 0,
+            max_nonterminal_updates_per_lane: 1,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(heartbeat.pending.len(), 1);
+        let status = heartbeat
+            .pending
+            .iter()
+            .find(|pending| pending.message_kind == AgentProgressDeliveryMessageKind::Status)
+            .unwrap();
+        assert_eq!(status.action, AgentProgressDeliveryAction::Edit);
+        assert!(status.text.contains("Updates capped; still working."));
+        assert!(status.text.contains("Latest internal event: 3000ms"));
+        assert_eq!(heartbeat.summary.volume_limited, 1);
+
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Runtime,
+                "runtime",
+                "completed",
+                AgentProgressStatus::Completed,
+                5000,
+            ),
+        )
+        .unwrap();
+        let terminal = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 6000,
+            min_update_interval_ms: 0,
+            max_nonterminal_updates_per_lane: 1,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(terminal.pending.len(), 2);
+        assert!(terminal.pending.iter().all(|pending| pending.terminal));
+        assert!(
+            terminal
+                .pending
+                .iter()
+                .all(|pending| pending.action == AgentProgressDeliveryAction::Edit)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delivery_plan_status_heartbeat_after_body_cap_is_channel_agnostic() {
+        for platform in ["telegram", "discord"] {
+            let root = temp_root(&format!(
+                "delivery_plan_status_heartbeat_after_body_cap_{platform}"
+            ));
+            let harness_home = root.join(".agent-harness");
+            let context = AgentProgressContext {
+                queue_id: format!("turn:{platform}:1"),
+                platform: platform.to_string(),
+                channel_id: format!("{platform}-dm"),
+                session_key: format!("{platform}:dm:user:main"),
+                ..context()
+            };
+            append_agent_progress_event(
+                &harness_home,
+                &AgentProgressEvent::new(
+                    &context,
+                    AgentProgressKind::Todo,
+                    "todo",
+                    "planning 1 task(s)",
+                    AgentProgressStatus::Started,
+                    1000,
+                ),
+            )
+            .unwrap();
+            let initial = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+                harness_home: harness_home.clone(),
+                platform: Some(platform.to_string()),
+                now_ms: 2000,
+                min_update_interval_ms: 0,
+                max_nonterminal_updates_per_lane: 1,
+                ..AgentProgressDeliveryPlanOptions::default()
+            })
+            .unwrap();
+            assert_eq!(initial.pending.len(), 2);
+            for (index, pending) in initial.pending.into_iter().enumerate() {
+                record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+                    harness_home: harness_home.clone(),
+                    queue_id: pending.queue_id,
+                    platform: pending.platform,
+                    account_id: pending.account_id,
+                    channel_id: pending.channel_id,
+                    thread_id: pending.thread_id,
+                    user_id: pending.user_id,
+                    session_key: pending.session_key,
+                    message_kind: pending.message_kind,
+                    action: pending.action,
+                    status: AgentProgressDeliveryStatus::Delivered,
+                    provider_message_id: Some(format!("{platform}-provider-{}", index + 1)),
+                    event_line: pending.event_line,
+                    text_hash: pending.text_hash,
+                    terminal: pending.terminal,
+                    policy_decision: Some("test".to_string()),
+                    error: None,
+                    now_ms: 2000,
+                })
+                .unwrap();
+            }
+            append_agent_progress_event(
+                &harness_home,
+                &AgentProgressEvent::new(
+                    &context,
+                    AgentProgressKind::AssistantNarration,
+                    "assistant_narration",
+                    "Checking artifact prompt hygiene and progress heartbeat tests.",
+                    AgentProgressStatus::Progress,
+                    3000,
+                ),
+            )
+            .unwrap();
+            append_agent_progress_event(
+                &harness_home,
+                &AgentProgressEvent::new(
+                    &context,
+                    AgentProgressKind::ToolCall,
+                    "tool_call",
+                    "cargo test -p agent-harness-core",
+                    AgentProgressStatus::Progress,
+                    4000,
+                ),
+            )
+            .unwrap();
+
+            let heartbeat = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+                harness_home: harness_home.clone(),
+                platform: Some(platform.to_string()),
+                now_ms: 302_000,
+                min_update_interval_ms: 0,
+                max_nonterminal_updates_per_lane: 1,
+                ..AgentProgressDeliveryPlanOptions::default()
+            })
+            .unwrap();
+            assert_eq!(heartbeat.pending.len(), 1, "platform={platform}");
+            let pending = heartbeat.pending[0].clone();
+            assert_eq!(pending.platform, platform);
+            assert_eq!(
+                pending.message_kind,
+                AgentProgressDeliveryMessageKind::Status
+            );
+            assert!(pending.text.contains("Updates capped; still working."));
+            assert!(pending.text.contains("Latest internal event: 4000ms"));
+            assert!(
+                pending
+                    .text
+                    .contains("Current step: Checking artifact prompt hygiene")
+            );
+            assert_eq!(heartbeat.summary.volume_limited, 1);
+
+            record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+                harness_home: harness_home.clone(),
+                queue_id: pending.queue_id,
+                platform: pending.platform,
+                account_id: pending.account_id,
+                channel_id: pending.channel_id,
+                thread_id: pending.thread_id,
+                user_id: pending.user_id,
+                session_key: pending.session_key,
+                message_kind: pending.message_kind,
+                action: pending.action,
+                status: AgentProgressDeliveryStatus::Delivered,
+                provider_message_id: pending.provider_message_id,
+                event_line: pending.event_line,
+                text_hash: pending.text_hash,
+                terminal: pending.terminal,
+                policy_decision: Some("test".to_string()),
+                error: None,
+                now_ms: 302_000,
+            })
+            .unwrap();
+            let deduped = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+                harness_home: harness_home.clone(),
+                platform: Some(platform.to_string()),
+                now_ms: 302_001,
+                min_update_interval_ms: 0,
+                max_nonterminal_updates_per_lane: 1,
+                ..AgentProgressDeliveryPlanOptions::default()
+            })
+            .unwrap();
+            assert!(deduped.pending.is_empty(), "platform={platform}");
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn delivery_plan_status_updates_immediately_for_new_current_step_after_body_cap() {
+        let root = temp_root(
+            "delivery_plan_status_updates_immediately_for_new_current_step_after_body_cap",
+        );
+        let harness_home = root.join(".agent-harness");
+        let context = context();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Todo,
+                "todo",
+                "planning 1 task(s)",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+        )
+        .unwrap();
+        let initial = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2000,
+            min_update_interval_ms: 0,
+            max_nonterminal_updates_per_lane: 1,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(initial.pending.len(), 2);
+        for (index, pending) in initial.pending.into_iter().enumerate() {
+            record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+                harness_home: harness_home.clone(),
+                queue_id: pending.queue_id,
+                platform: pending.platform,
+                account_id: pending.account_id,
+                channel_id: pending.channel_id,
+                thread_id: pending.thread_id,
+                user_id: pending.user_id,
+                session_key: pending.session_key,
+                message_kind: pending.message_kind,
+                action: pending.action,
+                status: AgentProgressDeliveryStatus::Delivered,
+                provider_message_id: Some(format!("provider-{}", index + 1)),
+                event_line: pending.event_line,
+                text_hash: pending.text_hash,
+                terminal: pending.terminal,
+                policy_decision: Some("test".to_string()),
+                error: None,
+                now_ms: 2000,
+            })
+            .unwrap();
+        }
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::ToolCall,
+                "tool_call",
+                "cargo test -p agent-harness-core",
+                AgentProgressStatus::Progress,
+                3000,
+            ),
+        )
+        .unwrap();
+        let capped = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 4000,
+            min_update_interval_ms: 0,
+            max_nonterminal_updates_per_lane: 1,
+            status_heartbeat_after_body_cap_ms: 300_000,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert!(capped.pending.is_empty());
+
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::AssistantNarration,
+                "assistant_narration",
+                "healthz age differs only because collect_status reads time later; relaxing age.",
+                AgentProgressStatus::Progress,
+                5000,
+            ),
+        )
+        .unwrap();
+        let realtime_summary = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 5001,
+            min_update_interval_ms: 0,
+            max_nonterminal_updates_per_lane: 1,
+            status_heartbeat_after_body_cap_ms: 300_000,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+
+        assert_eq!(realtime_summary.pending.len(), 1);
+        let pending = &realtime_summary.pending[0];
+        assert_eq!(
+            pending.message_kind,
+            AgentProgressDeliveryMessageKind::Status
+        );
+        assert_eq!(pending.action, AgentProgressDeliveryAction::Edit);
+        assert!(pending.text.contains("Current step: healthz age differs"));
+        assert!(pending.text.contains("Updates capped; still working."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delivery_plan_reads_volume_limit_from_response_config() {
+        let root = temp_root("delivery_plan_reads_volume_limit_from_response_config");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"response":{"progressDeliveryMaxNonterminalUpdatesPerLane":1}}"#,
+        )
+        .unwrap();
+        let context = context();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Todo,
+                "todo",
+                "planning 1 task(s)",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+        )
+        .unwrap();
+        let initial = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(initial.pending.len(), 2);
+        for (index, pending) in initial.pending.into_iter().enumerate() {
+            record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+                harness_home: harness_home.clone(),
+                queue_id: pending.queue_id,
+                platform: pending.platform,
+                account_id: pending.account_id,
+                channel_id: pending.channel_id,
+                thread_id: pending.thread_id,
+                user_id: pending.user_id,
+                session_key: pending.session_key,
+                message_kind: pending.message_kind,
+                action: pending.action,
+                status: AgentProgressDeliveryStatus::Delivered,
+                provider_message_id: Some(format!("provider-{}", index + 1)),
+                event_line: pending.event_line,
+                text_hash: pending.text_hash,
+                terminal: pending.terminal,
+                policy_decision: Some("test".to_string()),
+                error: None,
+                now_ms: 2000,
+            })
+            .unwrap();
+        }
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::ToolCall,
+                "tool_call",
+                "cargo test",
+                AgentProgressStatus::Progress,
+                3000,
+            ),
+        )
+        .unwrap();
+
+        let limited = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 4000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+
+        assert!(limited.pending.is_empty());
+        assert_eq!(limited.summary.volume_limited, 1);
+        assert_eq!(limited.summary.rate_limited, 1);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2217,7 +2824,8 @@ mod tests {
             .map(|stored| &stored.event)
             .collect::<Vec<_>>();
         assert!(
-            render_agent_progress_status(event_refs.as_slice(), 4000, 120, 1200).contains("Failed")
+            render_agent_progress_status(event_refs.as_slice(), 4000, 120, 1200, false)
+                .contains("Failed")
         );
 
         let _ = fs::remove_dir_all(root);
@@ -2727,6 +3335,7 @@ mod tests {
                 format!("body-hash-{index}"),
                 2_000 + index as i64,
                 true,
+                true,
             );
             cursor.record_lane(
                 AgentProgressDeliveryMessageKind::Status,
@@ -2734,6 +3343,7 @@ mod tests {
                 line_number,
                 format!("status-hash-{index}"),
                 2_000 + index as i64,
+                true,
                 true,
             );
             state.queues.insert(old_context.queue_id.clone(), cursor);

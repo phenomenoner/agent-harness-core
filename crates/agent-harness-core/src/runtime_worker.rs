@@ -2684,12 +2684,12 @@ fn maybe_apply_context_rollover_before_turn(
 mod tests {
     use super::*;
     use crate::{
-        ChannelSessionState, ContextCompactAttemptOptions, ContextRolloverLane,
-        InboundMediaArtifact, InboundMediaDownloadStatus, InboundMediaModelAttachmentStatus,
-        InboundMediaSelectedVariant, RuntimeQueueEnqueueOptions, TurnPlanInput, build_channel_step,
-        build_source_skill_index, build_turn_plan, channel_session_state_file,
-        enqueue_channel_step, inbound_media_attachment_root, read_channel_session_state,
-        record_context_compact_attempt,
+        ArtifactExtractionSummary, ChannelSessionState, ContextCompactAttemptOptions,
+        ContextRolloverLane, InboundMediaArtifact, InboundMediaDownloadStatus,
+        InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant, RuntimeQueueEnqueueOptions,
+        TurnPlanInput, build_channel_step, build_source_skill_index, build_turn_plan,
+        channel_session_state_file, enqueue_channel_step, inbound_media_attachment_root,
+        read_channel_session_state, record_context_compact_attempt,
     };
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2856,6 +2856,24 @@ mod tests {
                     mime: Some("image/jpeg".to_string()),
                     sha256: Some("abc123".to_string()),
                     source: "https://api.telegram.org/botTOKEN/getFile?file_id=secret".to_string(),
+                    caption_preview: Some(
+                        "data:image/jpeg;base64,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                            .to_string(),
+                    ),
+                    lifecycle_status: Some("summarized".to_string()),
+                    extraction_summary: Some(ArtifactExtractionSummary {
+                        artifact_class: Some("image".to_string()),
+                        modality: Some("photo".to_string()),
+                        summary: Some(
+                            "Reference image extracted into subject, pose, wardrobe, and composition facts."
+                                .to_string(),
+                        ),
+                        facts: vec![
+                            "subject pose is visible".to_string(),
+                            "raw pixels remain in artifact storage".to_string(),
+                        ],
+                        uncertainty: Some("fine details require vision tool lookup".to_string()),
+                    }),
                     download_status: InboundMediaDownloadStatus::Downloaded,
                     model_attachment_status: InboundMediaModelAttachmentStatus::PromptOnly,
                     warnings: vec!["file_id=secret".to_string()],
@@ -2909,9 +2927,15 @@ mod tests {
         assert!(prompt_markdown.contains("height=1280"));
         assert!(prompt_markdown.contains("downloadStatus=downloaded"));
         assert!(prompt_markdown.contains("modelAttachmentStatus=vision-tool-available"));
+        assert!(prompt_markdown.contains("artifactClass=image"));
+        assert!(prompt_markdown.contains("lifecycleStatus=summarized"));
+        assert!(prompt_markdown.contains("extractionSummary=Reference image extracted"));
+        assert!(prompt_markdown.contains("captionPreview=redacted-artifact-payload"));
         assert!(!prompt_markdown.contains("file_id=secret"));
         assert!(!prompt_markdown.contains("botTOKEN"));
         assert!(!prompt_markdown.contains("api.telegram.org/file"));
+        assert!(!prompt_markdown.contains("data:image"));
+        assert!(!prompt_markdown.contains("base64"));
 
         let _ = fs::remove_dir_all(root);
     }

@@ -169,7 +169,7 @@ Minimum evidence bundle for each phase:
 | P4 | Token reports, golden prompt bundle diffs, >=30% token reduction proof, cache-prefix assertions, recall/skill citation ledger samples. | Token efficiency, observability, testing |
 | P5 | Budget race tests, native MCP protocol fixtures, tool-call latency benchmark, proposal/quarantine receipts, learning-loop default-on/propose-only proof, and auto-apply-off-by-default proof. | Extensibility, safety, maturity, token efficiency |
 | T | `docs/invariants.md`, seeded simulation output, sanitized replay fixtures, restore drill receipt. | Testing, persistence, recovery |
-| M | ContextPack fixtures, ingest idempotency test, MCP memory fail-open proof, tool-description hash drift test, provenance trace sample. | Extensibility, security, observability |
+| M | ContextPack fixtures, ingest idempotency test, MCP memory fail-open proof, tool-description hash drift test, provenance trace sample, full-parity gap ledger for graph/autonomous matching. | Extensibility, security, observability |
 | P6 | Vault migration/rotation proof, shell hardening tests, adversarial injection fixtures, dependency audit, trust-boundary doc. | Security, maturity |
 | P7 | CI run, schema registry, Codex wire fixtures, changelog/release checklist, public hygiene report. | Testing, maturity, extensibility |
 
