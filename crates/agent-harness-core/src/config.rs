@@ -106,6 +106,7 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
         "runtimeDispatch",
         "runtimeBackoff",
         "cronScheduler",
+        "memory",
         "supervisor",
         "channelIdentity",
         "liveControlGuard",
@@ -134,6 +135,7 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
             }
             "runtimeBackoff" => validate_runtime_backoff_object("$.runtimeBackoff", child, errors),
             "cronScheduler" => validate_cron_scheduler_object("$.cronScheduler", child, errors),
+            "memory" => validate_memory_object("$.memory", child, errors),
             "supervisor" => validate_supervisor_object("$.supervisor", child, errors),
             "channelIdentity" => {
                 validate_channel_identity_object("$.channelIdentity", child, errors)
@@ -597,6 +599,21 @@ fn validate_supervisor_object(path: &str, value: &Value, errors: &mut Vec<String
             }
             "services" => validate_supervisor_services(path_key(path, key), child, errors),
             other => errors.push(format!("unknown supervisor config key `{other}` at {path}")),
+        }
+    }
+}
+
+fn validate_memory_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "openclawMemBridgeCommand"
+            | "openclaw_mem_bridge_command"
+            | "openclawMemBridgeBin"
+            | "openclaw_mem_bridge_bin" => expect_string(path_key(path, key), child, errors),
+            other => errors.push(format!("unknown memory config key `{other}` at {path}")),
         }
     }
 }
@@ -1106,6 +1123,10 @@ mod tests {
                 "curator": { "enabled": true, "intervalHours": 168, "usageWeighted": true },
                 "sessionSearch": { "enabled": true, "tokenizer": "trigram" },
                 "userModel": { "enabled": true, "provider": "local", "applyMode": "propose" }
+              },
+              "memory": {
+                "openclawMemBridgeCommand": "openclaw-mem-bridge-dispatch .agent-harness",
+                "openclawMemBridgeBin": "openclaw-mem"
               },
               "staging": {
                 "enabled": true,

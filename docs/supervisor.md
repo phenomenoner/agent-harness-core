@@ -18,7 +18,7 @@ The bundle contains runner scripts plus install/start/stop/uninstall scripts. It
 
 One runtime loop owns queue inspection and dispatch. Per-item leases and worker limits prevent a long turn in one channel from blocking unrelated channel work when capacity is available.
 
-When `supervisor-plan` is run without `--codex-exe`, it should discover a repo-local spawnable Codex CLI and pin that concrete path into generated runtime-capable scripts. On Windows, the preferred default is `.tools\codex-cli\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe`, with `.tools\codex-cli\node_modules\.bin\codex.cmd` as fallback. Generated live runners should not depend on an extensionless npm shim or Codex Desktop MSIX resource path through `PATH`.
+When `supervisor-plan` is run without `--codex-exe`, it should discover a repo-local spawnable Codex CLI and pin that concrete path into generated runtime-capable scripts. On Windows, Codex resolution prefers the native vendor `codex.exe`, then falls back to npm `codex.cmd` only when the native executable is unavailable. Generated live runners should not depend on an extensionless npm shim or Codex Desktop MSIX resource path through `PATH`.
 
 ## Start Fallback
 

@@ -1,6 +1,58 @@
 # Changelog
 
-## Unreleased - 2026-06-29
+## Unreleased
+
+## v0.2.0 - 2026-06-29
+
+### Difference from v0.1.7
+
+`v0.2.0` promotes the openclaw-mem bridge-primary memory path and hardens
+Windows service executable resolution. Compared with `v0.1.7`, configured
+`mem-engine` ownership can use an openclaw-mem subprocess bridge for status,
+recall, and approved store operations instead of relying on stale response
+files or a read-only migration fallback; Codex and Node service launches also
+avoid fragile Windows PATH/shim assumptions after the 2026-06-29 live incident.
+This release requires `openclaw-mem >= 1.9.31` for the bridge-primary envelope
+contract.
+
+### Changed
+
+- Added `memory.openclawMemBridgeCommand` / `memory.openclawMemBridgeBin`
+  validation to `harness-config.json` so managed harness restarts can retain the
+  openclaw-mem bridge route without operator shell environment variables.
+- Changed `memory-service-status` for active `mem-engine` ownership to ask the
+  configured bridge for fresh status telemetry before consulting older recall
+  receipts.
+- Raised the read-only openclaw-mem bridge deadline to 15 seconds and added one
+  bounded retry for `status` and `recall`; approved `store` stays fail-closed
+  and is not retried, avoiding duplicate canonical writes.
+- Updated the topology contract and invariant I12 to distinguish
+  bridge-primary status/recall/store proof from the remaining graph autonomous
+  matching parity work.
+- Prefer native Windows Codex vendor `codex.exe` for service-mode app-server
+  runtime plans, with npm `codex.cmd` shim execution only as fallback.
+- Record terminal `ProtocolError` receipts when Codex app-server startup or
+  early request writes fail before normal protocol completion.
+- Resolve default Node service commands on Windows through
+  `AGENT_HARNESS_NODE_EXE`, explicit `node.exe` install paths, or PATH
+  `node.exe` before falling back to bare `node`.
+- Updated the topology contract and invariant catalog with
+  `codex-startup-executable-stability-gap` as the promotion gate for Codex/Node
+  service executable stability.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- Focused memory owner/service bridge tests, including harness-config-backed
+  bridge routing.
+- Quality gate test for invariants and release checklist output.
+- openclaw-mem bridge CLI pytest suite from the paired `v1.9.31` local repo.
+- Focused Codex/Node service executable tests for native Codex vendor
+  resolution, startup terminal receipts, extensionless shim preflight, MSIX path
+  blocking, supervisor plan parsing, and Windows Node default resolution.
+- Public hygiene and `git diff --check` before tagging.
+
+## v0.1.7 - 2026-06-29
 
 ### Changed
 

@@ -14,6 +14,50 @@ Agent Harness Core reads most operator state from a harness home directory suppl
 
 Use `--source-home` for imported prompt files, registry, skills, and legacy context. Use `--runtime-workspace` only for the Codex working directory. Prompt assembly falls back to the imported source workspace when the runtime workspace does not contain prompt files.
 
+## Memory Bridge
+
+When `mem-engine` is the active memory owner, the harness can route status,
+recall, and approved store operations through the openclaw-mem subprocess bridge
+instead of stale response files or the read-only migration fallback. The bridge
+primary path requires `openclaw-mem >= 1.9.31`.
+
+`harness-config.json` accepts either a full bridge command or a bridge binary:
+
+```json
+{
+  "memory": {
+    "openclawMemBridgeCommand": "openclaw-mem-bridge-dispatch .agent-harness",
+    "openclawMemBridgeBin": "openclaw-mem-bridge-dispatch"
+  }
+}
+```
+
+`openclawMemBridgeCommand` takes precedence when both fields are present because
+it can include required arguments such as the harness home. `openclawMemBridgeBin`
+is the portable fallback when no extra arguments are needed. Read-only
+`status`/`recall` calls use a bounded deadline and one retry; approved `store`
+calls fail closed and are not retried, avoiding duplicate canonical writes.
+
+## Service Executables
+
+Windows service-mode execution should avoid unqualified PATH shims for long-lived
+runtime and gateway processes.
+
+For Codex app-server runtime plans, the harness prefers native vendor
+`codex.exe` when it detects an npm `codex.cmd` shim with a matching packaged
+binary; npm `codex.cmd` is only the fallback. Extensionless shims and Codex
+Desktop MSIX resource paths are rejected by preflight.
+
+For Node-backed gateway and plugin sidecar commands, the default Node resolution
+order is:
+
+```text
+AGENT_HARNESS_NODE_EXE -> explicit Windows node.exe install path -> PATH node.exe -> node
+```
+
+Operators can set `AGENT_HARNESS_NODE_EXE` or pass `--node-exe` to pin a known
+spawnable Node executable.
+
 ## Runtime Terminal State
 
 `timeout` run-once receipts are terminal for the parent queue id. Runtime selection, status open-item counts, native typing context, and progress delivery all treat the parent turn as closed after a timeout. To retry work, enqueue a new turn or explicit retry id rather than reusing the old queue id.

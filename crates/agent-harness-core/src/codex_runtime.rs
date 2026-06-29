@@ -59,6 +59,15 @@ const DEFAULT_CODEX_SANDBOX_POLICY: &str = "workspaceWrite";
 const RUNTIME_CANCEL_REQUEST_MAX_AGE_MS: i64 = 60_000;
 const CODEX_CHILD_TERMINATE_TIMEOUT_MS: u64 = 2_000;
 const CODEX_STDOUT_READER_JOIN_TIMEOUT_MS: u64 = 2_000;
+#[cfg(windows)]
+const CODEX_WINDOWS_NATIVE_VENDOR_RELATIVE: &[&str] = &[
+    "@openai",
+    "codex-win32-x64",
+    "vendor",
+    "x86_64-pc-windows-msvc",
+    "bin",
+    "codex.exe",
+];
 const DEFAULT_ASSISTANT_NARRATION_MAX_CHARS: usize = 1200;
 const CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT: u64 = 1_000_000;
 const CODEX_THREAD_INLINE_IMAGE_TOTAL_BYTES_LIMIT: u64 = 3_000_000;
@@ -3148,7 +3157,7 @@ fn drive_codex_app_server(
         &mut state.warnings,
     );
 
-    write_json_rpc(
+    if let Err(error) = write_json_rpc(
         &mut stdin,
         &json!({
             "id": 0,
@@ -3164,14 +3173,34 @@ fn drive_codex_app_server(
                 }
             }
         }),
-    )?;
-    write_json_rpc(
+    ) {
+        return Ok(codex_app_server_write_failed_result(
+            &mut child,
+            &mut reader_handle,
+            &mut state,
+            &stdout_log,
+            &stderr_log,
+            "initialize request",
+            error,
+        ));
+    }
+    if let Err(error) = write_json_rpc(
         &mut stdin,
         &json!({
             "method": "initialized",
             "params": {}
         }),
-    )?;
+    ) {
+        return Ok(codex_app_server_write_failed_result(
+            &mut child,
+            &mut reader_handle,
+            &mut state,
+            &stdout_log,
+            &stderr_log,
+            "initialized notification",
+            error,
+        ));
+    }
     let mut thread_params = json!({});
     let app_server_approval_policy = app_server_approval_policy_for_plan(harness_home, plan);
     let app_server_sandbox = app_server_sandbox_for_plan(plan);
@@ -3197,14 +3226,24 @@ fn drive_codex_app_server(
     } else {
         "thread/start"
     };
-    write_json_rpc(
+    if let Err(error) = write_json_rpc(
         &mut stdin,
         &json!({
             "id": 1,
             "method": thread_method,
             "params": thread_params
         }),
-    )?;
+    ) {
+        return Ok(codex_app_server_write_failed_result(
+            &mut child,
+            &mut reader_handle,
+            &mut state,
+            &stdout_log,
+            &stderr_log,
+            "thread start request",
+            error,
+        ));
+    }
 
     let thread_id = match wait_for_thread_start(
         &line_rx,
@@ -3611,14 +3650,24 @@ fn drive_codex_app_server(
         thread_id.clone(),
         turn_start_request_id,
     )?;
-    write_json_rpc(
+    if let Err(error) = write_json_rpc(
         &mut stdin,
         &json!({
             "id": turn_start_request_id,
             "method": "turn/start",
             "params": turn_params
         }),
-    )?;
+    ) {
+        return Ok(codex_app_server_write_failed_result(
+            &mut child,
+            &mut reader_handle,
+            &mut state,
+            &stdout_log,
+            &stderr_log,
+            "turn start request",
+            error,
+        ));
+    }
 
     let wait_result = wait_for_turn_completed(
         &line_rx,
@@ -6186,6 +6235,35 @@ fn finish_codex_child_and_stdout_reader(
     }
 }
 
+fn codex_app_server_write_failed_result(
+    child: &mut std::process::Child,
+    reader_handle: &mut StdoutReaderHandle,
+    state: &mut CodexProtocolState,
+    stdout_log: &Path,
+    stderr_log: &Path,
+    context: &str,
+    error: io::Error,
+) -> CodexAppServerRunResult {
+    let reason = format!("failed to write codex app-server {context}: {error}");
+    finish_codex_child_and_stdout_reader(child, reader_handle, &mut state.warnings, &reason);
+    CodexAppServerRunResult {
+        status: CodexRuntimeRunStatus::ProtocolError,
+        reason,
+        assistant_message: state.assistant_message_with_harness_notices(),
+        assistant_narration: state.assistant_narration_records(),
+        assistant_raw_message: state.assistant_raw_message(),
+        assistant_final_found: state.assistant_final_found(),
+        thread_id: None,
+        event_count: state.event_count,
+        usage: state.usage.clone(),
+        stdout_log: Some(stdout_log.to_path_buf()),
+        stderr_log: Some(stderr_log.to_path_buf()),
+        context_recovery: None,
+        tool_use_timeout: None,
+        warnings: std::mem::take(&mut state.warnings),
+    }
+}
+
 fn spawn_stdout_reader<R: Read + Send + 'static>(
     stdout: R,
     stdout_log: PathBuf,
@@ -7925,12 +8003,66 @@ fn resolve_runtime_plan_executable(executable: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {
         if let Some(resolved) = resolve_executable(&executable) {
+            if let Some(native) = native_codex_for_windows_cmd_shim(&resolved) {
+                return native;
+            }
             if executable_spawn_block_reason(&resolved).is_none() {
                 return resolved;
             }
         }
     }
     executable
+}
+
+#[cfg(windows)]
+fn native_codex_for_windows_cmd_shim(path: &Path) -> Option<PathBuf> {
+    if !path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("codex.cmd"))
+    {
+        return None;
+    }
+    let parent = path.parent()?;
+    let mut roots = Vec::new();
+    roots.push(
+        parent
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("node_modules"),
+    );
+    if parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(".bin"))
+        && let Some(node_modules) = parent.parent()
+    {
+        roots.push(node_modules.to_path_buf());
+        roots.push(
+            node_modules
+                .join("@openai")
+                .join("codex")
+                .join("node_modules"),
+        );
+    }
+
+    for root in roots {
+        let candidate = join_relative_components(&root, CODEX_WINDOWS_NATIVE_VENDOR_RELATIVE);
+        if candidate.is_file() && executable_spawn_block_reason(&candidate).is_none() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn join_relative_components(root: &Path, components: &[&str]) -> PathBuf {
+    let mut path = root.to_path_buf();
+    for component in components {
+        path.push(component);
+    }
+    path
 }
 
 fn executable_spawn_block_reason(path: &Path) -> Option<&'static str> {
@@ -10316,6 +10448,43 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    fn plan_codex_runtime_prefers_native_vendor_for_npm_cmd_shim() {
+        let root = temp_root("plan_codex_runtime_prefers_native_vendor_for_npm_cmd_shim");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let npm_prefix = root.join("npm-prefix");
+        let shim = npm_prefix.join("codex.cmd");
+        let native = join_relative_components(
+            &npm_prefix
+                .join("node_modules")
+                .join("@openai")
+                .join("codex")
+                .join("node_modules"),
+            CODEX_WINDOWS_NATIVE_VENDOR_RELATIVE,
+        );
+        fs::create_dir_all(native.parent().unwrap()).unwrap();
+        fs::write(&shim, "@echo off").unwrap();
+        fs::write(&native, "").unwrap();
+
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home,
+            execution_dir: None,
+            codex_executable: Some(shim),
+        })
+        .unwrap();
+
+        assert_eq!(
+            plan_report.plan.unwrap().invocation.executable,
+            native,
+            "npm codex.cmd shim should not be the live service runtime path"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn preflight_codex_runtime_blocks_codex_desktop_msix_resource_path() {
         let root = temp_root("preflight_codex_runtime_blocks_codex_desktop_msix_resource_path");
         let source = write_codex_runtime_source(&root);
@@ -10515,6 +10684,43 @@ mod tests {
         );
         assert!(report.process.is_none());
         assert!(report.launch_file.unwrap().is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_records_terminal_receipt_when_app_server_exits_during_startup() {
+        let root = temp_root(
+            "run_codex_runtime_records_terminal_receipt_when_app_server_exits_during_startup",
+        );
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = immediate_exit_command();
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 5_000,
+            idle_timeout_ms: 5_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+        assert!(report.run_file.as_ref().unwrap().is_file());
+        assert!(report.completion.is_none());
+        assert!(report.receipt.reason.contains("codex app-server"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -12316,6 +12522,33 @@ mod tests {
         (
             PathBuf::from("sh"),
             vec!["-c".to_string(), "while true; do sleep 1; done".to_string()],
+        )
+    }
+
+    #[cfg(windows)]
+    fn immediate_exit_command() -> (PathBuf, Vec<String>) {
+        let system_cmd = PathBuf::from(r"C:\Windows\System32\cmd.exe");
+        let executable = if system_cmd.is_file() {
+            system_cmd
+        } else {
+            PathBuf::from("cmd.exe")
+        };
+        (
+            executable,
+            vec![
+                "/C".to_string(),
+                "exit".to_string(),
+                "/B".to_string(),
+                "0".to_string(),
+            ],
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn immediate_exit_command() -> (PathBuf, Vec<String>) {
+        (
+            PathBuf::from("sh"),
+            vec!["-c".to_string(), "exit 0".to_string()],
         )
     }
 

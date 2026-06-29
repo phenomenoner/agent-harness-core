@@ -11001,7 +11001,7 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
         node_exe: options
             .optional("--node-exe")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("node")),
+            .unwrap_or_else(default_node_exe),
         gateway_script: options
             .optional("--gateway-script")
             .map(PathBuf::from)
@@ -11483,7 +11483,7 @@ fn supervisor_run_args_from_args(args: &[String]) -> Result<SupervisorRunArgs, S
     let node_exe = options
         .optional("--node-exe")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("node"));
+        .unwrap_or_else(default_node_exe);
     let gateway_script = options
         .optional("--gateway-script")
         .map(PathBuf::from)
@@ -11583,7 +11583,7 @@ fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs,
     let mut runtime_workspace = None;
     let mut harness_cli = default_harness_cli();
     let mut codex_exe = None;
-    let mut node_exe = PathBuf::from("node");
+    let mut node_exe = default_node_exe();
     let mut gateway_script = PathBuf::from("tools")
         .join("agent-discord-gateway")
         .join("index.mjs");
@@ -13230,7 +13230,7 @@ fn discord_gateway_args_from_args(args: &[String]) -> Result<DiscordGatewayArgs,
     let mut workspace = None;
     let mut runtime_workspace = None;
     let mut target_home = default_harness_home();
-    let mut node_exe = PathBuf::from("node");
+    let mut node_exe = default_node_exe();
     let mut gateway_script = PathBuf::from("tools")
         .join("agent-discord-gateway")
         .join("index.mjs");
@@ -13359,7 +13359,7 @@ fn discord_gateway_args_from_args(args: &[String]) -> Result<DiscordGatewayArgs,
 
 fn plugin_sidecar_probe_args_from_args(args: &[String]) -> Result<PluginSidecarProbeArgs, String> {
     let mut target_home = default_harness_home();
-    let mut node_exe = PathBuf::from("node");
+    let mut node_exe = default_node_exe();
     let mut sidecar_script = PathBuf::from("tools")
         .join("agent-plugin-sidecar")
         .join("index.mjs");
@@ -13400,7 +13400,7 @@ fn plugin_sidecar_probe_args_from_args(args: &[String]) -> Result<PluginSidecarP
 
 fn plugin_sidecar_call_args_from_args(args: &[String]) -> Result<PluginSidecarCallArgs, String> {
     let mut target_home = default_harness_home();
-    let mut node_exe = PathBuf::from("node");
+    let mut node_exe = default_node_exe();
     let mut sidecar_script = PathBuf::from("tools")
         .join("agent-plugin-sidecar")
         .join("index.mjs");
@@ -14321,6 +14321,53 @@ fn default_harness_cli() -> PathBuf {
         "agent-harness"
     };
     PathBuf::from("target").join("debug").join(exe)
+}
+
+fn default_node_exe() -> PathBuf {
+    if let Some(path) = default_node_exe_from_env(env::var_os("AGENT_HARNESS_NODE_EXE")) {
+        return path;
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(path) = windows_default_node_exe(env::var_os("PATH"), |path| path.is_file()) {
+            return path;
+        }
+    }
+
+    PathBuf::from("node")
+}
+
+fn default_node_exe_from_env(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let value = value?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(value))
+}
+
+#[cfg(windows)]
+fn windows_default_node_exe<F>(path_env: Option<std::ffi::OsString>, exists: F) -> Option<PathBuf>
+where
+    F: Fn(&Path) -> bool,
+{
+    for candidate in [
+        PathBuf::from(r"C:\Program Files\nodejs\node.exe"),
+        PathBuf::from(r"C:\Program Files (x86)\nodejs\node.exe"),
+    ] {
+        if exists(&candidate) {
+            return Some(candidate);
+        }
+    }
+
+    let path_env = path_env?;
+    for dir in env::split_paths(&path_env) {
+        let candidate = dir.join("node.exe");
+        if exists(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn is_harness_home_arg(flag: &str) -> bool {
@@ -20922,6 +20969,17 @@ mod tests {
 
         assert_eq!(args.target_home, PathBuf::from("live-home"));
         assert_eq!(args.source_home, PathBuf::from("legacy-home"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn default_node_exe_resolves_spawnable_path_node_on_windows() {
+        let expected = PathBuf::from(r"C:\Tools\nodejs\node.exe");
+        let path_env = Some(std::ffi::OsString::from(r"C:\Blocked;C:\Tools\nodejs"));
+        let resolved = windows_default_node_exe(path_env, |path| path == expected.as_path())
+            .expect("expected PATH node.exe to resolve");
+
+        assert_eq!(resolved, expected);
     }
 
     #[test]
