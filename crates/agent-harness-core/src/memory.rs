@@ -3,8 +3,10 @@ use std::env;
 use std::fs;
 use std::io;
 use std::io::BufRead;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -46,6 +48,8 @@ const OPENCLAW_MEM_LOCAL_OWNER_ENDPOINT: &str = "local-in-process";
 const OPENCLAW_MEM_ENGINE_PROVIDER: &str = "openclaw-mem-engine";
 const MEMORY_MIGRATION_FALLBACK_PROVIDER: &str = "migration-fallback";
 const OPENCLAW_MEM_ENGINE_RECALL_DEADLINE_MS: u64 = 1_500;
+const OPENCLAW_MEM_BRIDGE_COMMAND_ENV: &str = "AGENT_HARNESS_OPENCLAW_MEM_BRIDGE_COMMAND";
+const OPENCLAW_MEM_BRIDGE_BIN_ENV: &str = "AGENT_HARNESS_OPENCLAW_MEM_BRIDGE_BIN";
 const DEFAULT_MAX_FILE_BYTES: u64 = 1_000_000;
 const DEFAULT_CONTEXT_MAX_FILE_BYTES: u64 = 4_000_000;
 const DEFAULT_SNIPPET_CHARS: usize = 240;
@@ -2767,6 +2771,15 @@ pub fn store_openclaw_mem_service_memory(
     } else {
         OpenClawMemServiceStoreStatus::ReviewRequired
     };
+    if status == OpenClawMemServiceStoreStatus::Stored {
+        let owner_state = read_memory_owner_state_or_default(
+            &options.harness_home,
+            crate::current_log_time_ms().unwrap_or(options.now_ms),
+        )?;
+        if owner_state.owner == MEM_ENGINE_OWNER {
+            return store_openclaw_mem_engine_bridge(options, text, store_file, receipt_file);
+        }
+    }
     let store_id = if status == OpenClawMemServiceStoreStatus::Stored {
         let agent = options.agent_id.as_deref().unwrap_or("global");
         let session = options.session_key.as_deref().unwrap_or("unknown");
@@ -2805,6 +2818,134 @@ pub fn store_openclaw_mem_service_memory(
                 "openclaw-mem store skipped because text was empty".to_string()
             }
         },
+        store_id,
+        store_file,
+        receipt_file,
+        text_length: text.chars().count(),
+    };
+    append_json_line(&report.receipt_file, &report)?;
+    Ok(report)
+}
+
+fn store_openclaw_mem_engine_bridge(
+    options: OpenClawMemServiceStoreOptions,
+    text: String,
+    store_file: PathBuf,
+    receipt_file: PathBuf,
+) -> io::Result<OpenClawMemServiceStoreReport> {
+    let request_id = openclaw_mem_engine_store_request_id(
+        options.agent_id.as_deref(),
+        options.session_key.as_deref(),
+        &text,
+        options.now_ms,
+    );
+    let request_file = openclaw_mem_engine_store_request_file(&options.harness_home);
+    if let Some(parent) = request_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let request = serde_json::json!({
+        "v": 1,
+        "op": "store",
+        "requestId": request_id,
+        "deadlineMs": OPENCLAW_MEM_ENGINE_RECALL_DEADLINE_MS,
+        "host": {
+            "agentId": options.agent_id.as_deref().unwrap_or("global"),
+            "sessionKey": options.session_key,
+            "platform": std::env::consts::OS,
+            "harnessVersion": env!("CARGO_PKG_VERSION")
+        },
+        "payload": {
+            "text": text,
+            "approved": options.approved,
+            "category": "fact",
+            "metadata": redact_json_value(options.payload)
+        }
+    });
+    fs::write(
+        &request_file,
+        serde_json::to_string_pretty(&request).map_err(io::Error::other)?,
+    )?;
+    let response_file = openclaw_mem_engine_store_response_last_file(&options.harness_home);
+    let (status, reason, store_id) = match invoke_openclaw_mem_bridge(
+        &options.harness_home,
+        "store",
+        &request,
+        &response_file,
+        OPENCLAW_MEM_ENGINE_RECALL_DEADLINE_MS,
+    )? {
+        MemEngineBridgeInvocation::Response { text, .. } => {
+            match serde_json::from_str::<MemEngineRecallEnvelope>(&text) {
+                Ok(envelope)
+                    if envelope.provider.as_deref() == Some(OPENCLAW_MEM_ENGINE_PROVIDER)
+                        && envelope.operation.as_deref() == Some("store")
+                        && envelope.request_id.as_deref() == request["requestId"].as_str() =>
+                {
+                    let payload = envelope.payload.unwrap_or(Value::Null);
+                    let writes_performed = payload
+                        .get("writesPerformed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let store_id = json_string(&payload, "storeId");
+                    match envelope.status.as_deref() {
+                        Some("ready") if writes_performed && store_id.is_some() => (
+                            OpenClawMemServiceStoreStatus::Stored,
+                            "openclaw-mem-engine bridge stored approved memory".to_string(),
+                            store_id,
+                        ),
+                        Some("policy_denied") => (
+                            OpenClawMemServiceStoreStatus::ReviewRequired,
+                            envelope.error_message.unwrap_or_else(|| {
+                                "openclaw-mem-engine bridge denied store by policy".to_string()
+                            }),
+                            None,
+                        ),
+                        Some(other) => (
+                            OpenClawMemServiceStoreStatus::ReviewRequired,
+                            format!("openclaw-mem-engine store bridge status={other}"),
+                            None,
+                        ),
+                        None => (
+                            OpenClawMemServiceStoreStatus::ReviewRequired,
+                            "openclaw-mem-engine store bridge omitted status".to_string(),
+                            None,
+                        ),
+                    }
+                }
+                Ok(_) => (
+                    OpenClawMemServiceStoreStatus::ReviewRequired,
+                    "openclaw-mem-engine store bridge provider/operation/requestId mismatch"
+                        .to_string(),
+                    None,
+                ),
+                Err(error) => (
+                    OpenClawMemServiceStoreStatus::ReviewRequired,
+                    format!("openclaw-mem-engine store bridge returned malformed JSON: {error}"),
+                    None,
+                ),
+            }
+        }
+        MemEngineBridgeInvocation::Fallback(fallback) => (
+            OpenClawMemServiceStoreStatus::ReviewRequired,
+            format!(
+                "openclaw-mem-engine store bridge unavailable: {}",
+                fallback.warnings.join("; ")
+            ),
+            None,
+        ),
+        MemEngineBridgeInvocation::NotConfigured => (
+            OpenClawMemServiceStoreStatus::ReviewRequired,
+            "openclaw-mem-engine store bridge is not configured; refusing canonical write fallback"
+                .to_string(),
+            None,
+        ),
+    };
+    let report = OpenClawMemServiceStoreReport {
+        schema: OPENCLAW_MEM_SERVICE_STORE_SCHEMA,
+        harness_home: options.harness_home,
+        agent_id: options.agent_id,
+        session_key: options.session_key,
+        status,
+        reason,
         store_id,
         store_file,
         receipt_file,
@@ -4548,10 +4689,40 @@ fn openclaw_mem_engine_recall_response_file(harness_home: &Path) -> PathBuf {
     openclaw_mem_engine_bridge_dir(harness_home).join("recall-response.json")
 }
 
+fn openclaw_mem_engine_recall_response_last_file(harness_home: &Path) -> PathBuf {
+    openclaw_mem_engine_bridge_dir(harness_home).join("recall-response-last.json")
+}
+
+fn openclaw_mem_engine_store_request_file(harness_home: &Path) -> PathBuf {
+    openclaw_mem_engine_bridge_dir(harness_home).join("store-request-last.json")
+}
+
+fn openclaw_mem_engine_store_response_last_file(harness_home: &Path) -> PathBuf {
+    openclaw_mem_engine_bridge_dir(harness_home).join("store-response-last.json")
+}
+
 fn openclaw_mem_engine_recall_request_id(agent_id: Option<&str>, query: &str) -> String {
     stable_text_hash(
         "openclaw-mem-engine.recall.request",
         &format!("{}|{}", agent_id.unwrap_or("global"), query.trim()),
+    )
+}
+
+fn openclaw_mem_engine_store_request_id(
+    agent_id: Option<&str>,
+    session_key: Option<&str>,
+    text: &str,
+    now_ms: i64,
+) -> String {
+    stable_text_hash(
+        "openclaw-mem-engine.store.request",
+        &format!(
+            "{}|{}|{}|{}",
+            agent_id.unwrap_or("global"),
+            session_key.unwrap_or("unknown"),
+            now_ms,
+            text.trim()
+        ),
     )
 }
 
@@ -4669,6 +4840,12 @@ enum MemEngineBridgeRecallResult {
     Fallback(MemEngineBridgeFallback),
 }
 
+enum MemEngineBridgeInvocation {
+    NotConfigured,
+    Response { text: String, latency_ms: u64 },
+    Fallback(MemEngineBridgeFallback),
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MemEngineRecallEnvelope {
@@ -4680,6 +4857,131 @@ struct MemEngineRecallEnvelope {
     error_code: Option<String>,
     error_message: Option<String>,
     payload: Option<Value>,
+}
+
+fn invoke_openclaw_mem_bridge(
+    harness_home: &Path,
+    operation: &str,
+    request: &Value,
+    response_file: &Path,
+    deadline_ms: u64,
+) -> io::Result<MemEngineBridgeInvocation> {
+    let request_text = serde_json::to_string(request).map_err(io::Error::other)?;
+    let mut command = if let Some(command_line) = env::var_os(OPENCLAW_MEM_BRIDGE_COMMAND_ENV) {
+        let command = if cfg!(windows) {
+            let mut shell = Command::new("cmd");
+            shell.arg("/C").arg(command_line);
+            shell
+        } else {
+            let mut shell = Command::new("sh");
+            shell.arg("-c").arg(command_line);
+            shell
+        };
+        command
+    } else if let Some(bin) = env::var_os(OPENCLAW_MEM_BRIDGE_BIN_ENV) {
+        let mut command = Command::new(bin);
+        command
+            .arg("--harness-home")
+            .arg(harness_home)
+            .arg("--json")
+            .arg("bridge")
+            .arg(operation)
+            .arg("--stdin-json")
+            .arg("--response")
+            .arg(response_file);
+        command
+    } else {
+        return Ok(MemEngineBridgeInvocation::NotConfigured);
+    };
+    if let Some(parent) = response_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
+        .env("NODE_NO_WARNINGS", "1");
+    let started = Instant::now();
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return Ok(MemEngineBridgeInvocation::Fallback(
+                mem_engine_bridge_fallback(
+                    "mem_engine_unreachable",
+                    Some("bridge_unreachable".to_string()),
+                    format!("openclaw-mem-engine bridge command failed to start: {error}"),
+                ),
+            ));
+        }
+    };
+    if let Some(stdin) = child.stdin.as_mut() {
+        if let Err(error) = stdin.write_all(request_text.as_bytes()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(MemEngineBridgeInvocation::Fallback(
+                mem_engine_bridge_fallback(
+                    "bridge_protocol",
+                    Some("bridge_protocol".to_string()),
+                    format!("openclaw-mem-engine bridge stdin write failed: {error}"),
+                ),
+            ));
+        }
+    }
+    drop(child.stdin.take());
+    let timeout = Duration::from_millis(deadline_ms.saturating_add(250).max(250));
+    loop {
+        match child.try_wait()? {
+            Some(_status) => break,
+            None if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(MemEngineBridgeInvocation::Fallback(
+                    mem_engine_bridge_fallback(
+                        "mem_engine_deadline",
+                        Some("bridge_timeout".to_string()),
+                        format!(
+                            "openclaw-mem-engine bridge command exceeded deadlineMs={deadline_ms}"
+                        ),
+                    ),
+                ));
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    let output = child.wait_with_output()?;
+    let latency_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+    if !output.status.success() {
+        return Ok(MemEngineBridgeInvocation::Fallback(
+            mem_engine_bridge_fallback(
+                "mem_engine_unreachable",
+                Some("bridge_unreachable".to_string()),
+                format!(
+                    "openclaw-mem-engine bridge command exited with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            ),
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let text = if stdout.is_empty() && response_file.is_file() {
+        fs::read_to_string(response_file)?
+    } else {
+        stdout
+    };
+    if text.trim().is_empty() {
+        return Ok(MemEngineBridgeInvocation::Fallback(
+            mem_engine_bridge_fallback(
+                "bridge_protocol",
+                Some("bridge_protocol".to_string()),
+                "openclaw-mem-engine bridge command returned an empty response".to_string(),
+            ),
+        ));
+    }
+    fs::write(response_file, &text)?;
+    Ok(MemEngineBridgeInvocation::Response { text, latency_ms })
 }
 
 fn recall_openclaw_mem_engine_bridge(
@@ -4716,22 +5018,38 @@ fn recall_openclaw_mem_engine_bridge(
         serde_json::to_string_pretty(&request).map_err(io::Error::other)?,
     )?;
 
-    let response_file = openclaw_mem_engine_recall_response_file(harness_home);
-    let response_text = match fs::read_to_string(&response_file) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(MemEngineBridgeRecallResult::Fallback(
-                mem_engine_bridge_fallback(
-                    "mem_engine_unreachable",
-                    Some("bridge_unreachable".to_string()),
-                    format!(
-                        "openclaw-mem-engine recall bridge response not found at {}",
-                        response_file.display()
-                    ),
-                ),
-            ));
+    let response_last_file = openclaw_mem_engine_recall_response_last_file(harness_home);
+    let (response_text, bridge_latency_ms) = match invoke_openclaw_mem_bridge(
+        harness_home,
+        "recall",
+        &request,
+        &response_last_file,
+        OPENCLAW_MEM_ENGINE_RECALL_DEADLINE_MS,
+    )? {
+        MemEngineBridgeInvocation::Response { text, latency_ms } => (text, Some(latency_ms)),
+        MemEngineBridgeInvocation::Fallback(fallback) => {
+            return Ok(MemEngineBridgeRecallResult::Fallback(fallback));
         }
-        Err(error) => return Err(error),
+        MemEngineBridgeInvocation::NotConfigured => {
+            let response_file = openclaw_mem_engine_recall_response_file(harness_home);
+            let response_text = match fs::read_to_string(&response_file) {
+                Ok(text) => text,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(MemEngineBridgeRecallResult::Fallback(
+                        mem_engine_bridge_fallback(
+                            "mem_engine_unreachable",
+                            Some("bridge_unreachable".to_string()),
+                            format!(
+                                "openclaw-mem-engine recall bridge response not found at {}",
+                                response_file.display()
+                            ),
+                        ),
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            (response_text, None)
+        }
     };
     let envelope = match serde_json::from_str::<MemEngineRecallEnvelope>(&response_text) {
         Ok(envelope) => envelope,
@@ -4888,7 +5206,7 @@ fn recall_openclaw_mem_engine_bridge(
         writes_performed,
         canonical_writes_allowed,
         bridge_reachable: true,
-        bridge_latency_ms: Some(0),
+        bridge_latency_ms,
         last_mem_engine_receipt_id: envelope.receipt_id,
         last_mem_engine_error_code: envelope.error_code,
         policy_source: OPENCLAW_MEM_ENGINE_PROVIDER.to_string(),
@@ -5738,7 +6056,22 @@ fn is_service_writeback_store_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn bridge_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn clear_bridge_env() {
+        unsafe {
+            std::env::remove_var(OPENCLAW_MEM_BRIDGE_COMMAND_ENV);
+            std::env::remove_var(OPENCLAW_MEM_BRIDGE_BIN_ENV);
+        }
+    }
 
     #[test]
     fn search_imported_memory_finds_markdown_hits_and_skips_backends() {
@@ -6142,6 +6475,8 @@ mod tests {
 
     #[test]
     fn mem_engine_owner_recall_uses_ready_bridge_report() {
+        let _env_lock = bridge_env_lock();
+        clear_bridge_env();
         let root = temp_root("mem_engine_owner_recall_uses_ready_bridge_report");
         let harness_home = root.join("harness");
 
@@ -6264,7 +6599,216 @@ mod tests {
     }
 
     #[test]
+    fn mem_engine_owner_recall_invokes_configured_bridge_command() {
+        let _env_lock = bridge_env_lock();
+        clear_bridge_env();
+        let root = temp_root("mem_engine_owner_recall_invokes_configured_bridge_command");
+        let harness_home = root.join("harness");
+        store_openclaw_mem_service_memory(OpenClawMemServiceStoreOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            session_key: Some("session-local-owner".to_string()),
+            text: "bridge subprocess seed".to_string(),
+            payload: serde_json::json!({"source": "test"}),
+            approved: true,
+            now_ms: 1_800_000_001_000,
+        })
+        .unwrap();
+        prepare_openclaw_mem_local_owner(OpenClawMemLocalOwnerPrepareOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            query: "bridge subprocess seed".to_string(),
+            lease_id: Some("lease-local-owner".to_string()),
+            lease_ttl_ms: 60_000,
+            now_ms: 1_800_000_001_100,
+        })
+        .unwrap();
+        crate::memory_owner::request_memory_owner_promotion(
+            crate::memory_owner::MemoryOwnerPromotionOptions {
+                harness_home: harness_home.clone(),
+                operator_approved: true,
+                heartbeat_max_age_ms: 60_000,
+                now_ms: 1_800_000_001_200,
+            },
+        )
+        .unwrap();
+
+        let script = root.join("fake_bridge.py");
+        fs::write(
+            &script,
+            r#"
+import json
+import sys
+
+req = json.load(sys.stdin)
+print(json.dumps({
+    "v": 1,
+    "requestId": req["requestId"],
+    "provider": "openclaw-mem-engine",
+    "operation": "recall",
+    "status": "ready",
+    "receiptId": "ocm-subprocess-test",
+    "errorCode": None,
+    "errorMessage": None,
+    "payload": {
+        "backend": "sqlite-vector+service-writeback",
+        "attemptedBackend": "sqlite-vector+service-writeback",
+        "fallbackUsed": False,
+        "fallbackBackend": None,
+        "fallbackReason": None,
+        "writesPerformed": False,
+        "canonicalWritesAllowed": False,
+        "policySource": "openclaw-mem-engine",
+        "hits": [{
+            "lane": "mem-engine",
+            "id": "obs:subprocess",
+            "score": 1.0,
+            "title": "subprocess",
+            "text": "bridge subprocess primary hit",
+            "source": "fake-bridge"
+        }]
+    }
+}, separators=(",", ":")))
+"#,
+        )
+        .unwrap();
+        let command = format!("python {}", script.display());
+        unsafe {
+            std::env::set_var(OPENCLAW_MEM_BRIDGE_COMMAND_ENV, &command);
+        }
+
+        let recall = recall_openclaw_mem_service(OpenClawMemServiceRecallOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            query: "bridge subprocess".to_string(),
+            limit: 5,
+            max_file_bytes: 0,
+        })
+        .unwrap();
+
+        clear_bridge_env();
+        assert_eq!(recall.status, OpenClawMemServiceRecallStatus::Ready);
+        assert_eq!(recall.recall_provider, "openclaw-mem-engine");
+        assert_eq!(recall.backend, "sqlite-vector+service-writeback");
+        assert!(!recall.fallback_used);
+        assert!(recall.bridge_reachable);
+        assert_eq!(
+            recall.last_mem_engine_receipt_id.as_deref(),
+            Some("ocm-subprocess-test")
+        );
+        assert_eq!(recall.hits[0].text, "bridge subprocess primary hit");
+
+        let request_mirror =
+            fs::read_to_string(openclaw_mem_engine_recall_request_file(&harness_home)).unwrap();
+        assert!(request_mirror.contains("bridge subprocess"));
+        let response_mirror = fs::read_to_string(
+            openclaw_mem_engine_bridge_dir(&harness_home).join("recall-response-last.json"),
+        )
+        .unwrap();
+        assert!(response_mirror.contains("ocm-subprocess-test"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mem_engine_owner_store_invokes_configured_bridge_command() {
+        let _env_lock = bridge_env_lock();
+        clear_bridge_env();
+        let root = temp_root("mem_engine_owner_store_invokes_configured_bridge_command");
+        let harness_home = root.join("harness");
+        store_openclaw_mem_service_memory(OpenClawMemServiceStoreOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            session_key: Some("session-local-owner".to_string()),
+            text: "bridge store seed".to_string(),
+            payload: serde_json::json!({"source": "test"}),
+            approved: true,
+            now_ms: 1_800_000_002_000,
+        })
+        .unwrap();
+        prepare_openclaw_mem_local_owner(OpenClawMemLocalOwnerPrepareOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            query: "bridge store seed".to_string(),
+            lease_id: Some("lease-local-owner".to_string()),
+            lease_ttl_ms: 60_000,
+            now_ms: 1_800_000_002_100,
+        })
+        .unwrap();
+        crate::memory_owner::request_memory_owner_promotion(
+            crate::memory_owner::MemoryOwnerPromotionOptions {
+                harness_home: harness_home.clone(),
+                operator_approved: true,
+                heartbeat_max_age_ms: 60_000,
+                now_ms: 1_800_000_002_200,
+            },
+        )
+        .unwrap();
+
+        let script = root.join("fake_store_bridge.py");
+        fs::write(
+            &script,
+            r#"
+import json
+import sys
+
+req = json.load(sys.stdin)
+print(json.dumps({
+    "v": 1,
+    "requestId": req["requestId"],
+    "provider": "openclaw-mem-engine",
+    "operation": "store",
+    "status": "ready",
+    "receiptId": "ocm-store-subprocess-test",
+    "errorCode": None,
+    "errorMessage": None,
+    "payload": {
+        "backend": "sqlite",
+        "attemptedBackend": "sqlite",
+        "fallbackUsed": False,
+        "fallbackBackend": None,
+        "fallbackReason": None,
+        "writesPerformed": True,
+        "canonicalWritesAllowed": True,
+        "policySource": "openclaw-mem-engine",
+        "storeId": "obs:bridge-store"
+    }
+}, separators=(",", ":")))
+"#,
+        )
+        .unwrap();
+        let command = format!("python {}", script.display());
+        unsafe {
+            std::env::set_var(OPENCLAW_MEM_BRIDGE_COMMAND_ENV, &command);
+        }
+
+        let stored = store_openclaw_mem_service_memory(OpenClawMemServiceStoreOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("main".to_string()),
+            session_key: Some("session-local-owner".to_string()),
+            text: "bridge store primary write".to_string(),
+            payload: serde_json::json!({"source": "test"}),
+            approved: true,
+            now_ms: 1_800_000_002_300,
+        })
+        .unwrap();
+
+        clear_bridge_env();
+        assert_eq!(stored.status, OpenClawMemServiceStoreStatus::Stored);
+        assert_eq!(stored.store_id.as_deref(), Some("obs:bridge-store"));
+        assert!(openclaw_mem_engine_store_request_file(&harness_home).is_file());
+        let response_mirror =
+            fs::read_to_string(openclaw_mem_engine_store_response_last_file(&harness_home))
+                .unwrap();
+        assert!(response_mirror.contains("ocm-store-subprocess-test"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn mem_engine_owner_recall_falls_back_read_only_when_bridge_missing() {
+        let _env_lock = bridge_env_lock();
+        clear_bridge_env();
         let root = temp_root("mem_engine_owner_recall_falls_back_read_only_when_bridge_missing");
         let harness_home = root.join("harness");
 

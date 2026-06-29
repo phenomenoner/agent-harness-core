@@ -100,6 +100,11 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
             statement: "binary and bulky artifacts enter durable main-session context only as harness artifact references plus bounded extraction summaries; raw bytes, base64, provider URLs, and large tool blobs stay in artifact storage or receipts",
             owner: "media/prompt/runtime_worker/codex_runtime/workers/memory",
         },
+        InvariantEntry {
+            id: "I12",
+            statement: "active mem-engine ownership uses the openclaw-mem bridge as the primary write/recall path when configured; recall fallback remains read-only and store fails closed unless the memory layer accepts the write",
+            owner: "memory/memory_owner/openclaw-mem",
+        },
     ]
 }
 
@@ -476,6 +481,7 @@ pub fn release_checklist() -> ReleaseChecklist {
             "topology contract impact matrix reviewed for changed modules",
             "channel/runtime changes passed the agent-boundary scenario matrix",
             "prompt/memory changes passed /new task-boundary and per-agent memory recall checks",
+            "openclaw-mem bridge ownership changes passed configured-bridge and fallback gates",
             "response/runtime changes passed final-surface separation checks, including stdout recovery without final_answer",
             "progress delivery changes passed edit-volume replay checks",
             "progress panel lane-cap heartbeat/current-step checks passed across channel platforms",
@@ -542,6 +548,9 @@ mod tests {
         );
         assert!(release_checklist().required_items.contains(
             &"prompt/memory changes passed /new task-boundary and per-agent memory recall checks"
+        ));
+        assert!(release_checklist().required_items.contains(
+            &"openclaw-mem bridge ownership changes passed configured-bridge and fallback gates"
         ));
         assert!(
             release_checklist()
