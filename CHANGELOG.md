@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+## v0.2.1 - 2026-06-29
+
+### Difference from v0.2.0
+
+`v0.2.1` is the bridge-polish A/B follow-up to `v0.2.0`. Compared with
+`v0.2.0`, public/non-main memory status and read-path receipts now expose
+source allow/deny scopes, trust level, and filtered global-imported hit counts
+so operators can prove that public-facing agents are not inheriting private
+`main` imported memory by accident. This release keeps Phase C open:
+native Qdrant, `routeAuto`, autonomous graph parity, provenance, and freshness
+promotion gates remain tracked under `openclaw-mem-full-parity-gap`.
+
+This release pairs with `openclaw-mem v1.9.32`, which adds direct Windows
+console-wrapper proof for the generated `.venv\Scripts\openclaw-mem.exe`
+bridge entrypoint.
+
+### Changed
+
+- Added public/non-main memory scope telemetry:
+  `allowedSourceScopes`, `deniedSourceScopes`, `trustLevel`, and
+  `filteredGlobalImportedHits`.
+- Changed the public/non-main memory trust smoke so
+  `globalImportedSnapshotAllowed=false` is expected; the smoke now fails when
+  public/non-main agents allow private global imported memory or omit the deny
+  receipt.
+- Updated the topology contract, feature parity table, and invariant I8 to
+  record the A/B trust/source receipts while keeping full openclaw-mem graph
+  parity unclaimed.
+
+### Verification
+
+- `cargo test -p agent-harness-core memory::tests::public_agent_read_path_smoke_surfaces_source_allow_list_and_filtered_counts --target-dir target\staging-bridge-polish-final-test -- --test-threads=1`
+- `uv run python -m pytest tests\test_windows_console_wrapper_bridge.py -q`
+  in the paired `openclaw-mem v1.9.32` local repo.
+- `cargo fmt --all -- --check`
+- `git diff --check`
+- `target\debug\agent-harness.exe public-hygiene --root .public-export\agent-harness-core`
+- Post-cutover live checks: live binary SHA-256
+  `721D3750D729A560FBC0A466D7FC4DD30BB0AA1E03B07275684FA5B675A88E8F`,
+  `healthz ready=true live=true`, outbox pending `0`, bridge
+  `fallbackUsed=false`, and public-bot read-path scope/trust smoke green.
+
 ## v0.2.0 - 2026-06-29
 
 ### Difference from v0.1.7

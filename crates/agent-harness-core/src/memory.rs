@@ -290,6 +290,9 @@ pub struct MemoryScopePolicyReport {
     pub per_agent_writeback_required: bool,
     pub cross_agent_private_recall_allowed: bool,
     pub receipts_include_scope: bool,
+    pub allowed_source_scopes: Vec<String>,
+    pub denied_source_scopes: Vec<String>,
+    pub trust_level: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -609,6 +612,7 @@ pub struct OpenClawMemServiceRecallReport {
     pub query_length: usize,
     pub scope_policy: MemoryScopePolicyReport,
     pub trust_policy: MemoryTrustPolicyReport,
+    pub filtered_global_imported_hits: usize,
     pub hit_count: usize,
     pub searched_files: usize,
     pub skipped_files: usize,
@@ -1581,6 +1585,32 @@ fn parse_lenient_jsonl_value(line: &str) -> Option<Value> {
 fn memory_scope_policy(agent_id: Option<String>) -> MemoryScopePolicyReport {
     let global_imported_snapshot_allowed =
         memory_global_imported_snapshot_allowed(agent_id.as_deref());
+    let allowed_source_scopes = if agent_id.is_some() && !global_imported_snapshot_allowed {
+        vec![
+            "agent-private".to_string(),
+            "agent-service-recall".to_string(),
+            "explicit-public-global".to_string(),
+        ]
+    } else {
+        vec![
+            "global-imported".to_string(),
+            "agent-private".to_string(),
+            "agent-service-recall".to_string(),
+        ]
+    };
+    let denied_source_scopes = if agent_id.is_some() && !global_imported_snapshot_allowed {
+        vec!["global-imported-private".to_string()]
+    } else {
+        Vec::new()
+    };
+    let trust_level = if agent_id.is_some() && !global_imported_snapshot_allowed {
+        "public-safe"
+    } else if agent_id.is_some() {
+        "agent-scoped"
+    } else {
+        "operator-global"
+    }
+    .to_string();
     MemoryScopePolicyReport {
         default_scope: if agent_id.is_some() && !global_imported_snapshot_allowed {
             "agent-private-with-public-opt-in".to_string()
@@ -1594,6 +1624,9 @@ fn memory_scope_policy(agent_id: Option<String>) -> MemoryScopePolicyReport {
         per_agent_writeback_required: true,
         cross_agent_private_recall_allowed: false,
         receipts_include_scope: true,
+        allowed_source_scopes,
+        denied_source_scopes,
+        trust_level,
     }
 }
 
@@ -1608,8 +1641,22 @@ fn memory_trust_policy() -> MemoryTrustPolicyReport {
 
 fn memory_scope_trust_smoke_findings(report: &OpenClawMemServiceStatusReport) -> Vec<String> {
     let mut findings = Vec::new();
-    if !report.scope_policy.global_imported_snapshot_allowed {
-        findings.push("global_imported_snapshot_not_allowed".to_string());
+    let public_or_non_main = report
+        .scope_policy
+        .agent_id
+        .as_deref()
+        .is_some_and(|agent| normalized_agent_id(Some(agent)).as_deref() != Some("main"));
+    if public_or_non_main && report.scope_policy.global_imported_snapshot_allowed {
+        findings.push("public_agent_global_imported_snapshot_allowed".to_string());
+    }
+    if public_or_non_main
+        && !report
+            .scope_policy
+            .denied_source_scopes
+            .iter()
+            .any(|scope| scope == "global-imported-private")
+    {
+        findings.push("private_global_source_not_denied".to_string());
     }
     if !report.scope_policy.per_agent_writeback_required {
         findings.push("per_agent_writeback_not_required".to_string());
@@ -2424,6 +2471,7 @@ pub fn recall_openclaw_mem_service(
             query_length,
             scope_policy: memory_scope_policy(agent_id.clone()),
             trust_policy: memory_trust_policy(),
+            filtered_global_imported_hits: 0,
             hit_count: 0,
             searched_files: 0,
             skipped_files: 0,
@@ -2511,6 +2559,7 @@ fn recall_openclaw_mem_migration_fallback(
     let mut hits = Vec::new();
     let mut searched_files = 0usize;
     let mut skipped_files = 0usize;
+    let mut filtered_global_imported_hits = 0usize;
     let mut warnings = telemetry.warnings;
     let mut backend = "snapshot-text+service-writeback".to_string();
     let scope_policy = memory_scope_policy(agent_id.clone());
@@ -2604,9 +2653,10 @@ fn recall_openclaw_mem_migration_fallback(
         };
         let global_search = search_imported_memory(search_options)?;
         if global_search.status == MemorySearchStatus::Ready && !global_search.hits.is_empty() {
+            filtered_global_imported_hits = global_search.hits.len();
             warnings.push(format!(
                 "filteredGlobalImportedHits={}",
-                global_search.hits.len()
+                filtered_global_imported_hits
             ));
         }
         searched_files = search.searched_files;
@@ -2692,6 +2742,7 @@ fn recall_openclaw_mem_migration_fallback(
         query_length,
         scope_policy,
         trust_policy: memory_trust_policy(),
+        filtered_global_imported_hits,
         hit_count: hits.len(),
         searched_files,
         skipped_files,
@@ -5495,6 +5546,10 @@ fn recall_openclaw_mem_engine_bridge(
         query_length: query.chars().count(),
         scope_policy: memory_scope_policy(None),
         trust_policy: memory_trust_policy(),
+        filtered_global_imported_hits: payload
+            .get("filteredGlobalImportedHits")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
         hit_count: hits.len(),
         searched_files: 0,
         skipped_files: 0,
@@ -6513,6 +6568,69 @@ mod tests {
         .unwrap();
         assert!(service_receipt.contains(r#""globalImportedSnapshotAllowed": false"#));
         assert!(!service_receipt.contains("main-private agent memory"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn public_agent_read_path_smoke_surfaces_source_allow_list_and_filtered_counts() {
+        let root = temp_root(
+            "public_agent_read_path_smoke_surfaces_source_allow_list_and_filtered_counts",
+        );
+        let harness_home = root.join("harness");
+        let global_memory = harness_home.join("memory");
+        let public_memory = memory_path_for_agent(
+            &harness_home,
+            Some("public-bot"),
+            Path::new("memory/MEMORY.md"),
+        );
+        fs::create_dir_all(&global_memory).unwrap();
+        fs::create_dir_all(public_memory.parent().unwrap()).unwrap();
+        fs::write(
+            global_memory.join("MEMORY.md"),
+            "main-private memory bridge trust scope marker: do not show this to public agents.",
+        )
+        .unwrap();
+        fs::write(
+            &public_memory,
+            "public-bot allowed memory: bridge trust scope marker.",
+        )
+        .unwrap();
+
+        let report = run_openclaw_mem_read_path_smoke(OpenClawMemReadPathSmokeOptions {
+            harness_home: harness_home.clone(),
+            agent_id: Some("public-bot".to_string()),
+            query: "memory bridge trust scope marker".to_string(),
+            limit: 5,
+        })
+        .unwrap();
+
+        assert!(report.scope_trust_smoke_ok);
+        assert_eq!(
+            report.status_report.scope_policy.allowed_source_scopes,
+            vec![
+                "agent-private",
+                "agent-service-recall",
+                "explicit-public-global"
+            ]
+        );
+        assert!(
+            report
+                .status_report
+                .scope_policy
+                .denied_source_scopes
+                .contains(&"global-imported-private".to_string())
+        );
+        assert_eq!(report.status_report.scope_policy.trust_level, "public-safe");
+        assert_eq!(report.recall_report.filtered_global_imported_hits, 1);
+        assert_eq!(
+            report.recall_report.scope_policy.agent_id.as_deref(),
+            Some("public-bot")
+        );
+        assert!(!report.recall_report.hits.iter().any(|hit| {
+            hit.text
+                .contains("main-private memory bridge trust scope marker")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
