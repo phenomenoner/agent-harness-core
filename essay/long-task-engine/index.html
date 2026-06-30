@@ -197,7 +197,8 @@
   <div class="statusbox">
     <h3>// honest status — because this whole project is about that</h3>
     <div class="row"><span class="pill p-mech">live-wired</span><span>The rollover check runs on <em>every</em> turn in the reference deployment. The mechanism, the working set, the guards, the receipts — all shipped, all tested without a model call.</span></div>
-    <div class="row"><span class="pill p-spec">proof gated</span><span>But daily chat rarely compacts twice, so a real rollover hasn't fired in production yet. The end-to-end forced-rollover proof — fresh session, same virtual id, working-set injection, no unsafe rewrite, traced through to final delivery — is a <em>published gate</em>, not a claim. The honest gap is the point.</span></div>
+    <div class="row"><span class="pill p-mech">rollover fired</span><span>On <em>2026-06-30</em> it fired for real on a live lane: two lossy compacts crossed the threshold, the runtime applied a rollover into a fresh continuation session (cont-1 → cont-2) under the same virtual id, re-keyed the pending turn, and wrote working-set and episode receipts. No longer a hypothetical.</span></div>
+    <div class="row"><span class="pill p-spec">gate narrowed</span><span>What's still gated is the through-delivery trace — the continuation turn injecting the working set into its prompt and the final reply delivered and traced back to the continuation queue item. The honest gap is smaller now, but still the point.</span></div>
   </div>
 
   <h2>But continuity isn't intelligence</h2>
@@ -406,7 +407,8 @@
   <div class="statusbox">
     <h3>// the honest ledger for this essay</h3>
     <div class="row"><span class="pill p-mech">shipped</span><span>Virtual sessions, working-set rollover, guards, and receipts — live-wired into every turn; tested without a model call.</span></div>
-    <div class="row"><span class="pill p-spec">gated</span><span>The end-to-end forced-rollover proof under live traffic — a named, published release gate, not yet earned.</span></div>
+    <div class="row"><span class="pill p-mech">observed</span><span>On 2026-06-30 a real compact-threshold rollover fired on a live lane — cont-1 → cont-2 under the same virtual id, with working-set and episode receipts recorded.</span></div>
+    <div class="row"><span class="pill p-spec">gate narrowed</span><span>What remains is the through-delivery trace — working-set injection into the continuation prompt and the final reply traced back to the continuation queue item.</span></div>
     <div class="row"><span class="pill p-design">design note</span><span>RLM integration — the boundary, the job spec, the failure classes, the phased plan are specified in the repo; the engine is not built yet.</span></div>
     <div class="row"><span class="pill p-mech">integrated</span><span>Long-term memory — openclaw-mem hooks with vector recall over imported embeddings, external and fail-open with citations; full autonomous-graph parity is itself a tracked gate.</span></div>
   </div>

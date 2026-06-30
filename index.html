@@ -208,7 +208,7 @@
 
     <p class="lead">That is the difference between an agent that dazzles for five minutes and one you can leave running for a week: continuity is a durable structure, deep reasoning is a bounded sandbox, and every rollover and subcall is auditable. <a href="essay/long-task-engine/">Read the full architecture, with diagrams →</a></p>
 
-    <p class="receipt-note"><b>Honest status, in this project's house style:</b> the virtual-session mechanism is <span class="mono">live-wired</span> into every turn and tested without a model call, but the end-to-end forced-rollover proof under live traffic is a <span class="mono">published gate</span>, not yet earned. RLM integration is a <span class="mono">design note</span> in the repo — boundary, job spec, and failure classes specified; the engine is not built yet. Labeled, not blurred.</p>
+    <p class="receipt-note"><b>Honest status, in this project's house style:</b> the virtual-session mechanism is <span class="mono">live-wired</span> into every turn and tested without a model call — and on <span class="mono">2026-06-30</span> a real compact-threshold rollover fired on a live lane: two lossy compacts crossed the threshold, the runtime re-keyed the turn into a fresh continuation session under the same virtual id, with working-set and episode receipts recorded. The remaining gate <span class="mono">narrows</span> to the through-delivery trace. RLM integration is a <span class="mono">design note</span> in the repo — boundary, job spec, and failure classes specified; the engine is not built yet. Labeled, not blurred.</p>
   </div>
 </section>
 
@@ -318,8 +318,8 @@ cargo run -p agent-harness-cli -- enable-check --target-home C:\path\to\.agent-h
       <div class="proof">
         <div class="num">PROOF 01</div>
         <h3>Forced-Rollover Continuity</h3>
-        <p>The signature design, proven end to end: force the compaction threshold, verify a fresh session under the same virtual id, the working set injected, no unsafe rewrite of in-flight work, traced through to final delivery. The unique advantage, earned not asserted.</p>
-        <span class="badge b-mech">MECHANISM LIVE-WIRED · PROOF GATED</span>
+        <p>The signature design, caught firing: on 2026-06-30 a live lane crossed the compaction threshold (two lossy compacts) and the runtime applied a rollover into a fresh continuation session under the same virtual id — re-keying the turn and writing working-set and episode receipts. What's left to earn is the through-delivery trace: the working set injected into the continuation prompt and the final reply traced back to it.</p>
+        <span class="badge b-mech">FIRST ROLLOVER OBSERVED · DELIVERY TRACE GATED</span>
       </div>
       <div class="proof">
         <div class="num">PROOF 02</div>
@@ -346,7 +346,7 @@ cargo run -p agent-harness-cli -- enable-check --target-home C:\path\to\.agent-h
       <span class="gate">first tagged release</span>
     </div>
 
-    <p class="receipt-note"><b>Evidence accruing, honestly:</b> the reference deployment now has tens of thousands of delivered messages and hundreds of completed model turns on record, with fewer than two dozen dead-letters — all from known transient provider stream disconnects, each retried before dead-lettering. That is real soak, not a passed gate: the formal forced-rollover, shadow-parity, and 30-day SLO clocks above stay open until their exact criteria are met.</p>
+    <p class="receipt-note"><b>Evidence accruing, honestly:</b> the reference deployment now has tens of thousands of delivered messages and hundreds of completed model turns on record, with fewer than two dozen dead-letters — all from known transient provider stream disconnects, each retried before dead-lettering. The signature rollover has now fired once on a live lane (2026-06-30: threshold → applied → fresh continuation session, receipts recorded). That is real soak and a real first firing, not yet a passed gate: the full through-delivery rollover proof, the shadow-parity clock, and the 30-day SLO clock stay open until their exact criteria are met.</p>
 
     <p class="receipt-note">Progress is tracked item-by-item in the repo's <a href="https://github.com/phenomenoner/agent-harness-core/blob/main/docs/agent-harness-core-roadmap-backlog.md">roadmap &amp; backlog</a> with a four-tier honesty vocabulary — <span class="mono">staging-tested · pending live gate · pending fixtures · deferred by policy</span> — and a named remaining gate for every single item. Few projects of any size publish their uncertainty this precisely. That, too, is the product.</p>
   </div>
