@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-No unreleased changes.
+- Recorded the first live compact-threshold context rollover on a Discord/main lane (2026-06-30): two official Codex compacts crossed the threshold (`successfulCompactCount=2`, `rolloverPending=true`) and the runtime applied a rollover into a fresh continuation session (`cont-1` -> `cont-2`) under the same virtual session, re-keying the pending turn and writing virtual-session, episode-index, and `continuation-rollover` working-set receipts. This advances `virtual-session-continuity-gap` from "mechanism live-wired, firing never observed" to "first rollover observed live," superseding the 2026-06-29 compacts-without-rollover audit finding for that lane. The remaining gate narrows to the end-to-end through-delivery trace: working-set prompt injection in the continuation turn and the final reply traced back to the continuation queue item. Updated the topology contract, regenerated the topology explorer, and updated the feature-parity surfaces to match.
 
 ## v0.3.0 - 2026-06-30
 
