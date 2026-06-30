@@ -2489,4 +2489,152 @@ mod tests {
         assert!(episode_text.contains("\"queueId\":\"queue-1\""));
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn three_turn_compact_rollover_replay_writes_continuation_working_set() {
+        let root = temp_root("three_turn_compact_rollover_replay");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"codexContext":{"maxSuccessfulCompactsBeforeRollover":2}}"#,
+        )
+        .unwrap();
+        let old_session = "discord:channel-42:user-7:main";
+        let state_file =
+            channel_session_state_file(&harness_home, "discord", "channel-42", "user-7");
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        write_json_atomic(
+            &state_file,
+            &ChannelSessionState {
+                schema: "agent-harness.channel-session-state.v1".to_string(),
+                platform: "discord".to_string(),
+                channel_id: "channel-42".to_string(),
+                user_id: "user-7".to_string(),
+                active_session_key: old_session.to_string(),
+                agent_id: Some("main".to_string()),
+                provider: None,
+                model: None,
+                session_topic: None,
+                model_override: None,
+                model_override_provider: None,
+                model_override_model: None,
+                thinking_enabled: true,
+                thinking_level: Some("xhigh".to_string()),
+                thinking_instruction: None,
+                stop_requested: false,
+                stop_reason: None,
+                steering_notes: Vec::new(),
+                btw_notes: Vec::new(),
+                last_command: None,
+                updated_at_ms: 100,
+            },
+        )
+        .unwrap();
+        append_jsonl_value(
+            &queue_dir.join("pending.jsonl"),
+            &serde_json::json!({
+                "schema": "agent-harness.runtime-queue-item.v1",
+                "queueId": "queue-third-turn",
+                "status": "queued",
+                "runtimeClass": "interactive",
+                "origin": "channel",
+                "source": {"kind": "channel", "sourceHome": root, "sourceWorkspace": root},
+                "createdAtMs": 300,
+                "agentId": "main",
+                "sessionKey": old_session,
+                "platform": "discord",
+                "channelId": "channel-42",
+                "userId": "user-7",
+                "messageText": "third high-context turn",
+                "plannedTranscriptFile": "third.jsonl",
+                "plannedTrajectoryFile": "third.trajectory.jsonl"
+            }),
+        )
+        .unwrap();
+
+        let lane = ContextRolloverLane {
+            runtime_class: "interactive".to_string(),
+            agent_id: "main".to_string(),
+            platform: "discord".to_string(),
+            channel_id: "channel-42".to_string(),
+            user_id: "user-7".to_string(),
+            working_session_key: old_session.to_string(),
+            virtual_session_id: None,
+            continuation_index: 0,
+        };
+        let first = record_context_compact_attempt(ContextCompactAttemptOptions {
+            harness_home: harness_home.clone(),
+            lane: lane.clone(),
+            compact_succeeded: true,
+            rewrote_active_context: true,
+            compact_thread_id: Some("thread-after-first-compact".to_string()),
+            compact_attempt_key: Some("queue-first:thread-original".to_string()),
+            max_successful_compacts_before_rollover: 2,
+            now_ms: 101,
+        })
+        .unwrap();
+        assert_eq!(first.successful_compact_count, 1);
+        assert!(!first.rollover_pending);
+        let second = record_context_compact_attempt(ContextCompactAttemptOptions {
+            harness_home: harness_home.clone(),
+            lane,
+            compact_succeeded: true,
+            rewrote_active_context: true,
+            compact_thread_id: Some("thread-after-second-compact".to_string()),
+            compact_attempt_key: Some("queue-second:thread-after-first-compact".to_string()),
+            max_successful_compacts_before_rollover: 2,
+            now_ms: 201,
+        })
+        .unwrap();
+        assert_eq!(second.successful_compact_count, 2);
+        assert!(second.rollover_pending);
+
+        let receipt = apply_context_rollover_before_turn(ContextRolloverBeforeTurnOptions {
+            harness_home: harness_home.clone(),
+            queue_id: "queue-third-turn".to_string(),
+            runtime_class: "interactive".to_string(),
+            agent_id: "main".to_string(),
+            platform: "discord".to_string(),
+            channel_id: "channel-42".to_string(),
+            user_id: "user-7".to_string(),
+            working_session_key: old_session.to_string(),
+            now_ms: 301,
+        })
+        .unwrap();
+
+        assert_eq!(receipt.status, ContextRolloverStatus::Applied);
+        assert_eq!(receipt.previous_working_session_key, old_session);
+        assert_eq!(
+            receipt.new_working_session_key.as_deref(),
+            Some("discord:channel-42:user-7:main:cont-1")
+        );
+        assert_eq!(receipt.continuation_index, 1);
+        assert!(receipt.working_set_file.as_ref().unwrap().is_file());
+        assert!(receipt.virtual_session_file.as_ref().unwrap().is_file());
+
+        let state = read_channel_session_state(&harness_home, "discord", "channel-42", "user-7")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.active_session_key,
+            "discord:channel-42:user-7:main:cont-1"
+        );
+        assert_eq!(state.agent_id.as_deref(), Some("main"));
+        let continuity = load_working_set_continuity_section(
+            &harness_home,
+            "discord:channel-42:user-7:main:cont-1",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(continuity.contains("virtualSessionId:"));
+        assert!(continuity.contains("workingSessionKey: discord:channel-42:user-7:main:cont-1"));
+        assert!(continuity.contains("pendingQueueId: queue-third-turn"));
+
+        let queue_text = fs::read_to_string(queue_dir.join("pending.jsonl")).unwrap();
+        assert!(queue_text.contains("\"sessionKey\":\"discord:channel-42:user-7:main:cont-1\""));
+        assert!(queue_text.contains("\"completionKind\":\"continuation-rollover\""));
+        let _ = fs::remove_dir_all(root);
+    }
 }

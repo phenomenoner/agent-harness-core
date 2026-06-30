@@ -41,6 +41,7 @@ pub struct ChannelOutboxPlanSummary {
     pub pending: usize,
     pub delivered: usize,
     pub failed_retryable: usize,
+    pub partial_failed: usize,
     pub skipped_platform: usize,
     pub invalid_lines: usize,
 }
@@ -68,6 +69,7 @@ pub struct ChannelDeliveryRecordOptions {
     pub provider_message_id: Option<String>,
     pub error: Option<String>,
     pub now_ms: i64,
+    pub rendered_units: Vec<ChannelDeliveryRenderedUnitReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +86,8 @@ pub struct ChannelDeliveryReceipt {
     pub session_key: String,
     pub provider_message_id: Option<String>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rendered_units: Vec<ChannelDeliveryRenderedUnitReceipt>,
     pub at_ms: i64,
 }
 
@@ -92,6 +96,34 @@ pub struct ChannelDeliveryReceipt {
 pub enum ChannelDeliveryStatus {
     Delivered,
     Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelDeliveryRenderedUnitReceipt {
+    pub unit_id: String,
+    pub kind: ChannelDeliveryRenderedUnitKind,
+    pub status: ChannelDeliveryUnitStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChannelDeliveryRenderedUnitKind {
+    Text,
+    Media,
+    ComponentAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChannelDeliveryUnitStatus {
+    Delivered,
+    Failed,
+    Skipped,
 }
 
 pub fn plan_channel_outbox(
@@ -162,6 +194,13 @@ pub fn plan_channel_outbox(
             }
             Some(ChannelDeliveryStatus::Failed) => {
                 summary.failed_retryable += 1;
+                if receipts
+                    .get(&delivery_id)
+                    .and_then(|records| records.last())
+                    .is_some_and(|receipt| receipt.has_partial_failure())
+                {
+                    summary.partial_failed += 1;
+                }
                 true
             }
             None => true,
@@ -194,6 +233,17 @@ pub fn plan_channel_outbox(
 pub fn record_channel_delivery(
     options: ChannelDeliveryRecordOptions,
 ) -> io::Result<ChannelDeliveryReceipt> {
+    if options.status == ChannelDeliveryStatus::Delivered
+        && options
+            .rendered_units
+            .iter()
+            .any(|unit| unit.status != ChannelDeliveryUnitStatus::Delivered)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot mark delivery delivered when a rendered unit is not delivered",
+        ));
+    }
     let channel_dir = options.harness_home.join("state").join("channels");
     let receipts_file = channel_dir.join("delivery-receipts.jsonl");
     fs::create_dir_all(&channel_dir)?;
@@ -208,6 +258,7 @@ pub fn record_channel_delivery(
         session_key: options.session_key,
         provider_message_id: options.provider_message_id,
         error: options.error,
+        rendered_units: options.rendered_units,
         at_ms: options.now_ms,
     };
     append_json_line(&receipts_file, &receipt)?;
@@ -292,7 +343,10 @@ fn fnv1a_64_hex(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ChannelOutboundMessageKind;
+    use crate::{
+        ChannelOutboundMessageKind, RichMessagePresentation, RichPresentationAtomicity,
+        RichPresentationDeliveryPolicy, RichPresentationLinkPreview,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -329,6 +383,7 @@ mod tests {
             provider_message_id: Some("tg-1".to_string()),
             error: None,
             now_ms: 1234,
+            rendered_units: Vec::new(),
         })
         .unwrap();
         record_channel_delivery(ChannelDeliveryRecordOptions {
@@ -343,6 +398,7 @@ mod tests {
             provider_message_id: None,
             error: Some("rate limited".to_string()),
             now_ms: 1235,
+            rendered_units: Vec::new(),
         })
         .unwrap();
 
@@ -414,6 +470,7 @@ mod tests {
             provider_message_id: Some("dc-1".to_string()),
             error: None,
             now_ms: 1234,
+            rendered_units: Vec::new(),
         })
         .unwrap();
 
@@ -429,6 +486,112 @@ mod tests {
         assert_eq!(limited.summary.pending, 4);
         assert_eq!(limited.pending[0].message.text, "message 2");
         assert_eq!(limited.pending[1].message.text, "message 3");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rich_delivery_receipt_records_units_and_retries_partial_failure() {
+        let root = temp_root("rich_delivery_receipt_records_units_and_retries_partial_failure");
+        let harness_home = root.join(".agent-harness");
+        let outbox_file = harness_home
+            .join("state")
+            .join("channels")
+            .join("outbox.jsonl");
+        let mut outbound = message("telegram", "dm-1", "user-1", "session-1", "fallback");
+        outbound.presentation = Some(rich_presentation());
+        append_json_line(&outbox_file, &outbound).unwrap();
+
+        let initial = plan_channel_outbox(ChannelOutboxPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            limit: 10,
+        })
+        .unwrap();
+        assert_eq!(initial.pending.len(), 1);
+
+        record_channel_delivery(ChannelDeliveryRecordOptions {
+            harness_home: harness_home.clone(),
+            delivery_id: initial.pending[0].delivery_id.clone(),
+            status: ChannelDeliveryStatus::Failed,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-1".to_string(),
+            user_id: "user-1".to_string(),
+            session_key: "session-1".to_string(),
+            provider_message_id: Some("100,101".to_string()),
+            error: Some("media unit failed".to_string()),
+            now_ms: 1234,
+            rendered_units: vec![
+                ChannelDeliveryRenderedUnitReceipt {
+                    unit_id: "text:0".to_string(),
+                    kind: ChannelDeliveryRenderedUnitKind::Text,
+                    status: ChannelDeliveryUnitStatus::Delivered,
+                    provider_message_id: Some("100".to_string()),
+                    error: None,
+                },
+                ChannelDeliveryRenderedUnitReceipt {
+                    unit_id: "media:0".to_string(),
+                    kind: ChannelDeliveryRenderedUnitKind::Media,
+                    status: ChannelDeliveryUnitStatus::Failed,
+                    provider_message_id: None,
+                    error: Some("upload failed".to_string()),
+                },
+            ],
+        })
+        .unwrap();
+
+        let retry = plan_channel_outbox(ChannelOutboxPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            limit: 10,
+        })
+        .unwrap();
+        assert_eq!(retry.pending.len(), 1);
+        assert_eq!(retry.summary.delivered, 0);
+        assert_eq!(retry.summary.failed_retryable, 1);
+        assert_eq!(retry.summary.partial_failed, 1);
+
+        let receipt_text = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("channels")
+                .join("delivery-receipts.jsonl"),
+        )
+        .unwrap();
+        assert!(receipt_text.contains("\"renderedUnits\""));
+        assert!(receipt_text.contains("\"unitId\":\"media:0\""));
+        assert!(receipt_text.contains("\"status\":\"failed\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rich_delivery_rejects_delivered_receipt_when_any_unit_failed() {
+        let root = temp_root("rich_delivery_rejects_delivered_receipt_when_any_unit_failed");
+        let harness_home = root.join(".agent-harness");
+        let error = record_channel_delivery(ChannelDeliveryRecordOptions {
+            harness_home: harness_home.clone(),
+            delivery_id: "delivery:1:test".to_string(),
+            status: ChannelDeliveryStatus::Delivered,
+            platform: "discord".to_string(),
+            account_id: None,
+            channel_id: "dm-1".to_string(),
+            user_id: "user-1".to_string(),
+            session_key: "session-1".to_string(),
+            provider_message_id: Some("200".to_string()),
+            error: None,
+            now_ms: 1234,
+            rendered_units: vec![ChannelDeliveryRenderedUnitReceipt {
+                unit_id: "component-action:approve".to_string(),
+                kind: ChannelDeliveryRenderedUnitKind::ComponentAction,
+                status: ChannelDeliveryUnitStatus::Failed,
+                provider_message_id: None,
+                error: Some("components disabled".to_string()),
+            }],
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot mark delivery delivered"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -450,6 +613,7 @@ mod tests {
             source_queue_id: None,
             source_completion_file: None,
             text: text.to_string(),
+            presentation: None,
             delivery_intent: None,
             attachments: Vec::new(),
         }
@@ -464,5 +628,35 @@ mod tests {
             "agent-harness-channel-delivery-{test_name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn rich_presentation() -> RichMessagePresentation {
+        RichMessagePresentation {
+            schema: crate::RICH_MESSAGE_PRESENTATION_SCHEMA.to_string(),
+            fallback_text: "fallback".to_string(),
+            blocks: Vec::new(),
+            actions: Vec::new(),
+            media: vec![crate::RichPresentationMediaRef {
+                attachment_index: Some(0),
+                artifact_ref: None,
+                caption: Some("caption".to_string()),
+                role: Some("primary".to_string()),
+            }],
+            link_preview: RichPresentationLinkPreview::default(),
+            delivery_policy: RichPresentationDeliveryPolicy {
+                atomicity: RichPresentationAtomicity::AllOrTerminal,
+                allow_fallback_text: true,
+            },
+        }
+    }
+}
+
+impl ChannelDeliveryReceipt {
+    fn has_partial_failure(&self) -> bool {
+        !self.rendered_units.is_empty()
+            && self
+                .rendered_units
+                .iter()
+                .any(|unit| unit.status != ChannelDeliveryUnitStatus::Delivered)
     }
 }

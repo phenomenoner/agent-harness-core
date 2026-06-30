@@ -45,6 +45,7 @@ pub mod quality;
 pub mod queue_shadow;
 pub mod registry;
 pub mod response_tone;
+pub mod rich_presentation;
 pub mod runtime_pipeline;
 pub mod runtime_policy;
 pub mod runtime_queue;
@@ -97,7 +98,8 @@ pub use channel_commands::{
 };
 pub use channel_delivery::{
     ChannelDeliveryPending, ChannelDeliveryReceipt, ChannelDeliveryRecordOptions,
-    ChannelDeliveryStatus, ChannelOutboxPlanOptions, ChannelOutboxPlanReport,
+    ChannelDeliveryRenderedUnitKind, ChannelDeliveryRenderedUnitReceipt, ChannelDeliveryStatus,
+    ChannelDeliveryUnitStatus, ChannelOutboxPlanOptions, ChannelOutboxPlanReport,
     ChannelOutboxPlanSummary, plan_channel_outbox, record_channel_delivery,
 };
 pub use channel_identity::{
@@ -385,8 +387,8 @@ pub use prompt::{
 };
 pub use quality::{
     InvariantEntry, PublicHygieneOptions, PublicHygieneReport, ReleaseChecklist,
-    SchemaRegistryEntry, invariant_catalog, release_checklist, run_public_hygiene,
-    schema_registry_entries,
+    ScenarioMatrixEntry, SchemaRegistryEntry, invariant_catalog, release_checklist,
+    run_public_hygiene, scenario_matrix_catalog, schema_registry_entries,
 };
 pub use queue_shadow::{
     QueueShadowCompareOptions, QueueShadowCompareReport, QueueShadowDivergence,
@@ -400,6 +402,17 @@ pub use registry::{
 pub use response_tone::{
     EmojiAccentMode, ResponseToneConfig, ResponseToneContext, apply_response_tone,
     load_response_tone_config, parse_emoji_accent_mode,
+};
+pub use rich_presentation::{
+    RICH_MESSAGE_PRESENTATION_SCHEMA, RenderedDiscordPresentation, RenderedRichBatch,
+    RenderedRichUnit, RenderedRichUnitKind, RenderedTelegramPresentation, RichMessagePresentation,
+    RichPresentationAction, RichPresentationActionKind, RichPresentationAtomicity,
+    RichPresentationBlock, RichPresentationDeliveryPolicy, RichPresentationField,
+    RichPresentationLinkPreview, RichPresentationLinkPreviewMode, RichPresentationMediaRef,
+    RichPresentationTextStyle, RichPresentationValidationError, RichPresentationValidationOptions,
+    render_rich_presentation_batch_for_discord, render_rich_presentation_batch_for_telegram,
+    render_rich_presentation_for_discord, render_rich_presentation_for_telegram,
+    validate_rich_message_presentation,
 };
 pub use runtime_pipeline::{
     RuntimeRunOnceOptions, RuntimeRunOnceReceipt, RuntimeRunOnceReport, RuntimeRunOnceStatus,

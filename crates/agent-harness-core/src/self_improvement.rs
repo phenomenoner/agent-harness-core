@@ -302,6 +302,7 @@ pub fn append_self_improvement_notification(
         source_queue_id: None,
         source_completion_file: None,
         text,
+        presentation: None,
         delivery_intent: None,
         attachments: Vec::new(),
     };

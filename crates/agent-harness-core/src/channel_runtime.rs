@@ -8,8 +8,9 @@ use serde_json::Value;
 
 use crate::{
     AgentRegistry, ChannelCommandIntent, DEFAULT_THINKING_LEVEL, InboundMediaArtifact,
-    THINKING_LEVELS, TurnDispatch, TurnPlan, XHIGH_THINKING_LEVEL, inspect_codex_approval_policy,
-    inspect_codex_sandbox, inspect_codex_sandbox_policy, normalize_thinking_level,
+    RichMessagePresentation, THINKING_LEVELS, TurnDispatch, TurnPlan, XHIGH_THINKING_LEVEL,
+    inspect_codex_approval_policy, inspect_codex_sandbox, inspect_codex_sandbox_policy,
+    normalize_thinking_level,
 };
 
 const CHANNEL_STEP_SCHEMA: &str = "agent-harness.channel-step.v1";
@@ -192,6 +193,8 @@ pub struct ChannelOutboundMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_completion_file: Option<PathBuf>,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<RichMessagePresentation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_intent: Option<ChannelDeliveryIntent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1224,6 +1227,7 @@ fn outbound(
         source_queue_id: None,
         source_completion_file: None,
         text,
+        presentation: None,
         delivery_intent: None,
         attachments: Vec::new(),
     }

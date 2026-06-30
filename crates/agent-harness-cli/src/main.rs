@@ -25,7 +25,8 @@ use agent_harness_core::{
     BackgroundTaskRecord, BackgroundTaskUpsertOptions, BudgetAcquireOptions,
     BuiltinHarnessSkillSyncOptions, BuiltinHarnessSkillSyncReport, ChannelCommand,
     ChannelCommandApplyOptions, ChannelCommandApplyReport, ChannelDeliveryIntentKind,
-    ChannelDeliveryReceipt, ChannelDeliveryRecordOptions, ChannelDeliveryStatus,
+    ChannelDeliveryReceipt, ChannelDeliveryRecordOptions, ChannelDeliveryRenderedUnitKind,
+    ChannelDeliveryRenderedUnitReceipt, ChannelDeliveryStatus, ChannelDeliveryUnitStatus,
     ChannelIdentityLookup, ChannelIdentityResolutionStatus, ChannelOutboundAttachment,
     ChannelOutboundAttachmentKind, ChannelOutboundMessage, ChannelOutboxPlanOptions,
     ChannelOutboxPlanReport, ChannelReceiveOptions, ChannelReceiveReport, ChannelRunOnceOptions,
@@ -63,43 +64,44 @@ use agent_harness_core::{
     OpsCutoverApplyOptions, OpsCutoverApproveOptions, OpsCutoverReceiptOptions,
     OpsCutoverRequestOptions, OpsCutoverStatusOptions, PromptAssemblyOptions, PromptBundle,
     PromptReductionOptions, PublicHygieneOptions, QueueShadowCompareOptions,
-    QueueShadowRecordOptions, RuntimeQueueCapacityOptions, RuntimeQueueControlAction,
-    RuntimeQueueControlOptions, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
-    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeRunOnceOptions,
-    RuntimeRunOnceReport, RuntimeRunOnceStatus, ScopedStopOptions, ScopedStopTarget,
-    SecurityScanOptions, SkillApplyOptions, SkillArchiveOptions, SkillIndex,
-    SkillLearningProposalOperation, SkillLearningProposalStatus, SkillLearningSignal,
-    SkillProposalActionOptions, SkillProposalListOptions, SkillProposeOptions, SkillSelectionQuery,
-    SubagentLifecycleCloseOptions, SubagentLifecycleRecordOptions, SubagentLifecycleShowOptions,
-    SubagentLifecycleShowReport, SubagentLifecycleState, SubagentPlan, SubagentPlanInput,
-    SubagentWorkerEnqueueOptions, SuperviseDeployCanaryOptions, SupervisionEvaluateOptions,
-    SupervisorChildState, SupervisorInventoryOptions, SupervisorInventoryServiceConfig,
-    SupervisorLaunchCommand, TaskEntityOptions, TaskStatus, TokenEfficiencyOptions, TraceOptions,
-    TurnPlan, TurnPlanInput, VaultGetOptions, VaultPutOptions, WindowsSupervisorPlanOptions,
-    WindowsSupervisorPlanReport, WorkerCancelOptions, WorkerEnqueueOptions, WorkerEnqueueReport,
-    WorkerJobKind, WorkerReapStaleOptions, WorkerRunOnceOptions, WorkerRunOnceReport,
-    WorkerRunOnceStatus, WorkerStatusOptions, acquire_budget, add_operation_plan_item,
-    append_harness_log, append_jsonl_value, apply_channel_command_step, apply_skill_proposal,
-    assemble_prompt_bundle, block_operation_plan, build_channel_step, build_dry_run_report,
-    build_harness_skill_index, build_import_plan, build_runtime_skill_index,
-    build_source_skill_index, build_turn_plan, cancel_worker_job, check_activation_readiness,
-    check_config_drift, check_tool_description_pin, collect_harness_metrics,
-    collect_harness_status, collect_healthz, collect_inbound_media_cache_report,
-    collect_ops_cutover_status, collect_token_efficiency, collect_worker_status,
-    comment_on_operation_plan, compare_channel_turn_shadow, complete_operation_plan,
-    control_cron_run, control_runtime_queue_item, create_learning_proposal, create_operation_plan,
-    create_ops_backup, create_skill_archive_proposal, create_skill_learning_proposal,
-    current_log_time_ms, default_supervisor_child_specs, delegate_operation_plan_item,
-    enqueue_channel_step, enqueue_deterministic_cron_workers, enqueue_native_cron_workers,
-    enqueue_subagent_workers, enqueue_worker_job, ensure_memory_owner_state, evaluate_admission,
-    evaluate_prompt_reduction, evaluate_supervisor_children, execute_import,
-    export_harness_registry_files, export_memory_credentials, get_vault_secret, handle_mcp_request,
-    inspect_openclaw_mem_service, inspect_runtime_queue_capacity, invariant_catalog, inventory,
-    lint_cron_scheduler, list_background_tasks, list_cron_runs, list_operation_plans,
-    list_skill_proposals, load_agent_registry, load_deterministic_cron_store,
-    load_native_cron_store, load_subagent_ledger, parse_channel_command, parse_context_pack,
-    plan_agent_progress_delivery, plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron,
-    plan_native_cron, plan_subagents, preflight_codex_runtime, prepare_openclaw_mem_local_owner,
+    QueueShadowRecordOptions, RenderedRichUnitKind, RichPresentationValidationOptions,
+    RuntimeQueueCapacityOptions, RuntimeQueueControlAction, RuntimeQueueControlOptions,
+    RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions,
+    RuntimeQueuePrepareReport, RuntimeRunOnceOptions, RuntimeRunOnceReport, RuntimeRunOnceStatus,
+    ScopedStopOptions, ScopedStopTarget, SecurityScanOptions, SkillApplyOptions,
+    SkillArchiveOptions, SkillIndex, SkillLearningProposalOperation, SkillLearningProposalStatus,
+    SkillLearningSignal, SkillProposalActionOptions, SkillProposalListOptions, SkillProposeOptions,
+    SkillSelectionQuery, SubagentLifecycleCloseOptions, SubagentLifecycleRecordOptions,
+    SubagentLifecycleShowOptions, SubagentLifecycleShowReport, SubagentLifecycleState,
+    SubagentPlan, SubagentPlanInput, SubagentWorkerEnqueueOptions, SuperviseDeployCanaryOptions,
+    SupervisionEvaluateOptions, SupervisorChildState, SupervisorInventoryOptions,
+    SupervisorInventoryServiceConfig, SupervisorLaunchCommand, TaskEntityOptions, TaskStatus,
+    TokenEfficiencyOptions, TraceOptions, TurnPlan, TurnPlanInput, VaultGetOptions,
+    VaultPutOptions, WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport,
+    WorkerCancelOptions, WorkerEnqueueOptions, WorkerEnqueueReport, WorkerJobKind,
+    WorkerReapStaleOptions, WorkerRunOnceOptions, WorkerRunOnceReport, WorkerRunOnceStatus,
+    WorkerStatusOptions, acquire_budget, add_operation_plan_item, append_harness_log,
+    append_jsonl_value, apply_channel_command_step, apply_skill_proposal, assemble_prompt_bundle,
+    block_operation_plan, build_channel_step, build_dry_run_report, build_harness_skill_index,
+    build_import_plan, build_runtime_skill_index, build_source_skill_index, build_turn_plan,
+    cancel_worker_job, check_activation_readiness, check_config_drift, check_tool_description_pin,
+    collect_harness_metrics, collect_harness_status, collect_healthz,
+    collect_inbound_media_cache_report, collect_ops_cutover_status, collect_token_efficiency,
+    collect_worker_status, comment_on_operation_plan, compare_channel_turn_shadow,
+    complete_operation_plan, control_cron_run, control_runtime_queue_item,
+    create_learning_proposal, create_operation_plan, create_ops_backup,
+    create_skill_archive_proposal, create_skill_learning_proposal, current_log_time_ms,
+    default_supervisor_child_specs, delegate_operation_plan_item, enqueue_channel_step,
+    enqueue_deterministic_cron_workers, enqueue_native_cron_workers, enqueue_subagent_workers,
+    enqueue_worker_job, ensure_memory_owner_state, evaluate_admission, evaluate_prompt_reduction,
+    evaluate_supervisor_children, execute_import, export_harness_registry_files,
+    export_memory_credentials, get_vault_secret, handle_mcp_request, inspect_openclaw_mem_service,
+    inspect_runtime_queue_capacity, invariant_catalog, inventory, lint_cron_scheduler,
+    list_background_tasks, list_cron_runs, list_operation_plans, list_skill_proposals,
+    load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
+    load_subagent_ledger, parse_channel_command, parse_context_pack, plan_agent_progress_delivery,
+    plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron, plan_native_cron,
+    plan_subagents, preflight_codex_runtime, prepare_openclaw_mem_local_owner,
     prepare_runtime_queue_item, probe_codex_runtime_launch,
     promote_operation_plan_items_from_dependencies, propose_openclaw_mem_service_memory,
     put_vault_secret, reap_stale_worker_jobs, recall_openclaw_mem_service, receive_channel_message,
@@ -110,18 +112,19 @@ use agent_harness_core::{
     record_ops_control, record_ops_cutover_apply, record_ops_cutover_approval,
     record_ops_cutover_receipt, record_ops_cutover_request, record_scoped_stop,
     record_subagent_lifecycle, record_supervise_deploy_canary, recover_memory_owner_state,
-    reject_skill_proposal, release_checklist, request_memory_owner_promotion,
+    reject_skill_proposal, release_checklist, render_rich_presentation_batch_for_discord,
+    render_rich_presentation_batch_for_telegram, request_memory_owner_promotion,
     requeue_prepared_context_rollover, resolve_channel_identity, rotate_harness_log_if_needed,
     run_channel_once, run_codex_runtime, run_cron_scheduler_once, run_memory_canvas_worker,
     run_memory_embedding_backfill, run_memory_hook_adapter, run_openclaw_mem_read_path_smoke,
     run_public_hygiene, run_runtime_queue_once, run_worker_once,
     runtime_worker::reconcile_runtime_queue_leases_for_generation, scan_security_boundaries,
-    schema_registry_entries, search_imported_memory, search_imported_vector_memory, select_skills,
-    show_operation_plan, show_subagent_lifecycle, store_openclaw_mem_service_memory,
-    subagent_lifecycle_receipts_file, subagent_lifecycle_snapshot_file,
-    sync_builtin_harness_skills, tool_description_hash, trace_harness_event,
-    update_operation_plan_item, upsert_background_task, validate_harness_config,
-    write_channel_step, write_deterministic_cron_plan, write_json_atomic,
+    scenario_matrix_catalog, schema_registry_entries, search_imported_memory,
+    search_imported_vector_memory, select_skills, show_operation_plan, show_subagent_lifecycle,
+    store_openclaw_mem_service_memory, subagent_lifecycle_receipts_file,
+    subagent_lifecycle_snapshot_file, sync_builtin_harness_skills, tool_description_hash,
+    trace_harness_event, update_operation_plan_item, upsert_background_task,
+    validate_harness_config, write_channel_step, write_deterministic_cron_plan, write_json_atomic,
     write_memory_search_receipt, write_memory_vector_recall_receipt, write_native_cron_plan,
     write_prompt_bundle, write_report_files, write_skill_index, write_subagent_plan,
     write_task_entity, write_turn_plan, write_windows_supervisor_plan,
@@ -181,6 +184,7 @@ fn main() {
         "tool-description-hash" => run_tool_description_hash(&rest),
         "tool-pin-check" => run_tool_pin_check(&rest),
         "invariants" => run_invariants(&rest),
+        "scenario-matrix" => run_scenario_matrix(&rest),
         "schema-registry" => run_schema_registry(&rest),
         "release-checklist" => run_release_checklist(&rest),
         "public-hygiene" => run_public_hygiene_cli(&rest),
@@ -1454,6 +1458,11 @@ fn run_invariants(args: &[String]) -> Result<(), String> {
     print_json(&invariant_catalog())
 }
 
+fn run_scenario_matrix(args: &[String]) -> Result<(), String> {
+    SimpleOptions::parse(args, "scenario-matrix", &[], &[])?;
+    print_json(&scenario_matrix_catalog())
+}
+
 fn run_schema_registry(args: &[String]) -> Result<(), String> {
     SimpleOptions::parse(args, "schema-registry", &[], &[])?;
     print_json(&schema_registry_entries())
@@ -2665,6 +2674,7 @@ fn run_channel_delivery_record(args: &[String]) -> Result<(), String> {
         provider_message_id: args.provider_message_id,
         error: args.error,
         now_ms: args.now_ms,
+        rendered_units: Vec::new(),
     })
     .map_err(|err| err.to_string())?;
 
@@ -4441,7 +4451,7 @@ fn execute_telegram_poll_once(
             continue;
         }
         match telegram_send_outbound_message(&args.target_home, token, &pending.message) {
-            Ok(provider_message_id) => {
+            Ok(send) => {
                 record_channel_delivery(ChannelDeliveryRecordOptions {
                     harness_home: args.target_home.clone(),
                     delivery_id: pending.delivery_id,
@@ -4451,9 +4461,10 @@ fn execute_telegram_poll_once(
                     channel_id: pending.message.channel_id.clone(),
                     user_id: pending.message.user_id.clone(),
                     session_key: pending.message.session_key.clone(),
-                    provider_message_id,
+                    provider_message_id: send.provider_message_id,
                     error: None,
                     now_ms: current_time_ms()?,
+                    rendered_units: send.rendered_units,
                 })
                 .map_err(|err| err.to_string())?;
                 delivered_messages += 1;
@@ -4468,12 +4479,13 @@ fn execute_telegram_poll_once(
                     channel_id: pending.message.channel_id.clone(),
                     user_id: pending.message.user_id.clone(),
                     session_key: pending.message.session_key.clone(),
-                    provider_message_id: None,
-                    error: Some(error.clone()),
+                    provider_message_id: error.provider_message_id,
+                    error: Some(error.message.clone()),
                     now_ms: current_time_ms()?,
+                    rendered_units: error.rendered_units,
                 })
                 .map_err(|err| err.to_string())?;
-                warnings.push(error);
+                warnings.push(error.message);
                 failed_deliveries += 1;
             }
         }
@@ -5273,7 +5285,7 @@ fn execute_discord_outbox_send_once(
             continue;
         }
         match discord_send_outbound_message(&token, &pending.message) {
-            Ok(provider_message_id) => {
+            Ok(send) => {
                 record_channel_delivery(ChannelDeliveryRecordOptions {
                     harness_home: args.target_home.clone(),
                     delivery_id: pending.delivery_id,
@@ -5283,9 +5295,10 @@ fn execute_discord_outbox_send_once(
                     channel_id: pending.message.channel_id.clone(),
                     user_id: pending.message.user_id.clone(),
                     session_key: pending.message.session_key.clone(),
-                    provider_message_id,
+                    provider_message_id: send.provider_message_id,
                     error: None,
                     now_ms: current_time_ms()?,
+                    rendered_units: send.rendered_units,
                 })
                 .map_err(|err| err.to_string())?;
                 delivered_messages += 1;
@@ -5300,12 +5313,13 @@ fn execute_discord_outbox_send_once(
                     channel_id: pending.message.channel_id.clone(),
                     user_id: pending.message.user_id.clone(),
                     session_key: pending.message.session_key.clone(),
-                    provider_message_id: None,
-                    error: Some(error.clone()),
+                    provider_message_id: error.provider_message_id,
+                    error: Some(error.message.clone()),
                     now_ms: current_time_ms()?,
+                    rendered_units: error.rendered_units,
                 })
                 .map_err(|err| err.to_string())?;
-                warnings.push(error);
+                warnings.push(error.message);
                 failed_deliveries += 1;
             }
         }
@@ -16243,6 +16257,30 @@ fn telegram_get_updates(
 enum TelegramFormattingMode {
     Plain,
     Html,
+    TrustedHtml,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ChannelSendAttempt {
+    provider_message_id: Option<String>,
+    rendered_units: Vec<ChannelDeliveryRenderedUnitReceipt>,
+}
+
+#[derive(Debug, Clone)]
+struct ChannelSendError {
+    message: String,
+    provider_message_id: Option<String>,
+    rendered_units: Vec<ChannelDeliveryRenderedUnitReceipt>,
+}
+
+impl From<String> for ChannelSendError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            provider_message_id: None,
+            rendered_units: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -16307,6 +16345,15 @@ fn telegram_message_payload(
                 "is_disabled": true
             }
         }),
+        TelegramFormattingMode::TrustedHtml => serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+            "link_preview_options": {
+                "is_disabled": true
+            }
+        }),
     };
     if let Some(reply_to_message_id) = options.reply_to_message_id {
         payload["reply_to_message_id"] = serde_json::json!(reply_to_message_id);
@@ -16327,7 +16374,10 @@ fn telegram_send_outbound_message(
     harness_home: &Path,
     token: &str,
     message: &ChannelOutboundMessage,
-) -> Result<Option<String>, String> {
+) -> Result<ChannelSendAttempt, ChannelSendError> {
+    if message.presentation.is_some() {
+        return telegram_send_rich_outbound_message(token, message);
+    }
     let mut provider_message_ids = Vec::new();
     let text = format_channel_reply_text(&message.text);
     if message.attachments.is_empty() || !text.trim().is_empty() {
@@ -16340,18 +16390,217 @@ fn telegram_send_outbound_message(
                 message_thread_id: telegram_message_thread_id(message),
                 formatting_mode: telegram_formatting_mode_for_message(harness_home, message),
             },
-        )? {
+        )
+        .map_err(ChannelSendError::from)?
+        {
             provider_message_ids.push(provider_message_id);
         }
     }
     for attachment in &message.attachments {
         if let Some(provider_message_id) =
-            telegram_send_attachment(token, &message.channel_id, attachment)?
+            telegram_send_attachment(token, &message.channel_id, attachment)
+                .map_err(ChannelSendError::from)?
         {
             provider_message_ids.push(provider_message_id);
         }
     }
-    Ok((!provider_message_ids.is_empty()).then(|| provider_message_ids.join(",")))
+    Ok(ChannelSendAttempt {
+        provider_message_id: (!provider_message_ids.is_empty())
+            .then(|| provider_message_ids.join(",")),
+        rendered_units: Vec::new(),
+    })
+}
+
+fn telegram_send_rich_outbound_message(
+    token: &str,
+    message: &ChannelOutboundMessage,
+) -> Result<ChannelSendAttempt, ChannelSendError> {
+    let presentation = message
+        .presentation
+        .as_ref()
+        .ok_or_else(|| ChannelSendError {
+            message: "rich presentation was missing".to_string(),
+            provider_message_id: None,
+            rendered_units: Vec::new(),
+        })?;
+    let batch = render_rich_presentation_batch_for_telegram(
+        presentation,
+        &RichPresentationValidationOptions {
+            attachment_count: message.attachments.len(),
+            allow_url_actions: true,
+            allow_callback_actions: false,
+        },
+    )
+    .map_err(|error| ChannelSendError {
+        message: format!(
+            "Telegram rich presentation validation failed at {}: {}",
+            error.field, error.message
+        ),
+        provider_message_id: None,
+        rendered_units: Vec::new(),
+    })?;
+    let mut provider_message_ids = Vec::new();
+    let mut rendered_units = Vec::new();
+    let mut first_message = true;
+    let mut text_provider_message_id = None;
+
+    for unit in batch.units {
+        match unit.kind {
+            RenderedRichUnitKind::Text => {
+                let text = unit.text.unwrap_or_default();
+                let send = telegram_send_message(
+                    token,
+                    &message.channel_id,
+                    &text,
+                    TelegramSendOptions {
+                        reply_to_message_id: first_message
+                            .then(|| telegram_reply_to_message_id(message))
+                            .flatten(),
+                        message_thread_id: telegram_message_thread_id(message),
+                        formatting_mode: TelegramFormattingMode::TrustedHtml,
+                    },
+                );
+                first_message = false;
+                match send {
+                    Ok(provider_message_id) => {
+                        if let Some(id) = provider_message_id.clone() {
+                            text_provider_message_id = Some(id.clone());
+                            provider_message_ids.push(id);
+                        }
+                        rendered_units.push(rendered_unit_receipt(
+                            unit.unit_id,
+                            unit.kind,
+                            ChannelDeliveryUnitStatus::Delivered,
+                            provider_message_id,
+                            None,
+                        ));
+                    }
+                    Err(error) => {
+                        rendered_units.push(rendered_unit_receipt(
+                            unit.unit_id,
+                            unit.kind,
+                            ChannelDeliveryUnitStatus::Failed,
+                            None,
+                            Some(error.clone()),
+                        ));
+                        return Err(ChannelSendError {
+                            message: error,
+                            provider_message_id: joined_provider_ids(&provider_message_ids),
+                            rendered_units,
+                        });
+                    }
+                }
+            }
+            RenderedRichUnitKind::Media => {
+                let Some(index) = unit.attachment_index else {
+                    let error = "Telegram rich media artifact refs are not live-deliverable without an attachment index".to_string();
+                    rendered_units.push(rendered_unit_receipt(
+                        unit.unit_id,
+                        unit.kind,
+                        ChannelDeliveryUnitStatus::Failed,
+                        None,
+                        Some(error.clone()),
+                    ));
+                    return Err(ChannelSendError {
+                        message: error,
+                        provider_message_id: joined_provider_ids(&provider_message_ids),
+                        rendered_units,
+                    });
+                };
+                let Some(base_attachment) = message.attachments.get(index) else {
+                    let error = format!("Telegram rich media attachment index {index} is missing");
+                    rendered_units.push(rendered_unit_receipt(
+                        unit.unit_id,
+                        unit.kind,
+                        ChannelDeliveryUnitStatus::Failed,
+                        None,
+                        Some(error.clone()),
+                    ));
+                    return Err(ChannelSendError {
+                        message: error,
+                        provider_message_id: joined_provider_ids(&provider_message_ids),
+                        rendered_units,
+                    });
+                };
+                let mut attachment = base_attachment.clone();
+                if unit
+                    .text
+                    .as_deref()
+                    .is_some_and(|caption| !caption.trim().is_empty())
+                {
+                    attachment.caption = unit.text.clone();
+                }
+                match telegram_send_attachment(token, &message.channel_id, &attachment) {
+                    Ok(provider_message_id) => {
+                        if let Some(id) = provider_message_id.clone() {
+                            provider_message_ids.push(id);
+                        }
+                        rendered_units.push(rendered_unit_receipt(
+                            unit.unit_id,
+                            unit.kind,
+                            ChannelDeliveryUnitStatus::Delivered,
+                            provider_message_id,
+                            None,
+                        ));
+                    }
+                    Err(error) => {
+                        rendered_units.push(rendered_unit_receipt(
+                            unit.unit_id,
+                            unit.kind,
+                            ChannelDeliveryUnitStatus::Failed,
+                            None,
+                            Some(error.clone()),
+                        ));
+                        return Err(ChannelSendError {
+                            message: error,
+                            provider_message_id: joined_provider_ids(&provider_message_ids),
+                            rendered_units,
+                        });
+                    }
+                }
+            }
+            RenderedRichUnitKind::ComponentAction => {
+                rendered_units.push(rendered_unit_receipt(
+                    unit.unit_id,
+                    unit.kind,
+                    ChannelDeliveryUnitStatus::Delivered,
+                    text_provider_message_id.clone(),
+                    None,
+                ));
+            }
+        }
+    }
+
+    Ok(ChannelSendAttempt {
+        provider_message_id: joined_provider_ids(&provider_message_ids),
+        rendered_units,
+    })
+}
+
+fn rendered_unit_receipt(
+    unit_id: String,
+    kind: RenderedRichUnitKind,
+    status: ChannelDeliveryUnitStatus,
+    provider_message_id: Option<String>,
+    error: Option<String>,
+) -> ChannelDeliveryRenderedUnitReceipt {
+    ChannelDeliveryRenderedUnitReceipt {
+        unit_id,
+        kind: match kind {
+            RenderedRichUnitKind::Text => ChannelDeliveryRenderedUnitKind::Text,
+            RenderedRichUnitKind::Media => ChannelDeliveryRenderedUnitKind::Media,
+            RenderedRichUnitKind::ComponentAction => {
+                ChannelDeliveryRenderedUnitKind::ComponentAction
+            }
+        },
+        status,
+        provider_message_id,
+        error,
+    }
+}
+
+fn joined_provider_ids(ids: &[String]) -> Option<String> {
+    (!ids.is_empty()).then(|| ids.join(","))
 }
 
 fn telegram_reply_to_message_id(message: &ChannelOutboundMessage) -> Option<i64> {
@@ -16909,7 +17158,10 @@ const DISCORD_MESSAGE_CONTENT_LIMIT: usize = 2_000;
 fn discord_send_outbound_message(
     token: &str,
     message: &ChannelOutboundMessage,
-) -> Result<Option<String>, String> {
+) -> Result<ChannelSendAttempt, ChannelSendError> {
+    if message.presentation.is_some() {
+        return discord_send_rich_outbound_message(token, message);
+    }
     let mut provider_message_ids = Vec::new();
     let text = format_channel_reply_text(&message.text);
     if !text.trim().is_empty() {
@@ -16918,13 +17170,16 @@ fn discord_send_outbound_message(
             &message.channel_id,
             &text,
             discord_message_reference(message),
-        )? {
+        )
+        .map_err(ChannelSendError::from)?
+        {
             provider_message_ids.push(provider_message_id);
         }
     }
     for attachment in &message.attachments {
         if let Some(provider_message_id) =
-            discord_send_attachment(token, &message.channel_id, attachment)?
+            discord_send_attachment(token, &message.channel_id, attachment)
+                .map_err(ChannelSendError::from)?
         {
             provider_message_ids.push(provider_message_id);
         }
@@ -16935,11 +17190,173 @@ fn discord_send_outbound_message(
             &message.channel_id,
             &text,
             discord_message_reference(message),
-        )? {
+        )
+        .map_err(ChannelSendError::from)?
+        {
             provider_message_ids.push(provider_message_id);
         }
     }
-    Ok((!provider_message_ids.is_empty()).then(|| provider_message_ids.join(",")))
+    Ok(ChannelSendAttempt {
+        provider_message_id: joined_provider_ids(&provider_message_ids),
+        rendered_units: Vec::new(),
+    })
+}
+
+fn discord_send_rich_outbound_message(
+    token: &str,
+    message: &ChannelOutboundMessage,
+) -> Result<ChannelSendAttempt, ChannelSendError> {
+    let presentation = message
+        .presentation
+        .as_ref()
+        .ok_or_else(|| ChannelSendError {
+            message: "rich presentation was missing".to_string(),
+            provider_message_id: None,
+            rendered_units: Vec::new(),
+        })?;
+    let batch = render_rich_presentation_batch_for_discord(
+        presentation,
+        &RichPresentationValidationOptions {
+            attachment_count: message.attachments.len(),
+            allow_url_actions: true,
+            allow_callback_actions: false,
+        },
+    )
+    .map_err(|error| ChannelSendError {
+        message: format!(
+            "Discord rich presentation validation failed at {}: {}",
+            error.field, error.message
+        ),
+        provider_message_id: None,
+        rendered_units: Vec::new(),
+    })?;
+    let mut provider_message_ids = Vec::new();
+    let mut rendered_units = Vec::new();
+    let mut first_message = true;
+    let mut last_text_provider_message_id = None;
+
+    for unit in batch.units {
+        match unit.kind {
+            RenderedRichUnitKind::Text => {
+                let text = unit.text.unwrap_or_default();
+                let reference = first_message
+                    .then(|| discord_message_reference(message))
+                    .flatten();
+                first_message = false;
+                match discord_send_message(token, &message.channel_id, &text, reference) {
+                    Ok(provider_message_id) => {
+                        if let Some(id) = provider_message_id.clone() {
+                            last_text_provider_message_id = Some(id.clone());
+                            provider_message_ids.push(id);
+                        }
+                        rendered_units.push(rendered_unit_receipt(
+                            unit.unit_id,
+                            unit.kind,
+                            ChannelDeliveryUnitStatus::Delivered,
+                            provider_message_id,
+                            None,
+                        ));
+                    }
+                    Err(error) => {
+                        rendered_units.push(rendered_unit_receipt(
+                            unit.unit_id,
+                            unit.kind,
+                            ChannelDeliveryUnitStatus::Failed,
+                            None,
+                            Some(error.clone()),
+                        ));
+                        return Err(ChannelSendError {
+                            message: error,
+                            provider_message_id: joined_provider_ids(&provider_message_ids),
+                            rendered_units,
+                        });
+                    }
+                }
+            }
+            RenderedRichUnitKind::Media => {
+                let Some(index) = unit.attachment_index else {
+                    let error = "Discord rich media artifact refs are not live-deliverable without an attachment index".to_string();
+                    rendered_units.push(rendered_unit_receipt(
+                        unit.unit_id,
+                        unit.kind,
+                        ChannelDeliveryUnitStatus::Failed,
+                        None,
+                        Some(error.clone()),
+                    ));
+                    return Err(ChannelSendError {
+                        message: error,
+                        provider_message_id: joined_provider_ids(&provider_message_ids),
+                        rendered_units,
+                    });
+                };
+                let Some(base_attachment) = message.attachments.get(index) else {
+                    let error = format!("Discord rich media attachment index {index} is missing");
+                    rendered_units.push(rendered_unit_receipt(
+                        unit.unit_id,
+                        unit.kind,
+                        ChannelDeliveryUnitStatus::Failed,
+                        None,
+                        Some(error.clone()),
+                    ));
+                    return Err(ChannelSendError {
+                        message: error,
+                        provider_message_id: joined_provider_ids(&provider_message_ids),
+                        rendered_units,
+                    });
+                };
+                let mut attachment = base_attachment.clone();
+                if unit
+                    .text
+                    .as_deref()
+                    .is_some_and(|caption| !caption.trim().is_empty())
+                {
+                    attachment.caption = unit.text.clone();
+                }
+                match discord_send_attachment(token, &message.channel_id, &attachment) {
+                    Ok(provider_message_id) => {
+                        if let Some(id) = provider_message_id.clone() {
+                            provider_message_ids.push(id);
+                        }
+                        rendered_units.push(rendered_unit_receipt(
+                            unit.unit_id,
+                            unit.kind,
+                            ChannelDeliveryUnitStatus::Delivered,
+                            provider_message_id,
+                            None,
+                        ));
+                    }
+                    Err(error) => {
+                        rendered_units.push(rendered_unit_receipt(
+                            unit.unit_id,
+                            unit.kind,
+                            ChannelDeliveryUnitStatus::Failed,
+                            None,
+                            Some(error.clone()),
+                        ));
+                        return Err(ChannelSendError {
+                            message: error,
+                            provider_message_id: joined_provider_ids(&provider_message_ids),
+                            rendered_units,
+                        });
+                    }
+                }
+            }
+            RenderedRichUnitKind::ComponentAction => {
+                rendered_units.push(rendered_unit_receipt(
+                    unit.unit_id,
+                    unit.kind,
+                    ChannelDeliveryUnitStatus::Delivered,
+                    last_text_provider_message_id.clone(),
+                    None,
+                ));
+            }
+        }
+    }
+
+    Ok(ChannelSendAttempt {
+        provider_message_id: joined_provider_ids(&provider_message_ids),
+        rendered_units,
+    })
 }
 
 fn discord_message_reference(message: &ChannelOutboundMessage) -> Option<serde_json::Value> {
@@ -17065,19 +17482,7 @@ fn discord_send_attachment(
     let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
     let token = normalize_discord_bot_token(token);
     let auth = format!("Bot {token}");
-    let filename = attachment_filename(attachment)?;
-    let payload = serde_json::json!({
-        "content": "",
-        "allowed_mentions": {
-            "parse": []
-        },
-        "attachments": [
-            {
-                "id": 0,
-                "filename": filename
-            }
-        ]
-    });
+    let payload = discord_attachment_payload(attachment)?;
     let fields = vec![("payload_json".to_string(), payload.to_string())];
     let value = multipart_post_json(
         "Discord",
@@ -17091,6 +17496,30 @@ fn discord_send_attachment(
         .get("id")
         .and_then(serde_json::Value::as_str)
         .map(ToString::to_string))
+}
+
+fn discord_attachment_payload(
+    attachment: &ChannelOutboundAttachment,
+) -> Result<serde_json::Value, String> {
+    let filename = attachment_filename(attachment)?;
+    let content = attachment
+        .caption
+        .as_deref()
+        .map(str::trim)
+        .filter(|caption| !caption.is_empty())
+        .unwrap_or("");
+    Ok(serde_json::json!({
+        "content": content,
+        "allowed_mentions": {
+            "parse": []
+        },
+        "attachments": [
+            {
+                "id": 0,
+                "filename": filename
+            }
+        ]
+    }))
 }
 
 fn discord_edit_message(
@@ -19623,6 +20052,7 @@ fn print_help() {
     println!("  tool-description-hash Hash MCP/tool descriptions for pinning");
     println!("  tool-pin-check  Verify a pinned MCP/tool description hash");
     println!("  invariants      Print reviewed runtime invariant catalog");
+    println!("  scenario-matrix Print topology-sensitive release scenario matrix");
     println!("  schema-registry Print core schema registry entries");
     println!("  release-checklist Print release gate checklist");
     println!("  public-hygiene  Scan public tree for forbidden private/debug paths");
@@ -21434,6 +21864,44 @@ mod tests {
         assert!(text.contains("<code>&lt;ok&gt;</code>"));
         assert!(text.contains("<pre>let x = &quot;&lt;&amp;&gt;&quot;;</pre>"));
         assert!(!text.contains("<ok>"));
+    }
+
+    #[test]
+    fn telegram_trusted_html_payload_keeps_renderer_output_unescaped() {
+        let payload = telegram_message_payload(
+            "2118296735",
+            "<b>Status</b>: <code>PASS</code>",
+            TelegramSendOptions {
+                formatting_mode: TelegramFormattingMode::TrustedHtml,
+                ..TelegramSendOptions::default()
+            },
+        );
+
+        assert_eq!(payload["parse_mode"], "HTML");
+        assert_eq!(payload["text"], "<b>Status</b>: <code>PASS</code>");
+        assert_eq!(payload["link_preview_options"]["is_disabled"], true);
+    }
+
+    #[test]
+    fn discord_attachment_payload_uses_caption_without_mentions() {
+        let attachment = ChannelOutboundAttachment {
+            kind: ChannelOutboundAttachmentKind::Image,
+            path: PathBuf::from("result.png"),
+            mime: Some("image/png".to_string()),
+            filename: Some("result.png".to_string()),
+            caption: Some("@everyone result".to_string()),
+        };
+
+        let payload = discord_attachment_payload(&attachment).unwrap();
+
+        assert_eq!(payload["content"], "@everyone result");
+        assert!(
+            payload["allowed_mentions"]["parse"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(payload["attachments"][0]["filename"], "result.png");
     }
 
     #[test]

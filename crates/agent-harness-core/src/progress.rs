@@ -2523,6 +2523,262 @@ mod tests {
     }
 
     #[test]
+    fn progress_surface_volume_replay_converges_without_post_terminal_churn() {
+        for platform in ["telegram", "discord"] {
+            let root = temp_root(&format!("progress_surface_volume_replay_{platform}"));
+            let harness_home = root.join(".agent-harness");
+            let context = AgentProgressContext {
+                queue_id: format!("turn:{platform}:progress-surface"),
+                platform: platform.to_string(),
+                channel_id: format!("{platform}-dm"),
+                session_key: format!("{platform}:dm:user:main"),
+                ..context()
+            };
+            append_agent_progress_event(
+                &harness_home,
+                &AgentProgressEvent::new(
+                    &context,
+                    AgentProgressKind::Todo,
+                    "todo",
+                    "planning progress replay",
+                    AgentProgressStatus::Started,
+                    1000,
+                ),
+            )
+            .unwrap();
+
+            let initial = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+                harness_home: harness_home.clone(),
+                platform: Some(platform.to_string()),
+                now_ms: 2000,
+                min_update_interval_ms: 0,
+                max_nonterminal_updates_per_lane: 1,
+                ..AgentProgressDeliveryPlanOptions::default()
+            })
+            .unwrap();
+            assert_eq!(initial.pending.len(), 2);
+            for (index, pending) in initial.pending.into_iter().enumerate() {
+                record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+                    harness_home: harness_home.clone(),
+                    queue_id: pending.queue_id,
+                    platform: pending.platform,
+                    account_id: pending.account_id,
+                    channel_id: pending.channel_id,
+                    thread_id: pending.thread_id,
+                    user_id: pending.user_id,
+                    session_key: pending.session_key,
+                    message_kind: pending.message_kind,
+                    action: pending.action,
+                    status: AgentProgressDeliveryStatus::Delivered,
+                    provider_message_id: Some(format!("{platform}-provider-{}", index + 1)),
+                    event_line: pending.event_line,
+                    text_hash: pending.text_hash,
+                    terminal: pending.terminal,
+                    policy_decision: Some("scenario-matrix".to_string()),
+                    error: None,
+                    now_ms: 2000,
+                })
+                .unwrap();
+            }
+
+            append_agent_progress_event(
+                &harness_home,
+                &AgentProgressEvent::new(
+                    &context,
+                    AgentProgressKind::AssistantNarration,
+                    "assistant_narration",
+                    "Running focused progress replay.",
+                    AgentProgressStatus::Progress,
+                    3000,
+                ),
+            )
+            .unwrap();
+            append_agent_progress_event(
+                &harness_home,
+                &AgentProgressEvent::new(
+                    &context,
+                    AgentProgressKind::ToolCall,
+                    "tool_call",
+                    "cargo test -p agent-harness-core progress",
+                    AgentProgressStatus::Progress,
+                    4000,
+                ),
+            )
+            .unwrap();
+            let capped = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+                harness_home: harness_home.clone(),
+                platform: Some(platform.to_string()),
+                now_ms: 5000,
+                min_update_interval_ms: 0,
+                max_nonterminal_updates_per_lane: 1,
+                status_heartbeat_after_body_cap_ms: 300_000,
+                ..AgentProgressDeliveryPlanOptions::default()
+            })
+            .unwrap();
+            assert_eq!(capped.pending.len(), 1);
+            assert_eq!(capped.summary.volume_limited, 1);
+            assert_eq!(capped.summary.rate_limited, 0);
+            let immediate_status = capped
+                .pending
+                .iter()
+                .find(|pending| pending.message_kind == AgentProgressDeliveryMessageKind::Status)
+                .unwrap();
+            assert_eq!(immediate_status.action, AgentProgressDeliveryAction::Edit);
+            assert!(!immediate_status.terminal);
+            assert!(
+                immediate_status
+                    .text
+                    .contains("Current step: Running focused progress replay.")
+            );
+            record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+                harness_home: harness_home.clone(),
+                queue_id: immediate_status.queue_id.clone(),
+                platform: immediate_status.platform.clone(),
+                account_id: immediate_status.account_id.clone(),
+                channel_id: immediate_status.channel_id.clone(),
+                thread_id: immediate_status.thread_id.clone(),
+                user_id: immediate_status.user_id.clone(),
+                session_key: immediate_status.session_key.clone(),
+                message_kind: immediate_status.message_kind,
+                action: immediate_status.action,
+                status: AgentProgressDeliveryStatus::Delivered,
+                provider_message_id: immediate_status.provider_message_id.clone(),
+                event_line: immediate_status.event_line,
+                text_hash: immediate_status.text_hash.clone(),
+                terminal: immediate_status.terminal,
+                policy_decision: Some("scenario-matrix".to_string()),
+                error: None,
+                now_ms: 5000,
+            })
+            .unwrap();
+
+            let heartbeat = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+                harness_home: harness_home.clone(),
+                platform: Some(platform.to_string()),
+                now_ms: 305_000,
+                min_update_interval_ms: 0,
+                max_nonterminal_updates_per_lane: 1,
+                status_heartbeat_after_body_cap_ms: 300_000,
+                ..AgentProgressDeliveryPlanOptions::default()
+            })
+            .unwrap();
+            assert_eq!(heartbeat.pending.len(), 1);
+            let status = heartbeat
+                .pending
+                .iter()
+                .find(|pending| pending.message_kind == AgentProgressDeliveryMessageKind::Status)
+                .unwrap();
+            assert_eq!(status.action, AgentProgressDeliveryAction::Edit);
+            assert!(!status.terminal);
+            assert!(
+                status
+                    .text
+                    .contains("Current step: Running focused progress replay.")
+            );
+            assert!(status.text.contains("Updates capped; still working."));
+            record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+                harness_home: harness_home.clone(),
+                queue_id: status.queue_id.clone(),
+                platform: status.platform.clone(),
+                account_id: status.account_id.clone(),
+                channel_id: status.channel_id.clone(),
+                thread_id: status.thread_id.clone(),
+                user_id: status.user_id.clone(),
+                session_key: status.session_key.clone(),
+                message_kind: status.message_kind,
+                action: status.action,
+                status: AgentProgressDeliveryStatus::Delivered,
+                provider_message_id: status.provider_message_id.clone(),
+                event_line: status.event_line,
+                text_hash: status.text_hash.clone(),
+                terminal: status.terminal,
+                policy_decision: Some("scenario-matrix".to_string()),
+                error: None,
+                now_ms: 305_000,
+            })
+            .unwrap();
+
+            append_agent_progress_event(
+                &harness_home,
+                &AgentProgressEvent::new(
+                    &context,
+                    AgentProgressKind::Runtime,
+                    "runtime",
+                    "completed",
+                    AgentProgressStatus::Completed,
+                    306_000,
+                ),
+            )
+            .unwrap();
+            let terminal = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+                harness_home: harness_home.clone(),
+                platform: Some(platform.to_string()),
+                now_ms: 307_000,
+                min_update_interval_ms: 0,
+                max_nonterminal_updates_per_lane: 1,
+                ..AgentProgressDeliveryPlanOptions::default()
+            })
+            .unwrap();
+            assert_eq!(terminal.pending.len(), 2);
+            assert!(terminal.pending.iter().all(|pending| pending.terminal));
+            assert!(
+                terminal
+                    .pending
+                    .iter()
+                    .all(|pending| pending.action == AgentProgressDeliveryAction::Edit)
+            );
+            for pending in terminal.pending {
+                record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+                    harness_home: harness_home.clone(),
+                    queue_id: pending.queue_id,
+                    platform: pending.platform,
+                    account_id: pending.account_id,
+                    channel_id: pending.channel_id,
+                    thread_id: pending.thread_id,
+                    user_id: pending.user_id,
+                    session_key: pending.session_key,
+                    message_kind: pending.message_kind,
+                    action: pending.action,
+                    status: AgentProgressDeliveryStatus::Delivered,
+                    provider_message_id: pending.provider_message_id,
+                    event_line: pending.event_line,
+                    text_hash: pending.text_hash,
+                    terminal: pending.terminal,
+                    policy_decision: Some("scenario-matrix".to_string()),
+                    error: None,
+                    now_ms: 307_000,
+                })
+                .unwrap();
+            }
+
+            append_agent_progress_event(
+                &harness_home,
+                &AgentProgressEvent::new(
+                    &context,
+                    AgentProgressKind::ToolCall,
+                    "tool_call",
+                    "late tool output after terminal",
+                    AgentProgressStatus::Progress,
+                    308_000,
+                ),
+            )
+            .unwrap();
+            let late = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+                harness_home: harness_home.clone(),
+                platform: Some(platform.to_string()),
+                now_ms: 309_000,
+                min_update_interval_ms: 0,
+                max_nonterminal_updates_per_lane: 1,
+                ..AgentProgressDeliveryPlanOptions::default()
+            })
+            .unwrap();
+            assert!(late.pending.is_empty());
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
     fn delivery_plan_reads_volume_limit_from_response_config() {
         let root = temp_root("delivery_plan_reads_volume_limit_from_response_config");
         let harness_home = root.join(".agent-harness");

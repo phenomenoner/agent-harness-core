@@ -1,6 +1,6 @@
 # Agent Harness Schema Registry
 
-Date: 2026-06-24
+Date: 2026-06-30
 
 The authoritative in-code registry is `agent_harness_core::quality::schema_registry_entries`, exposed by `agent-harness schema-registry`. This document records the current public compatibility contract for review and release checks.
 
@@ -23,6 +23,7 @@ The authoritative in-code registry is `agent_harness_core::quality::schema_regis
 | `agent-harness.channel-identity-check.v1` | `channel_identity` | Additive fields only in v1; non-bound statuses remain fail-closed. | Implemented. |
 | `agent-harness.channel-identity-registry.v1` | `channel_identity` | Additive binding fields only in v1; ambiguous bindings must fail closed. | Implemented. |
 | `agent-harness.channel-delivery-intent.v1` | `channel_runtime` | Additive fields only in v1; provider ids must come from captured inbound context. | Implemented. |
+| `agent-harness.rich-message-presentation.v1` | `rich_presentation` | Optional outbound presentation field; old outbox JSON without `presentation` must deserialize as plain text. v1 accepts additive semantic fields only after validation. | Package A adds schema structs, fail-closed validation, backward-compatibility coverage, and render-only Telegram/Discord fixtures; Package B adds rendered batch units and action capability gates; Package C stages provider send helper integration for adapter-rendered Telegram/Discord text/media plus rendered-unit delivery receipts while callbacks remain disabled. |
 | `agent-harness.channel-restart-request.v1` | `channel_runtime` | Restart request receipts are append-only; stop-file envelope action fields are additive in v1. | Implemented in staging. |
 | `agent-harness.gateway-restart-request.v1` | `channel_state` | Protected gateway restart requests are append-only; plain `/restart` remains request-only in v1. | Implemented in staging. |
 | `agent-harness.cron-scheduler.run-once.v1` | `cron_scheduler` | Additive fields only in v1; dry-run must not enqueue or write watermarks. | Implemented. |
@@ -73,5 +74,6 @@ The authoritative in-code registry is `agent_harness_core::quality::schema_regis
 | `agent-harness.encrypted-vault.v1` | `vault` | Breaking crypto/KDF changes require v2 and migration receipt. | Implemented in staging. |
 | `agent-harness.security-scan.v1` | `security` | Additive findings only in v1. | Implemented in staging. |
 | `agent-harness.quality-report.v1` | `quality` | Additive fields only in v1. | Implemented in staging. |
+| `agent-harness.scenario-matrix.v1` | `quality` | Release-gate catalog; additive scenario entries, evidence fields, and runnable-test pointers only in v1. | Round12 scenario-matrix follow-up exposes topology-sensitive release selectors through `agent-harness scenario-matrix`; Package A+B adds the rich-message-presentation selector for schema/validation/rendered-batch/receipt evidence. |
 
 Release rule: every new receipt/state schema must be added here and to `schema_registry_entries` before release. Breaking changes require a v2 schema, old-version reader, and migration receipt for one release cycle.

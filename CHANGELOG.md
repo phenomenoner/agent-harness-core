@@ -2,18 +2,39 @@
 
 ## Unreleased
 
+No unreleased changes.
+
+## v0.3.0 - 2026-06-30
+
+> Release stream note: the published GitHub Release stream is catching up. The
+> last visible GitHub Release was `v0.1.2`, while tags `v0.2.0` and `v0.2.1`
+> shipped without Release entries. This `v0.3.0` entry resumes the published
+> stream and is described relative to the `v0.2.1` tag.
+
+### Difference from v0.2.1
+
+`v0.2.1` was a memory-bridge polish release: public and non-main memory trust
+receipts began exposing source allow/deny scopes, trust level, and filtered
+global-imported hit counts.
+
+`v0.3.0` shifts focus to runtime continuity and outbound message presentation.
+It hardens thread recovery and context-rollover accounting around official Codex
+compaction, and introduces opt-in semantic rich-message presentation for
+Telegram and Discord with per-unit delivery receipts. Quality and topology
+surfaces were updated to track the new gates and the remaining gaps.
+
 ### Changed
 
-- Staged Round12 Track A virtual-session continuity fix: successful official
+- Round12 Track A virtual-session continuity fix: successful official
   Codex `compact-before-turn` outcomes now feed context-rollover accounting for
   the exact interactive/channel lane instead of silently compacting in place
   forever.
 - Added idempotent compact attempt keys so replaying the same queue/thread
   official compact success does not double-count toward rollover.
 - Updated invariant I13, the topology contract, release checklist output, and
-  generated topology explorer data to record the staging evidence while keeping
+  generated topology explorer data to record the release evidence while keeping
   broader end-to-end live rollover/final-delivery promotion gates open.
-- Staged Round12 Track A2 polluted-thread recovery guard: terminal
+- Round12 Track A2 polluted-thread recovery guard: terminal
   `DeadLetter` failures with polluted Codex context recovery can enqueue a
   virtual child continuation through the existing prepared-requeue path while
   suppressing the parent error outbox; `RetryPending`, max-depth continuations,
@@ -21,6 +42,16 @@
 - Added structured `threadHealthStatus` telemetry to Codex context preflight
   and recovery receipts so polluted-thread virtual-session recovery no longer
   depends only on diagnostic reason-string matching.
+- Rich message presentation Package A+B: optional semantic presentation
+  payloads now have safe Telegram/Discord render fixtures, deterministic
+  rendered batch units for text/media/actions, per-unit delivery receipt fields,
+  partial rich-batch retry accounting, and callback action capability gates.
+- Rich message presentation Package C: Telegram/Discord final outbox send
+  helpers now use adapter-rendered presentation text/media when
+  `ChannelOutboundMessage.presentation` is present, record rendered-unit
+  provider receipts, deliver attachment-index media captions through provider
+  attachment payloads, and fail closed for artifact-only media refs. Callback
+  actions remain disabled pending the interaction re-entry gate.
 
 ### Verification
 
@@ -38,6 +69,42 @@
 - `cargo test -p agent-harness-core run_runtime_queue_once_retries_reconnecting_protocol_error_then_dead_letters --target-dir target\staging-test-round12-a2-polluted-thread -- --nocapture`
 - `cargo test -p agent-harness-core context_preflight_compacts_for_bound_thread_inline_image_bloat --target-dir target\staging-test-round12-a2-thread-health-status -- --nocapture`
 - `cargo test -p agent-harness-core retryable_protocol_error_after_bloated_thread_rolls_over_to_fresh_thread --target-dir target\staging-test-round12-a2-thread-health-status -- --nocapture`
+- `cargo test -p agent-harness-core rich_presentation::tests:: --target-dir target\staging-rich-presentation-b-test -- --test-threads=1`
+- `cargo test -p agent-harness-core channel_delivery::tests:: --target-dir target\staging-rich-presentation-b-test -- --test-threads=1`
+- `cargo test -p agent-harness-core quality_catalogs_and_hygiene_report_are_actionable --target-dir target\staging-rich-presentation-b-test -- --test-threads=1`
+- `cargo check --workspace --target-dir target\staging-rich-presentation-b-check`
+- `cargo build -p agent-harness-cli --target-dir target\staging-rich-presentation-b-build`
+- `target\staging-rich-presentation-b-build\debug\agent-harness.exe scenario-matrix`
+- `target\staging-rich-presentation-b-build\debug\agent-harness.exe schema-registry`
+- `target\staging-rich-presentation-b-build\debug\agent-harness.exe invariants`
+- `target\staging-rich-presentation-b-build\debug\agent-harness.exe release-checklist`
+- `target\staging-rich-presentation-b-build\debug\agent-harness.exe public-hygiene --root .public-export\rich-presentation-b-20260630-172741`
+- `cargo check -p agent-harness-cli --target-dir target\staging-rich-presentation-c-check`
+- `cargo test -p agent-harness-cli telegram_trusted_html_payload_keeps_renderer_output_unescaped --target-dir target\staging-rich-presentation-c-test -- --test-threads=1`
+- `cargo test -p agent-harness-cli discord_attachment_payload_uses_caption_without_mentions --target-dir target\staging-rich-presentation-c-test -- --test-threads=1`
+- `cargo fmt --all -- --check`
+- `cargo test -p agent-harness-core rich_presentation::tests:: --target-dir target\staging-rich-presentation-c-release-test -- --test-threads=1`
+- `cargo test -p agent-harness-core channel_delivery::tests:: --target-dir target\staging-rich-presentation-c-release-test -- --test-threads=1`
+- `cargo test -p agent-harness-cli telegram_trusted_html_payload_keeps_renderer_output_unescaped --target-dir target\staging-rich-presentation-c-release-test -- --test-threads=1`
+- `cargo test -p agent-harness-cli discord_attachment_payload_uses_caption_without_mentions --target-dir target\staging-rich-presentation-c-release-test -- --test-threads=1`
+- `cargo test -p agent-harness-core quality_catalogs_and_hygiene_report_are_actionable --target-dir target\staging-rich-presentation-c-release-test -- --test-threads=1`
+- `cargo check --workspace --target-dir target\staging-rich-presentation-c-release-check`
+- `cargo build -p agent-harness-cli --target-dir target\staging-rich-presentation-c-build`
+- Candidate `scenario-matrix`, `schema-registry`, `invariants`, and
+  `release-checklist` smoke checks.
+- `agent-harness public-hygiene --root .public-export\v0.3.0`
+- `git diff --check`
+
+### Still gated / not included
+
+- Runtime/model tooling still needs a trusted way to create presentation payloads
+  for ordinary assistant final replies.
+- Telegram inline callback buttons remain disabled.
+- Discord component buttons remain disabled.
+- Clicked actions do not yet re-enter ingress with channel identity, `agentId`,
+  session, and permission gates.
+- Artifact-only media refs are not resolved to provider-sendable attachments.
+- Live preview integration remains a separate phase.
 
 ## v0.2.1 - 2026-06-29
 

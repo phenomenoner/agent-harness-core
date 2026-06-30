@@ -948,6 +948,7 @@ mod tests {
                 source_queue_id: None,
                 source_completion_file: None,
                 text: "ok".to_string(),
+                presentation: None,
                 delivery_intent: None,
                 attachments: Vec::new(),
             }],

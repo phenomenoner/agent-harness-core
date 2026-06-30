@@ -29,6 +29,18 @@ pub struct SchemaRegistryEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ScenarioMatrixEntry {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub changed_areas: Vec<&'static str>,
+    pub required_invariants: Vec<&'static str>,
+    pub required_evidence: Vec<&'static str>,
+    pub runnable_tests: Vec<&'static str>,
+    pub promotion_gate: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PublicHygieneReport {
     pub schema: &'static str,
     pub root: PathBuf,
@@ -109,6 +121,11 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
             id: "I13",
             statement: "successful official Codex compaction feeds the harness context-rollover policy instead of silently compacting in place forever, and polluted-thread terminal recovery preserves single-delivery virtual-session continuity",
             owner: "codex_runtime/context_rollover/runtime_queue/prompt/runtime_pipeline",
+        },
+        InvariantEntry {
+            id: "I14",
+            statement: "rich outbound presentation is rendered by provider adapters from a trusted semantic payload; model-authored raw Telegram/Discord syntax is not the safety boundary",
+            owner: "runtime_pipeline/channel_delivery/progress/media/trace",
         },
     ]
 }
@@ -199,6 +216,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             schema: "agent-harness.channel-delivery-intent.v1",
             owner_module: "channel_runtime",
             compatibility: "additive fields only in v1; provider ids must come from captured inbound context",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.rich-message-presentation.v1",
+            owner_module: "rich_presentation",
+            compatibility: "optional field on channel outbound messages; old outbox JSON without presentation remains plain text, v1 is additive, validated before render, and provider senders may honor it with adapter-rendered text/media while callbacks stay gated",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.channel-restart-request.v1",
@@ -450,6 +472,188 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             owner_module: "quality",
             compatibility: "additive fields only in v1",
         },
+        SchemaRegistryEntry {
+            schema: "agent-harness.scenario-matrix.v1",
+            owner_module: "quality",
+            compatibility: "release-gate catalog; additive scenario entries, evidence fields, and runnable-test pointers only in v1",
+        },
+    ]
+}
+
+pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
+    vec![
+        ScenarioMatrixEntry {
+            id: "agent-boundary",
+            title: "Agent boundary and task freshness",
+            changed_areas: vec![
+                "channel identity/state",
+                "channel ingress/runtime",
+                "prompt assembly",
+                "runtime pipeline",
+            ],
+            required_invariants: vec!["I1", "I2", "I7", "I8"],
+            required_evidence: vec![
+                "same-agent stale-session suppression",
+                "different-agent non-suppression on the same platform/channel/user",
+                "fresh /new prompt/memory task boundary",
+                "trace reconstruction from ingress to terminal outcome",
+            ],
+            runnable_tests: vec![
+                "runtime_pipeline::tests::channel_session_freshness_does_not_cross_suppress_other_agent",
+                "prompt::tests::prompt_bundle_new_command_boundary_skips_prior_task_memory_context",
+            ],
+            promotion_gate: "Run the agent-boundary scenario pack from docs/agent-harness-topology-contract.md for channel/runtime/session changes.",
+        },
+        ScenarioMatrixEntry {
+            id: "final-outbox-delivery-trace",
+            title: "Final outbox, delivery, and trace",
+            changed_areas: vec![
+                "runtime pipeline",
+                "final outbox",
+                "channel delivery",
+                "trace",
+            ],
+            required_invariants: vec!["I2", "I3", "I7", "I9"],
+            required_evidence: vec![
+                "exactly one source-correlated final outbox or terminal notification",
+                "duplicate suppression by source queue/completion",
+                "Telegram and Discord delivery receipt trace",
+                "final agent-reply excludes progress/narration stream content",
+            ],
+            runnable_tests: vec![
+                "runtime_pipeline::tests::already_recorded_completion_repair_keeps_progress_panel_out_of_final_outbox",
+                "runtime_pipeline::tests::already_recorded_completion_repair_keeps_progress_panel_out_of_discord_final_outbox",
+                "trace::tests::trace_harness_event_detects_terminal_runtime_status",
+            ],
+            promotion_gate: "Prove completed turns converge to one final/terminal surface with reconstructable queue-to-delivery trace.",
+        },
+        ScenarioMatrixEntry {
+            id: "virtual-session-rollover",
+            title: "Virtual session continuity and rollover",
+            changed_areas: vec![
+                "codex runtime",
+                "context rollover",
+                "runtime queue",
+                "prompt assembly",
+                "runtime pipeline",
+            ],
+            required_invariants: vec!["I2", "I7", "I8", "I13"],
+            required_evidence: vec![
+                "first official compact success recorded",
+                "second official compact success recorded",
+                "continuation session or structured skip receipt",
+                "working-set prompt injection",
+                "final outbox/delivery trace from continuation queue item",
+                "/new boundary does not inherit previous-task memory context",
+            ],
+            runnable_tests: vec![
+                "context_rollover::tests::three_turn_compact_rollover_replay_writes_continuation_working_set",
+                "codex_runtime::tests::run_codex_runtime_preflight_compacts_existing_thread_before_turn",
+                "context_rollover::tests::compact_counter_deduplicates_successful_attempt_key",
+                "context_rollover::tests::prepared_auto_requeue_blocks_parent_session_sibling",
+                "runtime_pipeline::tests::polluted_thread_continuation_runs_only_at_dead_letter_and_respects_depth_limit",
+                "prompt::tests::prompt_bundle_new_command_boundary_skips_prior_task_memory_context",
+            ],
+            promotion_gate: "Force at least three high-context turns and prove rollover/final-delivery parity across Discord/TG identity axes.",
+        },
+        ScenarioMatrixEntry {
+            id: "progress-surface-volume",
+            title: "Progress final surface and delivery volume",
+            changed_areas: vec![
+                "progress",
+                "codex runtime",
+                "runtime pipeline",
+                "channel delivery",
+            ],
+            required_invariants: vec!["I2", "I7", "I9", "I13"],
+            required_evidence: vec![
+                "bounded per-queue body/action edit volume",
+                "status/current-step heartbeat after body cap",
+                "immediate current-step update for new assistant execution summary",
+                "repeated text-hash suppression",
+                "terminal progress convergence",
+                "no post-terminal edit churn",
+                "final outbox contains only final answer",
+            ],
+            runnable_tests: vec![
+                "progress::tests::progress_surface_volume_replay_converges_without_post_terminal_churn",
+                "progress::tests::delivery_plan_status_heartbeat_after_body_cap_is_channel_agnostic",
+                "progress::tests::delivery_plan_status_updates_immediately_for_new_current_step_after_body_cap",
+                "codex_runtime::tests::run_codex_runtime_rejects_stdout_recovery_narration_without_final_answer",
+            ],
+            promotion_gate: "Replay Telegram and Discord long-running turns through progress caps, recovery, final outbox, and terminal convergence.",
+        },
+        ScenarioMatrixEntry {
+            id: "multi-agent-memory-compartment",
+            title: "Multi-agent full matrix and per-agent memory compartment",
+            changed_areas: vec![
+                "agent registry",
+                "channel state",
+                "prompt assembly",
+                "runtime queue",
+                "workers/subagents",
+                "memory",
+                "final outbox",
+                "delivery",
+            ],
+            required_invariants: vec!["I1", "I2", "I7", "I8", "I12"],
+            required_evidence: vec![
+                "new configured agent has independent workspace/prompt source",
+                "channel command state preserves agent identity",
+                "provider/model command state is agent/session scoped",
+                "prompt context hides main-only operation plans from non-main agents",
+                "memory recall excludes private main/global imported context unless allowed",
+                "worker/subagent lease ownership remains agent-scoped",
+                "final outbox and delivery receipts preserve agentId",
+            ],
+            runnable_tests: vec![
+                "channel_state::tests::new_session_records_agent_from_new_session_key",
+                "channel_state::tests::applies_per_agent_global_model_and_thinking_overrides",
+                "prompt::tests::prompt_bundle_hides_main_operation_plan_from_other_agent",
+                "runtime_worker::tests::prepare_runtime_queue_item_respects_agent_channel_lease_limit",
+                "runtime_pipeline::tests::channel_session_freshness_does_not_cross_suppress_other_agent",
+                "memory::tests::non_main_memory_prompt_context_excludes_global_imported_snapshot_by_default",
+                "memory::tests::public_agent_read_path_smoke_surfaces_source_allow_list_and_filtered_counts",
+                "prompt::tests::prompt_bundle_new_command_boundary_skips_prior_task_memory_context",
+            ],
+            promotion_gate: "Create or reuse a configured-agent matrix covering main, xiaoxiaoli, and a future public/coach agent without rebuilding shared loops.",
+        },
+        ScenarioMatrixEntry {
+            id: "rich-message-presentation",
+            title: "Rich outbound presentation schema and safe renderers",
+            changed_areas: vec![
+                "runtime pipeline",
+                "final outbox",
+                "channel delivery",
+                "media",
+                "trace",
+            ],
+            required_invariants: vec!["I2", "I7", "I9", "I11", "I14"],
+            required_evidence: vec![
+                "old outbox JSON without presentation remains plain text",
+                "semantic presentation schema validates fallback text, bounded blocks, safe URLs, media refs, and capability-gated actions",
+                "Telegram render fixture escapes HTML and disables link previews by default",
+                "Discord render fixture chunks under provider limit and keeps allowed_mentions.parse empty",
+                "rendered rich batches expose deterministic text/media/action units",
+                "per-unit delivery receipts preserve partial rich-batch failures as retryable instead of delivered",
+                "callback actions require provider capability and mark re-entry gating",
+                "provider send helpers use adapter-rendered Telegram HTML and Discord content when presentation is present",
+                "rich media attachmentIndex captions are delivered through provider attachment payloads",
+            ],
+            runnable_tests: vec![
+                "rich_presentation::tests::legacy_channel_outbound_message_without_presentation_stays_plain_text",
+                "rich_presentation::tests::rich_presentation_validation_fails_closed_for_unsafe_shapes",
+                "rich_presentation::tests::telegram_render_fixture_escapes_html_and_disables_preview",
+                "rich_presentation::tests::discord_render_fixture_splits_and_suppresses_mentions",
+                "rich_presentation::tests::telegram_rendered_batch_gates_callback_actions_and_units",
+                "rich_presentation::tests::discord_rendered_batch_accounts_chunks_and_action_units",
+                "channel_delivery::tests::rich_delivery_receipt_records_units_and_retries_partial_failure",
+                "channel_delivery::tests::rich_delivery_rejects_delivered_receipt_when_any_unit_failed",
+                "agent-harness-cli::tests::telegram_trusted_html_payload_keeps_renderer_output_unescaped",
+                "agent-harness-cli::tests::discord_attachment_payload_uses_caption_without_mentions",
+            ],
+            promotion_gate: "Promote Package C only after schema/validation/render fixtures, rendered-batch accounting, provider-rich text/media delivery integration, partial-failure receipt semantics, and action capability gates pass. Live Telegram inline callbacks, Discord components, clicked-action ingress re-entry, and live preview remain separate gates.",
+        },
     ]
 }
 
@@ -481,6 +685,7 @@ pub fn release_checklist() -> ReleaseChecklist {
             "cargo fmt --all",
             "cargo test --workspace",
             "schema registry updated",
+            "scenario matrix gate reviewed for changed components",
             "CHANGELOG.md updated",
             "docs/skills/help stale guidance review completed",
             "topology contract impact matrix reviewed for changed modules",
@@ -488,6 +693,7 @@ pub fn release_checklist() -> ReleaseChecklist {
             "prompt/memory changes passed /new task-boundary and per-agent memory recall checks",
             "openclaw-mem bridge ownership changes passed configured-bridge and fallback gates",
             "response/runtime changes passed final-surface separation checks, including stdout recovery without final_answer",
+            "rich-message presentation changes passed adapter-rendering, no-ping, escaping, multi-unit receipt, and interaction re-entry checks",
             "context rollover changes passed official-compact accounting and polluted-thread recovery checks",
             "progress delivery changes passed edit-volume replay checks",
             "progress panel lane-cap heartbeat/current-step checks passed across channel platforms",
@@ -522,6 +728,37 @@ mod tests {
     #[test]
     fn quality_catalogs_and_hygiene_report_are_actionable() {
         assert!(invariant_catalog().len() >= 11);
+        let scenario_matrix = scenario_matrix_catalog();
+        assert!(
+            scenario_matrix
+                .iter()
+                .any(|entry| entry.id == "agent-boundary")
+        );
+        assert!(
+            scenario_matrix
+                .iter()
+                .any(|entry| entry.id == "final-outbox-delivery-trace")
+        );
+        assert!(
+            scenario_matrix
+                .iter()
+                .any(|entry| entry.id == "virtual-session-rollover")
+        );
+        assert!(
+            scenario_matrix
+                .iter()
+                .any(|entry| entry.id == "progress-surface-volume")
+        );
+        assert!(
+            scenario_matrix
+                .iter()
+                .any(|entry| entry.id == "multi-agent-memory-compartment")
+        );
+        assert!(
+            scenario_matrix
+                .iter()
+                .any(|entry| entry.id == "rich-message-presentation")
+        );
         assert!(
             schema_registry_entries()
                 .iter()
@@ -566,6 +803,11 @@ mod tests {
         assert!(
             release_checklist()
                 .required_items
+                .contains(&"rich-message presentation changes passed adapter-rendering, no-ping, escaping, multi-unit receipt, and interaction re-entry checks")
+        );
+        assert!(
+            release_checklist()
+                .required_items
                 .contains(&"progress delivery changes passed edit-volume replay checks")
         );
         assert!(release_checklist().required_items.contains(
@@ -579,6 +821,37 @@ mod tests {
         assert!(release_checklist().required_items.contains(
             &"artifact/context hygiene changes passed generic artifact prompt/progress redaction and Discord attachment extraction checks"
         ));
+        let invariant_ids: Vec<&str> = invariant_catalog().iter().map(|entry| entry.id).collect();
+        for entry in &scenario_matrix {
+            assert!(
+                !entry.changed_areas.is_empty(),
+                "scenario matrix entry {} must name changed areas",
+                entry.id
+            );
+            assert!(
+                !entry.required_evidence.is_empty(),
+                "scenario matrix entry {} must name required evidence",
+                entry.id
+            );
+            assert!(
+                !entry.runnable_tests.is_empty(),
+                "scenario matrix entry {} must point to runnable tests",
+                entry.id
+            );
+            assert!(
+                !entry.promotion_gate.trim().is_empty(),
+                "scenario matrix entry {} must name a promotion gate",
+                entry.id
+            );
+            for invariant in &entry.required_invariants {
+                assert!(
+                    invariant_ids.contains(invariant),
+                    "scenario matrix entry {} references unknown invariant {}",
+                    entry.id,
+                    invariant
+                );
+            }
+        }
 
         let root = temp_root("quality_catalogs_and_hygiene_report_are_actionable");
         fs::create_dir_all(root.join(".agent-harness").join("secrets")).unwrap();

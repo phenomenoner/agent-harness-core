@@ -554,6 +554,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                 source_queue_id: run.receipt.queue_id.clone(),
                                 source_completion_file: run.receipt.completion_file.clone(),
                                 text,
+                                presentation: None,
                                 delivery_intent: delivery_intent_from_inbound_context(
                                     &context.platform,
                                     &context.channel_id,
@@ -654,6 +655,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                     &receipt_reason,
                     run.receipt.queue_id.as_deref(),
                 ),
+                presentation: None,
                 delivery_intent: delivery_intent_from_inbound_context(
                     &context.platform,
                     &context.channel_id,
@@ -2356,6 +2358,7 @@ mod tests {
                 execution_dir.join("codex-runtime-completion-receipt.json"),
             ),
             text: "Pipeline fake reply.".to_string(),
+            presentation: None,
             delivery_intent: None,
             attachments: Vec::new(),
         };

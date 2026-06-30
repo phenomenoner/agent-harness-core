@@ -219,7 +219,7 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "35bf4a4adbd97c4396693f54ee0997bab0a0fa500ce1d13b0875f428c4e4311c"
+      "sha256": "e947a5cbc06d1900febf8f0e4d50f8caa8e39da9d3dbe66809b8ce97c2844f1c"
     },
     {
       "path": "docs/.private/agent-harness-operations-handbook.md",
@@ -370,10 +370,10 @@
       "label": "channel_delivery",
       "group": "component",
       "state": "implemented",
-      "summary": "provider-native delivery and retry",
-      "reads": "outbox JSONL",
-      "writes": "delivery receipts",
-      "invariants": "I2, I7, I9",
+      "summary": "provider-native delivery, retry, and outbound presentation rendering",
+      "reads": "outbox JSONL, optional rich-message presentation payloads",
+      "writes": "delivery receipts, per-provider rendered-unit receipts",
+      "invariants": "I2, I7, I9, I14",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -548,6 +548,17 @@
       ]
     },
     {
+      "id": "impact-outbound-presentation-or-rich-message-rendering",
+      "label": "Outbound presentation or rich-message rendering",
+      "group": "gate",
+      "state": "release-gate",
+      "summary": "semantic presentation renders deterministically to Telegram and Discord; Telegram HTML is escaped; Discord disables accidental mentions; text/media/action units are receipt-accounted; partial rich-batch delivery is not marked complete; interactions re-enter normal channel identity/session routing",
+      "reviewDocs": "local docs/.private/rich-message-presentation-design-2026-06-30.md, docs/invariants.md, local docs/.private/release-checklist.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
       "id": "impact-progress-delivery-or-narration",
       "label": "Progress delivery or narration",
       "group": "gate",
@@ -659,7 +670,7 @@
       "state": "open-gap",
       "summary": "Virtual session and working-context continuity",
       "designTarget": "Long tasks should survive repeated compaction by rolling into fresh concrete sessions inside a stable virtual session, carrying a bounded working set so repeated compression does not silently distort task state. /new is a task-boundary command and must not inherit the previous virtual/task memory context.",
-      "currentEvidence": "context_rollover records compact counters, virtual-session records, working-set memory, session indexes, rollover episodes, and guarded requeue receipts; prompt assembly injects working-set continuity when a continuation session has an index. Local Round10 gap-closure staging adds prompt::tests::prompt_bundle_new_command_boundary_skips_prior_task_memory_context, proving a fresh /new prompt suppresses previous-task imported memory context. A 2026-06-29 Discord long-lane audit found repeated official Codex compact-before-turn successes on the same bound thread, but no visible compact-counter, rollover receipt, fresh session key, or structured skip reason. Round12 Track A staging wires official compact-before-turn success into context-rollover accounting and adds focused tests for lane counter advancement, compact thread id recording, idempotent queue/thread attempt keys, next-turn rollover rekeying, and leased-item blocking. Round12 Track A2 staging adds a terminal polluted-thread recovery gate in runtime_pipeline that can requeue a prepared parent into a virtual child only at DeadLetter, blocks parent-session sibling pending items before channel-state advance, preserves max-depth terminal delivery, and now consumes structured threadHealthStatus telemetry from Codex preflight/recovery receipts instead of relying only on diagnostic reason substrings. Broader end-to-end rollover/final-delivery parity remains pending.",
+      "currentEvidence": "context_rollover records compact counters, virtual-session records, working-set memory, session indexes, rollover episodes, and guarded requeue receipts; prompt assembly injects working-set continuity when a continuation session has an index. Local Round10 gap-closure staging adds prompt::tests::prompt_bundle_new_command_boundary_skips_prior_task_memory_context, proving a fresh /new prompt suppresses previous-task imported memory context. A 2026-06-29 Discord long-lane audit found repeated official Codex compact-before-turn successes on the same bound thread, but no visible compact-counter, rollover receipt, fresh session key, or structured skip reason. Round12 Track A staging wires official compact-before-turn success into context-rollover accounting and adds focused tests for lane counter advancement, compact thread id recording, idempotent queue/thread attempt keys, next-turn rollover rekeying, and leased-item blocking. Round12 Track A2 staging adds a terminal polluted-thread recovery gate in runtime_pipeline that can requeue a prepared parent into a virtual child only at DeadLetter, blocks parent-session sibling pending items before channel-state advance, preserves max-depth terminal delivery, and now consumes structured threadHealthStatus telemetry from Codex preflight/recovery receipts instead of relying only on diagnostic reason substrings. Round12 scenario-matrix follow-up adds context_rollover::tests::three_turn_compact_rollover_replay_writes_continuation_working_set, proving two successful compact records make the third high-context Discord turn re-key into a continuation session, update channel state, preserve virtual-session working-set continuity, and mark the pending queue item as continuation-rollover. Broader provider/live final-delivery parity remains pending.",
       "promotionGate": "Promote after an end-to-end scenario forces at least three high-context turns: first official compact success, second official compact success, then configured rollover or an explicit machine-readable skip receipt. The scenario must verify a fresh session key under the same virtual session when rollover occurs, check prompt working-set injection, confirm old prepared/leased turns are not rewritten unsafely, trace final outbox/delivery back to the continuation queue item, include Discord/TG lane identity axes, and separately prove /new creates a new task boundary that does not inherit previous-task memory context. The polluted-thread branch must additionally prove parent terminal error outbox is suppressed only when child enqueue succeeds, child success/failure yields exactly one user-visible reply, sibling pending turns are not stranded, and crash-ordering avoids both suppressed-without-child and parent-error-plus-child states.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -672,7 +683,7 @@
       "state": "open-gap",
       "summary": "Progress delivery and final-reply UX",
       "designTarget": "A long-running channel turn should show bounded progress updates, then converge to one final reply or terminal notification without excessive provider edits, repeated body/status churn, or non-terminal progress after completion. The body/action lane is an event-history stream and may be capped; the status/current-step lane is a heartbeat/current-summary surface and must remain editable after the body cap.",
-      "currentEvidence": "A 2026-06-28 Telegram DM audit after 02:57 Taipei found one completed turn with one final outbox but more than 100 progress edit receipts, and a later in-flight turn with dozens of progress edits before any final outbox. A Discord long-running turn then showed the inverse UX failure: body/status counters reached 6 while internal events and typing indicators continued, making the visible panel look frozen. Round10 adds response.progressDeliveryMaxNonterminalUpdatesPerLane / progressDeliveryMaxNonterminalBodyUpdatesPerQueue, tracks delivered non-terminal lane counters in agent-harness.progress-delivery-state.v1, exposes volume_limited, keeps terminal convergence outside the volume cap, and adds status heartbeat after body cap via progressDeliveryStatusHeartbeatAfterBodyCapMs. progress::tests::delivery_plan_status_heartbeat_after_body_cap_is_channel_agnostic proves the same behavior for Telegram and Discord fixtures. Follow-up staging adds progress::tests::delivery_plan_status_updates_immediately_for_new_current_step_after_body_cap, proving a newly appended assistant execution summary bypasses the post-body-cap heartbeat interval and edits the status/current-step lane immediately.",
+      "currentEvidence": "A 2026-06-28 Telegram DM audit after 02:57 Taipei found one completed turn with one final outbox but more than 100 progress edit receipts, and a later in-flight turn with dozens of progress edits before any final outbox. A Discord long-running turn then showed the inverse UX failure: body/status counters reached 6 while internal events and typing indicators continued, making the visible panel look frozen. Round10 adds response.progressDeliveryMaxNonterminalUpdatesPerLane / progressDeliveryMaxNonterminalBodyUpdatesPerQueue, tracks delivered non-terminal lane counters in agent-harness.progress-delivery-state.v1, exposes volume_limited, keeps terminal convergence outside the volume cap, and adds status heartbeat after body cap via progressDeliveryStatusHeartbeatAfterBodyCapMs. progress::tests::delivery_plan_status_heartbeat_after_body_cap_is_channel_agnostic proves the same behavior for Telegram and Discord fixtures. Follow-up staging adds progress::tests::delivery_plan_status_updates_immediately_for_new_current_step_after_body_cap, proving a newly appended assistant execution summary bypasses the post-body-cap heartbeat interval and edits the status/current-step lane immediately. Round12 scenario-matrix follow-up adds progress::tests::progress_surface_volume_replay_converges_without_post_terminal_churn, covering Telegram and Discord in one replay: delivered body/status, capped body/action lane, immediate status/current-step update, heartbeat after cap, terminal convergence, and no late provider-visible churn after terminal delivery.",
       "promotionGate": "Promote only after a replay/scenario gate proves per-queue body/action edit caps, status/current-step heartbeat after body cap, immediate current-step updates for new assistant execution summaries, repeated text-hash suppression, terminal progress convergence, final-outbox presence, and no post-terminal edit churn across Telegram and Discord.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -744,14 +755,40 @@
       ]
     },
     {
-      "id": "gap-fast",
-      "label": "fast\\",
+      "id": "gap-first-class-command-plane-gap",
+      "label": "first-class-command-plane-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "First-class command plane",
+      "designTarget": "User commands should be parsed as control-plane events before model dispatch, mutate scoped channel/session state deterministically, emit machine-readable command receipts, and skip LLM execution when the command is fully handled by the runtime. Commands should not depend on a chat-facing agent noticing and obeying command-shaped text.",
+      "currentEvidence": "Agent Harness has a command path for /new, /think, /model, /stop, /status, /steer, /btw, and protected restart requests: channel_runtime builds CommandReply steps, channel_state writes scoped state plus command receipts, and command replies do not enqueue agent turns. The gap is that the command registry remains partial and uneven: /fast on currently reaches the chat-facing agent as ordinary text instead of a first-class command, lifecycle commands such as checkpoint/compact are not uniformly represented as pre-model control-plane effects, and unsupported commands do not consistently produce structured skip/unknown-command receipts.",
+      "promotionGate": "Add a central command registry and parser coverage for command-only, command-plus-reply, and command-plus-enqueue cases; emit stable command receipts for applied, unsupported, unknown, and skipped-not-command outcomes; prove handled commands do not create model turns; prove same platform/channel/user but different agentId state isolation; prove /stop cancellation is immediate and source-correlated; document which lifecycle commands are runtime-owned versus model-assisted.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-provider-fast-request-override-gap",
+      "label": "provider-fast-request-override-gap",
       "group": "gap",
       "state": "open-gap",
       "summary": "Provider request acceleration command",
       "designTarget": "Users should be able to toggle provider-native fast/priority request behavior for the current agent/session without mutating prompt text, leaking across agents/channels, or sending unsupported request parameters to Codex/proxy/provider routes.",
-      "currentEvidence": "Hermes Agent upstream implements `/fast [normal\\",
-      "promotionGate": "status] as a command-state/request-override path: command registry plus CLI/gateway handlers, model capability checks, per-turn request_overrides, OpenAI service_tier=\"priority\" for supported routes, Anthropic speed=\"fast\" only for supported native routes, and defensive stripping for incompatible routes. Agent Harness currently has provider/model command state and request planning, but no first-class /fast` command or provider-scoped fast/priority override receipt.",
+      "currentEvidence": "Hermes Agent upstream implements /fast normal, /fast fast, and /fast status as a command-state/request-override path: command registry plus CLI/gateway handlers, model capability checks, per-turn request_overrides, OpenAI service_tier=\"priority\" for supported routes, Anthropic speed=\"fast\" only for supported native routes, and defensive stripping for incompatible routes. Agent Harness currently has provider/model command state and request planning, but no first-class /fast command or provider-scoped fast/priority override receipt.",
+      "promotionGate": "Add /fast status, /fast fast, /fast normal, /fast on, and /fast off as commands, not model prompts; persist initially at agent/session scope; gate by provider/model capability; exclude Codex app-server/Codex-series and unverified proxy routes unless support is proven; write command/request-plan receipts; prove Discord/TG and main/non-main isolation; prove provider/model switches recompute or clear stale overrides; prove command replies do not enqueue model turns.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-rich-message-presentation-gap",
+      "label": "rich-message-presentation-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Rich message presentation",
+      "designTarget": "Final replies, attachments, links, buttons/actions, captions, and provider-native rich UI should be modeled as a semantic presentation payload rendered by channel adapters, not as raw model-authored Telegram/Discord syntax.",
+      "currentEvidence": "Agent Harness already has durable ChannelOutboundMessage text/attachment outbox, Telegram HTML-capable final sends through scoped formatting config, Discord 2000-character chunking with allowed_mentions.parse=[], provider reply/thread intent, attachment delivery, and progress/final separation. Package A staging adds optional agent-harness.rich-message-presentation.v1, fail-closed validation, backward-compatible old-outbox deserialization, and render-only Telegram/Discord fixtures for escaping, no-ping behavior, chunking, safe URLs, and capability-gated actions. Package B staging adds rendered rich-batch text/media/action units, per-unit delivery receipt fields, partial rich-batch retry semantics, and provider action capability gates. Package C staging connects Telegram/Discord provider send helpers to adapter-rendered presentation text/media when presentation is present, records rendered-unit provider receipts, fails closed for artifact-only media without an attachment index, and keeps callbacks disabled. Remaining gaps are live cutover, Telegram inline action sends, Discord component sends, live preview integration, and clicked-action ingress re-entry evidence.",
+      "promotionGate": "Promote only after an optional agent-harness.rich-message-presentation.v1 schema exists, Telegram and Discord render fixtures prove escaping/chunking/no-ping behavior, multi-unit rich batches record per-unit provider receipts, partial delivery cannot be marked complete, media captions do not duplicate text/media sends, progress/narration cannot enter final presentation, raw artifacts/provider URLs/file IDs are excluded, and Telegram/Discord action interactions re-enter through normal channel identity, agentId, session, and permission gates.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -815,8 +852,8 @@
       "state": "open-gap",
       "summary": "Release-gate scenario replay",
       "designTarget": "Every topology-sensitive change maps changed modules to required scenario packs and invariant replay.",
-      "currentEvidence": "Invariants and release checklist exist; agent-boundary regression added for session freshness.",
-      "promotionGate": "A reusable scenario runner or documented command pack covers agent-boundary, final-outbox, delivery, trace, and memory graph cases for changed components.",
+      "currentEvidence": "Invariants and release checklist exist; agent-boundary regression added for session freshness. agent-harness scenario-matrix now exposes a reusable catalog covering agent-boundary, final-outbox/delivery/trace, virtual-session rollover, progress surface/volume, and multi-agent memory compartment gates.",
+      "promotionGate": "Keep the scenario matrix catalog green and use it as the release gate selector for changed components. Promotion beyond coverage scaffolding still requires each selected scenario pack to have runnable replay evidence or a documented stronger equivalent.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -1219,6 +1256,11 @@
       "label": "changes trigger"
     },
     {
+      "source": "impact-outbound-presentation-or-rich-message-rendering",
+      "target": "canon-topology-contract",
+      "label": "reviewed by"
+    },
+    {
       "source": "impact-progress-delivery-or-narration",
       "target": "canon-topology-contract",
       "label": "reviewed by"
@@ -1400,6 +1442,11 @@
     },
     {
       "source": "component-codex-runtime",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
       "target": "gap-virtual-session-continuity-gap",
       "label": "has gap"
     },
@@ -1629,43 +1676,133 @@
       "label": "has gap"
     },
     {
-      "source": "gap-fast",
+      "source": "gap-first-class-command-plane-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
     },
     {
       "source": "component-channel-identity",
-      "target": "gap-fast",
+      "target": "gap-first-class-command-plane-gap",
       "label": "has gap"
     },
     {
       "source": "component-channel-state",
-      "target": "gap-fast",
+      "target": "gap-first-class-command-plane-gap",
       "label": "has gap"
     },
     {
       "source": "component-channel-ingress-channel-runtime",
-      "target": "gap-fast",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-first-class-command-plane-gap",
       "label": "has gap"
     },
     {
       "source": "component-prompt-turns",
-      "target": "gap-fast",
+      "target": "gap-first-class-command-plane-gap",
       "label": "has gap"
     },
     {
       "source": "component-codex-runtime",
-      "target": "gap-fast",
+      "target": "gap-first-class-command-plane-gap",
       "label": "has gap"
     },
     {
       "source": "component-provider-request-policy",
-      "target": "gap-fast",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline",
+      "target": "gap-first-class-command-plane-gap",
       "label": "has gap"
     },
     {
       "source": "component-channel-delivery",
-      "target": "gap-fast",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-provider-fast-request-override-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-provider-fast-request-override-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-provider-fast-request-override-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime",
+      "target": "gap-provider-fast-request-override-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-provider-fast-request-override-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime",
+      "target": "gap-provider-fast-request-override-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-provider-fast-request-override-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-provider-fast-request-override-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-rich-message-presentation-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-rich-message-presentation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-rich-message-presentation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime",
+      "target": "gap-rich-message-presentation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-media-artifact-hygiene",
+      "target": "gap-rich-message-presentation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-rich-message-presentation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-rich-message-presentation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-progress",
+      "target": "gap-rich-message-presentation-gap",
       "label": "has gap"
     },
     {
@@ -1752,6 +1889,21 @@
       "source": "gap-scenario-matrix-coverage-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-scenario-matrix-coverage-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-progress",
+      "target": "gap-scenario-matrix-coverage-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory",
+      "target": "gap-scenario-matrix-coverage-gap",
+      "label": "has gap"
     }
   ],
   "journeys": [
