@@ -265,6 +265,27 @@ pub fn validate_rich_message_presentation(
     Ok(())
 }
 
+pub fn rich_presentation_from_plain_final(text: &str) -> Option<RichMessagePresentation> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let fallback_text = truncate_chars(text, MAX_FALLBACK_TEXT_CHARS);
+    let blocks = rich_blocks_from_plain_final(text);
+    let presentation = RichMessagePresentation {
+        schema: RICH_MESSAGE_PRESENTATION_SCHEMA.to_string(),
+        fallback_text,
+        blocks,
+        actions: Vec::new(),
+        media: Vec::new(),
+        link_preview: RichPresentationLinkPreview::default(),
+        delivery_policy: RichPresentationDeliveryPolicy::default(),
+    };
+    validate_rich_message_presentation(&presentation, &RichPresentationValidationOptions::default())
+        .ok()
+        .map(|_| presentation)
+}
+
 pub fn render_rich_presentation_for_telegram(
     presentation: &RichMessagePresentation,
     options: &RichPresentationValidationOptions,
@@ -539,6 +560,105 @@ fn validate_media_ref(
     Ok(())
 }
 
+fn rich_blocks_from_plain_final(text: &str) -> Vec<RichPresentationBlock> {
+    let mut blocks = Vec::new();
+    let mut paragraph = Vec::new();
+    let mut code = Vec::new();
+    let mut code_language: Option<String> = None;
+    let mut in_code = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(fence) = trimmed.strip_prefix("```") {
+            if in_code {
+                push_code_block(&mut blocks, code_language.take(), &mut code);
+                in_code = false;
+            } else {
+                push_paragraph_blocks(&mut blocks, &mut paragraph);
+                code_language = fence
+                    .split_whitespace()
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string());
+                in_code = true;
+            }
+            if blocks.len() >= MAX_BLOCKS {
+                break;
+            }
+            continue;
+        }
+
+        if in_code {
+            code.push(line.to_string());
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            push_paragraph_blocks(&mut blocks, &mut paragraph);
+            if blocks.len() >= MAX_BLOCKS {
+                break;
+            }
+            continue;
+        }
+        paragraph.push(line.to_string());
+    }
+
+    if blocks.len() < MAX_BLOCKS {
+        if in_code {
+            push_code_block(&mut blocks, code_language, &mut code);
+        } else {
+            push_paragraph_blocks(&mut blocks, &mut paragraph);
+        }
+    }
+
+    if blocks.is_empty() {
+        blocks.push(RichPresentationBlock::Paragraph {
+            text: truncate_chars(text, MAX_PARAGRAPH_CHARS),
+        });
+    }
+    blocks.truncate(MAX_BLOCKS);
+    blocks
+}
+
+fn push_paragraph_blocks(blocks: &mut Vec<RichPresentationBlock>, paragraph: &mut Vec<String>) {
+    if paragraph.is_empty() || blocks.len() >= MAX_BLOCKS {
+        paragraph.clear();
+        return;
+    }
+    let text = paragraph.join("\n").trim().to_string();
+    paragraph.clear();
+    for chunk in chunk_chars(&text, MAX_PARAGRAPH_CHARS) {
+        if blocks.len() >= MAX_BLOCKS {
+            break;
+        }
+        if !chunk.trim().is_empty() {
+            blocks.push(RichPresentationBlock::Paragraph { text: chunk });
+        }
+    }
+}
+
+fn push_code_block(
+    blocks: &mut Vec<RichPresentationBlock>,
+    language: Option<String>,
+    code: &mut Vec<String>,
+) {
+    if code.is_empty() || blocks.len() >= MAX_BLOCKS {
+        code.clear();
+        return;
+    }
+    let text = code.join("\n");
+    code.clear();
+    for chunk in chunk_chars(&text, MAX_CODE_CHARS) {
+        if blocks.len() >= MAX_BLOCKS {
+            break;
+        }
+        blocks.push(RichPresentationBlock::Code {
+            language: language.clone(),
+            text: chunk,
+        });
+    }
+}
+
 fn append_media_units(units: &mut Vec<RenderedRichUnit>, presentation: &RichMessagePresentation) {
     for (index, media) in presentation.media.iter().enumerate() {
         units.push(RenderedRichUnit {
@@ -632,6 +752,31 @@ fn split_discord_chunks(text: &str, max_chars: usize) -> Vec<String> {
             chunks.push(std::mem::take(&mut current));
             current.push_str(segment);
             current_chars = segment_chars;
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn chunk_chars(value: &str, max_chars: usize) -> Vec<String> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_chars = 0usize;
+    for ch in value.chars() {
+        current.push(ch);
+        current_chars += 1;
+        if current_chars == max_chars {
+            chunks.push(std::mem::take(&mut current));
+            current_chars = 0;
         }
     }
     if !current.is_empty() {
@@ -788,6 +933,38 @@ mod tests {
         let message: ChannelOutboundMessage = serde_json::from_str(json).unwrap();
         assert_eq!(message.text, "plain legacy reply");
         assert!(message.presentation.is_none());
+    }
+
+    #[test]
+    fn plain_final_bridge_builds_safe_paragraph_and_code_blocks() {
+        let presentation = rich_presentation_from_plain_final(
+            "Done <ok> & safe\n\n```powershell\ncargo test\n```\n\nNext line.",
+        )
+        .unwrap();
+
+        assert_eq!(
+            presentation.fallback_text,
+            "Done <ok> & safe\n\n```powershell\ncargo test\n```\n\nNext line."
+        );
+        assert_eq!(presentation.blocks.len(), 3);
+        assert!(matches!(
+            &presentation.blocks[1],
+            RichPresentationBlock::Code {
+                language,
+                text
+            } if language.as_deref() == Some("powershell") && text == "cargo test"
+        ));
+        let telegram = render_rich_presentation_for_telegram(
+            &presentation,
+            &RichPresentationValidationOptions::default(),
+        )
+        .unwrap();
+        assert!(telegram.text.contains("Done &lt;ok&gt; &amp; safe"));
+        assert!(
+            telegram
+                .text
+                .contains("<pre><code class=\"language-powershell\">cargo test</code></pre>")
+        );
     }
 
     #[test]

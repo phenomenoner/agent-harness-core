@@ -1484,6 +1484,13 @@ fn append_json_line(path: &Path, value: &impl Serialize) -> io::Result<()> {
 }
 
 fn render_action_line(event: &AgentProgressEvent, max_preview_chars: usize) -> String {
+    if is_internal_worker_result_event(event) {
+        return format!(
+            "{} {}: \"internal worker result received; awaiting main-agent summary\"",
+            progress_icon(event.kind),
+            event.label
+        );
+    }
     let preview = quote_safe_preview(&event.preview, max_preview_chars);
     format!(
         "{} {}: \"{}\"",
@@ -1491,6 +1498,28 @@ fn render_action_line(event: &AgentProgressEvent, max_preview_chars: usize) -> S
         event.label,
         preview
     )
+}
+
+fn is_internal_worker_result_event(event: &AgentProgressEvent) -> bool {
+    if event.kind != AgentProgressKind::ToolCall {
+        return false;
+    }
+    let source = event
+        .source
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let label = event.label.to_ascii_lowercase();
+    let preview = event.preview.trim_start().to_ascii_lowercase();
+    source.contains("subagent")
+        || source.contains("multi_agent")
+        || source.contains("explorer")
+        || label.contains("wait_agent")
+        || label.contains("spawn_agent")
+        || label.contains("subagent")
+        || preview.starts_with("current answer:")
+        || preview.starts_with("current answer：")
+        || preview.starts_with("completed status")
 }
 
 fn quote_safe_preview(value: &str, max_preview_chars: usize) -> String {
@@ -1806,6 +1835,29 @@ mod tests {
         assert!(actions.is_empty());
         assert!(!actions.contains("private"));
         assert!(!actions.contains("delivery"));
+    }
+
+    #[test]
+    fn action_stream_summarizes_internal_worker_results_instead_of_raw_final_text() {
+        let context = context();
+        let event = AgentProgressEvent::new(
+            &context,
+            AgentProgressKind::ToolCall,
+            "wait_agent",
+            "Current answer: default handling is refs/summaries only in prompt, working context, queue metadata, and rollover continuity. Evidence: private path and English worker text.",
+            AgentProgressStatus::Completed,
+            1000,
+        )
+        .source("multi_agent.wait_agent");
+        let events = [event];
+        let refs = events.iter().collect::<Vec<_>>();
+
+        let actions = render_agent_progress_actions(&refs, 8, 240);
+
+        assert!(actions.contains("internal worker result received"));
+        assert!(!actions.contains("Current answer"));
+        assert!(!actions.contains("default handling is refs"));
+        assert!(!actions.contains("private path"));
     }
 
     #[test]

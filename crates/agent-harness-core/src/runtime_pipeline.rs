@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::codex_runtime::{CodexContextRecoveryReceipt, CodexThreadHealthStatus};
+use crate::rich_presentation::rich_presentation_from_plain_final;
 use crate::{
     AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
     AssistantNarrationConfig, AssistantNarrationMode, ChannelDeliveryIntent,
@@ -33,6 +34,8 @@ use crate::{
 const RUNTIME_RUN_ONCE_SCHEMA: &str = "agent-harness.runtime-run-once.v1";
 const RUNTIME_DEAD_LETTER_SCHEMA: &str = "agent-harness.runtime-dead-letter.v1";
 const FINAL_OUTBOX_RECEIPT_SCHEMA: &str = "agent-harness.runtime-final-outbox.v1";
+const STREAM_UNSTABLE_CONTINUATION_MIN_ATTEMPTS: usize = 2;
+const STREAM_UNSTABLE_CONTINUATION_TOKEN_LIMIT: u64 = 80_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeRunOnceOptions {
@@ -553,8 +556,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                 kind: ChannelOutboundMessageKind::AgentReply,
                                 source_queue_id: run.receipt.queue_id.clone(),
                                 source_completion_file: run.receipt.completion_file.clone(),
+                                presentation: rich_presentation_from_plain_final(&text),
                                 text,
-                                presentation: None,
                                 delivery_intent: delivery_intent_from_inbound_context(
                                     &context.platform,
                                     &context.channel_id,
@@ -692,6 +695,28 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             "queue channel context was unavailable; runtime failure was not written to outbox"
                 .to_string(),
         );
+    } else if receipt_status == RuntimeRunOnceStatus::RetryPending {
+        if let Some(rollover) = maybe_enqueue_stream_unstable_retry_continuation(
+            &options.harness_home,
+            prepare.item.as_ref(),
+            &run,
+            queue_failure_attempts,
+            &mut warnings,
+        )? {
+            receipt_reason = format!(
+                "stream-unstable retry requeued into continuation; childQueueId={}; childSessionKey={}; priorReason={}",
+                rollover.requeued_queue_id, rollover.new_working_session_key, receipt_reason
+            );
+            warnings.push(format!(
+                "stream-unstable retry enqueued continuation queue item {} after repeated high-risk Codex stream disconnect",
+                rollover.requeued_queue_id
+            ));
+        } else {
+            warnings.push(format!(
+                "runtime failure for queue item will be retried; attempt {}/{}",
+                queue_failure_attempts, retry_policy.policy.max_failure_attempts
+            ));
+        }
     } else {
         warnings.push(format!(
             "runtime failure for queue item will be retried; attempt {}/{}",
@@ -1198,6 +1223,112 @@ fn maybe_enqueue_polluted_thread_continuation(
         }
         Err(error) => Err(error),
     }
+}
+
+fn maybe_enqueue_stream_unstable_retry_continuation(
+    harness_home: &Path,
+    item: Option<&RuntimeQueuePreparedItem>,
+    run: &CodexRuntimeRunReport,
+    failure_attempts: usize,
+    warnings: &mut Vec<String>,
+) -> io::Result<Option<ContextRolloverPreparedRequeueReport>> {
+    let Some(item) = item else {
+        warnings.push(
+            "stream-unstable retry continuation skipped: prepared queue item was unavailable"
+                .to_string(),
+        );
+        return Ok(None);
+    };
+    if !should_enqueue_stream_unstable_retry_continuation(item, run, failure_attempts) {
+        return Ok(None);
+    }
+    let config = load_context_rollover_config(harness_home)?;
+    if config.rollover_mode == ContextRolloverMode::Disabled {
+        warnings.push(
+            "stream-unstable retry continuation skipped: context rollover disabled".to_string(),
+        );
+        return Ok(None);
+    }
+    let current_index = item.continuation.continuation_index.unwrap_or(0);
+    if current_index >= config.max_successful_compacts_before_rollover {
+        warnings.push(format!(
+            "stream-unstable retry continuation skipped: continuation depth {} reached configured limit {}",
+            current_index, config.max_successful_compacts_before_rollover
+        ));
+        return Ok(None);
+    }
+    let next_index = current_index.saturating_add(1);
+    let root_session = root_working_session_key(&item.session_key);
+    let new_working_session_key = continuation_session_key(&root_session, next_index);
+    let now_ms = current_log_time_ms()?;
+    match requeue_prepared_context_rollover_if_no_parent_siblings(
+        ContextRolloverRequeuePreparedOptions {
+            harness_home: harness_home.to_path_buf(),
+            queue_id: item.queue_id.clone(),
+            new_working_session_key,
+            reason: format!(
+                "automatic stream-unstable virtual session recovery after retry-pending attempt {}; codexStatus={:?}; inputTokens={:?}; totalTokens={:?}; mediaArtifacts={}; nativeMediaParts={}; reason={}",
+                failure_attempts,
+                run.receipt.status,
+                run.receipt
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.input_tokens),
+                run.receipt
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.total_tokens),
+                run.receipt.media_plan.artifacts.len(),
+                run.receipt.media_plan.native_input_parts.len(),
+                run.receipt.reason
+            ),
+            now_ms,
+        },
+    ) {
+        Ok(report) => Ok(Some(report)),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            warnings.push(format!(
+                "stream-unstable retry continuation skipped: {error}"
+            ));
+            Ok(None)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            warnings.push(format!(
+                "stream-unstable retry continuation skipped: {error}"
+            ));
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn should_enqueue_stream_unstable_retry_continuation(
+    item: &RuntimeQueuePreparedItem,
+    run: &CodexRuntimeRunReport,
+    failure_attempts: usize,
+) -> bool {
+    if item.runtime_class != "interactive" || item.origin != "channel" {
+        return false;
+    }
+    if run.receipt.status != CodexRuntimeRunStatus::ProtocolError {
+        return false;
+    }
+    if failure_attempts < STREAM_UNSTABLE_CONTINUATION_MIN_ATTEMPTS {
+        return false;
+    }
+    if !is_retryable_codex_protocol_error(&run.receipt.reason) {
+        return false;
+    }
+    let usage_exceeds_limit = run.receipt.usage.as_ref().is_some_and(|usage| {
+        usage
+            .input_tokens
+            .or(usage.total_tokens)
+            .is_some_and(|tokens| tokens >= STREAM_UNSTABLE_CONTINUATION_TOKEN_LIMIT)
+    });
+    let has_media = !run.receipt.media_plan.artifacts.is_empty()
+        || !run.receipt.media_plan.native_input_parts.is_empty()
+        || !item.inbound_media_artifacts.is_empty();
+    usage_exceeds_limit && has_media
 }
 
 fn context_recovery_indicates_polluted_thread(
@@ -1956,6 +2087,7 @@ fn inbound_media_artifacts_field(value: &Value, keys: &[&str]) -> Vec<InboundMed
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex_runtime::CodexRuntimeUsage;
     use crate::{
         AgentSource, ChannelReceiveOptions, ChannelReceiveStatus, build_source_skill_index,
         receive_channel_message,
@@ -2125,9 +2257,13 @@ mod tests {
         assert_eq!(outbound.channel_id, "dm-42");
         assert_eq!(outbound.user_id, "user-7");
         assert_eq!(outbound.text, "Pipeline fake reply.");
+        let presentation = outbound.presentation.as_ref().unwrap();
+        assert_eq!(presentation.fallback_text, "Pipeline fake reply.");
+        assert_eq!(presentation.blocks.len(), 1);
         let outbox_file = report.outbox_file.unwrap();
         let outbox = fs::read_to_string(outbox_file).unwrap();
         assert!(outbox.contains("\"kind\":\"agent-reply\""));
+        assert!(outbox.contains("\"presentation\""));
         assert!(outbox.contains("Pipeline fake reply."));
         let log = fs::read_to_string(
             harness_home
@@ -2255,6 +2391,14 @@ mod tests {
         assert_eq!(outbound.source_queue_id.as_deref(), Some(queue_id.as_str()));
         assert_eq!(outbound.text, "Final answer only.");
         assert!(!outbound.text.contains("progress:"));
+        let presentation = outbound.presentation.as_ref().unwrap();
+        assert_eq!(presentation.fallback_text, "Final answer only.");
+        assert!(
+            presentation
+                .blocks
+                .iter()
+                .all(|block| !serde_json::to_string(block).unwrap().contains("progress:"))
+        );
         let outbox = fs::read_to_string(report.outbox_file.unwrap()).unwrap();
         assert!(outbox.contains("Final answer only."));
         assert!(!outbox.contains("progress:"));
@@ -2729,6 +2873,29 @@ mod tests {
     }
 
     #[test]
+    fn stream_unstable_retry_continuation_requires_repeated_high_usage_media_failure() {
+        let item = prepared_test_item("queue-stream", "discord:dm-42:user-7:main", None);
+        let run = stream_unstable_failed_run("queue-stream", Some(90_038), true);
+
+        assert!(should_enqueue_stream_unstable_retry_continuation(
+            &item, &run, 2
+        ));
+        assert!(!should_enqueue_stream_unstable_retry_continuation(
+            &item, &run, 1
+        ));
+        assert!(!should_enqueue_stream_unstable_retry_continuation(
+            &item,
+            &stream_unstable_failed_run("queue-stream", Some(79_999), true),
+            2
+        ));
+        assert!(!should_enqueue_stream_unstable_retry_continuation(
+            &item,
+            &stream_unstable_failed_run("queue-stream", Some(90_038), false),
+            2
+        ));
+    }
+
+    #[test]
     fn self_improvement_hook_is_suppressed_for_rollover_continuations() {
         let legacy = RuntimeContinuationMetadata::legacy();
         assert!(should_run_self_improvement_hook(
@@ -2796,6 +2963,75 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("continuation depth 2"))
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repeated_stream_disconnect_high_media_retry_requeues_continuation() {
+        let root = temp_root("repeated_stream_disconnect_high_media_retry_requeues_continuation");
+        let harness_home = root.join(".agent-harness");
+        let queue_id = "queue-stream";
+        let session_key = "discord:dm-42:user-7:main";
+        seed_prepared_pending_for_stream_retry(&harness_home, queue_id, session_key);
+        let mut item = prepared_test_item(queue_id, session_key, None);
+        item.platform = "discord".to_string();
+        item.channel_id = "dm-42".to_string();
+        item.user_id = "user-7".to_string();
+        item.inbound_media_artifacts = vec![InboundMediaArtifact {
+            platform: "discord".to_string(),
+            kind: "attachment-image".to_string(),
+            artifact_uri: Some("agent-harness://inbound-media/discord/msg-1/0.jpg".to_string()),
+            mime: Some("image/jpeg".to_string()),
+            sha256: Some("abc123".to_string()),
+            ..InboundMediaArtifact::default()
+        }];
+        let run = stream_unstable_failed_run(queue_id, Some(90_038), true);
+        let mut warnings = Vec::new();
+
+        let rollover = maybe_enqueue_stream_unstable_retry_continuation(
+            &harness_home,
+            Some(&item),
+            &run,
+            2,
+            &mut warnings,
+        )
+        .unwrap()
+        .expect("expected stream-unstable retry to requeue a continuation");
+
+        assert_eq!(rollover.queue_id, queue_id);
+        assert_eq!(
+            rollover.previous_working_session_key.as_deref(),
+            Some(session_key)
+        );
+        assert_eq!(
+            rollover.new_working_session_key,
+            "discord:dm-42:user-7:main:cont-1"
+        );
+        assert_eq!(rollover.continuation_index, 1);
+        assert!(
+            rollover
+                .requeued_queue_id
+                .starts_with("queue-stream:rollover-requeue-")
+        );
+        let pending = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        assert!(pending.contains("\"requeuedFromQueueId\":\"queue-stream\""));
+        assert!(pending.contains("\"completionKind\":\"continuation-rollover\""));
+        assert!(pending.contains("stream-unstable"));
+        assert!(
+            !harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl")
+                .exists()
+        );
+        assert!(warnings.is_empty());
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3329,6 +3565,134 @@ mod tests {
             stderr_log: None,
             warnings: Vec::new(),
         }
+    }
+
+    fn stream_unstable_failed_run(
+        queue_id: &str,
+        input_tokens: Option<u64>,
+        include_media: bool,
+    ) -> CodexRuntimeRunReport {
+        let mut media_plan = crate::InboundMediaInputPlan::default();
+        if include_media {
+            media_plan.artifacts.push(InboundMediaArtifact {
+                platform: "discord".to_string(),
+                kind: "attachment-image".to_string(),
+                artifact_uri: Some("agent-harness://inbound-media/discord/msg-1/0.jpg".to_string()),
+                mime: Some("image/jpeg".to_string()),
+                sha256: Some("abc123".to_string()),
+                ..InboundMediaArtifact::default()
+            });
+        }
+        CodexRuntimeRunReport {
+            schema: "agent-harness.codex-runtime-run.v1",
+            harness_home: PathBuf::from(".agent-harness"),
+            execution_dir: Some(PathBuf::from("execution")),
+            plan_file: Some(PathBuf::from("codex-runtime-plan.json")),
+            run_file: Some(PathBuf::from("codex-runtime-run.json")),
+            receipts_file: PathBuf::from("codex-runtime-run-receipts.jsonl"),
+            receipt: crate::CodexRuntimeRunReceipt {
+                queue_id: Some(queue_id.to_string()),
+                status: CodexRuntimeRunStatus::ProtocolError,
+                execution_dir: Some(PathBuf::from("execution")),
+                plan_file: Some(PathBuf::from("codex-runtime-plan.json")),
+                run_file: Some(PathBuf::from("codex-runtime-run.json")),
+                completion_file: None,
+                transcript_file: None,
+                trajectory_file: None,
+                codex_binding_file: None,
+                reason: "Reconnecting... 2/5; stream disconnected before completion: websocket closed by server before response.completed".to_string(),
+                elapsed_ms: 1_584_219,
+                event_count: 2_110,
+                usage: input_tokens.map(|tokens| CodexRuntimeUsage {
+                    input_tokens: Some(tokens),
+                    output_tokens: Some(2_513),
+                    total_tokens: Some(tokens.saturating_add(2_513)),
+                    source: "test".to_string(),
+                    raw: None,
+                }),
+                media_plan,
+                context_recovery: None,
+                tool_use_timeout: None,
+            },
+            completion: None,
+            stdout_log: None,
+            stderr_log: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn seed_prepared_pending_for_stream_retry(
+        harness_home: &Path,
+        queue_id: &str,
+        session_key: &str,
+    ) {
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        append_json_line(
+            &queue_dir.join("pending.jsonl"),
+            &serde_json::json!({
+                "queueId": queue_id,
+                "status": "queued",
+                "runtimeClass": "interactive",
+                "origin": "channel",
+                "agentId": "main",
+                "platform": "discord",
+                "channelId": "dm-42",
+                "userId": "user-7",
+                "sessionKey": session_key,
+                "inboundMediaArtifacts": [{
+                    "schema": crate::INBOUND_MEDIA_ARTIFACT_SCHEMA,
+                    "platform": "discord",
+                    "kind": "attachment-image",
+                    "artifactUri": "agent-harness://inbound-media/discord/msg-1/0.jpg",
+                    "mime": "image/jpeg",
+                    "sha256": "abc123",
+                    "downloadStatus": "downloaded",
+                    "modelAttachmentStatus": "vision-tool-available"
+                }]
+            }),
+        )
+        .unwrap();
+        append_json_line(
+            &queue_dir.join("execution-receipts.jsonl"),
+            &serde_json::json!({
+                "queueId": queue_id,
+                "status": "prepared",
+                "runtimeClass": "interactive",
+                "origin": "channel",
+                "executionDir": "execution"
+            }),
+        )
+        .unwrap();
+        let state_file =
+            crate::channel_session_state_file(harness_home, "discord", "dm-42", "user-7");
+        write_json_atomic(
+            &state_file,
+            &crate::ChannelSessionState {
+                schema: "agent-harness.channel-session-state.v1".to_string(),
+                platform: "discord".to_string(),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                active_session_key: session_key.to_string(),
+                agent_id: Some("main".to_string()),
+                provider: None,
+                model: None,
+                session_topic: None,
+                model_override: None,
+                model_override_provider: None,
+                model_override_model: None,
+                thinking_enabled: false,
+                thinking_level: None,
+                thinking_instruction: None,
+                stop_requested: false,
+                stop_reason: None,
+                steering_notes: Vec::new(),
+                btw_notes: Vec::new(),
+                last_command: None,
+                updated_at_ms: 1_234,
+            },
+        )
+        .unwrap();
     }
 
     fn prepare_already_recorded_completion_without_outbox(
