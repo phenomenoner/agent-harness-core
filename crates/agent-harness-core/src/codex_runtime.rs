@@ -20,6 +20,10 @@ use crate::{
     config::{
         HarnessConfigValidationReport, HarnessConfigValidationStatus, validate_harness_config,
     },
+    context_rollover::{
+        ContextCompactAttemptOptions, ContextRolloverLane, record_context_compact_attempt,
+        root_working_session_key,
+    },
     current_log_time_ms,
     live_control::{classify_approval_request, is_live_harness_home},
     plan_inbound_media_inputs, write_json_atomic,
@@ -3419,6 +3423,13 @@ fn drive_codex_app_server(
             2,
         )? {
             ProtocolWait::CompactCompleted => {
+                record_official_compact_rollover_accounting(
+                    harness_home,
+                    plan,
+                    &thread_id,
+                    context_policy,
+                    &mut state.warnings,
+                )?;
                 context_recovery = Some(CodexContextRecoveryReceipt {
                     status: "compact-before-turn".to_string(),
                     queue_id: plan.queue_id.clone(),
@@ -4553,6 +4564,186 @@ fn write_context_rollover_receipt(
     Ok(ContextRolloverFiles {
         rollover_file,
         binding_backup_file,
+    })
+}
+
+fn record_official_compact_rollover_accounting(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    compact_thread_id: &str,
+    context_policy: &CodexContextPolicy,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    if context_policy.rollover_mode == "disabled" {
+        return Ok(());
+    }
+    let Some(lane) = official_compact_rollover_lane(harness_home, plan, warnings)? else {
+        return Ok(());
+    };
+    let compact_attempt_key = Some(format!(
+        "{}:{}:compact-before-turn",
+        plan.queue_id.as_deref().unwrap_or("(no-queue)"),
+        compact_thread_id
+    ));
+    let counter = record_context_compact_attempt(ContextCompactAttemptOptions {
+        harness_home: harness_home.to_path_buf(),
+        lane,
+        compact_succeeded: true,
+        rewrote_active_context: true,
+        compact_thread_id: Some(compact_thread_id.to_string()),
+        compact_attempt_key,
+        max_successful_compacts_before_rollover: context_policy
+            .max_successful_compacts_before_rollover,
+        now_ms: current_log_time_ms()?,
+    })?;
+    warnings.push(format!(
+        "official compact-before-turn recorded context rollover accounting for lane `{}`: successful_compact_count={}, rollover_pending={}",
+        counter.lane_key, counter.successful_compact_count, counter.rollover_pending
+    ));
+    Ok(())
+}
+
+fn official_compact_rollover_lane(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    warnings: &mut Vec<String>,
+) -> io::Result<Option<ContextRolloverLane>> {
+    if let Some(queue_id) = plan.queue_id.as_deref()
+        && let Some(lane) = official_compact_rollover_lane_from_pending(
+            harness_home,
+            queue_id,
+            &plan.session_key,
+            warnings,
+        )?
+    {
+        return Ok(Some(lane));
+    }
+    Ok(official_compact_rollover_lane_from_session(plan, warnings))
+}
+
+fn official_compact_rollover_lane_from_pending(
+    harness_home: &Path,
+    queue_id: &str,
+    plan_session_key: &str,
+    warnings: &mut Vec<String>,
+) -> io::Result<Option<ContextRolloverLane>> {
+    let queue_file = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("pending.jsonl");
+    if !queue_file.is_file() {
+        warnings.push(format!(
+            "official compact rollover accounting could not resolve pending queue file: {}",
+            queue_file.display()
+        ));
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&queue_file)?;
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(error) => {
+                warnings.push(format!(
+                    "official compact rollover accounting skipped invalid pending queue line {}: {}",
+                    index + 1,
+                    error
+                ));
+                continue;
+            }
+        };
+        if string_field(&value, &["queueId", "queue_id"]) != Some(queue_id) {
+            continue;
+        }
+        let runtime_class = string_field(&value, &["runtimeClass", "runtime_class"])
+            .unwrap_or("interactive")
+            .to_string();
+        let origin = string_field(&value, &["origin"]).unwrap_or("channel");
+        if runtime_class != "interactive" || origin != "channel" {
+            warnings.push(format!(
+                "official compact rollover accounting skipped queue `{queue_id}` because runtimeClass={runtime_class} origin={origin}"
+            ));
+            return Ok(None);
+        }
+        let session_key = string_field(&value, &["sessionKey", "session_key"])
+            .unwrap_or(plan_session_key)
+            .to_string();
+        if session_key != plan_session_key {
+            warnings.push(format!(
+                "official compact rollover accounting skipped queue `{queue_id}` because plan session `{plan_session_key}` did not match pending session `{session_key}`"
+            ));
+            return Ok(None);
+        }
+        return Ok(Some(ContextRolloverLane {
+            runtime_class,
+            agent_id: string_field(&value, &["agentId", "agent_id"])
+                .unwrap_or("main")
+                .to_string(),
+            platform: string_field(&value, &["platform"])
+                .unwrap_or("unknown")
+                .to_string(),
+            channel_id: string_field(&value, &["channelId", "channel_id"])
+                .unwrap_or("unknown")
+                .to_string(),
+            user_id: string_field(&value, &["userId", "user_id"])
+                .unwrap_or("unknown")
+                .to_string(),
+            working_session_key: session_key,
+            virtual_session_id: value
+                .get("virtualSessionId")
+                .or_else(|| value.get("virtual_session_id"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            continuation_index: value
+                .get("continuationIndex")
+                .or_else(|| value.get("continuation_index"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        }));
+    }
+    warnings.push(format!(
+        "official compact rollover accounting could not find pending queue item `{queue_id}`"
+    ));
+    Ok(None)
+}
+
+fn official_compact_rollover_lane_from_session(
+    plan: &CodexRuntimePlanFile,
+    warnings: &mut Vec<String>,
+) -> Option<ContextRolloverLane> {
+    let root_session_key = root_working_session_key(&plan.session_key);
+    let mut parts = root_session_key.split(':');
+    let (Some(platform), Some(channel_id), Some(user_id), Some(agent_id)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        warnings.push(format!(
+            "official compact rollover accounting skipped session `{}` because it does not expose platform/channel/user/agent axes",
+            plan.session_key
+        ));
+        return None;
+    };
+    if parts.next().is_some() {
+        warnings.push(format!(
+            "official compact rollover accounting skipped session `{}` because its identity axes are ambiguous",
+            plan.session_key
+        ));
+        return None;
+    }
+    Some(ContextRolloverLane {
+        runtime_class: "interactive".to_string(),
+        agent_id: plan
+            .agent_id
+            .clone()
+            .unwrap_or_else(|| agent_id.to_string()),
+        platform: platform.to_string(),
+        channel_id: channel_id.to_string(),
+        user_id: user_id.to_string(),
+        working_session_key: plan.session_key.clone(),
+        virtual_session_id: plan.continuation.virtual_session_id.clone(),
+        continuation_index: plan.continuation.continuation_index.unwrap_or(0),
     })
 }
 
@@ -9151,7 +9342,11 @@ mod tests {
     use crate::{
         InboundMediaModelAttachmentStatus, PromptAssemblyOptions, RuntimeQueueEnqueueOptions,
         RuntimeQueuePrepareOptions, TurnPlanInput, build_channel_step, build_source_skill_index,
-        build_turn_plan, enqueue_channel_step, load_agent_registry, prepare_runtime_queue_item,
+        build_turn_plan,
+        context_rollover::{
+            ContextCompactCounter, ContextRolloverLane, context_compact_counter_file,
+        },
+        enqueue_channel_step, load_agent_registry, prepare_runtime_queue_item,
         runtime_worker::release_runtime_queue_lease,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -11536,6 +11731,33 @@ mod tests {
         )
         .unwrap();
         assert!(preflight.contains(r#""compactBeforeTurn": true"#));
+        let counter_lane = ContextRolloverLane {
+            runtime_class: "interactive".to_string(),
+            agent_id: plan.agent_id.clone().unwrap_or_else(|| "main".to_string()),
+            platform: "telegram".to_string(),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            working_session_key: plan.session_key.clone(),
+            virtual_session_id: None,
+            continuation_index: 0,
+        };
+        let counter_file = context_compact_counter_file(&harness_home, &counter_lane.lane_key());
+        assert!(
+            counter_file.is_file(),
+            "official compact success must write context rollover counter for the active lane"
+        );
+        let counter: ContextCompactCounter =
+            serde_json::from_slice(&fs::read(counter_file).unwrap()).unwrap();
+        assert_eq!(counter.successful_compact_count, 1);
+        assert!(!counter.rollover_pending);
+        assert_eq!(
+            counter.last_compact_thread_id.as_deref(),
+            report
+                .receipt
+                .context_recovery
+                .as_ref()
+                .and_then(|receipt| receipt.original_thread_id.as_deref())
+        );
 
         let _ = fs::remove_dir_all(root);
     }

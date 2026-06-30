@@ -3490,6 +3490,7 @@ mod tests {
             compact_succeeded: true,
             rewrote_active_context: true,
             compact_thread_id: Some("thread-after-compact".to_string()),
+            compact_attempt_key: None,
             max_successful_compacts_before_rollover: 1,
             now_ms: 1235,
         })
@@ -3616,6 +3617,7 @@ mod tests {
             compact_succeeded: true,
             rewrote_active_context: true,
             compact_thread_id: Some("thread-after-compact".to_string()),
+            compact_attempt_key: None,
             max_successful_compacts_before_rollover: 1,
             now_ms: 1235,
         })

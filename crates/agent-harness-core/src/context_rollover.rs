@@ -113,6 +113,8 @@ pub struct ContextCompactCounter {
     pub successful_compact_count: u64,
     pub rollover_pending: bool,
     pub last_compact_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_compact_attempt_key: Option<String>,
     pub last_rollover_receipt: Option<PathBuf>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -132,6 +134,7 @@ pub struct ContextCompactAttemptOptions {
     pub compact_succeeded: bool,
     pub rewrote_active_context: bool,
     pub compact_thread_id: Option<String>,
+    pub compact_attempt_key: Option<String>,
     pub max_successful_compacts_before_rollover: u64,
     pub now_ms: i64,
 }
@@ -396,9 +399,13 @@ pub fn record_context_compact_attempt(
         lane: options.lane,
         now_ms: options.now_ms,
     })?;
-    if options.compact_succeeded && options.rewrote_active_context {
+    let duplicate_attempt = options.compact_attempt_key.is_some()
+        && options.compact_attempt_key.as_deref()
+            == counter.last_successful_compact_attempt_key.as_deref();
+    if options.compact_succeeded && options.rewrote_active_context && !duplicate_attempt {
         counter.successful_compact_count = counter.successful_compact_count.saturating_add(1);
         counter.last_compact_thread_id = options.compact_thread_id;
+        counter.last_successful_compact_attempt_key = options.compact_attempt_key;
     }
     if counter.successful_compact_count >= options.max_successful_compacts_before_rollover {
         counter.rollover_pending = true;
@@ -1034,6 +1041,7 @@ fn new_context_compact_counter(
         successful_compact_count: 0,
         rollover_pending: false,
         last_compact_thread_id: None,
+        last_successful_compact_attempt_key: None,
         last_rollover_receipt: None,
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
@@ -1734,6 +1742,7 @@ mod tests {
             compact_succeeded: false,
             rewrote_active_context: true,
             compact_thread_id: Some("thread-failed".to_string()),
+            compact_attempt_key: None,
             max_successful_compacts_before_rollover: 2,
             now_ms: 10,
         })
@@ -1744,6 +1753,7 @@ mod tests {
             compact_succeeded: true,
             rewrote_active_context: true,
             compact_thread_id: Some("thread-ok".to_string()),
+            compact_attempt_key: None,
             max_successful_compacts_before_rollover: 2,
             now_ms: 11,
         })
@@ -1752,6 +1762,42 @@ mod tests {
         assert_eq!(counter.successful_compact_count, 1);
         assert!(!counter.rollover_pending);
         assert_eq!(counter.last_compact_thread_id.as_deref(), Some("thread-ok"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compact_counter_deduplicates_successful_attempt_key() {
+        let root = temp_root("counter_idempotent_key");
+        let harness_home = root.join(".agent-harness");
+        let lane = test_lane("telegram:dm:user:main");
+        let key = Some("queue-1:thread-ok:compact-before-turn".to_string());
+
+        record_context_compact_attempt(ContextCompactAttemptOptions {
+            harness_home: harness_home.clone(),
+            lane: lane.clone(),
+            compact_succeeded: true,
+            rewrote_active_context: true,
+            compact_thread_id: Some("thread-ok".to_string()),
+            compact_attempt_key: key.clone(),
+            max_successful_compacts_before_rollover: 2,
+            now_ms: 10,
+        })
+        .unwrap();
+        let counter = record_context_compact_attempt(ContextCompactAttemptOptions {
+            harness_home: harness_home.clone(),
+            lane,
+            compact_succeeded: true,
+            rewrote_active_context: true,
+            compact_thread_id: Some("thread-ok".to_string()),
+            compact_attempt_key: key.clone(),
+            max_successful_compacts_before_rollover: 2,
+            now_ms: 11,
+        })
+        .unwrap();
+
+        assert_eq!(counter.successful_compact_count, 1);
+        assert_eq!(counter.last_successful_compact_attempt_key, key);
+        assert!(!counter.rollover_pending);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1767,6 +1813,7 @@ mod tests {
             compact_succeeded: true,
             rewrote_active_context: true,
             compact_thread_id: Some("thread-ok".to_string()),
+            compact_attempt_key: None,
             max_successful_compacts_before_rollover: 1,
             now_ms: 10,
         })
@@ -1857,6 +1904,7 @@ mod tests {
             compact_succeeded: true,
             rewrote_active_context: true,
             compact_thread_id: Some("thread-ok".to_string()),
+            compact_attempt_key: None,
             max_successful_compacts_before_rollover: 1,
             now_ms: 5,
         })
@@ -1909,6 +1957,7 @@ mod tests {
             compact_succeeded: true,
             rewrote_active_context: true,
             compact_thread_id: None,
+            compact_attempt_key: None,
             max_successful_compacts_before_rollover: 1,
             now_ms: 5,
         })
@@ -1980,6 +2029,7 @@ mod tests {
             compact_succeeded: true,
             rewrote_active_context: true,
             compact_thread_id: None,
+            compact_attempt_key: None,
             max_successful_compacts_before_rollover: 1,
             now_ms: 5,
         })
@@ -2209,6 +2259,7 @@ mod tests {
             compact_succeeded: true,
             rewrote_active_context: true,
             compact_thread_id: Some("thread-ok".to_string()),
+            compact_attempt_key: None,
             max_successful_compacts_before_rollover: 1,
             now_ms: 5,
         })

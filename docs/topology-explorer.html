@@ -219,7 +219,7 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "e98f9eb7d6df91499a7dcd97c92682894206fd1c7a4e02e242d3bb93cb4eff43"
+      "sha256": "9fa1192cd19780202d31a1a29ef0e0702ba3b3264d94088c6ebb7579c880d03a"
     },
     {
       "path": "docs/.private/agent-harness-operations-handbook.md",
@@ -331,10 +331,23 @@
       "label": "codex_runtime",
       "group": "component",
       "state": "implemented",
-      "summary": "app-server plan, preflight, run, completion capture, tool-timeout recovery",
-      "reads": "prompt bundle, Codex config",
-      "writes": "execution receipts, transcripts, completions, toolUseTimeout summaries",
+      "summary": "app-server plan/executable resolution, preflight, startup/run, completion capture, tool-timeout recovery",
+      "reads": "prompt bundle, Codex config, provider request policy",
+      "writes": "execution receipts, terminal protocol-error receipts, transcripts, completions, toolUseTimeout summaries",
       "invariants": "I2, I3, I7, I10",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-provider-request-policy",
+      "label": "provider_request_policy",
+      "group": "component",
+      "state": "implemented",
+      "summary": "provider/model capability gates and optional per-request acceleration overrides such as priority/fast mode",
+      "reads": "agent/session command state, provider route, model id, provider profile",
+      "writes": "request-plan overrides, command receipts, unsupported/skip reasons",
+      "invariants": "I7, I8",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -517,7 +530,7 @@
       "label": "Codex runtime or completion recording",
       "group": "gate",
       "state": "release-gate",
-      "summary": "real final plus empty completion; already-recorded completion outbox repair; protocol error classification; active tool-use idle timeout recovery",
+      "summary": "real final plus empty completion; already-recorded completion outbox repair; protocol error classification, including app-server startup/write failures; Windows shim/native executable resolution; active tool-use idle timeout recovery",
       "reviewDocs": "local docs/.private/agent-harness-dev-handoff.md, local docs/.private/r9-2-completion-outbox-staging.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -551,7 +564,7 @@
       "group": "gate",
       "state": "release-gate",
       "summary": "image, audio/transcript, generated speech/media, browser capture, document/download, long tool-log/review transcript, worker-report, provider-native attachment fixtures, and Discord text/image attachments render as artifact refs plus bounded extraction summaries; raw bytes/base64/provider URLs/tool blobs are absent from main-thread prompt/continuity and Codex progress previews",
-      "reviewDocs": "local .debug/round10/image-artifact-context-hygiene-tech-note-2026-06-28.md, docs/invariants.md, local docs/.private/release-checklist.md, this file",
+      "reviewDocs": "local private artifact-hygiene evidence, docs/invariants.md, local docs/.private/release-checklist.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -563,6 +576,17 @@
       "state": "release-gate",
       "summary": "main and non-main prompt isolation; provider/Codex home selection; prompt file role headers; fresh /new request does not inject previous-task memory context",
       "reviewDocs": "local docs/.private/agent-harness-dev-handoff.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "impact-provider-model-request-override-commands",
+      "label": "Provider/model/request override commands",
+      "group": "gate",
+      "state": "release-gate",
+      "summary": "/model, /think, and /fast command state remains agent/session-scoped; unsupported provider/model routes fail closed; request overrides are capability-gated and stripped on incompatible routes; command replies do not start model turns",
+      "reviewDocs": "docs/configuration.md, local docs/.private/agent-harness-dev-handoff.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -583,7 +607,7 @@
       "label": "Supervisor or live cutover",
       "group": "gate",
       "state": "release-gate",
-      "summary": "staging build, idle gate, backup/rollback receipt, post-cutover health/status/outbox checks",
+      "summary": "staging build, idle gate, backup/rollback receipt, spawn-stable Node/Codex executable paths, post-cutover health/status/outbox checks",
       "reviewDocs": "local docs/.private/agent-harness-operations-handbook.md, local docs/.private/release-checklist.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -596,8 +620,8 @@
       "state": "open-gap",
       "summary": "openclaw-mem graph autonomous matching",
       "designTarget": "openclaw-mem / openclaw-mem-engine graph recall, capture, routeAuto/autonomous matching, provenance, and freshness operate at full product parity through the active memory owner.",
-      "currentEvidence": "Graph topology extract is green for the harness support plane; memory read-path smoke is ready through explicit SQLite/vector/text/writeback migration fallback when the mem-engine bridge response is absent.",
-      "promotionGate": "Bridge/sidecar emits stable recall envelopes; Qdrant/native backend selected by the memory layer; routeAuto/autonomous matching fixture passes; provenance/freshness receipts are green; fallback is not used for the proof query; canonical writes remain governed.",
+      "currentEvidence": "Graph topology extract is green for the harness support plane. The 2026-06-29 live cutover has a bounded subprocess bridge path for active mem-engine status/recall/store ownership with request/response mirrors, fallback telemetry, approved-store fail-closed behavior, env-or-harness-config bridge routing, and post-cutover proof that status/recall/read-path smoke run with fallbackUsed=false. Graph autonomous matching is still not parity.",
+      "promotionGate": "Bridge/sidecar emits stable recall/store envelopes; Qdrant/native backend selected by the memory layer; routeAuto/autonomous matching fixture passes; provenance/freshness receipts are green; fallback is not used for the proof query; canonical writes remain governed by openclaw-mem policy.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -609,8 +633,8 @@
       "state": "open-gap",
       "summary": "Per-agent memory recall compartment",
       "designTarget": "Non-main and public-facing agents should receive their own memory prompt/lifecycle/canvas/writeback context by default. Legacy/global imported memory should be opt-in, trust-tagged, and visibly scoped so a public or coach agent cannot accidentally inherit private main context.",
-      "currentEvidence": "Local Round10 gap-closure staging now has memory::tests::non_main_memory_prompt_context_excludes_global_imported_snapshot_by_default, which proves a non-main agent recall context uses its per-agent memory root, reports globalImportedSnapshotAllowed=false, records source scope, and filters private global imported memory. Live cutover and broader openclaw-mem full parity remain pending.",
-      "promotionGate": "Before promotion, run the focused memory regression plus a status/read-path smoke that surfaces the same scope/filter telemetry for the candidate live home. Do not claim openclaw-mem full parity while bridge fallback is active or global imported recall remains a policy exception.",
+      "currentEvidence": "Local Round10 gap-closure staging has memory::tests::non_main_memory_prompt_context_excludes_global_imported_snapshot_by_default, which proves a non-main agent recall context uses its per-agent memory root, reports globalImportedSnapshotAllowed=false, records source scope, and filters private global imported memory. The 2026-06-29 bridge-primary live cutover removes the active recall/store fallback dependency. The follow-up memory::tests::public_agent_read_path_smoke_surfaces_source_allow_list_and_filtered_counts broadens the candidate read-path smoke to expose public/non-main allow/deny source scopes, trust level, and filtered global-imported hit counts.",
+      "promotionGate": "Before promotion, run the focused memory regression plus candidate-home status/read-path smoke that surfaces the same scope/filter telemetry. Do not claim openclaw-mem full graph parity while native/Qdrant backend proof, routeAuto/autonomous matching fixtures, or provenance/freshness receipts remain open under openclaw-mem-full-parity-gap.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -635,8 +659,8 @@
       "state": "open-gap",
       "summary": "Virtual session and working-context continuity",
       "designTarget": "Long tasks should survive repeated compaction by rolling into fresh concrete sessions inside a stable virtual session, carrying a bounded working set so repeated compression does not silently distort task state. /new is a task-boundary command and must not inherit the previous virtual/task memory context.",
-      "currentEvidence": "context_rollover records compact counters, virtual-session records, working-set memory, session indexes, rollover episodes, and guarded requeue receipts; prompt assembly injects working-set continuity when a continuation session has an index. Local Round10 gap-closure staging adds prompt::tests::prompt_bundle_new_command_boundary_skips_prior_task_memory_context, proving a fresh /new prompt suppresses previous-task imported memory context. Broader end-to-end rollover/final-delivery parity remains pending.",
-      "promotionGate": "Add an end-to-end scenario that forces compact-threshold rollover, verifies a fresh session key under the same virtual session, checks prompt working-set injection, confirms old prepared/leased turns are not rewritten unsafely, traces final outbox/delivery back to the continuation queue item, and separately proves /new creates a new task boundary that does not inherit previous-task memory context.",
+      "currentEvidence": "context_rollover records compact counters, virtual-session records, working-set memory, session indexes, rollover episodes, and guarded requeue receipts; prompt assembly injects working-set continuity when a continuation session has an index. Local Round10 gap-closure staging adds prompt::tests::prompt_bundle_new_command_boundary_skips_prior_task_memory_context, proving a fresh /new prompt suppresses previous-task imported memory context. A 2026-06-29 Discord long-lane audit found repeated official Codex compact-before-turn successes on the same bound thread, but no visible compact-counter, rollover receipt, fresh session key, or structured skip reason. Round12 Track A staging wires official compact-before-turn success into context-rollover accounting and adds focused tests for lane counter advancement, compact thread id recording, idempotent queue/thread attempt keys, next-turn rollover rekeying, and leased-item blocking. Broader end-to-end rollover/final-delivery parity remains pending.",
+      "promotionGate": "Promote after an end-to-end scenario forces at least three high-context turns: first official compact success, second official compact success, then configured rollover or an explicit machine-readable skip receipt. The scenario must verify a fresh session key under the same virtual session when rollover occurs, check prompt working-set injection, confirm old prepared/leased turns are not rewritten unsafely, trace final outbox/delivery back to the continuation queue item, include Discord/TG lane identity axes, and separately prove /new creates a new task boundary that does not inherit previous-task memory context.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -681,6 +705,19 @@
       ]
     },
     {
+      "id": "gap-codex-startup-executable-stability-gap",
+      "label": "codex-startup-executable-stability-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Codex app-server startup and executable stability",
+      "designTarget": "Service-mode runtime should invoke a spawn-stable Codex executable and classify startup/write failures as terminal receipts instead of losing queue trace or wedging channel callbacks.",
+      "currentEvidence": "A 2026-06-29 live incident found runtime execution vulnerable to Windows command-shim/native-binary drift after a Codex app update: app-server startup could exit with 0xC0000142, and stale Discord queues needed replay or explicit terminalization. Source hardening now prefers native Windows vendor codex.exe for npm codex.cmd shim installations and uses the shim only as fallback, while app-server startup/write failure records a terminal protocol-error receipt with focused regression coverage. The same follow-up makes CLI default Node resolution prefer an explicit Windows node.exe when no --node-exe is supplied, and the live Discord scheduled gateway script was hotpatched away from the bare node PATH shim. The live runtime was hotpatched to an explicit native Codex executable; broader binary cutover and soak remain separate gates.",
+      "promotionGate": "Promote only after Windows npm-shim/native-vendor tests, MSIX/extensionless rejection tests, Node default-resolution tests, early-exit/write-failure terminal receipt tests, and a live post-restart smoke prove pending queues and runtimeOpenItems converge to zero across Discord and Telegram.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
       "id": "gap-external-review-loop-resilience-gap",
       "label": "external-review-loop-resilience-gap",
       "group": "gap",
@@ -702,6 +739,19 @@
       "designTarget": "Bound Codex threads with very high recorded usage should compact or checkpoint before heavy image/external-tool continuations, even when prompt bytes are modest and no modelContextWindow ratio is configured.",
       "currentEvidence": "Local Round10 gap closure adds codex_runtime::tests::run_codex_runtime_preflight_compacts_high_usage_bound_thread_without_model_window, which failed first for a 136602-token replay with compactBeforeTurn=false and now passes by forcing compact through highContextUsageCompactTokenLimit.",
       "promotionGate": "Promote only after Telegram/Discord replay proves high prior bound-thread usage triggers compact/checkpoint/fresh-thread before heavy continuations, fallback does not reuse the overloaded context, and final outbox/progress surfaces remain separated.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-fast",
+      "label": "fast\\",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Provider request acceleration command",
+      "designTarget": "Users should be able to toggle provider-native fast/priority request behavior for the current agent/session without mutating prompt text, leaking across agents/channels, or sending unsupported request parameters to Codex/proxy/provider routes.",
+      "currentEvidence": "Hermes Agent upstream implements `/fast [normal\\",
+      "promotionGate": "status] as a command-state/request-override path: command registry plus CLI/gateway handlers, model capability checks, per-turn request_overrides, OpenAI service_tier=\"priority\" for supported routes, Anthropic speed=\"fast\" only for supported native routes, and defensive stripping for incompatible routes. Agent Harness currently has provider/model command state and request planning, but no first-class /fast` command or provider-scoped fast/priority override receipt.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -811,6 +861,11 @@
     {
       "source": "canon-topology-contract",
       "target": "component-codex-runtime",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-provider-request-policy",
       "label": "owns boundary"
     },
     {
@@ -965,6 +1020,11 @@
     },
     {
       "source": "axis-agentid",
+      "target": "component-provider-request-policy",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
       "target": "component-runtime-pipeline",
       "label": "must survive through"
     },
@@ -1026,6 +1086,11 @@
     {
       "source": "axis-runtimeclass",
       "target": "component-runtime-queue-runtime-worker",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-runtimeclass",
+      "target": "component-provider-request-policy",
       "label": "must survive through"
     },
     {
@@ -1194,6 +1259,16 @@
       "label": "changes trigger"
     },
     {
+      "source": "impact-provider-model-request-override-commands",
+      "target": "canon-topology-contract",
+      "label": "reviewed by"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "impact-provider-model-request-override-commands",
+      "label": "changes trigger"
+    },
+    {
       "source": "impact-memory-or-graph-recall",
       "target": "canon-topology-contract",
       "label": "reviewed by"
@@ -1212,6 +1287,11 @@
       "source": "gap-openclaw-mem-full-parity-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-openclaw-mem-full-parity-gap",
+      "label": "has gap"
     },
     {
       "source": "component-memory",
@@ -1269,6 +1349,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-provider-request-policy",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-runtime-pipeline",
       "target": "gap-multi-agent-full-matrix-gap",
       "label": "has gap"
@@ -1300,6 +1385,11 @@
     },
     {
       "source": "component-prompt-turns",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime",
       "target": "gap-virtual-session-continuity-gap",
       "label": "has gap"
     },
@@ -1340,6 +1430,11 @@
     },
     {
       "source": "component-media-artifact-hygiene",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
       "target": "gap-progress-delivery-volume-gap",
       "label": "has gap"
     },
@@ -1419,6 +1514,46 @@
       "label": "has gap"
     },
     {
+      "source": "gap-codex-startup-executable-stability-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
       "source": "gap-external-review-loop-resilience-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
@@ -1479,6 +1614,46 @@
       "label": "has gap"
     },
     {
+      "source": "gap-fast",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
       "source": "gap-generic-artifact-context-hygiene-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
@@ -1505,6 +1680,11 @@
     },
     {
       "source": "component-codex-runtime",
+      "target": "gap-generic-artifact-context-hygiene-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
       "target": "gap-generic-artifact-context-hygiene-gap",
       "label": "has gap"
     },

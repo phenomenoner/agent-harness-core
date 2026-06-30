@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Changed
+
+- Staged Round12 Track A virtual-session continuity fix: successful official
+  Codex `compact-before-turn` outcomes now feed context-rollover accounting for
+  the exact interactive/channel lane instead of silently compacting in place
+  forever.
+- Added idempotent compact attempt keys so replaying the same queue/thread
+  official compact success does not double-count toward rollover.
+- Updated invariant I13, the topology contract, release checklist output, and
+  generated topology explorer data to record the staging evidence while keeping
+  broader end-to-end live rollover/final-delivery promotion gates open.
+
+### Verification
+
+- `cargo test -p agent-harness-core run_codex_runtime_preflight_compacts_existing_thread_before_turn --target-dir target\staging-test-round12-virtual-session-a-green -- --nocapture`
+- `cargo test -p agent-harness-core compact_counter_ --target-dir target\staging-test-round12-virtual-session-a-green -- --nocapture`
+- `cargo test -p agent-harness-core prepare_runtime_queue_item_rekeys_pending_turn_when_rollover_is_pending --target-dir target\staging-test-round12-virtual-session-a-green -- --nocapture`
+- `cargo test -p agent-harness-core context_rollover_blocked_leased_stops_prepare_path --target-dir target\staging-test-round12-virtual-session-a-green -- --nocapture`
+- `cargo test -p agent-harness-core quality_catalogs_and_hygiene_report_are_actionable --target-dir target\staging-test-round12-virtual-session-a-green -- --nocapture`
+- `cargo fmt --all -- --check`
+- `cargo check -p agent-harness-core --target-dir target\staging-check-round12-virtual-session-a`
+- `cargo build -p agent-harness-cli --target-dir target\staging-build-round12-virtual-session-a`
+- `target\staging-build-round12-virtual-session-a\debug\agent-harness.exe public-hygiene --root .public-export\round12-virtual-session-a-20260630`
+
 ## v0.2.1 - 2026-06-29
 
 ### Difference from v0.2.0

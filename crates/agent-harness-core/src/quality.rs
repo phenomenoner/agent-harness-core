@@ -105,6 +105,11 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
             statement: "active mem-engine ownership uses the openclaw-mem bridge as the primary write/recall path when configured; recall fallback remains read-only and store fails closed unless the memory layer accepts the write",
             owner: "memory/memory_owner/openclaw-mem",
         },
+        InvariantEntry {
+            id: "I13",
+            statement: "successful official Codex compaction feeds the harness context-rollover policy instead of silently compacting in place forever",
+            owner: "codex_runtime/context_rollover/runtime_queue/prompt/runtime_pipeline",
+        },
     ]
 }
 
@@ -483,6 +488,7 @@ pub fn release_checklist() -> ReleaseChecklist {
             "prompt/memory changes passed /new task-boundary and per-agent memory recall checks",
             "openclaw-mem bridge ownership changes passed configured-bridge and fallback gates",
             "response/runtime changes passed final-surface separation checks, including stdout recovery without final_answer",
+            "context rollover changes passed official-compact accounting checks",
             "progress delivery changes passed edit-volume replay checks",
             "progress panel lane-cap heartbeat/current-step checks passed across channel platforms",
             "Codex tool-use timeout changes passed bounded recovery checks",
