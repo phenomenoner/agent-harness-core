@@ -7,23 +7,27 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::codex_runtime::CodexContextRecoveryReceipt;
 use crate::{
     AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
     AssistantNarrationConfig, AssistantNarrationMode, ChannelDeliveryIntent,
     ChannelDeliveryIntentKind, ChannelOutboundAttachment, ChannelOutboundAttachmentKind,
     ChannelOutboundMessage, ChannelOutboundMessageKind, CodexRuntimePlan, CodexRuntimePlanOptions,
     CodexRuntimePlanReport, CodexRuntimeReceiptStatus, CodexRuntimeRunOptions,
-    CodexRuntimeRunReport, CodexRuntimeRunStatus, HarnessLogEvent, HarnessLogLevel,
-    InboundMediaArtifact, MemoryLifecycleTurnOptions, PromptAssemblyOptions, ResponseToneConfig,
-    ResponseToneContext, RuntimeContinuationMetadata, RuntimeExecutionReceiptStatus,
-    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeQueuePreparedItem,
-    SelfImprovementNotificationTarget, SelfImprovementReviewHookOptions,
-    append_agent_progress_event, append_harness_log, apply_response_tone, current_log_time_ms,
-    inspect_runtime_backoff_policy, load_assistant_narration_config, load_response_tone_config,
+    CodexRuntimeRunReport, CodexRuntimeRunStatus, ContextRolloverMode,
+    ContextRolloverPreparedRequeueReport, ContextRolloverRequeuePreparedOptions, HarnessLogEvent,
+    HarnessLogLevel, InboundMediaArtifact, MemoryLifecycleTurnOptions, PromptAssemblyOptions,
+    ResponseToneConfig, ResponseToneContext, RuntimeContinuationMetadata,
+    RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
+    RuntimeQueuePreparedItem, SelfImprovementNotificationTarget, SelfImprovementReviewHookOptions,
+    append_agent_progress_event, append_harness_log, apply_response_tone, continuation_session_key,
+    current_log_time_ms, inspect_runtime_backoff_policy, load_assistant_narration_config,
+    load_context_rollover_config, load_response_tone_config,
     mark_cron_run_runtime_status_by_queue_id, plan_codex_runtime, prepare_runtime_queue_item,
     read_channel_session_state, record_memory_lifecycle_turn,
-    record_skill_usage_from_prompt_bundle, release_runtime_queue_lease, run_codex_runtime,
-    run_self_improvement_review_hook, write_json_atomic,
+    record_skill_usage_from_prompt_bundle, release_runtime_queue_lease,
+    requeue_prepared_context_rollover_if_no_parent_siblings, root_working_session_key,
+    run_codex_runtime, run_self_improvement_review_hook, write_json_atomic,
 };
 
 const RUNTIME_RUN_ONCE_SCHEMA: &str = "agent-harness.runtime-run-once.v1";
@@ -416,7 +420,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         &run.receipt.reason,
         retry_policy.policy.max_failure_attempts,
     );
-    let receipt_reason = final_run_once_reason(
+    let mut receipt_reason = final_run_once_reason(
         receipt_status,
         run.receipt.status,
         queue_failure_attempts,
@@ -620,7 +624,22 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         && let Some(context) = channel_context
     {
         let status = receipt_status;
-        if channel_session_is_current(&options.harness_home, &context, &mut warnings)? {
+        if let Some(rollover) = maybe_enqueue_polluted_thread_continuation(
+            &options.harness_home,
+            prepare.item.as_ref(),
+            &run,
+            status,
+            &mut warnings,
+        )? {
+            receipt_reason = format!(
+                "context rollover parent tombstoned after polluted thread failure; childQueueId={}; childSessionKey={}; priorReason={}",
+                rollover.requeued_queue_id, rollover.new_working_session_key, receipt_reason
+            );
+            warnings.push(format!(
+                "polluted thread recovery enqueued continuation queue item {} and suppressed parent error outbox",
+                rollover.requeued_queue_id
+            ));
+        } else if channel_session_is_current(&options.harness_home, &context, &mut warnings)? {
             let message = ChannelOutboundMessage {
                 platform: context.platform.clone(),
                 account_id: context.account_id.clone(),
@@ -1111,6 +1130,95 @@ fn should_write_failure_outbox(status: RuntimeRunOnceStatus) -> bool {
             | RuntimeRunOnceStatus::ProtocolError
             | RuntimeRunOnceStatus::ContextExhausted
     )
+}
+
+fn maybe_enqueue_polluted_thread_continuation(
+    harness_home: &Path,
+    item: Option<&RuntimeQueuePreparedItem>,
+    run: &CodexRuntimeRunReport,
+    receipt_status: RuntimeRunOnceStatus,
+    warnings: &mut Vec<String>,
+) -> io::Result<Option<ContextRolloverPreparedRequeueReport>> {
+    if receipt_status != RuntimeRunOnceStatus::DeadLetter {
+        return Ok(None);
+    }
+    let Some(item) = item else {
+        warnings.push(
+            "polluted thread recovery skipped: prepared queue item was unavailable".to_string(),
+        );
+        return Ok(None);
+    };
+    if item.runtime_class != "interactive" || item.origin != "channel" {
+        return Ok(None);
+    }
+    if !context_recovery_indicates_polluted_thread(run.receipt.context_recovery.as_ref()) {
+        return Ok(None);
+    }
+    let config = load_context_rollover_config(harness_home)?;
+    if config.rollover_mode == ContextRolloverMode::Disabled {
+        warnings.push("polluted thread recovery skipped: context rollover disabled".to_string());
+        return Ok(None);
+    }
+    let current_index = item.continuation.continuation_index.unwrap_or(0);
+    if current_index >= config.max_successful_compacts_before_rollover {
+        warnings.push(format!(
+            "polluted thread recovery skipped: continuation depth {} reached configured limit {}",
+            current_index, config.max_successful_compacts_before_rollover
+        ));
+        return Ok(None);
+    }
+    let next_index = current_index.saturating_add(1);
+    let root_session = root_working_session_key(&item.session_key);
+    let new_working_session_key = continuation_session_key(&root_session, next_index);
+    let now_ms = current_log_time_ms()?;
+    match requeue_prepared_context_rollover_if_no_parent_siblings(
+        ContextRolloverRequeuePreparedOptions {
+            harness_home: harness_home.to_path_buf(),
+            queue_id: item.queue_id.clone(),
+            new_working_session_key,
+            reason: format!(
+                "automatic polluted-thread virtual session recovery after terminal {}; codexStatus={:?}; reason={}",
+                receipt_status.as_str(),
+                run.receipt.status,
+                run.receipt.reason
+            ),
+            now_ms,
+        },
+    ) {
+        Ok(report) => Ok(Some(report)),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            warnings.push(format!("polluted thread recovery skipped: {error}"));
+            Ok(None)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            warnings.push(format!("polluted thread recovery skipped: {error}"));
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn context_recovery_indicates_polluted_thread(
+    recovery: Option<&CodexContextRecoveryReceipt>,
+) -> bool {
+    let Some(recovery) = recovery else {
+        return false;
+    };
+    matches!(
+        recovery.status.as_str(),
+        "compact-before-turn-fallback-failed"
+            | "fresh-thread-failed"
+            | "compact-before-turn-failed"
+            | "compact-before-turn-timeout"
+    ) || recovery
+        .reason
+        .to_ascii_lowercase()
+        .contains("thread health")
+        || recovery.reason.to_ascii_lowercase().contains("polluted")
+        || recovery
+            .reason
+            .to_ascii_lowercase()
+            .contains("inline image")
 }
 
 fn truncate_for_channel(value: &str, max_chars: usize) -> String {
@@ -2643,6 +2751,46 @@ mod tests {
     }
 
     #[test]
+    fn polluted_thread_continuation_runs_only_at_dead_letter_and_respects_depth_limit() {
+        let root = temp_root("polluted_thread_continuation_dead_letter_depth");
+        let harness_home = root.join(".agent-harness");
+        let retry_item = prepared_test_item("queue-retry", "telegram:dm-42:user-7:main", None);
+        let run = polluted_thread_failed_run("queue-retry");
+        let mut warnings = Vec::new();
+
+        let retry_result = maybe_enqueue_polluted_thread_continuation(
+            &harness_home,
+            Some(&retry_item),
+            &run,
+            RuntimeRunOnceStatus::RetryPending,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(retry_result.is_none());
+        assert!(warnings.is_empty());
+
+        let max_depth_item =
+            prepared_test_item("queue-max", "telegram:dm-42:user-7:main:cont-2", Some(2));
+        let max_depth_result = maybe_enqueue_polluted_thread_continuation(
+            &harness_home,
+            Some(&max_depth_item),
+            &polluted_thread_failed_run("queue-max"),
+            RuntimeRunOnceStatus::DeadLetter,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(max_depth_result.is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("continuation depth 2"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_runtime_queue_once_retries_reconnecting_protocol_error_then_dead_letters() {
         let _guard = ENV_LOCK.lock().unwrap();
         let root = temp_root(
@@ -3086,6 +3234,90 @@ mod tests {
                     None => std::env::remove_var(self.key),
                 }
             }
+        }
+    }
+
+    fn prepared_test_item(
+        queue_id: &str,
+        session_key: &str,
+        continuation_index: Option<u64>,
+    ) -> RuntimeQueuePreparedItem {
+        RuntimeQueuePreparedItem {
+            queue_id: queue_id.to_string(),
+            agent_id: "main".to_string(),
+            session_key: session_key.to_string(),
+            runtime_class: "interactive".to_string(),
+            origin: "channel".to_string(),
+            cron_run_id: None,
+            scheduled_for_ms: None,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            provider: Some("openai".to_string()),
+            model: Some("gpt-5.5".to_string()),
+            execution_dir: PathBuf::from("execution"),
+            prompt_bundle_json: PathBuf::from("prompt-bundle.json"),
+            prompt_markdown: PathBuf::from("prompt.md"),
+            receipt_file: PathBuf::from("execution-receipt.json"),
+            planned_transcript_file: PathBuf::from("transcript.jsonl"),
+            planned_trajectory_file: PathBuf::from("trajectory.jsonl"),
+            selected_skill_ids: Vec::new(),
+            continuation: RuntimeContinuationMetadata {
+                continuation_index,
+                ..RuntimeContinuationMetadata::legacy()
+            },
+        }
+    }
+
+    fn polluted_thread_failed_run(queue_id: &str) -> CodexRuntimeRunReport {
+        CodexRuntimeRunReport {
+            schema: "agent-harness.codex-runtime-run.v1",
+            harness_home: PathBuf::from(".agent-harness"),
+            execution_dir: Some(PathBuf::from("execution")),
+            plan_file: Some(PathBuf::from("codex-runtime-plan.json")),
+            run_file: Some(PathBuf::from("codex-runtime-run.json")),
+            receipts_file: PathBuf::from("codex-runtime-run-receipts.jsonl"),
+            receipt: crate::CodexRuntimeRunReceipt {
+                queue_id: Some(queue_id.to_string()),
+                status: CodexRuntimeRunStatus::ProtocolError,
+                execution_dir: Some(PathBuf::from("execution")),
+                plan_file: Some(PathBuf::from("codex-runtime-plan.json")),
+                run_file: Some(PathBuf::from("codex-runtime-run.json")),
+                completion_file: None,
+                transcript_file: None,
+                trajectory_file: None,
+                codex_binding_file: None,
+                reason: "app-server completed without final answer after polluted thread health recovery".to_string(),
+                elapsed_ms: 300_000,
+                event_count: 0,
+                usage: None,
+                media_plan: Default::default(),
+                context_recovery: Some(CodexContextRecoveryReceipt {
+                    status: "compact-before-turn-fallback-failed".to_string(),
+                    queue_id: Some(queue_id.to_string()),
+                    session_key: "telegram:dm-42:user-7:main".to_string(),
+                    original_thread_id: Some("thread-polluted".to_string()),
+                    recovered_thread_id: Some("thread-fresh".to_string()),
+                    official_compact_attempts: 1,
+                    retry_attempted: true,
+                    fallback_policy: "checkpoint-and-new-thread".to_string(),
+                    fresh_thread_attempted: true,
+                    fresh_thread_succeeded: false,
+                    checkpoint_file: None,
+                    rollover_file: None,
+                    binding_backup_file: None,
+                    reason: "bound thread health guard found inline image bloat and fallback failed"
+                        .to_string(),
+                }),
+                tool_use_timeout: None,
+            },
+            completion: None,
+            stdout_log: None,
+            stderr_log: None,
+            warnings: Vec::new(),
         }
     }
 

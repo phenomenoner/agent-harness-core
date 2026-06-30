@@ -941,6 +941,52 @@ pub fn requeue_prepared_context_rollover(
     Ok(report)
 }
 
+pub fn requeue_prepared_context_rollover_if_no_parent_siblings(
+    options: ContextRolloverRequeuePreparedOptions,
+) -> io::Result<ContextRolloverPreparedRequeueReport> {
+    let queue_file = options
+        .harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("pending.jsonl");
+    let pending_item =
+        find_pending_queue_item(&queue_file, &options.queue_id)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("pending queue item {} was not found", options.queue_id),
+            )
+        })?;
+    let parent_session = string_field(&pending_item, &["sessionKey", "session_key"])
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pending queue item has no sessionKey; refusing auto rollover requeue",
+            )
+        })?
+        .to_string();
+    let agent_id = string_field(&pending_item, &["agentId", "agent_id"]).unwrap_or("main");
+    let platform = string_field(&pending_item, &["platform"]).unwrap_or("unknown");
+    let channel_id = string_field(&pending_item, &["channelId", "channel_id"]).unwrap_or("unknown");
+    let user_id = string_field(&pending_item, &["userId", "user_id"]).unwrap_or("unknown");
+
+    if queued_parent_session_sibling_exists(
+        &queue_file,
+        &options.queue_id,
+        &parent_session,
+        agent_id,
+        platform,
+        channel_id,
+        user_id,
+    )? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "another pending item targets the parent working session; refusing auto rollover requeue",
+        ));
+    }
+
+    requeue_prepared_context_rollover(options)
+}
+
 pub fn context_rollover_receipts_file(harness_home: impl AsRef<Path>) -> PathBuf {
     harness_home
         .as_ref()
@@ -1230,6 +1276,45 @@ fn find_pending_queue_item(queue_file: &Path, queue_id: &str) -> io::Result<Opti
         }
     }
     Ok(None)
+}
+
+fn queued_parent_session_sibling_exists(
+    queue_file: &Path,
+    queue_id: &str,
+    parent_session: &str,
+    agent_id: &str,
+    platform: &str,
+    channel_id: &str,
+    user_id: &str,
+) -> io::Result<bool> {
+    if !queue_file.is_file() {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(queue_file)?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if string_field(&value, &["queueId", "queue_id"]) == Some(queue_id) {
+            continue;
+        }
+        if string_field(&value, &["status"]) != Some("queued") {
+            continue;
+        }
+        if string_field(&value, &["sessionKey", "session_key"]) == Some(parent_session)
+            && string_field(&value, &["agentId", "agent_id"]) == Some(agent_id)
+            && string_field(&value, &["platform"]) == Some(platform)
+            && string_field(&value, &["channelId", "channel_id"]) == Some(channel_id)
+            && string_field(&value, &["userId", "user_id"]) == Some(user_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn find_latest_prepared_receipt(receipts_file: &Path, queue_id: &str) -> io::Result<Option<Value>> {
@@ -2158,6 +2243,99 @@ mod tests {
             state.active_session_key,
             "telegram:dm:user:assistant:cont-1"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepared_auto_requeue_blocks_parent_session_sibling() {
+        let root = temp_root("prepared_auto_requeue_blocks_parent_session_sibling");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let state_file = channel_session_state_file(&harness_home, "telegram", "dm", "user");
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        write_json_atomic(
+            &state_file,
+            &ChannelSessionState {
+                schema: "agent-harness.channel-session-state.v1".to_string(),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                active_session_key: "telegram:dm:user:main".to_string(),
+                agent_id: Some("main".to_string()),
+                provider: None,
+                model: None,
+                session_topic: None,
+                model_override: None,
+                model_override_provider: None,
+                model_override_model: None,
+                thinking_enabled: false,
+                thinking_level: None,
+                thinking_instruction: None,
+                stop_requested: false,
+                stop_reason: None,
+                steering_notes: Vec::new(),
+                btw_notes: Vec::new(),
+                last_command: None,
+                updated_at_ms: 1,
+            },
+        )
+        .unwrap();
+        for queue_id in ["queue-1", "queue-2"] {
+            append_jsonl_value(
+                &queue_dir.join("pending.jsonl"),
+                &serde_json::json!({
+                    "schema": "agent-harness.runtime-queue-item.v1",
+                    "queueId": queue_id,
+                    "status": "queued",
+                    "runtimeClass": "interactive",
+                    "origin": "channel",
+                    "source": {"kind": "channel", "sourceHome": root, "sourceWorkspace": root},
+                    "createdAtMs": 1,
+                    "agentId": "main",
+                    "sessionKey": "telegram:dm:user:main",
+                    "platform": "telegram",
+                    "channelId": "dm",
+                    "userId": "user",
+                    "messageText": "continue",
+                    "plannedTranscriptFile": "old.jsonl",
+                    "plannedTrajectoryFile": "old.trajectory.jsonl"
+                }),
+            )
+            .unwrap();
+        }
+        append_jsonl_value(
+            &queue_dir.join("execution-receipts.jsonl"),
+            &serde_json::json!({
+                "queueId": "queue-1",
+                "status": "prepared",
+                "runtimeClass": "interactive",
+                "origin": "channel",
+                "executionDir": queue_dir.join("executions").join("queue-1"),
+                "promptBundleJson": "old-prompt-bundle.json"
+            }),
+        )
+        .unwrap();
+
+        let error = requeue_prepared_context_rollover_if_no_parent_siblings(
+            ContextRolloverRequeuePreparedOptions {
+                harness_home: harness_home.clone(),
+                queue_id: "queue-1".to_string(),
+                new_working_session_key: "telegram:dm:user:main:cont-1".to_string(),
+                reason: "auto polluted thread recovery".to_string(),
+                now_ms: 42,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("another pending item"));
+        let state = read_channel_session_state(&harness_home, "telegram", "dm", "user")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.active_session_key, "telegram:dm:user:main");
+        let queue_text = fs::read_to_string(queue_dir.join("pending.jsonl")).unwrap();
+        assert!(!queue_text.contains(":cont-1"));
         let _ = fs::remove_dir_all(root);
     }
 

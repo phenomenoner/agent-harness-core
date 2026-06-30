@@ -107,7 +107,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I13",
-            statement: "successful official Codex compaction feeds the harness context-rollover policy instead of silently compacting in place forever",
+            statement: "successful official Codex compaction feeds the harness context-rollover policy instead of silently compacting in place forever, and polluted-thread terminal recovery preserves single-delivery virtual-session continuity",
             owner: "codex_runtime/context_rollover/runtime_queue/prompt/runtime_pipeline",
         },
     ]
@@ -488,7 +488,7 @@ pub fn release_checklist() -> ReleaseChecklist {
             "prompt/memory changes passed /new task-boundary and per-agent memory recall checks",
             "openclaw-mem bridge ownership changes passed configured-bridge and fallback gates",
             "response/runtime changes passed final-surface separation checks, including stdout recovery without final_answer",
-            "context rollover changes passed official-compact accounting checks",
+            "context rollover changes passed official-compact accounting and polluted-thread recovery checks",
             "progress delivery changes passed edit-volume replay checks",
             "progress panel lane-cap heartbeat/current-step checks passed across channel platforms",
             "Codex tool-use timeout changes passed bounded recovery checks",

@@ -13,6 +13,11 @@
 - Updated invariant I13, the topology contract, release checklist output, and
   generated topology explorer data to record the staging evidence while keeping
   broader end-to-end live rollover/final-delivery promotion gates open.
+- Staged Round12 Track A2 polluted-thread recovery guard: terminal
+  `DeadLetter` failures with polluted Codex context recovery can enqueue a
+  virtual child continuation through the existing prepared-requeue path while
+  suppressing the parent error outbox; `RetryPending`, max-depth continuations,
+  and parent-session sibling pending items do not auto-rollover.
 
 ### Verification
 
@@ -25,6 +30,9 @@
 - `cargo check -p agent-harness-core --target-dir target\staging-check-round12-virtual-session-a`
 - `cargo build -p agent-harness-cli --target-dir target\staging-build-round12-virtual-session-a`
 - `target\staging-build-round12-virtual-session-a\debug\agent-harness.exe public-hygiene --root .public-export\round12-virtual-session-a-20260630`
+- `cargo test -p agent-harness-core polluted_thread_continuation_runs_only_at_dead_letter_and_respects_depth_limit --target-dir target\staging-test-round12-a2-polluted-thread -- --nocapture`
+- `cargo test -p agent-harness-core prepared_auto_requeue_blocks_parent_session_sibling --target-dir target\staging-test-round12-a2-polluted-thread -- --nocapture`
+- `cargo test -p agent-harness-core run_runtime_queue_once_retries_reconnecting_protocol_error_then_dead_letters --target-dir target\staging-test-round12-a2-polluted-thread -- --nocapture`
 
 ## v0.2.1 - 2026-06-29
 

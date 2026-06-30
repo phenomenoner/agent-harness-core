@@ -4,7 +4,7 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "9fa1192cd19780202d31a1a29ef0e0702ba3b3264d94088c6ebb7579c880d03a"
+      "sha256": "118b2528cc1f9d42a417a234fa0125ba646e4d004096e30e695b4a953fbec9af"
     },
     {
       "path": "docs/.private/agent-harness-operations-handbook.md",
@@ -444,8 +444,8 @@
       "state": "open-gap",
       "summary": "Virtual session and working-context continuity",
       "designTarget": "Long tasks should survive repeated compaction by rolling into fresh concrete sessions inside a stable virtual session, carrying a bounded working set so repeated compression does not silently distort task state. /new is a task-boundary command and must not inherit the previous virtual/task memory context.",
-      "currentEvidence": "context_rollover records compact counters, virtual-session records, working-set memory, session indexes, rollover episodes, and guarded requeue receipts; prompt assembly injects working-set continuity when a continuation session has an index. Local Round10 gap-closure staging adds prompt::tests::prompt_bundle_new_command_boundary_skips_prior_task_memory_context, proving a fresh /new prompt suppresses previous-task imported memory context. A 2026-06-29 Discord long-lane audit found repeated official Codex compact-before-turn successes on the same bound thread, but no visible compact-counter, rollover receipt, fresh session key, or structured skip reason. Round12 Track A staging wires official compact-before-turn success into context-rollover accounting and adds focused tests for lane counter advancement, compact thread id recording, idempotent queue/thread attempt keys, next-turn rollover rekeying, and leased-item blocking. Broader end-to-end rollover/final-delivery parity remains pending.",
-      "promotionGate": "Promote after an end-to-end scenario forces at least three high-context turns: first official compact success, second official compact success, then configured rollover or an explicit machine-readable skip receipt. The scenario must verify a fresh session key under the same virtual session when rollover occurs, check prompt working-set injection, confirm old prepared/leased turns are not rewritten unsafely, trace final outbox/delivery back to the continuation queue item, include Discord/TG lane identity axes, and separately prove /new creates a new task boundary that does not inherit previous-task memory context.",
+      "currentEvidence": "context_rollover records compact counters, virtual-session records, working-set memory, session indexes, rollover episodes, and guarded requeue receipts; prompt assembly injects working-set continuity when a continuation session has an index. Local Round10 gap-closure staging adds prompt::tests::prompt_bundle_new_command_boundary_skips_prior_task_memory_context, proving a fresh /new prompt suppresses previous-task imported memory context. A 2026-06-29 Discord long-lane audit found repeated official Codex compact-before-turn successes on the same bound thread, but no visible compact-counter, rollover receipt, fresh session key, or structured skip reason. Round12 Track A staging wires official compact-before-turn success into context-rollover accounting and adds focused tests for lane counter advancement, compact thread id recording, idempotent queue/thread attempt keys, next-turn rollover rekeying, and leased-item blocking. Round12 Track A2 staging adds a terminal polluted-thread recovery gate in runtime_pipeline that can requeue a prepared parent into a virtual child only at DeadLetter, blocks parent-session sibling pending items before channel-state advance, and preserves max-depth terminal delivery. Broader end-to-end rollover/final-delivery parity remains pending.",
+      "promotionGate": "Promote after an end-to-end scenario forces at least three high-context turns: first official compact success, second official compact success, then configured rollover or an explicit machine-readable skip receipt. The scenario must verify a fresh session key under the same virtual session when rollover occurs, check prompt working-set injection, confirm old prepared/leased turns are not rewritten unsafely, trace final outbox/delivery back to the continuation queue item, include Discord/TG lane identity axes, and separately prove /new creates a new task boundary that does not inherit previous-task memory context. The polluted-thread branch must additionally prove parent terminal error outbox is suppressed only when child enqueue succeeds, child success/failure yields exactly one user-visible reply, sibling pending turns are not stranded, and crash-ordering avoids both suppressed-without-child and parent-error-plus-child states.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -1159,7 +1159,17 @@
       "label": "tracked in"
     },
     {
+      "source": "component-channel-identity",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-channel-state",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime",
       "target": "gap-virtual-session-continuity-gap",
       "label": "has gap"
     },
@@ -1175,6 +1185,11 @@
     },
     {
       "source": "component-codex-runtime",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline",
       "target": "gap-virtual-session-continuity-gap",
       "label": "has gap"
     },

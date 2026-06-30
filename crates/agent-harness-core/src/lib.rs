@@ -158,7 +158,8 @@ pub use context_rollover::{
     continuation_session_key, is_rollover_completion_kind, load_context_rollover_config,
     load_or_create_context_compact_counter, load_working_set_continuity_section,
     parse_rollover_mode, planned_session_files, record_context_compact_attempt,
-    requeue_prepared_context_rollover, root_working_session_key, working_set_session_index_file,
+    requeue_prepared_context_rollover, requeue_prepared_context_rollover_if_no_parent_siblings,
+    root_working_session_key, working_set_session_index_file,
 };
 pub use cron::{
     NativeCronJob, NativeCronJobState, NativeCronPlan, NativeCronPlanAction, NativeCronPlanEntry,
