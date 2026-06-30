@@ -123,7 +123,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.codex-runtime-run.v1",
             owner_module: "codex_runtime",
-            compatibility: "append-only JSONL plus per-execution JSON; v1 accepts additive recovery fields such as toolUseTimeout",
+            compatibility: "append-only JSONL plus per-execution JSON; v1 accepts additive recovery fields such as toolUseTimeout and contextRecovery.threadHealthStatus",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.external-review-evidence.v1",
@@ -173,7 +173,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.codex-context-preflight.v1",
             owner_module: "codex_runtime",
-            compatibility: "append-only JSONL plus per-execution JSON; additive fields only in v1",
+            compatibility: "append-only JSONL plus per-execution JSON; additive fields only in v1, including threadHealthStatus",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.codex-context-checkpoint.v1",

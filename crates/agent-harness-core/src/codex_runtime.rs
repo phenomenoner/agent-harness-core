@@ -545,6 +545,8 @@ pub struct CodexRuntimeUsage {
 #[serde(rename_all = "camelCase")]
 pub struct CodexContextRecoveryReceipt {
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_health_status: Option<CodexThreadHealthStatus>,
     pub queue_id: Option<String>,
     pub session_key: String,
     pub original_thread_id: Option<String>,
@@ -626,6 +628,15 @@ struct CodexThreadHealthReport {
     reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexThreadHealthStatus {
+    Healthy,
+    CompactNeeded,
+    Polluted,
+    PollutedAfterCompact,
+}
+
 impl Default for CodexContextPolicy {
     fn default() -> Self {
         Self {
@@ -675,6 +686,7 @@ struct CodexContextPreflightReceipt {
     model_context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_context_ratio: Option<f64>,
+    thread_health_status: CodexThreadHealthStatus,
     thread_health: CodexThreadHealthReport,
     compact_before_turn: bool,
     reason: String,
@@ -2359,6 +2371,13 @@ fn preflight_codex_context(
         )
     };
     let preflight_file = execution_dir.map(|dir| dir.join("codex-context-preflight.json"));
+    let thread_health_status = if thread_health.compact_recommended {
+        CodexThreadHealthStatus::Polluted
+    } else if compact_before_turn {
+        CodexThreadHealthStatus::CompactNeeded
+    } else {
+        CodexThreadHealthStatus::Healthy
+    };
     let receipt = CodexContextPreflightReceipt {
         schema: CODEX_CONTEXT_PREFLIGHT_SCHEMA,
         queue_id: plan.queue_id.clone(),
@@ -2376,6 +2395,7 @@ fn preflight_codex_context(
         latest_usage,
         model_context_window,
         active_context_ratio,
+        thread_health_status,
         thread_health,
         compact_before_turn,
         reason,
@@ -3432,6 +3452,7 @@ fn drive_codex_app_server(
                 )?;
                 context_recovery = Some(CodexContextRecoveryReceipt {
                     status: "compact-before-turn".to_string(),
+                    thread_health_status: Some(CodexThreadHealthStatus::CompactNeeded),
                     queue_id: plan.queue_id.clone(),
                     session_key: plan.session_key.clone(),
                     original_thread_id: Some(thread_id.clone()),
@@ -3965,6 +3986,7 @@ fn context_recovery_failure_receipt(
 ) -> CodexContextRecoveryReceipt {
     CodexContextRecoveryReceipt {
         status: status.to_string(),
+        thread_health_status: None,
         queue_id: plan.queue_id.clone(),
         session_key: plan.session_key.clone(),
         original_thread_id,
@@ -4047,6 +4069,7 @@ fn recover_codex_context_exhaustion(
                 } else {
                     "compact-retry-failed".to_string()
                 },
+                thread_health_status: None,
                 queue_id: plan.queue_id.clone(),
                 session_key: plan.session_key.clone(),
                 original_thread_id: Some(thread_id),
@@ -4250,6 +4273,11 @@ fn recover_thread_health_protocol_error(
         } else {
             "thread-health-rollover-failed".to_string()
         };
+        recovery.thread_health_status = Some(if succeeded {
+            CodexThreadHealthStatus::Polluted
+        } else {
+            CodexThreadHealthStatus::PollutedAfterCompact
+        });
         recovery.reason = if succeeded {
             format!(
                 "retryable Codex ProtocolError after unhealthy bound thread; checkpoint fallback opened a fresh Codex thread. Guard reason: {guard_reason}. Prior reason: {prior_reason}"
@@ -4356,6 +4384,7 @@ fn recover_tool_use_timeout(
         } else {
             "tool-timeout-fallback-failed".to_string()
         },
+        thread_health_status: None,
         queue_id: plan.queue_id.clone(),
         session_key: plan.session_key.clone(),
         original_thread_id,
@@ -4475,6 +4504,7 @@ fn run_context_checkpoint_fallback(
         } else {
             "fresh-thread-failed".to_string()
         },
+        thread_health_status: None,
         queue_id: plan.queue_id.clone(),
         session_key: plan.session_key.clone(),
         original_thread_id,
@@ -9462,6 +9492,10 @@ mod tests {
 
         assert!(preflight.receipt.compact_before_turn);
         assert!(preflight.receipt.reason.contains("inline image"));
+        assert_eq!(
+            preflight.receipt.thread_health_status,
+            CodexThreadHealthStatus::Polluted
+        );
         assert!(preflight.receipt.thread_health.compact_recommended);
         assert_eq!(
             preflight.receipt.thread_health.thread_id.as_deref(),
@@ -9527,6 +9561,15 @@ mod tests {
         assert_eq!(
             report.receipt.context_recovery.as_ref().unwrap().status,
             "thread-health-rollover-succeeded"
+        );
+        assert_eq!(
+            report
+                .receipt
+                .context_recovery
+                .as_ref()
+                .unwrap()
+                .thread_health_status,
+            Some(CodexThreadHealthStatus::Polluted)
         );
         assert!(
             report

@@ -18,6 +18,9 @@
   virtual child continuation through the existing prepared-requeue path while
   suppressing the parent error outbox; `RetryPending`, max-depth continuations,
   and parent-session sibling pending items do not auto-rollover.
+- Added structured `threadHealthStatus` telemetry to Codex context preflight
+  and recovery receipts so polluted-thread virtual-session recovery no longer
+  depends only on diagnostic reason-string matching.
 
 ### Verification
 
@@ -33,6 +36,8 @@
 - `cargo test -p agent-harness-core polluted_thread_continuation_runs_only_at_dead_letter_and_respects_depth_limit --target-dir target\staging-test-round12-a2-polluted-thread -- --nocapture`
 - `cargo test -p agent-harness-core prepared_auto_requeue_blocks_parent_session_sibling --target-dir target\staging-test-round12-a2-polluted-thread -- --nocapture`
 - `cargo test -p agent-harness-core run_runtime_queue_once_retries_reconnecting_protocol_error_then_dead_letters --target-dir target\staging-test-round12-a2-polluted-thread -- --nocapture`
+- `cargo test -p agent-harness-core context_preflight_compacts_for_bound_thread_inline_image_bloat --target-dir target\staging-test-round12-a2-thread-health-status -- --nocapture`
+- `cargo test -p agent-harness-core retryable_protocol_error_after_bloated_thread_rolls_over_to_fresh_thread --target-dir target\staging-test-round12-a2-thread-health-status -- --nocapture`
 
 ## v0.2.1 - 2026-06-29
 

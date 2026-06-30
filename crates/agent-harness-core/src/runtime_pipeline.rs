@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::codex_runtime::CodexContextRecoveryReceipt;
+use crate::codex_runtime::{CodexContextRecoveryReceipt, CodexThreadHealthStatus};
 use crate::{
     AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
     AssistantNarrationConfig, AssistantNarrationMode, ChannelDeliveryIntent,
@@ -1204,6 +1204,12 @@ fn context_recovery_indicates_polluted_thread(
     let Some(recovery) = recovery else {
         return false;
     };
+    if matches!(
+        recovery.thread_health_status,
+        Some(CodexThreadHealthStatus::Polluted | CodexThreadHealthStatus::PollutedAfterCompact)
+    ) {
+        return true;
+    }
     matches!(
         recovery.status.as_str(),
         "compact-before-turn-fallback-failed"
@@ -3297,6 +3303,7 @@ mod tests {
                 media_plan: Default::default(),
                 context_recovery: Some(CodexContextRecoveryReceipt {
                     status: "compact-before-turn-fallback-failed".to_string(),
+                    thread_health_status: Some(CodexThreadHealthStatus::PollutedAfterCompact),
                     queue_id: Some(queue_id.to_string()),
                     session_key: "telegram:dm-42:user-7:main".to_string(),
                     original_thread_id: Some("thread-polluted".to_string()),
