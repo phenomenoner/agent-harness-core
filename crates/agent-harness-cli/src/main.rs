@@ -19600,6 +19600,7 @@ fn runtime_run_once_report_is_idle(report: &RuntimeRunOnceReport) -> bool {
 fn runtime_run_once_status_label(status: RuntimeRunOnceStatus) -> &'static str {
     match status {
         RuntimeRunOnceStatus::Completed => "completed",
+        RuntimeRunOnceStatus::Skipped => "skipped",
         RuntimeRunOnceStatus::LeaseBusy => "lease-busy",
         RuntimeRunOnceStatus::NoWork => "no-work",
         RuntimeRunOnceStatus::NoPreparedExecution => "no-prepared-execution",
@@ -21869,7 +21870,7 @@ mod tests {
     #[test]
     fn telegram_trusted_html_payload_keeps_renderer_output_unescaped() {
         let payload = telegram_message_payload(
-            "2118296735",
+            "123456789",
             "<b>Status</b>: <code>PASS</code>",
             TelegramSendOptions {
                 formatting_mode: TelegramFormattingMode::TrustedHtml,

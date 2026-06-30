@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::codex_runtime::{CodexContextRecoveryReceipt, CodexThreadHealthStatus};
-use crate::rich_presentation::rich_presentation_from_plain_final;
+use crate::rich_presentation::rich_presentation_from_plain_final_with_attachment_count;
 use crate::{
     AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
     AssistantNarrationConfig, AssistantNarrationMode, ChannelDeliveryIntent,
@@ -36,6 +36,65 @@ const RUNTIME_DEAD_LETTER_SCHEMA: &str = "agent-harness.runtime-dead-letter.v1";
 const FINAL_OUTBOX_RECEIPT_SCHEMA: &str = "agent-harness.runtime-final-outbox.v1";
 const STREAM_UNSTABLE_CONTINUATION_MIN_ATTEMPTS: usize = 2;
 const STREAM_UNSTABLE_CONTINUATION_TOKEN_LIMIT: u64 = 80_000;
+
+#[derive(Debug, Clone)]
+struct RuntimeContinuationCandidate {
+    queue_id: String,
+    session_key: String,
+    runtime_class: String,
+    origin: String,
+    inbound_media_artifacts: Vec<InboundMediaArtifact>,
+    continuation: RuntimeContinuationMetadata,
+}
+
+impl RuntimeContinuationCandidate {
+    fn from_prepared_item(item: &RuntimeQueuePreparedItem) -> Self {
+        Self {
+            queue_id: item.queue_id.clone(),
+            session_key: item.session_key.clone(),
+            runtime_class: item.runtime_class.clone(),
+            origin: item.origin.clone(),
+            inbound_media_artifacts: item.inbound_media_artifacts.clone(),
+            continuation: item.continuation.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingContinuationCandidateRecord {
+    queue_id: String,
+    session_key: String,
+    #[serde(default = "default_interactive_runtime_class_text")]
+    runtime_class: String,
+    #[serde(default = "default_channel_origin_text")]
+    origin: String,
+    #[serde(default)]
+    inbound_media_artifacts: Vec<InboundMediaArtifact>,
+    #[serde(default, flatten)]
+    continuation: RuntimeContinuationMetadata,
+}
+
+impl From<PendingContinuationCandidateRecord> for RuntimeContinuationCandidate {
+    fn from(record: PendingContinuationCandidateRecord) -> Self {
+        Self {
+            queue_id: record.queue_id,
+            session_key: record.session_key,
+            runtime_class: record.runtime_class,
+            origin: record.origin,
+            inbound_media_artifacts: record.inbound_media_artifacts,
+            continuation: record.continuation,
+        }
+    }
+}
+
+fn default_interactive_runtime_class_text() -> String {
+    "interactive".to_string()
+}
+
+fn default_channel_origin_text() -> String {
+    "channel".to_string()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeRunOnceOptions {
@@ -88,6 +147,7 @@ pub struct RuntimeRunOnceReceipt {
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeRunOnceStatus {
     Completed,
+    Skipped,
     LeaseBusy,
     NoWork,
     NoPreparedExecution,
@@ -107,6 +167,7 @@ impl RuntimeRunOnceStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Completed => "completed",
+            Self::Skipped => "skipped",
             Self::LeaseBusy => "lease-busy",
             Self::NoWork => "no-work",
             Self::NoPreparedExecution => "no-prepared-execution",
@@ -417,7 +478,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         .unwrap_or(0);
     let retry_policy = inspect_runtime_backoff_policy(&options.harness_home)?;
     warnings.extend(retry_policy.warnings.clone());
-    let receipt_status = final_run_once_status(
+    let mut receipt_status = final_run_once_status(
         run.receipt.status,
         queue_failure_attempts,
         &run.receipt.reason,
@@ -556,7 +617,11 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                 kind: ChannelOutboundMessageKind::AgentReply,
                                 source_queue_id: run.receipt.queue_id.clone(),
                                 source_completion_file: run.receipt.completion_file.clone(),
-                                presentation: rich_presentation_from_plain_final(&text),
+                                presentation:
+                                    rich_presentation_from_plain_final_with_attachment_count(
+                                        &text,
+                                        attachments.len(),
+                                    ),
                                 text,
                                 delivery_intent: delivery_intent_from_inbound_context(
                                     &context.platform,
@@ -711,6 +776,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 "stream-unstable retry enqueued continuation queue item {} after repeated high-risk Codex stream disconnect",
                 rollover.requeued_queue_id
             ));
+            receipt_status = RuntimeRunOnceStatus::Skipped;
         } else {
             warnings.push(format!(
                 "runtime failure for queue item will be retried; attempt {}/{}",
@@ -746,6 +812,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         | RuntimeRunOnceStatus::DeadLetter
         | RuntimeRunOnceStatus::FailedTerminal => HarnessLogLevel::Error,
         RuntimeRunOnceStatus::Canceled
+        | RuntimeRunOnceStatus::Skipped
         | RuntimeRunOnceStatus::RetryPending
         | RuntimeRunOnceStatus::LeaseBusy => HarnessLogLevel::Warn,
         RuntimeRunOnceStatus::NoWork
@@ -755,6 +822,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
     };
     let log_event = match receipt.status {
         RuntimeRunOnceStatus::Completed => "runtime.run-once.completed",
+        RuntimeRunOnceStatus::Skipped => "runtime.run-once.skipped",
         RuntimeRunOnceStatus::LeaseBusy => "runtime.run-once.lease-busy",
         RuntimeRunOnceStatus::NoWork => "runtime.run-once.no-work",
         RuntimeRunOnceStatus::NoPreparedExecution => "runtime.run-once.no-prepared-execution",
@@ -967,6 +1035,7 @@ fn append_runtime_progress_finished(
     };
     let progress_status = match status {
         RuntimeRunOnceStatus::Completed => AgentProgressStatus::Completed,
+        RuntimeRunOnceStatus::Skipped => AgentProgressStatus::Completed,
         RuntimeRunOnceStatus::RetryPending => AgentProgressStatus::Progress,
         _ => AgentProgressStatus::Failed,
     };
@@ -990,6 +1059,7 @@ fn append_runtime_progress_finished(
 fn runtime_progress_preview(status: RuntimeRunOnceStatus, reason: &str) -> String {
     match status {
         RuntimeRunOnceStatus::Completed => "done".to_string(),
+        RuntimeRunOnceStatus::Skipped => "skipped because continuation work was queued".to_string(),
         RuntimeRunOnceStatus::RetryPending => {
             "transient runtime failure; preserving session for retry".to_string()
         }
@@ -1112,6 +1182,12 @@ fn is_retryable_codex_protocol_error(reason: &str) -> bool {
         || lower.contains("reconnecting...")
 }
 
+fn is_stream_unstable_codex_protocol_error(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("stream disconnected before completion")
+        || lower.contains("websocket closed by server before response.completed")
+}
+
 fn is_external_review_evidence_protocol_error(reason: &str) -> bool {
     reason
         .to_ascii_lowercase()
@@ -1141,6 +1217,11 @@ fn final_run_once_reason(
         RuntimeRunOnceStatus::Canceled => {
             format!("runtime queue item was canceled by operator request; reason: {reason}")
         }
+        RuntimeRunOnceStatus::Skipped => {
+            format!(
+                "runtime queue item was skipped because continuation work was queued; reason: {reason}"
+            )
+        }
         _ => reason.to_string(),
     }
 }
@@ -1159,6 +1240,63 @@ fn should_write_failure_outbox(status: RuntimeRunOnceStatus) -> bool {
     )
 }
 
+fn continuation_candidate_for_run(
+    harness_home: &Path,
+    item: Option<&RuntimeQueuePreparedItem>,
+    queue_id: Option<&str>,
+    label: &str,
+    warnings: &mut Vec<String>,
+) -> io::Result<Option<RuntimeContinuationCandidate>> {
+    if let Some(item) = item {
+        return Ok(Some(RuntimeContinuationCandidate::from_prepared_item(item)));
+    }
+    let Some(queue_id) = queue_id else {
+        warnings.push(format!(
+            "{label} skipped: runtime run receipt had no queue id"
+        ));
+        return Ok(None);
+    };
+    let recovered = read_pending_continuation_candidate(harness_home, queue_id, warnings)?;
+    if recovered.is_none() {
+        warnings.push(format!(
+            "{label} skipped: queue item metadata was unavailable for {queue_id}"
+        ));
+    }
+    Ok(recovered)
+}
+
+fn read_pending_continuation_candidate(
+    harness_home: &Path,
+    queue_id: &str,
+    warnings: &mut Vec<String>,
+) -> io::Result<Option<RuntimeContinuationCandidate>> {
+    let queue_file = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("pending.jsonl");
+    let text = match fs::read_to_string(&queue_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<PendingContinuationCandidateRecord>(trimmed) {
+            Ok(record) if record.queue_id == queue_id => return Ok(Some(record.into())),
+            Ok(_) => {}
+            Err(error) => warnings.push(format!(
+                "pending queue item line {} could not be read for continuation metadata: {}",
+                index + 1,
+                error
+            )),
+        }
+    }
+    Ok(None)
+}
+
 fn maybe_enqueue_polluted_thread_continuation(
     harness_home: &Path,
     item: Option<&RuntimeQueuePreparedItem>,
@@ -1169,10 +1307,14 @@ fn maybe_enqueue_polluted_thread_continuation(
     if receipt_status != RuntimeRunOnceStatus::DeadLetter {
         return Ok(None);
     }
-    let Some(item) = item else {
-        warnings.push(
-            "polluted thread recovery skipped: prepared queue item was unavailable".to_string(),
-        );
+    let Some(item) = continuation_candidate_for_run(
+        harness_home,
+        item,
+        run.receipt.queue_id.as_deref(),
+        "polluted thread recovery",
+        warnings,
+    )?
+    else {
         return Ok(None);
     };
     if item.runtime_class != "interactive" || item.origin != "channel" {
@@ -1232,14 +1374,17 @@ fn maybe_enqueue_stream_unstable_retry_continuation(
     failure_attempts: usize,
     warnings: &mut Vec<String>,
 ) -> io::Result<Option<ContextRolloverPreparedRequeueReport>> {
-    let Some(item) = item else {
-        warnings.push(
-            "stream-unstable retry continuation skipped: prepared queue item was unavailable"
-                .to_string(),
-        );
+    let Some(item) = continuation_candidate_for_run(
+        harness_home,
+        item,
+        run.receipt.queue_id.as_deref(),
+        "stream-unstable retry continuation",
+        warnings,
+    )?
+    else {
         return Ok(None);
     };
-    if !should_enqueue_stream_unstable_retry_continuation(item, run, failure_attempts) {
+    if !should_enqueue_stream_unstable_retry_continuation(&item, run, failure_attempts) {
         return Ok(None);
     }
     let config = load_context_rollover_config(harness_home)?;
@@ -1303,7 +1448,7 @@ fn maybe_enqueue_stream_unstable_retry_continuation(
 }
 
 fn should_enqueue_stream_unstable_retry_continuation(
-    item: &RuntimeQueuePreparedItem,
+    item: &RuntimeContinuationCandidate,
     run: &CodexRuntimeRunReport,
     failure_attempts: usize,
 ) -> bool {
@@ -1316,7 +1461,7 @@ fn should_enqueue_stream_unstable_retry_continuation(
     if failure_attempts < STREAM_UNSTABLE_CONTINUATION_MIN_ATTEMPTS {
         return false;
     }
-    if !is_retryable_codex_protocol_error(&run.receipt.reason) {
+    if !is_stream_unstable_codex_protocol_error(&run.receipt.reason) {
         return false;
     }
     let usage_exceeds_limit = run.receipt.usage.as_ref().is_some_and(|usage| {
@@ -2296,6 +2441,75 @@ mod tests {
     }
 
     #[test]
+    fn run_runtime_queue_once_keeps_media_attachments_in_rich_presentation() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("run_runtime_queue_once_keeps_media_attachments_in_rich_presentation");
+        fs::create_dir_all(&root).unwrap();
+        let media_file = root.join("final-artifact.txt");
+        fs::write(&media_file, "package d media smoke").unwrap();
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "discord".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "send the generated artifact".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+        let fake_codex = fake_media_final_codex_executable(&root, &media_file);
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            codex_executable: Some(fake_codex),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        let outbound = report.outbound_message.unwrap();
+        assert_eq!(outbound.kind, ChannelOutboundMessageKind::AgentReply);
+        assert_eq!(outbound.platform, "discord");
+        assert_eq!(outbound.text, "Here is the file.\nDone.");
+        assert_eq!(outbound.attachments.len(), 1);
+        assert_eq!(outbound.attachments[0].path, media_file);
+        assert_eq!(outbound.attachments[0].mime.as_deref(), Some("text/plain"));
+        let presentation = outbound.presentation.as_ref().unwrap();
+        assert_eq!(presentation.fallback_text, "Here is the file.\nDone.");
+        assert_eq!(presentation.media.len(), 1);
+        assert_eq!(presentation.media[0].attachment_index, Some(0));
+        let outbox = fs::read_to_string(report.outbox_file.unwrap()).unwrap();
+        assert!(outbox.contains("\"presentation\""));
+        assert!(outbox.contains("\"attachments\""));
+        assert!(outbox.contains("\"attachmentIndex\":0"));
+        assert!(!outbox.contains("MEDIA:"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_runtime_queue_once_repairs_outbox_for_already_recorded_completion() {
         let _guard = ENV_LOCK.lock().unwrap();
         let root =
@@ -2875,21 +3089,29 @@ mod tests {
     #[test]
     fn stream_unstable_retry_continuation_requires_repeated_high_usage_media_failure() {
         let item = prepared_test_item("queue-stream", "discord:dm-42:user-7:main", None);
+        let candidate = RuntimeContinuationCandidate::from_prepared_item(&item);
         let run = stream_unstable_failed_run("queue-stream", Some(90_038), true);
+        let mut reconnecting_only = stream_unstable_failed_run("queue-stream", Some(90_038), true);
+        reconnecting_only.receipt.reason = "Reconnecting... 2/5".to_string();
 
         assert!(should_enqueue_stream_unstable_retry_continuation(
-            &item, &run, 2
+            &candidate, &run, 2
         ));
         assert!(!should_enqueue_stream_unstable_retry_continuation(
-            &item, &run, 1
+            &candidate,
+            &reconnecting_only,
+            2
         ));
         assert!(!should_enqueue_stream_unstable_retry_continuation(
-            &item,
+            &candidate, &run, 1
+        ));
+        assert!(!should_enqueue_stream_unstable_retry_continuation(
+            &candidate,
             &stream_unstable_failed_run("queue-stream", Some(79_999), true),
             2
         ));
         assert!(!should_enqueue_stream_unstable_retry_continuation(
-            &item,
+            &candidate,
             &stream_unstable_failed_run("queue-stream", Some(90_038), false),
             2
         ));
@@ -3031,6 +3253,134 @@ mod tests {
                 .exists()
         );
         assert!(warnings.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stream_unstable_retry_continuation_tombstones_parent_queue_item() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("stream_unstable_retry_continuation_tombstones_parent_queue_item");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "discord".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "handle these media files without losing the workflow".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: vec![InboundMediaArtifact {
+                platform: "discord".to_string(),
+                kind: "attachment-image".to_string(),
+                artifact_uri: Some("agent-harness://inbound-media/discord/msg-1/0.jpg".to_string()),
+                mime: Some("image/jpeg".to_string()),
+                sha256: Some("abc123".to_string()),
+                ..InboundMediaArtifact::default()
+            }],
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        let queue_id = receive.queue_id.unwrap();
+        write_test_channel_session_state(
+            &harness_home,
+            "discord",
+            "dm-42",
+            "user-7",
+            "discord:dm-42:user-7:main",
+            "main",
+        );
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let first = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: Some(fake_high_usage_reconnecting_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(first.receipt.status, RuntimeRunOnceStatus::RetryPending);
+        assert!(first.outbound_message.is_none());
+
+        let second = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: Some(fake_high_usage_reconnecting_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(second.receipt.status, RuntimeRunOnceStatus::Skipped);
+        assert!(second.outbound_message.is_none());
+        assert!(second.receipt.reason.contains("childQueueId="));
+
+        let run_once_receipts = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("run-once-receipts.jsonl"),
+        )
+        .unwrap();
+        let latest_parent_status = run_once_receipts
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| string_field(value, &["queueId"]) == Some(queue_id.as_str()))
+            .filter_map(|value| string_field(&value, &["status"]).map(str::to_string))
+            .last()
+            .unwrap();
+        assert_eq!(latest_parent_status, "skipped");
+
+        let pending = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        assert!(pending.contains("\"requeuedFromQueueId\""));
+        assert!(pending.contains("\"completionKind\":\"continuation-rollover\""));
+
+        let third = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            codex_executable: Some(fake_high_usage_reconnecting_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_ne!(third.receipt.queue_id.as_deref(), Some(queue_id.as_str()));
+        assert!(
+            third
+                .receipt
+                .queue_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("turn:") || id.contains(":rollover-requeue-"))
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3695,6 +4045,45 @@ mod tests {
         .unwrap();
     }
 
+    fn write_test_channel_session_state(
+        harness_home: &Path,
+        platform: &str,
+        channel_id: &str,
+        user_id: &str,
+        session_key: &str,
+        agent_id: &str,
+    ) {
+        let state_file =
+            crate::channel_session_state_file(harness_home, platform, channel_id, user_id);
+        write_json_atomic(
+            &state_file,
+            &crate::ChannelSessionState {
+                schema: "agent-harness.channel-session-state.v1".to_string(),
+                platform: platform.to_string(),
+                channel_id: channel_id.to_string(),
+                user_id: user_id.to_string(),
+                active_session_key: session_key.to_string(),
+                agent_id: Some(agent_id.to_string()),
+                provider: None,
+                model: None,
+                session_topic: None,
+                model_override: None,
+                model_override_provider: None,
+                model_override_model: None,
+                thinking_enabled: false,
+                thinking_level: None,
+                thinking_instruction: None,
+                stop_requested: false,
+                stop_reason: None,
+                steering_notes: Vec::new(),
+                btw_notes: Vec::new(),
+                last_command: None,
+                updated_at_ms: 1_234,
+            },
+        )
+        .unwrap();
+    }
+
     fn prepare_already_recorded_completion_without_outbox(
         root: &Path,
     ) -> (PathBuf, String, PathBuf, EnvGuard) {
@@ -3814,6 +4203,59 @@ while ($true) {
         )
         .unwrap();
         let cmd = root.join("fake-codex.cmd");
+        fs::write(
+            &cmd,
+            format!(
+                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        cmd
+    }
+
+    #[cfg(windows)]
+    fn fake_media_final_codex_executable(root: &Path, media_path: &Path) -> PathBuf {
+        fs::write(
+            root.join("media-path.txt"),
+            media_path.display().to_string(),
+        )
+        .unwrap();
+        let script = root.join("fake-media-final-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+$media = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'media-path.txt') -Raw).Trim()
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try {
+        $msg = $line | ConvertFrom-Json
+    } catch {
+        continue
+    }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-media-final"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        $delta = "Here is the file.`nMEDIA:$media`nDone."
+        $event = @{
+            method = 'item/agentMessage/delta'
+            params = @{ delta = $delta }
+        } | ConvertTo-Json -Compress
+        [Console]::Out.WriteLine($event)
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"turn":{"id":"turn-media-final","status":"completed"}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let cmd = root.join("fake-media-final-codex.cmd");
         fs::write(
             &cmd,
             format!(
@@ -3961,6 +4403,48 @@ while ($true) {
         cmd
     }
 
+    #[cfg(windows)]
+    fn fake_high_usage_reconnecting_codex_executable(root: &Path) -> PathBuf {
+        let script = root.join("fake-high-usage-reconnecting-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try {
+        $msg = $line | ConvertFrom-Json
+    } catch {
+        continue
+    }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-high-usage-reconnect"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"input":90038,"output":2513,"total":92551}}}')
+        [Console]::Out.WriteLine('{"method":"error","params":{"message":"Reconnecting... 2/5","additionalDetails":"stream disconnected before completion: websocket closed by server before response.completed"}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let cmd = root.join("fake-high-usage-reconnecting-codex.cmd");
+        fs::write(
+            &cmd,
+            format!(
+                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        cmd
+    }
+
     #[cfg(not(windows))]
     fn fake_codex_executable(root: &Path) -> PathBuf {
         let script = root.join("fake-codex");
@@ -3978,6 +4462,46 @@ while IFS= read -r line; do
         *'"method":"turn/start"'*)
             printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"Pipeline fake reply."}}'
             printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-pipeline","status":"completed"}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+        script
+    }
+
+    #[cfg(not(windows))]
+    fn fake_media_final_codex_executable(root: &Path, media_path: &Path) -> PathBuf {
+        fs::write(
+            root.join("media-path.txt"),
+            media_path.display().to_string(),
+        )
+        .unwrap();
+        let script = root.join("fake-media-final-codex");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+media="$(cat "$(dirname "$0")/media-path.txt")"
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-media-final"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' "{\"method\":\"item/agentMessage/delta\",\"params\":{\"delta\":\"Here is the file.\\nMEDIA:$media\\nDone.\"}}"
+            printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-media-final","status":"completed"}}}'
             exit 0
             ;;
     esac
@@ -4040,6 +4564,40 @@ while IFS= read -r line; do
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-reconnect"}}}'
             ;;
         *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"error","params":{"message":"Reconnecting... 2/5","additionalDetails":"stream disconnected before completion: websocket closed by server before response.completed"}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+        script
+    }
+
+    #[cfg(not(windows))]
+    fn fake_high_usage_reconnecting_codex_executable(root: &Path) -> PathBuf {
+        let script = root.join("fake-high-usage-reconnecting-codex");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-high-usage-reconnect"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"input":90038,"output":2513,"total":92551}}}'
             printf '%s\n' '{"method":"error","params":{"message":"Reconnecting... 2/5","additionalDetails":"stream disconnected before completion: websocket closed by server before response.completed"}}'
             exit 0
             ;;

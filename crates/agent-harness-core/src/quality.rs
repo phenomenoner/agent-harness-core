@@ -555,6 +555,7 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "runtime_pipeline::tests::polluted_thread_continuation_runs_only_at_dead_letter_and_respects_depth_limit",
                 "runtime_pipeline::tests::stream_unstable_retry_continuation_requires_repeated_high_usage_media_failure",
                 "runtime_pipeline::tests::repeated_stream_disconnect_high_media_retry_requeues_continuation",
+                "runtime_pipeline::tests::stream_unstable_retry_continuation_tombstones_parent_queue_item",
                 "prompt::tests::prompt_bundle_new_command_boundary_skips_prior_task_memory_context",
             ],
             promotion_gate: "Force high-context compact rollover and repeated stream-unstable media retry scenarios, then prove rollover/final-delivery parity across Discord/TG identity axes.",
@@ -584,6 +585,7 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "progress::tests::delivery_plan_status_heartbeat_after_body_cap_is_channel_agnostic",
                 "progress::tests::delivery_plan_status_updates_immediately_for_new_current_step_after_body_cap",
                 "progress::tests::action_stream_summarizes_internal_worker_results_instead_of_raw_final_text",
+                "progress::tests::action_stream_summarizes_structured_subagent_notifications_without_source_label",
                 "codex_runtime::tests::run_codex_runtime_rejects_stdout_recovery_narration_without_final_answer",
             ],
             promotion_gate: "Replay Telegram and Discord long-running turns through progress caps, recovery, final outbox, and terminal convergence.",
@@ -649,12 +651,14 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
             runnable_tests: vec![
                 "rich_presentation::tests::legacy_channel_outbound_message_without_presentation_stays_plain_text",
                 "rich_presentation::tests::plain_final_bridge_builds_safe_paragraph_and_code_blocks",
+                "rich_presentation::tests::plain_final_bridge_maps_attachments_to_rendered_media_units",
                 "rich_presentation::tests::rich_presentation_validation_fails_closed_for_unsafe_shapes",
                 "rich_presentation::tests::telegram_render_fixture_escapes_html_and_disables_preview",
                 "rich_presentation::tests::discord_render_fixture_splits_and_suppresses_mentions",
                 "rich_presentation::tests::telegram_rendered_batch_gates_callback_actions_and_units",
                 "rich_presentation::tests::discord_rendered_batch_accounts_chunks_and_action_units",
                 "runtime_pipeline::tests::run_runtime_queue_once_records_agent_reply_outbox",
+                "runtime_pipeline::tests::run_runtime_queue_once_keeps_media_attachments_in_rich_presentation",
                 "runtime_pipeline::tests::already_recorded_completion_repair_keeps_progress_panel_out_of_final_outbox",
                 "channel_delivery::tests::rich_delivery_receipt_records_units_and_retries_partial_failure",
                 "channel_delivery::tests::rich_delivery_rejects_delivered_receipt_when_any_unit_failed",
@@ -702,7 +706,7 @@ pub fn release_checklist() -> ReleaseChecklist {
             "prompt/memory changes passed /new task-boundary and per-agent memory recall checks",
             "openclaw-mem bridge ownership changes passed configured-bridge and fallback gates",
             "response/runtime changes passed final-surface separation checks, including stdout recovery without final_answer",
-            "rich-message presentation changes passed adapter-rendering, no-ping, escaping, multi-unit receipt, and interaction re-entry checks",
+            "rich-message presentation changes passed adapter-rendering, no-ping, escaping, multi-unit receipt, and action re-entry verified-or-deferred checks",
             "context rollover changes passed official-compact accounting and polluted-thread recovery checks",
             "progress delivery changes passed edit-volume replay checks",
             "progress panel lane-cap heartbeat/current-step checks passed across channel platforms",
@@ -812,7 +816,7 @@ mod tests {
         assert!(
             release_checklist()
                 .required_items
-                .contains(&"rich-message presentation changes passed adapter-rendering, no-ping, escaping, multi-unit receipt, and interaction re-entry checks")
+                .contains(&"rich-message presentation changes passed adapter-rendering, no-ping, escaping, multi-unit receipt, and action re-entry verified-or-deferred checks")
         );
         assert!(
             release_checklist()

@@ -266,24 +266,45 @@ pub fn validate_rich_message_presentation(
 }
 
 pub fn rich_presentation_from_plain_final(text: &str) -> Option<RichMessagePresentation> {
+    rich_presentation_from_plain_final_with_attachment_count(text, 0)
+}
+
+pub fn rich_presentation_from_plain_final_with_attachment_count(
+    text: &str,
+    attachment_count: usize,
+) -> Option<RichMessagePresentation> {
     let text = text.trim();
     if text.is_empty() {
         return None;
     }
     let fallback_text = truncate_chars(text, MAX_FALLBACK_TEXT_CHARS);
     let blocks = rich_blocks_from_plain_final(text);
+    let media = (0..attachment_count)
+        .map(|index| RichPresentationMediaRef {
+            attachment_index: Some(index),
+            artifact_ref: None,
+            caption: None,
+            role: None,
+        })
+        .collect::<Vec<_>>();
     let presentation = RichMessagePresentation {
         schema: RICH_MESSAGE_PRESENTATION_SCHEMA.to_string(),
         fallback_text,
         blocks,
         actions: Vec::new(),
-        media: Vec::new(),
+        media,
         link_preview: RichPresentationLinkPreview::default(),
         delivery_policy: RichPresentationDeliveryPolicy::default(),
     };
-    validate_rich_message_presentation(&presentation, &RichPresentationValidationOptions::default())
-        .ok()
-        .map(|_| presentation)
+    validate_rich_message_presentation(
+        &presentation,
+        &RichPresentationValidationOptions {
+            attachment_count,
+            ..RichPresentationValidationOptions::default()
+        },
+    )
+    .ok()
+    .map(|_| presentation)
 }
 
 pub fn render_rich_presentation_for_telegram(
@@ -964,6 +985,62 @@ mod tests {
             telegram
                 .text
                 .contains("<pre><code class=\"language-powershell\">cargo test</code></pre>")
+        );
+    }
+
+    #[test]
+    fn plain_final_bridge_maps_attachments_to_rendered_media_units() {
+        let presentation =
+            rich_presentation_from_plain_final_with_attachment_count("Done with files.", 2)
+                .unwrap();
+
+        assert_eq!(presentation.fallback_text, "Done with files.");
+        assert_eq!(presentation.media.len(), 2);
+        assert_eq!(presentation.media[0].attachment_index, Some(0));
+        assert_eq!(presentation.media[1].attachment_index, Some(1));
+        validate_rich_message_presentation(
+            &presentation,
+            &RichPresentationValidationOptions {
+                attachment_count: 2,
+                ..RichPresentationValidationOptions::default()
+            },
+        )
+        .unwrap();
+
+        let telegram = render_rich_presentation_batch_for_telegram(
+            &presentation,
+            &RichPresentationValidationOptions {
+                attachment_count: 2,
+                ..RichPresentationValidationOptions::default()
+            },
+        )
+        .unwrap();
+        let media_units = telegram
+            .units
+            .iter()
+            .filter(|unit| unit.kind == RenderedRichUnitKind::Media)
+            .collect::<Vec<_>>();
+        assert_eq!(media_units.len(), 2);
+        assert_eq!(media_units[0].unit_id, "media:0");
+        assert_eq!(media_units[0].attachment_index, Some(0));
+        assert_eq!(media_units[1].unit_id, "media:1");
+        assert_eq!(media_units[1].attachment_index, Some(1));
+
+        let discord = render_rich_presentation_batch_for_discord(
+            &presentation,
+            &RichPresentationValidationOptions {
+                attachment_count: 2,
+                ..RichPresentationValidationOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            discord
+                .units
+                .iter()
+                .filter(|unit| unit.kind == RenderedRichUnitKind::Media)
+                .count(),
+            2
         );
     }
 

@@ -1520,6 +1520,15 @@ fn is_internal_worker_result_event(event: &AgentProgressEvent) -> bool {
         || preview.starts_with("current answer:")
         || preview.starts_with("current answer：")
         || preview.starts_with("completed status")
+        || preview_mentions_internal_worker_result(&preview)
+}
+
+fn preview_mentions_internal_worker_result(preview: &str) -> bool {
+    preview.starts_with("<subagent_notification")
+        || (preview.contains("\"agent_path\"")
+            && (preview.contains("\"completed\"")
+                || preview.contains("\"status\"")
+                || preview.contains("\"current_answer\"")))
 }
 
 fn quote_safe_preview(value: &str, max_preview_chars: usize) -> String {
@@ -1858,6 +1867,29 @@ mod tests {
         assert!(!actions.contains("Current answer"));
         assert!(!actions.contains("default handling is refs"));
         assert!(!actions.contains("private path"));
+    }
+
+    #[test]
+    fn action_stream_summarizes_structured_subagent_notifications_without_source_label() {
+        let context = context();
+        let event = AgentProgressEvent::new(
+            &context,
+            AgentProgressKind::ToolCall,
+            "tool_result",
+            r#"<subagent_notification>
+{"agent_path":"019f19c4-0111","status":{"completed":"Current answer: raw worker handoff with owner-only implementation details"}}
+</subagent_notification>"#,
+            AgentProgressStatus::Completed,
+            1000,
+        );
+        let events = [event];
+        let refs = events.iter().collect::<Vec<_>>();
+
+        let actions = render_agent_progress_actions(&refs, 8, 240);
+
+        assert!(actions.contains("internal worker result received"));
+        assert!(!actions.contains("raw worker handoff"));
+        assert!(!actions.contains("owner-only implementation details"));
     }
 
     #[test]

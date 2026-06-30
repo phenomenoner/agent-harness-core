@@ -412,7 +412,7 @@ pub use rich_presentation::{
     RichPresentationTextStyle, RichPresentationValidationError, RichPresentationValidationOptions,
     render_rich_presentation_batch_for_discord, render_rich_presentation_batch_for_telegram,
     render_rich_presentation_for_discord, render_rich_presentation_for_telegram,
-    validate_rich_message_presentation,
+    rich_presentation_from_plain_final_with_attachment_count, validate_rich_message_presentation,
 };
 pub use runtime_pipeline::{
     RuntimeRunOnceOptions, RuntimeRunOnceReceipt, RuntimeRunOnceReport, RuntimeRunOnceStatus,
