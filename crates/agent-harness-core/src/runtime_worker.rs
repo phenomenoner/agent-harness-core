@@ -127,6 +127,7 @@ pub struct RuntimeQueuePreparedItem {
     pub account_id: Option<String>,
     pub channel_id: String,
     pub user_id: String,
+    pub message_text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inbound_context: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -831,6 +832,7 @@ pub fn prepare_runtime_queue_item(
         account_id: pending.account_id.clone(),
         channel_id: pending.channel_id.clone(),
         user_id: pending.user_id.clone(),
+        message_text: pending.message_text.clone(),
         inbound_context: pending.inbound_context.clone(),
         inbound_media_artifacts: pending.inbound_media_artifacts.clone(),
         provider: bundle.provider.clone(),
@@ -3466,6 +3468,7 @@ mod tests {
                 thinking_enabled: false,
                 thinking_level: None,
                 thinking_instruction: None,
+                fast_mode: None,
                 stop_requested: false,
                 stop_reason: None,
                 steering_notes: Vec::new(),
@@ -3582,6 +3585,7 @@ mod tests {
                 thinking_enabled: false,
                 thinking_level: None,
                 thinking_instruction: None,
+                fast_mode: None,
                 stop_requested: false,
                 stop_reason: None,
                 steering_notes: Vec::new(),

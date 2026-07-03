@@ -22,6 +22,8 @@ secrets/
 .public-export/
 .agent-harness/
 .agent-harness-*/
+.learnings/
+openspec/
 docs/.private/
 tools/.private/
 

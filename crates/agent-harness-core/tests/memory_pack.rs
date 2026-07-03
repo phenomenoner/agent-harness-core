@@ -11,6 +11,9 @@ use agent_harness_core::{
     validate_pack_canary_schema, write_pack_strategy_config,
 };
 
+const MAIN_SESSION_KEY: &str = "telegram:dm-42:user-7:main:session-1";
+const OTHER_SESSION_KEY: &str = "telegram:dm-42:user-7:other:session-2";
+
 #[test]
 fn marker_parser_requires_exact_full_sha256_hashes() {
     let marker = concat!(
@@ -39,7 +42,7 @@ fn artifact_store_round_trips_exact_bytes_and_reuses_same_session_hash() {
     let root = temp_root("artifact_store_round_trips_exact_bytes_and_reuses_same_session_hash");
     let harness_home = root.join("harness");
     let raw = br#"{"rows":[{"id":1},{"id":2}],"secret":"do-not-log"}"#.to_vec();
-    let metadata = metadata("main", "session-1", "tool-output", "application/json");
+    let metadata = metadata("main", MAIN_SESSION_KEY, "tool-output", "application/json");
 
     let first = put_pack_artifact(PackArtifactPutOptions {
         harness_home: harness_home.clone(),
@@ -69,7 +72,7 @@ fn artifact_store_round_trips_exact_bytes_and_reuses_same_session_hash() {
         harness_home: harness_home.clone(),
         marker_or_hash: first.marker.clone(),
         agent_id: "main".to_string(),
-        session_key: "session-1".to_string(),
+        session_key: MAIN_SESSION_KEY.to_string(),
         requester: "operator".to_string(),
         now_ms: 1_800_000_000_002,
     })
@@ -98,12 +101,12 @@ fn artifact_retrieval_denials_emit_explicit_scope_trust_and_expiry_receipts() {
     let private = put_pack_artifact(PackArtifactPutOptions {
         harness_home: harness_home.clone(),
         raw_bytes: b"private raw".to_vec(),
-        metadata: metadata("main", "session-1", "tool-output", "text/plain"),
+        metadata: metadata("main", MAIN_SESSION_KEY, "tool-output", "text/plain"),
         config: PackAdmissionConfig::testing(),
         now_ms: 1_000,
     })
     .unwrap();
-    let mut unknown = metadata("main", "session-1", "tool-output", "text/plain");
+    let mut unknown = metadata("main", MAIN_SESSION_KEY, "tool-output", "text/plain");
     unknown.trust_level = "unknown".to_string();
     let unknown = put_pack_artifact(PackArtifactPutOptions {
         harness_home: harness_home.clone(),
@@ -113,7 +116,7 @@ fn artifact_retrieval_denials_emit_explicit_scope_trust_and_expiry_receipts() {
         now_ms: 1_001,
     })
     .unwrap();
-    let mut expiring = metadata("main", "session-1", "log", "text/plain");
+    let mut expiring = metadata("main", MAIN_SESSION_KEY, "log", "text/plain");
     expiring.ttl_policy = PackTtlPolicy {
         mode: "duration".to_string(),
         expires_at_ms: Some(1_050),
@@ -133,7 +136,7 @@ fn artifact_retrieval_denials_emit_explicit_scope_trust_and_expiry_receipts() {
         harness_home: harness_home.clone(),
         marker_or_hash: private.marker,
         agent_id: "other".to_string(),
-        session_key: "session-2".to_string(),
+        session_key: OTHER_SESSION_KEY.to_string(),
         requester: "model".to_string(),
         now_ms: 1_010,
     })
@@ -142,7 +145,7 @@ fn artifact_retrieval_denials_emit_explicit_scope_trust_and_expiry_receipts() {
         harness_home: harness_home.clone(),
         marker_or_hash: unknown.marker,
         agent_id: "main".to_string(),
-        session_key: "session-1".to_string(),
+        session_key: MAIN_SESSION_KEY.to_string(),
         requester: "model".to_string(),
         now_ms: 1_011,
     })
@@ -151,7 +154,7 @@ fn artifact_retrieval_denials_emit_explicit_scope_trust_and_expiry_receipts() {
         harness_home: harness_home.clone(),
         marker_or_hash: expiring.marker,
         agent_id: "main".to_string(),
-        session_key: "session-1".to_string(),
+        session_key: MAIN_SESSION_KEY.to_string(),
         requester: "model".to_string(),
         now_ms: 1_051,
     })
@@ -165,7 +168,7 @@ fn artifact_retrieval_denials_emit_explicit_scope_trust_and_expiry_receipts() {
         )
         .to_string(),
         agent_id: "main".to_string(),
-        session_key: "session-1".to_string(),
+        session_key: MAIN_SESSION_KEY.to_string(),
         requester: "model".to_string(),
         now_ms: 1_052,
     })
@@ -200,7 +203,7 @@ fn pack_registry_shortens_json_log_and_search_results_but_retrieves_exact_origin
     let json = pack_candidate(PackCandidateOptions {
         harness_home: harness_home.clone(),
         raw_bytes: json_raw.clone().into_bytes(),
-        metadata: metadata("main", "session-1", "tool-output", "application/json"),
+        metadata: metadata("main", MAIN_SESSION_KEY, "tool-output", "application/json"),
         admission: PackAdmissionConfig::testing(),
         strategy_config: PackStrategyConfig::default(),
         now_ms: 2_000,
@@ -216,7 +219,7 @@ fn pack_registry_shortens_json_log_and_search_results_but_retrieves_exact_origin
     let log = pack_candidate(PackCandidateOptions {
         harness_home: harness_home.clone(),
         raw_bytes: log_raw.clone().into_bytes(),
-        metadata: metadata("main", "session-1", "log", "text/plain"),
+        metadata: metadata("main", MAIN_SESSION_KEY, "log", "text/plain"),
         admission: PackAdmissionConfig::testing(),
         strategy_config: PackStrategyConfig::default(),
         now_ms: 2_001,
@@ -230,7 +233,12 @@ fn pack_registry_shortens_json_log_and_search_results_but_retrieves_exact_origin
     let search = pack_candidate(PackCandidateOptions {
         harness_home: harness_home.clone(),
         raw_bytes: search_raw.clone().into_bytes(),
-        metadata: metadata("main", "session-1", "search-results", "application/json"),
+        metadata: metadata(
+            "main",
+            MAIN_SESSION_KEY,
+            "search-results",
+            "application/json",
+        ),
         admission: PackAdmissionConfig::testing(),
         strategy_config: PackStrategyConfig::default(),
         now_ms: 2_002,
@@ -249,7 +257,7 @@ fn pack_registry_shortens_json_log_and_search_results_but_retrieves_exact_origin
             harness_home: harness_home.clone(),
             marker_or_hash: marker,
             agent_id: "main".to_string(),
-            session_key: "session-1".to_string(),
+            session_key: MAIN_SESSION_KEY.to_string(),
             requester: "operator".to_string(),
             now_ms: 2_010,
         })
@@ -277,7 +285,7 @@ fn canary_and_observe_reports_include_strategy_controls_and_retrieval_rates() {
     let disabled_log = pack_candidate(PackCandidateOptions {
         harness_home: harness_home.clone(),
         raw_bytes: long_log_fixture().into_bytes(),
-        metadata: metadata("main", "session-1", "log", "text/plain"),
+        metadata: metadata("main", MAIN_SESSION_KEY, "log", "text/plain"),
         admission: PackAdmissionConfig::testing(),
         strategy_config: PackStrategyConfig {
             disabled_strategies: vec!["log-anomaly-v1".to_string()],
@@ -304,7 +312,7 @@ fn canary_and_observe_reports_include_strategy_controls_and_retrieval_rates() {
     let json = pack_candidate(PackCandidateOptions {
         harness_home: harness_home.clone(),
         raw_bytes: json_rows_fixture(90).into_bytes(),
-        metadata: metadata("main", "session-1", "tool-output", "application/json"),
+        metadata: metadata("main", MAIN_SESSION_KEY, "tool-output", "application/json"),
         admission: PackAdmissionConfig::testing(),
         strategy_config: PackStrategyConfig::default(),
         now_ms: 3_001,
@@ -314,7 +322,7 @@ fn canary_and_observe_reports_include_strategy_controls_and_retrieval_rates() {
         harness_home: harness_home.clone(),
         marker_or_hash: json.marker,
         agent_id: "main".to_string(),
-        session_key: "session-1".to_string(),
+        session_key: MAIN_SESSION_KEY.to_string(),
         requester: "model".to_string(),
         now_ms: 3_002,
     })
@@ -328,7 +336,7 @@ fn canary_and_observe_reports_include_strategy_controls_and_retrieval_rates() {
         )
         .to_string(),
         agent_id: "main".to_string(),
-        session_key: "session-1".to_string(),
+        session_key: MAIN_SESSION_KEY.to_string(),
         requester: "model".to_string(),
         now_ms: 3_003,
     })

@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    AgentRegistry, ChannelCommandIntent, DEFAULT_THINKING_LEVEL, InboundMediaArtifact,
-    RichMessagePresentation, THINKING_LEVELS, TurnDispatch, TurnPlan, XHIGH_THINKING_LEVEL,
-    inspect_codex_approval_policy, inspect_codex_sandbox, inspect_codex_sandbox_policy,
-    normalize_thinking_level,
+    AgentRegistry, ChannelCommandIntent, DEFAULT_THINKING_LEVEL, FastCommandMode,
+    InboundMediaArtifact, RichMessagePresentation, THINKING_LEVELS, TurnDispatch, TurnPlan,
+    XHIGH_THINKING_LEVEL, inspect_codex_approval_policy, inspect_codex_sandbox,
+    inspect_codex_sandbox_policy, normalize_thinking_level,
 };
 
 const CHANNEL_STEP_SCHEMA: &str = "agent-harness.channel-step.v1";
@@ -126,10 +126,35 @@ pub enum ChannelCommandEffect {
         provider_known: bool,
         model_known: bool,
     },
+    ShowFast {
+        agent_id: Option<String>,
+        provider: Option<String>,
+        model: Option<String>,
+        current_mode: String,
+        effective_acceleration: String,
+        reason: String,
+    },
+    SwitchFast {
+        agent_id: Option<String>,
+        provider: Option<String>,
+        model: Option<String>,
+        global: bool,
+        previous_mode: String,
+        mode: String,
+        effective_acceleration: String,
+        reason: String,
+    },
     ShowStatus {
         scope: Option<String>,
         snapshot: ChannelStatusSnapshot,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastRequestRoutePolicy {
+    pub effective_acceleration: String,
+    pub reason: String,
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -162,6 +187,7 @@ pub struct ChannelStatusSnapshot {
     pub active_session_key: Option<String>,
     pub thinking_enabled: bool,
     pub thinking_level: Option<String>,
+    pub fast_mode: Option<String>,
     pub steering_notes: usize,
     pub btw_notes: usize,
 }
@@ -248,6 +274,9 @@ pub struct ChannelOutboundAttachment {
 pub enum ChannelOutboundAttachmentKind {
     Image,
     Document,
+    Audio,
+    Voice,
+    Video,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -413,6 +442,7 @@ fn command_effect(
         ChannelCommandIntent::Model { target, global } => {
             model_command_effect(registry, turn, target, global)
         }
+        ChannelCommandIntent::Fast { mode, global } => fast_command_effect(turn, mode, global),
         ChannelCommandIntent::ShowStatus { scope } => ChannelCommandEffect::ShowStatus {
             snapshot: status_snapshot(registry, turn, scope.clone()),
             scope,
@@ -813,6 +843,192 @@ fn model_command_effect(
     }
 }
 
+fn fast_command_effect(
+    turn: &TurnPlan,
+    mode: FastCommandMode,
+    global: bool,
+) -> ChannelCommandEffect {
+    let agent_id = turn.agent.as_ref().map(|agent| agent.id.clone());
+    let provider = turn.model_policy.provider.clone();
+    let model = turn.model_policy.model.clone();
+    let current_mode = turn.provider_request_policy.fast_mode.clone();
+    let request_policy = fast_request_policy_for_route(
+        &provider,
+        &model,
+        mode_to_state(mode, &current_mode),
+        turn.harness_home.as_deref(),
+    );
+    match mode {
+        FastCommandMode::Status => ChannelCommandEffect::ShowFast {
+            agent_id,
+            provider,
+            model,
+            current_mode,
+            effective_acceleration: request_policy.effective_acceleration,
+            reason: request_policy.reason,
+        },
+        FastCommandMode::Fast | FastCommandMode::Normal => ChannelCommandEffect::SwitchFast {
+            agent_id,
+            provider,
+            model,
+            global,
+            previous_mode: current_mode,
+            mode: mode_to_state(mode, "normal").to_string(),
+            effective_acceleration: request_policy.effective_acceleration,
+            reason: request_policy.reason,
+        },
+    }
+}
+
+fn mode_to_state(mode: FastCommandMode, current: &str) -> &str {
+    match mode {
+        FastCommandMode::Status => current,
+        FastCommandMode::Fast => "fast",
+        FastCommandMode::Normal => "normal",
+    }
+}
+
+pub fn fast_request_policy_for_route(
+    provider: &Option<String>,
+    model: &Option<String>,
+    mode: &str,
+    harness_home: Option<&Path>,
+) -> FastRequestRoutePolicy {
+    let fast_service_tier = codex_fast_service_tier_for_model(provider, model, harness_home);
+    if mode != "fast" {
+        if fast_service_tier.is_some() {
+            return FastRequestRoutePolicy {
+                effective_acceleration: "disabled".to_string(),
+                reason:
+                    "fast mode is normal; Codex app-server serviceTier=default will be requested"
+                        .to_string(),
+                service_tier: Some("default".to_string()),
+            };
+        }
+        return FastRequestRoutePolicy {
+            effective_acceleration: "disabled".to_string(),
+            reason: "fast mode is normal for this session".to_string(),
+            service_tier: None,
+        };
+    }
+    if let Some(service_tier) = fast_service_tier {
+        return FastRequestRoutePolicy {
+            effective_acceleration: "enabled".to_string(),
+            reason: format!(
+                "Codex app-server serviceTier={service_tier} will be requested for this model"
+            ),
+            service_tier: Some(service_tier),
+        };
+    }
+    FastRequestRoutePolicy {
+        effective_acceleration: "unsupported".to_string(),
+        reason:
+            "Codex app-server model catalog does not advertise a Fast service tier for this route"
+                .to_string(),
+        service_tier: None,
+    }
+}
+
+fn codex_fast_service_tier_for_model(
+    provider: &Option<String>,
+    model: &Option<String>,
+    harness_home: Option<&Path>,
+) -> Option<String> {
+    if !is_codex_openai_provider(provider) {
+        return None;
+    }
+    let model = model.as_deref()?.trim();
+    if model.is_empty() {
+        return None;
+    }
+    let cache_file = harness_home?.join("codex-home").join("models_cache.json");
+    let cache = fs::read_to_string(cache_file).ok()?;
+    let catalog = serde_json::from_str::<Value>(&cache).ok()?;
+    catalog
+        .get("models")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|entry| codex_catalog_entry_matches_model(entry, model))
+        .and_then(codex_fast_service_tier_id)
+}
+
+fn is_codex_openai_provider(provider: &Option<String>) -> bool {
+    match provider.as_deref().map(str::trim) {
+        Some(provider) if provider.eq_ignore_ascii_case("openai") => true,
+        Some(provider) if provider.eq_ignore_ascii_case("codex") => true,
+        Some(_) => false,
+        None => true,
+    }
+}
+
+fn codex_catalog_entry_matches_model(entry: &Value, model: &str) -> bool {
+    ["slug", "id", "model"].iter().any(|key| {
+        entry
+            .get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(model))
+    })
+}
+
+fn codex_fast_service_tier_id(entry: &Value) -> Option<String> {
+    for key in ["service_tiers", "serviceTiers"] {
+        if let Some(service_tiers) = entry.get(key).and_then(Value::as_array) {
+            for tier in service_tiers {
+                let tier_id = tier.get("id").and_then(Value::as_str)?.trim();
+                if tier_id.is_empty() {
+                    continue;
+                }
+                let tier_name = tier.get("name").and_then(Value::as_str).unwrap_or_default();
+                if tier_name.eq_ignore_ascii_case("fast")
+                    || tier_id.eq_ignore_ascii_case("priority")
+                    || tier_id.eq_ignore_ascii_case("fast")
+                {
+                    return Some(tier_id.to_string());
+                }
+            }
+        }
+    }
+    for key in ["additional_speed_tiers", "additionalSpeedTiers"] {
+        if entry
+            .get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|tiers| {
+                tiers.iter().any(|tier| {
+                    tier.as_str()
+                        .is_some_and(|tier| tier.eq_ignore_ascii_case("fast"))
+                })
+            })
+        {
+            return Some("fast".to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn write_codex_models_cache_for_test(harness_home: &Path) {
+    let codex_home = harness_home.join("codex-home");
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::write(
+        codex_home.join("models_cache.json"),
+        r#"{
+          "models": [
+            {
+              "slug": "gpt-5.5",
+              "service_tiers": [
+                { "id": "priority", "name": "Fast" }
+              ]
+            },
+            {
+              "slug": "gpt-5.4-mini",
+              "service_tiers": []
+            }
+          ]
+        }"#,
+    )
+    .unwrap();
+}
+
 fn new_session_key(turn: &TurnPlan) -> String {
     let agent_id = turn
         .agent
@@ -1047,6 +1263,47 @@ fn command_reply_text(effect: &ChannelCommandEffect) -> String {
             yes_no(*provider_known),
             yes_no(*model_known)
         ),
+        ChannelCommandEffect::ShowFast {
+            provider,
+            model,
+            current_mode,
+            effective_acceleration,
+            reason,
+            ..
+        } => format!(
+            "Fast mode: {}\nScope: current session\nRoute: {}\nRequest acceleration: {} ({})",
+            current_mode,
+            display_model_route(provider, model),
+            effective_acceleration,
+            reason
+        ),
+        ChannelCommandEffect::SwitchFast {
+            agent_id,
+            provider,
+            model,
+            global,
+            mode,
+            effective_acceleration,
+            reason,
+            ..
+        } => {
+            let scope = if *global {
+                format!(
+                    "current session and agent `{}` default",
+                    display_opt(agent_id)
+                )
+            } else {
+                "current session".to_string()
+            };
+            format!(
+                "Fast mode: {}\nScope: {}\nRoute: {}\nRequest acceleration: {} ({})",
+                mode,
+                scope,
+                display_model_route(provider, model),
+                effective_acceleration,
+                reason
+            )
+        }
         ChannelCommandEffect::ShowStatus { snapshot, .. } => status_reply_text(snapshot),
     }
 }
@@ -1074,13 +1331,14 @@ fn status_reply_text(snapshot: &ChannelStatusSnapshot) -> String {
             yes_no(snapshot.discord_configured)
         ),
         Some("model") => format!(
-            "Agent Harness Model Status\nAgent: {}\nProvider: {}\nModel: {}\nOverride: {}\nThinking: {}, level={}",
+            "Agent Harness Model Status\nAgent: {}\nProvider: {}\nModel: {}\nOverride: {}\nThinking: {}, level={}\nFast: {}",
             display_opt(&snapshot.current_agent_id),
             display_opt(&snapshot.current_provider),
             display_opt(&snapshot.current_model),
             display_opt(&snapshot.model_override),
             yes_no(snapshot.thinking_enabled),
-            display_thinking_level(&snapshot.thinking_level)
+            display_thinking_level(&snapshot.thinking_level),
+            display_opt(&snapshot.fast_mode)
         ),
         Some("security") => format!(
             "Agent Harness Security Status\nApprovals: {}\nWindows sandbox: {}\nFilesystem sandbox: {}",
@@ -1097,7 +1355,7 @@ fn status_reply_text(snapshot: &ChannelStatusSnapshot) -> String {
             "Cron status is available through cron-plan and deterministic-cron-plan.".to_string()
         }
         _ => format!(
-            "Agent Harness Status\nAgent: {} ({}/{})\nModel: provider={}, model={}, override={}\nThinking: enabled={}, level={}\nSecurity: approvals={}, windowsSandbox={}, filesystemSandbox={}\nChannels: telegram={}, discord={}, current={}\nSession: active={}, stateLoaded={}\nPrompt: files {}/{} ({})\nSkills: {} selected ({})\nState: steer={}, btw={}\nRegistry: providers={}, plugins={}",
+            "Agent Harness Status\nAgent: {} ({}/{})\nModel: provider={}, model={}, override={}\nThinking: enabled={}, level={}\nFast: {}\nSecurity: approvals={}, windowsSandbox={}, filesystemSandbox={}\nChannels: telegram={}, discord={}, current={}\nSession: active={}, stateLoaded={}\nPrompt: files {}/{} ({})\nSkills: {} selected ({})\nState: steer={}, btw={}\nRegistry: providers={}, plugins={}",
             display_opt(&snapshot.current_agent_id),
             snapshot.agents_enabled,
             snapshot.agents_total,
@@ -1106,6 +1364,7 @@ fn status_reply_text(snapshot: &ChannelStatusSnapshot) -> String {
             display_opt(&snapshot.model_override),
             yes_no(snapshot.thinking_enabled),
             display_thinking_level(&snapshot.thinking_level),
+            display_opt(&snapshot.fast_mode),
             display_opt(&snapshot.codex_approval_policy),
             display_opt(&snapshot.codex_sandbox),
             display_opt(&snapshot.codex_sandbox_policy),
@@ -1199,6 +1458,10 @@ fn status_snapshot(
             .map(|state| state.active_session_key.clone()),
         thinking_enabled: turn.thinking_policy.enabled,
         thinking_level: turn.thinking_policy.level.clone(),
+        fast_mode: turn
+            .channel_state
+            .as_ref()
+            .and_then(|state| state.fast_mode.clone()),
         steering_notes: turn
             .channel_state
             .as_ref()
@@ -1850,6 +2113,178 @@ mod tests {
                 ..
             }) if level == "xhigh" && valid
         ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_step_reports_and_switches_fast_mode_with_route_capability() {
+        let root = temp_root("channel_step_reports_and_switches_fast_mode");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_codex_models_cache_for_test(&harness_home);
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let show_turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "/fast".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main55".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let show_step = build_channel_step(&registry, &show_turn);
+        assert_eq!(show_step.action, ChannelStepAction::ReplyOnly);
+        assert!(
+            show_step.outbound_messages[0]
+                .text
+                .contains("Fast mode: normal")
+        );
+        assert!(
+            show_step.outbound_messages[0]
+                .text
+                .contains("Request acceleration: disabled")
+        );
+        assert!(matches!(
+            show_step.command_effect,
+            Some(ChannelCommandEffect::ShowFast {
+                ref current_mode,
+                ref effective_acceleration,
+                ..
+            }) if current_mode == "normal" && effective_acceleration == "disabled"
+        ));
+
+        let switch_turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "/fast on".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main55".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let switch_step = build_channel_step(&registry, &switch_turn);
+        assert_eq!(switch_step.action, ChannelStepAction::ReplyOnly);
+        assert!(
+            switch_step.outbound_messages[0]
+                .text
+                .contains("Fast mode: fast")
+        );
+        assert!(
+            switch_step.outbound_messages[0]
+                .text
+                .contains("Request acceleration: enabled")
+        );
+        assert!(matches!(
+            switch_step.command_effect,
+            Some(ChannelCommandEffect::SwitchFast {
+                ref previous_mode,
+                ref mode,
+                ref effective_acceleration,
+                global,
+                ..
+            }) if previous_mode == "normal"
+                && mode == "fast"
+                && effective_acceleration == "enabled"
+                && !global
+        ));
+
+        let global_turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "/fast on --global".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main55".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let global_step = build_channel_step(&registry, &global_turn);
+        assert!(
+            global_step.outbound_messages[0]
+                .text
+                .contains("Scope: current session and agent `main55` default")
+        );
+        assert!(matches!(
+            global_step.command_effect,
+            Some(ChannelCommandEffect::SwitchFast {
+                ref mode,
+                global,
+                ..
+            }) if mode == "fast" && global
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fast_request_policy_is_codex_model_catalog_gated() {
+        let root = temp_root("fast_request_policy_is_codex_model_catalog_gated");
+        let harness_home = root.join(".agent-harness");
+        write_codex_models_cache_for_test(&harness_home);
+
+        let supported = fast_request_policy_for_route(
+            &Some("openai".to_string()),
+            &Some("gpt-5.5".to_string()),
+            "fast",
+            Some(&harness_home),
+        );
+        assert_eq!(supported.effective_acceleration, "enabled");
+        assert_eq!(supported.service_tier.as_deref(), Some("priority"));
+
+        let normal = fast_request_policy_for_route(
+            &Some("openai".to_string()),
+            &Some("gpt-5.5".to_string()),
+            "normal",
+            Some(&harness_home),
+        );
+        assert_eq!(normal.effective_acceleration, "disabled");
+        assert_eq!(normal.service_tier.as_deref(), Some("default"));
+
+        let unsupported_model = fast_request_policy_for_route(
+            &Some("openai".to_string()),
+            &Some("gpt-5.4-mini".to_string()),
+            "fast",
+            Some(&harness_home),
+        );
+        assert_eq!(unsupported_model.effective_acceleration, "unsupported");
+        assert_eq!(unsupported_model.service_tier, None);
+
+        let unsupported_provider = fast_request_policy_for_route(
+            &Some("openrouter".to_string()),
+            &Some("gpt-5.5".to_string()),
+            "fast",
+            Some(&harness_home),
+        );
+        assert_eq!(unsupported_provider.effective_acceleration, "unsupported");
+        assert_eq!(unsupported_provider.service_tier, None);
 
         let _ = fs::remove_dir_all(root);
     }

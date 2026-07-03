@@ -46,6 +46,7 @@ pub struct TurnPlan {
     pub dispatch: TurnDispatch,
     pub agent: Option<TurnAgent>,
     pub model_policy: TurnModelPolicy,
+    pub provider_request_policy: TurnProviderRequestPolicy,
     pub thinking_policy: TurnThinkingPolicy,
     pub channel_state: Option<ChannelSessionState>,
     pub command: Option<ChannelCommand>,
@@ -79,6 +80,29 @@ pub struct TurnAgent {
 pub struct TurnModelPolicy {
     pub provider: Option<String>,
     pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnProviderRequestPolicy {
+    pub fast_mode: String,
+    pub effective_acceleration: String,
+    pub route_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    pub reason: String,
+}
+
+impl Default for TurnProviderRequestPolicy {
+    fn default() -> Self {
+        Self {
+            fast_mode: "normal".to_string(),
+            effective_acceleration: "disabled".to_string(),
+            route_kind: "codex-app-server".to_string(),
+            service_tier: None,
+            reason: "fast mode is normal for this session".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -126,11 +150,12 @@ pub fn build_turn_plan(
         warnings.push("no harness agent is available for this turn".to_string());
     }
 
-    if let Some(agent_override) = load_agent_override(
+    let agent_override = load_agent_override(
         input.harness_home.as_deref(),
         agent.as_ref().map(|agent| agent.id.as_str()),
         &mut warnings,
-    ) {
+    );
+    if let Some(agent_override) = &agent_override {
         apply_agent_override(&mut model_policy, &mut thinking_policy, &agent_override);
     }
 
@@ -147,6 +172,12 @@ pub fn build_turn_plan(
         apply_model_override(&mut model_policy, state);
         apply_thinking_override(&mut thinking_policy, state);
     }
+    let provider_request_policy = provider_request_policy_from_state(
+        &model_policy,
+        channel_state.as_ref(),
+        agent_override.as_ref(),
+        input.harness_home.as_deref(),
+    );
     let session_key = input
         .session_hint
         .clone()
@@ -212,6 +243,7 @@ pub fn build_turn_plan(
         dispatch,
         agent,
         model_policy,
+        provider_request_policy,
         thinking_policy,
         channel_state,
         command,
@@ -220,6 +252,31 @@ pub fn build_turn_plan(
         selected_skills,
         warnings,
     })
+}
+
+fn provider_request_policy_from_state(
+    model_policy: &TurnModelPolicy,
+    state: Option<&ChannelSessionState>,
+    override_entry: Option<&AgentOverride>,
+    harness_home: Option<&Path>,
+) -> TurnProviderRequestPolicy {
+    let fast_mode = state
+        .and_then(|state| state.fast_mode.clone())
+        .or_else(|| override_entry.and_then(|entry| entry.fast_mode.clone()))
+        .unwrap_or_else(|| "normal".to_string());
+    let request_policy = crate::fast_request_policy_for_route(
+        &model_policy.provider,
+        &model_policy.model,
+        &fast_mode,
+        harness_home,
+    );
+    TurnProviderRequestPolicy {
+        fast_mode,
+        effective_acceleration: request_policy.effective_acceleration,
+        route_kind: "codex-app-server".to_string(),
+        service_tier: request_policy.service_tier,
+        reason: request_policy.reason,
+    }
 }
 
 pub fn write_turn_plan(plan: &TurnPlan, output_dir: impl AsRef<Path>) -> io::Result<TurnPlanFile> {
@@ -882,6 +939,7 @@ mod tests {
         );
         let registry = load_agent_registry(&source).unwrap();
         let skills = build_source_skill_index(&source).unwrap();
+        write_codex_models_cache(&harness_home);
 
         let plan = build_turn_plan(
             &source,
@@ -914,6 +972,166 @@ mod tests {
         assert_eq!(
             plan.selected_skills[0].skill_id,
             "workspace:openrouter-routing"
+        );
+        assert_eq!(plan.provider_request_policy.fast_mode, "normal");
+        assert_eq!(
+            plan.provider_request_policy.effective_acceleration,
+            "disabled"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn turn_plan_applies_fast_mode_as_provider_request_policy() {
+        let root = temp_root("turn_plan_applies_fast_mode_as_provider_request_policy");
+        let source = write_turn_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_agent_overrides(
+            &harness_home,
+            r#"{
+              "schema": "agent-harness.agent-overrides.v1",
+              "agents": {
+                "main": {
+                  "fastMode": "normal",
+                  "updatedAtMs": 999
+                }
+              }
+            }"#,
+        );
+        write_channel_state(
+            &harness_home,
+            r#"{
+              "schema": "agent-harness.channel-session-state.v1",
+              "platform": "telegram",
+              "channelId": "dm",
+              "userId": "user",
+              "activeSessionKey": "telegram:dm:user:main:session-1",
+              "agentId": "main",
+              "provider": "openai",
+              "model": "gpt-5.5",
+              "modelOverride": "openai/gpt-5.5",
+              "modelOverrideProvider": "openai",
+              "modelOverrideModel": "gpt-5.5",
+              "fastMode": "fast",
+              "thinkingEnabled": true,
+              "thinkingLevel": "medium",
+              "steeringNotes": [],
+              "btwNotes": [],
+              "updatedAtMs": 1000
+            }"#,
+        );
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        write_codex_models_cache(&harness_home);
+
+        let plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "continue".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.dispatch, TurnDispatch::AgentTurn);
+        assert_eq!(plan.provider_request_policy.fast_mode, "fast");
+        assert_eq!(
+            plan.provider_request_policy.effective_acceleration,
+            "enabled"
+        );
+        assert_eq!(
+            plan.provider_request_policy.service_tier.as_deref(),
+            Some("priority")
+        );
+        assert_eq!(plan.provider_request_policy.route_kind, "codex-app-server");
+        assert!(
+            plan.provider_request_policy
+                .reason
+                .contains("serviceTier=priority")
+        );
+
+        let other_plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "continue".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("other".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        assert_eq!(other_plan.provider_request_policy.fast_mode, "normal");
+        assert_eq!(
+            other_plan.provider_request_policy.effective_acceleration,
+            "disabled"
+        );
+        assert_eq!(other_plan.provider_request_policy.service_tier, None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn turn_plan_uses_global_fast_mode_when_session_has_no_override() {
+        let root = temp_root("turn_plan_uses_global_fast_mode_when_session_has_no_override");
+        let source = write_turn_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_agent_overrides(
+            &harness_home,
+            r#"{
+              "schema": "agent-harness.agent-overrides.v1",
+              "agents": {
+                "main": {
+                  "fastMode": "fast",
+                  "updatedAtMs": 1000
+                }
+              }
+            }"#,
+        );
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+
+        let plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "continue".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.provider_request_policy.fast_mode, "fast");
+        assert_eq!(
+            plan.provider_request_policy.effective_acceleration,
+            "unsupported"
         );
 
         let _ = fs::remove_dir_all(root);
@@ -1118,6 +1336,29 @@ mod tests {
             .join("state.json");
         fs::create_dir_all(state_file.parent().unwrap()).unwrap();
         fs::write(state_file, state_json).unwrap();
+    }
+
+    fn write_codex_models_cache(harness_home: &Path) {
+        let codex_home = harness_home.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(
+            codex_home.join("models_cache.json"),
+            r#"{
+              "models": [
+                {
+                  "slug": "gpt-5.5",
+                  "service_tiers": [
+                    { "id": "priority", "name": "Fast" }
+                  ]
+                },
+                {
+                  "slug": "gpt-5.4-mini",
+                  "service_tiers": []
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
     }
 
     fn write_agent_overrides(harness_home: &Path, overrides_json: &str) {

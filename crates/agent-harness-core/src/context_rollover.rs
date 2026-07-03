@@ -31,6 +31,12 @@ pub enum ContextRolloverMode {
 #[serde(rename_all = "camelCase")]
 pub struct ContextRolloverConfig {
     pub max_successful_compacts_before_rollover: u64,
+    #[serde(default = "default_max_continuation_depth")]
+    pub max_continuation_depth: u64,
+    #[serde(default = "default_stream_unstable_continuation_min_attempts")]
+    pub stream_unstable_continuation_min_attempts: usize,
+    #[serde(default = "default_stream_unstable_continuation_token_limit")]
+    pub stream_unstable_continuation_token_limit: u64,
     pub rollover_mode: ContextRolloverMode,
     pub cooperative_mid_turn_drain: bool,
 }
@@ -39,10 +45,25 @@ impl Default for ContextRolloverConfig {
     fn default() -> Self {
         Self {
             max_successful_compacts_before_rollover: 2,
+            max_continuation_depth: 2,
+            stream_unstable_continuation_min_attempts: 2,
+            stream_unstable_continuation_token_limit: 80_000,
             rollover_mode: ContextRolloverMode::WorkingSetMemory,
             cooperative_mid_turn_drain: false,
         }
     }
+}
+
+fn default_max_continuation_depth() -> u64 {
+    ContextRolloverConfig::default().max_continuation_depth
+}
+
+fn default_stream_unstable_continuation_min_attempts() -> usize {
+    ContextRolloverConfig::default().stream_unstable_continuation_min_attempts
+}
+
+fn default_stream_unstable_continuation_token_limit() -> u64 {
+    ContextRolloverConfig::default().stream_unstable_continuation_token_limit
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,13 +322,65 @@ pub struct ContextRolloverEpisode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct WorkingSetSessionIndex {
-    schema: String,
-    session_key: String,
-    virtual_session_id: String,
-    continuation_index: u64,
-    working_set_file: PathBuf,
-    updated_at_ms: i64,
+pub(crate) struct WorkingSetSessionIndex {
+    pub(crate) schema: String,
+    pub(crate) session_key: String,
+    pub(crate) virtual_session_id: String,
+    pub(crate) continuation_index: u64,
+    pub(crate) working_set_file: PathBuf,
+    pub(crate) updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedTurnWorkingSetSnapshotOptions {
+    pub harness_home: PathBuf,
+    pub platform: String,
+    pub channel_id: String,
+    pub user_id: String,
+    pub agent_id: String,
+    pub working_session_key: String,
+    pub queue_id: Option<String>,
+    pub message_text: Option<String>,
+    pub status: String,
+    pub run_once_receipt_file: Option<PathBuf>,
+    pub outbox_file: Option<PathBuf>,
+    pub completion_file: Option<PathBuf>,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualSessionTaskBoundaryCloseOptions {
+    pub harness_home: PathBuf,
+    pub previous_session_key: String,
+    pub ended_by: String,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualSessionThreadBackfillOptions {
+    pub harness_home: PathBuf,
+    pub session_key: String,
+    pub thread_id: String,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualSessionTerminalOptions {
+    pub harness_home: PathBuf,
+    pub session_key: String,
+    pub ended_by: String,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletedTurnWorkingSetSnapshotReport {
+    pub schema: String,
+    pub virtual_session_id: String,
+    pub working_session_key: String,
+    pub continuation_index: u64,
+    pub working_set_file: PathBuf,
+    pub virtual_session_file: PathBuf,
 }
 
 pub fn load_context_rollover_config(harness_home: &Path) -> io::Result<ContextRolloverConfig> {
@@ -338,6 +411,34 @@ pub fn load_context_rollover_config(harness_home: &Path) -> io::Result<ContextRo
         .filter(|value| *value > 0)
         {
             config.max_successful_compacts_before_rollover = value;
+        }
+        if let Some(value) = json_u64(context, &["maxContinuationDepth", "max_continuation_depth"])
+            .filter(|value| *value > 0)
+        {
+            config.max_continuation_depth = value;
+        }
+        if let Some(value) = json_u64(
+            context,
+            &[
+                "streamUnstableContinuationMinAttempts",
+                "stream_unstable_continuation_min_attempts",
+            ],
+        )
+        .filter(|value| *value > 0)
+        {
+            config.stream_unstable_continuation_min_attempts =
+                value.min(usize::MAX as u64) as usize;
+        }
+        if let Some(value) = json_u64(
+            context,
+            &[
+                "streamUnstableContinuationTokenLimit",
+                "stream_unstable_continuation_token_limit",
+            ],
+        )
+        .filter(|value| *value > 0)
+        {
+            config.stream_unstable_continuation_token_limit = value;
         }
         if let Some(value) = json_string(context, &["rolloverMode", "rollover_mode"]) {
             config.rollover_mode = parse_rollover_mode(&value);
@@ -631,6 +732,13 @@ pub fn apply_context_rollover_before_turn(
             continuation_index,
             Some(updated_queue_item),
             options.now_ms,
+            WorkingSetWriteOptions {
+                append_decision: Some(
+                    "context rollover re-keyed an unprepared pending queue item".to_string(),
+                ),
+                inherit_parent: true,
+                ..WorkingSetWriteOptions::default()
+            },
         )?;
         let virtual_session_file = write_virtual_session_record(
             &options.harness_home,
@@ -715,6 +823,21 @@ pub fn load_working_set_continuity_section(
     harness_home: &Path,
     session_key: &str,
 ) -> io::Result<Option<String>> {
+    let Some((index, working_set)) =
+        read_working_set_memory_for_session(harness_home, session_key)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(render_working_set_continuity(
+        &index.working_set_file,
+        &working_set,
+    )))
+}
+
+pub(crate) fn read_working_set_memory_for_session(
+    harness_home: &Path,
+    session_key: &str,
+) -> io::Result<Option<(WorkingSetSessionIndex, ContextWorkingSetMemory)>> {
     let index_file = working_set_session_index_file(harness_home, session_key);
     if !index_file.is_file() {
         return Ok(None);
@@ -725,10 +848,177 @@ pub fn load_working_set_continuity_section(
     let working_set_text = fs::read_to_string(&index.working_set_file)?;
     let working_set = serde_json::from_str::<ContextWorkingSetMemory>(&working_set_text)
         .map_err(io::Error::other)?;
-    Ok(Some(render_working_set_continuity(
-        &index.working_set_file,
-        &working_set,
-    )))
+    Ok(Some((index, working_set)))
+}
+
+pub fn close_virtual_session_for_task_boundary(
+    options: VirtualSessionTaskBoundaryCloseOptions,
+) -> io::Result<Option<PathBuf>> {
+    let Some((file, mut record, _index)) = read_virtual_session_record_for_session(
+        &options.harness_home,
+        &options.previous_session_key,
+    )?
+    else {
+        return Ok(None);
+    };
+    record.status = "closed".to_string();
+    close_open_working_sessions(&mut record, &options.ended_by, options.now_ms);
+    write_json_atomic(&file, &record)?;
+    Ok(Some(file))
+}
+
+pub fn backfill_virtual_session_codex_thread_id(
+    options: VirtualSessionThreadBackfillOptions,
+) -> io::Result<Option<PathBuf>> {
+    let thread_id = options.thread_id.trim();
+    if thread_id.is_empty() {
+        return Ok(None);
+    }
+    let Some((file, mut record, index)) =
+        read_virtual_session_record_for_session(&options.harness_home, &options.session_key)?
+    else {
+        return Ok(None);
+    };
+    if let Some(session) = record
+        .working_sessions
+        .iter_mut()
+        .find(|session| session.session_key == options.session_key)
+    {
+        session.codex_thread_id = Some(thread_id.to_string());
+    } else {
+        record.working_sessions.push(ContextWorkingSessionRef {
+            session_key: options.session_key,
+            continuation_index: index.continuation_index,
+            codex_thread_id: Some(thread_id.to_string()),
+            started_at_ms: options.now_ms,
+            ended_at_ms: None,
+            ended_by: None,
+            working_set_file: Some(index.working_set_file),
+        });
+    }
+    write_json_atomic(&file, &record)?;
+    Ok(Some(file))
+}
+
+pub fn mark_virtual_session_terminal(
+    options: VirtualSessionTerminalOptions,
+) -> io::Result<Option<PathBuf>> {
+    let Some((file, mut record, _index)) =
+        read_virtual_session_record_for_session(&options.harness_home, &options.session_key)?
+    else {
+        return Ok(None);
+    };
+    record.status = "terminal-failed".to_string();
+    close_open_working_sessions(&mut record, &options.ended_by, options.now_ms);
+    write_json_atomic(&file, &record)?;
+    Ok(Some(file))
+}
+
+pub fn record_completed_turn_working_set_snapshot(
+    options: CompletedTurnWorkingSetSnapshotOptions,
+) -> io::Result<CompletedTurnWorkingSetSnapshotReport> {
+    let root_session_key = root_working_session_key(&options.working_session_key);
+    let continuation_index =
+        continuation_index_from_session_key(&options.working_session_key).unwrap_or(0);
+    let virtual_session_id =
+        read_working_set_memory_for_session(&options.harness_home, &options.working_session_key)?
+            .map(|(index, _)| index.virtual_session_id)
+            .or_else(|| {
+                read_working_set_memory_for_session(&options.harness_home, &root_session_key)
+                    .ok()
+                    .flatten()
+                    .map(|(index, _)| index.virtual_session_id)
+            })
+            .unwrap_or_else(|| {
+                derive_virtual_session_id(
+                    &options.platform,
+                    &options.channel_id,
+                    &options.user_id,
+                    &options.agent_id,
+                    &root_session_key,
+                )
+            });
+    let predecessor = predecessor_session_key(&root_session_key, continuation_index);
+    let pending_queue_item = options.queue_id.as_ref().map(|queue_id| {
+        serde_json::json!({
+            "schema": "agent-harness.runtime-queue-item.v1",
+            "queueId": queue_id,
+            "status": &options.status,
+            "runtimeClass": "interactive",
+            "origin": "channel",
+            "agentId": &options.agent_id,
+            "sessionKey": &options.working_session_key,
+            "platform": &options.platform,
+            "channelId": &options.channel_id,
+            "userId": &options.user_id,
+            "messageText": options.message_text.as_deref().unwrap_or_default(),
+        })
+    });
+    let mut recent_files = Vec::new();
+    if let Some(path) = options.outbox_file.as_ref() {
+        recent_files.push(format!("final-outbox:{}", path.display()));
+    }
+    if let Some(path) = options.completion_file.as_ref() {
+        recent_files.push(format!("completion:{}", path.display()));
+    }
+    let mut validation = Vec::new();
+    if let Some(queue_id) = options.queue_id.as_ref() {
+        validation.push(format!("run-once:{queue_id}:{}", options.status));
+    }
+    if let Some(path) = options.run_once_receipt_file.as_ref() {
+        validation.push(format!("run-once-receipts:{}", path.display()));
+    }
+    let working_set_file = write_working_set_memory(
+        &options.harness_home,
+        &options.agent_id,
+        &virtual_session_id,
+        &options.working_session_key,
+        predecessor.as_deref(),
+        continuation_index,
+        pending_queue_item,
+        options.now_ms,
+        WorkingSetWriteOptions {
+            objective: options
+                .message_text
+                .as_deref()
+                .and_then(|value| bounded_line(value, 200)),
+            status: Some("active".to_string()),
+            recent_files,
+            validation,
+            inherit_parent: true,
+            ..WorkingSetWriteOptions::default()
+        },
+    )?;
+    let virtual_session_file = write_virtual_session_record(
+        &options.harness_home,
+        &virtual_session_id,
+        &options.platform,
+        &options.channel_id,
+        &options.user_id,
+        &options.agent_id,
+        &root_session_key,
+        &options.working_session_key,
+        continuation_index,
+        &working_set_file,
+        options.now_ms,
+    )?;
+    write_working_set_session_index(
+        &options.harness_home,
+        &options.working_session_key,
+        &virtual_session_id,
+        continuation_index,
+        &working_set_file,
+        options.now_ms,
+    )?;
+
+    Ok(CompletedTurnWorkingSetSnapshotReport {
+        schema: WORKING_SET_MEMORY_SCHEMA.to_string(),
+        virtual_session_id,
+        working_session_key: options.working_session_key,
+        continuation_index,
+        working_set_file,
+        virtual_session_file,
+    })
 }
 
 pub fn requeue_prepared_context_rollover(
@@ -918,6 +1208,58 @@ pub fn requeue_prepared_context_rollover(
     ) {
         let _ = write_json_atomic(&state_file, &original_state);
         return Err(error);
+    }
+
+    if let Some(virtual_session_id) = virtual_session_id.as_ref() {
+        let file = write_working_set_memory(
+            &options.harness_home,
+            agent_id,
+            virtual_session_id,
+            &options.new_working_session_key,
+            previous_working_session_key.as_deref(),
+            continuation_index,
+            Some(new_item.clone()),
+            options.now_ms,
+            WorkingSetWriteOptions {
+                append_decision: Some(format!(
+                    "context rollover requeued prepared item: {}",
+                    options.reason
+                )),
+                inherit_parent: true,
+                ..WorkingSetWriteOptions::default()
+            },
+        )?;
+        write_virtual_session_record(
+            &options.harness_home,
+            virtual_session_id,
+            platform,
+            channel_id,
+            user_id,
+            agent_id,
+            &root_session_key,
+            &options.new_working_session_key,
+            continuation_index,
+            &file,
+            options.now_ms,
+        )?;
+        write_context_rollover_episode(
+            &options.harness_home,
+            virtual_session_id,
+            Some(&requeued_queue_id),
+            previous_session,
+            &options.new_working_session_key,
+            continuation_index,
+            &file,
+            options.now_ms,
+        )?;
+        write_working_set_session_index(
+            &options.harness_home,
+            &options.new_working_session_key,
+            virtual_session_id,
+            continuation_index,
+            &file,
+            options.now_ms,
+        )?;
     }
 
     let report_file = context_rollover_prepared_requeues_file(&options.harness_home);
@@ -1340,6 +1682,16 @@ fn find_latest_prepared_receipt(receipts_file: &Path, queue_id: &str) -> io::Res
     Ok(receipt)
 }
 
+#[derive(Debug, Clone, Default)]
+struct WorkingSetWriteOptions {
+    objective: Option<String>,
+    status: Option<String>,
+    recent_files: Vec<String>,
+    validation: Vec<String>,
+    append_decision: Option<String>,
+    inherit_parent: bool,
+}
+
 fn write_working_set_memory(
     harness_home: &Path,
     agent_id: &str,
@@ -1349,12 +1701,74 @@ fn write_working_set_memory(
     continuation_index: u64,
     pending_queue_item: Option<Value>,
     now_ms: i64,
+    options: WorkingSetWriteOptions,
 ) -> io::Result<PathBuf> {
     let file = working_set_file(harness_home, virtual_session_id, continuation_index);
     let (transcript_file, trajectory_file) =
         planned_session_files(harness_home, agent_id, working_session_key);
     let active_plan_refs =
         collect_active_operation_plan_refs(harness_home, agent_id, working_session_key)?;
+    let inherited = if options.inherit_parent {
+        previous_working_session_key
+            .map(|session| read_working_set_memory_for_session(harness_home, session))
+            .transpose()?
+            .flatten()
+            .map(|(_, memory)| memory)
+    } else {
+        None
+    };
+    let inherited_goal = inherited.as_ref().map(|memory| memory.goal.clone());
+    let objective = options
+        .objective
+        .or_else(|| {
+            inherited_goal
+                .as_ref()
+                .and_then(|goal| goal.objective.clone())
+        })
+        .or_else(|| {
+            pending_queue_item
+                .as_ref()
+                .and_then(|value| string_field(value, &["messageText", "message_text"]))
+                .and_then(|value| bounded_line(value, 200))
+        });
+    let goal_status = options
+        .status
+        .or_else(|| inherited_goal.as_ref().map(|goal| goal.status.clone()))
+        .unwrap_or_else(|| "active".to_string());
+    let mut constraints = inherited
+        .as_ref()
+        .map(|memory| memory.constraints.clone())
+        .unwrap_or_default();
+    let mut decisions = inherited
+        .as_ref()
+        .map(|memory| memory.decisions.clone())
+        .unwrap_or_default();
+    if let Some(decision) = options
+        .append_decision
+        .and_then(|value| bounded_line(&value, 240))
+    {
+        if !decisions.iter().any(|existing| existing == &decision) {
+            decisions.push(decision);
+        }
+    }
+    let mut recent_files = inherited
+        .as_ref()
+        .map(|memory| memory.recent_files.clone())
+        .unwrap_or_default();
+    recent_files.extend(options.recent_files);
+    let mut validation = inherited
+        .as_ref()
+        .map(|memory| memory.validation.clone())
+        .unwrap_or_default();
+    validation.extend(options.validation);
+    let blockers = inherited
+        .as_ref()
+        .map(|memory| memory.blockers.clone())
+        .unwrap_or_default();
+    cap_strings(&mut constraints, 8);
+    cap_strings(&mut decisions, 12);
+    cap_strings(&mut recent_files, 8);
+    cap_strings(&mut validation, 8);
     let queue_dir = harness_home.join("state").join("runtime-queue");
     let prompt_bundle_json = pending_queue_item
         .as_ref()
@@ -1372,18 +1786,22 @@ fn write_working_set_memory(
         previous_working_session_key: previous_working_session_key.map(ToString::to_string),
         continuation_index,
         goal: ContextWorkingSetGoal {
-            objective: None,
-            status: "active".to_string(),
-            budget_usage: None,
-            completion_criteria: Vec::new(),
+            objective,
+            status: goal_status,
+            budget_usage: inherited_goal
+                .as_ref()
+                .and_then(|goal| goal.budget_usage.clone()),
+            completion_criteria: inherited_goal
+                .map(|goal| goal.completion_criteria)
+                .unwrap_or_default(),
         },
         active_plan_refs,
         pending_queue_item,
-        constraints: Vec::new(),
-        decisions: Vec::new(),
-        recent_files: Vec::new(),
-        validation: Vec::new(),
-        blockers: Vec::new(),
+        constraints,
+        decisions,
+        recent_files,
+        validation,
+        blockers,
         static_record_refs: ContextStaticRecordRefs {
             transcript_file: Some(transcript_file.clone()),
             trajectory_file: Some(trajectory_file.clone()),
@@ -1465,6 +1883,51 @@ fn write_virtual_session_record(
     record.working_set_file = working_set_file.to_path_buf();
     write_json_atomic(&file, &record)?;
     Ok(file)
+}
+
+fn read_virtual_session_record_for_session(
+    harness_home: &Path,
+    session_key: &str,
+) -> io::Result<Option<(PathBuf, ContextVirtualSessionRecord, WorkingSetSessionIndex)>> {
+    let Some(index) = working_set_index_for_session_or_root(harness_home, session_key)? else {
+        return Ok(None);
+    };
+    let file = virtual_session_file(harness_home, &index.virtual_session_id);
+    if !file.is_file() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&file)?;
+    let record =
+        serde_json::from_str::<ContextVirtualSessionRecord>(&text).map_err(io::Error::other)?;
+    Ok(Some((file, record, index)))
+}
+
+fn working_set_index_for_session_or_root(
+    harness_home: &Path,
+    session_key: &str,
+) -> io::Result<Option<WorkingSetSessionIndex>> {
+    if let Some((index, _)) = read_working_set_memory_for_session(harness_home, session_key)? {
+        return Ok(Some(index));
+    }
+    let root_session_key = root_working_session_key(session_key);
+    if root_session_key == session_key {
+        return Ok(None);
+    }
+    read_working_set_memory_for_session(harness_home, &root_session_key)
+        .map(|maybe| maybe.map(|(index, _)| index))
+}
+
+fn close_open_working_sessions(
+    record: &mut ContextVirtualSessionRecord,
+    ended_by: &str,
+    now_ms: i64,
+) {
+    for session in &mut record.working_sessions {
+        if session.ended_at_ms.is_none() {
+            session.ended_at_ms = Some(now_ms);
+            session.ended_by = Some(ended_by.to_string());
+        }
+    }
 }
 
 fn write_context_rollover_episode(
@@ -1555,7 +2018,7 @@ fn render_working_set_continuity(
     )
 }
 
-fn working_set_file(
+pub(crate) fn working_set_file(
     harness_home: &Path,
     virtual_session_id: &str,
     continuation_index: u64,
@@ -1568,7 +2031,7 @@ fn working_set_file(
         .join(format!("{continuation_index}.json"))
 }
 
-fn virtual_session_file(harness_home: &Path, virtual_session_id: &str) -> PathBuf {
+pub(crate) fn virtual_session_file(harness_home: &Path, virtual_session_id: &str) -> PathBuf {
     harness_home
         .join("state")
         .join("context-rollover")
@@ -1576,7 +2039,7 @@ fn virtual_session_file(harness_home: &Path, virtual_session_id: &str) -> PathBu
         .join(format!("{}.json", safe_path_segment(virtual_session_id)))
 }
 
-fn derive_virtual_session_id(
+pub(crate) fn derive_virtual_session_id(
     platform: &str,
     channel_id: &str,
     user_id: &str,
@@ -1615,7 +2078,7 @@ fn json_string(object: &Map<String, Value>, keys: &[&str]) -> Option<String> {
     })
 }
 
-fn collect_active_operation_plan_refs(
+pub(crate) fn collect_active_operation_plan_refs(
     harness_home: &Path,
     agent_id: &str,
     working_session_key: &str,
@@ -1670,7 +2133,7 @@ fn collect_active_operation_plan_refs(
     Ok(refs.into_iter().collect())
 }
 
-fn string_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
+pub(crate) fn string_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
     names.iter().find_map(|name| value.get(*name)?.as_str())
 }
 
@@ -1678,9 +2141,55 @@ fn path_string_field(value: &Value, names: &[&str]) -> Option<PathBuf> {
     string_field(value, names).map(PathBuf::from)
 }
 
-fn continuation_index_from_session_key(session_key: &str) -> Option<u64> {
+pub(crate) fn continuation_index_from_session_key(session_key: &str) -> Option<u64> {
     let (_, suffix) = session_key.rsplit_once(":cont-")?;
     suffix.parse::<u64>().ok()
+}
+
+fn predecessor_session_key(root_session_key: &str, continuation_index: u64) -> Option<String> {
+    match continuation_index {
+        0 => None,
+        1 => Some(root_session_key.to_string()),
+        value => Some(continuation_session_key(
+            root_session_key,
+            value.saturating_sub(1),
+        )),
+    }
+}
+
+fn bounded_line(value: &str, max_chars: usize) -> Option<String> {
+    let line = value
+        .lines()
+        .find(|line| !line.trim().is_empty())?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if line.is_empty() {
+        return None;
+    }
+    if line.chars().count() <= max_chars {
+        return Some(line);
+    }
+    let mut out = line
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    Some(out)
+}
+
+fn cap_strings(values: &mut Vec<String>, limit: usize) {
+    for value in values.iter_mut() {
+        if let Some(bounded) = bounded_line(value, 300) {
+            *value = bounded;
+        }
+    }
+    values.sort();
+    values.dedup();
+    if values.len() > limit {
+        let keep_from = values.len().saturating_sub(limit);
+        values.drain(0..keep_from);
+    }
 }
 
 fn write_text_atomic(path: &Path, contents: &str) -> io::Result<()> {
@@ -1727,7 +2236,7 @@ fn write_text_atomic(path: &Path, contents: &str) -> io::Result<()> {
     }
 }
 
-fn safe_path_segment(value: &str) -> String {
+pub(crate) fn safe_path_segment(value: &str) -> String {
     let mut out = String::new();
     for ch in value.chars() {
         if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
@@ -1812,6 +2321,26 @@ mod tests {
             context_compact_counter_file(&harness_home, &left.lane_key()),
             context_compact_counter_file(&harness_home, &right.lane_key())
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_rollover_config_separates_compact_count_from_continuation_depth() {
+        let root = temp_root("config_separates_compact_count_from_continuation_depth");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"codexContext":{"maxSuccessfulCompactsBeforeRollover":7,"maxContinuationDepth":3,"streamUnstableContinuationMinAttempts":4,"streamUnstableContinuationTokenLimit":123456}}"#,
+        )
+        .unwrap();
+
+        let config = load_context_rollover_config(&harness_home).unwrap();
+
+        assert_eq!(config.max_successful_compacts_before_rollover, 7);
+        assert_eq!(config.max_continuation_depth, 3);
+        assert_eq!(config.stream_unstable_continuation_min_attempts, 4);
+        assert_eq!(config.stream_unstable_continuation_token_limit, 123456);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1940,6 +2469,7 @@ mod tests {
                 thinking_enabled: false,
                 thinking_level: None,
                 thinking_instruction: None,
+                fast_mode: None,
                 stop_requested: false,
                 stop_reason: None,
                 steering_notes: Vec::new(),
@@ -2170,6 +2700,7 @@ mod tests {
                 thinking_enabled: false,
                 thinking_level: None,
                 thinking_instruction: None,
+                fast_mode: None,
                 stop_requested: false,
                 stop_reason: None,
                 steering_notes: Vec::new(),
@@ -2233,6 +2764,26 @@ mod tests {
         assert!(queue_text.contains("\"queueId\":\"queue-1:rollover-requeue-42\""));
         assert!(queue_text.contains("\"previousExecutionDir\""));
         assert!(queue_text.contains("assistant:cont-1"));
+        let index_file =
+            working_set_session_index_file(&harness_home, "telegram:dm:user:assistant:cont-1");
+        assert!(index_file.is_file());
+        let index: WorkingSetSessionIndex =
+            serde_json::from_slice(&fs::read(index_file).unwrap()).unwrap();
+        let working_set: ContextWorkingSetMemory =
+            serde_json::from_slice(&fs::read(index.working_set_file).unwrap()).unwrap();
+        assert_eq!(
+            working_set
+                .pending_queue_item
+                .as_ref()
+                .and_then(|value| { string_field(value, &["queueId", "queue_id"]) }),
+            Some("queue-1:rollover-requeue-42")
+        );
+        assert!(
+            working_set
+                .decisions
+                .iter()
+                .any(|entry| entry.contains("operator rollover recovery"))
+        );
         let run_once = fs::read_to_string(queue_dir.join("run-once-receipts.jsonl")).unwrap();
         assert!(run_once.contains("\"queueId\":\"queue-1\""));
         assert!(run_once.contains("\"status\":\"skipped\""));
@@ -2272,6 +2823,7 @@ mod tests {
                 thinking_enabled: false,
                 thinking_level: None,
                 thinking_instruction: None,
+                fast_mode: None,
                 stop_requested: false,
                 stop_reason: None,
                 steering_notes: Vec::new(),
@@ -2381,6 +2933,7 @@ mod tests {
                 thinking_enabled: false,
                 thinking_level: None,
                 thinking_instruction: None,
+                fast_mode: None,
                 stop_requested: false,
                 stop_reason: None,
                 steering_notes: Vec::new(),
@@ -2523,6 +3076,7 @@ mod tests {
                 thinking_enabled: true,
                 thinking_level: Some("xhigh".to_string()),
                 thinking_instruction: None,
+                fast_mode: None,
                 stop_requested: false,
                 stop_reason: None,
                 steering_notes: Vec::new(),
@@ -2635,6 +3189,306 @@ mod tests {
         let queue_text = fs::read_to_string(queue_dir.join("pending.jsonl")).unwrap();
         assert!(queue_text.contains("\"sessionKey\":\"discord:channel-42:user-7:main:cont-1\""));
         assert!(queue_text.contains("\"completionKind\":\"continuation-rollover\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn completed_turn_updates_root_working_set_snapshot() {
+        let root = temp_root("completed_turn_updates_root_working_set_snapshot");
+        let harness_home = root.join(".agent-harness");
+        let session_key = "telegram:dm:user:main";
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let run_once_file = queue_dir.join("run-once-receipts.jsonl");
+        let outbox_file = harness_home
+            .join("state")
+            .join("channels")
+            .join("outbox.jsonl");
+        let completion_file = queue_dir
+            .join("executions")
+            .join("queue-1")
+            .join("completion.json");
+
+        let report =
+            record_completed_turn_working_set_snapshot(CompletedTurnWorkingSetSnapshotOptions {
+                harness_home: harness_home.clone(),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                agent_id: "main".to_string(),
+                working_session_key: session_key.to_string(),
+                queue_id: Some("queue-1".to_string()),
+                message_text: Some(
+                    "finish Zhongxiao Dunhua continuity plan\nextra ignored".to_string(),
+                ),
+                status: "completed".to_string(),
+                run_once_receipt_file: Some(run_once_file.clone()),
+                outbox_file: Some(outbox_file.clone()),
+                completion_file: Some(completion_file.clone()),
+                now_ms: 77,
+            })
+            .unwrap();
+
+        assert_eq!(report.continuation_index, 0);
+        assert!(report.working_set_file.is_file());
+        assert!(report.virtual_session_file.is_file());
+        assert!(working_set_session_index_file(&harness_home, session_key).is_file());
+        let working_set: ContextWorkingSetMemory =
+            serde_json::from_slice(&fs::read(&report.working_set_file).unwrap()).unwrap();
+        assert_eq!(
+            working_set.goal.objective.as_deref(),
+            Some("finish Zhongxiao Dunhua continuity plan")
+        );
+        assert!(
+            working_set
+                .validation
+                .iter()
+                .any(|entry| entry.contains("queue-1") && entry.contains("completed"))
+        );
+        assert!(
+            working_set
+                .recent_files
+                .iter()
+                .any(|entry| entry.contains("outbox.jsonl"))
+        );
+        let continuity = load_working_set_continuity_section(&harness_home, session_key)
+            .unwrap()
+            .unwrap();
+        assert!(continuity.contains("goalObjective: finish Zhongxiao Dunhua continuity plan"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn virtual_session_thread_backfill_updates_matching_working_session() {
+        let root = temp_root("virtual_session_thread_backfill_updates_matching_session");
+        let harness_home = root.join(".agent-harness");
+        let session_key = "telegram:dm:user:main";
+        let snapshot =
+            record_completed_turn_working_set_snapshot(CompletedTurnWorkingSetSnapshotOptions {
+                harness_home: harness_home.clone(),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                agent_id: "main".to_string(),
+                working_session_key: session_key.to_string(),
+                queue_id: Some("queue-thread".to_string()),
+                message_text: Some("record thread id in virtual session".to_string()),
+                status: "completed".to_string(),
+                run_once_receipt_file: None,
+                outbox_file: None,
+                completion_file: None,
+                now_ms: 77,
+            })
+            .unwrap();
+
+        let updated =
+            backfill_virtual_session_codex_thread_id(VirtualSessionThreadBackfillOptions {
+                harness_home: harness_home.clone(),
+                session_key: session_key.to_string(),
+                thread_id: "thread-recorded".to_string(),
+                now_ms: 88,
+            })
+            .unwrap()
+            .expect("virtual-session record should be updated");
+
+        assert_eq!(updated, snapshot.virtual_session_file);
+        let record: ContextVirtualSessionRecord =
+            serde_json::from_slice(&fs::read(updated).unwrap()).unwrap();
+        let working_session = record
+            .working_sessions
+            .iter()
+            .find(|session| session.session_key == session_key)
+            .expect("working session ref");
+        assert_eq!(
+            working_session.codex_thread_id.as_deref(),
+            Some("thread-recorded")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn virtual_session_terminal_mark_closes_open_working_session() {
+        let root = temp_root("virtual_session_terminal_mark_closes_open_working_session");
+        let harness_home = root.join(".agent-harness");
+        let session_key = "telegram:dm:user:main:cont-3";
+        let snapshot =
+            record_completed_turn_working_set_snapshot(CompletedTurnWorkingSetSnapshotOptions {
+                harness_home: harness_home.clone(),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                agent_id: "main".to_string(),
+                working_session_key: session_key.to_string(),
+                queue_id: Some("queue-terminal".to_string()),
+                message_text: Some("terminal continuation depth reached".to_string()),
+                status: "active".to_string(),
+                run_once_receipt_file: None,
+                outbox_file: None,
+                completion_file: None,
+                now_ms: 77,
+            })
+            .unwrap();
+
+        let updated = mark_virtual_session_terminal(VirtualSessionTerminalOptions {
+            harness_home: harness_home.clone(),
+            session_key: session_key.to_string(),
+            ended_by: "max-continuation-depth:3".to_string(),
+            now_ms: 88,
+        })
+        .unwrap()
+        .expect("virtual-session record should be marked terminal-failed");
+
+        assert_eq!(updated, snapshot.virtual_session_file);
+        let record: ContextVirtualSessionRecord =
+            serde_json::from_slice(&fs::read(updated).unwrap()).unwrap();
+        assert_eq!(record.status, "terminal-failed");
+        let working_session = record
+            .working_sessions
+            .iter()
+            .find(|session| session.session_key == session_key)
+            .expect("working session ref");
+        assert_eq!(working_session.ended_at_ms, Some(88));
+        assert_eq!(
+            working_session.ended_by.as_deref(),
+            Some("max-continuation-depth:3")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollover_child_working_set_inherits_parent_goal_and_decisions() {
+        let root = temp_root("rollover_child_working_set_inherits_parent_goal_and_decisions");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"codexContext":{"maxSuccessfulCompactsBeforeRollover":1}}"#,
+        )
+        .unwrap();
+        let old_session = "telegram:dm:user:main";
+        let state_file = channel_session_state_file(&harness_home, "telegram", "dm", "user");
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        write_json_atomic(
+            &state_file,
+            &ChannelSessionState {
+                schema: "agent-harness.channel-session-state.v1".to_string(),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                active_session_key: old_session.to_string(),
+                agent_id: Some("main".to_string()),
+                provider: None,
+                model: None,
+                session_topic: None,
+                model_override: None,
+                model_override_provider: None,
+                model_override_model: None,
+                thinking_enabled: false,
+                thinking_level: None,
+                thinking_instruction: None,
+                fast_mode: None,
+                stop_requested: false,
+                stop_reason: None,
+                steering_notes: Vec::new(),
+                btw_notes: Vec::new(),
+                last_command: None,
+                updated_at_ms: 1,
+            },
+        )
+        .unwrap();
+
+        let parent =
+            record_completed_turn_working_set_snapshot(CompletedTurnWorkingSetSnapshotOptions {
+                harness_home: harness_home.clone(),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                agent_id: "main".to_string(),
+                working_session_key: old_session.to_string(),
+                queue_id: Some("queue-parent".to_string()),
+                message_text: Some("preserve the virtual session objective".to_string()),
+                status: "completed".to_string(),
+                run_once_receipt_file: None,
+                outbox_file: None,
+                completion_file: None,
+                now_ms: 2,
+            })
+            .unwrap();
+        let mut parent_memory: ContextWorkingSetMemory =
+            serde_json::from_slice(&fs::read(&parent.working_set_file).unwrap()).unwrap();
+        parent_memory.constraints.push("same lane only".to_string());
+        parent_memory
+            .decisions
+            .push("use resolver envelope".to_string());
+        parent_memory.blockers.push("needs live bake".to_string());
+        write_json_atomic(&parent.working_set_file, &parent_memory).unwrap();
+
+        append_jsonl_value(
+            &queue_dir.join("pending.jsonl"),
+            &serde_json::json!({
+                "schema": "agent-harness.runtime-queue-item.v1",
+                "queueId": "queue-child",
+                "status": "queued",
+                "runtimeClass": "interactive",
+                "origin": "channel",
+                "source": {"kind": "channel", "sourceHome": root, "sourceWorkspace": root},
+                "createdAtMs": 3,
+                "agentId": "main",
+                "sessionKey": old_session,
+                "platform": "telegram",
+                "channelId": "dm",
+                "userId": "user",
+                "messageText": "continue",
+                "plannedTranscriptFile": "child.jsonl",
+                "plannedTrajectoryFile": "child.trajectory.jsonl"
+            }),
+        )
+        .unwrap();
+        record_context_compact_attempt(ContextCompactAttemptOptions {
+            harness_home: harness_home.clone(),
+            lane: test_lane(old_session),
+            compact_succeeded: true,
+            rewrote_active_context: true,
+            compact_thread_id: Some("thread-after-compact".to_string()),
+            compact_attempt_key: Some("queue-parent:thread".to_string()),
+            max_successful_compacts_before_rollover: 1,
+            now_ms: 4,
+        })
+        .unwrap();
+
+        let receipt = apply_context_rollover_before_turn(ContextRolloverBeforeTurnOptions {
+            harness_home: harness_home.clone(),
+            queue_id: "queue-child".to_string(),
+            runtime_class: "interactive".to_string(),
+            agent_id: "main".to_string(),
+            platform: "telegram".to_string(),
+            channel_id: "dm".to_string(),
+            user_id: "user".to_string(),
+            working_session_key: old_session.to_string(),
+            now_ms: 5,
+        })
+        .unwrap();
+
+        let child: ContextWorkingSetMemory =
+            serde_json::from_slice(&fs::read(receipt.working_set_file.unwrap()).unwrap()).unwrap();
+        assert_eq!(
+            child.goal.objective.as_deref(),
+            Some("preserve the virtual session objective")
+        );
+        assert_eq!(child.constraints, vec!["same lane only".to_string()]);
+        assert!(
+            child
+                .decisions
+                .contains(&"use resolver envelope".to_string())
+        );
+        assert!(
+            child
+                .decisions
+                .iter()
+                .any(|entry| entry.contains("context rollover"))
+        );
+        assert_eq!(child.blockers, vec!["needs live bake".to_string()]);
         let _ = fs::remove_dir_all(root);
     }
 }

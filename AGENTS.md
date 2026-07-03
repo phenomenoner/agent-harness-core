@@ -4,10 +4,19 @@
 
 - For a new local working session, read `docs/.private/agent-harness-operations-handbook.md` first when it exists: it holds the live topology, current live validation, the full command walkthrough, and the private documentation map. The root `README.md` is the public-facing overview, not the operational source of truth.
 - Treat the handbook as task-scoped repo-development orientation, not ambient prompt material. Read only the sections needed for the current repo task, keep excerpts bounded, and do not keep the handbook resident for ordinary channel/chat turns or active harness-home operations that do not need repo-development context.
+- For programming, project-understanding, design, implementation, verification, completion, documentation cleanup, and handoff/cutover work, use `docs/.private/openspec-superpowers-agency-agents-workflow-guide.md` as the default SOP. It is the private canonical workflow for OpenSpec/Superpowers planning, automated review, completion gates, test synthesis, public/private hygiene, cleanup, self-improvement capture, project-understanding context packs, and battle-set operations.
 
 ## Documentation Language
 
 - Write technical documents in English by default, including design notes, implementation plans, technical proposals, runbooks, backlog documents, and review artifacts, unless the user explicitly asks for another language.
+
+## Default Development SOP
+
+- Treat `docs/.private/openspec-superpowers-agency-agents-workflow-guide.md` as the default programming and software-development workflow for this repository. Use it before falling back to ad hoc planning or implementation.
+- For unfamiliar code, stale docs, unclear topology, or cross-module changes, start with the SOP's project-understanding intake: build or refresh the private codebase map, docs inventory, impact map, and context pack before proposing or implementing.
+- For behavior-changing work, use the SOP's OpenSpec/Superpowers path: proposal or impact context, design review, task plan, TDD implementation, automated spec/code review, verification gates, archive/handoff, and learning capture as applicable.
+- For small local changes, scale the SOP down rather than skipping it: still classify blast radius, run fresh verification, respect public/private hygiene, and report cleanup.
+- If a workflow rule is duplicated between this `AGENTS.md` and the private SOP, this file states the high-priority project constraint and the SOP supplies the detailed procedure. If they conflict, follow the stricter safety, privacy, verification, or live-ops rule and record the mismatch as a self-improvement learning.
 
 ## Topology And Change Gates
 
@@ -17,21 +26,23 @@
 - Treat platform/channel as a task-continuity boundary when reconnecting prior work. Before claiming a "previous session" state, verify receipts by exact `platform`, `accountId`, `channelId`, `userId`, `agentId`, and `sessionKey`; do not substitute Telegram DM evidence for Discord DM work, or vice versa, even when artifacts, topics, or user intent look related.
 - First-citizen ops rule: when CK says "previous session" / "last session" / `上個 session` without narrowing it, interpret that as the whole active virtual session for the current platform/channel/user/agent lane, not an arbitrary concrete child session or unrelated repo session. Only narrow to a child/continuation session when CK explicitly names a child session, queue id, continuation index, or artifact. Discord and Telegram remain separate first-class lanes; never inspect or rely on the other channel's session unless CK explicitly asks for cross-channel evidence.
 - For gaps where design intent is broader than current implementation, use the topology contract's Expected Vs Actual Gaps table and Promotion Gate column as the source of missing regressions to add before claiming parity. Current examples include progress delivery volume, progress/final-surface separation, openclaw-mem full parity, multi-agent full matrix, virtual-session continuity, repo code graph support, and scenario-matrix coverage.
-- For implementation-completeness and test-case synthesis, use [.debug/test-synthesis-and-completeness-sop-2026-06-28.md](.debug/test-synthesis-and-completeness-sop-2026-06-28.md) as the local guide until it is promoted or superseded. It defines maturity tiers, blast-radius-to-test-tier mapping, fail-first replay expectations, and the completeness verdict table required before claiming a topology-sensitive change is done.
+- For implementation-completeness and test-case synthesis, use the completion gate in `docs/.private/openspec-superpowers-agency-agents-workflow-guide.md` as the promoted default. The older `.debug/test-synthesis-and-completeness-sop-2026-06-28.md` is historical/local reference material only when needed for details not yet moved into the SOP.
+- Keep the private canonical feature/module topology described by the SOP up to date when changes affect module relationships, invariants, design-vs-implementation gaps, or test coverage expectations.
 
 ## Public / Private Repo Surface
 
-- Treat `README.md`, `CHANGELOG.md`, `SECURITY.md`, `DOC-GUIDELINES.md`, root `AGENTS.md`, and public `docs/` / `tools/` entries as GitHub-facing. They must explain architecture, configuration, usage, or public project status without exposing local ops receipts, private handoffs, debug evidence, channel/user identifiers, or machine-specific runbooks.
-- Keep non-public documents under ignored `docs/.private/`. This includes live operations handbooks, release/checkpoint handoffs, cutover evidence, validation scratch notes, Superpowers plans, and owner/operator-only runbooks.
+- Treat `README.md`, `CHANGELOG.md`, `SECURITY.md`, `DOC-GUIDELINES.md`, root `AGENTS.md`, and public `docs/` / `tools/` entries as GitHub-facing. They must explain architecture, configuration, usage, or public project status without exposing local ops receipts, private handoffs, debug evidence, channel/user identifiers, machine-specific runbooks, generated local graph/session caches, or private topology evidence.
+- Keep non-public documents under ignored `docs/.private/`. This includes live operations handbooks, release/checkpoint handoffs, cutover evidence, validation scratch notes, Superpowers/OpenSpec plans, project-understanding artifacts, self-improvement learnings, private topology maps, and owner/operator-only runbooks.
 - Keep non-public tools under ignored `tools/.private/`. This includes local environment wrappers, one-off maintenance scripts, private evidence collectors, and tools that only make sense for the owner machine.
 - Keep `.debug/` local-only. If a file under `.debug/` was ever tracked, remove it from the index while preserving the local copy when it is still useful.
 - When adding new docs or tools, choose the public location only if a new user or contributor benefits from reading or running it from GitHub. Otherwise put it directly in the matching `.private` folder.
+- Before public remote push or PR creation, run the SOP's public/private hygiene gate. Private docs may be committed only locally or to a private destination; do not push them to a public remote.
 
 ## Default Superpowers For Development
 
-- For programming or software-development tasks, default to enabling and following [$superpowers](C:\Users\user\.agents\skills\superpowers\SKILL.md) before implementation unless the user explicitly says not to use it.
+- For programming or software-development tasks, default to enabling and following [$superpowers](C:\Users\user\.agents\skills\superpowers\SKILL.md) through the private SOP before implementation unless the user explicitly says not to use it.
 - Treat this repo-level AGENTS section, or a user `[$superpowers]` mention, as the explicit project invocation for this repository if the standalone Superpowers skill text says it should only be used when explicitly invoked.
-- Treat Superpowers as the baseline development workflow for planning, implementation discipline, verification, and completion checks. If the skill file is unavailable in a session, state that briefly and continue with the closest matching local process.
+- Treat Superpowers as the baseline development workflow for planning, implementation discipline, verification, and completion checks, with OpenSpec/project-understanding/self-improvement steps supplied by the private SOP. If the skill file is unavailable in a session, state that briefly and continue with the closest matching local process.
 
 ## Command Approval Discipline
 
@@ -56,16 +67,16 @@
 
 ## Post-Task Cleanup
 
-- Before finishing a repo task, remove intermediate validation artifacts that are no longer needed, especially task-scoped `target\staging-*`, `target\staging-test-*`, `target\staging-check-*`, `target\staging-build-*`, `target\tmp`, and throwaway debug outputs created for the current task.
+- Before finishing a repo task, follow the cleanup gate in `docs/.private/openspec-superpowers-agency-agents-workflow-guide.md`: remove intermediate validation artifacts that are no longer needed, especially task-scoped `target\staging-*`, `target\staging-test-*`, `target\staging-check-*`, `target\staging-build-*`, `target\tmp`, local graph/index scratch files, and throwaway debug outputs created for the current task.
 - Do not automatically remove live or rollback material: keep `target\debug\agent-harness.exe`, documented `target\debug\agent-harness.pre-*.exe` rollback binaries, current cutover candidate builds, artifacts referenced by the operations handbook, and evidence that is still needed for audit, review, or reproduction.
 - If an artifact might still be useful but is not needed in the active workspace, archive it outside the repo with a manifest/checksum before deleting the workspace copy; prefer `E:\Warehouse_Rust-OpenClaw-Core_target\` for archived `target` material.
 - Include cleanup in the final verification checklist: report what was removed, what was archived, and what was intentionally retained.
 
 ## Ops Keyword
 
-- When the user says `戰定` or asks to run the `戰定流程`, treat it as an ops keyword for carrying the current plan through the full operational workflow: implement the planned changes to completion, make the relevant tests pass, update and clean up documentation and skills, run public hygiene, push the finished work, and then perform the intentional live cutover to enable it.
+- When the user says `戰定` or asks to run the `戰定流程`, run the private SOP's Battle-Set Mode: carry the approved plan through implementation, tests, completion gate, test synthesis, docs/topology/self-improvement updates, public/private hygiene, cleanup, public-safe push when authorized, and the selected cutover path.
 - During this workflow, "update and clean up documentation and skills" means correcting or removing stale, contradictory, or no-longer-applicable guidance instead of only appending new notes.
-- The final live cutover is an explicit part of `戰定`/`戰定流程`; until that step is reached, continue to use staging target directories and avoid disturbing the live `.agent-harness` gateway.
+- If the `戰定` request does not explicitly say handoff-only or no-cutover, treat it as authorization to perform the intentional live cutover after all required gates pass. If the user asks for handoff-only/manual cutover, generate the private handoff document and stop before live-control actions. Until the cutover step is reached, continue to use staging target directories and avoid disturbing the live `.agent-harness` gateway.
 
 ## Sub-Agent Delegation Preference
 

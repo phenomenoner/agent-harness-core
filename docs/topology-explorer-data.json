@@ -4,7 +4,7 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "864b94dee4dc325f4970d4b1615ecb007039621b54430c266b6e273e45a42218"
+      "sha256": "1e715bac40b7717c7f2dbf186cdb2a1c5f476b8c9c93d2738f3dd27796a97cf0"
     },
     {
       "path": "docs/.private/agent-harness-operations-handbook.md",
@@ -90,10 +90,10 @@
       "label": "media / artifact hygiene",
       "group": "component",
       "state": "implemented",
-      "summary": "harness-contained artifact metadata, extraction summaries, prompt-safe artifact refs",
-      "reads": "inbound attachments, generated media/tool receipts, artifact metadata",
-      "writes": "agent-harness.inbound-media-artifact.v1, prompt-safe artifact summaries",
-      "invariants": "I8, I11",
+      "summary": "harness-contained artifact metadata, extraction summaries, prompt-safe artifact refs, outbound media policy decisions",
+      "reads": "inbound attachments, generated media/tool receipts, artifact metadata, outbound local paths and harness artifact refs",
+      "writes": "agent-harness.inbound-media-artifact.v1, agent-harness.outbound-media-policy.v1, prompt-safe artifact summaries",
+      "invariants": "I8, I11, I16",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -142,10 +142,10 @@
       "label": "runtime_pipeline",
       "group": "component",
       "state": "implemented",
-      "summary": "run-once orchestration, retry/dead-letter, final outbox repair",
-      "reads": "queue item, Codex receipts, channel state",
-      "writes": "run-once receipt, dead-letter receipt, final outbox",
-      "invariants": "I2, I3, I7, I8, I9",
+      "summary": "run-once orchestration, retry/dead-letter, final outbox repair, outbound media directive parsing and artifactRef resolution",
+      "reads": "queue item, Codex receipts, channel state, media policy config",
+      "writes": "run-once receipt, dead-letter receipt, final outbox, media policy/lint receipts",
+      "invariants": "I2, I3, I7, I8, I9, I16",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -155,10 +155,10 @@
       "label": "channel_delivery",
       "group": "component",
       "state": "implemented",
-      "summary": "provider-native delivery, retry, and outbound presentation rendering",
-      "reads": "outbox JSONL, optional rich-message presentation payloads",
-      "writes": "delivery receipts, per-provider rendered-unit receipts",
-      "invariants": "I2, I7, I9, I14",
+      "summary": "provider-native delivery, retry, outbound presentation rendering, and attachment-kind-aware media upload",
+      "reads": "outbox JSONL, optional rich-message presentation payloads, policy-validated attachments",
+      "writes": "delivery receipts, per-provider rendered-unit receipts with attachment kind",
+      "invariants": "I2, I7, I9, I14, I16",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -177,14 +177,14 @@
       ]
     },
     {
-      "id": "component-memory",
-      "label": "memory",
+      "id": "component-memory-session-history-retrieval",
+      "label": "memory / session-history retrieval",
       "group": "component",
       "state": "implemented",
-      "summary": "recall/lifecycle/store proposal namespaces",
-      "reads": "prompt bundle, memory config",
-      "writes": "memory receipts and graph freshness receipts",
-      "invariants": "I8",
+      "summary": "recall/lifecycle/store proposal namespaces and lane-bound session-history lookup",
+      "reads": "prompt bundle, memory config, pack artifact metadata",
+      "writes": "memory receipts, graph freshness receipts, pack retrieval receipts",
+      "invariants": "I8, I15",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -326,7 +326,7 @@
       "label": "Final outbox or delivery",
       "group": "gate",
       "state": "release-gate",
-      "summary": "completed turn has exactly one final outbox or terminal notification; duplicate suppression by source queue/completion; final agent-reply excludes progress/narration stream content; Telegram and Discord delivery receipt trace",
+      "summary": "completed turn has exactly one final outbox or terminal notification; duplicate suppression by source queue/completion; final agent-reply excludes progress/narration stream content and implementation-goal read-only review evidence; structured owner/session routing keeps non-main or mismatched-run output as internal evidence; invalid historical outbox rows are retired with skipped-permanent receipts instead of fake delivered receipts; Telegram and Discord delivery receipt trace",
       "reviewDocs": "local docs/.private/agent-harness-channel-self-check.md, docs/invariants.md, local docs/.private/release-checklist.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -337,8 +337,19 @@
       "label": "Outbound presentation or rich-message rendering",
       "group": "gate",
       "state": "release-gate",
-      "summary": "semantic presentation renders deterministically to Telegram and Discord; Telegram HTML is escaped; Discord disables accidental mentions; text/media/action units are receipt-accounted; attachment-index media refs preserve generated attachments; partial rich-batch delivery is not marked complete; action re-entry is verified or explicitly deferred under normal channel identity/session routing",
+      "summary": "semantic presentation renders deterministically to Telegram and Discord; plain-final Markdown subset is harness-parsed before provider rendering; Telegram HTML is escaped; Discord disables accidental mentions; text/media/action units and presentation render/fallback/full-text-preserved receipts are accounted; attachment-index and artifactRef media refs preserve generated or inbound attachments; rendered media units record attachment kind; partial rich-batch delivery is not marked complete; action re-entry is verified or explicitly deferred under normal channel identity/session routing",
       "reviewDocs": "local docs/.private/rich-message-presentation-design-2026-06-30.md, docs/invariants.md, local docs/.private/release-checklist.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "impact-outbound-media-directive-or-delivery-policy",
+      "label": "Outbound media directive or delivery policy",
+      "group": "gate",
+      "state": "release-gate",
+      "summary": "MEDIA directives are parsed only outside protected spans; unknown or denied paths leave visible rejection text plus agent-harness.outbound-media-policy.v1 receipts; artifactRef resolution stays inside the harness artifact resolver; lint warning/fail-closed behavior is covered; Telegram image albums/caption overflow and Discord multipart batching record attachment-kind delivery receipts",
+      "reviewDocs": "docs/invariants.md, docs/schema-registry.md, local docs/.private/release-checklist.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -359,7 +370,7 @@
       "label": "Artifact or media prompt hygiene",
       "group": "gate",
       "state": "release-gate",
-      "summary": "image, audio/transcript, generated speech/media, browser capture, document/download, long tool-log/review transcript, worker-report, provider-native attachment fixtures, and Discord text/image attachments render as artifact refs plus bounded extraction summaries; raw bytes/base64/provider URLs/tool blobs are absent from main-thread prompt/continuity and Codex progress previews",
+      "summary": "image, audio/transcript, generated speech/media, browser capture, document/download, long tool-log/review transcript, worker-report, provider-native attachment fixtures, Discord text/image/referenced attachments, and Telegram document/voice/audio/video/static-sticker/reply media render as artifact refs plus bounded extraction summaries with provenance; raw bytes/base64/provider URLs/tool blobs are absent from main-thread prompt/continuity and Codex progress previews",
       "reviewDocs": "local private artifact-hygiene evidence, docs/invariants.md, local docs/.private/release-checklist.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -381,19 +392,19 @@
       "label": "Provider/model/request override commands",
       "group": "gate",
       "state": "release-gate",
-      "summary": "/model, /think, and /fast command state remains agent/session-scoped; unsupported provider/model routes fail closed; request overrides are capability-gated and stripped on incompatible routes; command replies do not start model turns",
+      "summary": "/model, /think, and /fast command state remains agent/session-scoped; unsupported provider/model routes fail closed; Codex app-server fast mode is gated by model-catalog serviceTiers and uses camelCase serviceTier only for supported routes; command replies do not start model turns",
       "reviewDocs": "docs/configuration.md, local docs/.private/agent-harness-dev-handoff.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
     },
     {
-      "id": "impact-memory-or-graph-recall",
-      "label": "Memory or graph recall",
+      "id": "impact-memory-graph-recall-or-session-history-search",
+      "label": "Memory, graph recall, or session-history search",
       "group": "gate",
       "state": "release-gate",
-      "summary": "per-agent memory namespace; source-scope/filter telemetry; graph freshness receipt; no canonical writes through read-index caches",
-      "reviewDocs": "local docs/.private/ops/memory-importance-maintenance-contract.md, this file",
+      "summary": "per-agent memory namespace; source-scope/filter telemetry; graph freshness receipt; no canonical writes through read-index caches; concrete session-history candidates require same agent plus lane-qualified session key; project/global fallback is explicit",
+      "reviewDocs": "local docs/.private/ops/memory-importance-maintenance-contract.md, docs/invariants.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -436,6 +447,19 @@
       ]
     },
     {
+      "id": "gap-channel-session-history-classification-gap",
+      "label": "channel-session-history-classification-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Channel session history classification",
+      "designTarget": "Requests like \"previous session\" or cross-session search should resolve within the current platform/account/channel/user/agent lane unless a result is explicitly broad-scope project/global history. Agent-space history must not be treated as one blended pool.",
+      "currentEvidence": "Channel session history classification staging adds memory_pack::tests::retrieval_scope_session_requires_same_agent_and_session_key, memory_pack::tests::retrieval_scope_session_rejects_bare_session_key_even_when_equal, memory_pack::tests::retrieval_scope_agent_private_rejects_bare_session_key_even_when_equal, memory_pack::tests::retrieval_candidate_does_not_fall_back_to_wrong_lane_concrete_history, memory_pack::tests::retrieval_candidate_uses_project_after_wrong_lane_concrete_candidate, memory_pack::tests::retrieve_wrong_lane_concrete_history_reports_scope_denied_not_missing, memory_pack::tests::retrieve_wrong_lane_concrete_then_project_returns_explicit_broad_scope, and memory_pack::tests::retrieve_wrong_lane_concrete_then_global_imported_returns_explicit_broad_scope, proving concrete session/agent-private history is same-agent/session only, bare concrete keys fail closed, wrong-lane concrete candidates do not become arbitrary fallbacks, denial receipts stay visible, and explicit project/global-imported fallback still works. Account/channel/user axes are currently enforced through lane-qualified sessionKey rather than separate pack-artifact columns.",
+      "promotionGate": "Promote only after cross-session search/retrieval replay covers Telegram vs Discord and main vs non-main axes, receipts distinguish same-lane, cross-agent/session denied, and explicit project/global fallback, and any future store that has separate account/channel/user columns compares those axes directly instead of relying only on sessionKey.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
       "id": "gap-multi-agent-full-matrix-gap",
       "label": "multi-agent-full-matrix-gap",
       "group": "gap",
@@ -455,8 +479,8 @@
       "state": "open-gap",
       "summary": "Virtual session and working-context continuity",
       "designTarget": "Long tasks should survive repeated compaction or repeated high-risk stream instability by rolling into fresh concrete sessions inside a stable virtual session, carrying a bounded working set so repeated compression or broken stream retries do not silently distort task state. /new is a task-boundary command and must not inherit the previous virtual/task memory context.",
-      "currentEvidence": "context_rollover records compact counters, virtual-session records, working-set memory, session indexes, rollover episodes, and guarded requeue receipts; prompt assembly injects working-set continuity when a continuation session has an index. Local Round10 gap-closure staging adds prompt::tests::prompt_bundle_new_command_boundary_skips_prior_task_memory_context, proving a fresh /new prompt suppresses previous-task imported memory context. A 2026-06-29 Discord long-lane audit found repeated official Codex compact-before-turn successes on the same bound thread, but no visible compact-counter, rollover receipt, fresh session key, or structured skip reason. Round12 Track A staging wires official compact-before-turn success into context-rollover accounting and adds focused tests for lane counter advancement, compact thread id recording, idempotent queue/thread attempt keys, next-turn rollover rekeying, and leased-item blocking. Round12 Track A2 staging adds a terminal polluted-thread recovery gate in runtime_pipeline that can requeue a prepared parent into a virtual child only at DeadLetter, blocks parent-session sibling pending items before channel-state advance, preserves max-depth terminal delivery, and now consumes structured threadHealthStatus telemetry from Codex preflight/recovery receipts instead of relying only on diagnostic reason substrings. Round12 scenario-matrix follow-up adds context_rollover::tests::three_turn_compact_rollover_replay_writes_continuation_working_set, proving two successful compact records make the third high-context Discord turn re-key into a continuation session, update channel state, preserve virtual-session working-set continuity, and mark the pending queue item as continuation-rollover. On 2026-06-30 a live Discord/main lane produced the first real firing of this path: the compact counter reached successfulCompactCount=2 with rolloverPending=true, an applied rollover receipt re-keyed cont-1 into cont-2 under the same virtual session, and the virtual-session record, episode index, and continuation-rollover working-set were written as receipts, superseding the 2026-06-29 compacts-without-rollover audit finding for this lane. Package D staging adds runtime_pipeline::tests::stream_unstable_retry_continuation_requires_repeated_high_usage_media_failure, runtime_pipeline::tests::repeated_stream_disconnect_high_media_retry_requeues_continuation, and runtime_pipeline::tests::stream_unstable_retry_continuation_tombstones_parent_queue_item, proving repeated retryable Codex stream disconnects with high token usage plus media context can requeue a guarded continuation during RetryPending, write the parent run-once receipt as latest skipped instead of resurrectable retry-pending, and avoid a failure outbox when child enqueue succeeds. Broader provider/live final-delivery parity — working-set prompt injection through to traced final delivery, the /new live boundary, the stream-unstable branch, and the polluted-thread branch — remains pending.",
-      "promotionGate": "Promote after end-to-end scenarios force both high-context compact rollover and repeated stream-unstable media retry: first official compact success, second official compact success, then configured rollover or explicit machine-readable skip; and repeated retryable stream disconnect with high usage plus media context, then guarded continuation requeue or explicit structured skip. The scenarios must verify a fresh session key under the same virtual session when rollover occurs, check prompt working-set injection, confirm old prepared/leased turns are not rewritten unsafely, trace final outbox/delivery back to the continuation queue item, include Discord/TG lane identity axes, and separately prove /new creates a new task boundary that does not inherit previous-task memory context. The polluted-thread branch must additionally prove parent terminal error outbox is suppressed only when child enqueue succeeds, child success/failure yields exactly one user-visible reply, sibling pending turns are not stranded, and crash-ordering avoids both suppressed-without-child and parent-error-plus-child states.",
+      "currentEvidence": "context_rollover records compact counters, virtual-session records, working-set memory, session indexes, rollover episodes, and guarded requeue receipts. The current implementation injects a bounded, pointer-only Virtual session working context prompt section from resolve_virtual_session_working_context, emits a missing-reply-metadata hint from same-lane queue anchors, closes prior virtual-session records on /new, backfills codexThreadId from Codex completion capture, separates maxContinuationDepth from compact-count thresholds, exposes stream-unstable continuation knobs, and marks max-depth virtual sessions terminal-failed. Replay and catalog coverage includes context_rollover::tests::three_turn_compact_rollover_replay_writes_continuation_working_set, runtime_pipeline::tests::stream_unstable_retry_continuation_requires_repeated_high_usage_stream_failure, runtime_pipeline::tests::polluted_thread_continuation_runs_at_terminal_failure_and_respects_depth_limit, prompt missing-reply/root-boundary coverage, /new closure coverage, Codex thread-backfill coverage, and the virtual-session-rollover S1-S5 scenario-matrix labels. Live validation has confirmed model-visible working-context prompt injection and a real /new task-boundary readback without carrying prior working-set context. Remaining evidence before promotion is broader live soak plus traced final-delivery continuity across real channel turns.",
+      "promotionGate": "Replay requirements are met for the current implementation. Promote only after live soak demonstrates model-visible continuity through real Telegram/Discord turns, traced final delivery remains correct, and /new task-boundary behavior remains verified without cross-lane or cross-agent substitution.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -519,9 +543,9 @@
       "group": "gap",
       "state": "open-gap",
       "summary": "External review loop resilience",
-      "designTarget": "External review/second-brain output is progress evidence for the parent task unless the parent queue explicitly reaches final completion. A Claude review result, timeout, or auth failure must not be mistaken for workflow closure.",
-      "currentEvidence": "Local Round10 gap closure adds codex_runtime::tests::run_codex_runtime_keeps_external_review_recovery_as_evidence_not_final, which records review-only recovery output as agent-harness.external-review-evidence.v1 instead of a completion. It also adds runtime_pipeline::tests::run_runtime_queue_once_keeps_external_review_evidence_resumable_without_final_outbox, proving the parent queue remains retryable/resumable and no final outbox is written for review-only evidence.",
-      "promotionGate": "Keep the runtime-pipeline replay green and add live/soak evidence before promotion: final outbox closure must only happen after the parent workflow completes or emits an explicit terminal blocker.",
+      "designTarget": "External review/second-brain output is progress evidence for the parent task unless the parent queue explicitly reaches final completion. A Claude review result, timeout, auth failure, read-only inspection result, or non-owner agent result must not be mistaken for workflow closure.",
+      "currentEvidence": "Local Round10 gap closure adds codex_runtime::tests::run_codex_runtime_keeps_external_review_recovery_as_evidence_not_final and runtime_pipeline::tests::run_runtime_queue_once_keeps_external_review_evidence_resumable_without_final_outbox, proving review-only recovery output is evidence, the parent queue remains resumable, and no final outbox is written. Round14 staging adds runtime_pipeline::tests::run_runtime_queue_once_suppresses_read_only_review_final_for_implementation_goal and runtime_pipeline::tests::run_runtime_queue_once_suppresses_non_main_agent_final_outbox, proving implementation-goal read-only review text and non-main/owner-mismatched completed output stay off user-facing agent-reply rows.",
+      "promotionGate": "Keep the runtime-pipeline replay green and add live/soak evidence before promotion: final outbox closure must only happen after the parent workflow completes or emits an explicit terminal blocker, and structured owner/session identity must match before a completion can become a visible final reply.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -532,9 +556,9 @@
       "group": "gap",
       "state": "open-gap",
       "summary": "Context preflight high-usage guard",
-      "designTarget": "Bound Codex threads with very high recorded usage should compact or checkpoint before heavy image/external-tool continuations, even when prompt bytes are modest and no modelContextWindow ratio is configured.",
-      "currentEvidence": "Local Round10 gap closure adds codex_runtime::tests::run_codex_runtime_preflight_compacts_high_usage_bound_thread_without_model_window, which failed first for a 136602-token replay with compactBeforeTurn=false and now passes by forcing compact through highContextUsageCompactTokenLimit.",
-      "promotionGate": "Promote only after Telegram/Discord replay proves high prior bound-thread usage triggers compact/checkpoint/fresh-thread before heavy continuations, fallback does not reuse the overloaded context, and final outbox/progress surfaces remain separated.",
+      "designTarget": "Bound Codex threads with very high recorded usage or known thread-health pollution should compact, checkpoint, or rotate to a fresh thread before heavy image/external-tool continuations, even when prompt bytes are modest and no modelContextWindow ratio is configured.",
+      "currentEvidence": "Local Round10 gap closure adds codex_runtime::tests::run_codex_runtime_preflight_compacts_high_usage_bound_thread_without_model_window, which failed first for a 136602-token replay with compactBeforeTurn=false and now passes by forcing compact through highContextUsageCompactTokenLimit. Round14 backlog staging adds codex_runtime::tests::context_preflight_rolls_over_bound_thread_inline_image_bloat and codex_runtime::tests::retryable_protocol_error_after_bloated_thread_rolls_over_to_fresh_thread, proving inline-image/oversized-output polluted bound threads use fresh-thread rollover before another doomed turn/start instead of resuming or compacting the same polluted thread.",
+      "promotionGate": "Promote only after Telegram/Discord replay proves high prior bound-thread usage and polluted thread-health receipts trigger compact/checkpoint/fresh-thread before heavy continuations, fallback does not reuse the overloaded context, and final outbox/progress surfaces remain separated.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -553,14 +577,27 @@
       ]
     },
     {
-      "id": "gap-provider-fast-request-override-gap",
-      "label": "provider-fast-request-override-gap",
+      "id": "gap-fast",
+      "label": "fast",
       "group": "gap",
       "state": "open-gap",
       "summary": "Provider request acceleration command",
       "designTarget": "Users should be able to toggle provider-native fast/priority request behavior for the current agent/session without mutating prompt text, leaking across agents/channels, or sending unsupported request parameters to Codex/proxy/provider routes.",
-      "currentEvidence": "Hermes Agent upstream implements /fast normal, /fast fast, and /fast status as a command-state/request-override path: command registry plus CLI/gateway handlers, model capability checks, per-turn request_overrides, OpenAI service_tier=\"priority\" for supported routes, Anthropic speed=\"fast\" only for supported native routes, and defensive stripping for incompatible routes. Agent Harness currently has provider/model command state and request planning, but no first-class /fast command or provider-scoped fast/priority override receipt.",
-      "promotionGate": "Add /fast status, /fast fast, /fast normal, /fast on, and /fast off as commands, not model prompts; persist initially at agent/session scope; gate by provider/model capability; exclude Codex app-server/Codex-series and unverified proxy routes unless support is proven; write command/request-plan receipts; prove Discord/TG and main/non-main isolation; prove provider/model switches recompute or clear stale overrides; prove command replies do not enqueue model turns.",
+      "currentEvidence": "Hermes Agent upstream implements /fast normal, /fast fast, and /fast status as a command-state/request-override path: command registry plus CLI/gateway handlers, model capability checks, per-turn request_overrides, OpenAI service_tier=\"priority\" for supported routes, Anthropic speed=\"fast\" only for supported native routes, and defensive stripping for incompatible routes. Agent Harness now handles `/fast status",
+      "promotionGate": "normal",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-channel-media-delivery-gap",
+      "label": "channel-media-delivery-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Channel media delivery",
+      "designTarget": "Outbound files should be delivered through channel-native media APIs only after harness policy accepts the local path or resolvable artifactRef, while inbound and referenced channel media should remain prompt-safe artifacts with provenance.",
+      "currentEvidence": "Channel-media staging adds a shared media extension/kind policy, protected-span MEDIA directive parsing, rejection/lint receipts, inbound-media and generated-image/generated-media artifactRef resolution into attachments, Telegram photo albums plus document/audio/voice/video sends with caption overflow handling, Discord multipart file batching, Telegram non-image document/voice/audio/video/static-sticker/reply-media artifact extraction, Discord referenced-media fetching, and native-image-input context-bloat preflight. ArtifactRef resolution is intentionally limited to harness-owned URI namespaces plus the same outbound policy gate; arbitrary provider URLs and raw paths remain refused.",
+      "promotionGate": "Promote only after parser/policy/lint gates, provider batching gates, inbound/referenced media hygiene gates, native-image bloat rollover, public schema/topology docs, and live Telegram/Discord smoke all pass. Keep media.nativeImageInput and media.lintFailClosed default-off until post-cutover enablement evidence exists.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -572,8 +609,8 @@
       "state": "open-gap",
       "summary": "Rich message presentation",
       "designTarget": "Final replies, attachments, links, buttons/actions, captions, and provider-native rich UI should be modeled as a semantic presentation payload rendered by channel adapters, not as raw model-authored Telegram/Discord syntax.",
-      "currentEvidence": "Agent Harness already has durable ChannelOutboundMessage text/attachment outbox, Telegram HTML-capable final sends through scoped formatting config, Discord 2000-character chunking with allowed_mentions.parse=[], provider reply/thread intent, attachment delivery, and progress/final separation. Package A staging adds optional agent-harness.rich-message-presentation.v1, fail-closed validation, backward-compatible old-outbox deserialization, and render-only Telegram/Discord fixtures for escaping, no-ping behavior, chunking, safe URLs, and capability-gated actions. Package B staging adds rendered rich-batch text/media/action units, per-unit delivery receipt fields, partial rich-batch retry semantics, and provider action capability gates. Package C staging connects Telegram/Discord provider send helpers to adapter-rendered presentation text/media when presentation is present, records rendered-unit provider receipts, fails closed for artifact-only media without an attachment index, and keeps callbacks disabled. Package D staging connects ordinary successful agent-reply finals to the presentation path by building paragraph/code semantic blocks from the final-only text after MEDIA: extraction while leaving plain text as fallback and keeping progress-panel narration out. Remaining gaps are Package D live cutover/soak, Telegram inline action sends, Discord component sends, live preview integration, artifact/provider URL redaction coverage for generated presentation payloads, and clicked-action ingress re-entry evidence.",
-      "promotionGate": "Promote only after an optional agent-harness.rich-message-presentation.v1 schema exists, Telegram and Discord render fixtures prove escaping/chunking/no-ping behavior, ordinary final replies emit presentation payloads without progress/narration, multi-unit rich batches record per-unit provider receipts, partial delivery cannot be marked complete, media captions do not duplicate text/media sends, progress/narration cannot enter final presentation, raw artifacts/provider URLs/file IDs are excluded, and Telegram/Discord action interactions re-enter through normal channel identity, agentId, session, and permission gates.",
+      "currentEvidence": "Agent Harness already has durable ChannelOutboundMessage text/attachment outbox, Telegram HTML-capable final sends through scoped formatting config, Discord 2000-character chunking with allowed_mentions.parse=[], provider reply/thread intent, attachment delivery, and progress/final separation. Package A-D staging adds optional agent-harness.rich-message-presentation.v1, fail-closed validation, old-outbox compatibility, Telegram/Discord render fixtures, rendered text/media/action units, per-unit delivery receipt fields, partial retry semantics, provider send helpers, and ordinary final-to-presentation conversion. Round14 backlog staging adds rich_presentation::tests::plain_final_bridge_renders_markdown_subset_as_semantic_blocks, channel_delivery::tests::rich_delivery_receipt_records_units_and_retries_partial_failure, channel_delivery::tests::delivery_receipt_without_presentation_field_stays_readable, the Telegram closed-loop delivery receipt test, and Telegram/Discord rich sender fallback tests, proving plain-final Markdown subset parsing, Telegram HTML provider payload rendering, provider render-mode capture, fallback reason telemetry, and full-text-preserved fallback receipts for both channel adapters. Remaining gaps are live cutover/soak, Telegram inline action sends, Discord component sends, live preview integration, artifact/provider URL redaction coverage for generated presentation payloads, and clicked-action ingress re-entry evidence.",
+      "promotionGate": "Promote only after an optional agent-harness.rich-message-presentation.v1 schema exists, Telegram and Discord render fixtures prove escaping/chunking/no-ping behavior, ordinary final replies emit presentation payloads without progress/narration, provider receipts capture rendered units plus render/fallback/full-text status, multi-unit rich batches record per-unit provider receipts, partial delivery cannot be marked complete, media captions do not duplicate text/media sends, raw artifacts/provider URLs/file IDs are excluded, and Telegram/Discord action interactions re-enter through normal channel identity, agentId, session, and permission gates.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -707,7 +744,7 @@
     },
     {
       "source": "canon-topology-contract",
-      "target": "component-memory",
+      "target": "component-memory-session-history-retrieval",
       "label": "owns boundary"
     },
     {
@@ -816,6 +853,11 @@
       "label": "must survive through"
     },
     {
+      "source": "axis-userid",
+      "target": "component-memory-session-history-retrieval",
+      "label": "must survive through"
+    },
+    {
       "source": "canon-topology-contract",
       "target": "axis-agentid",
       "label": "defines"
@@ -857,7 +899,7 @@
     },
     {
       "source": "axis-agentid",
-      "target": "component-memory",
+      "target": "component-memory-session-history-retrieval",
       "label": "must survive through"
     },
     {
@@ -897,7 +939,7 @@
     },
     {
       "source": "axis-sessionkey",
-      "target": "component-memory",
+      "target": "component-memory-session-history-retrieval",
       "label": "must survive through"
     },
     {
@@ -1046,6 +1088,26 @@
       "label": "reviewed by"
     },
     {
+      "source": "impact-outbound-media-directive-or-delivery-policy",
+      "target": "canon-topology-contract",
+      "label": "reviewed by"
+    },
+    {
+      "source": "component-media-artifact-hygiene",
+      "target": "impact-outbound-media-directive-or-delivery-policy",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "impact-outbound-media-directive-or-delivery-policy",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "impact-outbound-media-directive-or-delivery-policy",
+      "label": "changes trigger"
+    },
+    {
       "source": "impact-progress-delivery-or-narration",
       "target": "canon-topology-contract",
       "label": "reviewed by"
@@ -1096,13 +1158,13 @@
       "label": "changes trigger"
     },
     {
-      "source": "impact-memory-or-graph-recall",
+      "source": "impact-memory-graph-recall-or-session-history-search",
       "target": "canon-topology-contract",
       "label": "reviewed by"
     },
     {
-      "source": "component-memory",
-      "target": "impact-memory-or-graph-recall",
+      "source": "component-memory-session-history-retrieval",
+      "target": "impact-memory-graph-recall-or-session-history-search",
       "label": "changes trigger"
     },
     {
@@ -1121,7 +1183,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-memory",
+      "source": "component-memory-session-history-retrieval",
       "target": "gap-openclaw-mem-full-parity-gap",
       "label": "has gap"
     },
@@ -1136,8 +1198,53 @@
       "label": "has gap"
     },
     {
-      "source": "component-memory",
+      "source": "component-memory-session-history-retrieval",
       "target": "gap-per-agent-memory-recall-compartment-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-channel-session-history-classification-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-media-artifact-hygiene",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-channel-session-history-classification-gap",
       "label": "has gap"
     },
     {
@@ -1191,7 +1298,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-memory",
+      "source": "component-memory-session-history-retrieval",
       "target": "gap-multi-agent-full-matrix-gap",
       "label": "has gap"
     },
@@ -1221,22 +1328,12 @@
       "label": "has gap"
     },
     {
-      "source": "component-media-artifact-hygiene",
-      "target": "gap-virtual-session-continuity-gap",
-      "label": "has gap"
-    },
-    {
       "source": "component-prompt-turns",
       "target": "gap-virtual-session-continuity-gap",
       "label": "has gap"
     },
     {
       "source": "component-codex-runtime",
-      "target": "gap-virtual-session-continuity-gap",
-      "label": "has gap"
-    },
-    {
-      "source": "component-provider-request-policy",
       "target": "gap-virtual-session-continuity-gap",
       "label": "has gap"
     },
@@ -1251,7 +1348,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-memory",
+      "source": "component-memory-session-history-retrieval",
       "target": "gap-virtual-session-continuity-gap",
       "label": "has gap"
     },
@@ -1297,6 +1394,11 @@
     },
     {
       "source": "component-progress",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
       "target": "gap-progress-delivery-volume-gap",
       "label": "has gap"
     },
@@ -1516,43 +1618,93 @@
       "label": "has gap"
     },
     {
-      "source": "gap-provider-fast-request-override-gap",
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-fast",
       "target": "canon-topology-contract",
       "label": "tracked in"
     },
     {
       "source": "component-channel-identity",
-      "target": "gap-provider-fast-request-override-gap",
+      "target": "gap-fast",
       "label": "has gap"
     },
     {
       "source": "component-channel-state",
-      "target": "gap-provider-fast-request-override-gap",
+      "target": "gap-fast",
       "label": "has gap"
     },
     {
       "source": "component-channel-ingress-channel-runtime",
-      "target": "gap-provider-fast-request-override-gap",
+      "target": "gap-fast",
       "label": "has gap"
     },
     {
       "source": "component-prompt-turns",
-      "target": "gap-provider-fast-request-override-gap",
+      "target": "gap-fast",
       "label": "has gap"
     },
     {
       "source": "component-codex-runtime",
-      "target": "gap-provider-fast-request-override-gap",
+      "target": "gap-fast",
       "label": "has gap"
     },
     {
       "source": "component-provider-request-policy",
-      "target": "gap-provider-fast-request-override-gap",
+      "target": "gap-fast",
       "label": "has gap"
     },
     {
       "source": "component-channel-delivery",
-      "target": "gap-provider-fast-request-override-gap",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-channel-media-delivery-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-channel-media-delivery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-channel-media-delivery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime",
+      "target": "gap-channel-media-delivery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-media-artifact-hygiene",
+      "target": "gap-channel-media-delivery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-channel-media-delivery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-channel-media-delivery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-channel-media-delivery-gap",
       "label": "has gap"
     },
     {
@@ -1641,7 +1793,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-memory",
+      "source": "component-memory-session-history-retrieval",
       "target": "gap-generic-artifact-context-hygiene-gap",
       "label": "has gap"
     },
@@ -1691,7 +1843,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-memory",
+      "source": "component-memory-session-history-retrieval",
       "target": "gap-scenario-matrix-coverage-gap",
       "label": "has gap"
     }
@@ -1751,7 +1903,6 @@
         "component-prompt-turns",
         "component-runtime-queue-runtime-worker",
         "component-runtime-pipeline",
-        "component-memory",
         "gap-multi-agent-full-matrix-gap",
         "gap-per-agent-memory-recall-compartment-gap"
       ],
@@ -1815,7 +1966,6 @@
       "summary": "Understand the Store / Pack / Observe boundary, current fallback posture, and what remains before openclaw-mem parity.",
       "why": "Use this when recall quality, graph freshness, Qdrant Edge, or per-agent memory scope looks suspicious.",
       "nodes": [
-        "component-memory",
         "ops-current-live-validation",
         "gap-openclaw-mem-full-parity-gap",
         "gap-per-agent-memory-recall-compartment-gap",
@@ -1850,7 +2000,6 @@
         "ops-current-live-validation",
         "impact-codex-runtime-or-completion-recording",
         "impact-final-outbox-or-delivery",
-        "impact-memory-or-graph-recall",
         "impact-supervisor-or-live-cutover",
         "gap-scenario-matrix-coverage-gap",
         "gap-supervisor-service-health-precedence-gap"

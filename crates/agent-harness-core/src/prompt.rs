@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::load_working_set_continuity_section;
 use crate::operation_plan::{
     OperationPlanItemStatus, OperationPlanShowOptions, OperationPlanShowReport,
     OperationPlanStatus, list_operation_plans, show_operation_plan,
@@ -14,14 +13,17 @@ use crate::{
     InboundMediaInputPlanOptions, InboundMediaModelAttachmentStatus, MemoryPromptContextOptions,
     MemoryPromptContextStatus, MemoryRecallPlanOptions, PackArtifactMetadata, PackCandidateOptions,
     PackTtlPolicy, SKILL_FILE_NAME, SkillDeliveryMode, SkillSelection, TurnDispatch, TurnPlan,
+    VirtualSessionContextQuery, VirtualSessionEvidenceAnchor, VirtualSessionWorkingContext,
     build_memory_prompt_context, current_log_time_ms, pack_candidate, plan_inbound_media_inputs,
     plan_memory_policy_recall, render_inbound_media_artifacts_for_prompt,
-    render_skill_invocation_envelope, skill_body_checksum, write_memory_prompt_context_receipt,
+    render_skill_invocation_envelope, resolve_virtual_session_working_context, skill_body_checksum,
+    write_memory_prompt_context_receipt,
 };
 
 const PROMPT_BUNDLE_SCHEMA: &str = "agent-harness.prompt-bundle.v1";
 const PROMPT_INJECTION_LEDGER_SCHEMA: &str = "agent-harness.prompt-injection-ledger.v2";
 const INBOUND_CONTEXT_MAX_BYTES: usize = 16 * 1024;
+const VIRTUAL_SESSION_CONTEXT_MAX_BYTES: usize = 2 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptAssemblyOptions {
@@ -60,6 +62,7 @@ pub struct PromptBundle {
     pub agent_id: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub provider_request_policy: crate::TurnProviderRequestPolicy,
     pub thinking_enabled: bool,
     pub thinking_level: Option<String>,
     pub summary: PromptBundleSummary,
@@ -116,6 +119,7 @@ pub enum PromptSectionKind {
     MemoryContext,
     InboundContext,
     InboundMedia,
+    ChannelOutputContract,
     PromptFile,
     SkillIndex,
     Skill,
@@ -180,16 +184,17 @@ pub fn assemble_prompt_bundle(
         ));
     } else {
         sections.push(agent_identity_section(plan));
+        sections.push(channel_output_contract_section());
         if let Some(harness_home) = options.harness_home.as_ref() {
             match operation_plan_context_section(harness_home, plan, agent_id.as_deref()) {
                 Ok(section) => sections.push(section),
                 Err(error) => warnings.push(format!("operation plan context unavailable: {error}")),
             }
-            match load_working_set_continuity_section(harness_home, &plan.session_key) {
-                Ok(Some(content)) => sections.push(working_set_continuity_section(content)),
+            match virtual_session_working_context_section(harness_home, plan) {
+                Ok(Some(section)) => sections.push(section),
                 Ok(None) => {}
                 Err(error) => warnings.push(format!(
-                    "working set continuity context unavailable: {error}"
+                    "virtual session working context unavailable: {error}"
                 )),
             }
         }
@@ -341,6 +346,7 @@ pub fn assemble_prompt_bundle(
         agent_id,
         provider: plan.model_policy.provider.clone(),
         model: plan.model_policy.model.clone(),
+        provider_request_policy: plan.provider_request_policy.clone(),
         thinking_enabled: plan.thinking_policy.enabled,
         thinking_level: plan.thinking_policy.level.clone(),
         summary,
@@ -713,21 +719,205 @@ fn session_continuity_section(notes: Vec<String>) -> PromptSection {
     }
 }
 
-fn working_set_continuity_section(content: String) -> PromptSection {
-    let bytes = content.len();
-    PromptSection {
+fn virtual_session_working_context_section(
+    harness_home: &Path,
+    plan: &TurnPlan,
+) -> io::Result<Option<PromptSection>> {
+    let Some(agent_id) = plan.agent.as_ref().map(|agent| agent.id.clone()) else {
+        return Ok(None);
+    };
+    let context = resolve_virtual_session_working_context(VirtualSessionContextQuery {
+        harness_home: harness_home.to_path_buf(),
+        platform: plan.platform.clone(),
+        channel_id: plan.channel_id.clone(),
+        user_id: plan.user_id.clone(),
+        agent_id,
+        session_key: Some(plan.session_key.clone()),
+        now_ms: current_log_time_ms().unwrap_or(0),
+    })?;
+    if !virtual_session_context_has_prompt_value(&context) {
+        return Ok(None);
+    }
+    let mut content = render_virtual_session_working_context(&context);
+    if missing_reply_metadata_hint_needed(plan, &context) {
+        content.push_str("\nmissingReplyMetadataHint: inbound reply metadata was not present; same-lane recentQueueIds from the resolver are candidate continuity anchors only.");
+    }
+    content.push_str("\nDeterministic resolver state outranks narrative continuation notes.");
+    let bytes_original = content.len();
+    let truncated = bytes_original > VIRTUAL_SESSION_CONTEXT_MAX_BYTES;
+    if truncated {
+        content = truncate_utf8_to_bytes(&content, VIRTUAL_SESSION_CONTEXT_MAX_BYTES);
+        content.push_str("\n[truncated]");
+    }
+    let bytes_included = content.len();
+    Ok(Some(PromptSection {
         kind: PromptSectionKind::SessionContinuity,
         tier: PromptSectionTier::Continuity,
-        title: "Working set continuity".to_string(),
-        path: None,
-        bytes_original: bytes,
-        bytes_included: bytes,
-        truncated: false,
+        title: "Virtual session working context".to_string(),
+        path: context.working_set_file.clone(),
+        bytes_original,
+        bytes_included,
+        truncated,
         skill_id: None,
         body_checksum: None,
         delivery_mode: None,
         content,
+    }))
+}
+
+fn virtual_session_context_has_prompt_value(context: &VirtualSessionWorkingContext) -> bool {
+    context.scope_decision.status != "same-virtual-session"
+        || context.predecessor_session_key.is_some()
+        || context.continuation_index > 0
+        || context.working_set_file.is_some()
+        || !context.recent_queue_ids.is_empty()
+        || !context.operation_plans.is_empty()
+        || !context.evidence_anchors.run_once_receipts.is_empty()
+        || !context.evidence_anchors.execution_receipts.is_empty()
+        || !context.evidence_anchors.outbox_rows.is_empty()
+        || !context.evidence_anchors.delivery_receipts.is_empty()
+        || !context.evidence_anchors.progress_receipts.is_empty()
+}
+
+fn render_virtual_session_working_context(context: &VirtualSessionWorkingContext) -> String {
+    let mut lines = vec![
+        format!("schema: {}", context.schema),
+        format!(
+            "lane: platform={} channelId={} userId={} agentId={}",
+            context.lane.platform,
+            context.lane.channel_id,
+            context.lane.user_id,
+            context.lane.agent_id
+        ),
+        format!(
+            "scopeDecision: {} ({})",
+            context.scope_decision.status, context.scope_decision.reason
+        ),
+        format!("fallbackUsed: {}", context.scope_decision.fallback_used),
+        format!(
+            "currentSessionKey: {}",
+            context.current_session_key.as_deref().unwrap_or("(none)")
+        ),
+        format!(
+            "virtualSessionId: {}",
+            context.virtual_session_id.as_deref().unwrap_or("(none)")
+        ),
+        format!("continuationIndex: {}", context.continuation_index),
+        format!(
+            "predecessorSession: {}",
+            context
+                .predecessor_session_key
+                .as_deref()
+                .unwrap_or("(none)")
+        ),
+        format!(
+            "workingSetFile: {}",
+            context
+                .working_set_file
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "(none)".to_string())
+        ),
+    ];
+    push_string_list(&mut lines, "recentQueueIds", &context.recent_queue_ids);
+    push_anchor_list(
+        &mut lines,
+        "runOnceReceipts",
+        &context.evidence_anchors.run_once_receipts,
+    );
+    push_anchor_list(
+        &mut lines,
+        "executionReceipts",
+        &context.evidence_anchors.execution_receipts,
+    );
+    push_anchor_list(
+        &mut lines,
+        "outboxRows",
+        &context.evidence_anchors.outbox_rows,
+    );
+    push_anchor_list(
+        &mut lines,
+        "deliveryReceipts",
+        &context.evidence_anchors.delivery_receipts,
+    );
+    push_anchor_list(
+        &mut lines,
+        "progressReceipts",
+        &context.evidence_anchors.progress_receipts,
+    );
+    push_string_list(&mut lines, "operationPlans", &context.operation_plans);
+    if !context.scope_decision.denied_candidates.is_empty() {
+        push_string_list(
+            &mut lines,
+            "deniedCandidates",
+            &context.scope_decision.denied_candidates,
+        );
     }
+    lines.join("\n")
+}
+
+fn push_string_list(lines: &mut Vec<String>, label: &str, values: &[String]) {
+    lines.push(format!("{label}:"));
+    if values.is_empty() {
+        lines.push("- (none)".to_string());
+    } else {
+        for value in values.iter().take(5) {
+            lines.push(format!("- {}", bounded_prompt_line(value, 180)));
+        }
+    }
+}
+
+fn push_anchor_list(
+    lines: &mut Vec<String>,
+    label: &str,
+    anchors: &[VirtualSessionEvidenceAnchor],
+) {
+    lines.push(format!("{label}:"));
+    if anchors.is_empty() {
+        lines.push("- (none)".to_string());
+    } else {
+        for anchor in anchors.iter().take(3) {
+            let mut line = format!(
+                "- queueId={} status={} file={}",
+                bounded_prompt_line(&anchor.queue_id, 120),
+                bounded_prompt_line(&anchor.status, 80),
+                anchor.file.display()
+            );
+            if let Some(reason) = anchor.reason.as_deref() {
+                line.push_str(&format!(" reason={}", bounded_prompt_line(reason, 120)));
+            }
+            lines.push(line);
+        }
+    }
+}
+
+fn missing_reply_metadata_hint_needed(
+    plan: &TurnPlan,
+    context: &VirtualSessionWorkingContext,
+) -> bool {
+    if context.scope_decision.status != "same-virtual-session"
+        || context.recent_queue_ids.is_empty()
+    {
+        return false;
+    }
+    let Some(inbound_context) = plan.inbound_context.as_deref() else {
+        return true;
+    };
+    let normalized = inbound_context.to_ascii_lowercase();
+    !(normalized.contains("reply") || normalized.contains("referenced message"))
+}
+
+fn bounded_prompt_line(value: &str, max_chars: usize) -> String {
+    let single_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.chars().count() <= max_chars {
+        return single_line;
+    }
+    let mut out = single_line
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
 }
 
 fn memory_context_section(content: String) -> PromptSection {
@@ -815,6 +1005,23 @@ fn inbound_context_section(context: &str) -> PromptSection {
         body_checksum: None,
         delivery_mode: None,
         content,
+    }
+}
+
+fn channel_output_contract_section() -> PromptSection {
+    const CONTENT: &str = "To attach a local file to your channel reply, emit a standalone line `MEDIA:<absolute path>` with one file per line. Quotes or backticks are allowed around paths with spaces. Use `[[as_document]]` to send images uncompressed as documents, and `[[audio_as_voice]]` to send audio as voice messages. A Markdown link or a bare path in prose is not an attachment. Files outside harness workspace/artifact areas are refused by policy; rejected directives leave a visible note.";
+    PromptSection {
+        kind: PromptSectionKind::ChannelOutputContract,
+        tier: PromptSectionTier::StableRuntime,
+        title: "Channel output contract".to_string(),
+        path: None,
+        bytes_original: CONTENT.len(),
+        bytes_included: CONTENT.len(),
+        truncated: false,
+        skill_id: None,
+        body_checksum: None,
+        delivery_mode: None,
+        content: CONTENT.to_string(),
     }
 }
 
@@ -921,6 +1128,10 @@ fn channel_state_section(state: &crate::ChannelSessionState) -> PromptSection {
     content.push_str(&format!(
         "thinking_instruction: {}\n",
         state.thinking_instruction.as_deref().unwrap_or("-")
+    ));
+    content.push_str(&format!(
+        "fast_mode: {}\n",
+        state.fast_mode.as_deref().unwrap_or("normal")
     ));
     content.push_str(&format!("stop_requested: {}\n", state.stop_requested));
     content.push_str(&format!(
@@ -1316,6 +1527,7 @@ fn section_kind_label(kind: PromptSectionKind) -> &'static str {
         PromptSectionKind::MemoryContext => "memory-context",
         PromptSectionKind::InboundContext => "inbound-context",
         PromptSectionKind::InboundMedia => "inbound-media",
+        PromptSectionKind::ChannelOutputContract => "channel-output-contract",
         PromptSectionKind::PromptFile => "prompt-file",
         PromptSectionKind::SkillIndex => "skill-index",
         PromptSectionKind::Skill => "skill",
@@ -1360,6 +1572,7 @@ fn summarize_sections(sections: &[PromptSection]) -> PromptBundleSummary {
             PromptSectionKind::MemoryContext => summary.memory_context_sections_included += 1,
             PromptSectionKind::InboundContext => summary.inbound_context_sections_included += 1,
             PromptSectionKind::InboundMedia => summary.inbound_media_sections_included += 1,
+            PromptSectionKind::ChannelOutputContract => {}
             PromptSectionKind::PromptFile => summary.prompt_files_included += 1,
             PromptSectionKind::SkillIndex => summary.skill_index_sections_included += 1,
             PromptSectionKind::Skill => summary.skills_included += 1,
@@ -1570,6 +1783,48 @@ mod tests {
                     && section.content == "repair memory cron")
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prompt_bundle_includes_channel_output_contract_once() {
+        let root = temp_root("prompt_bundle_includes_channel_output_contract_once");
+        let source = write_prompt_source(&root);
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "discord".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "send the image".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        let bundle = assemble_prompt_bundle(&plan, PromptAssemblyOptions::default()).unwrap();
+        let contracts = bundle
+            .sections
+            .iter()
+            .filter(|section| section.kind == PromptSectionKind::ChannelOutputContract)
+            .collect::<Vec<_>>();
+
+        assert_eq!(contracts.len(), 1);
+        assert!(contracts[0].content.contains("MEDIA:<absolute path>"));
+        assert!(
+            contracts[0]
+                .content
+                .contains("bare path in prose is not an attachment")
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2334,8 +2589,8 @@ mod tests {
     }
 
     #[test]
-    fn prompt_bundle_includes_working_set_continuity_section() {
-        let root = temp_root("prompt_bundle_includes_working_set_continuity_section");
+    fn prompt_bundle_includes_virtual_session_resolver_context_section() {
+        let root = temp_root("prompt_bundle_includes_virtual_session_resolver_context_section");
         let source = write_prompt_source(&root);
         let harness_home = root.join(".agent-harness");
         let continuation_session = "telegram:dm:user:main:cont-1";
@@ -2426,10 +2681,92 @@ mod tests {
         assert_eq!(bundle.summary.session_continuity_sections_included, 1);
         assert!(bundle.sections.iter().any(|section| {
             section.kind == PromptSectionKind::SessionContinuity
-                && section.title == "Working set continuity"
+                && section.title == "Virtual session working context"
+                && section
+                    .content
+                    .contains("schema: agent-harness.virtual-session-working-context.v1")
+                && section
+                    .content
+                    .contains("scopeDecision: same-virtual-session")
+                && section.content.contains("fallbackUsed: false")
+                && section
+                    .content
+                    .contains("currentSessionKey: telegram:dm:user:main:cont-1")
                 && section.content.contains("virtualSessionId: vsession-test")
-                && section.content.contains("pendingQueueId: turn:rollover")
+                && section.content.contains("recentQueueIds:")
+                && section.content.contains("- turn:rollover")
+                && section
+                    .content
+                    .contains("Deterministic resolver state outranks narrative continuation notes.")
         }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prompt_bundle_missing_reply_metadata_hint_uses_resolver_queue_ids() {
+        let root = temp_root("prompt_bundle_missing_reply_metadata_hint_uses_resolver_queue_ids");
+        let source = write_prompt_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let session_key = "telegram:dm:user:main";
+        let snapshot = crate::record_completed_turn_working_set_snapshot(
+            crate::CompletedTurnWorkingSetSnapshotOptions {
+                harness_home: harness_home.clone(),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                agent_id: "main".to_string(),
+                working_session_key: session_key.to_string(),
+                queue_id: Some("turn:same-lane-previous".to_string()),
+                message_text: Some("previous exact lane task".to_string()),
+                status: "completed".to_string(),
+                run_once_receipt_file: None,
+                outbox_file: None,
+                completion_file: None,
+                now_ms: 1234,
+            },
+        )
+        .unwrap();
+        assert!(snapshot.virtual_session_file.is_file());
+
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "continue the previous session".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: Some(session_key.to_string()),
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        let bundle = assemble_prompt_bundle(
+            &plan,
+            PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        )
+        .unwrap();
+
+        let section = bundle
+            .sections
+            .iter()
+            .find(|section| section.title == "Virtual session working context")
+            .expect("virtual-session resolver context section");
+        assert!(section.content.contains("missingReplyMetadataHint:"));
+        assert!(section.content.contains("turn:same-lane-previous"));
+        assert!(!section.content.contains("cross-lane"));
 
         let _ = fs::remove_dir_all(root);
     }

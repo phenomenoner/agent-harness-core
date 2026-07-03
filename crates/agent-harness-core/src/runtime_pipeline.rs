@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -8,35 +8,38 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::codex_runtime::{CodexContextRecoveryReceipt, CodexThreadHealthStatus};
-use crate::rich_presentation::rich_presentation_from_plain_final_with_attachment_count;
+use crate::rich_presentation::{
+    RichMessagePresentation, rich_presentation_from_plain_final_with_attachment_count,
+};
 use crate::{
     AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
     AssistantNarrationConfig, AssistantNarrationMode, ChannelDeliveryIntent,
     ChannelDeliveryIntentKind, ChannelOutboundAttachment, ChannelOutboundAttachmentKind,
     ChannelOutboundMessage, ChannelOutboundMessageKind, CodexRuntimePlan, CodexRuntimePlanOptions,
     CodexRuntimePlanReport, CodexRuntimeReceiptStatus, CodexRuntimeRunOptions,
-    CodexRuntimeRunReport, CodexRuntimeRunStatus, ContextRolloverMode,
-    ContextRolloverPreparedRequeueReport, ContextRolloverRequeuePreparedOptions, HarnessLogEvent,
-    HarnessLogLevel, InboundMediaArtifact, MemoryLifecycleTurnOptions, PromptAssemblyOptions,
-    ResponseToneConfig, ResponseToneContext, RuntimeContinuationMetadata,
-    RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
-    RuntimeQueuePreparedItem, SelfImprovementNotificationTarget, SelfImprovementReviewHookOptions,
-    append_agent_progress_event, append_harness_log, apply_response_tone, continuation_session_key,
-    current_log_time_ms, inspect_runtime_backoff_policy, load_assistant_narration_config,
-    load_context_rollover_config, load_response_tone_config,
-    mark_cron_run_runtime_status_by_queue_id, plan_codex_runtime, prepare_runtime_queue_item,
-    read_channel_session_state, record_memory_lifecycle_turn,
-    record_skill_usage_from_prompt_bundle, release_runtime_queue_lease,
-    requeue_prepared_context_rollover_if_no_parent_siblings, root_working_session_key,
-    run_codex_runtime, run_self_improvement_review_hook, write_json_atomic,
+    CodexRuntimeRunReport, CodexRuntimeRunStatus, CompletedTurnWorkingSetSnapshotOptions,
+    ContextRolloverMode, ContextRolloverPreparedRequeueReport,
+    ContextRolloverRequeuePreparedOptions, HarnessLogEvent, HarnessLogLevel, InboundMediaArtifact,
+    MediaDeliveryVerdict, MemoryLifecycleTurnOptions, PromptAssemblyOptions, ResponseToneConfig,
+    ResponseToneContext, RuntimeContinuationMetadata, RuntimeExecutionReceiptStatus,
+    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeQueuePreparedItem,
+    SelfImprovementNotificationTarget, SelfImprovementReviewHookOptions,
+    VirtualSessionTerminalOptions, append_agent_progress_event, append_harness_log,
+    apply_response_tone, attachment_kind_from_path, continuation_session_key, current_log_time_ms,
+    evaluate_outbound_media_path, inspect_runtime_backoff_policy, is_deliverable_media_path,
+    load_assistant_narration_config, load_context_rollover_config, load_harness_media_config,
+    load_response_tone_config, mark_cron_run_runtime_status_by_queue_id,
+    mark_virtual_session_terminal, plan_codex_runtime, prepare_runtime_queue_item,
+    read_channel_session_state, record_completed_turn_working_set_snapshot,
+    record_memory_lifecycle_turn, record_skill_usage_from_prompt_bundle,
+    release_runtime_queue_lease, requeue_prepared_context_rollover_if_no_parent_siblings,
+    resolve_inbound_media_artifact_reference, root_working_session_key, run_codex_runtime,
+    run_self_improvement_review_hook, write_json_atomic, write_media_policy_receipt,
 };
 
 const RUNTIME_RUN_ONCE_SCHEMA: &str = "agent-harness.runtime-run-once.v1";
 const RUNTIME_DEAD_LETTER_SCHEMA: &str = "agent-harness.runtime-dead-letter.v1";
 const FINAL_OUTBOX_RECEIPT_SCHEMA: &str = "agent-harness.runtime-final-outbox.v1";
-const STREAM_UNSTABLE_CONTINUATION_MIN_ATTEMPTS: usize = 2;
-const STREAM_UNSTABLE_CONTINUATION_TOKEN_LIMIT: u64 = 80_000;
-
 #[derive(Debug, Clone)]
 struct RuntimeContinuationCandidate {
     queue_id: String,
@@ -140,6 +143,10 @@ pub struct RuntimeRunOnceReceipt {
     pub outbox_file: Option<PathBuf>,
     #[serde(default, flatten)]
     pub continuation: RuntimeContinuationMetadata,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_queue_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_session_key: Option<String>,
     pub reason: String,
 }
 
@@ -307,6 +314,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             transcript_file: None,
             outbox_file: None,
             continuation: metadata.continuation,
+            child_queue_id: None,
+            child_session_key: None,
             reason: "runtime queue lease lock is busy; retrying later".to_string(),
         };
         append_runtime_run_once_log(
@@ -348,6 +357,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             transcript_file: None,
             outbox_file: None,
             continuation: metadata.continuation,
+            child_queue_id: None,
+            child_session_key: None,
             reason: if requested_specific_queue {
                 "requested queue item was not pending or prepared".to_string()
             } else {
@@ -402,6 +413,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             transcript_file: None,
             outbox_file: None,
             continuation: prepare.receipt.continuation.clone(),
+            child_queue_id: None,
+            child_session_key: None,
             reason: "no prepared runtime execution is available to run".to_string(),
         };
         append_runtime_run_once_log(
@@ -547,6 +560,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
     }
     let mut outbox_file = None;
     let mut outbound_message = None;
+    let mut child_queue_id = None;
+    let mut child_session_key = None;
     if run.receipt.status == CodexRuntimeRunStatus::Completed {
         if run.receipt.event_count == 0 && run.receipt.reason.contains("already recorded") {
             warnings.push(
@@ -576,21 +591,6 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                             &context,
                             &mut warnings,
                         )? {
-                            let (mut text, attachments) =
-                                split_outbound_media_directives(&response.outbound_text);
-                            let tone_config = match load_response_tone_config(&options.harness_home)
-                            {
-                                Ok(config) => {
-                                    warnings.extend(config.warnings.clone());
-                                    config
-                                }
-                                Err(error) => {
-                                    warnings.push(format!(
-                                            "response tone config could not be loaded; using defaults: {error}"
-                                        ));
-                                    ResponseToneConfig::default()
-                                }
-                            };
                             let agent_id = prepare
                                 .item
                                 .as_ref()
@@ -598,62 +598,143 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                 .or_else(|| {
                                     plan.plan.as_ref().and_then(|plan| plan.agent_id.as_deref())
                                 });
-                            text = apply_response_tone(
-                                &text,
-                                ResponseToneContext {
-                                    agent_id,
-                                    platform: &context.platform,
-                                    channel_id: &context.channel_id,
-                                    user_id: &context.user_id,
-                                },
-                                &tone_config,
+                            let run_session_key = prepare
+                                .item
+                                .as_ref()
+                                .map(|item| item.session_key.as_str())
+                                .or_else(|| {
+                                    plan.plan.as_ref().map(|plan| plan.session_key.as_str())
+                                });
+                            let input_kind = final_outbox_input_kind_for_completed_response(
+                                prepare.receipt.runtime_class.as_deref(),
+                                prepare.receipt.origin.as_deref(),
+                                agent_id,
+                                run_session_key,
+                                &context.session_key,
+                                response.prior_user_text.as_deref(),
+                                &response.final_text,
                             );
-                            let message = ChannelOutboundMessage {
-                                platform: context.platform.clone(),
-                                account_id: context.account_id.clone(),
-                                channel_id: context.channel_id.clone(),
-                                user_id: context.user_id.clone(),
-                                session_key: context.session_key.clone(),
-                                kind: ChannelOutboundMessageKind::AgentReply,
-                                source_queue_id: run.receipt.queue_id.clone(),
-                                source_completion_file: run.receipt.completion_file.clone(),
-                                presentation:
-                                    rich_presentation_from_plain_final_with_attachment_count(
-                                        &text,
-                                        attachments.len(),
-                                    ),
-                                text,
-                                delivery_intent: delivery_intent_from_inbound_context(
-                                    &context.platform,
-                                    &context.channel_id,
-                                    context.inbound_context.as_deref(),
-                                ),
-                                attachments,
-                            };
-                            let (file, appended) = append_final_outbound_message_once(
-                                &options.harness_home,
-                                run.receipt.execution_dir.as_deref(),
-                                run.receipt.completion_file.as_deref(),
-                                &message,
-                                &mut warnings,
-                            )?;
-                            outbox_file = Some(file);
-                            if appended {
-                                if let Some(codex_plan) = plan.plan.as_ref() {
-                                    match record_memory_lifecycle_turn(MemoryLifecycleTurnOptions {
-                                        harness_home: options.harness_home.clone(),
-                                        prompt_bundle_json: codex_plan.prompt_bundle_json.clone(),
-                                        assistant_text: response.final_text.clone(),
-                                        success: true,
-                                        now_ms: current_log_time_ms()?,
-                                    }) {
-                                        Ok(memory) => warnings.extend(memory.warnings),
-                                        Err(error) => warnings.push(format!(
-                                            "memory lifecycle recording failed: {error}"
-                                        )),
-                                    }
+                            let decision = final_outbox_decision(input_kind);
+                            if !decision.may_write_final_outbox() {
+                                warnings.push(format!(
+                                    "final outbox suppressed: completed response classified as {:?} with disposition {:?}",
+                                    input_kind, decision.disposition
+                                ));
+                            } else {
+                                let (mut text, mut attachments) = split_outbound_media_directives(
+                                    &options.harness_home,
+                                    run.receipt.queue_id.as_deref(),
+                                    Some(context.platform.as_str()),
+                                    &response.outbound_text,
+                                    &mut warnings,
+                                )?;
+                                let lint_result = maybe_record_media_delivery_lint(
+                                    &options.harness_home,
+                                    run.receipt.queue_id.as_deref(),
+                                    Some(context.platform.as_str()),
+                                    response.prior_user_text.as_deref(),
+                                    &response.outbound_text,
+                                    attachments.len(),
+                                    &mut warnings,
+                                );
+                                let mut outbound_kind = decision
+                                    .outbound_kind
+                                    .unwrap_or(ChannelOutboundMessageKind::AgentReply);
+                                if lint_result.fail_closed {
+                                    text = media_delivery_lint_terminal_notice();
+                                    attachments.clear();
+                                    outbound_kind = ChannelOutboundMessageKind::ErrorReply;
                                 }
-                                outbound_message = Some(message);
+                                let tone_config = match load_response_tone_config(
+                                    &options.harness_home,
+                                ) {
+                                    Ok(config) => {
+                                        warnings.extend(config.warnings.clone());
+                                        config
+                                    }
+                                    Err(error) => {
+                                        warnings.push(format!(
+                                            "response tone config could not be loaded; using defaults: {error}"
+                                        ));
+                                        ResponseToneConfig::default()
+                                    }
+                                };
+                                text = apply_response_tone(
+                                    &text,
+                                    ResponseToneContext {
+                                        agent_id,
+                                        platform: &context.platform,
+                                        channel_id: &context.channel_id,
+                                        user_id: &context.user_id,
+                                    },
+                                    &tone_config,
+                                );
+                                let mut presentation = decision
+                                    .attach_plain_final_presentation
+                                    .then(|| {
+                                        rich_presentation_from_plain_final_with_attachment_count(
+                                            &text,
+                                            attachments.len(),
+                                        )
+                                    })
+                                    .flatten();
+                                if let Some(presentation) = presentation.as_mut() {
+                                    resolve_presentation_artifact_refs(
+                                        &options.harness_home,
+                                        run.receipt.queue_id.as_deref(),
+                                        Some(context.platform.as_str()),
+                                        presentation,
+                                        &mut attachments,
+                                        &mut warnings,
+                                    )?;
+                                }
+                                let message = ChannelOutboundMessage {
+                                    platform: context.platform.clone(),
+                                    account_id: context.account_id.clone(),
+                                    channel_id: context.channel_id.clone(),
+                                    user_id: context.user_id.clone(),
+                                    session_key: context.session_key.clone(),
+                                    kind: outbound_kind,
+                                    source_queue_id: run.receipt.queue_id.clone(),
+                                    source_completion_file: run.receipt.completion_file.clone(),
+                                    presentation,
+                                    text,
+                                    delivery_intent: delivery_intent_from_inbound_context(
+                                        &context.platform,
+                                        &context.channel_id,
+                                        context.inbound_context.as_deref(),
+                                    ),
+                                    attachments,
+                                };
+                                let (file, appended) = append_final_outbound_message_once(
+                                    &options.harness_home,
+                                    run.receipt.execution_dir.as_deref(),
+                                    run.receipt.completion_file.as_deref(),
+                                    &message,
+                                    &mut warnings,
+                                )?;
+                                outbox_file = Some(file);
+                                if appended {
+                                    if let Some(codex_plan) = plan.plan.as_ref() {
+                                        match record_memory_lifecycle_turn(
+                                            MemoryLifecycleTurnOptions {
+                                                harness_home: options.harness_home.clone(),
+                                                prompt_bundle_json: codex_plan
+                                                    .prompt_bundle_json
+                                                    .clone(),
+                                                assistant_text: response.final_text.clone(),
+                                                success: true,
+                                                now_ms: current_log_time_ms()?,
+                                            },
+                                        ) {
+                                            Ok(memory) => warnings.extend(memory.warnings),
+                                            Err(error) => warnings.push(format!(
+                                                "memory lifecycle recording failed: {error}"
+                                            )),
+                                        }
+                                    }
+                                    outbound_message = Some(message);
+                                }
                             }
                         } else {
                             let receipt = RuntimeRunOnceReceipt {
@@ -667,6 +748,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                 transcript_file: run.receipt.transcript_file.clone(),
                                 outbox_file: None,
                                 continuation: prepare.receipt.continuation.clone(),
+                                child_queue_id: None,
+                                child_session_key: None,
                                 reason: run.receipt.reason.clone(),
                             };
                             append_runtime_run_once_log(
@@ -704,18 +787,23 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 "context rollover parent tombstoned after polluted thread failure; childQueueId={}; childSessionKey={}; priorReason={}",
                 rollover.requeued_queue_id, rollover.new_working_session_key, receipt_reason
             );
+            child_queue_id = Some(rollover.requeued_queue_id.clone());
+            child_session_key = Some(rollover.new_working_session_key.clone());
             warnings.push(format!(
                 "polluted thread recovery enqueued continuation queue item {} and suppressed parent error outbox",
                 rollover.requeued_queue_id
             ));
         } else if channel_session_is_current(&options.harness_home, &context, &mut warnings)? {
+            let decision = final_outbox_decision(FinalOutboxInputKind::TerminalError);
             let message = ChannelOutboundMessage {
                 platform: context.platform.clone(),
                 account_id: context.account_id.clone(),
                 channel_id: context.channel_id.clone(),
                 user_id: context.user_id.clone(),
                 session_key: context.session_key.clone(),
-                kind: ChannelOutboundMessageKind::ErrorReply,
+                kind: decision
+                    .outbound_kind
+                    .unwrap_or(ChannelOutboundMessageKind::ErrorReply),
                 source_queue_id: run.receipt.queue_id.clone(),
                 source_completion_file: run.receipt.completion_file.clone(),
                 text: runtime_failure_reply_text(
@@ -746,6 +834,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 transcript_file: run.receipt.transcript_file.clone(),
                 outbox_file: None,
                 continuation: prepare.receipt.continuation.clone(),
+                child_queue_id: None,
+                child_session_key: None,
                 reason: receipt_reason.clone(),
             };
             append_runtime_run_once_log(
@@ -772,6 +862,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 "stream-unstable retry requeued into continuation; childQueueId={}; childSessionKey={}; priorReason={}",
                 rollover.requeued_queue_id, rollover.new_working_session_key, receipt_reason
             );
+            child_queue_id = Some(rollover.requeued_queue_id.clone());
+            child_session_key = Some(rollover.new_working_session_key.clone());
             warnings.push(format!(
                 "stream-unstable retry enqueued continuation queue item {} after repeated high-risk Codex stream disconnect",
                 rollover.requeued_queue_id
@@ -801,8 +893,32 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         transcript_file: run.receipt.transcript_file.clone(),
         outbox_file: outbox_file.clone(),
         continuation: prepare.receipt.continuation.clone(),
+        child_queue_id,
+        child_session_key,
         reason: receipt_reason,
     };
+    if receipt.status == RuntimeRunOnceStatus::Completed
+        && let Some(item) = prepare.item.as_ref()
+    {
+        match record_completed_turn_working_set_snapshot(CompletedTurnWorkingSetSnapshotOptions {
+            harness_home: options.harness_home.clone(),
+            platform: item.platform.clone(),
+            channel_id: item.channel_id.clone(),
+            user_id: item.user_id.clone(),
+            agent_id: item.agent_id.clone(),
+            working_session_key: item.session_key.clone(),
+            queue_id: receipt.queue_id.clone(),
+            message_text: Some(item.message_text.clone()),
+            status: receipt.status.as_str().to_string(),
+            run_once_receipt_file: Some(receipts_file.clone()),
+            outbox_file: outbox_file.clone(),
+            completion_file: run.receipt.completion_file.clone(),
+            now_ms: current_log_time_ms()?,
+        }) {
+            Ok(_) => {}
+            Err(error) => warnings.push(format!("working-set snapshot write failed: {error}")),
+        }
+    }
     let log_level = match receipt.status {
         RuntimeRunOnceStatus::Completed => HarnessLogLevel::Info,
         RuntimeRunOnceStatus::Timeout
@@ -1240,6 +1356,145 @@ fn should_write_failure_outbox(status: RuntimeRunOnceStatus) -> bool {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalOutboxInputKind {
+    AgentReply,
+    ReviewEvidence,
+    InternalEvidence,
+    #[allow(dead_code)]
+    ProgressStatus,
+    TerminalError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalOutboxDisposition {
+    UserFacingFinal,
+    InternalEvidenceOnly,
+    ProgressOnly,
+    FailureNotice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FinalOutboxDecision {
+    disposition: FinalOutboxDisposition,
+    outbound_kind: Option<ChannelOutboundMessageKind>,
+    attach_plain_final_presentation: bool,
+}
+
+impl FinalOutboxDecision {
+    fn may_write_final_outbox(self) -> bool {
+        self.outbound_kind.is_some()
+    }
+}
+
+fn final_outbox_decision(input: FinalOutboxInputKind) -> FinalOutboxDecision {
+    match input {
+        FinalOutboxInputKind::AgentReply => FinalOutboxDecision {
+            disposition: FinalOutboxDisposition::UserFacingFinal,
+            outbound_kind: Some(ChannelOutboundMessageKind::AgentReply),
+            attach_plain_final_presentation: true,
+        },
+        FinalOutboxInputKind::ReviewEvidence | FinalOutboxInputKind::InternalEvidence => {
+            FinalOutboxDecision {
+                disposition: FinalOutboxDisposition::InternalEvidenceOnly,
+                outbound_kind: None,
+                attach_plain_final_presentation: false,
+            }
+        }
+        FinalOutboxInputKind::ProgressStatus => FinalOutboxDecision {
+            disposition: FinalOutboxDisposition::ProgressOnly,
+            outbound_kind: None,
+            attach_plain_final_presentation: false,
+        },
+        FinalOutboxInputKind::TerminalError => FinalOutboxDecision {
+            disposition: FinalOutboxDisposition::FailureNotice,
+            outbound_kind: Some(ChannelOutboundMessageKind::ErrorReply),
+            attach_plain_final_presentation: false,
+        },
+    }
+}
+
+fn final_outbox_input_kind_for_completed_response(
+    runtime_class: Option<&str>,
+    origin: Option<&str>,
+    agent_id: Option<&str>,
+    run_session_key: Option<&str>,
+    channel_session_key: &str,
+    user_message: Option<&str>,
+    final_text: &str,
+) -> FinalOutboxInputKind {
+    if runtime_class.is_some_and(|value| value != "interactive")
+        || origin.is_some_and(|value| value != "channel")
+    {
+        return FinalOutboxInputKind::InternalEvidence;
+    }
+    if !final_outbox_owner_is_channel_parent(agent_id, run_session_key, channel_session_key) {
+        return FinalOutboxInputKind::InternalEvidence;
+    }
+    if implementation_request_requires_parent_completion(user_message)
+        && looks_like_read_only_review_evidence(final_text)
+    {
+        return FinalOutboxInputKind::ReviewEvidence;
+    }
+    FinalOutboxInputKind::AgentReply
+}
+
+fn final_outbox_owner_is_channel_parent(
+    agent_id: Option<&str>,
+    run_session_key: Option<&str>,
+    channel_session_key: &str,
+) -> bool {
+    if let Some(run_session_key) = run_session_key
+        && run_session_key != channel_session_key
+    {
+        return false;
+    }
+    if session_key_agent_segment(channel_session_key)
+        .as_deref()
+        .is_some_and(|agent| agent != "main")
+    {
+        return false;
+    }
+    let agent_id = agent_id.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(agent_id) = agent_id {
+        return agent_id == "main";
+    }
+    true
+}
+
+fn implementation_request_requires_parent_completion(user_message: Option<&str>) -> bool {
+    let Some(message) = user_message else {
+        return false;
+    };
+    let lower = message.to_ascii_lowercase();
+    let has_ascii_action = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|word| {
+            matches!(
+                word,
+                "implement" | "finish" | "complete" | "cutover" | "ship"
+            )
+        });
+    has_ascii_action
+        || lower.contains("battle-set")
+        || message.contains("開 goal")
+        || message.contains("開goal")
+        || message.contains("戰定")
+        || message.contains("實作")
+        || message.contains("開發")
+        || message.contains("落實")
+        || message.contains("完成")
+}
+
+fn looks_like_read_only_review_evidence(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("read-only inspection only")
+        || lower.contains("read-only review only")
+        || (lower.contains("no files changed") && lower.contains("no tests run"))
+        || (lower.contains("recommended seam") && lower.contains("fail-first tests"))
+        || (lower.contains("dirty worktree risks") && lower.contains("read-only"))
+}
+
 fn continuation_candidate_for_run(
     harness_home: &Path,
     item: Option<&RuntimeQueuePreparedItem>,
@@ -1304,7 +1559,10 @@ fn maybe_enqueue_polluted_thread_continuation(
     receipt_status: RuntimeRunOnceStatus,
     warnings: &mut Vec<String>,
 ) -> io::Result<Option<ContextRolloverPreparedRequeueReport>> {
-    if receipt_status != RuntimeRunOnceStatus::DeadLetter {
+    if !matches!(
+        receipt_status,
+        RuntimeRunOnceStatus::FailedTerminal | RuntimeRunOnceStatus::DeadLetter
+    ) {
         return Ok(None);
     }
     let Some(item) = continuation_candidate_for_run(
@@ -1329,11 +1587,17 @@ fn maybe_enqueue_polluted_thread_continuation(
         return Ok(None);
     }
     let current_index = item.continuation.continuation_index.unwrap_or(0);
-    if current_index >= config.max_successful_compacts_before_rollover {
+    if current_index >= config.max_continuation_depth {
         warnings.push(format!(
             "polluted thread recovery skipped: continuation depth {} reached configured limit {}",
-            current_index, config.max_successful_compacts_before_rollover
+            current_index, config.max_continuation_depth
         ));
+        mark_virtual_session_terminal_after_depth_limit(
+            harness_home,
+            &item.session_key,
+            config.max_continuation_depth,
+            warnings,
+        )?;
         return Ok(None);
     }
     let next_index = current_index.saturating_add(1);
@@ -1384,10 +1648,16 @@ fn maybe_enqueue_stream_unstable_retry_continuation(
     else {
         return Ok(None);
     };
-    if !should_enqueue_stream_unstable_retry_continuation(&item, run, failure_attempts) {
+    let config = load_context_rollover_config(harness_home)?;
+    if !should_enqueue_stream_unstable_retry_continuation(
+        &item,
+        run,
+        failure_attempts,
+        config.stream_unstable_continuation_min_attempts,
+        config.stream_unstable_continuation_token_limit,
+    ) {
         return Ok(None);
     }
-    let config = load_context_rollover_config(harness_home)?;
     if config.rollover_mode == ContextRolloverMode::Disabled {
         warnings.push(
             "stream-unstable retry continuation skipped: context rollover disabled".to_string(),
@@ -1395,11 +1665,17 @@ fn maybe_enqueue_stream_unstable_retry_continuation(
         return Ok(None);
     }
     let current_index = item.continuation.continuation_index.unwrap_or(0);
-    if current_index >= config.max_successful_compacts_before_rollover {
+    if current_index >= config.max_continuation_depth {
         warnings.push(format!(
             "stream-unstable retry continuation skipped: continuation depth {} reached configured limit {}",
-            current_index, config.max_successful_compacts_before_rollover
+            current_index, config.max_continuation_depth
         ));
+        mark_virtual_session_terminal_after_depth_limit(
+            harness_home,
+            &item.session_key,
+            config.max_continuation_depth,
+            warnings,
+        )?;
         return Ok(None);
     }
     let next_index = current_index.saturating_add(1);
@@ -1412,7 +1688,7 @@ fn maybe_enqueue_stream_unstable_retry_continuation(
             queue_id: item.queue_id.clone(),
             new_working_session_key,
             reason: format!(
-                "automatic stream-unstable virtual session recovery after retry-pending attempt {}; codexStatus={:?}; inputTokens={:?}; totalTokens={:?}; mediaArtifacts={}; nativeMediaParts={}; reason={}",
+                "automatic stream-unstable virtual session recovery after retry-pending attempt {}; codexStatus={:?}; inputTokens={:?}; totalTokens={:?}; mediaArtifacts={}; nativeMediaParts={}; inboundMediaArtifacts={}; reason={}",
                 failure_attempts,
                 run.receipt.status,
                 run.receipt
@@ -1425,6 +1701,7 @@ fn maybe_enqueue_stream_unstable_retry_continuation(
                     .and_then(|usage| usage.total_tokens),
                 run.receipt.media_plan.artifacts.len(),
                 run.receipt.media_plan.native_input_parts.len(),
+                item.inbound_media_artifacts.len(),
                 run.receipt.reason
             ),
             now_ms,
@@ -1447,10 +1724,40 @@ fn maybe_enqueue_stream_unstable_retry_continuation(
     }
 }
 
+fn mark_virtual_session_terminal_after_depth_limit(
+    harness_home: &Path,
+    session_key: &str,
+    max_continuation_depth: u64,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    let ended_by = format!("max-continuation-depth:{max_continuation_depth}");
+    match mark_virtual_session_terminal(VirtualSessionTerminalOptions {
+        harness_home: harness_home.to_path_buf(),
+        session_key: session_key.to_string(),
+        ended_by,
+        now_ms: current_log_time_ms()?,
+    }) {
+        Ok(Some(file)) => warnings.push(format!(
+            "virtual session marked terminal after continuation depth limit: {}",
+            file.display()
+        )),
+        Ok(None) => warnings.push(
+            "virtual session terminal mark skipped: no working-set record found for session"
+                .to_string(),
+        ),
+        Err(error) => warnings.push(format!(
+            "virtual session terminal mark failed after continuation depth limit: {error}"
+        )),
+    }
+    Ok(())
+}
+
 fn should_enqueue_stream_unstable_retry_continuation(
     item: &RuntimeContinuationCandidate,
     run: &CodexRuntimeRunReport,
     failure_attempts: usize,
+    min_attempts: usize,
+    token_limit: u64,
 ) -> bool {
     if item.runtime_class != "interactive" || item.origin != "channel" {
         return false;
@@ -1458,7 +1765,7 @@ fn should_enqueue_stream_unstable_retry_continuation(
     if run.receipt.status != CodexRuntimeRunStatus::ProtocolError {
         return false;
     }
-    if failure_attempts < STREAM_UNSTABLE_CONTINUATION_MIN_ATTEMPTS {
+    if failure_attempts < min_attempts {
         return false;
     }
     if !is_stream_unstable_codex_protocol_error(&run.receipt.reason) {
@@ -1468,12 +1775,9 @@ fn should_enqueue_stream_unstable_retry_continuation(
         usage
             .input_tokens
             .or(usage.total_tokens)
-            .is_some_and(|tokens| tokens >= STREAM_UNSTABLE_CONTINUATION_TOKEN_LIMIT)
+            .is_some_and(|tokens| tokens >= token_limit)
     });
-    let has_media = !run.receipt.media_plan.artifacts.is_empty()
-        || !run.receipt.media_plan.native_input_parts.is_empty()
-        || !item.inbound_media_artifacts.is_empty();
-    usage_exceeds_limit && has_media
+    usage_exceeds_limit
 }
 
 fn context_recovery_indicates_polluted_thread(
@@ -1492,6 +1796,7 @@ fn context_recovery_indicates_polluted_thread(
         recovery.status.as_str(),
         "compact-before-turn-fallback-failed"
             | "fresh-thread-failed"
+            | "preflight-thread-health-rollover-failed"
             | "compact-before-turn-failed"
             | "compact-before-turn-timeout"
     ) || recovery
@@ -1818,6 +2123,7 @@ fn context_text_block(context: &str) -> Option<String> {
 struct LatestAssistantResponse {
     final_text: String,
     outbound_text: String,
+    prior_user_text: Option<String>,
 }
 
 fn latest_assistant_response(
@@ -1849,15 +2155,15 @@ fn latest_assistant_response(
     else {
         return Ok(None);
     };
+    let prior_user_entry_index = entries[..assistant_index]
+        .iter()
+        .rposition(|(role, _)| role == "user");
+    let prior_user_text = prior_user_entry_index.map(|index| entries[index].1.clone());
     let final_text = entries[assistant_index].1.clone();
     let outbound_text = match config.mode {
         AssistantNarrationMode::Off | AssistantNarrationMode::ProgressPanel => final_text.clone(),
         AssistantNarrationMode::InlinePreface => {
-            let prior_user_index = entries[..assistant_index]
-                .iter()
-                .rposition(|(role, _)| role == "user")
-                .map(|index| index + 1)
-                .unwrap_or(0);
+            let prior_user_index = prior_user_entry_index.map(|index| index + 1).unwrap_or(0);
             let narration = entries[prior_user_index..assistant_index]
                 .iter()
                 .filter(|(role, content)| {
@@ -1880,6 +2186,7 @@ fn latest_assistant_response(
     Ok(Some(LatestAssistantResponse {
         final_text,
         outbound_text,
+        prior_user_text,
     }))
 }
 
@@ -1887,60 +2194,569 @@ fn compact_inline_narration(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn split_outbound_media_directives(text: &str) -> (String, Vec<ChannelOutboundAttachment>) {
-    let mut clean_lines = Vec::new();
+fn split_outbound_media_directives(
+    harness_home: &Path,
+    queue_id: Option<&str>,
+    platform: Option<&str>,
+    text: &str,
+    warnings: &mut Vec<String>,
+) -> io::Result<(String, Vec<ChannelOutboundAttachment>)> {
+    let config = match load_harness_media_config(harness_home) {
+        Ok(config) => config,
+        Err(error) => {
+            warnings.push(format!(
+                "media delivery config could not be loaded; using defaults: {error}"
+            ));
+            Default::default()
+        }
+    };
+    let parsed = parse_outbound_media_directives(text);
+    let mut replacements = parsed
+        .modifier_spans
+        .iter()
+        .map(|span| SpanReplacement {
+            start: span.start,
+            end: span.end,
+            replacement: String::new(),
+        })
+        .collect::<Vec<_>>();
     let mut attachments = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(path) = trimmed.strip_prefix("MEDIA:") {
-            let path = path.trim();
-            if !path.is_empty() {
-                let path = PathBuf::from(path);
+    let as_document = parsed.as_document;
+    let audio_as_voice = parsed.audio_as_voice;
+    for directive in parsed.directives {
+        let forced_kind = forced_attachment_kind(&directive.path, as_document, audio_as_voice);
+        let evaluation = evaluate_outbound_media_path(
+            harness_home,
+            &directive.path,
+            &config.policy,
+            forced_kind,
+        );
+        if let Err(error) =
+            write_media_policy_receipt(harness_home, queue_id, platform, &evaluation)
+        {
+            warnings.push(format!(
+                "outbound media policy receipt write failed: {error}"
+            ));
+        }
+        match evaluation.verdict {
+            MediaDeliveryVerdict::Accepted {
+                kind,
+                mime,
+                byte_len: _,
+            } => {
                 attachments.push(ChannelOutboundAttachment {
-                    kind: attachment_kind_from_path(&path),
-                    mime: attachment_mime_from_path(&path),
-                    filename: path
+                    kind,
+                    mime,
+                    filename: directive
+                        .path
                         .file_name()
                         .map(|name| name.to_string_lossy().to_string()),
                     caption: None,
-                    path,
+                    path: directive.path,
+                });
+                replacements.push(SpanReplacement {
+                    start: directive.start,
+                    end: directive.end,
+                    replacement: String::new(),
                 });
             }
+            MediaDeliveryVerdict::Rejected { reason_code } => {
+                replacements.push(SpanReplacement {
+                    start: directive.start,
+                    end: directive.end,
+                    replacement: format!("[attachment not delivered: {reason_code}]"),
+                });
+            }
+        }
+    }
+    Ok((
+        apply_span_replacements(text, &mut replacements),
+        attachments,
+    ))
+}
+
+fn resolve_presentation_artifact_refs(
+    harness_home: &Path,
+    queue_id: Option<&str>,
+    platform: Option<&str>,
+    presentation: &mut RichMessagePresentation,
+    attachments: &mut Vec<ChannelOutboundAttachment>,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    if presentation.media.is_empty() {
+        return Ok(());
+    }
+    let config = match load_harness_media_config(harness_home) {
+        Ok(config) => config,
+        Err(error) => {
+            warnings.push(format!(
+                "media delivery config could not be loaded for artifact refs; using defaults: {error}"
+            ));
+            Default::default()
+        }
+    };
+    for media in &mut presentation.media {
+        if media.attachment_index.is_some() {
             continue;
         }
-        clean_lines.push(line);
+        let Some(artifact_ref) = media.artifact_ref.clone() else {
+            continue;
+        };
+        let path = match resolve_outbound_media_artifact_reference(harness_home, &artifact_ref) {
+            Ok(path) => path,
+            Err(error) => {
+                warnings.push(format!(
+                    "rich media artifactRef {artifact_ref} was not resolved for delivery: {error}; fallback=artifact-ref-unresolvable"
+                ));
+                continue;
+            }
+        };
+        let evaluation = evaluate_outbound_media_path(harness_home, &path, &config.policy, None);
+        if let Err(error) =
+            write_media_policy_receipt(harness_home, queue_id, platform, &evaluation)
+        {
+            warnings.push(format!(
+                "outbound media policy receipt write failed for artifactRef {artifact_ref}: {error}"
+            ));
+        }
+        match evaluation.verdict {
+            MediaDeliveryVerdict::Accepted { kind, mime, .. } => {
+                let index = attachments.len();
+                attachments.push(ChannelOutboundAttachment {
+                    kind,
+                    path,
+                    mime,
+                    filename: artifact_ref
+                        .rsplit('/')
+                        .next()
+                        .filter(|name| !name.trim().is_empty())
+                        .map(ToString::to_string),
+                    caption: media.caption.clone(),
+                });
+                media.attachment_index = Some(index);
+            }
+            MediaDeliveryVerdict::Rejected { reason_code } => {
+                warnings.push(format!(
+                    "rich media artifactRef {artifact_ref} resolved but was rejected by media policy: {reason_code}; fallback=artifact-ref-policy-rejected"
+                ));
+            }
+        }
     }
-    (clean_lines.join("\n").trim().to_string(), attachments)
+    Ok(())
 }
 
-fn attachment_kind_from_path(path: &Path) -> ChannelOutboundAttachmentKind {
-    match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("jpg" | "jpeg" | "png" | "gif" | "webp") => ChannelOutboundAttachmentKind::Image,
-        _ => ChannelOutboundAttachmentKind::Document,
+fn resolve_outbound_media_artifact_reference(
+    harness_home: &Path,
+    artifact_ref: &str,
+) -> Result<PathBuf, String> {
+    let trimmed = artifact_ref.trim();
+    if trimmed.is_empty() {
+        return Err("artifact reference is empty".to_string());
     }
+    if trimmed.starts_with("agent-harness://inbound-media/") {
+        return resolve_inbound_media_artifact_reference(harness_home, trimmed);
+    }
+    if let Some(relative) = trimmed.strip_prefix("agent-harness://generated-images/") {
+        return resolve_outbound_media_relative_artifact(
+            &harness_home.join("codex-home").join("generated_images"),
+            relative,
+        );
+    }
+    if let Some(relative) = trimmed.strip_prefix("agent-harness://generated-media/") {
+        return resolve_outbound_media_relative_artifact(
+            &harness_home.join("state").join("generated-media"),
+            relative,
+        );
+    }
+    Err("artifact URI namespace is not supported for outbound delivery".to_string())
 }
 
-fn attachment_mime_from_path(path: &Path) -> Option<String> {
-    match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("jpg" | "jpeg") => Some("image/jpeg".to_string()),
-        Some("png") => Some("image/png".to_string()),
-        Some("gif") => Some("image/gif".to_string()),
-        Some("webp") => Some("image/webp".to_string()),
-        Some("pdf") => Some("application/pdf".to_string()),
-        Some("txt" | "log" | "md") => Some("text/plain".to_string()),
-        Some("json") => Some("application/json".to_string()),
+fn resolve_outbound_media_relative_artifact(
+    root: &Path,
+    relative: &str,
+) -> Result<PathBuf, String> {
+    let relative_path = safe_outbound_media_relative_path(relative)?;
+    let candidate = root.join(relative_path);
+    let root = fs::canonicalize(root).map_err(|err| {
+        format!(
+            "artifact root {} does not exist or is not readable: {err}",
+            root.display()
+        )
+    })?;
+    let candidate = fs::canonicalize(&candidate).map_err(|err| {
+        format!(
+            "artifact path {} does not exist or is not readable: {err}",
+            candidate.display()
+        )
+    })?;
+    if !candidate.starts_with(&root) {
+        return Err("artifact path is outside the supported artifact root".to_string());
+    }
+    if !candidate.is_file() {
+        return Err("artifact path does not exist or is not a file".to_string());
+    }
+    Ok(candidate)
+}
+
+fn safe_outbound_media_relative_path(value: &str) -> Result<PathBuf, String> {
+    let mut path = PathBuf::new();
+    for component in Path::new(value).components() {
+        match component {
+            Component::Normal(part) => path.push(part),
+            _ => return Err("artifact URI contains an unsafe path component".to_string()),
+        }
+    }
+    if path.as_os_str().is_empty() {
+        return Err("artifact URI does not name a file".to_string());
+    }
+    Ok(path)
+}
+
+fn forced_attachment_kind(
+    path: &Path,
+    as_document: bool,
+    audio_as_voice: bool,
+) -> Option<ChannelOutboundAttachmentKind> {
+    match attachment_kind_from_path(path) {
+        Some(ChannelOutboundAttachmentKind::Image) if as_document => {
+            Some(ChannelOutboundAttachmentKind::Document)
+        }
+        Some(ChannelOutboundAttachmentKind::Audio) if audio_as_voice => {
+            Some(ChannelOutboundAttachmentKind::Voice)
+        }
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedOutboundMediaDirectives {
+    directives: Vec<ParsedOutboundMediaDirective>,
+    modifier_spans: Vec<ProtectedSpan>,
+    as_document: bool,
+    audio_as_voice: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedOutboundMediaDirective {
+    start: usize,
+    end: usize,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProtectedSpan {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpanReplacement {
+    start: usize,
+    end: usize,
+    replacement: String,
+}
+
+fn parse_outbound_media_directives(text: &str) -> ParsedOutboundMediaDirectives {
+    let protected = protected_outbound_spans(text);
+    let mut directives = Vec::new();
+    let mut offset = 0usize;
+    while let Some(relative) = text[offset..].find("MEDIA:") {
+        let start = offset + relative;
+        if byte_is_protected(start, &protected) {
+            offset = start + "MEDIA:".len();
+            continue;
+        }
+        let Some((end, path)) = parse_media_path_after_prefix(text, start + "MEDIA:".len()) else {
+            offset = start + "MEDIA:".len();
+            continue;
+        };
+        if path.is_absolute() && is_deliverable_media_path(&path) {
+            let (start, end) = expand_standalone_media_directive_span(text, start, end);
+            directives.push(ParsedOutboundMediaDirective { start, end, path });
+        }
+        offset = end.max(start + "MEDIA:".len());
+    }
+
+    let mut modifier_spans = Vec::new();
+    let as_document =
+        collect_modifier_spans(text, "[[as_document]]", &protected, &mut modifier_spans);
+    let audio_as_voice =
+        collect_modifier_spans(text, "[[audio_as_voice]]", &protected, &mut modifier_spans);
+    ParsedOutboundMediaDirectives {
+        directives,
+        modifier_spans,
+        as_document,
+        audio_as_voice,
+    }
+}
+
+fn collect_modifier_spans(
+    text: &str,
+    marker: &str,
+    protected: &[ProtectedSpan],
+    spans: &mut Vec<ProtectedSpan>,
+) -> bool {
+    let mut found = false;
+    let mut offset = 0usize;
+    while let Some(relative) = text[offset..].find(marker) {
+        let start = offset + relative;
+        let end = start + marker.len();
+        if !byte_is_protected(start, protected) {
+            spans.push(ProtectedSpan { start, end });
+            found = true;
+        }
+        offset = end;
+    }
+    found
+}
+
+fn parse_media_path_after_prefix(text: &str, mut index: usize) -> Option<(usize, PathBuf)> {
+    let bytes = text.as_bytes();
+    while index < bytes.len() && matches!(bytes[index], b' ' | b'\t') {
+        index += 1;
+    }
+    if index >= bytes.len() {
+        return None;
+    }
+    let first = bytes[index];
+    if matches!(first, b'"' | b'\'' | b'`') {
+        let quote = first;
+        let path_start = index + 1;
+        let mut end = path_start;
+        while end < bytes.len() && bytes[end] != quote {
+            end += 1;
+        }
+        if end >= bytes.len() {
+            return None;
+        }
+        let path = text[path_start..end].trim();
+        return (!path.is_empty()).then(|| (end + 1, PathBuf::from(path)));
+    }
+    let path_start = index;
+    while index < bytes.len() && !bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    let path = text[path_start..index].trim();
+    (!path.is_empty()).then(|| (index, PathBuf::from(path)))
+}
+
+fn expand_standalone_media_directive_span(text: &str, start: usize, end: usize) -> (usize, usize) {
+    let line_start = text[..start]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let line_end = text[end..]
+        .find('\n')
+        .map(|relative| end + relative + 1)
+        .unwrap_or(end);
+    let line_without_directive = format!("{}{}", &text[line_start..start], &text[end..line_end]);
+    if line_without_directive.trim().is_empty() {
+        (line_start, line_end)
+    } else {
+        (start, end)
+    }
+}
+
+fn protected_outbound_spans(text: &str) -> Vec<ProtectedSpan> {
+    let mut spans = Vec::new();
+    let mut offset = 0usize;
+    let mut in_fence = false;
+    for line in text.split_inclusive('\n') {
+        let line_end = offset + line.len();
+        let trimmed = line.trim_start();
+        let fence_line = trimmed.starts_with("```");
+        if in_fence || fence_line || trimmed.starts_with('>') {
+            spans.push(ProtectedSpan {
+                start: offset,
+                end: line_end,
+            });
+        }
+        if !in_fence && !fence_line && !trimmed.starts_with('>') {
+            push_inline_code_spans(line, offset, &mut spans);
+        }
+        if fence_line {
+            in_fence = !in_fence;
+        }
+        offset = line_end;
+    }
+    if offset < text.len() {
+        let tail = &text[offset..];
+        if in_fence || tail.trim_start().starts_with('>') {
+            spans.push(ProtectedSpan {
+                start: offset,
+                end: text.len(),
+            });
+        } else {
+            push_inline_code_spans(tail, offset, &mut spans);
+        }
+    }
+    spans
+}
+
+fn push_inline_code_spans(line: &str, line_offset: usize, spans: &mut Vec<ProtectedSpan>) {
+    let mut code_start = None;
+    for (relative, ch) in line.char_indices() {
+        if ch != '`' {
+            continue;
+        }
+        if let Some(start) = code_start.take() {
+            spans.push(ProtectedSpan {
+                start,
+                end: line_offset + relative + ch.len_utf8(),
+            });
+        } else {
+            code_start = Some(line_offset + relative);
+        }
+    }
+    if let Some(start) = code_start {
+        spans.push(ProtectedSpan {
+            start,
+            end: line_offset + line.len(),
+        });
+    }
+}
+
+fn byte_is_protected(index: usize, spans: &[ProtectedSpan]) -> bool {
+    spans
+        .iter()
+        .any(|span| index >= span.start && index < span.end)
+}
+
+fn apply_span_replacements(text: &str, replacements: &mut Vec<SpanReplacement>) -> String {
+    replacements.sort_by_key(|span| (span.start, span.end));
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for replacement in replacements {
+        if replacement.start < cursor
+            || replacement.start > text.len()
+            || replacement.end > text.len()
+        {
+            continue;
+        }
+        out.push_str(&text[cursor..replacement.start]);
+        out.push_str(&replacement.replacement);
+        cursor = replacement.end;
+    }
+    out.push_str(&text[cursor..]);
+    cleanup_outbound_media_text(&out)
+}
+
+fn cleanup_outbound_media_text(text: &str) -> String {
+    let mut cleaned = Vec::new();
+    let mut blank_count = 0usize;
+    for line in text.lines() {
+        let trimmed_end = line.trim_end();
+        if trimmed_end.trim().is_empty() {
+            blank_count += 1;
+            if blank_count <= 1 {
+                cleaned.push(String::new());
+            }
+        } else {
+            blank_count = 0;
+            cleaned.push(trimmed_end.to_string());
+        }
+    }
+    cleaned.join("\n").trim().to_string()
+}
+
+fn maybe_record_media_delivery_lint(
+    harness_home: &Path,
+    queue_id: Option<&str>,
+    platform: Option<&str>,
+    prior_user_text: Option<&str>,
+    final_text: &str,
+    attachment_count: usize,
+    warnings: &mut Vec<String>,
+) -> MediaDeliveryLintResult {
+    if attachment_count > 0 {
+        return MediaDeliveryLintResult::default();
+    }
+    let Some(user_text) = prior_user_text else {
+        return MediaDeliveryLintResult::default();
+    };
+    if !user_text_has_media_send_intent(user_text)
+        || !final_text_has_media_delivery_clue(final_text)
+    {
+        return MediaDeliveryLintResult::default();
+    }
+    let fail_closed = load_harness_media_config(harness_home)
+        .map(|config| config.lint.fail_closed)
+        .unwrap_or(false);
+    let receipt_file = harness_home
+        .join("state")
+        .join("channels")
+        .join("media-delivery-lint-receipts.jsonl");
+    let receipt = serde_json::json!({
+        "schema": "agent-harness.media-delivery-lint.v1",
+        "atMs": current_log_time_ms().unwrap_or(0),
+        "queueId": queue_id,
+        "platform": platform,
+        "status": if fail_closed { "failed-closed" } else { "warning" },
+        "reason": "media-send-intent-with-zero-attachments",
+        "failClosed": fail_closed,
+    });
+    if let Err(error) = crate::append_jsonl_value(&receipt_file, &receipt) {
+        warnings.push(format!("media delivery lint receipt write failed: {error}"));
+    } else {
+        let action = if fail_closed {
+            "terminal notification will replace the text-only final"
+        } else {
+            "warning only"
+        };
+        warnings.push(format!(
+            "media-delivery-lint: send intent found but final outbox has zero attachments; {action}"
+        ));
+    }
+    MediaDeliveryLintResult {
+        triggered: true,
+        fail_closed,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MediaDeliveryLintResult {
+    triggered: bool,
+    fail_closed: bool,
+}
+
+fn media_delivery_lint_terminal_notice() -> String {
+    "I could not attach the requested media. No file was delivered because the final response did not include a policy-accepted attachment directive.".to_string()
+}
+
+fn user_text_has_media_send_intent(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let has_action = ["send", "attach", "upload", "drop", "傳", "丟", "發"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    let has_media_object = [
+        "image",
+        "photo",
+        "picture",
+        "file",
+        "attachment",
+        "圖",
+        "照片",
+        "檔",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    has_action && has_media_object
+}
+
+fn final_text_has_media_delivery_clue(text: &str) -> bool {
+    if text.contains("MEDIA:") || text.contains("[attachment not delivered:") {
+        return true;
+    }
+    text.split_whitespace().any(|part| {
+        let trimmed = part.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | '.'
+            )
+        });
+        let path = Path::new(trimmed);
+        path.is_absolute() && is_deliverable_media_path(path)
+    })
 }
 
 fn append_outbound_message(
@@ -2249,19 +3065,283 @@ mod tests {
 
     #[test]
     fn split_outbound_media_directives_extracts_attachments() {
+        let root = temp_root("split_outbound_media_directives_extracts_attachments");
+        let harness_home = root.join("harness");
+        let media = harness_home.join("workspace").join("image.png");
+        fs::create_dir_all(media.parent().unwrap()).unwrap();
+        fs::write(&media, b"image").unwrap();
+        let mut warnings = Vec::new();
         let (text, attachments) = split_outbound_media_directives(
-            "Here is the file.\nMEDIA:D:\\Warehouse\\image.png\nDone.",
-        );
+            &harness_home,
+            Some("queue-media"),
+            Some("telegram"),
+            &format!("Here is the file.\nMEDIA:{}\nDone.", media.display()),
+            &mut warnings,
+        )
+        .unwrap();
 
         assert_eq!(text, "Here is the file.\nDone.");
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].kind, ChannelOutboundAttachmentKind::Image);
         assert_eq!(attachments[0].mime.as_deref(), Some("image/png"));
         assert_eq!(attachments[0].filename.as_deref(), Some("image.png"));
-        assert_eq!(
-            attachments[0].path,
-            PathBuf::from("D:\\Warehouse\\image.png")
+        assert_eq!(attachments[0].path, media);
+        let receipt_text = fs::read_to_string(crate::media_policy_receipts_file(&harness_home))
+            .expect("policy receipt should be written");
+        assert!(receipt_text.contains("\"verdict\":\"accepted\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn outbound_media_parser_masks_protected_spans_and_preserves_unknown_tags() {
+        let parsed = parse_outbound_media_directives(
+            "```text\nMEDIA:C:\\safe\\example.png\n```\n`MEDIA:C:\\safe\\inline.png`\n> MEDIA:C:\\safe\\quote.png\nMEDIA:C:\\safe\\ship.png\nMEDIA:C:\\safe\\unknown.exe",
         );
+
+        assert_eq!(parsed.directives.len(), 1);
+        assert_eq!(
+            parsed.directives[0].path,
+            PathBuf::from("C:\\safe\\ship.png")
+        );
+    }
+
+    #[test]
+    fn rejected_outbound_media_directive_leaves_visible_note() {
+        let root = temp_root("rejected_outbound_media_directive_leaves_visible_note");
+        let harness_home = root.join("harness");
+        let denied = harness_home
+            .join("state")
+            .join("channels")
+            .join("secret.png");
+        fs::create_dir_all(denied.parent().unwrap()).unwrap();
+        fs::write(&denied, b"secret").unwrap();
+        let mut warnings = Vec::new();
+
+        let (text, attachments) = split_outbound_media_directives(
+            &harness_home,
+            Some("queue-denied"),
+            Some("telegram"),
+            &format!("Please send this.\nMEDIA:{}", denied.display()),
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(attachments.is_empty());
+        assert!(text.contains("[attachment not delivered: denied-prefix]"));
+        let receipt_text = fs::read_to_string(crate::media_policy_receipts_file(&harness_home))
+            .expect("policy receipt should be written");
+        assert!(receipt_text.contains("\"verdict\":\"rejected\""));
+        assert!(receipt_text.contains("\"reasonCode\":\"denied-prefix\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rich_media_artifact_ref_resolves_to_attachment_backed_unit() {
+        let root = temp_root("rich_media_artifact_ref_resolves_to_attachment_backed_unit");
+        let harness_home = root.join("harness");
+        let artifact_ref = "agent-harness://inbound-media/telegram/update-1/0.png";
+        let media = crate::inbound_media_attachment_root(&harness_home)
+            .join("update-1")
+            .join("0.png");
+        fs::create_dir_all(media.parent().unwrap()).unwrap();
+        fs::write(&media, b"image").unwrap();
+        let mut presentation = RichMessagePresentation {
+            schema: crate::rich_presentation::RICH_MESSAGE_PRESENTATION_SCHEMA.to_string(),
+            fallback_text: "image".to_string(),
+            blocks: Vec::new(),
+            actions: Vec::new(),
+            media: vec![crate::rich_presentation::RichPresentationMediaRef {
+                attachment_index: None,
+                artifact_ref: Some(artifact_ref.to_string()),
+                caption: Some("caption".to_string()),
+                role: None,
+            }],
+            link_preview: crate::rich_presentation::RichPresentationLinkPreview::default(),
+            delivery_policy: crate::rich_presentation::RichPresentationDeliveryPolicy::default(),
+        };
+        let mut attachments = Vec::new();
+        let mut warnings = Vec::new();
+
+        resolve_presentation_artifact_refs(
+            &harness_home,
+            Some("queue-artifact-ref"),
+            Some("telegram"),
+            &mut presentation,
+            &mut attachments,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].path, media);
+        assert_eq!(attachments[0].kind, ChannelOutboundAttachmentKind::Image);
+        assert_eq!(attachments[0].caption.as_deref(), Some("caption"));
+        assert_eq!(presentation.media[0].attachment_index, Some(0));
+        let receipt_text = fs::read_to_string(crate::media_policy_receipts_file(&harness_home))
+            .expect("policy receipt should be written");
+        assert!(receipt_text.contains("\"verdict\":\"accepted\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rich_media_generated_image_artifact_ref_resolves_to_attachment() {
+        let root = temp_root("rich_media_generated_image_artifact_ref_resolves_to_attachment");
+        let harness_home = root.join("harness");
+        let artifact_ref = "agent-harness://generated-images/thread-1/ig_sample.png";
+        let media = harness_home
+            .join("codex-home")
+            .join("generated_images")
+            .join("thread-1")
+            .join("ig_sample.png");
+        fs::create_dir_all(media.parent().unwrap()).unwrap();
+        fs::write(&media, b"image").unwrap();
+        let mut presentation = RichMessagePresentation {
+            schema: crate::rich_presentation::RICH_MESSAGE_PRESENTATION_SCHEMA.to_string(),
+            fallback_text: "generated image".to_string(),
+            blocks: Vec::new(),
+            actions: Vec::new(),
+            media: vec![crate::rich_presentation::RichPresentationMediaRef {
+                attachment_index: None,
+                artifact_ref: Some(artifact_ref.to_string()),
+                caption: None,
+                role: None,
+            }],
+            link_preview: crate::rich_presentation::RichPresentationLinkPreview::default(),
+            delivery_policy: crate::rich_presentation::RichPresentationDeliveryPolicy::default(),
+        };
+        let mut attachments = Vec::new();
+        let mut warnings = Vec::new();
+
+        resolve_presentation_artifact_refs(
+            &harness_home,
+            Some("queue-generated-artifact-ref"),
+            Some("discord"),
+            &mut presentation,
+            &mut attachments,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].path, fs::canonicalize(&media).unwrap());
+        assert_eq!(attachments[0].kind, ChannelOutboundAttachmentKind::Image);
+        assert_eq!(presentation.media[0].attachment_index, Some(0));
+        let receipt_text = fs::read_to_string(crate::media_policy_receipts_file(&harness_home))
+            .expect("policy receipt should be written");
+        assert!(receipt_text.contains("\"verdict\":\"accepted\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rich_media_artifact_ref_policy_rejects_oversize_resolved_path() {
+        let root = temp_root("rich_media_artifact_ref_policy_rejects_oversize_resolved_path");
+        let harness_home = root.join("harness");
+        let artifact_ref = "agent-harness://inbound-media/telegram/update-1/0.png";
+        let media = crate::inbound_media_attachment_root(&harness_home)
+            .join("update-1")
+            .join("0.png");
+        fs::create_dir_all(media.parent().unwrap()).unwrap();
+        fs::write(&media, vec![b'x'; 2 * 1024 * 1024]).unwrap();
+        let mut presentation = RichMessagePresentation {
+            schema: crate::rich_presentation::RICH_MESSAGE_PRESENTATION_SCHEMA.to_string(),
+            fallback_text: "image".to_string(),
+            blocks: Vec::new(),
+            actions: Vec::new(),
+            media: vec![crate::rich_presentation::RichPresentationMediaRef {
+                attachment_index: None,
+                artifact_ref: Some(artifact_ref.to_string()),
+                caption: None,
+                role: None,
+            }],
+            link_preview: crate::rich_presentation::RichPresentationLinkPreview::default(),
+            delivery_policy: crate::rich_presentation::RichPresentationDeliveryPolicy::default(),
+        };
+        let config = serde_json::json!({
+            "media": {
+                "maxMbPerAttachment": 1,
+                "allowDirs": [crate::inbound_media_attachment_root(&harness_home)],
+                "trustRecentSeconds": null,
+                "strict": true
+            }
+        });
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+        let mut attachments = Vec::new();
+        let mut warnings = Vec::new();
+
+        resolve_presentation_artifact_refs(
+            &harness_home,
+            Some("queue-artifact-ref"),
+            Some("telegram"),
+            &mut presentation,
+            &mut attachments,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(attachments.is_empty());
+        assert_eq!(presentation.media[0].attachment_index, None);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("artifact-ref-policy-rejected"))
+        );
+        let receipt_text = fs::read_to_string(crate::media_policy_receipts_file(&harness_home))
+            .expect("policy receipt should be written");
+        assert!(receipt_text.contains("\"verdict\":\"rejected\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn media_delivery_lint_warns_or_fails_closed_from_config() {
+        let root = temp_root("media_delivery_lint_warns_or_fails_closed_from_config");
+        let harness_home = root.join("harness");
+        let media = harness_home.join("workspace").join("image.png");
+        let mut warnings = Vec::new();
+
+        let warning = maybe_record_media_delivery_lint(
+            &harness_home,
+            Some("queue-lint"),
+            Some("discord"),
+            Some("please send the image"),
+            &format!("The image is at {}", media.display()),
+            0,
+            &mut warnings,
+        );
+        assert!(warning.triggered);
+        assert!(!warning.fail_closed);
+
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"media":{"lintFailClosed":true}}"#,
+        )
+        .unwrap();
+        let failed = maybe_record_media_delivery_lint(
+            &harness_home,
+            Some("queue-lint-closed"),
+            Some("discord"),
+            Some("please send the image"),
+            &format!("The image is at {}", media.display()),
+            0,
+            &mut warnings,
+        );
+        assert!(failed.triggered);
+        assert!(failed.fail_closed);
+        let receipt = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("channels")
+                .join("media-delivery-lint-receipts.jsonl"),
+        )
+        .unwrap();
+        assert!(receipt.contains("\"status\":\"warning\""));
+        assert!(receipt.contains("\"status\":\"failed-closed\""));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2396,6 +3476,7 @@ mod tests {
             report.run.as_ref().unwrap().receipt.status,
             CodexRuntimeRunStatus::Completed
         );
+        let completed_queue_id = report.receipt.queue_id.clone().unwrap();
         let outbound = report.outbound_message.unwrap();
         assert_eq!(outbound.kind, ChannelOutboundMessageKind::AgentReply);
         assert_eq!(outbound.platform, "telegram");
@@ -2436,6 +3517,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(episodes.lines().count(), 2);
+        let envelope =
+            crate::resolve_virtual_session_working_context(crate::VirtualSessionContextQuery {
+                harness_home: harness_home.clone(),
+                platform: "telegram".to_string(),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                agent_id: "main".to_string(),
+                session_key: Some("telegram:dm-42:user-7:main".to_string()),
+                now_ms: 1235,
+            })
+            .unwrap();
+        assert_eq!(
+            envelope.scope_decision.status, "same-virtual-session",
+            "completed runtime turn should write a root working-set snapshot"
+        );
+        assert!(envelope.working_set_file.as_ref().unwrap().is_file());
+        assert!(
+            envelope
+                .recent_queue_ids
+                .iter()
+                .any(|queue_id| queue_id == &completed_queue_id)
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3035,6 +4138,119 @@ mod tests {
     }
 
     #[test]
+    fn final_outbox_decision_classifies_user_final_evidence_progress_and_error() {
+        let agent_reply = final_outbox_decision(FinalOutboxInputKind::AgentReply);
+        assert_eq!(
+            agent_reply.disposition,
+            FinalOutboxDisposition::UserFacingFinal
+        );
+        assert_eq!(
+            agent_reply.outbound_kind,
+            Some(ChannelOutboundMessageKind::AgentReply)
+        );
+        assert!(agent_reply.attach_plain_final_presentation);
+        assert!(agent_reply.may_write_final_outbox());
+
+        for evidence_kind in [
+            FinalOutboxInputKind::ReviewEvidence,
+            FinalOutboxInputKind::InternalEvidence,
+        ] {
+            let decision = final_outbox_decision(evidence_kind);
+            assert_eq!(
+                decision.disposition,
+                FinalOutboxDisposition::InternalEvidenceOnly
+            );
+            assert_eq!(decision.outbound_kind, None);
+            assert!(!decision.attach_plain_final_presentation);
+            assert!(!decision.may_write_final_outbox());
+        }
+
+        let progress = final_outbox_decision(FinalOutboxInputKind::ProgressStatus);
+        assert_eq!(progress.disposition, FinalOutboxDisposition::ProgressOnly);
+        assert_eq!(progress.outbound_kind, None);
+        assert!(!progress.attach_plain_final_presentation);
+        assert!(!progress.may_write_final_outbox());
+
+        let terminal_error = final_outbox_decision(FinalOutboxInputKind::TerminalError);
+        assert_eq!(
+            terminal_error.disposition,
+            FinalOutboxDisposition::FailureNotice
+        );
+        assert_eq!(
+            terminal_error.outbound_kind,
+            Some(ChannelOutboundMessageKind::ErrorReply)
+        );
+        assert!(!terminal_error.attach_plain_final_presentation);
+        assert!(terminal_error.may_write_final_outbox());
+    }
+
+    #[test]
+    fn final_outbox_input_kind_suppresses_read_only_review_only_for_workflow_requests() {
+        let review_text = "Read-only inspection only. No files changed, no tests run.\n\n- Final/outbox authority seam.";
+
+        assert_eq!(
+            final_outbox_input_kind_for_completed_response(
+                Some("interactive"),
+                Some("channel"),
+                Some("main"),
+                Some("telegram:dm-42:user-7:main"),
+                "telegram:dm-42:user-7:main",
+                Some("開 goal 把所有 package 都完成，落實下來，準備進入實作"),
+                review_text,
+            ),
+            FinalOutboxInputKind::ReviewEvidence
+        );
+        assert_eq!(
+            final_outbox_input_kind_for_completed_response(
+                Some("interactive"),
+                Some("channel"),
+                Some("main"),
+                Some("telegram:dm-42:user-7:main"),
+                "telegram:dm-42:user-7:main",
+                Some("please review this implementation plan"),
+                review_text,
+            ),
+            FinalOutboxInputKind::AgentReply
+        );
+        assert_eq!(
+            final_outbox_input_kind_for_completed_response(
+                Some("worker"),
+                Some("channel"),
+                Some("main"),
+                Some("telegram:dm-42:user-7:main"),
+                "telegram:dm-42:user-7:main",
+                Some("complete the package"),
+                "Done.",
+            ),
+            FinalOutboxInputKind::InternalEvidence
+        );
+        assert_eq!(
+            final_outbox_input_kind_for_completed_response(
+                Some("interactive"),
+                Some("channel"),
+                Some("xiaoxiaoli"),
+                Some("telegram:dm-42:user-7:xiaoxiaoli"),
+                "telegram:dm-42:user-7:xiaoxiaoli",
+                Some("complete the package"),
+                "Done."
+            ),
+            FinalOutboxInputKind::InternalEvidence
+        );
+        assert_eq!(
+            final_outbox_input_kind_for_completed_response(
+                Some("interactive"),
+                Some("channel"),
+                Some("main"),
+                Some("telegram:dm-42:user-7:main:old"),
+                "telegram:dm-42:user-7:main:new",
+                Some("complete the package"),
+                "Done."
+            ),
+            FinalOutboxInputKind::InternalEvidence
+        );
+    }
+
+    #[test]
     fn retryable_protocol_error_policy_retries_then_dead_letters() {
         let reason = "Reconnecting... 2/5; stream disconnected before completion: websocket closed by server before response.completed";
 
@@ -3087,34 +4303,85 @@ mod tests {
     }
 
     #[test]
-    fn stream_unstable_retry_continuation_requires_repeated_high_usage_media_failure() {
+    fn stream_unstable_retry_continuation_requires_repeated_high_usage_stream_failure() {
         let item = prepared_test_item("queue-stream", "discord:dm-42:user-7:main", None);
         let candidate = RuntimeContinuationCandidate::from_prepared_item(&item);
         let run = stream_unstable_failed_run("queue-stream", Some(90_038), true);
+        let high_usage_without_current_media =
+            stream_unstable_failed_run("queue-stream", Some(192_644), false);
         let mut reconnecting_only = stream_unstable_failed_run("queue-stream", Some(90_038), true);
         reconnecting_only.receipt.reason = "Reconnecting... 2/5".to_string();
+        let config = crate::ContextRolloverConfig::default();
 
         assert!(should_enqueue_stream_unstable_retry_continuation(
-            &candidate, &run, 2
+            &candidate,
+            &run,
+            2,
+            config.stream_unstable_continuation_min_attempts,
+            config.stream_unstable_continuation_token_limit
         ));
         assert!(!should_enqueue_stream_unstable_retry_continuation(
             &candidate,
             &reconnecting_only,
-            2
+            2,
+            config.stream_unstable_continuation_min_attempts,
+            config.stream_unstable_continuation_token_limit
         ));
         assert!(!should_enqueue_stream_unstable_retry_continuation(
-            &candidate, &run, 1
+            &candidate,
+            &run,
+            1,
+            config.stream_unstable_continuation_min_attempts,
+            config.stream_unstable_continuation_token_limit
         ));
         assert!(!should_enqueue_stream_unstable_retry_continuation(
             &candidate,
             &stream_unstable_failed_run("queue-stream", Some(79_999), true),
-            2
+            2,
+            config.stream_unstable_continuation_min_attempts,
+            config.stream_unstable_continuation_token_limit
         ));
-        assert!(!should_enqueue_stream_unstable_retry_continuation(
+        assert!(should_enqueue_stream_unstable_retry_continuation(
             &candidate,
-            &stream_unstable_failed_run("queue-stream", Some(90_038), false),
-            2
+            &high_usage_without_current_media,
+            2,
+            config.stream_unstable_continuation_min_attempts,
+            config.stream_unstable_continuation_token_limit
         ));
+    }
+
+    #[test]
+    fn pending_continuation_candidate_record_preserves_inbound_media_artifacts() {
+        let record: PendingContinuationCandidateRecord = serde_json::from_str(
+            r#"{
+                "queueId": "queue-stream",
+                "sessionKey": "discord:dm-42:user-7:main",
+                "runtimeClass": "interactive",
+                "origin": "channel",
+                "inboundMediaArtifacts": [
+                    {
+                        "schema": "agent-harness.inbound-media-artifact.v1",
+                        "platform": "discord",
+                        "kind": "attachment-image",
+                        "source": "discord-gateway",
+                        "artifactUri": "agent-harness://inbound-media/discord/msg-1/0.jpg",
+                        "mime": "image/jpeg",
+                        "sha256": "abc123"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let candidate = RuntimeContinuationCandidate::from(record);
+
+        assert_eq!(candidate.queue_id, "queue-stream");
+        assert_eq!(candidate.inbound_media_artifacts.len(), 1);
+        assert_eq!(
+            candidate.inbound_media_artifacts[0].artifact_uri.as_deref(),
+            Some("agent-harness://inbound-media/discord/msg-1/0.jpg")
+        );
+        assert_eq!(candidate.inbound_media_artifacts[0].platform, "discord");
     }
 
     #[test]
@@ -3149,8 +4416,8 @@ mod tests {
     }
 
     #[test]
-    fn polluted_thread_continuation_runs_only_at_dead_letter_and_respects_depth_limit() {
-        let root = temp_root("polluted_thread_continuation_dead_letter_depth");
+    fn polluted_thread_continuation_runs_at_terminal_failure_and_respects_depth_limit() {
+        let root = temp_root("polluted_thread_continuation_terminal_depth");
         let harness_home = root.join(".agent-harness");
         let retry_item = prepared_test_item("queue-retry", "telegram:dm-42:user-7:main", None);
         let run = polluted_thread_failed_run("queue-retry");
@@ -3168,6 +4435,31 @@ mod tests {
         assert!(retry_result.is_none());
         assert!(warnings.is_empty());
 
+        let queue_id = "queue-terminal";
+        let session_key = "discord:dm-42:user-7:main";
+        seed_prepared_pending_for_stream_retry(&harness_home, queue_id, session_key);
+        let terminal_item = prepared_test_item(queue_id, session_key, None);
+        let terminal_result = maybe_enqueue_polluted_thread_continuation(
+            &harness_home,
+            Some(&terminal_item),
+            &polluted_thread_failed_run(queue_id),
+            RuntimeRunOnceStatus::FailedTerminal,
+            &mut warnings,
+        )
+        .unwrap()
+        .expect("terminal polluted failure should enqueue child continuation");
+
+        assert_eq!(terminal_result.queue_id, queue_id);
+        assert_eq!(
+            terminal_result.new_working_session_key,
+            "discord:dm-42:user-7:main:cont-1"
+        );
+
+        fs::write(
+            harness_home.join(crate::HARNESS_CONFIG_FILE_NAME),
+            r#"{"codexContext":{"maxSuccessfulCompactsBeforeRollover":9,"maxContinuationDepth":2}}"#,
+        )
+        .unwrap();
         let max_depth_item =
             prepared_test_item("queue-max", "telegram:dm-42:user-7:main:cont-2", Some(2));
         let max_depth_result = maybe_enqueue_polluted_thread_continuation(
@@ -3189,8 +4481,8 @@ mod tests {
     }
 
     #[test]
-    fn repeated_stream_disconnect_high_media_retry_requeues_continuation() {
-        let root = temp_root("repeated_stream_disconnect_high_media_retry_requeues_continuation");
+    fn repeated_stream_disconnect_high_usage_retry_requeues_continuation() {
+        let root = temp_root("repeated_stream_disconnect_high_usage_retry_requeues_continuation");
         let harness_home = root.join(".agent-harness");
         let queue_id = "queue-stream";
         let session_key = "discord:dm-42:user-7:main";
@@ -3254,6 +4546,92 @@ mod tests {
         );
         assert!(warnings.is_empty());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stream_unstable_retry_continuation_preserves_parent_when_child_enqueue_fails() {
+        let root = temp_root("stream_unstable_retry_continuation_child_enqueue_fails");
+        let harness_home = root.join(".agent-harness");
+        let queue_id = "queue-stream-missing";
+        let session_key = "discord:dm-42:user-7:main";
+        let item = prepared_test_item(queue_id, session_key, None);
+        let run = stream_unstable_failed_run(queue_id, Some(90_038), true);
+        let mut warnings = Vec::new();
+
+        let rollover = maybe_enqueue_stream_unstable_retry_continuation(
+            &harness_home,
+            Some(&item),
+            &run,
+            2,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(rollover.is_none());
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("pending queue item queue-stream-missing was not found")
+        }));
+        assert!(
+            !harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl")
+                .exists()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stream_unstable_retry_continuation_skips_when_parent_session_sibling_exists() {
+        let root = temp_root("stream_unstable_retry_continuation_parent_sibling");
+        let harness_home = root.join(".agent-harness");
+        let queue_id = "queue-stream";
+        let session_key = "discord:dm-42:user-7:main";
+        seed_prepared_pending_for_stream_retry(&harness_home, queue_id, session_key);
+        append_json_line(
+            &harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+            &serde_json::json!({
+                "queueId": "queue-sibling",
+                "status": "queued",
+                "runtimeClass": "interactive",
+                "origin": "channel",
+                "agentId": "main",
+                "platform": "discord",
+                "channelId": "dm-42",
+                "userId": "user-7",
+                "sessionKey": session_key
+            }),
+        )
+        .unwrap();
+        let item = prepared_test_item(queue_id, session_key, None);
+        let run = stream_unstable_failed_run(queue_id, Some(90_038), true);
+        let mut warnings = Vec::new();
+
+        let rollover = maybe_enqueue_stream_unstable_retry_continuation(
+            &harness_home,
+            Some(&item),
+            &run,
+            2,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(rollover.is_none());
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("another pending item targets the parent working session")
+        }));
+        let pending = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        assert!(!pending.contains("\"requeuedFromQueueId\":\"queue-stream\""));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3380,6 +4758,142 @@ mod tests {
                 .queue_id
                 .as_deref()
                 .is_some_and(|id| id.starts_with("turn:") || id.contains(":rollover-requeue-"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stream_unstable_retry_continuation_child_writes_exactly_one_final_outbox() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("stream_unstable_retry_continuation_child_writes_final_outbox");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "discord".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "finish this long media-heavy task".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: vec![InboundMediaArtifact {
+                platform: "discord".to_string(),
+                kind: "attachment-image".to_string(),
+                artifact_uri: Some("agent-harness://inbound-media/discord/msg-1/0.jpg".to_string()),
+                mime: Some("image/jpeg".to_string()),
+                sha256: Some("abc123".to_string()),
+                ..InboundMediaArtifact::default()
+            }],
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        let parent_queue_id = receive.queue_id.unwrap();
+        write_test_channel_session_state(
+            &harness_home,
+            "discord",
+            "dm-42",
+            "user-7",
+            "discord:dm-42:user-7:main",
+            "main",
+        );
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let first = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(parent_queue_id.clone()),
+            codex_executable: Some(fake_high_usage_reconnecting_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(first.receipt.status, RuntimeRunOnceStatus::RetryPending);
+        assert!(first.outbound_message.is_none());
+
+        let second = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(parent_queue_id.clone()),
+            codex_executable: Some(fake_high_usage_reconnecting_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(second.receipt.status, RuntimeRunOnceStatus::Skipped);
+        let child_queue_id = second
+            .receipt
+            .child_queue_id
+            .clone()
+            .expect("skip receipt should include structured childQueueId");
+        assert_ne!(child_queue_id, parent_queue_id);
+        assert_eq!(
+            second.receipt.child_session_key.as_deref(),
+            Some("discord:dm-42:user-7:main:cont-1")
+        );
+
+        let child = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(child_queue_id.clone()),
+            codex_executable: Some(fake_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(child.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert_eq!(
+            child.receipt.queue_id.as_deref(),
+            Some(child_queue_id.as_str())
+        );
+        assert_eq!(
+            child.outbound_message.as_ref().unwrap().text,
+            "Pipeline fake reply."
+        );
+
+        let outbox = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl"),
+        )
+        .unwrap();
+        let outbox_values: Vec<Value> = outbox
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect();
+        assert_eq!(outbox_values.len(), 1);
+        assert_eq!(
+            string_field(&outbox_values[0], &["sourceQueueId"]),
+            Some(child_queue_id.as_str())
+        );
+        assert_ne!(
+            string_field(&outbox_values[0], &["sourceQueueId"]),
+            Some(parent_queue_id.as_str())
+        );
+        assert_eq!(
+            string_field(&outbox_values[0], &["text"]),
+            Some("Pipeline fake reply.")
         );
 
         let _ = fs::remove_dir_all(root);
@@ -3577,6 +5091,158 @@ mod tests {
     }
 
     #[test]
+    fn run_runtime_queue_once_suppresses_read_only_review_final_for_implementation_goal() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("run_runtime_queue_once_suppresses_read_only_review_final_for_goal");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message:
+                "開 goal 把所有 package 都完成，先 double-check review loop 後落實下來，準備進入實作"
+                    .to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: receive.queue_id.clone(),
+            codex_executable: Some(fake_read_only_review_final_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert!(report.outbound_message.is_none());
+        assert!(report.outbox_file.is_none());
+        assert!(
+            !harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl")
+                .exists(),
+            "review/evidence shaped output for an implementation goal must not masquerade as user final"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_runtime_queue_once_suppresses_non_main_agent_final_outbox() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("run_runtime_queue_once_suppresses_non_main_agent_final_outbox");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("xiaoxiaoli".to_string()),
+            session_key: None,
+            message: "complete this delegated implementation".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+        let delegated_session_key = "telegram:dm-42:user-7:xiaoxiaoli";
+        let pending_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("pending.jsonl");
+        let pending = fs::read_to_string(&pending_file).unwrap();
+        fs::write(
+            &pending_file,
+            pending
+                .replace(r#""agentId":"main""#, r#""agentId":"xiaoxiaoli""#)
+                .replace(
+                    r#""sessionKey":"telegram:dm-42:user-7:main""#,
+                    &format!(r#""sessionKey":"{delegated_session_key}""#),
+                ),
+        )
+        .unwrap();
+        write_test_channel_session_state(
+            &harness_home,
+            "telegram",
+            "dm-42",
+            "user-7",
+            delegated_session_key,
+            "xiaoxiaoli",
+        );
+
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: receive.queue_id.clone(),
+            codex_executable: Some(fake_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert!(report.outbound_message.is_none());
+        assert!(report.outbox_file.is_none());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("classified as InternalEvidence")),
+            "non-main completed output must be classified as internal evidence"
+        );
+        assert!(
+            !harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl")
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_runtime_queue_once_suppresses_stale_session_reply_after_new() {
         let _guard = ENV_LOCK.lock().unwrap();
         let root = temp_root("run_runtime_queue_once_suppresses_stale_session_reply_after_new");
@@ -3664,6 +5330,76 @@ mod tests {
     }
 
     #[test]
+    fn run_runtime_queue_once_agent_reply_outbox_includes_plain_final_presentation() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("run_runtime_queue_once_agent_reply_has_presentation");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "ordinary final presentation guard".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+
+        let fake_codex = fake_codex_executable(&root);
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            codex_executable: Some(fake_codex),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        let outbox = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl"),
+        )
+        .unwrap();
+        let message: Value = serde_json::from_str(outbox.lines().next().unwrap()).unwrap();
+        assert_eq!(message["kind"], "agent-reply");
+        assert_eq!(message["text"], "Pipeline fake reply.");
+        assert_eq!(
+            message["presentation"]["schema"],
+            crate::rich_presentation::RICH_MESSAGE_PRESENTATION_SCHEMA
+        );
+        assert_eq!(
+            message["presentation"]["fallbackText"],
+            "Pipeline fake reply."
+        );
+        assert!(message["presentation"]["blocks"].as_array().unwrap().len() >= 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn channel_session_freshness_does_not_cross_suppress_other_agent() {
         let root = temp_root("channel_session_freshness_does_not_cross_suppress_other_agent");
         let harness_home = root.join(".agent-harness");
@@ -3694,6 +5430,7 @@ mod tests {
                 thinking_enabled: false,
                 thinking_level: None,
                 thinking_instruction: None,
+                fast_mode: None,
                 stop_requested: false,
                 stop_reason: None,
                 steering_notes: Vec::new(),
@@ -3849,6 +5586,7 @@ mod tests {
             account_id: None,
             channel_id: "dm-42".to_string(),
             user_id: "user-7".to_string(),
+            message_text: "continue after recovery".to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
             provider: Some("openai".to_string()),
@@ -4034,6 +5772,7 @@ mod tests {
                 thinking_enabled: false,
                 thinking_level: None,
                 thinking_instruction: None,
+                fast_mode: None,
                 stop_requested: false,
                 stop_reason: None,
                 steering_notes: Vec::new(),
@@ -4073,6 +5812,7 @@ mod tests {
                 thinking_enabled: false,
                 thinking_level: None,
                 thinking_instruction: None,
+                fast_mode: None,
                 stop_requested: false,
                 stop_reason: None,
                 steering_notes: Vec::new(),
@@ -4313,6 +6053,48 @@ while ($true) {
         )
         .unwrap();
         let cmd = root.join("fake-external-review-only-codex.cmd");
+        fs::write(
+            &cmd,
+            format!(
+                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        cmd
+    }
+
+    #[cfg(windows)]
+    fn fake_read_only_review_final_codex_executable(root: &Path) -> PathBuf {
+        let script = root.join("fake-read-only-review-final-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try {
+        $msg = $line | ConvertFrom-Json
+    } catch {
+        continue
+    }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-read-only-review-final"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"delta":"Read-only inspection only. No files changed, no tests run.\n\n- Final/outbox authority seam: runtime_pipeline owns final decisions.\n- Dirty Worktree Risks: implementation still needs to continue."}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"turn":{"id":"turn-read-only-review-final","status":"completed"}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let cmd = root.join("fake-read-only-review-final-codex.cmd");
         fs::write(
             &cmd,
             format!(
@@ -4648,6 +6430,40 @@ while IFS= read -r line; do
                 printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-only","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}'
                 exit 0
             fi
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+        script
+    }
+
+    #[cfg(not(windows))]
+    fn fake_read_only_review_final_codex_executable(root: &Path) -> PathBuf {
+        let script = root.join("fake-read-only-review-final-codex");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-read-only-review-final"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"Read-only inspection only. No files changed, no tests run.\n\n- Final/outbox authority seam: runtime_pipeline owns final decisions.\n- Dirty Worktree Risks: implementation still needs to continue."}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-read-only-review-final","status":"completed"}}}'
+            exit 0
             ;;
     esac
 done

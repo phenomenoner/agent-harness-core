@@ -123,10 +123,19 @@ pub struct OperationPlanShowReport {
     pub harness_home: PathBuf,
     pub plan: OperationPlan,
     pub items: Vec<OperationPlanItem>,
+    pub open_items: OperationPlanItemReadbackSummary,
+    pub blocked_items: OperationPlanItemReadbackSummary,
     pub events_file: PathBuf,
     pub comments_file: PathBuf,
     pub receipts_file: PathBuf,
     pub receipt: OperationPlanReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationPlanItemReadbackSummary {
+    pub count: usize,
+    pub item_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -455,6 +464,18 @@ pub fn show_operation_plan(
     let plan_dir = operation_plan_dir(&options.harness_home, &options.plan_id);
     let plan = read_json_plan(&plan_dir.join(PLAN_FILE))?;
     let items = read_items(&plan_dir.join(ITEMS_FILE))?;
+    let open_items = operation_plan_item_readback_summary(
+        items
+            .iter()
+            .filter(|item| !item.status.is_terminal())
+            .map(|item| item.item_id.as_str()),
+    );
+    let blocked_items = operation_plan_item_readback_summary(
+        items
+            .iter()
+            .filter(|item| item.status == OperationPlanItemStatus::Blocked)
+            .map(|item| item.item_id.as_str()),
+    );
     let events_file = plan_dir.join(EVENTS_FILE);
     let comments_file = plan_dir.join(COMMENTS_FILE);
     let receipt_file = plan_dir.join(RECEIPTS_FILE);
@@ -477,11 +498,23 @@ pub fn show_operation_plan(
         harness_home: options.harness_home,
         plan,
         items,
+        open_items,
+        blocked_items,
         events_file,
         comments_file,
         receipts_file: receipt_file,
         receipt,
     })
+}
+
+fn operation_plan_item_readback_summary<'a>(
+    item_ids: impl Iterator<Item = &'a str>,
+) -> OperationPlanItemReadbackSummary {
+    let item_ids = item_ids.map(ToString::to_string).collect::<Vec<_>>();
+    OperationPlanItemReadbackSummary {
+        count: item_ids.len(),
+        item_ids,
+    }
 }
 
 pub fn list_operation_plans(harness_home: PathBuf) -> io::Result<Vec<OperationPlanSummary>> {
@@ -1639,6 +1672,73 @@ mod tests {
             now_ms: 4002,
         });
         assert!(stale.is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn operation_plan_show_exposes_blocked_terminal_items_separately() {
+        let root = temp_root("operation_plan_show_exposes_blocked_terminal_items");
+        let harness_home = root.join(".agent-harness");
+        let _ = create_operation_plan(CreateOperationPlanOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "plan-blocked-readback".to_string(),
+            origin_queue_id: None,
+            session_key: "discord:dm-42:user-7:main".to_string(),
+            agent_id: "main".to_string(),
+            goal: "blocked readback".to_string(),
+            acceptance_criteria: None,
+            constraints: None,
+            max_open_items: None,
+            max_fanout: None,
+            now_ms: 4500,
+        })
+        .unwrap();
+
+        let item = add_operation_plan_item(OperationPlanAddItemOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "plan-blocked-readback".to_string(),
+            item_id: "SL-007".to_string(),
+            title: "Sandbox confirmation popup".to_string(),
+            body: "Needs explicit owner action.".to_string(),
+            depends_on: Vec::new(),
+            acceptance_criteria: None,
+            risk: None,
+            now_ms: 4501,
+        })
+        .unwrap();
+        let _ = update_operation_plan_item(OperationPlanUpdateItemOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "plan-blocked-readback".to_string(),
+            item_id: "SL-007".to_string(),
+            expected_item_version: Some(item.item.version),
+            status: Some(OperationPlanItemStatus::Blocked),
+            title: None,
+            body: None,
+            depends_on: None,
+            assignee: Some("owner".to_string()),
+            worker_job_id: None,
+            queue_id: None,
+            risk: None,
+            evidence: None,
+            replace_evidence: false,
+            add_evidence: vec!["blocked pending owner decision".to_string()],
+            now_ms: 4502,
+        })
+        .unwrap();
+
+        let show = show_operation_plan(OperationPlanShowOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "plan-blocked-readback".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(show.open_items.count, 0);
+        assert!(show.open_items.item_ids.is_empty());
+        assert_eq!(show.blocked_items.count, 1);
+        assert_eq!(show.blocked_items.item_ids, vec!["SL-007".to_string()]);
+        assert!(show.items[0].status.is_terminal());
+        assert_eq!(show.items[0].status, OperationPlanItemStatus::Blocked);
 
         let _ = fs::remove_dir_all(root);
     }

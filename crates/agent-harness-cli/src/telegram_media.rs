@@ -8,9 +8,10 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use agent_harness_core::{
-    DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM, DEFAULT_INBOUND_MEDIA_MAX_ITEMS_PER_TURN,
-    InboundMediaArtifact, InboundMediaDownloadStatus, InboundMediaModelAttachmentStatus,
-    InboundMediaSelectedVariant, append_jsonl_value, inbound_media_attachment_root,
+    ArtifactExtractionSummary, DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM,
+    DEFAULT_INBOUND_MEDIA_MAX_ITEMS_PER_TURN, InboundMediaArtifact, InboundMediaDownloadStatus,
+    InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant, append_jsonl_value,
+    inbound_media_attachment_root,
 };
 use ring::digest;
 use serde::{Deserialize, Serialize};
@@ -161,6 +162,9 @@ struct TelegramMediaCandidate {
     selected_variant: Option<InboundMediaSelectedVariant>,
     expected_mime: Option<String>,
     caption_preview: Option<String>,
+    provenance: Option<String>,
+    source: String,
+    requires_image_validation: bool,
 }
 
 pub fn ingest_telegram_media<F: TelegramMediaFetcher>(
@@ -561,27 +565,33 @@ fn ingest_candidate<F: TelegramMediaFetcher>(
         ));
         return artifact;
     }
-    let detected_mime = image_mime_from_bytes(&bytes);
-    if detected_mime.is_none() {
-        artifact.download_status = InboundMediaDownloadStatus::DownloadFailed;
-        artifact.byte_len = Some(bytes.len() as u64);
-        artifact
-            .warnings
-            .push("downloaded bytes failed image header validation".to_string());
-        return artifact;
+    let image_mime = image_mime_from_bytes(&bytes);
+    if candidate.requires_image_validation {
+        if image_mime.is_none() {
+            artifact.download_status = InboundMediaDownloadStatus::DownloadFailed;
+            artifact.byte_len = Some(bytes.len() as u64);
+            artifact
+                .warnings
+                .push("downloaded bytes failed image header validation".to_string());
+            return artifact;
+        }
+        let detected_image_mime = image_mime.unwrap();
+        if let Some(expected_mime) = candidate.expected_mime.as_deref()
+            && expected_mime.starts_with("image/")
+            && !image_mime_compatible(expected_mime, detected_image_mime)
+        {
+            artifact.download_status = InboundMediaDownloadStatus::DownloadFailed;
+            artifact.byte_len = Some(bytes.len() as u64);
+            artifact
+                .warnings
+                .push("downloaded image MIME did not match Telegram metadata".to_string());
+            return artifact;
+        }
     }
-    let detected_mime = detected_mime.unwrap();
-    if let Some(expected_mime) = candidate.expected_mime.as_deref()
-        && expected_mime.starts_with("image/")
-        && !image_mime_compatible(expected_mime, detected_mime)
-    {
-        artifact.download_status = InboundMediaDownloadStatus::DownloadFailed;
-        artifact.byte_len = Some(bytes.len() as u64);
-        artifact
-            .warnings
-            .push("downloaded image MIME did not match Telegram metadata".to_string());
-        return artifact;
-    }
+    let detected_mime = image_mime
+        .map(ToString::to_string)
+        .or_else(|| candidate.expected_mime.clone())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
 
     if let Err(_) = fs::create_dir_all(update_dir) {
         artifact.download_status = InboundMediaDownloadStatus::DownloadFailed;
@@ -593,7 +603,7 @@ fn ingest_candidate<F: TelegramMediaFetcher>(
     let extension = extension_for_file(
         &file_path,
         candidate.expected_mime.as_deref(),
-        detected_mime,
+        &detected_mime,
     );
     let local_path = update_dir.join(format!("{index}.{extension}"));
     if let Err(_) = fs::write(&local_path, &bytes) {
@@ -610,9 +620,11 @@ fn ingest_candidate<F: TelegramMediaFetcher>(
     artifact.artifact_uri = Some(format!(
         "agent-harness://inbound-media/telegram/update-{update_id}/{index}.{extension}"
     ));
-    artifact.mime = Some(detected_mime.to_string());
+    artifact.mime = Some(detected_mime.clone());
     artifact.sha256 = Some(sha256_hex(&bytes));
     artifact.byte_len = Some(bytes.len() as u64);
+    artifact.extraction_summary =
+        telegram_extraction_summary(&detected_mime, &bytes, &candidate.kind);
     artifact
 }
 
@@ -626,7 +638,8 @@ fn base_artifact(candidate: &TelegramMediaCandidate) -> InboundMediaArtifact {
         selected_variant: candidate.selected_variant.clone(),
         mime: candidate.expected_mime.clone(),
         caption_preview: candidate.caption_preview.clone(),
-        source: "telegram.getFile".to_string(),
+        source: candidate.source.clone(),
+        provenance: candidate.provenance.clone(),
         model_attachment_status: InboundMediaModelAttachmentStatus::PromptOnly,
         ..InboundMediaArtifact::default()
     }
@@ -650,15 +663,22 @@ fn telegram_media_candidates(message: &Value) -> Vec<TelegramMediaCandidate> {
             selected_variant: Some(selected_variant(photo)),
             expected_mime: Some("image/jpeg".to_string()),
             caption_preview: telegram_caption_preview(message),
+            provenance: None,
+            source: "telegram.getFile".to_string(),
+            requires_image_validation: true,
         });
     }
 
     if let Some(document) = message.get("document")
-        && telegram_document_is_image(document)
         && let Some(file_id) = document.get("file_id").and_then(Value::as_str)
     {
+        let is_image = telegram_document_is_image(document);
         candidates.push(TelegramMediaCandidate {
-            kind: "document-image".to_string(),
+            kind: if is_image {
+                "document-image".to_string()
+            } else {
+                "document".to_string()
+            },
             file_id: file_id.to_string(),
             message_id: telegram_id_string(message.get("message_id")),
             media_group_id: message
@@ -672,16 +692,56 @@ fn telegram_media_candidates(message: &Value) -> Vec<TelegramMediaCandidate> {
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
             caption_preview: telegram_caption_preview(message),
+            provenance: None,
+            source: "telegram.getFile".to_string(),
+            requires_image_validation: is_image,
         });
     }
 
-    if let Some(thumbnail) = message
-        .get("video")
-        .and_then(|video| video.get("thumbnail").or_else(|| video.get("thumb")))
-        && let Some(file_id) = thumbnail.get("file_id").and_then(Value::as_str)
+    for (kind, default_mime) in [
+        ("voice", Some("audio/ogg")),
+        ("audio", None),
+        ("video", Some("video/mp4")),
+    ] {
+        if let Some(value) = message.get(kind)
+            && let Some(file_id) = value.get("file_id").and_then(Value::as_str)
+        {
+            candidates.push(TelegramMediaCandidate {
+                kind: kind.to_string(),
+                file_id: file_id.to_string(),
+                message_id: telegram_id_string(message.get("message_id")),
+                media_group_id: message
+                    .get("media_group_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                variant_count: None,
+                selected_variant: Some(selected_variant(value)),
+                expected_mime: value
+                    .get("mime_type")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .or_else(|| default_mime.map(ToString::to_string)),
+                caption_preview: telegram_caption_preview(message),
+                provenance: None,
+                source: "telegram.getFile".to_string(),
+                requires_image_validation: false,
+            });
+        }
+    }
+
+    if let Some(sticker) = message.get("sticker")
+        && !sticker
+            .get("is_animated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        && !sticker
+            .get("is_video")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        && let Some(file_id) = sticker.get("file_id").and_then(Value::as_str)
     {
         candidates.push(TelegramMediaCandidate {
-            kind: "video-thumbnail".to_string(),
+            kind: "sticker-image".to_string(),
             file_id: file_id.to_string(),
             message_id: telegram_id_string(message.get("message_id")),
             media_group_id: message
@@ -689,47 +749,63 @@ fn telegram_media_candidates(message: &Value) -> Vec<TelegramMediaCandidate> {
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
             variant_count: None,
-            selected_variant: Some(selected_variant(thumbnail)),
-            expected_mime: Some("image/jpeg".to_string()),
+            selected_variant: Some(selected_variant(sticker)),
+            expected_mime: Some("image/webp".to_string()),
             caption_preview: telegram_caption_preview(message),
+            provenance: None,
+            source: "telegram.getFile".to_string(),
+            requires_image_validation: true,
         });
+    }
+    if let Some(reply) = message
+        .get("reply_to_message")
+        .filter(|value| value.is_object())
+    {
+        let mut referenced = telegram_media_candidates_without_replies(reply);
+        for candidate in &mut referenced {
+            candidate.provenance = Some("referenced".to_string());
+            candidate.source = "telegram.reply_to_message.getFile".to_string();
+        }
+        candidates.extend(referenced.into_iter().take(3));
     }
     candidates
 }
 
+fn telegram_media_candidates_without_replies(message: &Value) -> Vec<TelegramMediaCandidate> {
+    let mut clone = message.clone();
+    if let Some(object) = clone.as_object_mut() {
+        object.remove("reply_to_message");
+    }
+    telegram_media_candidates(&clone)
+}
+
 fn skipped_media_artifacts(message: &Value) -> Vec<InboundMediaArtifact> {
     let mut artifacts = Vec::new();
-    if let Some(document) = message.get("document")
-        && !telegram_document_is_image(document)
-    {
-        artifacts.push(skipped_artifact(
-            message,
-            "document",
-            document.get("mime_type").and_then(Value::as_str),
-            "telegram document is not an image",
-        ));
-    }
-    for kind in ["audio", "voice", "sticker", "animation", "video_note"] {
+    for kind in ["animation", "video_note"] {
         if let Some(value) = message.get(kind) {
             artifacts.push(skipped_artifact(
                 message,
                 kind,
                 value.get("mime_type").and_then(Value::as_str),
-                "telegram media kind is not image-download capable",
+                "telegram media kind is not supported by this ingest path",
             ));
         }
     }
-    if let Some(video) = message.get("video")
-        && video
-            .get("thumbnail")
-            .or_else(|| video.get("thumb"))
-            .is_none()
+    if let Some(sticker) = message.get("sticker")
+        && (sticker
+            .get("is_animated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || sticker
+                .get("is_video")
+                .and_then(Value::as_bool)
+                .unwrap_or(false))
     {
         artifacts.push(skipped_artifact(
             message,
-            "video",
-            video.get("mime_type").and_then(Value::as_str),
-            "telegram video has no downloadable thumbnail",
+            "sticker",
+            sticker.get("mime_type").and_then(Value::as_str),
+            "telegram animated sticker is unsupported",
         ));
     }
     artifacts
@@ -857,11 +933,35 @@ fn extension_for_file(file_path: &str, expected_mime: Option<&str>, detected_mim
     Path::new(file_path)
         .extension()
         .and_then(|ext| ext.to_str())
-        .and_then(|ext| image_extension(Some(ext)))
+        .and_then(media_extension)
         .or_else(|| expected_mime.and_then(extension_for_mime))
         .or_else(|| extension_for_mime(detected_mime))
         .unwrap_or("bin")
         .to_string()
+}
+
+fn media_extension(extension: &str) -> Option<&'static str> {
+    match extension.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => Some("jpg"),
+        "png" => Some("png"),
+        "gif" => Some("gif"),
+        "webp" => Some("webp"),
+        "pdf" => Some("pdf"),
+        "txt" => Some("txt"),
+        "md" => Some("md"),
+        "json" => Some("json"),
+        "csv" => Some("csv"),
+        "mp3" => Some("mp3"),
+        "wav" => Some("wav"),
+        "ogg" => Some("ogg"),
+        "opus" => Some("opus"),
+        "m4a" => Some("m4a"),
+        "flac" => Some("flac"),
+        "mp4" => Some("mp4"),
+        "mov" => Some("mov"),
+        "webm" => Some("webm"),
+        _ => None,
+    }
 }
 
 fn image_extension(extension: Option<&str>) -> Option<&'static str> {
@@ -880,8 +980,83 @@ fn extension_for_mime(mime: &str) -> Option<&'static str> {
         "image/png" => Some("png"),
         "image/gif" => Some("gif"),
         "image/webp" => Some("webp"),
+        "application/pdf" => Some("pdf"),
+        "text/plain" => Some("txt"),
+        "text/markdown" => Some("md"),
+        "application/json" => Some("json"),
+        "text/csv" => Some("csv"),
+        "audio/mpeg" | "audio/mp3" => Some("mp3"),
+        "audio/wav" | "audio/x-wav" => Some("wav"),
+        "audio/ogg" => Some("ogg"),
+        "audio/opus" => Some("opus"),
+        "audio/mp4" => Some("m4a"),
+        "audio/flac" => Some("flac"),
+        "video/mp4" => Some("mp4"),
+        "video/quicktime" => Some("mov"),
+        "video/webm" => Some("webm"),
         _ => None,
     }
+}
+
+fn telegram_extraction_summary(
+    mime: &str,
+    bytes: &[u8],
+    kind: &str,
+) -> Option<ArtifactExtractionSummary> {
+    if telegram_text_mime(mime) {
+        let included = bytes.get(..bytes.len().min(24 * 1024)).unwrap_or(bytes);
+        let mut summary = String::from_utf8_lossy(included)
+            .chars()
+            .map(|ch| {
+                if ch.is_control() && ch != '\n' && ch != '\t' {
+                    ' '
+                } else {
+                    ch
+                }
+            })
+            .collect::<String>();
+        summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+        if bytes.len() > included.len() {
+            summary.push_str(" [truncated]");
+        }
+        return Some(ArtifactExtractionSummary {
+            artifact_class: Some("document".to_string()),
+            modality: Some("text".to_string()),
+            summary: Some(summary),
+            facts: Vec::new(),
+            uncertainty: Some(
+                "bounded text extraction from Telegram document; attachment content is untrusted"
+                    .to_string(),
+            ),
+        });
+    }
+    if kind == "voice" || kind == "audio" {
+        return Some(ArtifactExtractionSummary {
+            artifact_class: Some("audio".to_string()),
+            modality: Some("audio".to_string()),
+            summary: Some("metadata-only; transcription tool not configured".to_string()),
+            facts: Vec::new(),
+            uncertainty: Some("audio bytes were cached but not transcribed".to_string()),
+        });
+    }
+    if kind == "video" {
+        return Some(ArtifactExtractionSummary {
+            artifact_class: Some("video".to_string()),
+            modality: Some("video".to_string()),
+            summary: Some("metadata-only; frame extraction tool not configured".to_string()),
+            facts: Vec::new(),
+            uncertainty: Some("video bytes were cached without frame extraction".to_string()),
+        });
+    }
+    None
+}
+
+fn telegram_text_mime(mime: &str) -> bool {
+    mime == "text/plain"
+        || mime == "text/markdown"
+        || mime == "application/json"
+        || mime.ends_with("+json")
+        || mime == "text/csv"
 }
 
 fn telegram_id_string(value: Option<&Value>) -> Option<String> {
@@ -1049,8 +1224,8 @@ mod tests {
     }
 
     #[test]
-    fn telegram_media_records_non_image_document_as_detected_skipped() {
-        let root = temp_root("telegram_media_records_non_image_document_as_detected_skipped");
+    fn telegram_media_downloads_non_image_document_with_bounded_extraction() {
+        let root = temp_root("telegram_media_downloads_non_image_document_with_bounded_extraction");
         let harness_home = root.join(".agent-harness");
         let message = serde_json::json!({
             "message_id": 10,
@@ -1061,7 +1236,12 @@ mod tests {
                 "file_size": 20
             }
         });
-        let fetcher = FakeFetcher::new(BTreeMap::new(), BTreeMap::new());
+        let file_path = "documents/notes.txt";
+        let bytes = b"hello from telegram document".to_vec();
+        let fetcher = FakeFetcher::new(
+            BTreeMap::from([("secret-doc".to_string(), file_path.to_string())]),
+            BTreeMap::from([(file_path.to_string(), bytes.clone())]),
+        );
 
         let report = ingest_telegram_media(&harness_home, 1234, &message, &fetcher).unwrap();
 
@@ -1070,16 +1250,138 @@ mod tests {
         assert_eq!(artifact.kind, "document");
         assert_eq!(
             artifact.download_status,
-            InboundMediaDownloadStatus::DetectedSkipped
+            InboundMediaDownloadStatus::Downloaded
         );
         assert_eq!(
             artifact.model_attachment_status,
-            InboundMediaModelAttachmentStatus::Unsupported
+            InboundMediaModelAttachmentStatus::PromptOnly
         );
-        assert!(artifact.local_path.is_none());
+        assert_eq!(artifact.mime.as_deref(), Some("text/plain"));
+        assert!(artifact.local_path.as_ref().unwrap().is_file());
+        assert!(
+            artifact
+                .extraction_summary
+                .as_ref()
+                .and_then(|summary| summary.summary.as_deref())
+                .is_some_and(|summary| summary.contains("hello from telegram document"))
+        );
         let receipt = fs::read_to_string(&report.receipt_file).unwrap();
         assert!(!receipt.contains("secret-doc"));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn telegram_media_downloads_voice_as_audio_metadata_only() {
+        let root = temp_root("telegram_media_downloads_voice_as_audio_metadata_only");
+        let harness_home = root.join(".agent-harness");
+        let message = serde_json::json!({
+            "message_id": 11,
+            "voice": {
+                "file_id": "secret-voice",
+                "mime_type": "audio/ogg",
+                "file_size": 8
+            }
+        });
+        let file_path = "voice/file_1.ogg";
+        let fetcher = FakeFetcher::new(
+            BTreeMap::from([("secret-voice".to_string(), file_path.to_string())]),
+            BTreeMap::from([(file_path.to_string(), b"OggSdata".to_vec())]),
+        );
+
+        let report = ingest_telegram_media(&harness_home, 1235, &message, &fetcher).unwrap();
+
+        assert_eq!(report.artifacts.len(), 1);
+        let artifact = &report.artifacts[0];
+        assert_eq!(artifact.kind, "voice");
+        assert_eq!(
+            artifact.download_status,
+            InboundMediaDownloadStatus::Downloaded
+        );
+        assert_eq!(artifact.mime.as_deref(), Some("audio/ogg"));
+        assert!(
+            artifact
+                .extraction_summary
+                .as_ref()
+                .and_then(|summary| summary.summary.as_deref())
+                .is_some_and(|summary| summary.contains("transcription tool not configured"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn telegram_reply_to_message_media_is_referenced_provenance() {
+        let root = temp_root("telegram_reply_to_message_media_is_referenced_provenance");
+        let harness_home = root.join(".agent-harness");
+        let message = serde_json::json!({
+            "message_id": 12,
+            "text": "use that image",
+            "reply_to_message": {
+                "message_id": 9,
+                "photo": [{
+                    "file_id": "secret-referenced-photo",
+                    "width": 320,
+                    "height": 240,
+                    "file_size": 12
+                }]
+            }
+        });
+        let file_path = "photos/referenced.jpg";
+        let bytes = jpeg_bytes();
+        let fetcher = FakeFetcher::new(
+            BTreeMap::from([("secret-referenced-photo".to_string(), file_path.to_string())]),
+            BTreeMap::from([(file_path.to_string(), bytes)]),
+        );
+
+        let report = ingest_telegram_media(&harness_home, 1236, &message, &fetcher).unwrap();
+
+        assert_eq!(report.artifacts.len(), 1);
+        let artifact = &report.artifacts[0];
+        assert_eq!(artifact.kind, "photo");
+        assert_eq!(artifact.message_id.as_deref(), Some("9"));
+        assert_eq!(artifact.provenance.as_deref(), Some("referenced"));
+        assert_eq!(artifact.source, "telegram.reply_to_message.getFile");
+        assert!(
+            artifact
+                .artifact_uri
+                .as_deref()
+                .unwrap()
+                .contains("update-1236")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn telegram_static_webp_sticker_downloads_as_image_artifact() {
+        let root = temp_root("telegram_static_webp_sticker_downloads_as_image_artifact");
+        let harness_home = root.join(".agent-harness");
+        let message = serde_json::json!({
+            "message_id": 13,
+            "sticker": {
+                "file_id": "secret-sticker",
+                "is_animated": false,
+                "is_video": false,
+                "file_size": 12
+            }
+        });
+        let file_path = "stickers/static.webp";
+        let bytes = webp_bytes();
+        let fetcher = FakeFetcher::new(
+            BTreeMap::from([("secret-sticker".to_string(), file_path.to_string())]),
+            BTreeMap::from([(file_path.to_string(), bytes)]),
+        );
+
+        let report = ingest_telegram_media(&harness_home, 1237, &message, &fetcher).unwrap();
+
+        assert_eq!(report.artifacts.len(), 1);
+        let artifact = &report.artifacts[0];
+        assert_eq!(artifact.kind, "sticker-image");
+        assert_eq!(
+            artifact.download_status,
+            InboundMediaDownloadStatus::Downloaded
+        );
+        assert_eq!(artifact.mime.as_deref(), Some("image/webp"));
+        assert!(artifact.local_path.as_ref().unwrap().is_file());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1337,6 +1639,10 @@ mod tests {
         vec![
             0xff, 0xd8, 0xff, 0xe0, 0, 1, b'J', b'F', b'I', b'F', 0xff, 0xd9,
         ]
+    }
+
+    fn webp_bytes() -> Vec<u8> {
+        b"RIFF\x04\x00\x00\x00WEBPdata".to_vec()
     }
 
     fn temp_root(test_name: &str) -> PathBuf {

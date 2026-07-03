@@ -45,6 +45,8 @@ pub struct InboundMediaArtifact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extraction_summary: Option<ArtifactExtractionSummary>,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
     #[serde(default)]
     pub download_status: InboundMediaDownloadStatus,
     #[serde(default)]
@@ -72,6 +74,7 @@ impl Default for InboundMediaArtifact {
             lifecycle_status: None,
             extraction_summary: None,
             source: String::new(),
+            provenance: None,
             download_status: InboundMediaDownloadStatus::default(),
             model_attachment_status: InboundMediaModelAttachmentStatus::default(),
             warnings: Vec::new(),
@@ -287,7 +290,16 @@ pub fn plan_inbound_media_inputs(
     let mut planned_artifacts = Vec::new();
     let mut native_input_parts = Vec::new();
     let mut warnings = Vec::new();
-    for (index, artifact) in artifacts.iter().enumerate() {
+    let mut ordered_artifacts = artifacts.iter().collect::<Vec<_>>();
+    ordered_artifacts.sort_by_key(|artifact| {
+        usize::from(
+            artifact
+                .provenance
+                .as_deref()
+                .is_some_and(|value| value == "referenced"),
+        )
+    });
+    for (index, artifact) in ordered_artifacts.into_iter().enumerate() {
         let mut planned = artifact.clone();
         if index >= DEFAULT_INBOUND_MEDIA_MAX_ITEMS_PER_TURN {
             planned.model_attachment_status = InboundMediaModelAttachmentStatus::PromptOnly;
@@ -589,12 +601,20 @@ fn render_inbound_media_artifact_line(
         sanitize_prompt_source_label(&artifact.source)
     ));
     fields.push(format!(
+        "provenance={}",
+        sanitize_prompt_source_label(artifact.provenance.as_deref().unwrap_or("current"))
+    ));
+    fields.push(format!(
         "downloadStatus={}",
         download_status_label(artifact.download_status)
     ));
     fields.push(format!(
         "modelAttachmentStatus={}",
         model_attachment_status_label(artifact.model_attachment_status)
+    ));
+    fields.push(format!(
+        "visual={}",
+        visual_readiness_label(artifact.model_attachment_status)
     ));
     if !artifact.warnings.is_empty() {
         fields.push(format!("warningsCount={}", artifact.warnings.len()));
@@ -829,6 +849,17 @@ fn model_attachment_status_label(status: InboundMediaModelAttachmentStatus) -> &
         InboundMediaModelAttachmentStatus::DownloadedButNotModelAttached => {
             "downloaded-but-not-model-attached"
         }
+        InboundMediaModelAttachmentStatus::Unsupported => "unsupported",
+    }
+}
+
+fn visual_readiness_label(status: InboundMediaModelAttachmentStatus) -> &'static str {
+    match status {
+        InboundMediaModelAttachmentStatus::ModelAttached => "model-attached",
+        InboundMediaModelAttachmentStatus::VisionToolAvailable => "vision-tool",
+        InboundMediaModelAttachmentStatus::DownloadedButNotModelAttached
+        | InboundMediaModelAttachmentStatus::PromptOnly
+        | InboundMediaModelAttachmentStatus::NotEvaluated => "prompt-only",
         InboundMediaModelAttachmentStatus::Unsupported => "unsupported",
     }
 }

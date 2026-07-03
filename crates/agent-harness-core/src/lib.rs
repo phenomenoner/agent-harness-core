@@ -31,6 +31,7 @@ pub mod logging;
 pub mod loop_health;
 pub mod mcp;
 pub mod media;
+pub mod media_delivery_policy;
 pub mod memory;
 pub mod memory_backfill;
 pub mod memory_contracts;
@@ -68,6 +69,7 @@ pub mod token_efficiency;
 pub mod trace;
 pub mod turns;
 pub mod vault;
+pub mod virtual_session_context;
 pub mod wake;
 pub mod worker_adapters;
 pub mod workers;
@@ -92,12 +94,13 @@ pub use background::{
     upsert_background_task,
 };
 pub use channel_commands::{
-    ChannelCommand, ChannelCommandIntent, DEFAULT_THINKING_LEVEL, THINKING_LEVELS,
+    ChannelCommand, ChannelCommandIntent, DEFAULT_THINKING_LEVEL, FastCommandMode, THINKING_LEVELS,
     XHIGH_THINKING_LEVEL, normalize_thinking_level, parse_channel_command,
     parse_channel_command_intent,
 };
 pub use channel_delivery::{
-    ChannelDeliveryPending, ChannelDeliveryReceipt, ChannelDeliveryRecordOptions,
+    ChannelDeliveryPending, ChannelDeliveryPresentationFallbackReason,
+    ChannelDeliveryPresentationReceipt, ChannelDeliveryReceipt, ChannelDeliveryRecordOptions,
     ChannelDeliveryRenderedUnitKind, ChannelDeliveryRenderedUnitReceipt, ChannelDeliveryStatus,
     ChannelDeliveryUnitStatus, ChannelOutboxPlanOptions, ChannelOutboxPlanReport,
     ChannelOutboxPlanSummary, plan_channel_outbox, record_channel_delivery,
@@ -118,7 +121,8 @@ pub use channel_runtime::{
     ChannelAgentTurnDispatch, ChannelCommandEffect, ChannelDeliveryIntent,
     ChannelDeliveryIntentKind, ChannelOutboundAttachment, ChannelOutboundAttachmentKind,
     ChannelOutboundMessage, ChannelOutboundMessageKind, ChannelStatusSnapshot, ChannelStep,
-    ChannelStepAction, ChannelStepFile, build_channel_step, write_channel_step,
+    ChannelStepAction, ChannelStepFile, FastRequestRoutePolicy, build_channel_step,
+    fast_request_policy_for_route, write_channel_step,
 };
 pub use channel_state::{
     AgentOverride, AgentOverridesStore, ChannelCommandApplyOptions, ChannelCommandApplyReceipt,
@@ -149,19 +153,24 @@ pub use config::{
     harness_config_candidates, validate_harness_config,
 };
 pub use context_rollover::{
+    CompletedTurnWorkingSetSnapshotOptions, CompletedTurnWorkingSetSnapshotReport,
     ContextCompactAttemptOptions, ContextCompactCounter, ContextCompactCounterOptions,
     ContextRolloverBeforeTurnOptions, ContextRolloverConfig, ContextRolloverEpisode,
     ContextRolloverLane, ContextRolloverMode, ContextRolloverPreparedRequeueReport,
     ContextRolloverReceipt, ContextRolloverRequeuePreparedOptions, ContextRolloverStatus,
     ContextStaticRecordRefs, ContextVirtualSessionRecord, ContextWorkingSetGoal,
-    ContextWorkingSetMemory, RuntimeContinuationMetadata, apply_context_rollover_before_turn,
-    context_compact_counter_file, context_rollover_episode_index_file,
-    context_rollover_prepared_requeues_file, context_rollover_receipts_file,
-    continuation_session_key, is_rollover_completion_kind, load_context_rollover_config,
-    load_or_create_context_compact_counter, load_working_set_continuity_section,
-    parse_rollover_mode, planned_session_files, record_context_compact_attempt,
-    requeue_prepared_context_rollover, requeue_prepared_context_rollover_if_no_parent_siblings,
-    root_working_session_key, working_set_session_index_file,
+    ContextWorkingSetMemory, RuntimeContinuationMetadata, VirtualSessionTaskBoundaryCloseOptions,
+    VirtualSessionTerminalOptions, VirtualSessionThreadBackfillOptions,
+    apply_context_rollover_before_turn, backfill_virtual_session_codex_thread_id,
+    close_virtual_session_for_task_boundary, context_compact_counter_file,
+    context_rollover_episode_index_file, context_rollover_prepared_requeues_file,
+    context_rollover_receipts_file, continuation_session_key, is_rollover_completion_kind,
+    load_context_rollover_config, load_or_create_context_compact_counter,
+    load_working_set_continuity_section, mark_virtual_session_terminal, parse_rollover_mode,
+    planned_session_files, record_completed_turn_working_set_snapshot,
+    record_context_compact_attempt, requeue_prepared_context_rollover,
+    requeue_prepared_context_rollover_if_no_parent_siblings, root_working_session_key,
+    working_set_session_index_file,
 };
 pub use cron::{
     NativeCronJob, NativeCronJobState, NativeCronPlan, NativeCronPlanAction, NativeCronPlanEntry,
@@ -245,6 +254,14 @@ pub use media::{
     inbound_media_attachment_root, plan_inbound_media_inputs,
     render_inbound_media_artifacts_for_prompt, resolve_inbound_media_artifact_reference,
     validate_inbound_media_artifact_paths, validate_inbound_media_safety,
+};
+pub use media_delivery_policy::{
+    DEFAULT_OUTBOUND_MEDIA_MAX_MB_PER_ATTACHMENT, DEFAULT_OUTBOUND_MEDIA_TRUST_RECENT_SECONDS,
+    HarnessMediaConfig, MediaDeliveryEvaluation, MediaDeliveryLintConfig, MediaDeliveryPolicy,
+    MediaDeliveryVerdict, OUTBOUND_MEDIA_POLICY_SCHEMA, OutboundMediaPolicyReceipt,
+    all_deliverable_extensions, attachment_kind_from_extension, attachment_kind_from_path,
+    attachment_mime_from_path, evaluate_outbound_media_path, is_deliverable_media_path,
+    load_harness_media_config, media_policy_receipts_file, write_media_policy_receipt,
 };
 pub use memory::{
     MemoryAdapterReadinessReport, MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport,
@@ -412,7 +429,8 @@ pub use rich_presentation::{
     RichPresentationTextStyle, RichPresentationValidationError, RichPresentationValidationOptions,
     render_rich_presentation_batch_for_discord, render_rich_presentation_batch_for_telegram,
     render_rich_presentation_for_discord, render_rich_presentation_for_telegram,
-    rich_presentation_from_plain_final_with_attachment_count, validate_rich_message_presentation,
+    rich_presentation_from_plain_final, rich_presentation_from_plain_final_with_attachment_count,
+    validate_rich_message_presentation,
 };
 pub use runtime_pipeline::{
     RuntimeRunOnceOptions, RuntimeRunOnceReceipt, RuntimeRunOnceReport, RuntimeRunOnceStatus,
@@ -512,11 +530,18 @@ pub use token_efficiency::{
 pub use trace::{TraceOptions, TraceRecord, TraceReport, trace_harness_event};
 pub use turns::{
     TurnAgent, TurnDispatch, TurnModelPolicy, TurnPlan, TurnPlanFile, TurnPlanInput,
-    TurnPromptFile, TurnThinkingPolicy, build_turn_plan, write_turn_plan,
+    TurnPromptFile, TurnProviderRequestPolicy, TurnThinkingPolicy, build_turn_plan,
+    write_turn_plan,
 };
 pub use vault::{
     EncryptedVaultFile, EncryptedVaultRecord, VaultGetOptions, VaultPutOptions, get_vault_secret,
     put_vault_secret,
+};
+pub use virtual_session_context::{
+    VIRTUAL_SESSION_WORKING_CONTEXT_SCHEMA, VirtualSessionContextQuery,
+    VirtualSessionEvidenceAnchor, VirtualSessionEvidenceAnchors, VirtualSessionLane,
+    VirtualSessionScopeDecision, VirtualSessionWorkingContext,
+    resolve_virtual_session_working_context,
 };
 pub use worker_adapters::{
     DeterministicCronWorkerEnqueueOptions, NativeCronWorkerEnqueueOptions,
@@ -533,6 +558,296 @@ pub use workers::{
     cancel_worker_job, collect_worker_status, enqueue_worker_job, init_worker_store,
     load_worker_dispatch_config, reap_stale_worker_jobs, run_worker_once, worker_db_file,
 };
+
+#[cfg(test)]
+mod virtual_session_context_tests {
+    use super::*;
+    use serde_json::Value;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "agent_harness_virtual_session_context_{}_{}_{}",
+            name,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn write_state(
+        harness_home: &std::path::Path,
+        platform: &str,
+        channel_id: &str,
+        user_id: &str,
+        agent_id: &str,
+        session_key: &str,
+    ) {
+        let state_file = channel_session_state_file(harness_home, platform, channel_id, user_id);
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        write_json_atomic(
+            &state_file,
+            &ChannelSessionState {
+                schema: "agent-harness.channel-session-state.v1".to_string(),
+                platform: platform.to_string(),
+                channel_id: channel_id.to_string(),
+                user_id: user_id.to_string(),
+                active_session_key: session_key.to_string(),
+                agent_id: Some(agent_id.to_string()),
+                provider: None,
+                model: None,
+                session_topic: None,
+                model_override: None,
+                model_override_provider: None,
+                model_override_model: None,
+                thinking_enabled: false,
+                thinking_level: None,
+                thinking_instruction: None,
+                fast_mode: None,
+                stop_requested: false,
+                stop_reason: None,
+                steering_notes: Vec::new(),
+                btw_notes: Vec::new(),
+                last_command: None,
+                updated_at_ms: 10,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resolver_returns_same_lane_envelope_for_active_continuation() {
+        let root = temp_root("resolver_returns_same_lane_envelope_for_active_continuation");
+        let harness_home = root.join(".agent-harness");
+        let session_key = "telegram:dm:user:main";
+        let cont_key = "telegram:dm:user:main:cont-1";
+        write_state(&harness_home, "telegram", "dm", "user", "main", cont_key);
+        record_completed_turn_working_set_snapshot(CompletedTurnWorkingSetSnapshotOptions {
+            harness_home: harness_home.clone(),
+            platform: "telegram".to_string(),
+            channel_id: "dm".to_string(),
+            user_id: "user".to_string(),
+            agent_id: "main".to_string(),
+            working_session_key: session_key.to_string(),
+            queue_id: Some("queue-root".to_string()),
+            message_text: Some("root task".to_string()),
+            status: "completed".to_string(),
+            run_once_receipt_file: None,
+            outbox_file: None,
+            completion_file: None,
+            now_ms: 11,
+        })
+        .unwrap();
+        record_completed_turn_working_set_snapshot(CompletedTurnWorkingSetSnapshotOptions {
+            harness_home: harness_home.clone(),
+            platform: "telegram".to_string(),
+            channel_id: "dm".to_string(),
+            user_id: "user".to_string(),
+            agent_id: "main".to_string(),
+            working_session_key: cont_key.to_string(),
+            queue_id: Some("queue-cont".to_string()),
+            message_text: Some("continuation task".to_string()),
+            status: "completed".to_string(),
+            run_once_receipt_file: None,
+            outbox_file: None,
+            completion_file: None,
+            now_ms: 12,
+        })
+        .unwrap();
+
+        let envelope = resolve_virtual_session_working_context(VirtualSessionContextQuery {
+            harness_home: harness_home.clone(),
+            platform: "telegram".to_string(),
+            channel_id: "dm".to_string(),
+            user_id: "user".to_string(),
+            agent_id: "main".to_string(),
+            session_key: None,
+            now_ms: 13,
+        })
+        .unwrap();
+
+        assert_eq!(
+            envelope.schema,
+            "agent-harness.virtual-session-working-context.v1"
+        );
+        assert_eq!(envelope.lane.agent_id, "main");
+        assert_eq!(envelope.current_session_key.as_deref(), Some(cont_key));
+        assert_eq!(
+            envelope.predecessor_session_key.as_deref(),
+            Some(session_key)
+        );
+        assert_eq!(envelope.continuation_index, 1);
+        assert_eq!(envelope.scope_decision.status, "same-virtual-session");
+        assert!(
+            envelope
+                .recent_queue_ids
+                .contains(&"queue-cont".to_string())
+        );
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(json.len() <= 4096);
+        assert!(!json.contains("data:image"));
+        assert!(!json.contains("provider.example"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolver_keeps_colon_delimited_queue_id_from_validation() {
+        let root = temp_root("resolver_keeps_colon_delimited_queue_id_from_validation");
+        let harness_home = root.join(".agent-harness");
+        let session_key = "telegram:dm:user:main";
+        let queue_id = "turn:telegram:dm:user:main:1782983000000";
+        write_state(&harness_home, "telegram", "dm", "user", "main", session_key);
+        let report =
+            record_completed_turn_working_set_snapshot(CompletedTurnWorkingSetSnapshotOptions {
+                harness_home: harness_home.clone(),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                agent_id: "main".to_string(),
+                working_session_key: session_key.to_string(),
+                queue_id: Some(queue_id.to_string()),
+                message_text: Some("colon queue task".to_string()),
+                status: "completed".to_string(),
+                run_once_receipt_file: None,
+                outbox_file: None,
+                completion_file: None,
+                now_ms: 14,
+            })
+            .unwrap();
+        let mut memory: ContextWorkingSetMemory =
+            serde_json::from_slice(&fs::read(&report.working_set_file).unwrap()).unwrap();
+        memory.pending_queue_item = None;
+        write_json_atomic(&report.working_set_file, &memory).unwrap();
+
+        let envelope = resolve_virtual_session_working_context(VirtualSessionContextQuery {
+            harness_home: harness_home.clone(),
+            platform: "telegram".to_string(),
+            channel_id: "dm".to_string(),
+            user_id: "user".to_string(),
+            agent_id: "main".to_string(),
+            session_key: None,
+            now_ms: 15,
+        })
+        .unwrap();
+
+        assert!(envelope.recent_queue_ids.contains(&queue_id.to_string()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolver_discord_and_telegram_lanes_do_not_substitute() {
+        let root = temp_root("resolver_discord_and_telegram_lanes_do_not_substitute");
+        let harness_home = root.join(".agent-harness");
+        write_state(
+            &harness_home,
+            "telegram",
+            "same-channel",
+            "same-user",
+            "main",
+            "telegram:same-channel:same-user:main",
+        );
+        write_state(
+            &harness_home,
+            "discord",
+            "same-channel",
+            "same-user",
+            "main",
+            "discord:same-channel:same-user:main",
+        );
+        record_completed_turn_working_set_snapshot(CompletedTurnWorkingSetSnapshotOptions {
+            harness_home: harness_home.clone(),
+            platform: "telegram".to_string(),
+            channel_id: "same-channel".to_string(),
+            user_id: "same-user".to_string(),
+            agent_id: "main".to_string(),
+            working_session_key: "telegram:same-channel:same-user:main".to_string(),
+            queue_id: Some("telegram-queue".to_string()),
+            message_text: Some("telegram task".to_string()),
+            status: "completed".to_string(),
+            run_once_receipt_file: None,
+            outbox_file: None,
+            completion_file: None,
+            now_ms: 20,
+        })
+        .unwrap();
+
+        let discord = resolve_virtual_session_working_context(VirtualSessionContextQuery {
+            harness_home: harness_home.clone(),
+            platform: "discord".to_string(),
+            channel_id: "same-channel".to_string(),
+            user_id: "same-user".to_string(),
+            agent_id: "main".to_string(),
+            session_key: None,
+            now_ms: 21,
+        })
+        .unwrap();
+
+        assert_eq!(discord.lane.platform, "discord");
+        assert!(
+            !discord
+                .recent_queue_ids
+                .contains(&"telegram-queue".to_string())
+        );
+        assert_ne!(
+            discord.current_session_key.as_deref(),
+            Some("telegram:same-channel:same-user:main")
+        );
+        let serialized: Value = serde_json::to_value(&discord).unwrap();
+        assert_eq!(serialized["scopeDecision"]["fallbackUsed"], false);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolver_non_main_agent_does_not_read_main_lane_state() {
+        let root = temp_root("resolver_non_main_agent_does_not_read_main_lane_state");
+        let harness_home = root.join(".agent-harness");
+        write_state(
+            &harness_home,
+            "telegram",
+            "dm",
+            "user",
+            "main",
+            "telegram:dm:user:main",
+        );
+        record_completed_turn_working_set_snapshot(CompletedTurnWorkingSetSnapshotOptions {
+            harness_home: harness_home.clone(),
+            platform: "telegram".to_string(),
+            channel_id: "dm".to_string(),
+            user_id: "user".to_string(),
+            agent_id: "main".to_string(),
+            working_session_key: "telegram:dm:user:main".to_string(),
+            queue_id: Some("main-queue".to_string()),
+            message_text: Some("main task".to_string()),
+            status: "completed".to_string(),
+            run_once_receipt_file: None,
+            outbox_file: None,
+            completion_file: None,
+            now_ms: 30,
+        })
+        .unwrap();
+
+        let non_main = resolve_virtual_session_working_context(VirtualSessionContextQuery {
+            harness_home: harness_home.clone(),
+            platform: "telegram".to_string(),
+            channel_id: "dm".to_string(),
+            user_id: "user".to_string(),
+            agent_id: "xiaoxiaoli".to_string(),
+            session_key: None,
+            now_ms: 31,
+        })
+        .unwrap();
+
+        assert_eq!(non_main.lane.agent_id, "xiaoxiaoli");
+        assert_eq!(non_main.scope_decision.status, "denied");
+        assert!(non_main.recent_queue_ids.is_empty());
+        assert!(non_main.working_set_file.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+}
 
 pub const PROMPT_FILE_NAMES: &[&str] = &[
     "AGENTS.md",

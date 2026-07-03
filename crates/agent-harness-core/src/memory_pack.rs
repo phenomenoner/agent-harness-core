@@ -486,14 +486,22 @@ pub fn retrieve_pack_artifact(
     init_pack_artifact_store(&conn)?;
 
     let candidates = read_artifact_candidates(&conn, &artifact_hash)?;
-    let Some(candidate) =
-        select_retrieval_candidate(&candidates, &options.agent_id, &options.session_key)
-    else {
+    let selection =
+        select_retrieval_candidate_with_scope(&candidates, &options.agent_id, &options.session_key);
+    let Some((candidate, scope)) = selection.candidate else {
+        if let Some(scope_denial) = selection.scope_denial {
+            report.decision = "scope-denied".to_string();
+            report.scope_decision = scope_denial;
+            report.trust_decision = PackPolicyDecision {
+                allowed: false,
+                policy: "not-evaluated".to_string(),
+                reason: "scope-denied-before-trust".to_string(),
+            };
+        }
         finish_retrieve_report(&mut report, started_at)?;
         return Ok(report);
     };
 
-    let scope = evaluate_scope(candidate, &options.agent_id, &options.session_key);
     report.scope_decision = scope.clone();
     if !scope.allowed {
         report.decision = "scope-denied".to_string();
@@ -954,25 +962,55 @@ fn read_artifact_candidates(
     Ok(artifacts)
 }
 
+struct RetrievalCandidateSelection<'a> {
+    candidate: Option<(&'a StoredArtifact, PackPolicyDecision)>,
+    scope_denial: Option<PackPolicyDecision>,
+}
+
+fn select_retrieval_candidate_with_scope<'a>(
+    candidates: &'a [StoredArtifact],
+    agent_id: &str,
+    session_key: &str,
+) -> RetrievalCandidateSelection<'a> {
+    let mut first_denial = None;
+    let mut broad_candidate = None;
+
+    for candidate in candidates {
+        let scope = evaluate_scope(candidate, agent_id, session_key);
+        if !scope.allowed {
+            if first_denial.is_none() {
+                first_denial = Some(scope);
+            }
+            continue;
+        }
+        if candidate.agent_id == agent_id && candidate.session_key == session_key {
+            return RetrievalCandidateSelection {
+                candidate: Some((candidate, scope)),
+                scope_denial: first_denial,
+            };
+        }
+        if matches!(candidate.scope.as_str(), "global-imported" | "project")
+            && broad_candidate.is_none()
+        {
+            broad_candidate = Some((candidate, scope));
+        }
+    }
+
+    RetrievalCandidateSelection {
+        candidate: broad_candidate,
+        scope_denial: first_denial,
+    }
+}
+
+#[cfg(test)]
 fn select_retrieval_candidate<'a>(
     candidates: &'a [StoredArtifact],
     agent_id: &str,
     session_key: &str,
 ) -> Option<&'a StoredArtifact> {
-    candidates
-        .iter()
-        .find(|candidate| candidate.agent_id == agent_id && candidate.session_key == session_key)
-        .or_else(|| {
-            candidates
-                .iter()
-                .find(|candidate| candidate.session_key == session_key)
-        })
-        .or_else(|| {
-            candidates
-                .iter()
-                .find(|candidate| matches!(candidate.scope.as_str(), "global-imported" | "project"))
-        })
-        .or_else(|| candidates.first())
+    select_retrieval_candidate_with_scope(candidates, agent_id, session_key)
+        .candidate
+        .map(|(candidate, _)| candidate)
 }
 
 fn evaluate_scope(
@@ -982,6 +1020,14 @@ fn evaluate_scope(
 ) -> PackPolicyDecision {
     match candidate.scope.as_str() {
         "agent-private" => {
+            if !is_lane_qualified_session_key_for_agent(&candidate.session_key, &candidate.agent_id)
+            {
+                return PackPolicyDecision {
+                    allowed: false,
+                    policy: "agent-private".to_string(),
+                    reason: "non-lane-qualified-session-key-denied".to_string(),
+                };
+            }
             let allowed = candidate.agent_id == agent_id && candidate.session_key == session_key;
             PackPolicyDecision {
                 allowed,
@@ -994,12 +1040,22 @@ fn evaluate_scope(
             }
         }
         "session" => {
-            let allowed = candidate.session_key == session_key;
+            if !is_lane_qualified_session_key_for_agent(&candidate.session_key, &candidate.agent_id)
+            {
+                return PackPolicyDecision {
+                    allowed: false,
+                    policy: "session".to_string(),
+                    reason: "non-lane-qualified-session-key-denied".to_string(),
+                };
+            }
+            let allowed = candidate.agent_id == agent_id && candidate.session_key == session_key;
             PackPolicyDecision {
                 allowed,
                 policy: "session".to_string(),
                 reason: if allowed {
-                    "same-session".to_string()
+                    "same-agent-session".to_string()
+                } else if candidate.agent_id != agent_id {
+                    "cross-agent-session-denied".to_string()
                 } else {
                     "cross-session-denied".to_string()
                 },
@@ -1016,6 +1072,27 @@ fn evaluate_scope(
             reason: "unknown-scope-denied".to_string(),
         },
     }
+}
+
+fn is_lane_qualified_session_key_for_agent(session_key: &str, agent_id: &str) -> bool {
+    let root = if let Some((root, suffix)) = session_key.rsplit_once(":cont-")
+        && !suffix.is_empty()
+        && suffix.chars().all(|ch| ch.is_ascii_digit())
+    {
+        root
+    } else {
+        session_key
+    };
+    let mut parts = root.split(':');
+    let (Some(platform), Some(channel), Some(user), Some(agent)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    [platform, channel, user, agent]
+        .iter()
+        .all(|part| !part.trim().is_empty())
+        && agent == agent_id
 }
 
 fn evaluate_trust(candidate: &StoredArtifact) -> PackPolicyDecision {
@@ -1383,4 +1460,228 @@ fn add_latency_bucket(histogram: &mut BTreeMap<String, u64>, latency_ms: u64) {
         _ => "1000ms+",
     };
     *histogram.entry(bucket.to_string()).or_default() += 1;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_harness_home(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "agent-harness-memory-pack-{name}-{}-{}",
+            std::process::id(),
+            current_time_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp harness home");
+        root
+    }
+
+    fn stored(agent_id: &str, session_key: &str, scope: &str) -> StoredArtifact {
+        StoredArtifact {
+            raw_bytes: format!("{agent_id}:{session_key}:{scope}").into_bytes(),
+            agent_id: agent_id.to_string(),
+            session_key: session_key.to_string(),
+            trust_level: "trusted".to_string(),
+            scope: scope.to_string(),
+            expires_at_ms: None,
+        }
+    }
+
+    fn metadata(agent_id: &str, session_key: &str, scope: &str) -> PackArtifactMetadata {
+        PackArtifactMetadata {
+            agent_id: agent_id.to_string(),
+            session_key: session_key.to_string(),
+            source_kind: "test".to_string(),
+            source_id: format!("{agent_id}:{session_key}:{scope}"),
+            trust_level: "trusted".to_string(),
+            scope: scope.to_string(),
+            content_type: "text/plain".to_string(),
+            producer: "memory-pack-test".to_string(),
+            command_or_tool: "unit-test".to_string(),
+            receipt_id: format!("receipt:{agent_id}:{session_key}:{scope}"),
+            ttl_policy: PackTtlPolicy::default(),
+        }
+    }
+
+    fn put_text(root: &Path, text: &str, agent_id: &str, session_key: &str, scope: &str) -> String {
+        let report = put_pack_artifact(PackArtifactPutOptions {
+            harness_home: root.to_path_buf(),
+            raw_bytes: text.as_bytes().to_vec(),
+            metadata: metadata(agent_id, session_key, scope),
+            config: PackAdmissionConfig::testing(),
+            now_ms: 1_000,
+        })
+        .expect("put pack artifact");
+        assert_eq!(report.decision, "stored");
+        report.artifact_hash
+    }
+
+    fn retrieve(
+        root: &Path,
+        artifact_hash: &str,
+        agent_id: &str,
+        session_key: &str,
+    ) -> PackArtifactRetrieveReport {
+        retrieve_pack_artifact(PackArtifactRetrieveOptions {
+            harness_home: root.to_path_buf(),
+            marker_or_hash: artifact_hash.to_string(),
+            agent_id: agent_id.to_string(),
+            session_key: session_key.to_string(),
+            requester: "unit-test".to_string(),
+            now_ms: 2_000,
+        })
+        .expect("retrieve pack artifact")
+    }
+
+    #[test]
+    fn retrieval_scope_session_requires_same_agent_and_session_key() {
+        let candidate = stored("main", "telegram:dm:user:main:session-a", "session");
+        let same = evaluate_scope(&candidate, "main", "telegram:dm:user:main:session-a");
+        assert!(same.allowed);
+        assert_eq!(same.reason, "same-agent-session");
+
+        let cross_agent =
+            evaluate_scope(&candidate, "public-bot", "telegram:dm:user:main:session-a");
+        assert!(!cross_agent.allowed);
+        assert_eq!(cross_agent.reason, "cross-agent-session-denied");
+    }
+
+    #[test]
+    fn retrieval_scope_session_rejects_bare_session_key_even_when_equal() {
+        let candidate = stored("main", "session-a", "session");
+
+        let same_bare = evaluate_scope(&candidate, "main", "session-a");
+
+        assert!(!same_bare.allowed);
+        assert_eq!(same_bare.reason, "non-lane-qualified-session-key-denied");
+    }
+
+    #[test]
+    fn retrieval_scope_agent_private_rejects_bare_session_key_even_when_equal() {
+        let candidate = stored("main", "session-a", "agent-private");
+
+        let same_bare = evaluate_scope(&candidate, "main", "session-a");
+
+        assert!(!same_bare.allowed);
+        assert_eq!(same_bare.reason, "non-lane-qualified-session-key-denied");
+    }
+
+    #[test]
+    fn retrieval_candidate_does_not_fall_back_to_wrong_lane_concrete_history() {
+        let candidates = vec![stored("main", "telegram:dm:user:main:session-a", "session")];
+
+        let selected =
+            select_retrieval_candidate(&candidates, "main", "discord:dm:user:main:session-b");
+
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn retrieval_candidate_uses_project_after_wrong_lane_concrete_candidate() {
+        let candidates = vec![
+            stored("main", "telegram:dm:user:main:session-a", "session"),
+            stored("main", "project:docs", "project"),
+        ];
+
+        let selected =
+            select_retrieval_candidate(&candidates, "main", "discord:dm:user:main:session-b")
+                .expect("explicit project scope should remain available");
+
+        assert_eq!(selected.scope, "project");
+        assert_eq!(selected.session_key, "project:docs");
+    }
+
+    #[test]
+    fn retrieve_wrong_lane_concrete_history_reports_scope_denied_not_missing() {
+        let root = temp_harness_home("wrong-lane-scope-denied");
+        let artifact_hash = put_text(
+            &root,
+            "same hash concrete history",
+            "main",
+            "telegram:dm:user:main:session-a",
+            "session",
+        );
+
+        let report = retrieve(
+            &root,
+            &artifact_hash,
+            "main",
+            "discord:dm:user:main:session-b",
+        );
+
+        assert_eq!(report.decision, "scope-denied");
+        assert_eq!(report.bytes_returned, 0);
+        assert!(report.raw_bytes.is_none());
+        assert_eq!(report.scope_decision.reason, "cross-session-denied");
+        assert_ne!(report.scope_decision.reason, "artifact-not-found");
+    }
+
+    #[test]
+    fn retrieve_wrong_lane_concrete_then_project_returns_explicit_broad_scope() {
+        let root = temp_harness_home("wrong-lane-project-fallback");
+        let artifact_hash = put_text(
+            &root,
+            "same hash project-visible history",
+            "main",
+            "telegram:dm:user:main:session-a",
+            "session",
+        );
+        let project_hash = put_text(
+            &root,
+            "same hash project-visible history",
+            "main",
+            "project:docs",
+            "project",
+        );
+        assert_eq!(artifact_hash, project_hash);
+
+        let report = retrieve(
+            &root,
+            &artifact_hash,
+            "main",
+            "discord:dm:user:main:session-b",
+        );
+
+        assert_eq!(report.decision, "returned");
+        assert_eq!(report.scope_decision.policy, "project");
+        assert_eq!(
+            report.raw_bytes.as_deref(),
+            Some(b"same hash project-visible history".as_slice())
+        );
+    }
+
+    #[test]
+    fn retrieve_wrong_lane_concrete_then_global_imported_returns_explicit_broad_scope() {
+        let root = temp_harness_home("wrong-lane-global-fallback");
+        let artifact_hash = put_text(
+            &root,
+            "same hash global-visible history",
+            "main",
+            "telegram:dm:user:main:session-a",
+            "agent-private",
+        );
+        let global_hash = put_text(
+            &root,
+            "same hash global-visible history",
+            "main",
+            "global:imported",
+            "global-imported",
+        );
+        assert_eq!(artifact_hash, global_hash);
+
+        let report = retrieve(
+            &root,
+            &artifact_hash,
+            "xiaoxiaoli",
+            "telegram:dm:user:xiaoxiaoli:session-b",
+        );
+
+        assert_eq!(report.decision, "returned");
+        assert_eq!(report.scope_decision.policy, "global-imported");
+        assert_eq!(
+            report.raw_bytes.as_deref(),
+            Some(b"same hash global-visible history".as_slice())
+        );
+    }
 }

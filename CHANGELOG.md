@@ -2,16 +2,88 @@
 
 ## Unreleased
 
-- Staged rich message presentation Package D: ordinary successful
-  `agent-reply` finals now get an optional semantic presentation payload by
-  converting final-only plain text into paragraph/code blocks after `MEDIA:`
-  extraction. Plain `text` remains the fallback, and progress-panel narration
-  stays out of both final text and generated presentation payloads.
-- Staged stream-resilience follow-up: repeated retryable Codex stream
-  disconnects on high-usage media turns can now requeue a guarded continuation
-  during `RetryPending`, and internal worker result progress events are
-  summarized instead of exposing raw worker final text in the action stream.
-- Recorded the first live compact-threshold context rollover on a Discord/main lane (2026-06-30): two official Codex compacts crossed the threshold (`successfulCompactCount=2`, `rolloverPending=true`) and the runtime applied a rollover into a fresh continuation session (`cont-1` -> `cont-2`) under the same virtual session, re-keying the pending turn and writing virtual-session, episode-index, and `continuation-rollover` working-set receipts. This advances `virtual-session-continuity-gap` from "mechanism live-wired, firing never observed" to "first rollover observed live," superseding the 2026-06-29 compacts-without-rollover audit finding for that lane. The remaining gate narrows to the end-to-end through-delivery trace: working-set prompt injection in the continuation turn and the final reply traced back to the continuation queue item. Updated the topology contract, regenerated the topology explorer, and updated the feature-parity surfaces to match.
+No unreleased changes.
+
+## v0.4.0 - 2026-07-03
+
+### Difference from v0.3.0
+
+`v0.3.0` introduced rich presentation delivery and the first public continuity
+release gates. `v0.4.0` promotes two broader runtime surfaces: bounded virtual
+session working context for long tasks, and policy-gated non-text media handling
+for Telegram and Discord. It also includes the follow-up rich-final bridge and
+stream-resilience hardening that landed after `v0.3.0`.
+
+### Changed
+
+- Added a resolver-backed `agent-harness.virtual-session-working-context.v1`
+  prompt section keyed by exact platform/channel/user/agent/session axes. The
+  section is bounded, pointer-only, and can surface same-lane anchors when reply
+  metadata is absent.
+- Hardened virtual-session lifecycle: `/new` closes the prior virtual-session
+  record and starts a clean task boundary, Codex completion capture can backfill
+  thread ids, `maxContinuationDepth` is separated from compact-count thresholds,
+  stream-unstable continuation thresholds are configurable, and max-depth
+  terminal cases mark the virtual session `terminal-failed`.
+- Added the virtual-session rollover scenario catalog covering Telegram and
+  Discord same-agent continuation, non-main isolation, `/new` boundaries, and
+  max-depth exact-lane evidence.
+- Added outbound media directive parsing v2: protected-span masking, quoted
+  paths, `[[as_document]]`, `[[audio_as_voice]]`, shared deliverable extension
+  mapping, and loud rejection for invalid directives.
+- Added `media_delivery_policy`: local attachment paths and harness artifact
+  refs are checked before provider upload, accepted/rejected decisions are
+  recorded as `agent-harness.outbound-media-policy.v1`, and media-delivery lint
+  receipts can warn or fail closed by config.
+- Expanded provider media delivery: Telegram can send photo albums, documents,
+  audio, voice, and video with caption handling; Discord can batch multipart
+  file attachments in one delivery.
+- Expanded inbound and referenced media handling: Telegram documents, voice,
+  audio, video, static stickers, and reply media are stored as prompt-safe
+  artifacts; Discord referenced-message attachments are fetched with provenance.
+- Added visual-readiness reporting and config-gated native image input. Native
+  image input ships default-off pending staged live enablement.
+- Rich final presentation now covers ordinary successful agent replies by
+  converting final-only text into trusted semantic blocks after `MEDIA:`
+  extraction. Plain text remains the fallback and progress-panel narration is
+  excluded.
+- Repeated retryable stream disconnects on high-usage media turns can guardedly
+  requeue a continuation during `RetryPending`, and internal worker progress
+  events are summarized instead of exposing raw worker final text.
+- Updated public topology, invariant, schema registry, feature parity, README,
+  and generated topology explorer surfaces to track invariants I15/I16 and the
+  new media and virtual-session promotion gates.
+
+### Verification
+
+- Focused virtual-session resolver, prompt, lifecycle, config, runtime, Codex
+  backfill, and scenario-catalog tests passed before release closeout.
+- Serial `agent-harness-core --lib`, `agent-harness-core --test memory_pack`,
+  full `agent-harness-cli`, workspace check, schema registry, invariants,
+  release checklist, scenario matrix, config validation, and scoped public
+  hygiene gates passed in the release validation set.
+- Channel media validation covered parser/policy/lint fixtures, artifact-ref
+  resolution, Telegram media kind mapping, Discord multipart batching, inbound
+  media provenance, native-image bloat preflight, and generated schema/topology
+  surfaces.
+- End-to-end channel readback confirmed the virtual-session working-context
+  prompt section was model-visible, a real `/new` task boundary started
+  cleanly, and Discord media attachment delivery passed with policy
+  accept/reject receipts.
+- Release closeout ran `git diff --check`, scoped public/private hygiene, and an
+  independent release-note/hygiene review.
+
+### Still gated / not included
+
+- Full promotion of the virtual-session continuity gap still waits for broader
+  live soak and final-delivery trace evidence across real Telegram/Discord
+  turns.
+- Telegram provider media smoke for photo + document + album remains a manual
+  post-release smoke check.
+- `media.nativeImageInput` and media lint fail-closed mode remain default-off
+  pending staged enablement and soak.
+- Telegram inline callback buttons, Discord component buttons, clicked-action
+  ingress re-entry, and live preview integration remain separate phases.
 
 ## v0.3.0 - 2026-06-30
 

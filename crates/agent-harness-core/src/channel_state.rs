@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ChannelCommandEffect, ChannelOutboundMessage, ChannelStep,
+    VirtualSessionTaskBoundaryCloseOptions, close_virtual_session_for_task_boundary,
     codex_runtime::{CodexTurnSteerRequestOptions, queue_codex_turn_steer_request},
     write_json_atomic,
 };
@@ -91,6 +92,8 @@ pub struct ChannelSessionState {
     #[serde(default)]
     pub thinking_instruction: Option<String>,
     #[serde(default)]
+    pub fast_mode: Option<String>,
+    #[serde(default)]
     pub stop_requested: bool,
     #[serde(default)]
     pub stop_reason: Option<String>,
@@ -115,6 +118,8 @@ pub struct AgentOverride {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub thinking_level: Option<String>,
+    #[serde(default)]
+    pub fast_mode: Option<String>,
     pub updated_at_ms: Option<i64>,
 }
 
@@ -303,6 +308,7 @@ fn new_state(step: &ChannelStep) -> ChannelSessionState {
         thinking_enabled: false,
         thinking_level: None,
         thinking_instruction: None,
+        fast_mode: None,
         stop_requested: false,
         stop_reason: None,
         steering_notes: Vec::new(),
@@ -327,6 +333,19 @@ fn apply_effect(
             topic,
             new_session_key,
         } => {
+            if let Err(error) =
+                close_virtual_session_for_task_boundary(VirtualSessionTaskBoundaryCloseOptions {
+                    harness_home: harness_home.to_path_buf(),
+                    previous_session_key: state.active_session_key.clone(),
+                    ended_by: "channel-command:/new".to_string(),
+                    now_ms,
+                })
+            {
+                warnings.push(format!(
+                    "virtual session task boundary close failed for previous session `{}`: {error}",
+                    state.active_session_key
+                ));
+            }
             if let Some(agent_id) = active_session_key_agent_segment(new_session_key) {
                 if state.agent_id.as_deref() != Some(agent_id.as_str()) {
                     state.provider = None;
@@ -342,6 +361,7 @@ fn apply_effect(
             state.thinking_enabled = false;
             state.thinking_level = None;
             state.thinking_instruction = None;
+            state.fast_mode = None;
             state.stop_requested = false;
             state.stop_reason = None;
             state.steering_notes.clear();
@@ -448,6 +468,28 @@ fn apply_effect(
                 )?;
             }
         }
+        ChannelCommandEffect::ShowFast {
+            agent_id,
+            provider,
+            model,
+            ..
+        } => {
+            update_model_context(state, agent_id, provider, model);
+        }
+        ChannelCommandEffect::SwitchFast {
+            agent_id,
+            provider,
+            model,
+            global,
+            mode,
+            ..
+        } => {
+            update_model_context(state, agent_id, provider, model);
+            state.fast_mode = Some(mode.clone());
+            if *global {
+                write_agent_override_fast_mode(harness_home, agent_id, mode, now_ms, warnings)?;
+            }
+        }
         ChannelCommandEffect::ShowStatus { snapshot, .. } => {
             update_model_context(
                 state,
@@ -502,6 +544,8 @@ fn command_name(effect: &ChannelCommandEffect) -> &'static str {
         ChannelCommandEffect::ShowModel { .. } => "model",
         ChannelCommandEffect::ListProviderModels { .. } => "model",
         ChannelCommandEffect::SwitchModel { .. } => "model",
+        ChannelCommandEffect::ShowFast { .. } => "fast",
+        ChannelCommandEffect::SwitchFast { .. } => "fast",
         ChannelCommandEffect::ShowStatus { .. } => "status",
     }
 }
@@ -586,6 +630,24 @@ fn write_agent_override_thinking(
     write_agent_overrides_store(harness_home, &store)
 }
 
+fn write_agent_override_fast_mode(
+    harness_home: &Path,
+    agent_id: &Option<String>,
+    mode: &str,
+    now_ms: i64,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    let Some(agent_id) = agent_id else {
+        warnings.push("fast --global was requested but no current agent was selected".to_string());
+        return Ok(());
+    };
+    let mut store = read_agent_overrides_store(harness_home)?;
+    let override_entry = store.agents.entry(agent_id.clone()).or_default();
+    override_entry.fast_mode = Some(mode.to_string());
+    override_entry.updated_at_ms = Some(now_ms);
+    write_agent_overrides_store(harness_home, &store)
+}
+
 fn agent_overrides_schema() -> String {
     AGENT_OVERRIDES_SCHEMA.to_string()
 }
@@ -627,7 +689,11 @@ fn normalize_key_part(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ChannelOutboundMessageKind, ChannelStatusSnapshot, ChannelStepAction};
+    use crate::{
+        ChannelOutboundMessageKind, ChannelStatusSnapshot, ChannelStepAction,
+        CompletedTurnWorkingSetSnapshotOptions, ContextVirtualSessionRecord,
+        record_completed_turn_working_set_snapshot,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -724,6 +790,145 @@ mod tests {
             state.model_override_model.as_deref(),
             Some("anthropic/claude-sonnet-4")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn new_session_command_closes_previous_virtual_session_record() {
+        let root = temp_root("new_session_command_closes_previous_virtual_session_record");
+        let harness_home = root.join(".agent-harness");
+        let previous_session = "telegram:dm:user:main";
+        let snapshot =
+            record_completed_turn_working_set_snapshot(CompletedTurnWorkingSetSnapshotOptions {
+                harness_home: harness_home.clone(),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                agent_id: "main".to_string(),
+                working_session_key: previous_session.to_string(),
+                queue_id: Some("queue-before-new".to_string()),
+                message_text: Some("previous virtual session task".to_string()),
+                status: "completed".to_string(),
+                run_once_receipt_file: None,
+                outbox_file: None,
+                completion_file: None,
+                now_ms: 900,
+            })
+            .unwrap();
+        let new_step = command_step_with_session(
+            previous_session,
+            ChannelCommandEffect::StartNewSession {
+                topic: Some("fresh task".to_string()),
+                new_session_key: "telegram:dm:user:main:session-new".to_string(),
+            },
+        );
+
+        let report = apply_channel_command_step(
+            &new_step,
+            ChannelCommandApplyOptions {
+                harness_home: harness_home.clone(),
+                now_ms: 1000,
+            },
+        )
+        .unwrap();
+
+        assert!(report.warnings.is_empty());
+        let record: ContextVirtualSessionRecord =
+            serde_json::from_slice(&fs::read(snapshot.virtual_session_file).unwrap()).unwrap();
+        assert_eq!(record.status, "closed");
+        let previous = record
+            .working_sessions
+            .iter()
+            .find(|session| session.session_key == previous_session)
+            .expect("previous working session");
+        assert_eq!(previous.ended_at_ms, Some(1000));
+        assert_eq!(previous.ended_by.as_deref(), Some("channel-command:/new"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn applies_fast_mode_and_new_session_clears_it() {
+        let root = temp_root("applies_fast_mode_and_new_session_clears_it");
+        let harness_home = root.join(".agent-harness");
+        let fast_step = command_step(ChannelCommandEffect::SwitchFast {
+            agent_id: Some("main".to_string()),
+            provider: Some("openai".to_string()),
+            model: Some("gpt-5".to_string()),
+            global: false,
+            previous_mode: "normal".to_string(),
+            mode: "fast".to_string(),
+            effective_acceleration: "enabled".to_string(),
+            reason: "Codex app-server serviceTier=priority will be requested".to_string(),
+        });
+
+        let report = apply_channel_command_step(
+            &fast_step,
+            ChannelCommandApplyOptions {
+                harness_home: harness_home.clone(),
+                now_ms: 2000,
+            },
+        )
+        .unwrap();
+
+        let state = report.state.unwrap();
+        assert_eq!(state.fast_mode.as_deref(), Some("fast"));
+        assert_eq!(state.last_command.as_deref(), Some("fast"));
+
+        let new_step = command_step_with_session(
+            "telegram:dm:user:main",
+            ChannelCommandEffect::StartNewSession {
+                topic: None,
+                new_session_key: "telegram:dm:user:main:new".to_string(),
+            },
+        );
+        let report = apply_channel_command_step(
+            &new_step,
+            ChannelCommandApplyOptions {
+                harness_home,
+                now_ms: 2001,
+            },
+        )
+        .unwrap();
+
+        let state = report.state.unwrap();
+        assert_eq!(state.active_session_key, "telegram:dm:user:main:new");
+        assert_eq!(state.fast_mode, None);
+        assert_eq!(state.last_command.as_deref(), Some("new"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn applies_global_fast_mode_as_agent_override() {
+        let root = temp_root("applies_global_fast_mode_as_agent_override");
+        let harness_home = root.join(".agent-harness");
+        let fast_step = command_step(ChannelCommandEffect::SwitchFast {
+            agent_id: Some("main".to_string()),
+            provider: Some("openai".to_string()),
+            model: Some("gpt-5".to_string()),
+            global: true,
+            previous_mode: "normal".to_string(),
+            mode: "fast".to_string(),
+            effective_acceleration: "enabled".to_string(),
+            reason: "Codex app-server serviceTier=priority will be requested".to_string(),
+        });
+
+        let report = apply_channel_command_step(
+            &fast_step,
+            ChannelCommandApplyOptions {
+                harness_home: harness_home.clone(),
+                now_ms: 2100,
+            },
+        )
+        .unwrap();
+
+        let state = report.state.unwrap();
+        assert_eq!(state.fast_mode.as_deref(), Some("fast"));
+        let override_entry = read_agent_override(&harness_home, "main").unwrap().unwrap();
+        assert_eq!(override_entry.fast_mode.as_deref(), Some("fast"));
+        assert_eq!(override_entry.updated_at_ms, Some(2100));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -891,6 +1096,7 @@ mod tests {
                 active_session_key: None,
                 thinking_enabled: false,
                 thinking_level: Some("medium".to_string()),
+                fast_mode: None,
                 steering_notes: 0,
                 btw_notes: 0,
             },

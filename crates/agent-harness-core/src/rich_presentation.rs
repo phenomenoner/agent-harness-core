@@ -7,6 +7,8 @@ const MAX_BLOCKS: usize = 16;
 const MAX_ACTIONS: usize = 8;
 const MAX_MEDIA_REFS: usize = 8;
 const MAX_PARAGRAPH_CHARS: usize = 4_096;
+const MAX_LIST_ITEMS: usize = 64;
+const MAX_LIST_ITEM_CHARS: usize = 1_000;
 const MAX_CODE_CHARS: usize = 8_000;
 const MAX_FIELD_LABEL_CHARS: usize = 80;
 const MAX_FIELD_VALUE_CHARS: usize = 1_000;
@@ -45,6 +47,10 @@ pub enum RichPresentationBlock {
     },
     FieldList {
         fields: Vec<RichPresentationField>,
+    },
+    List {
+        ordered: bool,
+        items: Vec<String>,
     },
     Code {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -315,10 +321,25 @@ pub fn render_rich_presentation_for_telegram(
     let mut lines = Vec::new();
     for block in &presentation.blocks {
         match block {
-            RichPresentationBlock::Paragraph { text } => lines.push(html_escape_text(text)),
+            RichPresentationBlock::Paragraph { text } => {
+                lines.push(render_telegram_inline_markdown(text));
+            }
             RichPresentationBlock::FieldList { fields } => {
                 for field in fields {
                     lines.push(render_telegram_field(field));
+                }
+            }
+            RichPresentationBlock::List { ordered, items } => {
+                for (index, item) in items.iter().enumerate() {
+                    let prefix = if *ordered {
+                        format!("{}.", index + 1)
+                    } else {
+                        "-".to_string()
+                    };
+                    lines.push(format!(
+                        "{prefix} {}",
+                        render_telegram_inline_markdown(item)
+                    ));
                 }
             }
             RichPresentationBlock::Code { language, text } => {
@@ -371,11 +392,21 @@ pub fn render_rich_presentation_for_discord(
     for block in &presentation.blocks {
         match block {
             RichPresentationBlock::Paragraph { text } => {
-                lines.push(discord_escape_text(text));
+                lines.push(render_discord_inline_markdown(text));
             }
             RichPresentationBlock::FieldList { fields } => {
                 for field in fields {
                     lines.push(render_discord_field(field));
+                }
+            }
+            RichPresentationBlock::List { ordered, items } => {
+                for (index, item) in items.iter().enumerate() {
+                    let prefix = if *ordered {
+                        format!("{}.", index + 1)
+                    } else {
+                        "-".to_string()
+                    };
+                    lines.push(format!("{prefix} {}", render_discord_inline_markdown(item)));
                 }
             }
             RichPresentationBlock::Code { language, text } => {
@@ -499,6 +530,31 @@ fn validate_block(block: &RichPresentationBlock) -> Result<(), RichPresentationV
             }
             Ok(())
         }
+        RichPresentationBlock::List { items, .. } => {
+            require(
+                "blocks.items",
+                !items.is_empty(),
+                "list requires at least one item".to_string(),
+            )?;
+            require(
+                "blocks.items",
+                items.len() <= MAX_LIST_ITEMS,
+                format!("list must contain <= {MAX_LIST_ITEMS} items"),
+            )?;
+            for item in items {
+                require(
+                    "blocks.items",
+                    !item.trim().is_empty(),
+                    "list item is required".to_string(),
+                )?;
+                require(
+                    "blocks.items",
+                    char_count(item) <= MAX_LIST_ITEM_CHARS,
+                    format!("list item must be <= {MAX_LIST_ITEM_CHARS} characters"),
+                )?;
+            }
+            Ok(())
+        }
         RichPresentationBlock::Code { text, .. } => require(
             "blocks.code.text",
             char_count(text) <= MAX_CODE_CHARS,
@@ -585,6 +641,8 @@ fn rich_blocks_from_plain_final(text: &str) -> Vec<RichPresentationBlock> {
     let mut blocks = Vec::new();
     let mut paragraph = Vec::new();
     let mut code = Vec::new();
+    let mut list_items = Vec::new();
+    let mut list_ordered: Option<bool> = None;
     let mut code_language: Option<String> = None;
     let mut in_code = false;
 
@@ -596,6 +654,7 @@ fn rich_blocks_from_plain_final(text: &str) -> Vec<RichPresentationBlock> {
                 in_code = false;
             } else {
                 push_paragraph_blocks(&mut blocks, &mut paragraph);
+                push_list_block(&mut blocks, &mut list_ordered, &mut list_items);
                 code_language = fence
                     .split_whitespace()
                     .next()
@@ -616,11 +675,28 @@ fn rich_blocks_from_plain_final(text: &str) -> Vec<RichPresentationBlock> {
 
         if trimmed.is_empty() {
             push_paragraph_blocks(&mut blocks, &mut paragraph);
+            push_list_block(&mut blocks, &mut list_ordered, &mut list_items);
             if blocks.len() >= MAX_BLOCKS {
                 break;
             }
             continue;
         }
+        if let Some((ordered, item)) = parse_list_marker(line) {
+            push_paragraph_blocks(&mut blocks, &mut paragraph);
+            if list_ordered.is_some_and(|current| current != ordered) {
+                push_list_block(&mut blocks, &mut list_ordered, &mut list_items);
+            }
+            list_ordered = Some(ordered);
+            list_items.push(item.to_string());
+            if list_items.len() >= MAX_LIST_ITEMS {
+                push_list_block(&mut blocks, &mut list_ordered, &mut list_items);
+            }
+            if blocks.len() >= MAX_BLOCKS {
+                break;
+            }
+            continue;
+        }
+        push_list_block(&mut blocks, &mut list_ordered, &mut list_items);
         paragraph.push(line.to_string());
     }
 
@@ -628,6 +704,7 @@ fn rich_blocks_from_plain_final(text: &str) -> Vec<RichPresentationBlock> {
         if in_code {
             push_code_block(&mut blocks, code_language, &mut code);
         } else {
+            push_list_block(&mut blocks, &mut list_ordered, &mut list_items);
             push_paragraph_blocks(&mut blocks, &mut paragraph);
         }
     }
@@ -639,6 +716,30 @@ fn rich_blocks_from_plain_final(text: &str) -> Vec<RichPresentationBlock> {
     }
     blocks.truncate(MAX_BLOCKS);
     blocks
+}
+
+fn parse_list_marker(line: &str) -> Option<(bool, &str)> {
+    let trimmed = line.trim_start();
+    if let Some(item) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
+        return Some((false, item.trim()));
+    }
+    let mut digit_len = 0usize;
+    for ch in trimmed.chars() {
+        if ch.is_ascii_digit() && digit_len < 4 {
+            digit_len += ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    if digit_len == 0 {
+        return None;
+    }
+    let rest = &trimmed[digit_len..];
+    let item = rest.strip_prefix(". ")?;
+    Some((true, item.trim()))
 }
 
 fn push_paragraph_blocks(blocks: &mut Vec<RichPresentationBlock>, paragraph: &mut Vec<String>) {
@@ -677,6 +778,33 @@ fn push_code_block(
             language: language.clone(),
             text: chunk,
         });
+    }
+}
+
+fn push_list_block(
+    blocks: &mut Vec<RichPresentationBlock>,
+    list_ordered: &mut Option<bool>,
+    list_items: &mut Vec<String>,
+) {
+    let Some(ordered) = *list_ordered else {
+        list_items.clear();
+        return;
+    };
+    if list_items.is_empty() || blocks.len() >= MAX_BLOCKS {
+        list_items.clear();
+        *list_ordered = None;
+        return;
+    }
+    let items = list_items
+        .drain(..)
+        .filter_map(|item| {
+            let item = truncate_chars(item.trim(), MAX_LIST_ITEM_CHARS);
+            (!item.trim().is_empty()).then_some(item)
+        })
+        .collect::<Vec<_>>();
+    *list_ordered = None;
+    if !items.is_empty() {
+        blocks.push(RichPresentationBlock::List { ordered, items });
     }
 }
 
@@ -742,6 +870,153 @@ fn render_discord_field(field: &RichPresentationField) -> String {
         }
         RichPresentationTextStyle::Bold => format!("**{label}**: **{value}**"),
     }
+}
+
+fn render_telegram_inline_markdown(value: &str) -> String {
+    let mut out = String::new();
+    let mut index = 0usize;
+    while index < value.len() {
+        let rest = &value[index..];
+        if let Some((rendered, consumed)) = render_telegram_inline_code(rest) {
+            out.push_str(&rendered);
+            index += consumed;
+            continue;
+        }
+        if let Some((rendered, consumed)) = render_telegram_inline_bold(rest) {
+            out.push_str(&rendered);
+            index += consumed;
+            continue;
+        }
+        if let Some((rendered, consumed)) = render_telegram_inline_link(rest) {
+            out.push_str(&rendered);
+            index += consumed;
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push_str(&html_escape_text(&ch.to_string()));
+        index += ch.len_utf8();
+    }
+    out
+}
+
+fn render_telegram_inline_code(rest: &str) -> Option<(String, usize)> {
+    if !rest.starts_with('`') {
+        return None;
+    }
+    let end = rest[1..].find('`')?;
+    let content = &rest[1..1 + end];
+    Some((
+        format!("<code>{}</code>", html_escape_text(content)),
+        end + 2,
+    ))
+}
+
+fn render_telegram_inline_bold(rest: &str) -> Option<(String, usize)> {
+    if !rest.starts_with("**") {
+        return None;
+    }
+    let end = rest[2..].find("**")?;
+    let content = &rest[2..2 + end];
+    Some((format!("<b>{}</b>", html_escape_text(content)), end + 4))
+}
+
+fn render_telegram_inline_link(rest: &str) -> Option<(String, usize)> {
+    if !rest.starts_with('[') {
+        return None;
+    }
+    let label_end = rest[1..].find(']')?;
+    let after_label = &rest[1 + label_end + 1..];
+    if !after_label.starts_with('(') {
+        return None;
+    }
+    let url_end = after_label[1..].find(')')?;
+    let label = &rest[1..1 + label_end];
+    let url = &after_label[1..1 + url_end];
+    let consumed = 1 + label_end + 1 + 1 + url_end + 1;
+    let literal = &rest[..consumed];
+    if !is_safe_http_url(url) {
+        return Some((html_escape_text(literal), consumed));
+    }
+    Some((
+        format!(
+            "<a href=\"{}\">{}</a>",
+            html_escape_attr(url),
+            html_escape_text(label)
+        ),
+        consumed,
+    ))
+}
+
+fn render_discord_inline_markdown(value: &str) -> String {
+    let mut out = String::new();
+    let mut index = 0usize;
+    while index < value.len() {
+        let rest = &value[index..];
+        if let Some((rendered, consumed)) = render_discord_inline_code(rest) {
+            out.push_str(&rendered);
+            index += consumed;
+            continue;
+        }
+        if let Some((rendered, consumed)) = render_discord_inline_bold(rest) {
+            out.push_str(&rendered);
+            index += consumed;
+            continue;
+        }
+        if let Some((rendered, consumed)) = render_discord_inline_link(rest) {
+            out.push_str(&rendered);
+            index += consumed;
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push_str(&discord_escape_plain_markdown(&ch.to_string()));
+        index += ch.len_utf8();
+    }
+    out
+}
+
+fn render_discord_inline_code(rest: &str) -> Option<(String, usize)> {
+    if !rest.starts_with('`') {
+        return None;
+    }
+    let end = rest[1..].find('`')?;
+    let content = discord_escape_text(&rest[1..1 + end]).replace('`', "'");
+    Some((format!("`{content}`"), end + 2))
+}
+
+fn render_discord_inline_bold(rest: &str) -> Option<(String, usize)> {
+    if !rest.starts_with("**") {
+        return None;
+    }
+    let end = rest[2..].find("**")?;
+    let content = discord_escape_plain_markdown(&rest[2..2 + end]);
+    Some((format!("**{content}**"), end + 4))
+}
+
+fn render_discord_inline_link(rest: &str) -> Option<(String, usize)> {
+    if !rest.starts_with('[') {
+        return None;
+    }
+    let label_end = rest[1..].find(']')?;
+    let after_label = &rest[1 + label_end + 1..];
+    if !after_label.starts_with('(') {
+        return None;
+    }
+    let url_end = after_label[1..].find(')')?;
+    let label = &rest[1..1 + label_end];
+    let url = &after_label[1..1 + url_end];
+    let consumed = 1 + label_end + 1 + 1 + url_end + 1;
+    let literal = &rest[..consumed];
+    if !is_safe_http_url(url) {
+        return Some((discord_escape_plain_markdown(literal), consumed));
+    }
+    Some((
+        format!(
+            "[{}]({})",
+            discord_escape_link_label(label),
+            discord_escape_url(url)
+        ),
+        consumed,
+    ))
 }
 
 fn split_discord_chunks(text: &str, max_chars: usize) -> Vec<String> {
@@ -859,6 +1134,21 @@ fn discord_escape_text(value: &str) -> String {
         .replace("<@", "< @")
         .replace("<#", "< #")
         .replace("<@&", "< @&")
+}
+
+fn discord_escape_plain_markdown(value: &str) -> String {
+    let escaped_mentions = discord_escape_text(value);
+    let mut out = String::with_capacity(escaped_mentions.len());
+    for ch in escaped_mentions.chars() {
+        match ch {
+            '\\' | '*' | '_' | '~' | '`' | '[' | ']' | '(' | ')' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn discord_escape_code_block(value: &str) -> String {
@@ -986,6 +1276,73 @@ mod tests {
                 .text
                 .contains("<pre><code class=\"language-powershell\">cargo test</code></pre>")
         );
+    }
+
+    #[test]
+    fn plain_final_bridge_renders_markdown_subset_as_semantic_blocks() {
+        let presentation = rich_presentation_from_plain_final(
+            "Done **bold** with `cargo test` and [report](https://example.invalid/report).\n\
+             Raw <script>alert(1)</script> remains text.\n\n\
+             - first **item**\n\
+             - second `item`\n\n\
+             1. ordered [link](https://example.invalid/ordered)",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            presentation.blocks.get(1),
+            Some(RichPresentationBlock::List {
+                ordered: false,
+                items
+            }) if items.len() == 2
+        ));
+        assert!(matches!(
+            presentation.blocks.get(2),
+            Some(RichPresentationBlock::List {
+                ordered: true,
+                items
+            }) if items.len() == 1
+        ));
+
+        let telegram = render_rich_presentation_for_telegram(
+            &presentation,
+            &RichPresentationValidationOptions::default(),
+        )
+        .unwrap();
+        assert!(telegram.text.contains("<b>bold</b>"));
+        assert!(telegram.text.contains("<code>cargo test</code>"));
+        assert!(
+            telegram
+                .text
+                .contains("<a href=\"https://example.invalid/report\">report</a>")
+        );
+        assert!(telegram.text.contains("- first <b>item</b>"));
+        assert!(
+            telegram
+                .text
+                .contains("1. ordered <a href=\"https://example.invalid/ordered\">link</a>")
+        );
+        assert!(
+            telegram
+                .text
+                .contains("&lt;script&gt;alert(1)&lt;/script&gt;")
+        );
+        assert!(!telegram.text.contains("**bold**"));
+        assert!(!telegram.text.contains("<script>"));
+
+        let discord = render_rich_presentation_for_discord(
+            &presentation,
+            &RichPresentationValidationOptions::default(),
+        )
+        .unwrap();
+        let discord_text = discord.chunks.join("");
+        assert!(discord_text.contains("**bold**"));
+        assert!(discord_text.contains("`cargo test`"));
+        assert!(discord_text.contains("[report](https://example.invalid/report)"));
+        assert!(discord_text.contains("- first **item**"));
+        assert!(discord_text.contains("1. ordered [link](https://example.invalid/ordered)"));
+        assert!(discord_text.contains("<script>alert\\(1\\)</script>"));
+        assert!(discord.allowed_mentions_parse.is_empty());
     }
 
     #[test]

@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ChannelOutboundMessage, HarnessLogEvent, HarnessLogLevel, append_harness_log,
-    current_log_time_ms,
+    ChannelOutboundAttachmentKind, ChannelOutboundMessage, HarnessLogEvent, HarnessLogLevel,
+    append_harness_log, current_log_time_ms,
 };
 
 const CHANNEL_OUTBOX_PLAN_SCHEMA: &str = "agent-harness.channel-outbox-plan.v1";
@@ -41,6 +41,7 @@ pub struct ChannelOutboxPlanSummary {
     pub pending: usize,
     pub delivered: usize,
     pub failed_retryable: usize,
+    pub skipped_permanent: usize,
     pub partial_failed: usize,
     pub skipped_platform: usize,
     pub invalid_lines: usize,
@@ -70,6 +71,7 @@ pub struct ChannelDeliveryRecordOptions {
     pub error: Option<String>,
     pub now_ms: i64,
     pub rendered_units: Vec<ChannelDeliveryRenderedUnitReceipt>,
+    pub presentation: Option<ChannelDeliveryPresentationReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,7 +90,53 @@ pub struct ChannelDeliveryReceipt {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rendered_units: Vec<ChannelDeliveryRenderedUnitReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<ChannelDeliveryPresentationReceipt>,
     pub at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelDeliveryPresentationReceipt {
+    pub present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_render_mode: Option<String>,
+    pub fallback_reason: ChannelDeliveryPresentationFallbackReason,
+    pub full_text_preserved: bool,
+}
+
+impl ChannelDeliveryPresentationReceipt {
+    pub fn rendered(provider_render_mode: impl Into<String>) -> Self {
+        Self {
+            present: true,
+            provider_render_mode: Some(provider_render_mode.into()),
+            fallback_reason: ChannelDeliveryPresentationFallbackReason::None,
+            full_text_preserved: true,
+        }
+    }
+
+    pub fn fallback(
+        reason: ChannelDeliveryPresentationFallbackReason,
+        provider_render_mode: impl Into<String>,
+        full_text_preserved: bool,
+    ) -> Self {
+        Self {
+            present: false,
+            provider_render_mode: Some(provider_render_mode.into()),
+            fallback_reason: reason,
+            full_text_preserved,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChannelDeliveryPresentationFallbackReason {
+    None,
+    Disabled,
+    ValidationFailure,
+    UnsupportedPlainBridge,
+    ProviderFallback,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +144,7 @@ pub struct ChannelDeliveryReceipt {
 pub enum ChannelDeliveryStatus {
     Delivered,
     Failed,
+    SkippedPermanent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +152,8 @@ pub enum ChannelDeliveryStatus {
 pub struct ChannelDeliveryRenderedUnitReceipt {
     pub unit_id: String,
     pub kind: ChannelDeliveryRenderedUnitKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_kind: Option<ChannelOutboundAttachmentKind>,
     pub status: ChannelDeliveryUnitStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_message_id: Option<String>,
@@ -192,6 +243,10 @@ pub fn plan_channel_outbox(
                 summary.delivered += 1;
                 false
             }
+            Some(ChannelDeliveryStatus::SkippedPermanent) => {
+                summary.skipped_permanent += 1;
+                false
+            }
             Some(ChannelDeliveryStatus::Failed) => {
                 summary.failed_retryable += 1;
                 if receipts
@@ -259,6 +314,7 @@ pub fn record_channel_delivery(
         provider_message_id: options.provider_message_id,
         error: options.error,
         rendered_units: options.rendered_units,
+        presentation: options.presentation,
         at_ms: options.now_ms,
     };
     append_json_line(&receipts_file, &receipt)?;
@@ -269,11 +325,13 @@ pub fn record_channel_delivery(
             match receipt.status {
                 ChannelDeliveryStatus::Delivered => HarnessLogLevel::Info,
                 ChannelDeliveryStatus::Failed => HarnessLogLevel::Warn,
+                ChannelDeliveryStatus::SkippedPermanent => HarnessLogLevel::Info,
             },
             "channel",
             match receipt.status {
                 ChannelDeliveryStatus::Delivered => "channel.delivery.delivered",
                 ChannelDeliveryStatus::Failed => "channel.delivery.failed",
+                ChannelDeliveryStatus::SkippedPermanent => "channel.delivery.skipped-permanent",
             },
             format!(
                 "delivery {} recorded as {:?}",
@@ -384,6 +442,7 @@ mod tests {
             error: None,
             now_ms: 1234,
             rendered_units: Vec::new(),
+            presentation: None,
         })
         .unwrap();
         record_channel_delivery(ChannelDeliveryRecordOptions {
@@ -399,6 +458,7 @@ mod tests {
             error: Some("rate limited".to_string()),
             now_ms: 1235,
             rendered_units: Vec::new(),
+            presentation: None,
         })
         .unwrap();
 
@@ -426,6 +486,82 @@ mod tests {
         .unwrap();
         assert!(log.contains("channel.delivery.delivered"));
         assert!(log.contains("channel.delivery.failed"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn outbox_plan_treats_permanent_skip_as_terminal_not_delivered() {
+        let root = temp_root("outbox_plan_treats_permanent_skip_as_terminal_not_delivered");
+        let harness_home = root.join(".agent-harness");
+        let outbox_file = harness_home
+            .join("state")
+            .join("channels")
+            .join("outbox.jsonl");
+        append_json_line(
+            &outbox_file,
+            &message(
+                "telegram",
+                "dm-1",
+                "user-1",
+                "session-1",
+                "suppressed evidence payload",
+            ),
+        )
+        .unwrap();
+
+        let initial = plan_channel_outbox(ChannelOutboxPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            limit: 10,
+        })
+        .unwrap();
+        assert_eq!(initial.pending.len(), 1);
+        record_channel_delivery(ChannelDeliveryRecordOptions {
+            harness_home: harness_home.clone(),
+            delivery_id: initial.pending[0].delivery_id.clone(),
+            status: ChannelDeliveryStatus::SkippedPermanent,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-1".to_string(),
+            user_id: "user-1".to_string(),
+            session_key: "session-1".to_string(),
+            provider_message_id: None,
+            error: Some("suppressed invalid final-surface row".to_string()),
+            now_ms: 1234,
+            rendered_units: Vec::new(),
+            presentation: None,
+        })
+        .unwrap();
+
+        let terminal = plan_channel_outbox(ChannelOutboxPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            limit: 10,
+        })
+        .unwrap();
+        assert!(terminal.pending.is_empty());
+        assert_eq!(terminal.summary.pending, 0);
+        assert_eq!(terminal.summary.delivered, 0);
+        assert_eq!(terminal.summary.failed_retryable, 0);
+        assert_eq!(terminal.summary.skipped_permanent, 1);
+
+        let receipt_text = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("channels")
+                .join("delivery-receipts.jsonl"),
+        )
+        .unwrap();
+        assert!(receipt_text.contains("\"status\":\"skipped-permanent\""));
+        let log = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("logs")
+                .join("harness.jsonl"),
+        )
+        .unwrap();
+        assert!(log.contains("channel.delivery.skipped-permanent"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -471,6 +607,7 @@ mod tests {
             error: None,
             now_ms: 1234,
             rendered_units: Vec::new(),
+            presentation: None,
         })
         .unwrap();
 
@@ -526,6 +663,7 @@ mod tests {
                 ChannelDeliveryRenderedUnitReceipt {
                     unit_id: "text:0".to_string(),
                     kind: ChannelDeliveryRenderedUnitKind::Text,
+                    attachment_kind: None,
                     status: ChannelDeliveryUnitStatus::Delivered,
                     provider_message_id: Some("100".to_string()),
                     error: None,
@@ -533,11 +671,15 @@ mod tests {
                 ChannelDeliveryRenderedUnitReceipt {
                     unit_id: "media:0".to_string(),
                     kind: ChannelDeliveryRenderedUnitKind::Media,
+                    attachment_kind: Some(ChannelOutboundAttachmentKind::Image),
                     status: ChannelDeliveryUnitStatus::Failed,
                     provider_message_id: None,
                     error: Some("upload failed".to_string()),
                 },
             ],
+            presentation: Some(ChannelDeliveryPresentationReceipt::rendered(
+                "telegram:parse_mode=HTML",
+            )),
         })
         .unwrap();
 
@@ -562,8 +704,35 @@ mod tests {
         assert!(receipt_text.contains("\"renderedUnits\""));
         assert!(receipt_text.contains("\"unitId\":\"media:0\""));
         assert!(receipt_text.contains("\"status\":\"failed\""));
+        assert!(receipt_text.contains("\"presentation\""));
+        assert!(receipt_text.contains("\"present\":true"));
+        assert!(receipt_text.contains("\"providerRenderMode\":\"telegram:parse_mode=HTML\""));
+        assert!(receipt_text.contains("\"fallbackReason\":\"none\""));
+        assert!(receipt_text.contains("\"fullTextPreserved\":true"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delivery_receipt_without_presentation_field_stays_readable() {
+        let json = r#"{
+          "schema": "agent-harness.channel-delivery-receipt.v1",
+          "deliveryId": "delivery:1:legacy",
+          "status": "delivered",
+          "platform": "telegram",
+          "channelId": "dm-1",
+          "userId": "user-1",
+          "sessionKey": "telegram:dm-1:user-1:main",
+          "providerMessageId": "100",
+          "error": null,
+          "atMs": 1234
+        }"#;
+
+        let receipt: ChannelDeliveryReceipt = serde_json::from_str(json).unwrap();
+
+        assert_eq!(receipt.status, ChannelDeliveryStatus::Delivered);
+        assert!(receipt.rendered_units.is_empty());
+        assert!(receipt.presentation.is_none());
     }
 
     #[test]
@@ -585,10 +754,12 @@ mod tests {
             rendered_units: vec![ChannelDeliveryRenderedUnitReceipt {
                 unit_id: "component-action:approve".to_string(),
                 kind: ChannelDeliveryRenderedUnitKind::ComponentAction,
+                attachment_kind: None,
                 status: ChannelDeliveryUnitStatus::Failed,
                 provider_message_id: None,
                 error: Some("components disabled".to_string()),
             }],
+            presentation: None,
         })
         .unwrap_err();
         assert!(error.to_string().contains("cannot mark delivery delivered"));

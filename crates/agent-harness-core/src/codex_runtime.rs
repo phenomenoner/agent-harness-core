@@ -15,13 +15,14 @@ use serde_json::{Value, json};
 use crate::{
     AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
     HarnessLogEvent, HarnessLogLevel, InboundMediaArtifact, InboundMediaInputPlan,
-    InboundMediaInputPlanOptions, RuntimeContinuationMetadata, append_agent_progress_event,
-    append_harness_log,
+    InboundMediaInputPlanOptions, InboundMediaNativeInputPart, RuntimeContinuationMetadata,
+    append_agent_progress_event, append_harness_log,
     config::{
         HarnessConfigValidationReport, HarnessConfigValidationStatus, validate_harness_config,
     },
     context_rollover::{
-        ContextCompactAttemptOptions, ContextRolloverLane, record_context_compact_attempt,
+        ContextCompactAttemptOptions, ContextRolloverLane, VirtualSessionThreadBackfillOptions,
+        backfill_virtual_session_codex_thread_id, record_context_compact_attempt,
         root_working_session_key,
     },
     current_log_time_ms,
@@ -308,6 +309,7 @@ pub struct CodexRuntimePlan {
     pub continuation: RuntimeContinuationMetadata,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub provider_request_policy: crate::TurnProviderRequestPolicy,
     pub prompt_bundle_json: PathBuf,
     pub prompt_markdown: PathBuf,
     pub media_plan: InboundMediaInputPlan,
@@ -619,6 +621,8 @@ struct CodexThreadHealthReport {
     data_image_count: usize,
     inline_image_bytes: u64,
     last_turn_inline_image_bytes: u64,
+    native_image_input_count: usize,
+    native_image_input_bytes: u64,
     oversized_tool_output_count: usize,
     oversized_tool_output_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -789,6 +793,8 @@ struct CodexRuntimePlanFile {
     pub continuation: RuntimeContinuationMetadata,
     pub provider: Option<String>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub provider_request_policy: crate::TurnProviderRequestPolicy,
     pub prompt_bundle_json: PathBuf,
     pub prompt_markdown: PathBuf,
     #[serde(default)]
@@ -971,9 +977,14 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
     let agent_id = string_field(&bundle, &["agentId", "agent_id"]).map(ToString::to_string);
     let provider = string_field(&bundle, &["provider"]).map(ToString::to_string);
     let model = string_field(&bundle, &["model"]).map(ToString::to_string);
+    let provider_request_policy = bundle
+        .get("providerRequestPolicy")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<crate::TurnProviderRequestPolicy>(value).ok())
+        .unwrap_or_default();
     let inbound_media_artifacts =
         inbound_media_artifacts_from_prepared_receipt(&prepared_receipt, &mut warnings);
-    let native_image_input_enabled = codex_native_media_input_enabled();
+    let native_image_input_enabled = codex_native_media_input_enabled(&options.harness_home);
     let media_plan = plan_inbound_media_inputs(
         InboundMediaInputPlanOptions {
             harness_home: options.harness_home.clone(),
@@ -1047,6 +1058,7 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
         continuation,
         provider,
         model,
+        provider_request_policy,
         prompt_bundle_json,
         prompt_markdown,
         media_plan,
@@ -1599,6 +1611,40 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
         );
     }
     let started = Instant::now();
+    if should_preflight_rollover_thread_health(&context_preflight.receipt) {
+        warnings.push(format!(
+            "Codex context preflight requires fresh-thread rollover before turn/start: {}",
+            context_preflight.receipt.reason
+        ));
+        let run_result = recover_preflight_thread_health_pollution(
+            &options.harness_home,
+            &plan,
+            &plan_file,
+            stdout_log.clone(),
+            stderr_log.clone(),
+            options.timeout_ms,
+            options.idle_timeout_ms,
+            options.progress_context.clone(),
+            &narration_config,
+            &context_policy,
+            &context_preflight.receipt,
+        )?;
+        let elapsed_ms = started.elapsed().as_millis();
+        let finished_at_ms = current_log_time_ms()?;
+        return finish_codex_runtime_run(
+            &options.harness_home,
+            &plan,
+            plan_file,
+            execution_dir,
+            run_file,
+            receipts_file,
+            run_result,
+            elapsed_ms,
+            finished_at_ms,
+            &narration_config,
+            warnings,
+        );
+    }
     let mut run_result = drive_codex_app_server(
         &options.harness_home,
         &plan,
@@ -2024,6 +2070,23 @@ pub fn record_codex_runtime_completion(
     }
 
     record_completion_outputs(&plan, &options)?;
+    if let Some(thread_id) = options.thread_id.as_deref() {
+        match backfill_virtual_session_codex_thread_id(VirtualSessionThreadBackfillOptions {
+            harness_home: options.harness_home.clone(),
+            session_key: plan.session_key.clone(),
+            thread_id: thread_id.to_string(),
+            now_ms: options.finished_at_ms,
+        }) {
+            Ok(Some(file)) => warnings.push(format!(
+                "virtual session working-session thread id backfilled at {}",
+                file.display()
+            )),
+            Ok(None) => {}
+            Err(error) => warnings.push(format!(
+                "virtual session working-session thread id backfill failed: {error}"
+            )),
+        }
+    }
     let receipt = CodexRuntimeCompletionReceipt {
         queue_id: plan.queue_id.clone(),
         status: CodexRuntimeCompletionStatus::Recorded,
@@ -2284,7 +2347,12 @@ fn preflight_codex_context(
     let prompt_markdown_bytes = file_len_or_zero(&plan.prompt_markdown);
     let prompt_bundle_bytes = file_len_or_zero(&plan.prompt_bundle_json);
     let (transcript_lines, transcript_bytes) = transcript_stats(&plan.outputs.transcript_file);
-    let thread_health = scan_codex_thread_health(harness_home, plan, &mut warnings);
+    let mut thread_health = scan_codex_thread_health(harness_home, plan, &mut warnings);
+    account_native_image_inputs_for_thread_health(
+        &mut thread_health,
+        &plan.media_plan.native_input_parts,
+        &mut warnings,
+    );
     let latest_usage = latest_codex_runtime_usage(
         harness_home,
         &plan.outputs.codex_binding_file,
@@ -2315,6 +2383,17 @@ fn preflight_codex_context(
         (
             false,
             "no existing Codex thread is bound to this harness session".to_string(),
+        )
+    } else if thread_health_requires_fresh_thread_rollover(&thread_health) {
+        (
+            false,
+            format!(
+                "{}; fresh-thread rollover required before turn/start",
+                thread_health.reason.clone().unwrap_or_else(|| {
+                    "bound Codex thread health guard found non-compactable context pollution"
+                        .to_string()
+                })
+            ),
         )
     } else if thread_health.compact_recommended {
         (
@@ -2406,6 +2485,13 @@ fn preflight_codex_context(
     }
     append_json_line(&receipts_file, &receipt)?;
     Ok(CodexContextPreflightRun { receipt, warnings })
+}
+
+fn thread_health_requires_fresh_thread_rollover(report: &CodexThreadHealthReport) -> bool {
+    report.compact_recommended
+        && (report.data_image_count > 0
+            || report.native_image_input_count > 0
+            || report.oversized_tool_output_count > 0)
 }
 
 fn file_len_or_zero(path: &Path) -> u64 {
@@ -2641,6 +2727,34 @@ fn scan_codex_rollout_file_for_thread_health(
         ));
     }
     report
+}
+
+fn account_native_image_inputs_for_thread_health(
+    report: &mut CodexThreadHealthReport,
+    native_input_parts: &[InboundMediaNativeInputPart],
+    warnings: &mut Vec<String>,
+) {
+    for part in native_input_parts {
+        report.native_image_input_count = report.native_image_input_count.saturating_add(1);
+        match fs::metadata(&part.local_path) {
+            Ok(metadata) => {
+                report.native_image_input_bytes = report
+                    .native_image_input_bytes
+                    .saturating_add(metadata.len());
+            }
+            Err(error) => warnings.push(format!(
+                "failed to stat native image input {} for thread health scan: {error}",
+                part.local_path.display()
+            )),
+        }
+    }
+    if report.native_image_input_bytes >= CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT {
+        report.compact_recommended = true;
+        report.reason = Some(format!(
+            "pending native image input has {} byte(s), above per-turn image limit {}",
+            report.native_image_input_bytes, CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT
+        ));
+    }
 }
 
 fn normalize_path_text_for_match(path: &str) -> String {
@@ -3239,6 +3353,7 @@ fn drive_codex_app_server(
     if let Some(provider) = app_server_model_provider(plan) {
         thread_params["modelProvider"] = json!(provider);
     }
+    attach_codex_app_server_service_tier(&mut thread_params, &plan.provider_request_policy);
     thread_params["cwd"] = json!(runtime_workspace_root.clone());
     thread_params["approvalPolicy"] = json!(app_server_approval_policy.clone());
     thread_params["sandbox"] = json!(app_server_sandbox_mode_value(&app_server_sandbox));
@@ -3661,7 +3776,7 @@ fn drive_codex_app_server(
             "sha256": part.sha256.clone()
         }));
     }
-    let turn_params = json!({
+    let mut turn_params = json!({
         "threadId": thread_id.clone(),
         "cwd": runtime_workspace_root,
         "approvalPolicy": app_server_approval_policy,
@@ -3674,6 +3789,7 @@ fn drive_codex_app_server(
         ],
         "input": input_parts
     });
+    attach_codex_app_server_service_tier(&mut turn_params, &plan.provider_request_policy);
     let turn_start_request_id = if compact_before_turn { 3 } else { 2 };
     let mut steer_bridge = CodexTurnSteerBridge::new(
         harness_home,
@@ -3972,6 +4088,24 @@ fn app_server_model_provider(plan: &CodexRuntimePlanFile) -> Option<String> {
         .or_else(|| plan.provider.clone())
         .map(|provider| provider.trim().to_string())
         .filter(|provider| !provider.is_empty())
+}
+
+fn attach_codex_app_server_service_tier(
+    params: &mut Value,
+    policy: &crate::TurnProviderRequestPolicy,
+) {
+    if let Some(service_tier) = codex_app_server_service_tier(policy) {
+        params["serviceTier"] = json!(service_tier);
+    }
+}
+
+fn codex_app_server_service_tier(policy: &crate::TurnProviderRequestPolicy) -> Option<String> {
+    policy
+        .service_tier
+        .as_deref()
+        .map(str::trim)
+        .filter(|service_tier| !service_tier.is_empty())
+        .map(ToString::to_string)
 }
 
 fn context_recovery_failure_receipt(
@@ -4291,6 +4425,96 @@ fn recover_thread_health_protocol_error(
     }
     recovered.warnings.push(format!(
         "retryable Codex ProtocolError used fresh-thread rollover because bound thread health guard triggered: {guard_reason}"
+    ));
+    Ok(recovered)
+}
+
+fn should_preflight_rollover_thread_health(preflight: &CodexContextPreflightReceipt) -> bool {
+    preflight.policy.enabled
+        && preflight.policy.fallback_on_compact_failure == "checkpoint-and-new-thread"
+        && preflight.thread_id.is_some()
+        && preflight.thread_health_status == CodexThreadHealthStatus::Polluted
+        && preflight.thread_health.compact_recommended
+        && !preflight.compact_before_turn
+        && thread_health_requires_fresh_thread_rollover(&preflight.thread_health)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_preflight_thread_health_pollution(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    plan_file: &Path,
+    stdout_log: Option<PathBuf>,
+    stderr_log: Option<PathBuf>,
+    timeout_ms: u64,
+    idle_timeout_ms: u64,
+    progress_context: Option<AgentProgressContext>,
+    narration_config: &AssistantNarrationConfig,
+    policy: &CodexContextPolicy,
+    preflight: &CodexContextPreflightReceipt,
+) -> io::Result<CodexAppServerRunResult> {
+    let original_thread_id = plan.invocation.thread_id.clone();
+    let guard_reason = preflight
+        .thread_health
+        .reason
+        .clone()
+        .unwrap_or_else(|| "bound Codex thread health guard recommended rollover".to_string());
+    let prior_reason = format!(
+        "Codex context preflight found unhealthy bound thread; fresh-thread rollover required before turn/start. Guard reason: {guard_reason}"
+    );
+    let prior = CodexAppServerRunResult {
+        status: CodexRuntimeRunStatus::ProtocolError,
+        reason: prior_reason.clone(),
+        assistant_message: String::new(),
+        assistant_narration: Vec::new(),
+        assistant_raw_message: String::new(),
+        assistant_final_found: false,
+        thread_id: original_thread_id.clone(),
+        event_count: 0,
+        usage: preflight.latest_usage.clone(),
+        stdout_log,
+        stderr_log,
+        context_recovery: None,
+        tool_use_timeout: None,
+        warnings: Vec::new(),
+    };
+    let mut recovered = run_context_checkpoint_fallback(
+        harness_home,
+        plan,
+        plan_file,
+        prior,
+        original_thread_id,
+        timeout_ms,
+        idle_timeout_ms,
+        progress_context,
+        narration_config,
+        policy,
+    )?;
+    let succeeded = recovered.status == CodexRuntimeRunStatus::Completed;
+    let recovered_reason = recovered.reason.clone();
+    if let Some(recovery) = recovered.context_recovery.as_mut() {
+        recovery.status = if succeeded {
+            "preflight-thread-health-rollover-succeeded".to_string()
+        } else {
+            "preflight-thread-health-rollover-failed".to_string()
+        };
+        recovery.thread_health_status = Some(if succeeded {
+            CodexThreadHealthStatus::Polluted
+        } else {
+            CodexThreadHealthStatus::PollutedAfterCompact
+        });
+        recovery.reason = if succeeded {
+            format!(
+                "Codex context preflight opened a fresh Codex thread before turn/start because the bound thread was unhealthy. Guard reason: {guard_reason}"
+            )
+        } else {
+            format!(
+                "Codex context preflight attempted fresh-thread rollover before turn/start because the bound thread was unhealthy, but fallback failed. Guard reason: {guard_reason}; fallback reason: {recovered_reason}"
+            )
+        };
+    }
+    recovered.warnings.push(format!(
+        "Codex context preflight used fresh-thread rollover before turn/start: {guard_reason}"
     ));
     Ok(recovered)
 }
@@ -8851,7 +9075,12 @@ fn inbound_media_artifacts_from_prepared_receipt(
     }
 }
 
-fn codex_native_media_input_enabled() -> bool {
+fn codex_native_media_input_enabled(harness_home: &Path) -> bool {
+    if let Ok(config) = crate::load_harness_media_config(harness_home)
+        && let Some(enabled) = config.native_image_input
+    {
+        return enabled;
+    }
     env::var("AGENT_HARNESS_CODEX_NATIVE_MEDIA_INPUT")
         .ok()
         .map(|value| {
@@ -9370,6 +9599,7 @@ fn normalize_key_part(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
+        CompletedTurnWorkingSetSnapshotOptions, ContextVirtualSessionRecord,
         InboundMediaModelAttachmentStatus, PromptAssemblyOptions, RuntimeQueueEnqueueOptions,
         RuntimeQueuePrepareOptions, TurnPlanInput, build_channel_step, build_source_skill_index,
         build_turn_plan,
@@ -9377,6 +9607,7 @@ mod tests {
             ContextCompactCounter, ContextRolloverLane, context_compact_counter_file,
         },
         enqueue_channel_step, load_agent_registry, prepare_runtime_queue_item,
+        record_completed_turn_working_set_snapshot,
         runtime_worker::release_runtime_queue_lease,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -9400,6 +9631,30 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(34));
         assert_eq!(usage.total_tokens, Some(1234));
         assert!(usage.source.contains("params.tokenUsage"));
+    }
+
+    #[test]
+    fn codex_app_server_service_tier_uses_provider_request_policy() {
+        let policy = serde_json::from_value::<crate::TurnProviderRequestPolicy>(json!({
+            "fastMode": "fast",
+            "effectiveAcceleration": "enabled",
+            "routeKind": "codex-app-server",
+            "serviceTier": "priority",
+            "reason": "Codex app-server serviceTier=priority will be requested for this model"
+        }))
+        .unwrap();
+
+        let mut params = json!({});
+        attach_codex_app_server_service_tier(&mut params, &policy);
+        assert_eq!(params["serviceTier"], json!("priority"));
+
+        let blank_policy = crate::TurnProviderRequestPolicy {
+            service_tier: Some("  ".to_string()),
+            ..crate::TurnProviderRequestPolicy::default()
+        };
+        let mut blank_params = json!({});
+        attach_codex_app_server_service_tier(&mut blank_params, &blank_policy);
+        assert!(blank_params.get("serviceTier").is_none());
     }
 
     #[test]
@@ -9447,8 +9702,8 @@ mod tests {
     }
 
     #[test]
-    fn context_preflight_compacts_for_bound_thread_inline_image_bloat() {
-        let root = temp_root("context_preflight_compacts_for_bound_thread_inline_image_bloat");
+    fn context_preflight_rolls_over_bound_thread_inline_image_bloat() {
+        let root = temp_root("context_preflight_rolls_over_bound_thread_inline_image_bloat");
         let source = write_codex_runtime_source(&root);
         let harness_home = root.join(".agent-harness");
         let thread_id = "019ef798-346b-7ae2-b341-60a7a20a8d96";
@@ -9490,8 +9745,9 @@ mod tests {
         let preflight =
             preflight_codex_context(&harness_home, &plan, plan_file, plan_file.parent()).unwrap();
 
-        assert!(preflight.receipt.compact_before_turn);
+        assert!(!preflight.receipt.compact_before_turn);
         assert!(preflight.receipt.reason.contains("inline image"));
+        assert!(preflight.receipt.reason.contains("fresh-thread rollover"));
         assert_eq!(
             preflight.receipt.thread_health_status,
             CodexThreadHealthStatus::Polluted
@@ -9500,6 +9756,96 @@ mod tests {
         assert_eq!(
             preflight.receipt.thread_health.thread_id.as_deref(),
             Some(thread_id)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_preflight_rolls_over_bound_thread_native_image_bloat() {
+        let root = temp_root("context_preflight_rolls_over_bound_thread_native_image_bloat");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"media":{"nativeImageInput":true}}"#,
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+        let execution_dir = latest_prepared_execution_dir(&harness_home);
+        let attachment_root =
+            crate::inbound_media_attachment_root(&harness_home).join("update-native");
+        fs::create_dir_all(&attachment_root).unwrap();
+        let bytes_per_image =
+            (CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT / 2).saturating_add(4096);
+        let first = attachment_root.join("0.png");
+        let second = attachment_root.join("1.png");
+        fs::write(
+            &first,
+            vec![b'A'; usize::try_from(bytes_per_image).unwrap()],
+        )
+        .unwrap();
+        fs::write(
+            &second,
+            vec![b'B'; usize::try_from(bytes_per_image).unwrap()],
+        )
+        .unwrap();
+        let receipt_file = execution_dir.join("execution-receipt.json");
+        let mut receipt: Value = serde_json::from_slice(&fs::read(&receipt_file).unwrap()).unwrap();
+        receipt["inboundMediaArtifacts"] = json!([
+            {
+                "platform": "telegram",
+                "kind": "photo",
+                "localPath": first,
+                "artifactUri": "agent-harness://inbound-media/telegram/update-native/0.png",
+                "mime": "image/png",
+                "byteLen": bytes_per_image,
+                "downloadStatus": "downloaded",
+                "source": "telegram.getFile"
+            },
+            {
+                "platform": "telegram",
+                "kind": "photo",
+                "localPath": second,
+                "artifactUri": "agent-harness://inbound-media/telegram/update-native/1.png",
+                "mime": "image/png",
+                "byteLen": bytes_per_image,
+                "downloadStatus": "downloaded",
+                "source": "telegram.getFile"
+            }
+        ]);
+        fs::write(
+            &receipt_file,
+            serde_json::to_string_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: Some(execution_dir),
+            codex_executable: Some(PathBuf::from("custom-codex.exe")),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_invocation_thread_id(plan_file, Some("thread-native-images"));
+        let plan: CodexRuntimePlanFile =
+            serde_json::from_slice(&fs::read(plan_file).unwrap()).unwrap();
+        assert_eq!(plan.media_plan.native_input_parts.len(), 2);
+
+        let preflight =
+            preflight_codex_context(&harness_home, &plan, plan_file, plan_file.parent()).unwrap();
+
+        assert!(!preflight.receipt.compact_before_turn);
+        assert!(preflight.receipt.reason.contains("native image input"));
+        assert!(preflight.receipt.reason.contains("fresh-thread rollover"));
+        assert_eq!(
+            preflight.receipt.thread_health_status,
+            CodexThreadHealthStatus::Polluted
+        );
+        assert_eq!(preflight.receipt.thread_health.native_image_input_count, 2);
+        assert!(
+            preflight.receipt.thread_health.native_image_input_bytes
+                > CODEX_THREAD_INLINE_IMAGE_LAST_TURN_BYTES_LIMIT
         );
 
         let _ = fs::remove_dir_all(root);
@@ -9560,7 +9906,7 @@ mod tests {
         assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
         assert_eq!(
             report.receipt.context_recovery.as_ref().unwrap().status,
-            "thread-health-rollover-succeeded"
+            "preflight-thread-health-rollover-succeeded"
         );
         assert_eq!(
             report
@@ -9583,9 +9929,9 @@ mod tests {
         let transcript = fs::read_to_string(completion.transcript_file.as_ref().unwrap()).unwrap();
         assert!(transcript.contains("Fresh fallback reply"));
         let events = fs::read_to_string(events_file).unwrap();
-        assert!(events.contains("thread/resume"));
-        assert!(events.contains("thread/compact/start"));
         assert!(events.contains("thread/start"));
+        assert!(!events.contains("thread/resume"));
+        assert!(!events.contains("thread/compact/start"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -12598,6 +12944,25 @@ mod tests {
             codex_executable: Some(PathBuf::from("custom-codex.exe")),
         })
         .unwrap();
+        let working_set_snapshot =
+            record_completed_turn_working_set_snapshot(CompletedTurnWorkingSetSnapshotOptions {
+                harness_home: harness_home.clone(),
+                platform: "telegram".to_string(),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                agent_id: "main".to_string(),
+                working_session_key: "telegram:dm-42:user-7:main".to_string(),
+                queue_id: Some("queue-before-completion".to_string()),
+                message_text: Some(
+                    "record completion backfills virtual session thread".to_string(),
+                ),
+                status: "completed".to_string(),
+                run_once_receipt_file: None,
+                outbox_file: None,
+                completion_file: None,
+                now_ms: 12344,
+            })
+            .unwrap();
 
         let report = record_codex_runtime_completion(CodexRuntimeCompletionOptions {
             harness_home: harness_home.clone(),
@@ -12630,6 +12995,18 @@ mod tests {
         assert_eq!(binding["schema"], CODEX_BINDING_SCHEMA);
         assert_eq!(binding["sessionKey"], "telegram:dm-42:user-7:main");
         assert_eq!(binding["threadId"], "thread-recorded");
+        let virtual_session: ContextVirtualSessionRecord =
+            serde_json::from_slice(&fs::read(&working_set_snapshot.virtual_session_file).unwrap())
+                .unwrap();
+        let working_session = virtual_session
+            .working_sessions
+            .iter()
+            .find(|session| session.session_key == "telegram:dm-42:user-7:main")
+            .expect("working session ref");
+        assert_eq!(
+            working_session.codex_thread_id.as_deref(),
+            Some("thread-recorded")
+        );
 
         let second = record_codex_runtime_completion(CodexRuntimeCompletionOptions {
             harness_home: harness_home.clone(),
@@ -13333,6 +13710,7 @@ while ($true) {
             r#"
 $events = Join-Path $PSScriptRoot 'stream-disconnect-events.jsonl'
 $first = Join-Path $PSScriptRoot 'stream-disconnect-first.marker'
+$resumed = Join-Path $PSScriptRoot 'stream-disconnect-resumed.marker'
 while ($true) {
     $line = [Console]::In.ReadLine()
     if ($null -eq $line) { break }
@@ -13342,6 +13720,7 @@ while ($true) {
         [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/resume') {
+        Set-Content -LiteralPath $resumed -Value 'resumed'
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-bloated"}}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/start') {
@@ -13353,7 +13732,7 @@ while ($true) {
         [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-bloated"}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
-        if (!(Test-Path -LiteralPath $first)) {
+        if ((Test-Path -LiteralPath $resumed) -and !(Test-Path -LiteralPath $first)) {
             Set-Content -LiteralPath $first -Value 'failed'
             [Console]::Out.WriteLine('{"method":"error","params":{"error":{"message":"Reconnecting... 2/5","additionalDetails":"stream disconnected before completion: websocket closed by server before response.completed"},"willRetry":true,"threadId":"thread-bloated","turnId":"turn-failed"}}')
             [Console]::Out.Flush()
@@ -13971,6 +14350,7 @@ done
 dir="$(dirname "$0")"
 events="$dir/stream-disconnect-events.jsonl"
 first="$dir/stream-disconnect-first.marker"
+resumed="$dir/stream-disconnect-resumed.marker"
 while IFS= read -r line; do
     method="$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')"
     [ -n "$method" ] && printf '%s\n' "$method" >> "$events"
@@ -13979,6 +14359,7 @@ while IFS= read -r line; do
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
             ;;
         *'"method":"thread/resume"'*)
+            printf resumed > "$resumed"
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-bloated"}}}'
             ;;
         *'"method":"thread/start"'*)
@@ -13990,7 +14371,7 @@ while IFS= read -r line; do
             printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-bloated"}}'
             ;;
         *'"method":"turn/start"'*)
-            if [ ! -f "$first" ]; then
+            if [ -f "$resumed" ] && [ ! -f "$first" ]; then
                 printf failed > "$first"
                 printf '%s\n' '{"method":"error","params":{"error":{"message":"Reconnecting... 2/5","additionalDetails":"stream disconnected before completion: websocket closed by server before response.completed"},"willRetry":true,"threadId":"thread-bloated","turnId":"turn-failed"}}'
                 exit 0

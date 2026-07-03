@@ -107,6 +107,7 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
         "runtimeBackoff",
         "cronScheduler",
         "memory",
+        "media",
         "supervisor",
         "channelIdentity",
         "liveControlGuard",
@@ -136,6 +137,7 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
             "runtimeBackoff" => validate_runtime_backoff_object("$.runtimeBackoff", child, errors),
             "cronScheduler" => validate_cron_scheduler_object("$.cronScheduler", child, errors),
             "memory" => validate_memory_object("$.memory", child, errors),
+            "media" => validate_media_object("$.media", child, errors),
             "supervisor" => validate_supervisor_object("$.supervisor", child, errors),
             "channelIdentity" => {
                 validate_channel_identity_object("$.channelIdentity", child, errors)
@@ -463,6 +465,12 @@ fn validate_codex_context_object(path: &str, value: &Value, errors: &mut Vec<Str
             | "model_auto_compact_token_limit"
             | "maxSuccessfulCompactsBeforeRollover"
             | "max_successful_compacts_before_rollover"
+            | "maxContinuationDepth"
+            | "max_continuation_depth"
+            | "streamUnstableContinuationMinAttempts"
+            | "stream_unstable_continuation_min_attempts"
+            | "streamUnstableContinuationTokenLimit"
+            | "stream_unstable_continuation_token_limit"
             | "toolOutputTokenLimit"
             | "tool_output_token_limit" => expect_positive_u64(path_key(path, key), child, errors),
             "modelAutoCompactTokenLimitScope"
@@ -614,6 +622,28 @@ fn validate_memory_object(path: &str, value: &Value, errors: &mut Vec<String>) {
             | "openclawMemBridgeBin"
             | "openclaw_mem_bridge_bin" => expect_string(path_key(path, key), child, errors),
             other => errors.push(format!("unknown memory config key `{other}` at {path}")),
+        }
+    }
+}
+
+fn validate_media_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "maxMbPerAttachment" | "max_mb_per_attachment" => {
+                expect_positive_u64(path_key(path, key), child, errors)
+            }
+            "allowDirs" | "allow_dirs" => validate_string_array(path_key(path, key), child, errors),
+            "trustRecentSeconds" | "trust_recent_seconds" => {
+                if !child.is_null() {
+                    expect_u64(path_key(path, key), child, errors);
+                }
+            }
+            "strict" | "lintFailClosed" | "lint_fail_closed" | "nativeImageInput"
+            | "native_image_input" => expect_bool(path_key(path, key), child, errors),
+            other => errors.push(format!("unknown media config key `{other}` at {path}")),
         }
     }
 }

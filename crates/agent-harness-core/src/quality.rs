@@ -99,7 +99,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I9",
-            statement: "final channel replies exclude progress and narration stream content when progress-panel narration is active",
+            statement: "final channel replies exclude progress/narration stream content and review-only evidence when the parent workflow has not completed",
             owner: "runtime_pipeline/progress/channel_delivery",
         },
         InvariantEntry {
@@ -109,7 +109,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I11",
-            statement: "binary and bulky artifacts enter durable main-session context only as harness artifact references plus bounded extraction summaries; raw bytes, base64, provider URLs, and large tool blobs stay in artifact storage or receipts",
+            statement: "binary and bulky artifacts enter durable main-session context only as harness artifact references plus bounded extraction summaries; raw bytes, base64, provider URLs, and large tool blobs stay in artifact storage or receipts, including expanded inbound media kinds and referenced-message media",
             owner: "media/prompt/runtime_worker/codex_runtime/workers/memory",
         },
         InvariantEntry {
@@ -119,13 +119,23 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I13",
-            statement: "successful official Codex compaction and repeated stream-unstable high-media retries feed the harness context-rollover policy instead of silently reusing overloaded sessions, and polluted-thread terminal recovery preserves single-delivery virtual-session continuity",
+            statement: "inline-image, native-image-input, or oversized-output polluted Codex threads rotate to fresh-thread recovery before the next turn, while successful official compaction and repeated high-usage stream-unstable retries still feed bounded context-rollover continuity",
             owner: "codex_runtime/context_rollover/runtime_queue/prompt/runtime_pipeline",
         },
         InvariantEntry {
             id: "I14",
-            statement: "rich outbound presentation is rendered by provider adapters from a trusted semantic payload; model-authored raw Telegram/Discord syntax is not the safety boundary",
+            statement: "rich outbound presentation is rendered by provider adapters from a trusted semantic payload; model-authored raw Telegram/Discord syntax is not the safety boundary, and media units carry provider delivery receipts with attachment-kind accounting",
             owner: "runtime_pipeline/channel_delivery/progress/media/trace",
+        },
+        InvariantEntry {
+            id: "I15",
+            statement: "concrete channel session history is lane-bound: session/private recall candidates require same agent and lane-qualified session key, while broad project/global recall must be explicit",
+            owner: "memory_pack/memory/prompt/context_rollover",
+        },
+        InvariantEntry {
+            id: "I16",
+            statement: "outbound channel attachments originate only from policy-validated local paths or resolvable harness artifacts; directive-like text inside protected spans is never delivered; rejected directives leave a visible note plus a machine-readable receipt",
+            owner: "runtime_pipeline/media_delivery_policy/channel_delivery",
         },
     ]
 }
@@ -150,7 +160,17 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.inbound-media-artifact.v1",
             owner_module: "media",
-            compatibility: "artifact metadata is additive in v1; Round10 adds lifecycleStatus and extractionSummary for bounded prompt hygiene",
+            compatibility: "artifact metadata is additive in v1; lifecycleStatus, extractionSummary, and provenance are optional additive fields for bounded prompt hygiene",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.outbound-media-policy.v1",
+            owner_module: "media_delivery_policy",
+            compatibility: "append-only policy receipts; path hashes and reason codes are additive in v1, raw sensitive payloads are never recorded",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.media-delivery-lint.v1",
+            owner_module: "runtime_pipeline",
+            compatibility: "append-only lint receipts; warning and failed-closed statuses are additive in v1",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.runtime-dead-letter.v1",
@@ -203,6 +223,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "per-execution recovery artifact; binding backup path remains optional",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.virtual-session-working-context.v1",
+            owner_module: "virtual_session_context",
+            compatibility: "read-only resolver envelope over existing lane state; additive fields only in v1 and evidence anchors remain bounded pointers, not payloads",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.channel-identity-check.v1",
             owner_module: "channel_identity",
             compatibility: "additive fields only in v1; non-bound statuses remain fail-closed",
@@ -220,7 +245,12 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.rich-message-presentation.v1",
             owner_module: "rich_presentation",
-            compatibility: "optional field on channel outbound messages; old outbox JSON without presentation remains plain text, v1 is additive, validated before render, and provider senders may honor it with adapter-rendered text/media while callbacks stay gated",
+            compatibility: "optional field on channel outbound messages; old outbox JSON without presentation remains plain text, v1 is additive, validates bounded semantic blocks including lists, and provider senders may honor it with adapter-rendered Telegram HTML or Discord safe Markdown while callbacks stay gated",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.channel-delivery-receipt.v1",
+            owner_module: "channel_delivery",
+            compatibility: "append-only delivery receipts; presentation/renderedUnits and renderedUnits.attachmentKind are additive and legacy receipts without presentation remain readable",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.channel-restart-request.v1",
@@ -375,7 +405,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.operation-plan.v1",
             owner_module: "operation_plan",
-            compatibility: "plan JSON may add metadata in v1; plan id and status semantics remain stable",
+            compatibility: "plan JSON may add metadata in v1; show/readback reports may add summary fields such as openItems and blockedItems while plan id and status semantics remain stable",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.operation-plan-item.v1",
@@ -519,10 +549,17 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "duplicate suppression by source queue/completion",
                 "Telegram and Discord delivery receipt trace",
                 "final agent-reply excludes progress/narration stream content",
+                "implementation-goal read-only review evidence does not become final agent-reply",
+                "structured owner/session routing suppresses non-main or mismatched-run completed output from final outbox",
+                "invalid or suppressed outbox rows can be retired with skipped-permanent receipts without counting as delivered",
             ],
             runnable_tests: vec![
+                "channel_delivery::tests::outbox_plan_treats_permanent_skip_as_terminal_not_delivered",
+                "runtime_pipeline::tests::final_outbox_input_kind_suppresses_read_only_review_only_for_workflow_requests",
                 "runtime_pipeline::tests::already_recorded_completion_repair_keeps_progress_panel_out_of_final_outbox",
                 "runtime_pipeline::tests::already_recorded_completion_repair_keeps_progress_panel_out_of_discord_final_outbox",
+                "runtime_pipeline::tests::run_runtime_queue_once_suppresses_read_only_review_final_for_implementation_goal",
+                "runtime_pipeline::tests::run_runtime_queue_once_suppresses_non_main_agent_final_outbox",
                 "trace::tests::trace_harness_event_detects_terminal_runtime_status",
             ],
             promotion_gate: "Prove completed turns converge to one final/terminal surface with reconstructable queue-to-delivery trace.",
@@ -542,23 +579,35 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "first official compact success recorded",
                 "second official compact success recorded",
                 "continuation session or structured skip receipt",
-                "repeated high-usage media stream disconnect can requeue a guarded continuation before terminal dead-letter",
+                "inline-image polluted bound thread uses preflight fresh-thread rollover before turn/start",
+                "repeated high-usage stream disconnect can requeue a guarded continuation before terminal dead-letter",
                 "working-set prompt injection",
                 "final outbox/delivery trace from continuation queue item",
                 "/new boundary does not inherit previous-task memory context",
+                "S1 Telegram same-agent continuation consumes resolver prompt context",
+                "S2 Discord same-agent continuation consumes resolver prompt context",
+                "S3 same platform/channel/user different agent is not cross-suppressed",
+                "S4 /new closes the previous virtual session and starts a fresh task boundary",
+                "S5 max-depth terminal-failed guard preserves exact-lane resolver evidence only",
             ],
             runnable_tests: vec![
                 "context_rollover::tests::three_turn_compact_rollover_replay_writes_continuation_working_set",
                 "codex_runtime::tests::run_codex_runtime_preflight_compacts_existing_thread_before_turn",
+                "codex_runtime::tests::context_preflight_rolls_over_bound_thread_inline_image_bloat",
+                "codex_runtime::tests::retryable_protocol_error_after_bloated_thread_rolls_over_to_fresh_thread",
                 "context_rollover::tests::compact_counter_deduplicates_successful_attempt_key",
                 "context_rollover::tests::prepared_auto_requeue_blocks_parent_session_sibling",
-                "runtime_pipeline::tests::polluted_thread_continuation_runs_only_at_dead_letter_and_respects_depth_limit",
-                "runtime_pipeline::tests::stream_unstable_retry_continuation_requires_repeated_high_usage_media_failure",
-                "runtime_pipeline::tests::repeated_stream_disconnect_high_media_retry_requeues_continuation",
+                "runtime_pipeline::tests::polluted_thread_continuation_runs_at_terminal_failure_and_respects_depth_limit",
+                "runtime_pipeline::tests::stream_unstable_retry_continuation_requires_repeated_high_usage_stream_failure",
+                "runtime_pipeline::tests::repeated_stream_disconnect_high_usage_retry_requeues_continuation",
                 "runtime_pipeline::tests::stream_unstable_retry_continuation_tombstones_parent_queue_item",
                 "prompt::tests::prompt_bundle_new_command_boundary_skips_prior_task_memory_context",
+                "prompt::tests::prompt_bundle_includes_virtual_session_resolver_context_section",
+                "prompt::tests::prompt_bundle_missing_reply_metadata_hint_uses_resolver_queue_ids",
+                "channel_state::tests::new_session_command_closes_previous_virtual_session_record",
+                "context_rollover::tests::virtual_session_thread_backfill_updates_matching_working_session",
             ],
-            promotion_gate: "Force high-context compact rollover and repeated stream-unstable media retry scenarios, then prove rollover/final-delivery parity across Discord/TG identity axes.",
+            promotion_gate: "Force high-context compact rollover and repeated high-usage stream-unstable retry scenarios, then prove rollover/final-delivery parity across Discord/TG identity axes.",
         },
         ScenarioMatrixEntry {
             id: "progress-surface-volume",
@@ -603,15 +652,17 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "final outbox",
                 "delivery",
             ],
-            required_invariants: vec!["I1", "I2", "I7", "I8", "I12"],
+            required_invariants: vec!["I1", "I2", "I7", "I8", "I12", "I15"],
             required_evidence: vec![
                 "new configured agent has independent workspace/prompt source",
                 "channel command state preserves agent identity",
                 "provider/model command state is agent/session scoped",
                 "prompt context hides main-only operation plans from non-main agents",
                 "memory recall excludes private main/global imported context unless allowed",
+                "session-history retrieval rejects wrong-lane concrete candidates and preserves only explicit project/global fallback",
                 "worker/subagent lease ownership remains agent-scoped",
-                "final outbox and delivery receipts preserve agentId",
+                "non-main agent completed output sharing platform/channel/user axes is internal evidence, not parent final outbox",
+                "final outbox and delivery receipts preserve agent/lane ownership",
             ],
             runnable_tests: vec![
                 "channel_state::tests::new_session_records_agent_from_new_session_key",
@@ -619,11 +670,50 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "prompt::tests::prompt_bundle_hides_main_operation_plan_from_other_agent",
                 "runtime_worker::tests::prepare_runtime_queue_item_respects_agent_channel_lease_limit",
                 "runtime_pipeline::tests::channel_session_freshness_does_not_cross_suppress_other_agent",
+                "runtime_pipeline::tests::run_runtime_queue_once_suppresses_non_main_agent_final_outbox",
                 "memory::tests::non_main_memory_prompt_context_excludes_global_imported_snapshot_by_default",
                 "memory::tests::public_agent_read_path_smoke_surfaces_source_allow_list_and_filtered_counts",
+                "memory_pack::tests::retrieval_scope_session_requires_same_agent_and_session_key",
+                "memory_pack::tests::retrieval_scope_session_rejects_bare_session_key_even_when_equal",
+                "memory_pack::tests::retrieval_scope_agent_private_rejects_bare_session_key_even_when_equal",
+                "memory_pack::tests::retrieval_candidate_does_not_fall_back_to_wrong_lane_concrete_history",
+                "memory_pack::tests::retrieval_candidate_uses_project_after_wrong_lane_concrete_candidate",
+                "memory_pack::tests::retrieve_wrong_lane_concrete_history_reports_scope_denied_not_missing",
+                "memory_pack::tests::retrieve_wrong_lane_concrete_then_project_returns_explicit_broad_scope",
+                "memory_pack::tests::retrieve_wrong_lane_concrete_then_global_imported_returns_explicit_broad_scope",
                 "prompt::tests::prompt_bundle_new_command_boundary_skips_prior_task_memory_context",
             ],
-            promotion_gate: "Create or reuse a configured-agent matrix covering main, xiaoxiaoli, and a future public/coach agent without rebuilding shared loops.",
+            promotion_gate: "Create or reuse a configured-agent matrix covering main, xiaoxiaoli, and a future public/coach agent without rebuilding shared loops. For cross-session search, prove concrete session history is same-agent/session only, non-lane-qualified concrete keys fail closed, wrong-lane concrete candidates fail closed with denial receipts, and project/global fallback is explicit.",
+        },
+        ScenarioMatrixEntry {
+            id: "provider-request-acceleration",
+            title: "Provider request acceleration command and service tier routing",
+            changed_areas: vec![
+                "channel runtime",
+                "channel state",
+                "turn planning",
+                "codex runtime",
+                "provider request policy",
+            ],
+            required_invariants: vec!["I2", "I7", "I8"],
+            required_evidence: vec![
+                "/fast status|on|off|fast|normal are command replies and do not enqueue model turns",
+                "fast mode state is scoped by channel session and optional per-agent default",
+                "Codex app-server fast mode is gated by the local model catalog serviceTiers metadata",
+                "supported OpenAI/Codex app-server models request serviceTier=priority",
+                "normal mode resets supported Codex app-server models with serviceTier=default",
+                "unsupported models, unverified proxy providers, and non-Codex native routes do not receive serviceTier/speed fields",
+            ],
+            runnable_tests: vec![
+                "channel_runtime::tests::channel_step_reports_and_switches_fast_mode_with_route_capability",
+                "channel_runtime::tests::fast_request_policy_is_codex_model_catalog_gated",
+                "channel_state::tests::applies_fast_mode_and_new_session_clears_it",
+                "channel_state::tests::applies_global_fast_mode_as_agent_override",
+                "turns::tests::turn_plan_applies_fast_mode_as_provider_request_policy",
+                "turns::tests::turn_plan_uses_global_fast_mode_when_session_has_no_override",
+                "codex_runtime::tests::codex_app_server_service_tier_uses_provider_request_policy",
+            ],
+            promotion_gate: "Promote only after command-plane `/fast` replies remain model-turn-free, model catalog gating proves supported and unsupported routes, Codex app-server JSON-RPC params carry camelCase serviceTier for supported routes, and live Telegram/Discord smokes show enabled on a Fast-capable model or unsupported on a non-capable model.",
         },
         ScenarioMatrixEntry {
             id: "rich-message-presentation",
@@ -641,7 +731,9 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "semantic presentation schema validates fallback text, bounded blocks, safe URLs, media refs, and capability-gated actions",
                 "Telegram render fixture escapes HTML and disables link previews by default",
                 "Discord render fixture chunks under provider limit and keeps allowed_mentions.parse empty",
+                "plain-final Markdown subset maps bold, inline code, safe links, and lists into harness-owned semantic render output",
                 "rendered rich batches expose deterministic text/media/action units",
+                "delivery presentation receipts capture provider render mode, fallback reason, and full-text-preserved status",
                 "per-unit delivery receipts preserve partial rich-batch failures as retryable instead of delivered",
                 "callback actions require provider capability and mark re-entry gating",
                 "provider send helpers use adapter-rendered Telegram HTML and Discord content when presentation is present",
@@ -651,6 +743,7 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
             runnable_tests: vec![
                 "rich_presentation::tests::legacy_channel_outbound_message_without_presentation_stays_plain_text",
                 "rich_presentation::tests::plain_final_bridge_builds_safe_paragraph_and_code_blocks",
+                "rich_presentation::tests::plain_final_bridge_renders_markdown_subset_as_semantic_blocks",
                 "rich_presentation::tests::plain_final_bridge_maps_attachments_to_rendered_media_units",
                 "rich_presentation::tests::rich_presentation_validation_fails_closed_for_unsafe_shapes",
                 "rich_presentation::tests::telegram_render_fixture_escapes_html_and_disables_preview",
@@ -661,11 +754,72 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "runtime_pipeline::tests::run_runtime_queue_once_keeps_media_attachments_in_rich_presentation",
                 "runtime_pipeline::tests::already_recorded_completion_repair_keeps_progress_panel_out_of_final_outbox",
                 "channel_delivery::tests::rich_delivery_receipt_records_units_and_retries_partial_failure",
+                "channel_delivery::tests::delivery_receipt_without_presentation_field_stays_readable",
                 "channel_delivery::tests::rich_delivery_rejects_delivered_receipt_when_any_unit_failed",
+                "agent-harness-cli::tests::telegram_rich_sender_records_html_presentation_receipt",
+                "agent-harness-cli::tests::telegram_rich_outbound_delivery_records_html_receipt_closed_loop",
+                "agent-harness-cli::tests::telegram_rich_sender_falls_back_to_plain_on_validation_failure",
+                "agent-harness-cli::tests::telegram_rich_sender_falls_back_to_plain_on_provider_failure",
+                "agent-harness-cli::tests::discord_rich_sender_records_safe_markdown_presentation_receipt",
+                "agent-harness-cli::tests::discord_rich_sender_falls_back_to_plain_on_provider_failure",
                 "agent-harness-cli::tests::telegram_trusted_html_payload_keeps_renderer_output_unescaped",
                 "agent-harness-cli::tests::discord_attachment_payload_uses_caption_without_mentions",
             ],
             promotion_gate: "Promote Package D only after schema/validation/render fixtures, default final-to-presentation bridge tests, rendered-batch accounting, provider-rich text/media delivery integration, partial-failure receipt semantics, and action capability gates pass. Live Telegram inline callbacks, Discord components, clicked-action ingress re-entry, artifact/provider URL redaction coverage for generated presentation payloads, and live preview remain separate gates.",
+        },
+        ScenarioMatrixEntry {
+            id: "channel-media-delivery",
+            title: "Channel media directive, policy, and provider delivery",
+            changed_areas: vec![
+                "runtime pipeline",
+                "media delivery policy",
+                "channel delivery",
+                "Telegram adapter",
+                "Discord adapter",
+                "media",
+                "codex runtime",
+                "prompt",
+            ],
+            required_invariants: vec!["I2", "I7", "I9", "I11", "I13", "I14", "I16"],
+            required_evidence: vec![
+                "MEDIA directive parser extracts standalone, inline, quoted, and backticked absolute local paths while preserving unknown extensions",
+                "MEDIA directives inside code fences, inline code, and blockquotes are ignored and not stripped",
+                "media delivery policy rejects denied roots, unsupported paths, missing files, oversize files, and unsafe artifact refs with visible degradation plus receipts",
+                "channel-output prompt contract tells agents how to attach files and how policy rejection behaves",
+                "final-outbox media lint warns by default and can fail closed through media.lintFailClosed",
+                "rich media artifactRef-only inbound and generated-image artifact refs resolve to attachment-backed media after policy evaluation",
+                "Telegram sends photo/document/audio/voice/video and batches image albums in chunks of 10 with caption overflow text",
+                "Discord batches multipart attachments with files[0..9] and disabled mentions",
+                "Telegram inbound documents, voice/audio/video, static stickers, and reply media become bounded artifacts without provider URL/file-id leakage",
+                "Discord referenced-message attachments are fetched through the same host-gated downloader and marked referenced",
+                "native image input is config-gated and pending native image bloat triggers fresh-thread rollover before another turn",
+            ],
+            runnable_tests: vec![
+                "runtime_pipeline::tests::split_outbound_media_directives_extracts_attachments",
+                "runtime_pipeline::tests::outbound_media_parser_masks_protected_spans_and_preserves_unknown_tags",
+                "runtime_pipeline::tests::rejected_outbound_media_directive_leaves_visible_note",
+                "runtime_pipeline::tests::media_delivery_lint_warns_or_fails_closed_from_config",
+                "runtime_pipeline::tests::rich_media_artifact_ref_resolves_to_attachment_backed_unit",
+                "runtime_pipeline::tests::rich_media_generated_image_artifact_ref_resolves_to_attachment",
+                "runtime_pipeline::tests::rich_media_artifact_ref_policy_rejects_oversize_resolved_path",
+                "media_delivery_policy::tests::deliverable_extension_table_covers_core_media_kinds",
+                "media_delivery_policy::tests::policy_accepts_workspace_file_and_rejects_denied_state_file",
+                "prompt::tests::prompt_bundle_includes_channel_output_contract_once",
+                "media::tests::prompt_rendering_uses_safe_relative_paths_and_redacts_provider_urls",
+                "media::tests::codex_media_planner_model_attaches_only_when_native_enabled_and_path_contained",
+                "codex_runtime::tests::context_preflight_rolls_over_bound_thread_native_image_bloat",
+                "agent-harness-cli::tests::telegram_media_group_payload_uses_attach_files_and_first_caption",
+                "agent-harness-cli::tests::telegram_rich_sender_batches_image_media_units_as_albums",
+                "agent-harness-cli::tests::telegram_plain_sender_chunks_twelve_images_as_albums",
+                "agent-harness-cli::tests::telegram_plain_sender_truncates_attachment_caption_and_sends_remainder",
+                "agent-harness-cli::tests::discord_attachments_payload_batches_multiple_files_without_mentions",
+                "agent-harness-cli::tests::discord_referenced_message_attachment_becomes_referenced_artifact",
+                "telegram_media::tests::telegram_media_downloads_non_image_document_with_bounded_extraction",
+                "telegram_media::tests::telegram_media_downloads_voice_as_audio_metadata_only",
+                "telegram_media::tests::telegram_reply_to_message_media_is_referenced_provenance",
+                "telegram_media::tests::telegram_static_webp_sticker_downloads_as_image_artifact",
+            ],
+            promotion_gate: "Promote only after parser/policy, lint, provider senders, inbound artifact hygiene, referenced-media provenance, native-input readiness, and context-bloat rollover tests pass for both channel adapters; live cutover keeps media.nativeImageInput and media.lintFailClosed default-off until post-cutover enablement.",
         },
     ]
 }
@@ -704,10 +858,13 @@ pub fn release_checklist() -> ReleaseChecklist {
             "topology contract impact matrix reviewed for changed modules",
             "channel/runtime changes passed the agent-boundary scenario matrix",
             "prompt/memory changes passed /new task-boundary and per-agent memory recall checks",
+            "channel session history search/retrieval changes passed lane-bound candidate classification checks",
             "openclaw-mem bridge ownership changes passed configured-bridge and fallback gates",
-            "response/runtime changes passed final-surface separation checks, including stdout recovery without final_answer",
+            "response/runtime changes passed final-surface separation checks, including stdout recovery without final_answer, read-only review evidence suppression, and skipped-permanent retirement for invalid final outbox rows",
             "rich-message presentation changes passed adapter-rendering, no-ping, escaping, multi-unit receipt, and action re-entry verified-or-deferred checks",
+            "channel media delivery changes passed parser/policy, provider batching, inbound artifact hygiene, referenced-media, and native-image bloat scenario checks",
             "context rollover changes passed official-compact accounting and polluted-thread recovery checks",
+            "virtual-session working-context changes passed resolver exact-lane, CLI read surface, root snapshot enrichment, and carry-forward inheritance checks",
             "progress delivery changes passed edit-volume replay checks",
             "progress panel lane-cap heartbeat/current-step checks passed across channel platforms",
             "Codex tool-use timeout changes passed bounded recovery checks",
@@ -811,7 +968,7 @@ mod tests {
         assert!(
             release_checklist()
                 .required_items
-                .contains(&"response/runtime changes passed final-surface separation checks, including stdout recovery without final_answer")
+                .contains(&"response/runtime changes passed final-surface separation checks, including stdout recovery without final_answer, read-only review evidence suppression, and skipped-permanent retirement for invalid final outbox rows")
         );
         assert!(
             release_checklist()
@@ -878,6 +1035,40 @@ mod tests {
         assert!(!report.forbidden_hits.is_empty());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn virtual_session_rollover_catalog_promotes_cutover_b_s1_s5_pack() {
+        let scenario_matrix = scenario_matrix_catalog();
+        let entry = scenario_matrix
+            .iter()
+            .find(|entry| entry.id == "virtual-session-rollover")
+            .expect("virtual-session-rollover matrix entry");
+
+        for evidence in [
+            "S1 Telegram same-agent continuation consumes resolver prompt context",
+            "S2 Discord same-agent continuation consumes resolver prompt context",
+            "S3 same platform/channel/user different agent is not cross-suppressed",
+            "S4 /new closes the previous virtual session and starts a fresh task boundary",
+            "S5 max-depth terminal-failed guard preserves exact-lane resolver evidence only",
+        ] {
+            assert!(
+                entry.required_evidence.contains(&evidence),
+                "missing Cutover B required evidence: {evidence}"
+            );
+        }
+        for runnable in [
+            "prompt::tests::prompt_bundle_includes_virtual_session_resolver_context_section",
+            "prompt::tests::prompt_bundle_missing_reply_metadata_hint_uses_resolver_queue_ids",
+            "channel_state::tests::new_session_command_closes_previous_virtual_session_record",
+            "context_rollover::tests::virtual_session_thread_backfill_updates_matching_working_session",
+            "runtime_pipeline::tests::polluted_thread_continuation_runs_at_terminal_failure_and_respects_depth_limit",
+        ] {
+            assert!(
+                entry.runnable_tests.contains(&runnable),
+                "missing Cutover B runnable test: {runnable}"
+            );
+        }
     }
 
     fn temp_root(test_name: &str) -> PathBuf {

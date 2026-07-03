@@ -25,6 +25,7 @@ use agent_harness_core::{
     BackgroundTaskRecord, BackgroundTaskUpsertOptions, BudgetAcquireOptions,
     BuiltinHarnessSkillSyncOptions, BuiltinHarnessSkillSyncReport, ChannelCommand,
     ChannelCommandApplyOptions, ChannelCommandApplyReport, ChannelDeliveryIntentKind,
+    ChannelDeliveryPresentationFallbackReason, ChannelDeliveryPresentationReceipt,
     ChannelDeliveryReceipt, ChannelDeliveryRecordOptions, ChannelDeliveryRenderedUnitKind,
     ChannelDeliveryRenderedUnitReceipt, ChannelDeliveryStatus, ChannelDeliveryUnitStatus,
     ChannelIdentityLookup, ChannelIdentityResolutionStatus, ChannelOutboundAttachment,
@@ -64,20 +65,21 @@ use agent_harness_core::{
     OpsCutoverApplyOptions, OpsCutoverApproveOptions, OpsCutoverReceiptOptions,
     OpsCutoverRequestOptions, OpsCutoverStatusOptions, PromptAssemblyOptions, PromptBundle,
     PromptReductionOptions, PublicHygieneOptions, QueueShadowCompareOptions,
-    QueueShadowRecordOptions, RenderedRichUnitKind, RichPresentationValidationOptions,
-    RuntimeQueueCapacityOptions, RuntimeQueueControlAction, RuntimeQueueControlOptions,
-    RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, RuntimeQueuePrepareOptions,
-    RuntimeQueuePrepareReport, RuntimeRunOnceOptions, RuntimeRunOnceReport, RuntimeRunOnceStatus,
-    ScopedStopOptions, ScopedStopTarget, SecurityScanOptions, SkillApplyOptions,
-    SkillArchiveOptions, SkillIndex, SkillLearningProposalOperation, SkillLearningProposalStatus,
-    SkillLearningSignal, SkillProposalActionOptions, SkillProposalListOptions, SkillProposeOptions,
-    SkillSelectionQuery, SubagentLifecycleCloseOptions, SubagentLifecycleRecordOptions,
-    SubagentLifecycleShowOptions, SubagentLifecycleShowReport, SubagentLifecycleState,
-    SubagentPlan, SubagentPlanInput, SubagentWorkerEnqueueOptions, SuperviseDeployCanaryOptions,
-    SupervisionEvaluateOptions, SupervisorChildState, SupervisorInventoryOptions,
-    SupervisorInventoryServiceConfig, SupervisorLaunchCommand, TaskEntityOptions, TaskStatus,
-    TokenEfficiencyOptions, TraceOptions, TurnPlan, TurnPlanInput, VaultGetOptions,
-    VaultPutOptions, WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport,
+    QueueShadowRecordOptions, RenderedRichUnit, RenderedRichUnitKind,
+    RichPresentationValidationOptions, RuntimeQueueCapacityOptions, RuntimeQueueControlAction,
+    RuntimeQueueControlOptions, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
+    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeRunOnceOptions,
+    RuntimeRunOnceReport, RuntimeRunOnceStatus, ScopedStopOptions, ScopedStopTarget,
+    SecurityScanOptions, SkillApplyOptions, SkillArchiveOptions, SkillIndex,
+    SkillLearningProposalOperation, SkillLearningProposalStatus, SkillLearningSignal,
+    SkillProposalActionOptions, SkillProposalListOptions, SkillProposeOptions, SkillSelectionQuery,
+    SubagentLifecycleCloseOptions, SubagentLifecycleRecordOptions, SubagentLifecycleShowOptions,
+    SubagentLifecycleShowReport, SubagentLifecycleState, SubagentPlan, SubagentPlanInput,
+    SubagentWorkerEnqueueOptions, SuperviseDeployCanaryOptions, SupervisionEvaluateOptions,
+    SupervisorChildState, SupervisorInventoryOptions, SupervisorInventoryServiceConfig,
+    SupervisorLaunchCommand, TaskEntityOptions, TaskStatus, TokenEfficiencyOptions, TraceOptions,
+    TurnPlan, TurnPlanInput, VaultGetOptions, VaultPutOptions, VirtualSessionContextQuery,
+    VirtualSessionWorkingContext, WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport,
     WorkerCancelOptions, WorkerEnqueueOptions, WorkerEnqueueReport, WorkerJobKind,
     WorkerReapStaleOptions, WorkerRunOnceOptions, WorkerRunOnceReport, WorkerRunOnceStatus,
     WorkerStatusOptions, acquire_budget, add_operation_plan_item, append_harness_log,
@@ -114,8 +116,9 @@ use agent_harness_core::{
     record_subagent_lifecycle, record_supervise_deploy_canary, recover_memory_owner_state,
     reject_skill_proposal, release_checklist, render_rich_presentation_batch_for_discord,
     render_rich_presentation_batch_for_telegram, request_memory_owner_promotion,
-    requeue_prepared_context_rollover, resolve_channel_identity, rotate_harness_log_if_needed,
-    run_channel_once, run_codex_runtime, run_cron_scheduler_once, run_memory_canvas_worker,
+    requeue_prepared_context_rollover, resolve_channel_identity,
+    resolve_virtual_session_working_context, rotate_harness_log_if_needed, run_channel_once,
+    run_codex_runtime, run_cron_scheduler_once, run_memory_canvas_worker,
     run_memory_embedding_backfill, run_memory_hook_adapter, run_openclaw_mem_read_path_smoke,
     run_public_hygiene, run_runtime_queue_once, run_worker_once,
     runtime_worker::reconcile_runtime_queue_leases_for_generation, scan_security_boundaries,
@@ -275,6 +278,7 @@ fn main() {
         "cron-scheduler-run-once" => run_cron_scheduler_run_once(&rest),
         "cron-scheduler-loop" => run_cron_scheduler_loop(&rest),
         "context-rollover" => run_context_rollover(&rest),
+        "virtual-session-context" => run_virtual_session_context(&rest),
         "subagent-plan" => run_subagent_plan(&rest),
         "subagent-enqueue" => run_subagent_enqueue(&rest),
         "subagent-lifecycle" => run_subagent_lifecycle(&rest),
@@ -2675,6 +2679,7 @@ fn run_channel_delivery_record(args: &[String]) -> Result<(), String> {
         error: args.error,
         now_ms: args.now_ms,
         rendered_units: Vec::new(),
+        presentation: None,
     })
     .map_err(|err| err.to_string())?;
 
@@ -4465,6 +4470,7 @@ fn execute_telegram_poll_once(
                     error: None,
                     now_ms: current_time_ms()?,
                     rendered_units: send.rendered_units,
+                    presentation: send.presentation,
                 })
                 .map_err(|err| err.to_string())?;
                 delivered_messages += 1;
@@ -4483,6 +4489,7 @@ fn execute_telegram_poll_once(
                     error: Some(error.message.clone()),
                     now_ms: current_time_ms()?,
                     rendered_units: error.rendered_units,
+                    presentation: error.presentation,
                 })
                 .map_err(|err| err.to_string())?;
                 warnings.push(error.message);
@@ -5299,6 +5306,7 @@ fn execute_discord_outbox_send_once(
                     error: None,
                     now_ms: current_time_ms()?,
                     rendered_units: send.rendered_units,
+                    presentation: send.presentation,
                 })
                 .map_err(|err| err.to_string())?;
                 delivered_messages += 1;
@@ -5317,6 +5325,7 @@ fn execute_discord_outbox_send_once(
                     error: Some(error.message.clone()),
                     now_ms: current_time_ms()?,
                     rendered_units: error.rendered_units,
+                    presentation: error.presentation,
                 })
                 .map_err(|err| err.to_string())?;
                 warnings.push(error.message);
@@ -7257,6 +7266,27 @@ fn run_context_rollover(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn run_virtual_session_context(args: &[String]) -> Result<(), String> {
+    let envelope = virtual_session_context_envelope_from_args(args)?;
+    print_json(&envelope)
+}
+
+fn virtual_session_context_envelope_from_args(
+    args: &[String],
+) -> Result<VirtualSessionWorkingContext, String> {
+    let args = virtual_session_context_args_from_args(args)?;
+    resolve_virtual_session_working_context(VirtualSessionContextQuery {
+        harness_home: args.target_home,
+        platform: args.platform,
+        channel_id: args.channel_id,
+        user_id: args.user_id,
+        agent_id: args.agent_id,
+        session_key: args.session_key,
+        now_ms: args.now_ms,
+    })
+    .map_err(|err| err.to_string())
+}
+
 fn run_subagent_plan(args: &[String]) -> Result<(), String> {
     let args = subagent_plan_args_from_args(args)?;
     let ledger = load_subagent_ledger(&args.source).map_err(|err| err.to_string())?;
@@ -7620,6 +7650,43 @@ fn context_rollover_args_from_args(args: &[String]) -> Result<ContextRolloverArg
             .optional("--new-working-session-key")
             .map(ToString::to_string),
         reason: options.optional("--reason").map(ToString::to_string),
+        now_ms,
+    })
+}
+
+fn virtual_session_context_args_from_args(
+    args: &[String],
+) -> Result<VirtualSessionContextArgs, String> {
+    let options = SimpleOptions::parse(
+        args,
+        "virtual-session-context",
+        &[
+            "--platform",
+            "--channel-id",
+            "--user-id",
+            "--agent-id",
+            "--agent",
+            "--session-key",
+            "--now-ms",
+        ],
+        &["--json"],
+    )?;
+    let now_ms = options
+        .optional_i64("--now-ms")?
+        .unwrap_or(current_time_ms()?);
+    let agent_id = options
+        .optional("--agent-id")
+        .or_else(|| options.optional("--agent"))
+        .unwrap_or("main")
+        .to_string();
+
+    Ok(VirtualSessionContextArgs {
+        target_home: options.target_home.clone(),
+        platform: options.required("--platform")?,
+        channel_id: options.required("--channel-id")?,
+        user_id: options.required("--user-id")?,
+        agent_id,
+        session_key: options.optional("--session-key").map(ToString::to_string),
         now_ms,
     })
 }
@@ -8247,6 +8314,16 @@ struct ContextRolloverArgs {
     now_ms: i64,
 }
 
+struct VirtualSessionContextArgs {
+    target_home: PathBuf,
+    platform: String,
+    channel_id: String,
+    user_id: String,
+    agent_id: String,
+    session_key: Option<String>,
+    now_ms: i64,
+}
+
 struct SubagentLifecycleArgs {
     target_home: PathBuf,
     source_home: PathBuf,
@@ -8790,6 +8867,7 @@ struct DiscordReplyContext {
     referenced_text: Option<BoundedText>,
     has_attachments: bool,
     attachment_count: usize,
+    referenced_attachments: Vec<DiscordAttachmentMetadata>,
     embeds_count: usize,
     source: String,
     source_available: bool,
@@ -14681,11 +14759,10 @@ fn discord_reply_context(payload: &serde_json::Value) -> Option<DiscordReplyCont
     });
     let referenced_text =
         content.map(|content| bounded_text(content, REPLY_CONTEXT_FULL_TEXT_MAX_CHARS));
-    let attachment_count = referenced
-        .and_then(|referenced| referenced.get("attachments"))
-        .and_then(serde_json::Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
+    let referenced_attachments = referenced
+        .map(discord_attachment_metadata)
+        .unwrap_or_default();
+    let attachment_count = referenced_attachments.len();
     let embeds_count = referenced
         .and_then(|referenced| referenced.get("embeds"))
         .and_then(serde_json::Value::as_array)
@@ -14702,6 +14779,7 @@ fn discord_reply_context(payload: &serde_json::Value) -> Option<DiscordReplyCont
         referenced_text,
         has_attachments: attachment_count > 0,
         attachment_count,
+        referenced_attachments,
         embeds_count,
         source: if referenced.is_some() {
             "discord.referenced_message".to_string()
@@ -14822,10 +14900,35 @@ fn attach_discord_message_artifacts<F: DiscordAttachmentFetcher>(
             &message.message_id,
             index,
             attachment,
+            None,
+            "discord.attachment",
             fetcher,
         )?);
     }
+    if let Some(reply_context) = &message.reply_context {
+        for (index, attachment) in reply_context
+            .referenced_attachments
+            .iter()
+            .take(3)
+            .enumerate()
+        {
+            let referenced_message_id = reply_context
+                .referenced_message_id
+                .as_deref()
+                .unwrap_or(&message.message_id);
+            artifacts.push(discord_attachment_artifact(
+                harness_home,
+                referenced_message_id,
+                index,
+                attachment,
+                Some("referenced"),
+                "discord.referenced_message.attachment",
+                fetcher,
+            )?);
+        }
+    }
     message.inbound_media_artifacts = artifacts;
+    append_referenced_media_context(message);
     Ok(())
 }
 
@@ -14834,6 +14937,8 @@ fn discord_attachment_artifact<F: DiscordAttachmentFetcher>(
     message_id: &str,
     index: usize,
     attachment: &DiscordAttachmentMetadata,
+    provenance: Option<&str>,
+    source: &str,
     fetcher: &F,
 ) -> Result<InboundMediaArtifact, String> {
     let expected_mime = normalized_discord_attachment_mime(attachment.content_type.as_deref());
@@ -14849,7 +14954,8 @@ fn discord_attachment_artifact<F: DiscordAttachmentFetcher>(
         }),
         mime: expected_mime.clone(),
         byte_len: attachment.size,
-        source: "discord.attachment".to_string(),
+        source: source.to_string(),
+        provenance: provenance.map(ToString::to_string),
         model_attachment_status: InboundMediaModelAttachmentStatus::PromptOnly,
         ..InboundMediaArtifact::default()
     };
@@ -14944,6 +15050,33 @@ fn discord_attachment_artifact<F: DiscordAttachmentFetcher>(
         artifact.extraction_summary = Some(discord_text_attachment_extraction_summary(&bytes));
     }
     Ok(artifact)
+}
+
+fn append_referenced_media_context(message: &mut DiscordGatewayMessage) {
+    let referenced = message
+        .inbound_media_artifacts
+        .iter()
+        .filter(|artifact| artifact.provenance.as_deref() == Some("referenced"))
+        .filter_map(|artifact| {
+            let uri = artifact.artifact_uri.as_deref()?;
+            let bytes = artifact.byte_len.unwrap_or(0);
+            Some(format!(
+                "- repliedToMedia: {} ({}, {} bytes)",
+                uri, artifact.kind, bytes
+            ))
+        })
+        .collect::<Vec<_>>();
+    if referenced.is_empty() {
+        return;
+    }
+    let section = format!(
+        "## ReferencedMedia: Discord reply media\n{}",
+        referenced.join("\n")
+    );
+    message.inbound_context = Some(match message.inbound_context.take() {
+        Some(existing) if !existing.trim().is_empty() => format!("{existing}\n\n{section}"),
+        _ => section,
+    });
 }
 
 fn discord_attachment_url_allowed(url: &str) -> bool {
@@ -16264,6 +16397,7 @@ enum TelegramFormattingMode {
 struct ChannelSendAttempt {
     provider_message_id: Option<String>,
     rendered_units: Vec<ChannelDeliveryRenderedUnitReceipt>,
+    presentation: Option<ChannelDeliveryPresentationReceipt>,
 }
 
 #[derive(Debug, Clone)]
@@ -16271,6 +16405,7 @@ struct ChannelSendError {
     message: String,
     provider_message_id: Option<String>,
     rendered_units: Vec<ChannelDeliveryRenderedUnitReceipt>,
+    presentation: Option<ChannelDeliveryPresentationReceipt>,
 }
 
 impl From<String> for ChannelSendError {
@@ -16279,6 +16414,7 @@ impl From<String> for ChannelSendError {
             message,
             provider_message_id: None,
             rendered_units: Vec::new(),
+            presentation: None,
         }
     }
 }
@@ -16375,15 +16511,44 @@ fn telegram_send_outbound_message(
     token: &str,
     message: &ChannelOutboundMessage,
 ) -> Result<ChannelSendAttempt, ChannelSendError> {
+    telegram_send_outbound_message_with_senders(
+        harness_home,
+        message,
+        |text, options| telegram_send_message(token, &message.channel_id, text, options),
+        |attachment| telegram_send_attachment(token, &message.channel_id, attachment),
+        |attachments, options| {
+            telegram_send_media_group(token, &message.channel_id, attachments, options)
+        },
+    )
+}
+
+fn telegram_send_outbound_message_with_senders<TextSender, AttachmentSender, MediaGroupSender>(
+    harness_home: &Path,
+    message: &ChannelOutboundMessage,
+    mut send_text: TextSender,
+    mut send_attachment: AttachmentSender,
+    mut send_media_group: MediaGroupSender,
+) -> Result<ChannelSendAttempt, ChannelSendError>
+where
+    TextSender: FnMut(&str, TelegramSendOptions<'_>) -> Result<Option<String>, String>,
+    AttachmentSender: FnMut(&ChannelOutboundAttachment) -> Result<Option<String>, String>,
+    MediaGroupSender: FnMut(
+        &[ChannelOutboundAttachment],
+        TelegramSendOptions<'_>,
+    ) -> Result<Option<String>, String>,
+{
     if message.presentation.is_some() {
-        return telegram_send_rich_outbound_message(token, message);
+        return telegram_send_rich_outbound_message_with_senders(
+            message,
+            send_text,
+            send_attachment,
+            send_media_group,
+        );
     }
     let mut provider_message_ids = Vec::new();
     let text = format_channel_reply_text(&message.text);
     if message.attachments.is_empty() || !text.trim().is_empty() {
-        if let Some(provider_message_id) = telegram_send_message(
-            token,
-            &message.channel_id,
+        if let Some(provider_message_id) = send_text(
             &text,
             TelegramSendOptions {
                 reply_to_message_id: telegram_reply_to_message_id(message),
@@ -16396,25 +16561,45 @@ fn telegram_send_outbound_message(
             provider_message_ids.push(provider_message_id);
         }
     }
-    for attachment in &message.attachments {
-        if let Some(provider_message_id) =
-            telegram_send_attachment(token, &message.channel_id, attachment)
-                .map_err(ChannelSendError::from)?
-        {
-            provider_message_ids.push(provider_message_id);
-        }
-    }
+    send_telegram_attachment_sequence(
+        &message.attachments,
+        TelegramSendOptions {
+            reply_to_message_id: telegram_reply_to_message_id(message),
+            message_thread_id: telegram_message_thread_id(message),
+            formatting_mode: TelegramFormattingMode::Plain,
+        },
+        &mut send_text,
+        &mut send_attachment,
+        &mut send_media_group,
+        &mut provider_message_ids,
+    )
+    .map_err(ChannelSendError::from)?;
     Ok(ChannelSendAttempt {
         provider_message_id: (!provider_message_ids.is_empty())
             .then(|| provider_message_ids.join(",")),
         rendered_units: Vec::new(),
+        presentation: None,
     })
 }
 
-fn telegram_send_rich_outbound_message(
-    token: &str,
+fn telegram_send_rich_outbound_message_with_senders<
+    TextSender,
+    AttachmentSender,
+    MediaGroupSender,
+>(
     message: &ChannelOutboundMessage,
-) -> Result<ChannelSendAttempt, ChannelSendError> {
+    mut send_text: TextSender,
+    mut send_attachment: AttachmentSender,
+    mut send_media_group: MediaGroupSender,
+) -> Result<ChannelSendAttempt, ChannelSendError>
+where
+    TextSender: FnMut(&str, TelegramSendOptions<'_>) -> Result<Option<String>, String>,
+    AttachmentSender: FnMut(&ChannelOutboundAttachment) -> Result<Option<String>, String>,
+    MediaGroupSender: FnMut(
+        &[ChannelOutboundAttachment],
+        TelegramSendOptions<'_>,
+    ) -> Result<Option<String>, String>,
+{
     let presentation = message
         .presentation
         .as_ref()
@@ -16422,35 +16607,44 @@ fn telegram_send_rich_outbound_message(
             message: "rich presentation was missing".to_string(),
             provider_message_id: None,
             rendered_units: Vec::new(),
+            presentation: None,
         })?;
-    let batch = render_rich_presentation_batch_for_telegram(
+    let batch = match render_rich_presentation_batch_for_telegram(
         presentation,
         &RichPresentationValidationOptions {
             attachment_count: message.attachments.len(),
             allow_url_actions: true,
             allow_callback_actions: false,
         },
-    )
-    .map_err(|error| ChannelSendError {
-        message: format!(
-            "Telegram rich presentation validation failed at {}: {}",
-            error.field, error.message
-        ),
-        provider_message_id: None,
-        rendered_units: Vec::new(),
-    })?;
+    ) {
+        Ok(batch) => batch,
+        Err(error) => {
+            let source_error = format!(
+                "Telegram rich presentation validation failed at {}: {}",
+                error.field, error.message
+            );
+            return telegram_send_plain_fallback_with_senders(
+                message,
+                ChannelDeliveryPresentationFallbackReason::ValidationFailure,
+                source_error,
+                &mut send_text,
+                &mut send_attachment,
+            );
+        }
+    };
     let mut provider_message_ids = Vec::new();
     let mut rendered_units = Vec::new();
     let mut first_message = true;
     let mut text_provider_message_id = None;
 
-    for unit in batch.units {
+    let units = batch.units;
+    let mut unit_index = 0usize;
+    while unit_index < units.len() {
+        let unit = units[unit_index].clone();
         match unit.kind {
             RenderedRichUnitKind::Text => {
                 let text = unit.text.unwrap_or_default();
-                let send = telegram_send_message(
-                    token,
-                    &message.channel_id,
+                let send = send_text(
                     &text,
                     TelegramSendOptions {
                         reply_to_message_id: first_message
@@ -16476,22 +16670,103 @@ fn telegram_send_rich_outbound_message(
                         ));
                     }
                     Err(error) => {
-                        rendered_units.push(rendered_unit_receipt(
-                            unit.unit_id,
-                            unit.kind,
-                            ChannelDeliveryUnitStatus::Failed,
-                            None,
-                            Some(error.clone()),
-                        ));
-                        return Err(ChannelSendError {
-                            message: error,
-                            provider_message_id: joined_provider_ids(&provider_message_ids),
-                            rendered_units,
-                        });
+                        return telegram_send_plain_fallback_with_senders(
+                            message,
+                            ChannelDeliveryPresentationFallbackReason::ProviderFallback,
+                            error,
+                            &mut send_text,
+                            &mut send_attachment,
+                        );
                     }
                 }
             }
             RenderedRichUnitKind::Media => {
+                if let Some((group, next_index)) =
+                    collect_telegram_rich_image_group(&units, unit_index, message)
+                    && group.len() >= 2
+                {
+                    for chunk in group.chunks(10) {
+                        let attachments = chunk
+                            .iter()
+                            .map(|(_, attachment)| attachment.clone())
+                            .collect::<Vec<_>>();
+                        let (attachments, overflow) =
+                            telegram_media_group_attachments_with_caption_limit(&attachments);
+                        let send = send_media_group(
+                            &attachments,
+                            TelegramSendOptions {
+                                reply_to_message_id: first_message
+                                    .then(|| telegram_reply_to_message_id(message))
+                                    .flatten(),
+                                message_thread_id: telegram_message_thread_id(message),
+                                formatting_mode: TelegramFormattingMode::Plain,
+                            },
+                        );
+                        first_message = false;
+                        match send {
+                            Ok(provider_message_id) => {
+                                if let Some(id) = provider_message_id.clone() {
+                                    provider_message_ids.push(id);
+                                }
+                                if let Some(overflow) = overflow {
+                                    match send_text(
+                                        &overflow,
+                                        TelegramSendOptions {
+                                            reply_to_message_id: None,
+                                            message_thread_id: telegram_message_thread_id(message),
+                                            formatting_mode: TelegramFormattingMode::Plain,
+                                        },
+                                    ) {
+                                        Ok(Some(id)) => provider_message_ids.push(id),
+                                        Ok(None) => {}
+                                        Err(error) => {
+                                            return Err(ChannelSendError {
+                                                message: format!(
+                                                    "Telegram media group caption overflow send failed: {error}"
+                                                ),
+                                                provider_message_id: joined_provider_ids(
+                                                    &provider_message_ids,
+                                                ),
+                                                rendered_units,
+                                                presentation: None,
+                                            });
+                                        }
+                                    }
+                                }
+                                for (group_unit, attachment) in chunk {
+                                    rendered_units.push(rendered_media_unit_receipt(
+                                        group_unit.unit_id.clone(),
+                                        group_unit.kind,
+                                        ChannelDeliveryUnitStatus::Delivered,
+                                        provider_message_id.clone(),
+                                        None,
+                                        attachment.kind,
+                                    ));
+                                }
+                            }
+                            Err(error) => {
+                                for (group_unit, attachment) in chunk {
+                                    rendered_units.push(rendered_media_unit_receipt(
+                                        group_unit.unit_id.clone(),
+                                        group_unit.kind,
+                                        ChannelDeliveryUnitStatus::Failed,
+                                        None,
+                                        Some(error.clone()),
+                                        attachment.kind,
+                                    ));
+                                }
+                                return Err(ChannelSendError {
+                                    message: error,
+                                    provider_message_id: joined_provider_ids(&provider_message_ids),
+                                    rendered_units,
+                                    presentation: None,
+                                });
+                            }
+                        }
+                    }
+                    unit_index = next_index;
+                    continue;
+                }
                 let Some(index) = unit.attachment_index else {
                     let error = "Telegram rich media artifact refs are not live-deliverable without an attachment index".to_string();
                     rendered_units.push(rendered_unit_receipt(
@@ -16505,6 +16780,7 @@ fn telegram_send_rich_outbound_message(
                         message: error,
                         provider_message_id: joined_provider_ids(&provider_message_ids),
                         rendered_units,
+                        presentation: None,
                     });
                 };
                 let Some(base_attachment) = message.attachments.get(index) else {
@@ -16520,6 +16796,7 @@ fn telegram_send_rich_outbound_message(
                         message: error,
                         provider_message_id: joined_provider_ids(&provider_message_ids),
                         rendered_units,
+                        presentation: None,
                     });
                 };
                 let mut attachment = base_attachment.clone();
@@ -16530,31 +16807,68 @@ fn telegram_send_rich_outbound_message(
                 {
                     attachment.caption = unit.text.clone();
                 }
-                match telegram_send_attachment(token, &message.channel_id, &attachment) {
+                let (attachment, overflow) = attachment_with_telegram_caption_limit(&attachment);
+                match send_attachment(&attachment) {
                     Ok(provider_message_id) => {
                         if let Some(id) = provider_message_id.clone() {
                             provider_message_ids.push(id);
                         }
-                        rendered_units.push(rendered_unit_receipt(
+                        if let Some(overflow) = overflow {
+                            match send_text(
+                                &overflow,
+                                TelegramSendOptions {
+                                    reply_to_message_id: None,
+                                    message_thread_id: telegram_message_thread_id(message),
+                                    formatting_mode: TelegramFormattingMode::Plain,
+                                },
+                            ) {
+                                Ok(Some(id)) => provider_message_ids.push(id),
+                                Ok(None) => {}
+                                Err(error) => {
+                                    rendered_units.push(rendered_media_unit_receipt(
+                                        unit.unit_id,
+                                        unit.kind,
+                                        ChannelDeliveryUnitStatus::Failed,
+                                        None,
+                                        Some(error.clone()),
+                                        attachment.kind,
+                                    ));
+                                    return Err(ChannelSendError {
+                                        message: format!(
+                                            "Telegram attachment caption overflow send failed: {error}"
+                                        ),
+                                        provider_message_id: joined_provider_ids(
+                                            &provider_message_ids,
+                                        ),
+                                        rendered_units,
+                                        presentation: None,
+                                    });
+                                }
+                            }
+                        }
+                        rendered_units.push(rendered_media_unit_receipt(
                             unit.unit_id,
                             unit.kind,
                             ChannelDeliveryUnitStatus::Delivered,
                             provider_message_id,
                             None,
+                            attachment.kind,
                         ));
                     }
                     Err(error) => {
-                        rendered_units.push(rendered_unit_receipt(
+                        rendered_units.push(rendered_media_unit_receipt(
                             unit.unit_id,
                             unit.kind,
                             ChannelDeliveryUnitStatus::Failed,
                             None,
                             Some(error.clone()),
+                            attachment.kind,
                         ));
                         return Err(ChannelSendError {
                             message: error,
                             provider_message_id: joined_provider_ids(&provider_message_ids),
                             rendered_units,
+                            presentation: None,
                         });
                     }
                 }
@@ -16569,11 +16883,100 @@ fn telegram_send_rich_outbound_message(
                 ));
             }
         }
+        unit_index += 1;
     }
 
     Ok(ChannelSendAttempt {
         provider_message_id: joined_provider_ids(&provider_message_ids),
         rendered_units,
+        presentation: Some(ChannelDeliveryPresentationReceipt::rendered(
+            "telegram:parse_mode=HTML",
+        )),
+    })
+}
+
+fn telegram_send_plain_fallback_with_senders<TextSender, AttachmentSender>(
+    message: &ChannelOutboundMessage,
+    reason: ChannelDeliveryPresentationFallbackReason,
+    source_error: String,
+    send_text: &mut TextSender,
+    send_attachment: &mut AttachmentSender,
+) -> Result<ChannelSendAttempt, ChannelSendError>
+where
+    TextSender: FnMut(&str, TelegramSendOptions<'_>) -> Result<Option<String>, String>,
+    AttachmentSender: FnMut(&ChannelOutboundAttachment) -> Result<Option<String>, String>,
+{
+    let text = format_channel_reply_text(&message.text);
+    let full_text_preserved = text == message.text.trim();
+    let mut provider_message_ids = Vec::new();
+    let mut rendered_units = Vec::new();
+    if message.attachments.is_empty() || !text.trim().is_empty() {
+        match send_text(
+            &text,
+            TelegramSendOptions {
+                reply_to_message_id: telegram_reply_to_message_id(message),
+                message_thread_id: telegram_message_thread_id(message),
+                formatting_mode: TelegramFormattingMode::Plain,
+            },
+        ) {
+            Ok(provider_message_id) => {
+                if let Some(id) = provider_message_id.clone() {
+                    provider_message_ids.push(id);
+                }
+                rendered_units.push(ChannelDeliveryRenderedUnitReceipt {
+                    unit_id: "text:fallback".to_string(),
+                    kind: ChannelDeliveryRenderedUnitKind::Text,
+                    attachment_kind: None,
+                    status: ChannelDeliveryUnitStatus::Delivered,
+                    provider_message_id,
+                    error: None,
+                });
+            }
+            Err(error) => {
+                return Err(ChannelSendError {
+                    message: format!("{source_error}; Telegram plain fallback failed: {error}"),
+                    provider_message_id: joined_provider_ids(&provider_message_ids),
+                    rendered_units,
+                    presentation: Some(ChannelDeliveryPresentationReceipt::fallback(
+                        reason,
+                        "telegram:plain-text",
+                        false,
+                    )),
+                });
+            }
+        }
+    }
+    for attachment in &message.attachments {
+        match send_attachment(attachment) {
+            Ok(provider_message_id) => {
+                if let Some(id) = provider_message_id.clone() {
+                    provider_message_ids.push(id);
+                }
+            }
+            Err(error) => {
+                return Err(ChannelSendError {
+                    message: format!(
+                        "{source_error}; Telegram fallback attachment failed: {error}"
+                    ),
+                    provider_message_id: joined_provider_ids(&provider_message_ids),
+                    rendered_units,
+                    presentation: Some(ChannelDeliveryPresentationReceipt::fallback(
+                        reason,
+                        "telegram:plain-text",
+                        full_text_preserved,
+                    )),
+                });
+            }
+        }
+    }
+    Ok(ChannelSendAttempt {
+        provider_message_id: joined_provider_ids(&provider_message_ids),
+        rendered_units,
+        presentation: Some(ChannelDeliveryPresentationReceipt::fallback(
+            reason,
+            "telegram:plain-text",
+            full_text_preserved,
+        )),
     })
 }
 
@@ -16593,10 +16996,24 @@ fn rendered_unit_receipt(
                 ChannelDeliveryRenderedUnitKind::ComponentAction
             }
         },
+        attachment_kind: None,
         status,
         provider_message_id,
         error,
     }
+}
+
+fn rendered_media_unit_receipt(
+    unit_id: String,
+    kind: RenderedRichUnitKind,
+    status: ChannelDeliveryUnitStatus,
+    provider_message_id: Option<String>,
+    error: Option<String>,
+    attachment_kind: ChannelOutboundAttachmentKind,
+) -> ChannelDeliveryRenderedUnitReceipt {
+    let mut receipt = rendered_unit_receipt(unit_id, kind, status, provider_message_id, error);
+    receipt.attachment_kind = Some(attachment_kind);
+    receipt
 }
 
 fn joined_provider_ids(ids: &[String]) -> Option<String> {
@@ -16874,13 +17291,16 @@ fn telegram_send_attachment(
     let (method, file_field) = match attachment.kind {
         ChannelOutboundAttachmentKind::Image => ("sendPhoto", "photo"),
         ChannelOutboundAttachmentKind::Document => ("sendDocument", "document"),
+        ChannelOutboundAttachmentKind::Audio => ("sendAudio", "audio"),
+        ChannelOutboundAttachmentKind::Voice => ("sendVoice", "voice"),
+        ChannelOutboundAttachmentKind::Video => ("sendVideo", "video"),
     };
     let url = format!("https://api.telegram.org/bot{token}/{method}");
     let mut fields = vec![("chat_id".to_string(), chat_id.to_string())];
     if let Some(caption) = attachment.caption.as_deref()
         && !caption.trim().is_empty()
     {
-        fields.push(("caption".to_string(), caption.to_string()));
+        fields.push(("caption".to_string(), telegram_truncate_caption(caption)));
     }
     let value = multipart_post_json("Telegram", &url, None, &fields, file_field, attachment)?;
     if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
@@ -16892,6 +17312,110 @@ fn telegram_send_attachment(
         .get("result")
         .and_then(|result| result.get("message_id"))
         .and_then(telegram_id_string))
+}
+
+fn telegram_send_media_group(
+    token: &str,
+    chat_id: &str,
+    attachments: &[ChannelOutboundAttachment],
+    options: TelegramSendOptions<'_>,
+) -> Result<Option<String>, String> {
+    if attachments.len() < 2 || attachments.len() > 10 {
+        return Err("Telegram media group must contain between 2 and 10 attachments".to_string());
+    }
+    if attachments
+        .iter()
+        .any(|attachment| attachment.kind != ChannelOutboundAttachmentKind::Image)
+    {
+        return Err("Telegram media group currently supports image attachments only".to_string());
+    }
+    let url = format!("https://api.telegram.org/bot{token}/sendMediaGroup");
+    let file_fields = telegram_media_group_file_fields(attachments.len());
+    let fields = telegram_media_group_fields(chat_id, attachments, options, &file_fields)?;
+    let value = multipart_post_json_attachments_with_field_names(
+        "Telegram",
+        &url,
+        None,
+        &fields,
+        &file_fields,
+        attachments,
+    )?;
+    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(format!(
+            "Telegram sendMediaGroup returned non-ok response: {value}"
+        ));
+    }
+    let ids = value
+        .get("result")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message.get("message_id").and_then(telegram_id_string))
+        .collect::<Vec<_>>();
+    Ok((!ids.is_empty()).then(|| ids.join(",")))
+}
+
+fn telegram_media_group_file_fields(count: usize) -> Vec<String> {
+    (0..count).map(|index| format!("file{index}")).collect()
+}
+
+fn telegram_media_group_fields(
+    chat_id: &str,
+    attachments: &[ChannelOutboundAttachment],
+    options: TelegramSendOptions<'_>,
+    file_fields: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    if attachments.len() != file_fields.len() {
+        return Err("Telegram media group file field count mismatch".to_string());
+    }
+    let media = attachments
+        .iter()
+        .zip(file_fields)
+        .enumerate()
+        .map(|(index, (attachment, field))| {
+            let mut row = serde_json::json!({
+                "type": "photo",
+                "media": format!("attach://{field}")
+            });
+            if index == 0
+                && let Some(caption) = attachment.caption.as_deref()
+                && !caption.trim().is_empty()
+            {
+                row["caption"] = serde_json::json!(telegram_truncate_caption(caption));
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    let mut fields = vec![
+        ("chat_id".to_string(), chat_id.to_string()),
+        (
+            "media".to_string(),
+            serde_json::to_string(&media).map_err(|err| err.to_string())?,
+        ),
+    ];
+    if let Some(reply_to_message_id) = options.reply_to_message_id {
+        fields.push((
+            "reply_to_message_id".to_string(),
+            reply_to_message_id.to_string(),
+        ));
+        fields.push((
+            "allow_sending_without_reply".to_string(),
+            "true".to_string(),
+        ));
+    }
+    if let Some(thread_id) = options
+        .message_thread_id
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty())
+        && let Ok(thread_id) = thread_id.parse::<i64>()
+    {
+        fields.push(("message_thread_id".to_string(), thread_id.to_string()));
+    }
+    Ok(fields)
+}
+
+fn telegram_truncate_caption(caption: &str) -> String {
+    caption.trim().chars().take(1024).collect()
 }
 
 fn format_channel_reply_text(text: &str) -> String {
@@ -17005,6 +17529,86 @@ fn multipart_post_json(
     response.into_json().map_err(|err| err.to_string())
 }
 
+fn multipart_post_json_attachments(
+    service: &str,
+    url: &str,
+    auth_header: Option<(&str, &str)>,
+    fields: &[(String, String)],
+    attachments: &[ChannelOutboundAttachment],
+) -> Result<serde_json::Value, String> {
+    let file_fields = (0..attachments.len())
+        .map(|index| format!("files[{index}]"))
+        .collect::<Vec<_>>();
+    multipart_post_json_attachments_with_field_names(
+        service,
+        url,
+        auth_header,
+        fields,
+        &file_fields,
+        attachments,
+    )
+}
+
+fn multipart_post_json_attachments_with_field_names(
+    service: &str,
+    url: &str,
+    auth_header: Option<(&str, &str)>,
+    fields: &[(String, String)],
+    file_fields: &[String],
+    attachments: &[ChannelOutboundAttachment],
+) -> Result<serde_json::Value, String> {
+    if file_fields.len() != attachments.len() {
+        return Err(format!(
+            "{service} multipart file field count did not match attachment count"
+        ));
+    }
+    let mut files = Vec::new();
+    for attachment in attachments {
+        let file_bytes = fs::read(&attachment.path).map_err(|err| {
+            format!(
+                "{service} attachment file could not be read at {}: {err}",
+                attachment.path.display()
+            )
+        })?;
+        files.push((
+            attachment_filename(attachment)?,
+            attachment_mime(attachment),
+            file_bytes,
+        ));
+    }
+    let boundary = format!(
+        "agent-harness-{}-{}",
+        std::process::id(),
+        current_time_ms().unwrap_or(0)
+    );
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        push_multipart_field(&mut body, &boundary, name, value);
+    }
+    for (index, (filename, mime, file_bytes)) in files.iter().enumerate() {
+        push_multipart_file(
+            &mut body,
+            &boundary,
+            &file_fields[index],
+            filename,
+            mime,
+            file_bytes,
+        );
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+    let agent = channel_http_short_agent();
+    let content_type = format!("multipart/form-data; boundary={boundary}");
+    let mut request = agent.post(url).set("Content-Type", &content_type);
+    if let Some((name, value)) = auth_header {
+        request = request.set(name, value);
+    }
+    let response = request
+        .send_bytes(&body)
+        .map_err(|error| multipart_http_error(service, error))?;
+    response.into_json().map_err(|err| err.to_string())
+}
+
 fn push_multipart_field(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
     body.extend_from_slice(
         format!(
@@ -17082,9 +17686,31 @@ fn attachment_mime_from_path(path: &Path) -> Option<String> {
         Some("png") => Some("image/png".to_string()),
         Some("gif") => Some("image/gif".to_string()),
         Some("webp") => Some("image/webp".to_string()),
+        Some("bmp") => Some("image/bmp".to_string()),
+        Some("tiff") => Some("image/tiff".to_string()),
+        Some("mp4") => Some("video/mp4".to_string()),
+        Some("mov") => Some("video/quicktime".to_string()),
+        Some("webm") => Some("video/webm".to_string()),
+        Some("mkv") => Some("video/x-matroska".to_string()),
+        Some("avi") => Some("video/x-msvideo".to_string()),
+        Some("mp3") => Some("audio/mpeg".to_string()),
+        Some("wav") => Some("audio/wav".to_string()),
+        Some("ogg") => Some("audio/ogg".to_string()),
+        Some("opus") => Some("audio/opus".to_string()),
+        Some("m4a") => Some("audio/mp4".to_string()),
+        Some("flac") => Some("audio/flac".to_string()),
         Some("pdf") => Some("application/pdf".to_string()),
+        Some("csv") => Some("text/csv".to_string()),
+        Some("tsv") => Some("text/tab-separated-values".to_string()),
         Some("json") => Some("application/json".to_string()),
         Some("txt" | "md" | "log") => Some("text/plain".to_string()),
+        Some("xml") => Some("application/xml".to_string()),
+        Some("yaml" | "yml") => Some("application/yaml".to_string()),
+        Some("html") => Some("text/html".to_string()),
+        Some("zip") => Some("application/zip".to_string()),
+        Some("tar") => Some("application/x-tar".to_string()),
+        Some("gz") => Some("application/gzip".to_string()),
+        Some("7z") => Some("application/x-7z-compressed".to_string()),
         _ => None,
     }
 }
@@ -17164,7 +17790,27 @@ fn discord_send_outbound_message(
     }
     let mut provider_message_ids = Vec::new();
     let text = format_channel_reply_text(&message.text);
-    if !text.trim().is_empty() {
+    if !message.attachments.is_empty() {
+        let mut first_batch = true;
+        for batch in message.attachments.chunks(10) {
+            let content = if first_batch { text.as_str() } else { "" };
+            let reference = first_batch
+                .then(|| discord_message_reference(message))
+                .flatten();
+            if let Some(provider_message_id) = discord_send_attachments_batch(
+                token,
+                &message.channel_id,
+                content,
+                reference,
+                batch,
+            )
+            .map_err(ChannelSendError::from)?
+            {
+                provider_message_ids.push(provider_message_id);
+            }
+            first_batch = false;
+        }
+    } else if !text.trim().is_empty() {
         if let Some(provider_message_id) = discord_send_message_chunks(
             token,
             &message.channel_id,
@@ -17172,14 +17818,6 @@ fn discord_send_outbound_message(
             discord_message_reference(message),
         )
         .map_err(ChannelSendError::from)?
-        {
-            provider_message_ids.push(provider_message_id);
-        }
-    }
-    for attachment in &message.attachments {
-        if let Some(provider_message_id) =
-            discord_send_attachment(token, &message.channel_id, attachment)
-                .map_err(ChannelSendError::from)?
         {
             provider_message_ids.push(provider_message_id);
         }
@@ -17199,6 +17837,7 @@ fn discord_send_outbound_message(
     Ok(ChannelSendAttempt {
         provider_message_id: joined_provider_ids(&provider_message_ids),
         rendered_units: Vec::new(),
+        presentation: None,
     })
 }
 
@@ -17206,6 +17845,22 @@ fn discord_send_rich_outbound_message(
     token: &str,
     message: &ChannelOutboundMessage,
 ) -> Result<ChannelSendAttempt, ChannelSendError> {
+    discord_send_rich_outbound_message_with_senders(
+        message,
+        |text, reference| discord_send_message(token, &message.channel_id, text, reference),
+        |attachment| discord_send_attachment(token, &message.channel_id, attachment),
+    )
+}
+
+fn discord_send_rich_outbound_message_with_senders<TextSender, AttachmentSender>(
+    message: &ChannelOutboundMessage,
+    mut send_text: TextSender,
+    mut send_attachment: AttachmentSender,
+) -> Result<ChannelSendAttempt, ChannelSendError>
+where
+    TextSender: FnMut(&str, Option<serde_json::Value>) -> Result<Option<String>, String>,
+    AttachmentSender: FnMut(&ChannelOutboundAttachment) -> Result<Option<String>, String>,
+{
     let presentation = message
         .presentation
         .as_ref()
@@ -17213,23 +17868,31 @@ fn discord_send_rich_outbound_message(
             message: "rich presentation was missing".to_string(),
             provider_message_id: None,
             rendered_units: Vec::new(),
+            presentation: None,
         })?;
-    let batch = render_rich_presentation_batch_for_discord(
+    let batch = match render_rich_presentation_batch_for_discord(
         presentation,
         &RichPresentationValidationOptions {
             attachment_count: message.attachments.len(),
             allow_url_actions: true,
             allow_callback_actions: false,
         },
-    )
-    .map_err(|error| ChannelSendError {
-        message: format!(
-            "Discord rich presentation validation failed at {}: {}",
-            error.field, error.message
-        ),
-        provider_message_id: None,
-        rendered_units: Vec::new(),
-    })?;
+    ) {
+        Ok(batch) => batch,
+        Err(error) => {
+            let source_error = format!(
+                "Discord rich presentation validation failed at {}: {}",
+                error.field, error.message
+            );
+            return discord_send_plain_fallback_with_senders(
+                message,
+                ChannelDeliveryPresentationFallbackReason::ValidationFailure,
+                source_error,
+                &mut send_text,
+                &mut send_attachment,
+            );
+        }
+    };
     let mut provider_message_ids = Vec::new();
     let mut rendered_units = Vec::new();
     let mut first_message = true;
@@ -17243,7 +17906,7 @@ fn discord_send_rich_outbound_message(
                     .then(|| discord_message_reference(message))
                     .flatten();
                 first_message = false;
-                match discord_send_message(token, &message.channel_id, &text, reference) {
+                match send_text(&text, reference) {
                     Ok(provider_message_id) => {
                         if let Some(id) = provider_message_id.clone() {
                             last_text_provider_message_id = Some(id.clone());
@@ -17258,18 +17921,13 @@ fn discord_send_rich_outbound_message(
                         ));
                     }
                     Err(error) => {
-                        rendered_units.push(rendered_unit_receipt(
-                            unit.unit_id,
-                            unit.kind,
-                            ChannelDeliveryUnitStatus::Failed,
-                            None,
-                            Some(error.clone()),
-                        ));
-                        return Err(ChannelSendError {
-                            message: error,
-                            provider_message_id: joined_provider_ids(&provider_message_ids),
-                            rendered_units,
-                        });
+                        return discord_send_plain_fallback_with_senders(
+                            message,
+                            ChannelDeliveryPresentationFallbackReason::ProviderFallback,
+                            error,
+                            &mut send_text,
+                            &mut send_attachment,
+                        );
                     }
                 }
             }
@@ -17287,6 +17945,7 @@ fn discord_send_rich_outbound_message(
                         message: error,
                         provider_message_id: joined_provider_ids(&provider_message_ids),
                         rendered_units,
+                        presentation: None,
                     });
                 };
                 let Some(base_attachment) = message.attachments.get(index) else {
@@ -17302,6 +17961,7 @@ fn discord_send_rich_outbound_message(
                         message: error,
                         provider_message_id: joined_provider_ids(&provider_message_ids),
                         rendered_units,
+                        presentation: None,
                     });
                 };
                 let mut attachment = base_attachment.clone();
@@ -17312,31 +17972,34 @@ fn discord_send_rich_outbound_message(
                 {
                     attachment.caption = unit.text.clone();
                 }
-                match discord_send_attachment(token, &message.channel_id, &attachment) {
+                match send_attachment(&attachment) {
                     Ok(provider_message_id) => {
                         if let Some(id) = provider_message_id.clone() {
                             provider_message_ids.push(id);
                         }
-                        rendered_units.push(rendered_unit_receipt(
+                        rendered_units.push(rendered_media_unit_receipt(
                             unit.unit_id,
                             unit.kind,
                             ChannelDeliveryUnitStatus::Delivered,
                             provider_message_id,
                             None,
+                            attachment.kind,
                         ));
                     }
                     Err(error) => {
-                        rendered_units.push(rendered_unit_receipt(
+                        rendered_units.push(rendered_media_unit_receipt(
                             unit.unit_id,
                             unit.kind,
                             ChannelDeliveryUnitStatus::Failed,
                             None,
                             Some(error.clone()),
+                            attachment.kind,
                         ));
                         return Err(ChannelSendError {
                             message: error,
                             provider_message_id: joined_provider_ids(&provider_message_ids),
                             rendered_units,
+                            presentation: None,
                         });
                     }
                 }
@@ -17356,7 +18019,291 @@ fn discord_send_rich_outbound_message(
     Ok(ChannelSendAttempt {
         provider_message_id: joined_provider_ids(&provider_message_ids),
         rendered_units,
+        presentation: Some(ChannelDeliveryPresentationReceipt::rendered(
+            "discord:safe-markdown;allowed_mentions.parse=[]",
+        )),
     })
+}
+
+fn discord_send_plain_fallback_with_senders<TextSender, AttachmentSender>(
+    message: &ChannelOutboundMessage,
+    reason: ChannelDeliveryPresentationFallbackReason,
+    source_error: String,
+    send_text: &mut TextSender,
+    send_attachment: &mut AttachmentSender,
+) -> Result<ChannelSendAttempt, ChannelSendError>
+where
+    TextSender: FnMut(&str, Option<serde_json::Value>) -> Result<Option<String>, String>,
+    AttachmentSender: FnMut(&ChannelOutboundAttachment) -> Result<Option<String>, String>,
+{
+    let text = format_channel_reply_text(&message.text);
+    let full_text_preserved = text == message.text.trim();
+    let mut provider_message_ids = Vec::new();
+    let mut rendered_units = Vec::new();
+    if !text.trim().is_empty() || message.attachments.is_empty() {
+        match send_text(&text, discord_message_reference(message)) {
+            Ok(provider_message_id) => {
+                if let Some(id) = provider_message_id.clone() {
+                    provider_message_ids.push(id);
+                }
+                rendered_units.push(ChannelDeliveryRenderedUnitReceipt {
+                    unit_id: "text:fallback".to_string(),
+                    kind: ChannelDeliveryRenderedUnitKind::Text,
+                    attachment_kind: None,
+                    status: ChannelDeliveryUnitStatus::Delivered,
+                    provider_message_id,
+                    error: None,
+                });
+            }
+            Err(error) => {
+                return Err(ChannelSendError {
+                    message: format!("{source_error}; Discord plain fallback failed: {error}"),
+                    provider_message_id: joined_provider_ids(&provider_message_ids),
+                    rendered_units,
+                    presentation: Some(ChannelDeliveryPresentationReceipt::fallback(
+                        reason,
+                        "discord:plain-text",
+                        false,
+                    )),
+                });
+            }
+        }
+    }
+    for attachment in &message.attachments {
+        match send_attachment(attachment) {
+            Ok(provider_message_id) => {
+                if let Some(id) = provider_message_id.clone() {
+                    provider_message_ids.push(id);
+                }
+            }
+            Err(error) => {
+                return Err(ChannelSendError {
+                    message: format!("{source_error}; Discord fallback attachment failed: {error}"),
+                    provider_message_id: joined_provider_ids(&provider_message_ids),
+                    rendered_units,
+                    presentation: Some(ChannelDeliveryPresentationReceipt::fallback(
+                        reason,
+                        "discord:plain-text",
+                        full_text_preserved,
+                    )),
+                });
+            }
+        }
+    }
+    Ok(ChannelSendAttempt {
+        provider_message_id: joined_provider_ids(&provider_message_ids),
+        rendered_units,
+        presentation: Some(ChannelDeliveryPresentationReceipt::fallback(
+            reason,
+            "discord:plain-text",
+            full_text_preserved,
+        )),
+    })
+}
+
+fn collect_telegram_rich_image_group(
+    units: &[RenderedRichUnit],
+    start: usize,
+    message: &ChannelOutboundMessage,
+) -> Option<(Vec<(RenderedRichUnit, ChannelOutboundAttachment)>, usize)> {
+    let mut group = Vec::new();
+    let mut index = start;
+    while let Some(unit) = units.get(index) {
+        if unit.kind != RenderedRichUnitKind::Media {
+            break;
+        }
+        let Some(attachment_index) = unit.attachment_index else {
+            break;
+        };
+        let Some(base_attachment) = message.attachments.get(attachment_index) else {
+            break;
+        };
+        if base_attachment.kind != ChannelOutboundAttachmentKind::Image {
+            break;
+        }
+        let mut attachment = base_attachment.clone();
+        if unit
+            .text
+            .as_deref()
+            .is_some_and(|caption| !caption.trim().is_empty())
+        {
+            attachment.caption = unit.text.clone();
+        }
+        group.push((unit.clone(), attachment));
+        index += 1;
+    }
+    (!group.is_empty()).then_some((group, index))
+}
+
+fn send_telegram_single_attachment_with_caption_overflow<TextSender, AttachmentSender>(
+    attachment: &ChannelOutboundAttachment,
+    options: TelegramSendOptions<'_>,
+    send_text: &mut TextSender,
+    send_attachment: &mut AttachmentSender,
+    provider_message_ids: &mut Vec<String>,
+) -> Result<(), String>
+where
+    TextSender: FnMut(&str, TelegramSendOptions<'_>) -> Result<Option<String>, String>,
+    AttachmentSender: FnMut(&ChannelOutboundAttachment) -> Result<Option<String>, String>,
+{
+    let (attachment, overflow) = attachment_with_telegram_caption_limit(attachment);
+    if let Some(provider_message_id) = send_attachment(&attachment)? {
+        provider_message_ids.push(provider_message_id);
+    }
+    if let Some(overflow) = overflow
+        && let Some(provider_message_id) = send_text(
+            &overflow,
+            TelegramSendOptions {
+                reply_to_message_id: None,
+                message_thread_id: options.message_thread_id,
+                formatting_mode: TelegramFormattingMode::Plain,
+            },
+        )?
+    {
+        provider_message_ids.push(provider_message_id);
+    }
+    Ok(())
+}
+
+fn attachment_with_telegram_caption_limit(
+    attachment: &ChannelOutboundAttachment,
+) -> (ChannelOutboundAttachment, Option<String>) {
+    let mut attachment = attachment.clone();
+    let (caption, overflow) = split_telegram_caption(attachment.caption.as_deref());
+    attachment.caption = caption;
+    (attachment, overflow)
+}
+
+fn telegram_media_group_attachments_with_caption_limit(
+    attachments: &[ChannelOutboundAttachment],
+) -> (Vec<ChannelOutboundAttachment>, Option<String>) {
+    let mut prepared = Vec::with_capacity(attachments.len());
+    let mut overflow = Vec::new();
+    for (index, attachment) in attachments.iter().enumerate() {
+        let mut attachment = attachment.clone();
+        if index == 0 {
+            let (caption, remainder) = split_telegram_caption(attachment.caption.as_deref());
+            attachment.caption = caption;
+            if let Some(remainder) = remainder {
+                overflow.push(remainder);
+            }
+        } else if let Some(caption) = attachment
+            .caption
+            .as_deref()
+            .map(str::trim)
+            .filter(|caption| !caption.is_empty())
+        {
+            overflow.push(caption.to_string());
+            attachment.caption = None;
+        }
+        prepared.push(attachment);
+    }
+    let overflow = (!overflow.is_empty()).then(|| overflow.join("\n\n"));
+    (prepared, overflow)
+}
+
+fn split_telegram_caption(caption: Option<&str>) -> (Option<String>, Option<String>) {
+    let Some(caption) = caption.map(str::trim).filter(|caption| !caption.is_empty()) else {
+        return (None, None);
+    };
+    let mut head = String::new();
+    let mut tail = String::new();
+    for (index, ch) in caption.chars().enumerate() {
+        if index < 1024 {
+            head.push(ch);
+        } else {
+            tail.push(ch);
+        }
+    }
+    let overflow = tail.trim().to_string();
+    (
+        Some(head),
+        (!overflow.is_empty()).then_some(format!("Caption continued:\n{overflow}")),
+    )
+}
+
+fn send_telegram_attachment_sequence<TextSender, AttachmentSender, MediaGroupSender>(
+    attachments: &[ChannelOutboundAttachment],
+    options: TelegramSendOptions<'_>,
+    send_text: &mut TextSender,
+    send_attachment: &mut AttachmentSender,
+    send_media_group: &mut MediaGroupSender,
+    provider_message_ids: &mut Vec<String>,
+) -> Result<(), String>
+where
+    TextSender: FnMut(&str, TelegramSendOptions<'_>) -> Result<Option<String>, String>,
+    AttachmentSender: FnMut(&ChannelOutboundAttachment) -> Result<Option<String>, String>,
+    MediaGroupSender: FnMut(
+        &[ChannelOutboundAttachment],
+        TelegramSendOptions<'_>,
+    ) -> Result<Option<String>, String>,
+{
+    let mut index = 0usize;
+    while index < attachments.len() {
+        if attachments[index].kind != ChannelOutboundAttachmentKind::Image {
+            send_telegram_single_attachment_with_caption_overflow(
+                &attachments[index],
+                options,
+                send_text,
+                send_attachment,
+                provider_message_ids,
+            )?;
+            index += 1;
+            continue;
+        }
+        let run_start = index;
+        while index < attachments.len()
+            && attachments[index].kind == ChannelOutboundAttachmentKind::Image
+        {
+            index += 1;
+        }
+        let run = &attachments[run_start..index];
+        if run.len() == 1 {
+            send_telegram_single_attachment_with_caption_overflow(
+                &run[0],
+                options,
+                send_text,
+                send_attachment,
+                provider_message_ids,
+            )?;
+            continue;
+        }
+        let mut offset = 0usize;
+        while offset < run.len() {
+            let remaining = run.len() - offset;
+            let take = if remaining == 1 { 1 } else { remaining.min(10) };
+            let chunk = &run[offset..offset + take];
+            if chunk.len() == 1 {
+                send_telegram_single_attachment_with_caption_overflow(
+                    &chunk[0],
+                    options,
+                    send_text,
+                    send_attachment,
+                    provider_message_ids,
+                )?;
+            } else {
+                let (chunk_attachments, overflow) =
+                    telegram_media_group_attachments_with_caption_limit(chunk);
+                if let Some(provider_message_id) = send_media_group(&chunk_attachments, options)? {
+                    provider_message_ids.push(provider_message_id);
+                }
+                if let Some(overflow) = overflow
+                    && let Some(provider_message_id) = send_text(
+                        &overflow,
+                        TelegramSendOptions {
+                            reply_to_message_id: None,
+                            message_thread_id: options.message_thread_id,
+                            formatting_mode: TelegramFormattingMode::Plain,
+                        },
+                    )?
+                {
+                    provider_message_ids.push(provider_message_id);
+                }
+            }
+            offset += take;
+        }
+    }
+    Ok(())
 }
 
 fn discord_message_reference(message: &ChannelOutboundMessage) -> Option<serde_json::Value> {
@@ -17452,15 +18399,7 @@ fn discord_send_message(
     let token = normalize_discord_bot_token(token);
     let auth = format!("Bot {token}");
     let agent = channel_http_short_agent();
-    let mut payload = serde_json::json!({
-        "content": text,
-        "allowed_mentions": {
-            "parse": []
-        }
-    });
-    if let Some(reference) = message_reference {
-        payload["message_reference"] = reference;
-    }
+    let payload = discord_message_payload(text, message_reference);
     let response = agent
         .post(&url)
         .set("Authorization", &auth)
@@ -17498,28 +18437,96 @@ fn discord_send_attachment(
         .map(ToString::to_string))
 }
 
+fn discord_send_attachments_batch(
+    token: &str,
+    channel_id: &str,
+    text: &str,
+    message_reference: Option<serde_json::Value>,
+    attachments: &[ChannelOutboundAttachment],
+) -> Result<Option<String>, String> {
+    if attachments.is_empty() {
+        return Ok(None);
+    }
+    if attachments.len() > 10 {
+        return Err("Discord attachment batch exceeds 10 files".to_string());
+    }
+    if text.chars().count() > DISCORD_MESSAGE_CONTENT_LIMIT {
+        return Err(
+            "Discord attachment batch content exceeds the 2000 character limit".to_string(),
+        );
+    }
+    let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
+    let token = normalize_discord_bot_token(token);
+    let auth = format!("Bot {token}");
+    let payload = discord_attachments_payload(text, message_reference, attachments)?;
+    let fields = vec![("payload_json".to_string(), payload.to_string())];
+    let value = multipart_post_json_attachments(
+        "Discord",
+        &url,
+        Some(("Authorization", auth.as_str())),
+        &fields,
+        attachments,
+    )?;
+    Ok(value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string))
+}
+
+fn discord_message_payload(
+    text: &str,
+    message_reference: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "content": text,
+        "allowed_mentions": {
+            "parse": []
+        }
+    });
+    if let Some(reference) = message_reference {
+        payload["message_reference"] = reference;
+    }
+    payload
+}
+
 fn discord_attachment_payload(
     attachment: &ChannelOutboundAttachment,
 ) -> Result<serde_json::Value, String> {
-    let filename = attachment_filename(attachment)?;
     let content = attachment
         .caption
         .as_deref()
         .map(str::trim)
         .filter(|caption| !caption.is_empty())
         .unwrap_or("");
-    Ok(serde_json::json!({
+    discord_attachments_payload(content, None, std::slice::from_ref(attachment))
+}
+
+fn discord_attachments_payload(
+    content: &str,
+    message_reference: Option<serde_json::Value>,
+    attachments: &[ChannelOutboundAttachment],
+) -> Result<serde_json::Value, String> {
+    let attachment_rows = attachments
+        .iter()
+        .enumerate()
+        .map(|(index, attachment)| {
+            Ok(serde_json::json!({
+                "id": index,
+                "filename": attachment_filename(attachment)?,
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut payload = serde_json::json!({
         "content": content,
         "allowed_mentions": {
             "parse": []
         },
-        "attachments": [
-            {
-                "id": 0,
-                "filename": filename
-            }
-        ]
-    }))
+        "attachments": attachment_rows
+    });
+    if let Some(reference) = message_reference {
+        payload["message_reference"] = reference;
+    }
+    Ok(payload)
 }
 
 fn discord_edit_message(
@@ -17660,8 +18667,9 @@ fn parse_delivery_status(value: &str) -> Result<ChannelDeliveryStatus, String> {
     match value {
         "delivered" => Ok(ChannelDeliveryStatus::Delivered),
         "failed" => Ok(ChannelDeliveryStatus::Failed),
+        "skipped-permanent" | "skipped" => Ok(ChannelDeliveryStatus::SkippedPermanent),
         other => Err(format!(
-            "unknown delivery status: {other}; expected delivered or failed"
+            "unknown delivery status: {other}; expected delivered, failed, or skipped-permanent"
         )),
     }
 }
@@ -19076,10 +20084,11 @@ fn print_channel_run_once_report(report: &ChannelRunOnceReport) {
         }
     }
     println!(
-        "Outbox pending={} delivered={} failed_retryable={}",
+        "Outbox pending={} delivered={} failed_retryable={} skipped_permanent={}",
         report.outbox.summary.pending,
         report.outbox.summary.delivered,
-        report.outbox.summary.failed_retryable
+        report.outbox.summary.failed_retryable,
+        report.outbox.summary.skipped_permanent
     );
     for pending in &report.outbox.pending {
         println!(
@@ -19107,11 +20116,12 @@ fn print_channel_outbox_plan_report(report: &ChannelOutboxPlanReport) {
     println!("Outbox file: {}", report.outbox_file.display());
     println!("Receipts file: {}", report.receipts_file.display());
     println!(
-        "Summary: lines={} pending={} delivered={} failed_retryable={} skipped_platform={} invalid={}",
+        "Summary: lines={} pending={} delivered={} failed_retryable={} skipped_permanent={} skipped_platform={} invalid={}",
         report.summary.total_outbox_lines,
         report.summary.pending,
         report.summary.delivered,
         report.summary.failed_retryable,
+        report.summary.skipped_permanent,
         report.summary.skipped_platform,
         report.summary.invalid_lines
     );
@@ -19300,10 +20310,11 @@ fn print_discord_event_run_once_report(report: &DiscordEventRunOnceReport) {
         println!("Run status: {:?}", run.status);
         println!("Session key: {}", run.receive.session_key);
         println!(
-            "Outbox pending={} delivered={} failed_retryable={}",
+            "Outbox pending={} delivered={} failed_retryable={} skipped_permanent={}",
             run.outbox.summary.pending,
             run.outbox.summary.delivered,
-            run.outbox.summary.failed_retryable
+            run.outbox.summary.failed_retryable,
+            run.outbox.summary.skipped_permanent
         );
     }
 }
@@ -20149,6 +21160,7 @@ fn print_help() {
     println!("  deterministic-cron-plan Dry-run deterministic cron without LLM access");
     println!("  deterministic-cron-enqueue Persist deterministic cron into worker dispatch");
     println!("  context-rollover Requeue prepared context rollover items safely");
+    println!("  virtual-session-context Resolve read-only virtual-session working context");
     println!("  subagent-plan   Dry-run subagent ledger cutover/resume planning");
     println!("  subagent-enqueue Persist resumable subagent work into worker dispatch");
     println!("  subagent-lifecycle Show, close, or smoke-test subagent lifecycle receipts");
@@ -20177,6 +21189,7 @@ fn print_help() {
     println!("  --task-prefix <name>    Windows scheduled-task name prefix for supervisor-plan");
     println!("  --query <text>          Match skills or search imported memory");
     println!("  --agent <id>            Agent hint for skill matching");
+    println!("  --agent-id <id>         Agent identity for lane-scoped commands");
     println!("  --telegram-account <id> Telegram account token/offset selector");
     println!("  --discord-account <id> Discord account token/outbox/gateway selector");
     println!("  --channel <name>        Channel hint for skill matching");
@@ -20199,7 +21212,7 @@ fn print_help() {
     println!("  --user-id <id>          User identity for session mapping");
     println!("  --session-key <key>     Existing session key override");
     println!("  --delivery-id <id>      Channel outbox delivery id");
-    println!("  --status <value>        Delivery status: delivered or failed");
+    println!("  --status <value>        Delivery status: delivered, failed, or skipped-permanent");
     println!("  --provider-message-id <id> Telegram/Discord message id after delivery");
     println!("  --error <text>          Delivery failure reason");
     println!(
@@ -20299,7 +21312,11 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_harness_core::{AGENT_HARNESS_CONTEXT_PACK_SCHEMA, OPENCLAW_MEM_CONTEXT_PACK_SCHEMA};
+    use agent_harness_core::{
+        AGENT_HARNESS_CONTEXT_PACK_SCHEMA, OPENCLAW_MEM_CONTEXT_PACK_SCHEMA,
+        rich_presentation_from_plain_final,
+        rich_presentation_from_plain_final_with_attachment_count,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct StaticDiscordAttachmentFetcher {
@@ -20347,6 +21364,91 @@ mod tests {
             worker_loop_wake_lane(Some("learning review")),
             "worker-learning-review"
         );
+    }
+
+    #[test]
+    fn virtual_session_context_cli_resolves_json_envelope_for_lane() {
+        let root = cli_temp_root("virtual_session_context_cli_resolves_json_envelope_for_lane");
+        let harness_home = root.join(".agent-harness");
+        let session_key = "discord:channel-42:user-7:main";
+        let state_file = agent_harness_core::channel_session_state_file(
+            &harness_home,
+            "discord",
+            "channel-42",
+            "user-7",
+        );
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        agent_harness_core::write_json_atomic(
+            &state_file,
+            &agent_harness_core::ChannelSessionState {
+                schema: "agent-harness.channel-session-state.v1".to_string(),
+                platform: "discord".to_string(),
+                channel_id: "channel-42".to_string(),
+                user_id: "user-7".to_string(),
+                active_session_key: session_key.to_string(),
+                agent_id: Some("main".to_string()),
+                provider: None,
+                model: None,
+                session_topic: None,
+                model_override: None,
+                model_override_provider: None,
+                model_override_model: None,
+                thinking_enabled: false,
+                thinking_level: None,
+                thinking_instruction: None,
+                fast_mode: None,
+                stop_requested: false,
+                stop_reason: None,
+                steering_notes: Vec::new(),
+                btw_notes: Vec::new(),
+                last_command: None,
+                updated_at_ms: 10,
+            },
+        )
+        .unwrap();
+        agent_harness_core::record_completed_turn_working_set_snapshot(
+            agent_harness_core::CompletedTurnWorkingSetSnapshotOptions {
+                harness_home: harness_home.clone(),
+                platform: "discord".to_string(),
+                channel_id: "channel-42".to_string(),
+                user_id: "user-7".to_string(),
+                agent_id: "main".to_string(),
+                working_session_key: session_key.to_string(),
+                queue_id: Some("queue-cli".to_string()),
+                message_text: Some("read the CLI envelope".to_string()),
+                status: "completed".to_string(),
+                run_once_receipt_file: None,
+                outbox_file: None,
+                completion_file: None,
+                now_ms: 11,
+            },
+        )
+        .unwrap();
+
+        let envelope = virtual_session_context_envelope_from_args(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+            "--platform".to_string(),
+            "discord".to_string(),
+            "--channel-id".to_string(),
+            "channel-42".to_string(),
+            "--user-id".to_string(),
+            "user-7".to_string(),
+            "--agent-id".to_string(),
+            "main".to_string(),
+            "--json".to_string(),
+            "--now-ms".to_string(),
+            "12".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            envelope.schema,
+            "agent-harness.virtual-session-working-context.v1"
+        );
+        assert_eq!(envelope.current_session_key.as_deref(), Some(session_key));
+        assert!(envelope.recent_queue_ids.contains(&"queue-cli".to_string()));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -21463,6 +22565,8 @@ mod tests {
                     transcript_file: None,
                     outbox_file: None,
                     continuation: agent_harness_core::RuntimeContinuationMetadata::legacy(),
+                    child_queue_id: None,
+                    child_session_key: None,
                     reason: "runtime queue lease lock is busy; retrying later".to_string(),
                 },
                 prepare: None,
@@ -21844,6 +22948,514 @@ mod tests {
         assert!(context.contains("messageThreadId: 7"));
     }
 
+    fn rich_outbound_message(platform: &str, text: &str) -> ChannelOutboundMessage {
+        ChannelOutboundMessage {
+            platform: platform.to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            session_key: format!("{platform}:dm-42:user-7:main"),
+            kind: agent_harness_core::ChannelOutboundMessageKind::AgentReply,
+            source_queue_id: Some("queue-rich".to_string()),
+            source_completion_file: None,
+            text: text.to_string(),
+            presentation: rich_presentation_from_plain_final(text),
+            delivery_intent: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    fn test_image_attachment(filename: &str, caption: Option<&str>) -> ChannelOutboundAttachment {
+        ChannelOutboundAttachment {
+            kind: ChannelOutboundAttachmentKind::Image,
+            path: PathBuf::from(filename),
+            mime: Some("image/png".to_string()),
+            filename: Some(filename.to_string()),
+            caption: caption.map(ToString::to_string),
+        }
+    }
+
+    #[test]
+    fn telegram_rich_sender_records_html_presentation_receipt() {
+        let message = rich_outbound_message(
+            "telegram",
+            "Done **bold** with `cargo test` and [report](https://example.invalid/report).\n\n- first",
+        );
+        let mut payloads = Vec::new();
+
+        let attempt = telegram_send_rich_outbound_message_with_senders(
+            &message,
+            |text, options| {
+                let provider_id = format!("tg-{}", payloads.len() + 1);
+                payloads.push(telegram_message_payload(&message.channel_id, text, options));
+                Ok(Some(provider_id))
+            },
+            |_attachment| -> Result<Option<String>, String> {
+                panic!("rich text fixture must not send attachments")
+            },
+            |_attachments, _options| -> Result<Option<String>, String> {
+                panic!("rich text fixture must not send media groups")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["parse_mode"], "HTML");
+        assert_eq!(payloads[0]["link_preview_options"]["is_disabled"], true);
+        let text = payloads[0]["text"].as_str().unwrap();
+        assert!(text.contains("<b>bold</b>"));
+        assert!(text.contains("<code>cargo test</code>"));
+        assert!(text.contains("<a href=\"https://example.invalid/report\">report</a>"));
+        assert!(text.contains("- first"));
+        assert_eq!(attempt.provider_message_id.as_deref(), Some("tg-1"));
+        assert_eq!(attempt.rendered_units.len(), 1);
+        assert_eq!(attempt.rendered_units[0].unit_id, "text:0");
+        assert_eq!(
+            attempt.rendered_units[0].status,
+            ChannelDeliveryUnitStatus::Delivered
+        );
+        let presentation = attempt.presentation.unwrap();
+        assert!(presentation.present);
+        assert_eq!(
+            presentation.provider_render_mode.as_deref(),
+            Some("telegram:parse_mode=HTML")
+        );
+        assert_eq!(
+            presentation.fallback_reason,
+            ChannelDeliveryPresentationFallbackReason::None
+        );
+        assert!(presentation.full_text_preserved);
+    }
+
+    #[test]
+    fn telegram_rich_outbound_delivery_records_html_receipt_closed_loop() {
+        let root =
+            cli_temp_root("telegram_rich_outbound_delivery_records_html_receipt_closed_loop");
+        let harness_home = root.join(".agent-harness");
+        let message = rich_outbound_message(
+            "telegram",
+            "Done **bold** with `cargo test` and [report](https://example.invalid/report).\n\n- first",
+        );
+        let mut payloads = Vec::new();
+
+        let attempt = telegram_send_outbound_message_with_senders(
+            &harness_home,
+            &message,
+            |text, options| {
+                let provider_id = format!("tg-{}", payloads.len() + 1);
+                payloads.push(telegram_message_payload(&message.channel_id, text, options));
+                Ok(Some(provider_id))
+            },
+            |_attachment| -> Result<Option<String>, String> {
+                panic!("rich text closed-loop fixture must not send attachments")
+            },
+            |_attachments, _options| -> Result<Option<String>, String> {
+                panic!("rich text closed-loop fixture must not send media groups")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["parse_mode"], "HTML");
+        assert_eq!(payloads[0]["link_preview_options"]["is_disabled"], true);
+        let provider_text = payloads[0]["text"].as_str().unwrap();
+        assert!(provider_text.contains("<b>bold</b>"));
+        assert!(provider_text.contains("<code>cargo test</code>"));
+        assert!(provider_text.contains("<a href=\"https://example.invalid/report\">report</a>"));
+        assert!(!provider_text.contains("**bold**"));
+
+        let receipt = record_channel_delivery(ChannelDeliveryRecordOptions {
+            harness_home: harness_home.clone(),
+            delivery_id: "delivery:telegram-rich-closed-loop:1".to_string(),
+            status: ChannelDeliveryStatus::Delivered,
+            platform: message.platform.clone(),
+            account_id: message.account_id.clone(),
+            channel_id: message.channel_id.clone(),
+            user_id: message.user_id.clone(),
+            session_key: message.session_key.clone(),
+            provider_message_id: attempt.provider_message_id,
+            error: None,
+            now_ms: 1_782_920_000_000,
+            rendered_units: attempt.rendered_units,
+            presentation: attempt.presentation,
+        })
+        .unwrap();
+
+        assert_eq!(receipt.provider_message_id.as_deref(), Some("tg-1"));
+        assert_eq!(receipt.rendered_units.len(), 1);
+        assert_eq!(receipt.rendered_units[0].unit_id, "text:0");
+        let presentation = receipt.presentation.as_ref().unwrap();
+        assert!(presentation.present);
+        assert_eq!(
+            presentation.provider_render_mode.as_deref(),
+            Some("telegram:parse_mode=HTML")
+        );
+        assert_eq!(
+            presentation.fallback_reason,
+            ChannelDeliveryPresentationFallbackReason::None
+        );
+        assert!(presentation.full_text_preserved);
+
+        let receipts_text = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("channels")
+                .join("delivery-receipts.jsonl"),
+        )
+        .unwrap();
+        let receipt_json: serde_json::Value =
+            serde_json::from_str(receipts_text.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            receipt_json["presentation"]["providerRenderMode"],
+            "telegram:parse_mode=HTML"
+        );
+        assert_eq!(receipt_json["presentation"]["fallbackReason"], "none");
+        assert_eq!(receipt_json["presentation"]["fullTextPreserved"], true);
+        assert_eq!(receipt_json["renderedUnits"][0]["unitId"], "text:0");
+        assert_eq!(
+            receipt_json["renderedUnits"][0]["providerMessageId"],
+            "tg-1"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn telegram_media_group_payload_uses_attach_files_and_first_caption() {
+        let attachments = vec![
+            test_image_attachment("first.png", Some(&"c".repeat(1100))),
+            test_image_attachment("second.png", Some("second caption is ignored for album")),
+        ];
+        let file_fields = telegram_media_group_file_fields(attachments.len());
+
+        let fields = telegram_media_group_fields(
+            "chat-42",
+            &attachments,
+            TelegramSendOptions {
+                reply_to_message_id: Some(99),
+                message_thread_id: Some("7"),
+                formatting_mode: TelegramFormattingMode::Plain,
+            },
+            &file_fields,
+        )
+        .unwrap();
+
+        assert!(fields.contains(&("chat_id".to_string(), "chat-42".to_string())));
+        assert!(fields.contains(&("reply_to_message_id".to_string(), "99".to_string())));
+        assert!(fields.contains(&("message_thread_id".to_string(), "7".to_string())));
+        let media_text = fields
+            .iter()
+            .find_map(|(name, value)| (name == "media").then_some(value))
+            .unwrap();
+        let media: serde_json::Value = serde_json::from_str(media_text).unwrap();
+        assert_eq!(media[0]["type"], "photo");
+        assert_eq!(media[0]["media"], "attach://file0");
+        assert_eq!(media[1]["media"], "attach://file1");
+        assert_eq!(media[0]["caption"].as_str().unwrap().chars().count(), 1024);
+        assert!(media[1].get("caption").is_none());
+    }
+
+    #[test]
+    fn telegram_rich_sender_batches_image_media_units_as_albums() {
+        let root = cli_temp_root("telegram_rich_sender_batches_image_media_units_as_albums");
+        let harness_home = root.join(".agent-harness");
+        let mut message = rich_outbound_message("telegram", "Images attached.");
+        message.attachments = (0..3)
+            .map(|index| test_image_attachment(&format!("image-{index}.png"), None))
+            .collect();
+        message.presentation =
+            rich_presentation_from_plain_final_with_attachment_count(&message.text, 3);
+        let mut texts = Vec::new();
+        let mut groups = Vec::new();
+
+        let attempt = telegram_send_outbound_message_with_senders(
+            &harness_home,
+            &message,
+            |text, _options| {
+                texts.push(text.to_string());
+                Ok(Some("tg-text".to_string()))
+            },
+            |_attachment| -> Result<Option<String>, String> {
+                panic!("3-image rich fixture should batch images instead of sending singles")
+            },
+            |attachments, _options| {
+                groups.push(
+                    attachments
+                        .iter()
+                        .map(|attachment| attachment_filename(attachment).unwrap())
+                        .collect::<Vec<_>>(),
+                );
+                Ok(Some(format!("tg-album-{}", groups.len())))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(texts, vec!["Images attached."]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 3);
+        assert_eq!(
+            attempt.provider_message_id.as_deref(),
+            Some("tg-text,tg-album-1")
+        );
+        assert_eq!(
+            attempt
+                .rendered_units
+                .iter()
+                .filter(|unit| unit.kind == ChannelDeliveryRenderedUnitKind::Media)
+                .count(),
+            3
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn telegram_plain_sender_chunks_twelve_images_as_albums() {
+        let root = cli_temp_root("telegram_plain_sender_chunks_twelve_images_as_albums");
+        let harness_home = root.join(".agent-harness");
+        let mut message = rich_outbound_message("telegram", "Images attached.");
+        message.presentation = None;
+        message.attachments = (0..12)
+            .map(|index| test_image_attachment(&format!("image-{index}.png"), None))
+            .collect();
+        let mut groups = Vec::new();
+
+        let attempt = telegram_send_outbound_message_with_senders(
+            &harness_home,
+            &message,
+            |_text, _options| Ok(Some("tg-text".to_string())),
+            |_attachment| -> Result<Option<String>, String> {
+                panic!("12-image plain fixture should batch images instead of sending singles")
+            },
+            |attachments, _options| {
+                groups.push(attachments.len());
+                Ok(Some(format!("tg-album-{}", groups.len())))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(groups, vec![10, 2]);
+        assert_eq!(
+            attempt.provider_message_id.as_deref(),
+            Some("tg-text,tg-album-1,tg-album-2")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn telegram_plain_sender_truncates_attachment_caption_and_sends_remainder() {
+        let root =
+            cli_temp_root("telegram_plain_sender_truncates_attachment_caption_and_sends_remainder");
+        let harness_home = root.join(".agent-harness");
+        let mut message = rich_outbound_message("telegram", "");
+        message.presentation = None;
+        message.text = String::new();
+        message.attachments = vec![ChannelOutboundAttachment {
+            kind: ChannelOutboundAttachmentKind::Video,
+            path: PathBuf::from("clip.mp4"),
+            mime: Some("video/mp4".to_string()),
+            filename: Some("clip.mp4".to_string()),
+            caption: Some("v".repeat(1100)),
+        }];
+        let mut attachment_captions = Vec::new();
+        let mut text_messages = Vec::new();
+
+        let attempt = telegram_send_outbound_message_with_senders(
+            &harness_home,
+            &message,
+            |text, _options| {
+                text_messages.push(text.to_string());
+                Ok(Some(format!("tg-text-{}", text_messages.len())))
+            },
+            |attachment| {
+                attachment_captions.push(attachment.caption.clone().unwrap_or_default());
+                Ok(Some("tg-video".to_string()))
+            },
+            |_attachments, _options| -> Result<Option<String>, String> {
+                panic!("single video caption fixture must not send a media group")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(attachment_captions.len(), 1);
+        assert_eq!(attachment_captions[0].chars().count(), 1024);
+        assert_eq!(text_messages.len(), 1);
+        assert!(text_messages[0].starts_with("Caption continued:\n"));
+        assert_eq!(
+            attempt.provider_message_id.as_deref(),
+            Some("tg-video,tg-text-1")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn telegram_rich_sender_falls_back_to_plain_on_validation_failure() {
+        let mut message = rich_outbound_message("telegram", "Fallback text stays intact.");
+        message.presentation.as_mut().unwrap().fallback_text.clear();
+        let mut texts = Vec::new();
+        let mut modes = Vec::new();
+
+        let attempt = telegram_send_rich_outbound_message_with_senders(
+            &message,
+            |text, options| {
+                texts.push(text.to_string());
+                modes.push(options.formatting_mode);
+                Ok(Some("tg-fallback".to_string()))
+            },
+            |_attachment| -> Result<Option<String>, String> {
+                panic!("fallback text fixture must not send attachments")
+            },
+            |_attachments, _options| -> Result<Option<String>, String> {
+                panic!("fallback text fixture must not send media groups")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(texts, vec!["Fallback text stays intact."]);
+        assert_eq!(modes, vec![TelegramFormattingMode::Plain]);
+        assert_eq!(attempt.provider_message_id.as_deref(), Some("tg-fallback"));
+        assert_eq!(attempt.rendered_units[0].unit_id, "text:fallback");
+        let presentation = attempt.presentation.unwrap();
+        assert!(!presentation.present);
+        assert_eq!(
+            presentation.provider_render_mode.as_deref(),
+            Some("telegram:plain-text")
+        );
+        assert_eq!(
+            presentation.fallback_reason,
+            ChannelDeliveryPresentationFallbackReason::ValidationFailure
+        );
+        assert!(presentation.full_text_preserved);
+    }
+
+    #[test]
+    fn telegram_rich_sender_falls_back_to_plain_on_provider_failure() {
+        let message = rich_outbound_message("telegram", "Provider fallback **keeps** full text.");
+        let mut texts = Vec::new();
+        let mut modes = Vec::new();
+
+        let attempt = telegram_send_rich_outbound_message_with_senders(
+            &message,
+            |text, options| {
+                texts.push(text.to_string());
+                modes.push(options.formatting_mode);
+                if texts.len() == 1 {
+                    Err("provider rejected rich html".to_string())
+                } else {
+                    Ok(Some("tg-plain".to_string()))
+                }
+            },
+            |_attachment| -> Result<Option<String>, String> {
+                panic!("provider fallback fixture must not send attachments")
+            },
+            |_attachments, _options| -> Result<Option<String>, String> {
+                panic!("provider fallback fixture must not send media groups")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            modes,
+            vec![
+                TelegramFormattingMode::TrustedHtml,
+                TelegramFormattingMode::Plain
+            ]
+        );
+        assert_eq!(texts[1], "Provider fallback **keeps** full text.");
+        let presentation = attempt.presentation.unwrap();
+        assert!(!presentation.present);
+        assert_eq!(
+            presentation.fallback_reason,
+            ChannelDeliveryPresentationFallbackReason::ProviderFallback
+        );
+        assert!(presentation.full_text_preserved);
+    }
+
+    #[test]
+    fn discord_rich_sender_records_safe_markdown_presentation_receipt() {
+        let message = rich_outbound_message(
+            "discord",
+            "Done **bold** with `cargo test` and [report](https://example.invalid/report) @everyone.",
+        );
+        let mut sends: Vec<(String, Option<serde_json::Value>)> = Vec::new();
+
+        let attempt = discord_send_rich_outbound_message_with_senders(
+            &message,
+            |text, reference| {
+                let provider_id = format!("dc-{}", sends.len() + 1);
+                sends.push((text.to_string(), reference));
+                Ok(Some(provider_id))
+            },
+            |_attachment| -> Result<Option<String>, String> {
+                panic!("rich text fixture must not send attachments")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(sends.len(), 1);
+        let payload = discord_message_payload(&sends[0].0, sends[0].1.clone());
+        assert!(
+            payload["allowed_mentions"]["parse"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let text = payload["content"].as_str().unwrap();
+        assert!(text.contains("**bold**"));
+        assert!(text.contains("`cargo test`"));
+        assert!(text.contains("[report](https://example.invalid/report)"));
+        assert!(text.contains("@ everyone"));
+        assert_eq!(attempt.provider_message_id.as_deref(), Some("dc-1"));
+        let presentation = attempt.presentation.unwrap();
+        assert!(presentation.present);
+        assert_eq!(
+            presentation.provider_render_mode.as_deref(),
+            Some("discord:safe-markdown;allowed_mentions.parse=[]")
+        );
+        assert_eq!(
+            presentation.fallback_reason,
+            ChannelDeliveryPresentationFallbackReason::None
+        );
+        assert!(presentation.full_text_preserved);
+    }
+
+    #[test]
+    fn discord_rich_sender_falls_back_to_plain_on_provider_failure() {
+        let message = rich_outbound_message("discord", "Discord fallback **keeps** full text.");
+        let mut texts = Vec::new();
+
+        let attempt = discord_send_rich_outbound_message_with_senders(
+            &message,
+            |text, _reference| {
+                texts.push(text.to_string());
+                if texts.len() == 1 {
+                    Err("provider rejected safe markdown".to_string())
+                } else {
+                    Ok(Some("dc-plain".to_string()))
+                }
+            },
+            |_attachment| -> Result<Option<String>, String> {
+                panic!("provider fallback fixture must not send attachments")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(texts[1], "Discord fallback **keeps** full text.");
+        let presentation = attempt.presentation.unwrap();
+        assert!(!presentation.present);
+        assert_eq!(
+            presentation.provider_render_mode.as_deref(),
+            Some("discord:plain-text")
+        );
+        assert_eq!(
+            presentation.fallback_reason,
+            ChannelDeliveryPresentationFallbackReason::ProviderFallback
+        );
+        assert!(presentation.full_text_preserved);
+    }
+
     #[test]
     fn telegram_html_payload_escapes_dynamic_text_and_sets_thread() {
         let payload = telegram_message_payload(
@@ -21903,6 +23515,47 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(payload["attachments"][0]["filename"], "result.png");
+    }
+
+    #[test]
+    fn discord_attachments_payload_batches_multiple_files_without_mentions() {
+        let attachments = vec![
+            ChannelOutboundAttachment {
+                kind: ChannelOutboundAttachmentKind::Image,
+                path: PathBuf::from("one.png"),
+                mime: Some("image/png".to_string()),
+                filename: Some("one.png".to_string()),
+                caption: None,
+            },
+            ChannelOutboundAttachment {
+                kind: ChannelOutboundAttachmentKind::Audio,
+                path: PathBuf::from("two.mp3"),
+                mime: Some("audio/mpeg".to_string()),
+                filename: Some("two.mp3".to_string()),
+                caption: None,
+            },
+            ChannelOutboundAttachment {
+                kind: ChannelOutboundAttachmentKind::Video,
+                path: PathBuf::from("three.mp4"),
+                mime: Some("video/mp4".to_string()),
+                filename: Some("three.mp4".to_string()),
+                caption: None,
+            },
+        ];
+
+        let payload = discord_attachments_payload("@everyone files", None, &attachments).unwrap();
+
+        assert_eq!(payload["content"], "@everyone files");
+        assert!(
+            payload["allowed_mentions"]["parse"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(payload["attachments"].as_array().unwrap().len(), 3);
+        assert_eq!(payload["attachments"][0]["id"], 0);
+        assert_eq!(payload["attachments"][1]["filename"], "two.mp3");
+        assert_eq!(payload["attachments"][2]["filename"], "three.mp4");
     }
 
     #[test]
@@ -22170,6 +23823,64 @@ mod tests {
         assert!(!rendered.contains("cdn.discordapp.com"));
         assert!(!rendered.contains("token=secret"));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discord_referenced_message_attachment_becomes_referenced_artifact() {
+        let root =
+            cli_temp_root("discord_referenced_message_attachment_becomes_referenced_artifact");
+        let harness_home = root.join("harness");
+        let payload = serde_json::json!({
+            "id": "message-2",
+            "channel_id": "channel-1",
+            "content": "use that image",
+            "author": { "id": "user-1" },
+            "message_reference": {
+                "message_id": "ref-1",
+                "channel_id": "channel-1"
+            },
+            "referenced_message": {
+                "id": "ref-1",
+                "content": "",
+                "author": { "id": "user-2" },
+                "attachments": [{
+                    "id": "ref-att-1",
+                    "filename": "prior.png",
+                    "content_type": "image/png",
+                    "size": 12,
+                    "width": 16,
+                    "height": 16,
+                    "url": "https://cdn.discordapp.com/attachments/private/prior.png?token=secret"
+                }]
+            }
+        });
+        let mut message = parse_discord_gateway_message(&payload).unwrap().unwrap();
+        let bytes = vec![
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 0,
+        ];
+
+        attach_discord_message_artifacts(
+            &harness_home,
+            &mut message,
+            &StaticDiscordAttachmentFetcher::new(vec![(
+                "https://cdn.discordapp.com/attachments/private/prior.png?token=secret",
+                bytes,
+            )]),
+        )
+        .unwrap();
+
+        assert_eq!(message.inbound_media_artifacts.len(), 1);
+        let artifact = &message.inbound_media_artifacts[0];
+        assert_eq!(artifact.provenance.as_deref(), Some("referenced"));
+        assert_eq!(artifact.message_id.as_deref(), Some("ref-1"));
+        assert_eq!(artifact.source, "discord.referenced_message.attachment");
+        let context = message.inbound_context.as_deref().unwrap();
+        assert!(context.contains("ReferencedMedia: Discord reply media"));
+        assert!(
+            context.contains("repliedToMedia: agent-harness://inbound-media/discord/ref-1/0.png")
+        );
+        assert!(!context.contains("cdn.discordapp.com"));
         let _ = fs::remove_dir_all(root);
     }
 

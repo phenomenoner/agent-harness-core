@@ -27,9 +27,21 @@ pub enum ChannelCommand {
         target: Option<String>,
         global: bool,
     },
+    Fast {
+        mode: FastCommandMode,
+        global: bool,
+    },
     Status {
         scope: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FastCommandMode {
+    Status,
+    Fast,
+    Normal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -62,6 +74,10 @@ pub enum ChannelCommandIntent {
         target: Option<String>,
         global: bool,
     },
+    Fast {
+        mode: FastCommandMode,
+        global: bool,
+    },
     ShowStatus {
         scope: Option<String>,
     },
@@ -81,6 +97,7 @@ impl ChannelCommand {
             ChannelCommand::Steer { .. } => "steer",
             ChannelCommand::Btw { .. } => "btw",
             ChannelCommand::Model { .. } => "model",
+            ChannelCommand::Fast { .. } => "fast",
             ChannelCommand::Status { .. } => "status",
         }
     }
@@ -105,6 +122,7 @@ impl ChannelCommand {
             ChannelCommand::Model { target, global } => {
                 ChannelCommandIntent::Model { target, global }
             }
+            ChannelCommand::Fast { mode, global } => ChannelCommandIntent::Fast { mode, global },
             ChannelCommand::Status { scope } => ChannelCommandIntent::ShowStatus { scope },
         }
     }
@@ -136,6 +154,7 @@ pub fn parse_channel_command(input: &str) -> Option<ChannelCommand> {
             let (target, global) = optional_text_with_global_flag(rest);
             Some(ChannelCommand::Model { target, global })
         }
+        "fast" => parse_fast_mode(rest).map(|(mode, global)| ChannelCommand::Fast { mode, global }),
         "status" => Some(ChannelCommand::Status {
             scope: optional_text(rest),
         }),
@@ -189,6 +208,20 @@ fn required_text(value: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+fn parse_fast_mode(value: &str) -> Option<(FastCommandMode, bool)> {
+    let (mode, global) = optional_text_with_global_flag(value);
+    let mode = mode.unwrap_or_default();
+    if mode.is_empty() {
+        return Some((FastCommandMode::Status, global));
+    }
+    match mode.to_ascii_lowercase().as_str() {
+        "status" => Some((FastCommandMode::Status, global)),
+        "fast" | "on" => Some((FastCommandMode::Fast, global)),
+        "normal" | "off" => Some((FastCommandMode::Normal, global)),
+        _ => None,
     }
 }
 
@@ -310,6 +343,56 @@ mod tests {
             parse_channel_command("/status"),
             Some(ChannelCommand::Status { scope: None })
         );
+        assert_eq!(
+            parse_channel_command("/fast status"),
+            Some(ChannelCommand::Fast {
+                mode: FastCommandMode::Status,
+                global: false
+            })
+        );
+        assert_eq!(
+            parse_channel_command("/fast fast"),
+            Some(ChannelCommand::Fast {
+                mode: FastCommandMode::Fast,
+                global: false
+            })
+        );
+        assert_eq!(
+            parse_channel_command("/fast on"),
+            Some(ChannelCommand::Fast {
+                mode: FastCommandMode::Fast,
+                global: false
+            })
+        );
+        assert_eq!(
+            parse_channel_command("/fast on --global"),
+            Some(ChannelCommand::Fast {
+                mode: FastCommandMode::Fast,
+                global: true
+            })
+        );
+        assert_eq!(
+            parse_channel_command("/fast normal"),
+            Some(ChannelCommand::Fast {
+                mode: FastCommandMode::Normal,
+                global: false
+            })
+        );
+        assert_eq!(
+            parse_channel_command("/fast off --global"),
+            Some(ChannelCommand::Fast {
+                mode: FastCommandMode::Normal,
+                global: true
+            })
+        );
+        assert_eq!(
+            parse_channel_command("/fast"),
+            Some(ChannelCommand::Fast {
+                mode: FastCommandMode::Status,
+                global: false
+            })
+        );
+        assert_eq!(parse_channel_command("/fast turbo"), None);
     }
 
     #[test]
@@ -397,6 +480,20 @@ mod tests {
                 scope: Some("cron".to_string())
             })
         );
+        assert_eq!(
+            parse_channel_command_intent("/fast on"),
+            Some(ChannelCommandIntent::Fast {
+                mode: FastCommandMode::Fast,
+                global: false
+            })
+        );
+        assert_eq!(
+            parse_channel_command_intent("/fast off --global"),
+            Some(ChannelCommandIntent::Fast {
+                mode: FastCommandMode::Normal,
+                global: true
+            })
+        );
     }
 
     #[test]
@@ -405,6 +502,8 @@ mod tests {
         assert_eq!(command.name(), "model");
         let command = parse_channel_command("/status agents").unwrap();
         assert_eq!(command.name(), "status");
+        let command = parse_channel_command("/fast on").unwrap();
+        assert_eq!(command.name(), "fast");
     }
 
     #[test]
