@@ -1007,7 +1007,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 source_completion_file: run.receipt.completion_file.clone(),
                 text: runtime_failure_reply_text(
                     status,
-                    &receipt_reason,
+                    &runtime_failure_reply_reason(&run.receipt, &receipt_reason),
                     run.receipt.queue_id.as_deref(),
                 ),
                 presentation: None,
@@ -1510,6 +1510,12 @@ fn runtime_failure_reply_text(
         .map(|queue_id| format!("\nQueue: {queue_id}"))
         .unwrap_or_default();
     if status == RuntimeRunOnceStatus::Canceled {
+        if reason.contains("interrupted_by_new_turn") {
+            return format!(
+                "This run was interrupted by a newer turn before the in-flight command produced an exit code.{queue_line}\nReason: {}\n\nUse the continuation context to inspect the interrupted command evidence and resume or rerun only verification-safe commands.",
+                truncate_for_channel(reason, 360),
+            );
+        }
         return "Stopped.".to_string();
     }
     if status == RuntimeRunOnceStatus::FailedTerminal {
@@ -1627,6 +1633,38 @@ fn final_run_once_reason(
         }
         _ => reason.to_string(),
     }
+}
+
+fn runtime_failure_reply_reason(
+    receipt: &crate::CodexRuntimeRunReceipt,
+    fallback_reason: &str,
+) -> String {
+    if receipt.status == CodexRuntimeRunStatus::Canceled
+        && receipt.interruption_reason.as_deref() == Some("interrupted_by_new_turn")
+    {
+        let tool_summary = receipt
+            .interrupted_tool_uses
+            .iter()
+            .take(3)
+            .map(|tool| {
+                let preview = tool.preview.as_deref().unwrap_or("(no preview)");
+                let action = if tool.safe_to_rerun {
+                    "verification-rerun-eligible"
+                } else {
+                    "explicit-review-required"
+                };
+                format!("{} [{action}]", truncate_for_channel(preview, 120))
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut reason = format!("interrupted_by_new_turn: {fallback_reason}");
+        if !tool_summary.is_empty() {
+            reason.push_str("; interruptedToolUses=");
+            reason.push_str(&tool_summary);
+        }
+        return reason;
+    }
+    fallback_reason.to_string()
 }
 
 fn should_write_failure_outbox(status: RuntimeRunOnceStatus) -> bool {
@@ -5174,6 +5212,84 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn run_runtime_queue_once_interrupted_command_uses_structured_reason_outbox() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root =
+            temp_root("run_runtime_queue_once_interrupted_command_uses_structured_reason_outbox");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source: source.clone(),
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "run a long verification command".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+
+        let session_key = "telegram:dm-42:user-7:main";
+        let cancel_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("cancel-requests")
+            .join(format!("{}.json", test_normalize_key_part(session_key)));
+        let fake_codex =
+            fake_interrupted_command_codex_executable(&root, &cancel_file, &source.workspace);
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            codex_executable: Some(fake_codex),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Canceled);
+        let run = report.run.as_ref().unwrap();
+        assert_eq!(run.receipt.status, CodexRuntimeRunStatus::Canceled);
+        assert_eq!(
+            run.receipt.interruption_reason.as_deref(),
+            Some("interrupted_by_new_turn")
+        );
+        assert_eq!(run.receipt.interrupted_tool_uses.len(), 1);
+        let outbound = report.outbound_message.unwrap();
+        assert_eq!(outbound.kind, ChannelOutboundMessageKind::ErrorReply);
+        assert!(outbound.text.contains("interrupted by a newer turn"));
+        assert!(outbound.text.contains("cargo test"));
+        assert!(outbound.text.contains("verification-rerun-eligible"));
+        assert_ne!(outbound.text, "Stopped.");
+        let outbox = fs::read_to_string(report.outbox_file.unwrap()).unwrap();
+        assert!(outbox.contains("\"kind\":\"error-reply\""));
+        assert!(outbox.contains("interrupted by a newer turn"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn timeout_policy_retries_then_dead_letters() {
         assert_eq!(
@@ -5463,6 +5579,60 @@ mod tests {
         );
         assert!(reply.contains("Codex context limit"));
         assert!(reply.contains("queue-context"));
+    }
+
+    #[test]
+    fn interrupted_verification_not_counted_as_test_failure() {
+        let receipt = crate::CodexRuntimeRunReceipt {
+            queue_id: Some("queue-interrupted".to_string()),
+            status: CodexRuntimeRunStatus::Canceled,
+            execution_dir: Some(PathBuf::from("execution")),
+            plan_file: Some(PathBuf::from("codex-runtime-plan.json")),
+            run_file: Some(PathBuf::from("codex-runtime-run.json")),
+            completion_file: None,
+            transcript_file: None,
+            trajectory_file: None,
+            codex_binding_file: None,
+            reason: "operator requested stop after newer same-lane turn arrived".to_string(),
+            elapsed_ms: 12_000,
+            event_count: 3,
+            usage: None,
+            media_plan: Default::default(),
+            context_recovery: None,
+            tool_use_timeout: None,
+            interruption_reason: Some("interrupted_by_new_turn".to_string()),
+            interrupted_tool_uses: vec![crate::codex_runtime::CodexInterruptedToolUse {
+                method: "item/started".to_string(),
+                item_id: Some("cmd-1".to_string()),
+                item_type: Some("commandExecution".to_string()),
+                preview: Some("cargo test -p agent-harness-core".to_string()),
+                cwd: Some(PathBuf::from("D:/Warehouse/Rust-OpenClaw-Core")),
+                started_at_ms: Some(1_000),
+                interrupted_at_ms: 2_000,
+                stdout_log: Some(PathBuf::from("stdout.log")),
+                stderr_log: Some(PathBuf::from("stderr.log")),
+                safe_to_rerun: true,
+                reason: "interrupted before exit code".to_string(),
+            }],
+        };
+        let reason = runtime_failure_reply_reason(
+            &receipt,
+            "runtime queue item was canceled by operator request; reason: operator requested stop after newer same-lane turn arrived",
+        );
+        let reply = runtime_failure_reply_text(
+            RuntimeRunOnceStatus::Canceled,
+            &reason,
+            Some("queue-interrupted"),
+        );
+
+        assert!(reply.contains("interrupted by a newer turn"));
+        assert!(reply.contains("queue-interrupted"));
+        assert!(reply.contains("cargo test -p agent-harness-core"));
+        assert!(reply.contains("verification-rerun-eligible"));
+        assert!(reply.contains("resume"));
+        assert!(!reply.to_ascii_lowercase().contains("failed test"));
+        assert!(!reply.to_ascii_lowercase().contains("test failed"));
+        assert_ne!(reply, "Stopped.");
     }
 
     #[test]
@@ -7167,6 +7337,8 @@ mod tests {
                         .to_string(),
                 }),
                 tool_use_timeout: None,
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
             },
             completion: None,
             stdout_log: None,
@@ -7221,6 +7393,8 @@ mod tests {
                 media_plan,
                 context_recovery: None,
                 tool_use_timeout: None,
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
             },
             completion: None,
             stdout_log: None,
@@ -7285,6 +7459,8 @@ mod tests {
                     started_at_ms: Some(1_000),
                     reason: "tool execution exceeded timeout".to_string(),
                 }),
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
             },
             completion: None,
             stdout_log: None,
@@ -7538,6 +7714,77 @@ while ($true) {
         )
         .unwrap();
         cmd
+    }
+
+    #[cfg(windows)]
+    fn fake_interrupted_command_codex_executable(
+        root: &Path,
+        cancel_file: &Path,
+        cwd: &Path,
+    ) -> PathBuf {
+        let script = root.join("fake-interrupted-command-app-server.ps1");
+        let cancel_file = cancel_file.display().to_string().replace('\'', "''");
+        let cwd = cwd.display().to_string().replace('\'', "''");
+        fs::write(
+            &script,
+            format!(
+                r#"
+$cancelFile = '{cancel_file}'
+$cwd = '{cwd}'
+while ($true) {{
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) {{ break }}
+    try {{
+        $msg = $line | ConvertFrom-Json
+    }} catch {{
+        continue
+    }}
+    if ($msg.id -eq 0) {{
+        [Console]::Out.WriteLine('{{"id":0,"result":{{"ok":true}}}}')
+        [Console]::Out.Flush()
+    }} elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {{
+        [Console]::Out.WriteLine('{{"id":1,"result":{{"thread":{{"id":"thread-interrupted-pipeline"}}}}}}')
+        [Console]::Out.Flush()
+    }} elseif ($msg.method -eq 'turn/start') {{
+        [Console]::Out.WriteLine('{{"method":"turn/started","params":{{"threadId":"thread-interrupted-pipeline","turn":{{"id":"turn-interrupted","kind":"regular"}}}}}}')
+        [Console]::Out.WriteLine(('{{"method":"item/started","params":{{"item":{{"type":"commandExecution","id":"cmd-interrupted","command":"cargo test -p agent-harness-core","cwd":"' + ($cwd -replace '\\','\\') + '"}},"threadId":"thread-interrupted-pipeline","turnId":"turn-interrupted"}}}}'))
+        [Console]::Out.Flush()
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $cancelFile) | Out-Null
+        $payload = '{{"schema":"agent-harness.runtime-cancel-request.v1","atMs":' + ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) + ',"sessionKey":"telegram:dm-42:user-7:main","reason":"new turn arrived while validation command was running"}}'
+        Set-Content -LiteralPath $cancelFile -Value $payload
+        Start-Sleep -Seconds 10
+    }}
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let cmd = root.join("fake-interrupted-codex.cmd");
+        fs::write(
+            &cmd,
+            format!(
+                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        cmd
+    }
+
+    fn test_normalize_key_part(value: &str) -> String {
+        let mut normalized = String::new();
+        for ch in value.chars() {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                normalized.push(ch.to_ascii_lowercase());
+            } else {
+                normalized.push('_');
+            }
+        }
+        if normalized.is_empty() {
+            "unknown".to_string()
+        } else {
+            normalized
+        }
     }
 
     #[cfg(windows)]

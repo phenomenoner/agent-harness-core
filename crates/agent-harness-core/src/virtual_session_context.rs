@@ -176,7 +176,7 @@ pub fn resolve_virtual_session_working_context(
     let working_set_file = indexed
         .as_ref()
         .map(|(index, _)| index.working_set_file.clone());
-    let last_interruption = indexed.as_ref().and_then(|(_, memory)| {
+    let mut last_interruption = indexed.as_ref().and_then(|(_, memory)| {
         memory
             .decisions
             .iter()
@@ -232,6 +232,11 @@ pub fn resolve_virtual_session_working_context(
         &root_session_key,
         &mut recent_queue_ids,
     )?;
+    if let Some(interruption) =
+        latest_structured_interruption(&query.harness_home, &recent_queue_ids)?
+    {
+        last_interruption = Some(interruption);
+    }
     let evidence_anchors = collect_evidence_anchors(&query.harness_home, &recent_queue_ids)?;
     let operation_plans = collect_active_operation_plan_refs(
         &query.harness_home,
@@ -340,6 +345,62 @@ fn collect_pending_queue_ids(
         }
     }
     Ok(())
+}
+
+fn latest_structured_interruption(
+    harness_home: &Path,
+    queue_ids: &[String],
+) -> io::Result<Option<String>> {
+    if queue_ids.is_empty() {
+        return Ok(None);
+    }
+    let queue_set = queue_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let file = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("codex-runtime-run-receipts.jsonl");
+    let mut latest = None;
+    for value in read_jsonl_values(&file)? {
+        let Some(queue_id) = string_field(&value, &["queueId", "queue_id"]) else {
+            continue;
+        };
+        if !queue_set.contains(queue_id) {
+            continue;
+        }
+        let Some(reason) = string_field(&value, &["interruptionReason", "interruption_reason"])
+        else {
+            continue;
+        };
+        let Some(tool) = value
+            .get("interruptedToolUses")
+            .or_else(|| value.get("interrupted_tool_uses"))
+            .and_then(Value::as_array)
+            .and_then(|tools| tools.first())
+        else {
+            continue;
+        };
+        let method = string_field(tool, &["method"]).unwrap_or("tool");
+        let item_type = string_field(tool, &["itemType", "item_type"]).unwrap_or("unknown");
+        let preview = string_field(tool, &["preview"]).unwrap_or("(no preview)");
+        let safe_to_rerun = tool
+            .get("safeToRerun")
+            .or_else(|| tool.get("safe_to_rerun"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let resume_action = if safe_to_rerun {
+            "resumeAction=verification-rerun-eligible"
+        } else {
+            "resumeAction=explicit-review-required"
+        };
+        latest = Some(bounded_text(
+            &format!(
+                "{reason}; method={method} itemType={item_type} preview={} {resume_action}",
+                bounded_text(preview, 120)
+            ),
+            240,
+        ));
+    }
+    Ok(latest)
 }
 
 fn collect_evidence_anchors(

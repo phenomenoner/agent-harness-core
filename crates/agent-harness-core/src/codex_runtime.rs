@@ -533,6 +533,10 @@ pub struct CodexRuntimeRunReceipt {
     pub context_recovery: Option<CodexContextRecoveryReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_use_timeout: Option<CodexToolUseTimeout>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interruption_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interrupted_tool_uses: Vec<CodexInterruptedToolUse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -582,6 +586,29 @@ pub struct CodexToolUseTimeout {
     pub preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at_ms: Option<i64>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexInterruptedToolUse {
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    pub interrupted_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_log: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_log: Option<PathBuf>,
+    pub safe_to_rerun: bool,
     pub reason: String,
 }
 
@@ -1400,6 +1427,8 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 media_plan: InboundMediaInputPlan::default(),
                 context_recovery: None,
                 tool_use_timeout: None,
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
             };
             append_codex_run_log(
                 &options.harness_home,
@@ -1444,6 +1473,8 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 media_plan: InboundMediaInputPlan::default(),
                 context_recovery: None,
                 tool_use_timeout: None,
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
             };
             append_codex_run_log(
                 &options.harness_home,
@@ -1492,6 +1523,8 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             media_plan: InboundMediaInputPlan::default(),
             context_recovery: None,
             tool_use_timeout: None,
+            interruption_reason: None,
+            interrupted_tool_uses: Vec::new(),
         };
         append_codex_run_log(
             &options.harness_home,
@@ -1544,6 +1577,8 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             media_plan: plan.media_plan.clone(),
             context_recovery: None,
             tool_use_timeout: None,
+            interruption_reason: None,
+            interrupted_tool_uses: Vec::new(),
         };
         append_codex_run_log(
             &options.harness_home,
@@ -1828,6 +1863,8 @@ fn finish_codex_runtime_run(
         media_plan: plan.media_plan.clone(),
         context_recovery: run_result.context_recovery,
         tool_use_timeout: run_result.tool_use_timeout,
+        interruption_reason: run_result.interruption_reason,
+        interrupted_tool_uses: run_result.interrupted_tool_uses,
     };
     let log_level = match receipt.status {
         CodexRuntimeRunStatus::Completed => HarnessLogLevel::Info,
@@ -1986,6 +2023,8 @@ fn recover_completed_codex_run_from_stdout_log(
                 stderr_log,
                 context_recovery: None,
                 tool_use_timeout: None,
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
                 warnings: state.warnings,
             }));
         }
@@ -2006,6 +2045,8 @@ fn recover_completed_codex_run_from_stdout_log(
         stderr_log,
         context_recovery: None,
         tool_use_timeout: None,
+        interruption_reason: None,
+        interrupted_tool_uses: Vec::new(),
         warnings: state.warnings,
     }))
 }
@@ -3121,6 +3162,8 @@ struct CodexAppServerRunResult {
     stderr_log: Option<PathBuf>,
     context_recovery: Option<CodexContextRecoveryReceipt>,
     tool_use_timeout: Option<CodexToolUseTimeout>,
+    interruption_reason: Option<String>,
+    interrupted_tool_uses: Vec<CodexInterruptedToolUse>,
     warnings: Vec<String>,
 }
 
@@ -3321,6 +3364,8 @@ fn drive_codex_app_server(
                 stderr_log: Some(stderr_log),
                 context_recovery: None,
                 tool_use_timeout: None,
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
                 warnings: Vec::new(),
             });
         }
@@ -3341,6 +3386,8 @@ fn drive_codex_app_server(
             stderr_log: Some(stderr_log),
             context_recovery: None,
             tool_use_timeout: None,
+            interruption_reason: None,
+            interrupted_tool_uses: Vec::new(),
             warnings: Vec::new(),
         });
     };
@@ -3360,6 +3407,8 @@ fn drive_codex_app_server(
             stderr_log: Some(stderr_log),
             context_recovery: None,
             tool_use_timeout: None,
+            interruption_reason: None,
+            interrupted_tool_uses: Vec::new(),
             warnings: Vec::new(),
         });
     };
@@ -3499,6 +3548,8 @@ fn drive_codex_app_server(
                 stderr_log: Some(stderr_log),
                 context_recovery: None,
                 tool_use_timeout: None,
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
                 warnings: state.warnings,
             });
         }
@@ -3523,6 +3574,8 @@ fn drive_codex_app_server(
                 stderr_log: Some(stderr_log),
                 context_recovery: None,
                 tool_use_timeout: Some(tool),
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
                 warnings: state.warnings,
             });
         }
@@ -3547,6 +3600,8 @@ fn drive_codex_app_server(
                 stderr_log: Some(stderr_log),
                 context_recovery: None,
                 tool_use_timeout: None,
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
                 warnings: state.warnings,
             });
         }
@@ -3571,6 +3626,8 @@ fn drive_codex_app_server(
                 stderr_log: Some(stderr_log),
                 context_recovery: None,
                 tool_use_timeout: None,
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
                 warnings: state.warnings,
             });
         }
@@ -3596,6 +3653,8 @@ fn drive_codex_app_server(
                 stderr_log: Some(stderr_log),
                 context_recovery: None,
                 tool_use_timeout: None,
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
                 warnings: state.warnings,
             });
         }
@@ -3620,6 +3679,8 @@ fn drive_codex_app_server(
                 stderr_log: Some(stderr_log),
                 context_recovery: None,
                 tool_use_timeout: None,
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
                 warnings: state.warnings,
             });
         }
@@ -3697,6 +3758,8 @@ fn drive_codex_app_server(
                     stderr_log: Some(stderr_log),
                     context_recovery: Some(recovery),
                     tool_use_timeout: None,
+                    interruption_reason: None,
+                    interrupted_tool_uses: Vec::new(),
                     warnings: state.warnings,
                 });
             }
@@ -3731,6 +3794,8 @@ fn drive_codex_app_server(
                     stderr_log: Some(stderr_log),
                     context_recovery: Some(recovery),
                     tool_use_timeout: Some(tool),
+                    interruption_reason: None,
+                    interrupted_tool_uses: Vec::new(),
                     warnings: state.warnings,
                 });
             }
@@ -3766,6 +3831,8 @@ fn drive_codex_app_server(
                     stderr_log: Some(stderr_log),
                     context_recovery: Some(recovery),
                     tool_use_timeout: None,
+                    interruption_reason: None,
+                    interrupted_tool_uses: Vec::new(),
                     warnings: state.warnings,
                 });
             }
@@ -3800,6 +3867,8 @@ fn drive_codex_app_server(
                     stderr_log: Some(stderr_log),
                     context_recovery: Some(recovery),
                     tool_use_timeout: None,
+                    interruption_reason: None,
+                    interrupted_tool_uses: Vec::new(),
                     warnings: state.warnings,
                 });
             }
@@ -3837,6 +3906,8 @@ fn drive_codex_app_server(
                     stderr_log: Some(stderr_log),
                     context_recovery: Some(recovery),
                     tool_use_timeout: None,
+                    interruption_reason: None,
+                    interrupted_tool_uses: Vec::new(),
                     warnings: state.warnings,
                 });
             }
@@ -3974,6 +4045,8 @@ fn drive_codex_app_server(
                 stderr_log: Some(stderr_log),
                 context_recovery: context_recovery.clone(),
                 tool_use_timeout: None,
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
                 warnings: state.warnings,
             });
         }
@@ -3998,6 +4071,8 @@ fn drive_codex_app_server(
                 stderr_log: Some(stderr_log),
                 context_recovery: context_recovery.clone(),
                 tool_use_timeout: Some(tool),
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
                 warnings: state.warnings,
             });
         }
@@ -4022,6 +4097,8 @@ fn drive_codex_app_server(
                 stderr_log: Some(stderr_log),
                 context_recovery: context_recovery.clone(),
                 tool_use_timeout: None,
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
                 warnings: state.warnings,
             });
         }
@@ -4047,6 +4124,8 @@ fn drive_codex_app_server(
                 stderr_log: Some(stderr_log),
                 context_recovery: context_recovery.clone(),
                 tool_use_timeout: None,
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
                 warnings: state.warnings,
             });
         }
@@ -4072,10 +4151,21 @@ fn drive_codex_app_server(
                 stderr_log: Some(stderr_log),
                 context_recovery: context_recovery.clone(),
                 tool_use_timeout: None,
+                interruption_reason: None,
+                interrupted_tool_uses: Vec::new(),
                 warnings: state.warnings,
             });
         }
         ProtocolWait::Canceled(reason) => {
+            let interrupted_tool_uses = interrupted_tool_uses_for_cancel(
+                &state,
+                &reason,
+                Some(stdout_log.clone()),
+                Some(stderr_log.clone()),
+            );
+            let interruption_reason = (!interrupted_tool_uses.is_empty()
+                && cancel_reason_is_new_turn_interruption(&reason))
+            .then(|| "interrupted_by_new_turn".to_string());
             let _ = write_json_rpc(
                 &mut stdin,
                 &json!({
@@ -4105,6 +4195,8 @@ fn drive_codex_app_server(
                 stderr_log: Some(stderr_log),
                 context_recovery: context_recovery.clone(),
                 tool_use_timeout: None,
+                interruption_reason,
+                interrupted_tool_uses,
                 warnings: state.warnings,
             });
         }
@@ -4135,6 +4227,8 @@ fn drive_codex_app_server(
             stderr_log: Some(stderr_log),
             context_recovery,
             tool_use_timeout: None,
+            interruption_reason: None,
+            interrupted_tool_uses: Vec::new(),
             warnings: state.warnings,
         });
     }
@@ -4158,6 +4252,8 @@ fn drive_codex_app_server(
         stderr_log: Some(stderr_log),
         context_recovery,
         tool_use_timeout: None,
+        interruption_reason: None,
+        interrupted_tool_uses: Vec::new(),
         warnings: state.warnings,
     })
 }
@@ -4558,6 +4654,8 @@ fn recover_preflight_thread_health_pollution(
         stderr_log,
         context_recovery: None,
         tool_use_timeout: None,
+        interruption_reason: None,
+        interrupted_tool_uses: Vec::new(),
         warnings: Vec::new(),
     };
     let mut recovered = run_context_checkpoint_fallback(
@@ -5377,6 +5475,7 @@ struct CodexActiveToolUse {
     item_id: Option<String>,
     item_type: Option<String>,
     preview: Option<String>,
+    cwd: Option<PathBuf>,
     started_at_ms: Option<i64>,
 }
 
@@ -5388,6 +5487,29 @@ impl CodexActiveToolUse {
             item_type: self.item_type.clone(),
             preview: self.preview.clone(),
             started_at_ms: self.started_at_ms,
+            reason,
+        }
+    }
+
+    fn interruption(
+        &self,
+        reason: String,
+        interrupted_at_ms: i64,
+        stdout_log: Option<PathBuf>,
+        stderr_log: Option<PathBuf>,
+    ) -> CodexInterruptedToolUse {
+        let preview = self.preview.as_deref().unwrap_or_default();
+        CodexInterruptedToolUse {
+            method: self.method.clone(),
+            item_id: self.item_id.clone(),
+            item_type: self.item_type.clone(),
+            preview: self.preview.clone(),
+            cwd: self.cwd.clone(),
+            started_at_ms: self.started_at_ms,
+            interrupted_at_ms,
+            stdout_log,
+            stderr_log,
+            safe_to_rerun: command_preview_is_safe_to_rerun(preview),
             reason,
         }
     }
@@ -5559,6 +5681,7 @@ fn observe_codex_active_tool_use(value: &Value, state: &mut CodexProtocolState) 
             item_id,
             item_type,
             preview,
+            cwd: codex_tool_cwd(value),
             started_at_ms,
         });
         return;
@@ -5578,9 +5701,68 @@ fn observe_codex_active_tool_use(value: &Value, state: &mut CodexProtocolState) 
             item_id,
             item_type,
             preview,
+            cwd: codex_tool_cwd(value),
             started_at_ms: current_log_time_ms().ok(),
         });
     }
+}
+
+fn codex_tool_cwd(value: &Value) -> Option<PathBuf> {
+    value
+        .pointer("/params/item/cwd")
+        .or_else(|| value.pointer("/params/item/workingDirectory"))
+        .or_else(|| value.pointer("/params/cwd"))
+        .or_else(|| value.pointer("/params/workingDirectory"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(PathBuf::from)
+}
+
+fn command_preview_is_safe_to_rerun(preview: &str) -> bool {
+    let lower = preview.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    let safe_prefixes = [
+        "cargo test",
+        "cargo check",
+        "cargo clippy",
+        "cargo fmt --check",
+        "git status",
+        "git diff",
+        "git grep",
+        "git log",
+    ];
+    safe_prefixes
+        .iter()
+        .any(|prefix| lower == *prefix || lower.starts_with(&format!("{prefix} ")))
+}
+
+fn interrupted_tool_uses_for_cancel(
+    state: &CodexProtocolState,
+    reason: &str,
+    stdout_log: Option<PathBuf>,
+    stderr_log: Option<PathBuf>,
+) -> Vec<CodexInterruptedToolUse> {
+    let Some(tool) = state.active_tool_use.as_ref() else {
+        return Vec::new();
+    };
+    let interrupted_at_ms = current_log_time_ms().unwrap_or(0);
+    vec![tool.interruption(
+        reason.to_string(),
+        interrupted_at_ms,
+        stdout_log,
+        stderr_log,
+    )]
+}
+
+fn cancel_reason_is_new_turn_interruption(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase().replace(['_', '-'], " ");
+    lower.contains("new turn")
+        || lower.contains("same lane")
+        || lower.contains("fresh turn")
+        || lower.contains("interrupted by new turn")
 }
 
 fn should_clear_active_tool(
@@ -6787,6 +6969,8 @@ fn codex_app_server_write_failed_result(
         stderr_log: Some(stderr_log.to_path_buf()),
         context_recovery: None,
         tool_use_timeout: None,
+        interruption_reason: None,
+        interrupted_tool_uses: Vec::new(),
         warnings: std::mem::take(&mut state.warnings),
     }
 }
@@ -12782,6 +12966,74 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn interrupt_running_shell_command_records_interrupted_status() {
+        let root = temp_root("interrupt_running_shell_command_records_interrupted_status");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let session_key = "telegram:dm-42:user-7:main";
+        let cancel_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("cancel-requests")
+            .join(format!("{}.json", normalize_key_part(session_key)));
+        let (executable, arguments) =
+            interrupted_command_app_server_command(&root, &cancel_file, &source.workspace);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Canceled);
+        assert_eq!(
+            report.receipt.interruption_reason.as_deref(),
+            Some("interrupted_by_new_turn")
+        );
+        assert_eq!(report.receipt.interrupted_tool_uses.len(), 1);
+        let tool = &report.receipt.interrupted_tool_uses[0];
+        assert_eq!(tool.item_id.as_deref(), Some("cmd-interrupted"));
+        assert_eq!(tool.item_type.as_deref(), Some("commandExecution"));
+        assert!(
+            tool.preview
+                .as_deref()
+                .is_some_and(|preview| preview.contains("cargo test"))
+        );
+        assert_eq!(tool.cwd.as_deref(), Some(source.workspace.as_path()));
+        assert!(tool.safe_to_rerun);
+        assert!(tool.stdout_log.is_some());
+        assert!(tool.stderr_log.is_some());
+        assert!(report.receipt.reason.contains("new turn"));
+        let receipts = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("codex-runtime-run-receipts.jsonl"),
+        )
+        .unwrap();
+        assert!(receipts.contains("\"interruptionReason\":\"interrupted_by_new_turn\""));
+        assert!(receipts.contains("\"safeToRerun\":true"));
+        assert!(receipts.contains("cargo test"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn runtime_cancel_request_survives_first_consumer_for_sibling_queue() {
         let root = temp_root("runtime_cancel_request_survives_first_consumer_for_sibling_queue");
@@ -13129,6 +13381,21 @@ mod tests {
     }
 
     #[test]
+    fn safe_rerun_classifier_allows_verification_only_and_requires_choice_for_mutation() {
+        assert!(command_preview_is_safe_to_rerun(
+            "cargo test -p agent-harness-core"
+        ));
+        assert!(command_preview_is_safe_to_rerun("cargo check --workspace"));
+        assert!(command_preview_is_safe_to_rerun("git status --short"));
+
+        assert!(!command_preview_is_safe_to_rerun("cargo run -- migrate"));
+        assert!(!command_preview_is_safe_to_rerun("git push origin main"));
+        assert!(!command_preview_is_safe_to_rerun(
+            "Remove-Item -Recurse target"
+        ));
+    }
+
+    #[test]
     fn record_codex_runtime_completion_writes_outputs_idempotently() {
         let root = temp_root("record_codex_runtime_completion_writes_outputs_idempotently");
         let source = write_codex_runtime_source(&root);
@@ -13425,6 +13692,68 @@ while ($true) {
     }
 }
 "#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
+
+    #[cfg(windows)]
+    fn interrupted_command_app_server_command(
+        root: &Path,
+        cancel_file: &Path,
+        cwd: &Path,
+    ) -> (PathBuf, Vec<String>) {
+        let script = root.join("interrupted-command-app-server.ps1");
+        let cancel_file = cancel_file.display().to_string().replace('\'', "''");
+        let cwd = cwd.display().to_string().replace('\'', "''");
+        fs::write(
+            &script,
+            format!(
+                r#"
+$cancelFile = '{cancel_file}'
+$cwd = '{cwd}'
+while ($true) {{
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) {{ break }}
+    try {{
+        $msg = $line | ConvertFrom-Json
+    }} catch {{
+        continue
+    }}
+    if ($msg.id -eq 0) {{
+        [Console]::Out.WriteLine('{{"id":0,"result":{{"ok":true}}}}')
+        [Console]::Out.Flush()
+    }} elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {{
+        [Console]::Out.WriteLine('{{"id":1,"result":{{"thread":{{"id":"thread-interrupted-command"}}}}}}')
+        [Console]::Out.Flush()
+    }} elseif ($msg.method -eq 'turn/start') {{
+        [Console]::Out.WriteLine('{{"method":"turn/started","params":{{"threadId":"thread-interrupted-command","turn":{{"id":"turn-interrupted","kind":"regular"}}}}}}')
+        [Console]::Out.WriteLine(('{{"method":"item/started","params":{{"item":{{"type":"commandExecution","id":"cmd-interrupted","command":"cargo test -p agent-harness-core","cwd":"' + ($cwd -replace '\\','\\') + '"}},"threadId":"thread-interrupted-command","turnId":"turn-interrupted"}}}}'))
+        [Console]::Out.Flush()
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $cancelFile) | Out-Null
+        $payload = '{{"schema":"agent-harness.runtime-cancel-request.v1","atMs":' + ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) + ',"sessionKey":"telegram:dm-42:user-7:main","reason":"interrupted by new turn while validation command was running"}}'
+        Set-Content -LiteralPath $cancelFile -Value $payload
+        Start-Sleep -Seconds 10
+    }}
+}}
+"#
+            ),
         )
         .unwrap();
         let system_powershell =

@@ -234,10 +234,9 @@ pub fn plan_channel_outbox(
         }
         let delivery_id = delivery_id(line_number, trimmed);
         let attempts = receipts.get(&delivery_id).map_or(0, Vec::len);
-        let last_status = receipts
-            .get(&delivery_id)
-            .and_then(|records| records.last())
-            .map(|receipt| receipt.status);
+        let records = receipts.get(&delivery_id).map(Vec::as_slice).unwrap_or(&[]);
+        let last_status = delivery_terminal_status(records)
+            .or_else(|| records.last().map(|receipt| receipt.status));
         let pending_status = match last_status {
             Some(ChannelDeliveryStatus::Delivered) => {
                 summary.delivered += 1;
@@ -249,9 +248,8 @@ pub fn plan_channel_outbox(
             }
             Some(ChannelDeliveryStatus::Failed) => {
                 summary.failed_retryable += 1;
-                if receipts
-                    .get(&delivery_id)
-                    .and_then(|records| records.last())
+                if records
+                    .last()
                     .is_some_and(|receipt| receipt.has_partial_failure())
                 {
                     summary.partial_failed += 1;
@@ -302,6 +300,11 @@ pub fn record_channel_delivery(
     let channel_dir = options.harness_home.join("state").join("channels");
     let receipts_file = channel_dir.join("delivery-receipts.jsonl");
     fs::create_dir_all(&channel_dir)?;
+    let mut warnings = Vec::new();
+    let superseded_by_terminal = options.status == ChannelDeliveryStatus::Failed
+        && read_delivery_receipts(&receipts_file, &mut warnings)?
+            .get(&options.delivery_id)
+            .is_some_and(|records| delivery_terminal_status(records).is_some());
     let receipt = ChannelDeliveryReceipt {
         schema: CHANNEL_DELIVERY_RECEIPT_SCHEMA.to_string(),
         delivery_id: options.delivery_id,
@@ -345,7 +348,40 @@ pub fn record_channel_delivery(
             receipt.user_id.clone(),
         ),
     )?;
+    if superseded_by_terminal {
+        append_harness_log(
+            &options.harness_home,
+            &HarnessLogEvent::new(
+                current_log_time_ms()?,
+                HarnessLogLevel::Warn,
+                "channel",
+                "channel.delivery.failed-superseded-by-terminal",
+                format!(
+                    "retryable failed receipt for delivery {} was recorded for audit but superseded by an existing terminal receipt",
+                    receipt.delivery_id
+                ),
+            )
+            .session_key(Some(receipt.session_key.clone()))
+            .channel(
+                receipt.platform.clone(),
+                receipt.channel_id.clone(),
+                receipt.user_id.clone(),
+            ),
+        )?;
+    }
     Ok(receipt)
+}
+
+fn delivery_terminal_status(records: &[ChannelDeliveryReceipt]) -> Option<ChannelDeliveryStatus> {
+    records
+        .iter()
+        .rev()
+        .find_map(|receipt| match receipt.status {
+            ChannelDeliveryStatus::Delivered | ChannelDeliveryStatus::SkippedPermanent => {
+                Some(receipt.status)
+            }
+            ChannelDeliveryStatus::Failed => None,
+        })
 }
 
 fn read_delivery_receipts(
@@ -562,6 +598,86 @@ mod tests {
         )
         .unwrap();
         assert!(log.contains("channel.delivery.skipped-permanent"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_delivery_receipt_outranks_later_retryable_failed_receipt() {
+        let root = temp_root("terminal_delivery_receipt_outranks_later_retryable_failed_receipt");
+        let harness_home = root.join(".agent-harness");
+        let outbox_file = harness_home
+            .join("state")
+            .join("channels")
+            .join("outbox.jsonl");
+        append_json_line(
+            &outbox_file,
+            &message("telegram", "dm-1", "user-1", "session-1", "overlong final"),
+        )
+        .unwrap();
+
+        let initial = plan_channel_outbox(ChannelOutboxPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            limit: 10,
+        })
+        .unwrap();
+        assert_eq!(initial.pending.len(), 1);
+        let delivery_id = initial.pending[0].delivery_id.clone();
+
+        record_channel_delivery(ChannelDeliveryRecordOptions {
+            harness_home: harness_home.clone(),
+            delivery_id: delivery_id.clone(),
+            status: ChannelDeliveryStatus::SkippedPermanent,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-1".to_string(),
+            user_id: "user-1".to_string(),
+            session_key: "session-1".to_string(),
+            provider_message_id: None,
+            error: Some("manual terminal skip for provider permanent failure".to_string()),
+            now_ms: 1234,
+            rendered_units: Vec::new(),
+            presentation: None,
+        })
+        .unwrap();
+        record_channel_delivery(ChannelDeliveryRecordOptions {
+            harness_home: harness_home.clone(),
+            delivery_id,
+            status: ChannelDeliveryStatus::Failed,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-1".to_string(),
+            user_id: "user-1".to_string(),
+            session_key: "session-1".to_string(),
+            provider_message_id: None,
+            error: Some("late in-flight retryable sender failure".to_string()),
+            now_ms: 1235,
+            rendered_units: Vec::new(),
+            presentation: None,
+        })
+        .unwrap();
+
+        let terminal = plan_channel_outbox(ChannelOutboxPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            limit: 10,
+        })
+        .unwrap();
+
+        assert!(terminal.pending.is_empty());
+        assert_eq!(terminal.summary.pending, 0);
+        assert_eq!(terminal.summary.skipped_permanent, 1);
+        assert_eq!(terminal.summary.failed_retryable, 0);
+
+        let log = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("logs")
+                .join("harness.jsonl"),
+        )
+        .unwrap();
+        assert!(log.contains("terminal receipt"));
 
         let _ = fs::remove_dir_all(root);
     }

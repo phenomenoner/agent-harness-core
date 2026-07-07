@@ -4669,63 +4669,17 @@ fn execute_telegram_poll_once(
     }
     write_telegram_offset(&offset_file, next_offset)?;
 
-    let delivery = plan_channel_outbox(ChannelOutboxPlanOptions {
-        harness_home: args.target_home.clone(),
-        platform: Some("telegram".to_string()),
-        limit: args.outbox_limit,
-    })
-    .map_err(|err| err.to_string())?;
-    warnings.extend(delivery.warnings.clone());
-    let mut delivered_messages = 0;
-    let mut failed_deliveries = 0;
-    for pending in delivery.pending {
-        if outbound_message_account_id(&pending.message)
-            != telegram_account_id(args.telegram_account.as_deref())
-        {
-            continue;
-        }
-        match telegram_send_outbound_message(&args.target_home, token, &pending.message) {
-            Ok(send) => {
-                record_channel_delivery(ChannelDeliveryRecordOptions {
-                    harness_home: args.target_home.clone(),
-                    delivery_id: pending.delivery_id,
-                    status: ChannelDeliveryStatus::Delivered,
-                    platform: pending.message.platform.clone(),
-                    account_id: pending.message.account_id.clone(),
-                    channel_id: pending.message.channel_id.clone(),
-                    user_id: pending.message.user_id.clone(),
-                    session_key: pending.message.session_key.clone(),
-                    provider_message_id: send.provider_message_id,
-                    error: None,
-                    now_ms: current_time_ms()?,
-                    rendered_units: send.rendered_units,
-                    presentation: send.presentation,
-                })
-                .map_err(|err| err.to_string())?;
-                delivered_messages += 1;
-            }
-            Err(error) => {
-                record_channel_delivery(ChannelDeliveryRecordOptions {
-                    harness_home: args.target_home.clone(),
-                    delivery_id: pending.delivery_id,
-                    status: ChannelDeliveryStatus::Failed,
-                    platform: pending.message.platform.clone(),
-                    account_id: pending.message.account_id.clone(),
-                    channel_id: pending.message.channel_id.clone(),
-                    user_id: pending.message.user_id.clone(),
-                    session_key: pending.message.session_key.clone(),
-                    provider_message_id: error.provider_message_id,
-                    error: Some(error.message.clone()),
-                    now_ms: current_time_ms()?,
-                    rendered_units: error.rendered_units,
-                    presentation: error.presentation,
-                })
-                .map_err(|err| err.to_string())?;
-                warnings.push(error.message);
-                failed_deliveries += 1;
-            }
-        }
-    }
+    let (_pending_count, delivered_messages, failed_deliveries) =
+        deliver_telegram_pending_outbox_with_sender(
+            &args.target_home,
+            args.telegram_account.as_deref(),
+            args.outbox_limit,
+            token,
+            &mut warnings,
+            &mut |harness_home, token, message| {
+                telegram_send_outbound_message(harness_home, token, message)
+            },
+        )?;
 
     let report = TelegramPollOnceReport {
         update_count: updates.len(),
@@ -4760,6 +4714,82 @@ fn execute_telegram_poll_once(
     )
     .map_err(|err| err.to_string())?;
     Ok(report)
+}
+
+fn deliver_telegram_pending_outbox_with_sender<Sender>(
+    harness_home: &Path,
+    telegram_account: Option<&str>,
+    outbox_limit: usize,
+    token: &str,
+    warnings: &mut Vec<String>,
+    send_outbound: &mut Sender,
+) -> Result<(usize, usize, usize), String>
+where
+    Sender:
+        FnMut(&Path, &str, &ChannelOutboundMessage) -> Result<ChannelSendAttempt, ChannelSendError>,
+{
+    let delivery = plan_channel_outbox(ChannelOutboxPlanOptions {
+        harness_home: harness_home.to_path_buf(),
+        platform: Some("telegram".to_string()),
+        limit: outbox_limit,
+    })
+    .map_err(|err| err.to_string())?;
+    warnings.extend(delivery.warnings.clone());
+    let pending_count = delivery.pending.len();
+    let mut delivered_messages = 0;
+    let mut failed_deliveries = 0;
+    for pending in delivery.pending {
+        if outbound_message_account_id(&pending.message) != telegram_account_id(telegram_account) {
+            continue;
+        }
+        match send_outbound(harness_home, token, &pending.message) {
+            Ok(send) => {
+                record_channel_delivery(ChannelDeliveryRecordOptions {
+                    harness_home: harness_home.to_path_buf(),
+                    delivery_id: pending.delivery_id,
+                    status: ChannelDeliveryStatus::Delivered,
+                    platform: pending.message.platform.clone(),
+                    account_id: pending.message.account_id.clone(),
+                    channel_id: pending.message.channel_id.clone(),
+                    user_id: pending.message.user_id.clone(),
+                    session_key: pending.message.session_key.clone(),
+                    provider_message_id: send.provider_message_id,
+                    error: None,
+                    now_ms: current_time_ms()?,
+                    rendered_units: send.rendered_units,
+                    presentation: send.presentation,
+                })
+                .map_err(|err| err.to_string())?;
+                delivered_messages += 1;
+            }
+            Err(error) => {
+                let status = if error.permanent {
+                    ChannelDeliveryStatus::SkippedPermanent
+                } else {
+                    ChannelDeliveryStatus::Failed
+                };
+                record_channel_delivery(ChannelDeliveryRecordOptions {
+                    harness_home: harness_home.to_path_buf(),
+                    delivery_id: pending.delivery_id,
+                    status,
+                    platform: pending.message.platform.clone(),
+                    account_id: pending.message.account_id.clone(),
+                    channel_id: pending.message.channel_id.clone(),
+                    user_id: pending.message.user_id.clone(),
+                    session_key: pending.message.session_key.clone(),
+                    provider_message_id: error.provider_message_id,
+                    error: Some(error.message.clone()),
+                    now_ms: current_time_ms()?,
+                    rendered_units: error.rendered_units,
+                    presentation: error.presentation,
+                })
+                .map_err(|err| err.to_string())?;
+                warnings.push(error.message);
+                failed_deliveries += 1;
+            }
+        }
+    }
+    Ok((pending_count, delivered_messages, failed_deliveries))
 }
 
 fn execute_telegram_media_group_flush<F: telegram_media::TelegramMediaFetcher>(
@@ -17011,6 +17041,7 @@ struct ChannelSendAttempt {
 #[derive(Debug, Clone)]
 struct ChannelSendError {
     message: String,
+    permanent: bool,
     provider_message_id: Option<String>,
     rendered_units: Vec<ChannelDeliveryRenderedUnitReceipt>,
     presentation: Option<ChannelDeliveryPresentationReceipt>,
@@ -17018,13 +17049,23 @@ struct ChannelSendError {
 
 impl From<String> for ChannelSendError {
     fn from(message: String) -> Self {
+        let permanent = telegram_send_error_is_permanent(&message);
         Self {
             message,
+            permanent,
             provider_message_id: None,
             rendered_units: Vec::new(),
             presentation: None,
         }
     }
+}
+
+const TELEGRAM_MESSAGE_TEXT_LIMIT: usize = 4_096;
+const TELEGRAM_MESSAGE_CHUNK_HEADROOM_UTF16: usize = 32;
+
+fn telegram_send_error_is_permanent(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("telegram http status 400") && normalized.contains("message is too long")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -17114,6 +17155,75 @@ fn telegram_message_payload(
     payload
 }
 
+fn telegram_message_chunks(text: &str) -> Vec<String> {
+    if text.encode_utf16().count() <= TELEGRAM_MESSAGE_TEXT_LIMIT {
+        return vec![text.to_string()];
+    }
+    let body_limit =
+        TELEGRAM_MESSAGE_TEXT_LIMIT.saturating_sub(TELEGRAM_MESSAGE_CHUNK_HEADROOM_UTF16);
+    let chunks = split_telegram_message_body_chunks(text, body_limit.max(1));
+    if chunks.len() <= 1 {
+        return chunks;
+    }
+    let total = chunks.len();
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| format!("({}/{})\n{}", index + 1, total, chunk))
+        .collect()
+}
+
+fn split_telegram_message_body_chunks(text: &str, max_utf16_units: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    if text.encode_utf16().count() <= max_utf16_units {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        let take = telegram_chunk_boundary(remaining, max_utf16_units);
+        let (head, tail) = remaining.split_at(take);
+        chunks.push(head.to_string());
+        remaining = tail;
+    }
+    chunks
+}
+
+fn telegram_chunk_boundary(text: &str, max_utf16_units: usize) -> usize {
+    let mut units = 0usize;
+    let mut max_boundary = 0usize;
+    let mut paragraph_boundary = None;
+    let mut line_boundary = None;
+    let mut previous_char_was_newline = false;
+
+    for (byte_index, ch) in text.char_indices() {
+        let ch_units = ch.len_utf16();
+        if units + ch_units > max_utf16_units {
+            break;
+        }
+        units += ch_units;
+        let next_boundary = byte_index + ch.len_utf8();
+        max_boundary = next_boundary;
+        if ch == '\n' {
+            line_boundary = Some(next_boundary);
+            if previous_char_was_newline {
+                paragraph_boundary = Some(next_boundary);
+            }
+            previous_char_was_newline = true;
+        } else {
+            previous_char_was_newline = false;
+        }
+    }
+
+    paragraph_boundary
+        .or(line_boundary)
+        .filter(|boundary| *boundary > 0)
+        .unwrap_or(max_boundary.max(text.chars().next().map(char::len_utf8).unwrap_or(0)))
+}
+
 fn telegram_send_outbound_message(
     harness_home: &Path,
     token: &str,
@@ -17155,19 +17265,20 @@ where
     }
     let mut provider_message_ids = Vec::new();
     let text = format_channel_reply_text(&message.text);
+    let mut rendered_units = Vec::new();
     if message.attachments.is_empty() || !text.trim().is_empty() {
-        if let Some(provider_message_id) = send_text(
+        rendered_units.extend(telegram_send_text_chunks_with_senders(
             &text,
             TelegramSendOptions {
                 reply_to_message_id: telegram_reply_to_message_id(message),
                 message_thread_id: telegram_message_thread_id(message),
                 formatting_mode: telegram_formatting_mode_for_message(harness_home, message),
             },
-        )
-        .map_err(ChannelSendError::from)?
-        {
-            provider_message_ids.push(provider_message_id);
-        }
+            "text:0",
+            &mut send_text,
+            &mut provider_message_ids,
+            None,
+        )?);
     }
     send_telegram_attachment_sequence(
         &message.attachments,
@@ -17185,7 +17296,7 @@ where
     Ok(ChannelSendAttempt {
         provider_message_id: (!provider_message_ids.is_empty())
             .then(|| provider_message_ids.join(",")),
-        rendered_units: Vec::new(),
+        rendered_units,
         presentation: None,
     })
 }
@@ -17213,6 +17324,7 @@ where
         .as_ref()
         .ok_or_else(|| ChannelSendError {
             message: "rich presentation was missing".to_string(),
+            permanent: false,
             provider_message_id: None,
             rendered_units: Vec::new(),
             presentation: None,
@@ -17252,7 +17364,18 @@ where
         match unit.kind {
             RenderedRichUnitKind::Text => {
                 let text = unit.text.unwrap_or_default();
-                let send = send_text(
+                if text.encode_utf16().count() > TELEGRAM_MESSAGE_TEXT_LIMIT {
+                    return telegram_send_plain_fallback_with_senders(
+                        message,
+                        ChannelDeliveryPresentationFallbackReason::ProviderFallback,
+                        "Telegram rendered HTML text exceeds sendMessage limit; falling back to plain chunked text"
+                            .to_string(),
+                        &mut send_text,
+                        &mut send_attachment,
+                    );
+                }
+                let previous_provider_id_count = provider_message_ids.len();
+                match telegram_send_text_chunks_with_senders(
                     &text,
                     TelegramSendOptions {
                         reply_to_message_id: first_message
@@ -17261,27 +17384,25 @@ where
                         message_thread_id: telegram_message_thread_id(message),
                         formatting_mode: TelegramFormattingMode::TrustedHtml,
                     },
-                );
-                first_message = false;
-                match send {
-                    Ok(provider_message_id) => {
-                        if let Some(id) = provider_message_id.clone() {
-                            text_provider_message_id = Some(id.clone());
-                            provider_message_ids.push(id);
+                    &unit.unit_id,
+                    &mut send_text,
+                    &mut provider_message_ids,
+                    None,
+                ) {
+                    Ok(units) => {
+                        first_message = false;
+                        if provider_message_ids.len() > previous_provider_id_count {
+                            text_provider_message_id = joined_provider_ids(
+                                &provider_message_ids[previous_provider_id_count..],
+                            );
                         }
-                        rendered_units.push(rendered_unit_receipt(
-                            unit.unit_id,
-                            unit.kind,
-                            ChannelDeliveryUnitStatus::Delivered,
-                            provider_message_id,
-                            None,
-                        ));
+                        rendered_units.extend(units);
                     }
                     Err(error) => {
                         return telegram_send_plain_fallback_with_senders(
                             message,
                             ChannelDeliveryPresentationFallbackReason::ProviderFallback,
-                            error,
+                            error.message,
                             &mut send_text,
                             &mut send_attachment,
                         );
@@ -17332,6 +17453,7 @@ where
                                                 message: format!(
                                                     "Telegram media group caption overflow send failed: {error}"
                                                 ),
+                                                permanent: telegram_send_error_is_permanent(&error),
                                                 provider_message_id: joined_provider_ids(
                                                     &provider_message_ids,
                                                 ),
@@ -17364,6 +17486,7 @@ where
                                     ));
                                 }
                                 return Err(ChannelSendError {
+                                    permanent: telegram_send_error_is_permanent(&error),
                                     message: error,
                                     provider_message_id: joined_provider_ids(&provider_message_ids),
                                     rendered_units,
@@ -17386,6 +17509,7 @@ where
                     ));
                     return Err(ChannelSendError {
                         message: error,
+                        permanent: false,
                         provider_message_id: joined_provider_ids(&provider_message_ids),
                         rendered_units,
                         presentation: None,
@@ -17402,6 +17526,7 @@ where
                     ));
                     return Err(ChannelSendError {
                         message: error,
+                        permanent: false,
                         provider_message_id: joined_provider_ids(&provider_message_ids),
                         rendered_units,
                         presentation: None,
@@ -17445,6 +17570,7 @@ where
                                         message: format!(
                                             "Telegram attachment caption overflow send failed: {error}"
                                         ),
+                                        permanent: telegram_send_error_is_permanent(&error),
                                         provider_message_id: joined_provider_ids(
                                             &provider_message_ids,
                                         ),
@@ -17473,6 +17599,7 @@ where
                             attachment.kind,
                         ));
                         return Err(ChannelSendError {
+                            permanent: telegram_send_error_is_permanent(&error),
                             message: error,
                             provider_message_id: joined_provider_ids(&provider_message_ids),
                             rendered_units,
@@ -17518,41 +17645,33 @@ where
     let full_text_preserved = text == message.text.trim();
     let mut provider_message_ids = Vec::new();
     let mut rendered_units = Vec::new();
+    let fallback_presentation = Some(ChannelDeliveryPresentationReceipt::fallback(
+        reason,
+        "telegram:plain-text",
+        full_text_preserved,
+    ));
     if message.attachments.is_empty() || !text.trim().is_empty() {
-        match send_text(
-            &text,
-            TelegramSendOptions {
-                reply_to_message_id: telegram_reply_to_message_id(message),
-                message_thread_id: telegram_message_thread_id(message),
-                formatting_mode: TelegramFormattingMode::Plain,
-            },
-        ) {
-            Ok(provider_message_id) => {
-                if let Some(id) = provider_message_id.clone() {
-                    provider_message_ids.push(id);
-                }
-                rendered_units.push(ChannelDeliveryRenderedUnitReceipt {
-                    unit_id: "text:fallback".to_string(),
-                    kind: ChannelDeliveryRenderedUnitKind::Text,
-                    attachment_kind: None,
-                    status: ChannelDeliveryUnitStatus::Delivered,
-                    provider_message_id,
-                    error: None,
-                });
-            }
-            Err(error) => {
-                return Err(ChannelSendError {
-                    message: format!("{source_error}; Telegram plain fallback failed: {error}"),
-                    provider_message_id: joined_provider_ids(&provider_message_ids),
-                    rendered_units,
-                    presentation: Some(ChannelDeliveryPresentationReceipt::fallback(
-                        reason,
-                        "telegram:plain-text",
-                        false,
-                    )),
-                });
-            }
-        }
+        rendered_units.extend(
+            telegram_send_text_chunks_with_senders(
+                &text,
+                TelegramSendOptions {
+                    reply_to_message_id: telegram_reply_to_message_id(message),
+                    message_thread_id: telegram_message_thread_id(message),
+                    formatting_mode: TelegramFormattingMode::Plain,
+                },
+                "text:fallback",
+                send_text,
+                &mut provider_message_ids,
+                fallback_presentation.clone(),
+            )
+            .map_err(|mut error| {
+                error.message = format!(
+                    "{source_error}; Telegram plain fallback failed: {}",
+                    error.message
+                );
+                error
+            })?,
+        );
     }
     for attachment in &message.attachments {
         match send_attachment(attachment) {
@@ -17566,6 +17685,7 @@ where
                     message: format!(
                         "{source_error}; Telegram fallback attachment failed: {error}"
                     ),
+                    permanent: telegram_send_error_is_permanent(&error),
                     provider_message_id: joined_provider_ids(&provider_message_ids),
                     rendered_units,
                     presentation: Some(ChannelDeliveryPresentationReceipt::fallback(
@@ -17580,11 +17700,7 @@ where
     Ok(ChannelSendAttempt {
         provider_message_id: joined_provider_ids(&provider_message_ids),
         rendered_units,
-        presentation: Some(ChannelDeliveryPresentationReceipt::fallback(
-            reason,
-            "telegram:plain-text",
-            full_text_preserved,
-        )),
+        presentation: fallback_presentation,
     })
 }
 
@@ -17626,6 +17742,83 @@ fn rendered_media_unit_receipt(
 
 fn joined_provider_ids(ids: &[String]) -> Option<String> {
     (!ids.is_empty()).then(|| ids.join(","))
+}
+
+fn telegram_send_text_chunks_with_senders<TextSender>(
+    text: &str,
+    options: TelegramSendOptions<'_>,
+    unit_id: &str,
+    send_text: &mut TextSender,
+    provider_message_ids: &mut Vec<String>,
+    error_presentation: Option<ChannelDeliveryPresentationReceipt>,
+) -> Result<Vec<ChannelDeliveryRenderedUnitReceipt>, ChannelSendError>
+where
+    TextSender: FnMut(&str, TelegramSendOptions<'_>) -> Result<Option<String>, String>,
+{
+    let chunks = telegram_message_chunks(text);
+    let total = chunks.len();
+    let mut rendered_units = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let chunk_unit_id = telegram_text_chunk_unit_id(unit_id, index, total);
+        let chunk_options = TelegramSendOptions {
+            reply_to_message_id: if index == 0 {
+                options.reply_to_message_id
+            } else {
+                None
+            },
+            message_thread_id: options.message_thread_id,
+            formatting_mode: options.formatting_mode,
+        };
+        match send_text(chunk, chunk_options) {
+            Ok(provider_message_id) => {
+                if let Some(id) = provider_message_id.clone() {
+                    provider_message_ids.push(id);
+                }
+                rendered_units.push(ChannelDeliveryRenderedUnitReceipt {
+                    unit_id: chunk_unit_id,
+                    kind: ChannelDeliveryRenderedUnitKind::Text,
+                    attachment_kind: None,
+                    status: ChannelDeliveryUnitStatus::Delivered,
+                    provider_message_id,
+                    error: None,
+                });
+            }
+            Err(error) => {
+                let permanent = telegram_send_error_is_permanent(&error);
+                let message = if permanent {
+                    format!(
+                        "Telegram post-chunk text send failed permanently; chunking/classification guard: {error}"
+                    )
+                } else {
+                    error.clone()
+                };
+                rendered_units.push(ChannelDeliveryRenderedUnitReceipt {
+                    unit_id: chunk_unit_id,
+                    kind: ChannelDeliveryRenderedUnitKind::Text,
+                    attachment_kind: None,
+                    status: ChannelDeliveryUnitStatus::Failed,
+                    provider_message_id: None,
+                    error: Some(message.clone()),
+                });
+                return Err(ChannelSendError {
+                    message,
+                    permanent,
+                    provider_message_id: joined_provider_ids(provider_message_ids),
+                    rendered_units,
+                    presentation: error_presentation,
+                });
+            }
+        }
+    }
+    Ok(rendered_units)
+}
+
+fn telegram_text_chunk_unit_id(unit_id: &str, index: usize, total: usize) -> String {
+    if total <= 1 {
+        unit_id.to_string()
+    } else {
+        format!("{unit_id}:chunk-{}", index + 1)
+    }
 }
 
 fn telegram_reply_to_message_id(message: &ChannelOutboundMessage) -> Option<i64> {
@@ -18474,6 +18667,7 @@ where
         .as_ref()
         .ok_or_else(|| ChannelSendError {
             message: "rich presentation was missing".to_string(),
+            permanent: false,
             provider_message_id: None,
             rendered_units: Vec::new(),
             presentation: None,
@@ -18551,6 +18745,7 @@ where
                     ));
                     return Err(ChannelSendError {
                         message: error,
+                        permanent: false,
                         provider_message_id: joined_provider_ids(&provider_message_ids),
                         rendered_units,
                         presentation: None,
@@ -18567,6 +18762,7 @@ where
                     ));
                     return Err(ChannelSendError {
                         message: error,
+                        permanent: false,
                         provider_message_id: joined_provider_ids(&provider_message_ids),
                         rendered_units,
                         presentation: None,
@@ -18605,6 +18801,7 @@ where
                         ));
                         return Err(ChannelSendError {
                             message: error,
+                            permanent: false,
                             provider_message_id: joined_provider_ids(&provider_message_ids),
                             rendered_units,
                             presentation: None,
@@ -18666,6 +18863,7 @@ where
             Err(error) => {
                 return Err(ChannelSendError {
                     message: format!("{source_error}; Discord plain fallback failed: {error}"),
+                    permanent: false,
                     provider_message_id: joined_provider_ids(&provider_message_ids),
                     rendered_units,
                     presentation: Some(ChannelDeliveryPresentationReceipt::fallback(
@@ -18687,6 +18885,7 @@ where
             Err(error) => {
                 return Err(ChannelSendError {
                     message: format!("{source_error}; Discord fallback attachment failed: {error}"),
+                    permanent: false,
                     provider_message_id: joined_provider_ids(&provider_message_ids),
                     rendered_units,
                     presentation: Some(ChannelDeliveryPresentationReceipt::fallback(
@@ -24952,6 +25151,107 @@ mod tests {
     }
 
     #[test]
+    fn telegram_message_chunks_respect_utf16_limit_and_labels() {
+        let text = "🙂".repeat(3_000);
+
+        let chunks = telegram_message_chunks(&text);
+
+        assert!(chunks.len() > 1);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.encode_utf16().count() <= TELEGRAM_MESSAGE_TEXT_LIMIT)
+        );
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert!(chunk.starts_with(&format!("({}/{})\n", index + 1, chunks.len())));
+        }
+        assert_eq!(strip_telegram_test_chunk_labels(&chunks), text);
+    }
+
+    #[test]
+    fn telegram_message_chunks_prefer_paragraph_and_line_boundaries() {
+        let text = format!(
+            "{}\n\n{}\n{}",
+            "a".repeat(3_900),
+            "b".repeat(350),
+            "c".repeat(350)
+        );
+
+        let chunks = telegram_message_chunks(&text);
+
+        assert_eq!(strip_telegram_test_chunk_labels(&chunks), text);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.encode_utf16().count() <= TELEGRAM_MESSAGE_TEXT_LIMIT)
+        );
+        assert!(chunks[0].ends_with("\n\n"));
+    }
+
+    #[test]
+    fn telegram_plain_sender_sends_overlong_final_as_ordered_rendered_units() {
+        let root =
+            cli_temp_root("telegram_plain_sender_sends_overlong_final_as_ordered_rendered_units");
+        let harness_home = root.join(".agent-harness");
+        let mut message =
+            rich_outbound_message("telegram", &"x".repeat(TELEGRAM_MESSAGE_TEXT_LIMIT + 500));
+        message.presentation = None;
+        let mut sends = Vec::new();
+
+        let attempt = telegram_send_outbound_message_with_senders(
+            &harness_home,
+            &message,
+            |text, options| {
+                let provider_id = format!("tg-{}", sends.len() + 1);
+                sends.push((
+                    text.to_string(),
+                    options.reply_to_message_id,
+                    options.message_thread_id.map(str::to_string),
+                    options.formatting_mode,
+                ));
+                Ok(Some(provider_id))
+            },
+            |_attachment| -> Result<Option<String>, String> {
+                panic!("overlong text fixture must not send attachments")
+            },
+            |_attachments, _options| -> Result<Option<String>, String> {
+                panic!("overlong text fixture must not send media groups")
+            },
+        )
+        .unwrap();
+
+        assert!(sends.len() > 1);
+        assert_eq!(
+            strip_telegram_test_chunk_labels(
+                &sends
+                    .iter()
+                    .map(|(text, _, _, _)| text.clone())
+                    .collect::<Vec<_>>()
+            ),
+            message.text
+        );
+        assert!(
+            sends
+                .iter()
+                .all(|(text, _, _, mode)| text.encode_utf16().count()
+                    <= TELEGRAM_MESSAGE_TEXT_LIMIT
+                    && *mode == TelegramFormattingMode::Plain)
+        );
+        assert_eq!(attempt.rendered_units.len(), sends.len());
+        assert_eq!(attempt.provider_message_id.as_deref(), Some("tg-1,tg-2"));
+        for (index, unit) in attempt.rendered_units.iter().enumerate() {
+            assert_eq!(unit.kind, ChannelDeliveryRenderedUnitKind::Text);
+            assert_eq!(unit.status, ChannelDeliveryUnitStatus::Delivered);
+            assert_eq!(
+                unit.provider_message_id.as_deref(),
+                Some(format!("tg-{}", index + 1).as_str())
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn telegram_rich_outbound_delivery_records_html_receipt_closed_loop() {
         let root =
             cli_temp_root("telegram_rich_outbound_delivery_records_html_receipt_closed_loop");
@@ -25298,6 +25598,186 @@ mod tests {
     }
 
     #[test]
+    fn telegram_rich_sender_fallback_chunks_overlong_plain_text() {
+        let message = rich_outbound_message(
+            "telegram",
+            &format!(
+                "Provider fallback {}\n\n{}",
+                "x".repeat(TELEGRAM_MESSAGE_TEXT_LIMIT),
+                "y".repeat(600)
+            ),
+        );
+        let mut texts = Vec::new();
+        let mut modes = Vec::new();
+
+        let attempt = telegram_send_rich_outbound_message_with_senders(
+            &message,
+            |text, options| {
+                let provider_id = format!("tg-{}", texts.len() + 1);
+                texts.push(text.to_string());
+                modes.push(options.formatting_mode);
+                if options.formatting_mode == TelegramFormattingMode::TrustedHtml {
+                    Err("provider rejected rich html".to_string())
+                } else {
+                    Ok(Some(provider_id))
+                }
+            },
+            |_attachment| -> Result<Option<String>, String> {
+                panic!("provider fallback fixture must not send attachments")
+            },
+            |_attachments, _options| -> Result<Option<String>, String> {
+                panic!("provider fallback fixture must not send media groups")
+            },
+        )
+        .unwrap();
+
+        assert!(texts.len() > 1);
+        assert!(
+            modes
+                .iter()
+                .all(|mode| *mode == TelegramFormattingMode::Plain)
+        );
+        assert_eq!(strip_telegram_test_chunk_labels(&texts), message.text);
+        assert!(
+            texts
+                .iter()
+                .all(|text| text.encode_utf16().count() <= TELEGRAM_MESSAGE_TEXT_LIMIT)
+        );
+        let presentation = attempt.presentation.unwrap();
+        assert!(!presentation.present);
+        assert_eq!(
+            presentation.fallback_reason,
+            ChannelDeliveryPresentationFallbackReason::ProviderFallback
+        );
+        assert!(presentation.full_text_preserved);
+    }
+
+    #[test]
+    fn telegram_message_too_long_error_is_permanent() {
+        let error = "Telegram HTTP status 400: {\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message is too long\"}";
+
+        assert!(telegram_send_error_is_permanent(error));
+        assert!(!telegram_send_error_is_permanent(
+            "Telegram transport error: connection refused"
+        ));
+    }
+
+    #[test]
+    fn telegram_plain_sender_post_chunk_message_too_long_returns_permanent_error() {
+        let root = cli_temp_root(
+            "telegram_plain_sender_post_chunk_message_too_long_returns_permanent_error",
+        );
+        let harness_home = root.join(".agent-harness");
+        let mut message =
+            rich_outbound_message("telegram", &"z".repeat(TELEGRAM_MESSAGE_TEXT_LIMIT + 1));
+        message.presentation = None;
+        let mut attempts = 0usize;
+
+        let error = telegram_send_outbound_message_with_senders(
+            &harness_home,
+            &message,
+            |_text, _options| {
+                attempts += 1;
+                Err("Telegram HTTP status 400: {\"ok\":false,\"description\":\"Bad Request: message is too long\"}".to_string())
+            },
+            |_attachment| -> Result<Option<String>, String> {
+                panic!("message-too-long fixture must not send attachments")
+            },
+            |_attachments, _options| -> Result<Option<String>, String> {
+                panic!("message-too-long fixture must not send media groups")
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(attempts, 1);
+        assert!(error.permanent);
+        assert!(error.message.contains("message is too long"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn telegram_outbox_delivery_records_permanent_send_error_as_skipped_permanent() {
+        let root = cli_temp_root(
+            "telegram_outbox_delivery_records_permanent_send_error_as_skipped_permanent",
+        );
+        let harness_home = root.join(".agent-harness");
+        let message = rich_outbound_message("telegram", "final reply that provider rejects");
+        let outbox_file = harness_home
+            .join("state")
+            .join("channels")
+            .join("outbox.jsonl");
+        append_jsonl_value(&outbox_file, &message).unwrap();
+
+        let mut warnings = Vec::new();
+        let mut send_count = 0usize;
+        let (pending_count, delivered, failed) = deliver_telegram_pending_outbox_with_sender(
+            &harness_home,
+            None,
+            10,
+            "fake-token",
+            &mut warnings,
+            &mut |_harness_home, _token, pending| {
+                send_count += 1;
+                assert_eq!(pending.text, message.text);
+                Err(ChannelSendError {
+                    message: "Telegram post-chunk text send failed permanently; chunking/classification guard: Bad Request: message is too long".to_string(),
+                    permanent: true,
+                    provider_message_id: None,
+                    rendered_units: vec![ChannelDeliveryRenderedUnitReceipt {
+                        unit_id: "text:0".to_string(),
+                        kind: ChannelDeliveryRenderedUnitKind::Text,
+                        attachment_kind: None,
+                        status: ChannelDeliveryUnitStatus::Failed,
+                        provider_message_id: None,
+                        error: Some("Bad Request: message is too long".to_string()),
+                    }],
+                    presentation: None,
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(pending_count, 1);
+        assert_eq!(send_count, 1);
+        assert_eq!(delivered, 0);
+        assert_eq!(failed, 1);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("message is too long"))
+        );
+
+        let receipts_text = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("channels")
+                .join("delivery-receipts.jsonl"),
+        )
+        .unwrap();
+        let receipt_json: serde_json::Value =
+            serde_json::from_str(receipts_text.lines().next().unwrap()).unwrap();
+        assert_eq!(receipt_json["status"], "skipped-permanent");
+        assert!(
+            receipt_json["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("message is too long"))
+        );
+        assert_eq!(receipt_json["renderedUnits"][0]["status"], "failed");
+
+        let plan = plan_channel_outbox(ChannelOutboxPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            limit: 10,
+        })
+        .unwrap();
+        assert!(plan.pending.is_empty());
+        assert_eq!(plan.summary.skipped_permanent, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn discord_rich_sender_records_safe_markdown_presentation_receipt() {
         let message = rich_outbound_message(
             "discord",
@@ -25576,6 +26056,22 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert!(chunks[0].ends_with('\n'));
         assert_eq!(chunks[1], "b".repeat(20));
+    }
+
+    fn strip_telegram_test_chunk_labels(chunks: &[String]) -> String {
+        chunks
+            .iter()
+            .map(|chunk| {
+                if chunks.len() <= 1 {
+                    return chunk.as_str();
+                }
+                chunk
+                    .split_once('\n')
+                    .map(|(_, body)| body)
+                    .unwrap_or(chunk.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("")
     }
 
     #[test]

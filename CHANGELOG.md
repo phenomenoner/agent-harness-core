@@ -4,6 +4,39 @@
 
 No unreleased changes.
 
+## v0.6.0 - 2026-07-08
+
+### Changed
+
+- Added Telegram final-message chunking by UTF-16 message budgets, including
+  ordered rendered-unit delivery receipts for overlong plain text and rich
+  message fallback that preserves the full plain-text body.
+- Hardened Telegram provider error handling so post-chunk `message is too
+  long` responses are treated as permanent skipped delivery receipts instead of
+  retryable failures.
+- Made terminal channel delivery receipts outrank later retryable failures for
+  the same delivery id, preventing already-delivered or permanently skipped
+  finals from reappearing as pending work.
+- Added structured Codex runtime interruption receipts for newer-turn
+  cancellations, including bounded interrupted tool-use metadata and
+  verification-only safe-rerun classification.
+- Updated runtime failure replies and virtual-session working context so an
+  interrupted verification command is reported as resumable work, not as a
+  failed test.
+- Refreshed topology, invariant, schema, and release gates for the new
+  delivery-terminal and interruption-observability contracts.
+
+### Verification
+
+- Added focused regressions for Telegram chunking, rich fallback, permanent
+  message-too-long mapping, channel terminal receipt precedence, structured
+  interrupted tool-use receipts, safe-rerun classification, prompt-context
+  injection, runtime interruption outbox wording, and quality catalogs.
+- Passed `cargo fmt --all -- --check`, `cargo check --workspace`, and full
+  `cargo test --workspace -- --test-threads=1` in Round18 staging target dirs.
+- Promoted the candidate through guarded live cutover and a controlled Telegram
+  post-cutover smoke with clean worker/outbox/supervisor readback.
+
 ## v0.5.0 - 2026-07-07
 
 ### Changed

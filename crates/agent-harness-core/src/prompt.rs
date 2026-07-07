@@ -2671,6 +2671,31 @@ mod tests {
             }),
         )
         .unwrap();
+        let runtime_queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&runtime_queue_dir).unwrap();
+        fs::write(
+            runtime_queue_dir.join("codex-runtime-run-receipts.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::to_string(&serde_json::json!({
+                    "queueId": "turn:rollover",
+                    "status": "canceled",
+                    "reason": "interrupted by new turn while validation command was running",
+                    "interruptionReason": "interrupted_by_new_turn",
+                    "interruptedToolUses": [{
+                        "method": "item/started",
+                        "itemId": "cmd-interrupted",
+                        "itemType": "commandExecution",
+                        "preview": "cargo test -p agent-harness-core",
+                        "safeToRerun": true,
+                        "interruptedAtMs": 1236,
+                        "reason": "interrupted by new turn while validation command was running"
+                    }]
+                }))
+                .unwrap()
+            ),
+        )
+        .unwrap();
 
         let registry = load_agent_registry(&source).unwrap();
         let skills = build_source_skill_index(&source).unwrap();
@@ -2718,7 +2743,9 @@ mod tests {
                     .contains("currentSessionKey: telegram:dm:user:main:cont-1")
                 && section.content.contains("virtualSessionId: vsession-test")
                 && section.content.contains("lastInterruption:")
-                && section.content.contains("cargo clippy")
+                && section.content.contains("interrupted_by_new_turn")
+                && section.content.contains("cargo test -p agent-harness-core")
+                && !section.content.contains("cargo clippy")
                 && section.content.contains("continuationGuidance:")
                 && section.content.contains("recentQueueIds:")
                 && section.content.contains("- turn:rollover")

@@ -142,6 +142,16 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
             statement: "durable control artifacts are authoritative before runtime execution, progress delivery, restart consumption, and sender-class cron notification",
             owner: "runtime_worker/runtime_pipeline/runtime_queue/progress/channel_runtime/dream_director/cron_scheduler",
         },
+        InvariantEntry {
+            id: "I18",
+            statement: "final delivery planning treats delivered or skipped-permanent receipts as terminal evidence, even if later retryable provider failures are recorded for the same logical delivery",
+            owner: "channel_delivery/agent-harness-cli",
+        },
+        InvariantEntry {
+            id: "I19",
+            statement: "a verification command interrupted by a newer same-lane turn records structured interruption evidence and resume guidance instead of being reported as a failed test",
+            owner: "codex_runtime/runtime_pipeline/virtual_session_context/prompt",
+        },
     ]
 }
 
@@ -155,7 +165,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.codex-runtime-run.v1",
             owner_module: "codex_runtime",
-            compatibility: "append-only JSONL plus per-execution JSON; v1 accepts additive recovery fields such as toolUseTimeout and contextRecovery.threadHealthStatus",
+            compatibility: "append-only JSONL plus per-execution JSON; v1 accepts additive recovery fields such as toolUseTimeout, interruptionReason, interruptedToolUses, and contextRecovery.threadHealthStatus",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.external-review-evidence.v1",
@@ -1011,6 +1021,7 @@ pub fn release_checklist() -> ReleaseChecklist {
             "progress panel lane-cap heartbeat/current-step checks passed across channel platforms",
             "cron freshness changes passed config run-cap validation, cron-canon health/status warnings, deterministic catch-up, and stale-source sender suppression checks",
             "Codex tool-use timeout changes passed bounded recovery checks",
+            "Round18 delivery/runtime interruption changes passed Telegram overlong final chunking, terminal receipt precedence, permanent provider rejection, structured interrupted command, safe-rerun, prompt/resolver, and runtime failure wording checks",
             "artifact/context hygiene changes passed generic artifact prompt/progress redaction and Discord attachment extraction checks",
             "public hygiene report passed",
             "rollback notes recorded",
@@ -1040,7 +1051,7 @@ mod tests {
 
     #[test]
     fn quality_catalogs_and_hygiene_report_are_actionable() {
-        assert!(invariant_catalog().len() >= 11);
+        assert!(invariant_catalog().len() >= 19);
         let scenario_matrix = scenario_matrix_catalog();
         assert!(
             scenario_matrix
@@ -1148,10 +1159,13 @@ mod tests {
                 .required_items
                 .contains(&"Codex tool-use timeout changes passed bounded recovery checks")
         );
+        assert!(release_checklist().required_items.contains(&"Round18 delivery/runtime interruption changes passed Telegram overlong final chunking, terminal receipt precedence, permanent provider rejection, structured interrupted command, safe-rerun, prompt/resolver, and runtime failure wording checks"));
         assert!(release_checklist().required_items.contains(
             &"artifact/context hygiene changes passed generic artifact prompt/progress redaction and Discord attachment extraction checks"
         ));
         let invariant_ids: Vec<&str> = invariant_catalog().iter().map(|entry| entry.id).collect();
+        assert!(invariant_ids.contains(&"I18"));
+        assert!(invariant_ids.contains(&"I19"));
         for entry in &scenario_matrix {
             assert!(
                 !entry.changed_areas.is_empty(),
