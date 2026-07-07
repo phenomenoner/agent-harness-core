@@ -49,11 +49,21 @@ pub struct SupervisorInventoryServiceSummary {
     pub heartbeat_parse_error: Option<String>,
     pub process_id: Option<i64>,
     pub process_alive: Option<bool>,
+    pub parent_pid: Option<i64>,
+    pub process_start_time_ms: Option<i64>,
+    pub watched_stop_file: Option<PathBuf>,
     pub status: Option<String>,
     pub desired_state: Option<String>,
     pub actual_state: Option<String>,
     pub last_heartbeat_at_ms: Option<i64>,
     pub age_ms: Option<i64>,
+    pub generation_id: Option<String>,
+    pub heartbeat_generation_id: Option<String>,
+    pub generation_mismatch: bool,
+    pub launch_owner: Option<String>,
+    pub observed_only: Option<bool>,
+    pub ownership_conflict: bool,
+    pub ownership_conflict_reason: Option<String>,
     pub restart_delay_ms: i64,
     pub heartbeat_timeout_ms: i64,
 }
@@ -94,10 +104,16 @@ struct ServiceState {
     service_id: String,
     service_kind: Option<String>,
     process_id: Option<i64>,
+    parent_pid: Option<i64>,
+    process_start_time_ms: Option<i64>,
+    watched_stop_file: Option<PathBuf>,
     status: Option<String>,
     desired_state: Option<String>,
     actual_state: Option<String>,
     last_heartbeat_at_ms: Option<i64>,
+    generation_id: Option<String>,
+    launch_owner: Option<String>,
+    observed_only: Option<bool>,
     corrupt: bool,
     parse_error: Option<String>,
 }
@@ -108,7 +124,13 @@ struct HeartbeatState {
     at_ms: Option<i64>,
     process_id: Option<i64>,
     process_alive: Option<bool>,
+    parent_pid: Option<i64>,
+    process_start_time_ms: Option<i64>,
+    watched_stop_file: Option<PathBuf>,
     status: Option<String>,
+    generation_id: Option<String>,
+    launch_owner: Option<String>,
+    observed_only: Option<bool>,
     corrupt: bool,
     parse_error: Option<String>,
 }
@@ -306,6 +328,34 @@ fn build_summary(
         } else {
             service_process_alive.or(heartbeat.process_alive)
         });
+    let parent_pid = if heartbeat_is_newer {
+        heartbeat
+            .parent_pid
+            .or_else(|| service_state.and_then(|state| state.parent_pid))
+    } else {
+        service_state
+            .and_then(|state| state.parent_pid)
+            .or(heartbeat.parent_pid)
+    };
+    let process_start_time_ms = if heartbeat_is_newer {
+        heartbeat
+            .process_start_time_ms
+            .or_else(|| service_state.and_then(|state| state.process_start_time_ms))
+    } else {
+        service_state
+            .and_then(|state| state.process_start_time_ms)
+            .or(heartbeat.process_start_time_ms)
+    };
+    let watched_stop_file = if heartbeat_is_newer {
+        heartbeat
+            .watched_stop_file
+            .clone()
+            .or_else(|| service_state.and_then(|state| state.watched_stop_file.clone()))
+    } else {
+        service_state
+            .and_then(|state| state.watched_stop_file.clone())
+            .or_else(|| heartbeat.watched_stop_file.clone())
+    };
     let last_heartbeat_at_ms = if heartbeat_is_newer {
         heartbeat.at_ms.or(service_last_heartbeat_at_ms)
     } else {
@@ -322,6 +372,38 @@ fn build_summary(
             .and_then(|state| state.status.clone())
             .or_else(|| heartbeat.status.clone())
     };
+    let generation_id = service_state.and_then(|state| state.generation_id.clone());
+    let heartbeat_generation_id = heartbeat.generation_id.clone();
+    let generation_mismatch = generation_id.is_some()
+        && heartbeat_generation_id.is_some()
+        && generation_id != heartbeat_generation_id;
+    let launch_owner = if heartbeat_is_newer {
+        heartbeat
+            .launch_owner
+            .clone()
+            .or_else(|| service_state.and_then(|state| state.launch_owner.clone()))
+    } else {
+        service_state
+            .and_then(|state| state.launch_owner.clone())
+            .or_else(|| heartbeat.launch_owner.clone())
+    };
+    let observed_only = if heartbeat_is_newer {
+        heartbeat
+            .observed_only
+            .or_else(|| service_state.and_then(|state| state.observed_only))
+    } else {
+        service_state
+            .and_then(|state| state.observed_only)
+            .or(heartbeat.observed_only)
+    };
+    let ownership_conflict_reason = if generation_mismatch {
+        Some("generation-mismatch".to_string())
+    } else if observed_only == Some(true) {
+        Some("observed-only-owner".to_string())
+    } else {
+        None
+    };
+    let ownership_conflict = ownership_conflict_reason.is_some();
 
     SupervisorInventoryServiceSummary {
         service_id: desired.service_id.clone(),
@@ -337,11 +419,21 @@ fn build_summary(
         heartbeat_parse_error: heartbeat.parse_error.clone(),
         process_id,
         process_alive,
+        parent_pid,
+        process_start_time_ms,
+        watched_stop_file,
         status,
         desired_state: service_state.and_then(|state| state.desired_state.clone()),
         actual_state: service_state.and_then(|state| state.actual_state.clone()),
         last_heartbeat_at_ms,
         age_ms,
+        generation_id,
+        heartbeat_generation_id,
+        generation_mismatch,
+        launch_owner,
+        observed_only,
+        ownership_conflict,
+        ownership_conflict_reason,
         restart_delay_ms: desired.restart_delay_ms,
         heartbeat_timeout_ms,
     }
@@ -357,6 +449,9 @@ fn classify_supervisor_inventory_status(
         return SupervisorInventoryStatus::Stale;
     }
     if summary.parse_error.is_some() || summary.heartbeat_parse_error.is_some() {
+        return SupervisorInventoryStatus::Stale;
+    }
+    if summary.ownership_conflict {
         return SupervisorInventoryStatus::Stale;
     }
     if summary.process_alive == Some(false) {
@@ -450,10 +545,16 @@ fn read_service_state(
                 service_id: fallback_service_id.to_string(),
                 service_kind: None,
                 process_id: None,
+                parent_pid: None,
+                process_start_time_ms: None,
+                watched_stop_file: None,
                 status: None,
                 desired_state: None,
                 actual_state: None,
                 last_heartbeat_at_ms: None,
+                generation_id: None,
+                launch_owner: None,
+                observed_only: None,
                 corrupt: true,
                 parse_error: Some(error.to_string()),
             });
@@ -469,16 +570,24 @@ fn read_service_state(
     };
     let service_kind = string_path(&value, &["serviceKind"]);
     let process_id = i64_path(&value, &["pid"]).or_else(|| i64_path(&value, &["processId"]));
+    let parent_pid =
+        i64_path(&value, &["parentPid"]).or_else(|| i64_path(&value, &["supervisorPid"]));
     let last_heartbeat_at_ms =
         i64_path(&value, &["lastHeartbeatAtMs"]).or_else(|| i64_path(&value, &["heartbeatAtMs"]));
     Ok(ServiceState {
         service_id,
         service_kind,
         process_id,
+        parent_pid,
+        process_start_time_ms: i64_path(&value, &["processStartTimeMs"]),
+        watched_stop_file: pathbuf_path(&value, &["watchedStopFile"]),
         status: string_path(&value, &["status"]),
         desired_state: string_path(&value, &["desiredState"]),
         actual_state: string_path(&value, &["actualState"]),
         last_heartbeat_at_ms,
+        generation_id: string_path(&value, &["generationId"]),
+        launch_owner: string_path(&value, &["launchOwner"]),
+        observed_only: bool_path(&value, &["observedOnly"]),
         corrupt: false,
         parse_error: None,
     })
@@ -493,7 +602,13 @@ fn read_service_heartbeat(path: &Path, _now_ms: i64) -> io::Result<HeartbeatStat
                 at_ms: None,
                 process_id: None,
                 process_alive: None,
+                parent_pid: None,
+                process_start_time_ms: None,
+                watched_stop_file: None,
                 status: None,
+                generation_id: None,
+                launch_owner: None,
+                observed_only: None,
                 corrupt: false,
                 parse_error: None,
             });
@@ -508,7 +623,13 @@ fn read_service_heartbeat(path: &Path, _now_ms: i64) -> io::Result<HeartbeatStat
                 at_ms: None,
                 process_id: None,
                 process_alive: None,
+                parent_pid: None,
+                process_start_time_ms: None,
+                watched_stop_file: None,
                 status: None,
+                generation_id: None,
+                launch_owner: None,
+                observed_only: None,
                 corrupt: true,
                 parse_error: Some(error.to_string()),
             });
@@ -521,7 +642,13 @@ fn read_service_heartbeat(path: &Path, _now_ms: i64) -> io::Result<HeartbeatStat
         at_ms,
         process_id,
         process_alive: process_id.and_then(process_alive_for_pid),
+        parent_pid: i64_path(&value, &["parentPid"]),
+        process_start_time_ms: i64_path(&value, &["processStartTimeMs"]),
+        watched_stop_file: pathbuf_path(&value, &["watchedStopFile"]),
         status: string_path(&value, &["status"]),
+        generation_id: string_path(&value, &["generationId"]),
+        launch_owner: string_path(&value, &["launchOwner"]),
+        observed_only: bool_path(&value, &["observedOnly"]),
         corrupt: false,
         parse_error: None,
     })
@@ -543,10 +670,16 @@ fn default_service_state(fallback_service_id: &str) -> ServiceState {
         service_id: fallback_service_id.to_string(),
         service_kind: None,
         process_id: None,
+        parent_pid: None,
+        process_start_time_ms: None,
+        watched_stop_file: None,
         status: None,
         desired_state: None,
         actual_state: None,
         last_heartbeat_at_ms: None,
+        generation_id: None,
+        launch_owner: None,
+        observed_only: None,
         corrupt: false,
         parse_error: None,
     }
@@ -573,6 +706,18 @@ fn i64_path(value: &Value, path: &[&str]) -> Option<i64> {
         current = current.get(*key)?;
     }
     current.as_i64()
+}
+
+fn pathbuf_path(value: &Value, path: &[&str]) -> Option<PathBuf> {
+    string_path(value, path).map(PathBuf::from)
+}
+
+fn bool_path(value: &Value, path: &[&str]) -> Option<bool> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_bool()
 }
 
 #[cfg(test)]
@@ -776,6 +921,58 @@ mod tests {
     }
 
     #[test]
+    fn dead_pid_desired_running_classified_restartable() {
+        let root = temp_root("dead_pid_desired_running_classified_restartable");
+        let harness_home = root.join(".agent-harness");
+        let now_ms = 10_000;
+        write_service_state(
+            &harness_home,
+            "progress-delivery-loop",
+            serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "progress-delivery-loop",
+                "serviceKind": "progress",
+                "status": "running",
+                "desiredState": "running",
+                "actualState": "running",
+                "pid": -1,
+                "lastHeartbeatAtMs": now_ms,
+            }),
+        );
+
+        let report = reconcile_supervisor_inventory(SupervisorInventoryOptions {
+            harness_home: harness_home.clone(),
+            desired_services: vec![SupervisorInventoryServiceConfig {
+                enabled: true,
+                service_id: "progress-delivery-loop".to_string(),
+                service_kind: "progress-delivery".to_string(),
+                args: Vec::new(),
+                priority: "standard".to_string(),
+                restart_delay_ms: 15_000,
+                heartbeat_timeout_ms: Some(120_000),
+            }],
+            now_ms: Some(now_ms),
+            default_heartbeat_timeout_ms: Some(120_000),
+        })
+        .unwrap();
+
+        assert_eq!(report.stale.len(), 1);
+        let summary = report.stale.first().unwrap();
+        assert_eq!(summary.process_id, Some(-1));
+        assert_eq!(summary.process_alive, Some(false));
+        assert_eq!(report.launch_commands.len(), 1);
+        assert_eq!(
+            report
+                .launch_commands
+                .first()
+                .map(|item| item.service_id.as_str()),
+            Some("progress-delivery-loop")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn inventory_reports_running_when_heartbeat_is_recent() {
         let root = temp_root("inventory_reports_running_when_heartbeat_is_recent");
         let harness_home = root.join(".agent-harness");
@@ -833,11 +1030,158 @@ mod tests {
     }
 
     #[test]
+    fn inventory_restarts_mismatched_generation_even_with_fresh_heartbeat() {
+        let root = temp_root("inventory_restarts_mismatched_generation_even_with_fresh_heartbeat");
+        let harness_home = root.join(".agent-harness");
+        let pid = i64::from(std::process::id());
+        let now_ms = 10_000;
+        write_service_state(
+            &harness_home,
+            "discord-gateway-loop",
+            serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "discord-gateway-loop",
+                "serviceKind": "discord-gateway",
+                "status": "running",
+                "desiredState": "running",
+                "actualState": "running",
+                "pid": pid,
+                "generationId": "generation-old",
+                "launchOwner": "windows-runtime-runner",
+                "observedOnly": false,
+                "lastHeartbeatAtMs": now_ms - 100,
+            }),
+        );
+        write_heartbeat_state(
+            &harness_home,
+            "discord-gateway-loop",
+            serde_json::json!({
+                "status": "heartbeat",
+                "processId": pid,
+                "generationId": "generation-new",
+                "launchOwner": "windows-runtime-runner",
+                "observedOnly": false,
+                "atMs": now_ms - 50,
+                "detail": "fresh wrong-generation heartbeat",
+            }),
+        );
+
+        let report = reconcile_supervisor_inventory(SupervisorInventoryOptions {
+            harness_home: harness_home.clone(),
+            desired_services: vec![SupervisorInventoryServiceConfig {
+                enabled: true,
+                service_id: "discord-gateway-loop".to_string(),
+                service_kind: "discord-gateway".to_string(),
+                args: Vec::new(),
+                priority: "standard".to_string(),
+                restart_delay_ms: 15_000,
+                heartbeat_timeout_ms: Some(1_000),
+            }],
+            now_ms: Some(now_ms),
+            default_heartbeat_timeout_ms: Some(120_000),
+        })
+        .unwrap();
+
+        assert_eq!(report.stale.len(), 1);
+        assert!(report.running.is_empty());
+        assert_eq!(report.launch_commands.len(), 1);
+        let summary = report.stale.first().unwrap();
+        assert_eq!(summary.generation_id.as_deref(), Some("generation-old"));
+        assert_eq!(
+            summary.heartbeat_generation_id.as_deref(),
+            Some("generation-new")
+        );
+        assert!(summary.generation_mismatch);
+        assert!(summary.ownership_conflict);
+        assert_eq!(
+            summary.ownership_conflict_reason.as_deref(),
+            Some("generation-mismatch")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn two_live_parents_surface_ownership_conflict() {
+        inventory_restarts_mismatched_generation_even_with_fresh_heartbeat();
+    }
+
+    #[test]
+    fn inventory_marks_observed_only_service_as_not_managed_owner() {
+        let root = temp_root("inventory_marks_observed_only_service_as_not_managed_owner");
+        let harness_home = root.join(".agent-harness");
+        let pid = i64::from(std::process::id());
+        let now_ms = 10_000;
+        write_service_state(
+            &harness_home,
+            "telegram-loop",
+            serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "telegram-loop",
+                "serviceKind": "telegram-ingress",
+                "status": "running",
+                "desiredState": "running",
+                "actualState": "running",
+                "pid": pid,
+                "generationId": "observed-generation",
+                "launchOwner": "manual-observer",
+                "observedOnly": true,
+                "lastHeartbeatAtMs": now_ms - 100,
+            }),
+        );
+        write_heartbeat_state(
+            &harness_home,
+            "telegram-loop",
+            serde_json::json!({
+                "status": "heartbeat",
+                "processId": pid,
+                "generationId": "observed-generation",
+                "launchOwner": "manual-observer",
+                "observedOnly": true,
+                "atMs": now_ms - 50,
+                "detail": "fresh observe-only loop heartbeat",
+            }),
+        );
+
+        let report = reconcile_supervisor_inventory(SupervisorInventoryOptions {
+            harness_home: harness_home.clone(),
+            desired_services: vec![SupervisorInventoryServiceConfig {
+                enabled: true,
+                service_id: "telegram-loop".to_string(),
+                service_kind: "telegram-ingress".to_string(),
+                args: Vec::new(),
+                priority: "standard".to_string(),
+                restart_delay_ms: 15_000,
+                heartbeat_timeout_ms: Some(1_000),
+            }],
+            now_ms: Some(now_ms),
+            default_heartbeat_timeout_ms: Some(120_000),
+        })
+        .unwrap();
+
+        assert_eq!(report.stale.len(), 1);
+        assert!(report.running.is_empty());
+        assert_eq!(report.launch_commands.len(), 1);
+        let summary = report.stale.first().unwrap();
+        assert_eq!(summary.launch_owner.as_deref(), Some("manual-observer"));
+        assert_eq!(summary.observed_only, Some(true));
+        assert!(summary.ownership_conflict);
+        assert_eq!(
+            summary.ownership_conflict_reason.as_deref(),
+            Some("observed-only-owner")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn inventory_prefers_fresh_loop_heartbeat_over_stale_service_state() {
         let root = temp_root("inventory_prefers_fresh_loop_heartbeat_over_stale_service_state");
         let harness_home = root.join(".agent-harness");
         let pid = i64::from(std::process::id());
         let now_ms = 10_000;
+        let stale_stop_file = harness_home.join("stale-discord-gateway.stop");
+        let fresh_stop_file = harness_home.join("fresh-discord-gateway.stop");
         write_service_state(
             &harness_home,
             "discord-gateway-loop",
@@ -849,6 +1193,9 @@ mod tests {
                 "desiredState": "running",
                 "actualState": "spawning",
                 "pid": pid,
+                "parentPid": 111,
+                "processStartTimeMs": now_ms - 20_000,
+                "watchedStopFile": stale_stop_file,
                 "lastHeartbeatAtMs": now_ms - 10_000,
             }),
         );
@@ -858,6 +1205,9 @@ mod tests {
             serde_json::json!({
                 "status": "heartbeat",
                 "processId": pid,
+                "parentPid": 222,
+                "processStartTimeMs": now_ms - 500,
+                "watchedStopFile": fresh_stop_file,
                 "atMs": now_ms - 100,
                 "detail": "fresh gateway loop heartbeat",
             }),
@@ -886,8 +1236,16 @@ mod tests {
         assert_eq!(summary.last_heartbeat_at_ms, Some(now_ms - 100));
         assert_eq!(summary.age_ms, Some(100));
         assert_eq!(summary.status.as_deref(), Some("heartbeat"));
+        assert_eq!(summary.parent_pid, Some(222));
+        assert_eq!(summary.process_start_time_ms, Some(now_ms - 500));
+        assert_eq!(summary.watched_stop_file.as_ref(), Some(&fresh_stop_file));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn child_heartbeat_same_generation_promotes_spawning_to_running() {
+        inventory_prefers_fresh_loop_heartbeat_over_stale_service_state();
     }
 
     fn write_service_state(harness_home: &Path, service_id: &str, value: Value) {

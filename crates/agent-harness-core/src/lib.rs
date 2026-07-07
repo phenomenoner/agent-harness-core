@@ -21,6 +21,7 @@ pub mod cron_runs;
 pub mod cron_scheduler;
 pub mod deploy;
 pub mod deterministic_cron;
+pub mod dream_director;
 pub mod harness_registry;
 pub mod harness_skills;
 pub mod health;
@@ -28,6 +29,7 @@ pub mod importer;
 pub mod latency;
 pub mod live_control;
 pub mod logging;
+pub mod loop_diagnostics;
 pub mod loop_health;
 pub mod mcp;
 pub mod media;
@@ -206,6 +208,12 @@ pub use deterministic_cron::{
     DeterministicCronPlanSummary, DeterministicCronRunner, DeterministicCronRunnerKind,
     DeterministicCronSchedule, DeterministicCronStore, DeterministicCronStoreSummary,
     load_deterministic_cron_store, plan_deterministic_cron, write_deterministic_cron_plan,
+};
+pub use dream_director::{
+    DEFAULT_DREAM_DIRECTOR_MAX_CHARS, DEFAULT_DREAM_DIRECTOR_SOURCE_MAX_AGE_HOURS,
+    DREAM_DIRECTOR_SEND_RECEIPT_SCHEMA, DreamDirectorSendOptions, DreamDirectorSendReceipt,
+    DreamDirectorSendReport, dream_director_daily_state_dir, dream_director_send_receipt_file,
+    run_dream_director_send,
 };
 pub use harness_registry::{
     CredentialStatus, HarnessAgent, HarnessPlugin, HarnessProvider, HarnessRegistry,
@@ -389,14 +397,20 @@ pub use ops::{
     record_ops_cutover_receipt, record_ops_cutover_request,
 };
 pub use progress::{
-    AgentProgressContext, AgentProgressDeliveryAction, AgentProgressDeliveryMessageKind,
-    AgentProgressDeliveryPending, AgentProgressDeliveryPlanOptions,
-    AgentProgressDeliveryPlanReport, AgentProgressDeliveryPlanSummary,
-    AgentProgressDeliveryReceipt, AgentProgressDeliveryRecordOptions, AgentProgressDeliveryStatus,
-    AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
+    AgentProgressContext, AgentProgressDeliveryAction, AgentProgressDeliveryFreshSendReason,
+    AgentProgressDeliveryMessageKind, AgentProgressDeliveryPending,
+    AgentProgressDeliveryPlanOptions, AgentProgressDeliveryPlanReport,
+    AgentProgressDeliveryPlanSummary, AgentProgressDeliveryReceipt,
+    AgentProgressDeliveryRecordContext, AgentProgressDeliveryRecordOptions,
+    AgentProgressDeliveryStatus, AgentProgressEvent, AgentProgressKind,
+    AgentProgressSessionSupersedeOptions, AgentProgressSessionSupersedeReport, AgentProgressStatus,
     agent_progress_delivery_receipts_file, agent_progress_delivery_state_file,
-    agent_progress_events_file, append_agent_progress_event, plan_agent_progress_delivery,
-    record_agent_progress_delivery, render_agent_progress_panel, sanitize_progress_preview,
+    agent_progress_events_file, agent_progress_session_supersede_receipts_file,
+    append_agent_progress_event, latest_agent_progress_event_line_for_queue,
+    plan_agent_progress_delivery, record_agent_progress_delivery,
+    record_agent_progress_delivery_with_context, release_agent_progress_surface_claim,
+    render_agent_progress_panel, sanitize_progress_preview,
+    supersede_agent_progress_session_surfaces,
 };
 pub use prompt::{
     PromptAssemblyOptions, PromptBundle, PromptBundleFiles, PromptBundleSummary, PromptSection,
@@ -451,7 +465,7 @@ pub use runtime_worker::{
     RuntimeExecutionReceiptStatus, RuntimeQueueCapacityOptions, RuntimeQueueCapacityReport,
     RuntimeQueueClassCapacity, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
     RuntimeQueuePreparedItem, inspect_runtime_queue_capacity, load_runtime_dispatch_config,
-    prepare_runtime_queue_item, release_runtime_queue_lease,
+    prepare_runtime_queue_item, release_runtime_queue_lease, write_runtime_queue_quarantine_marker,
 };
 pub use security::{SecurityScanOptions, SecurityScanReport, scan_security_boundaries};
 pub use self_improvement::{
@@ -493,10 +507,12 @@ pub use skills::{
     write_skill_selection_receipt,
 };
 pub use status::{
-    HarnessChannelStatus, HarnessCronSchedulerStatus, HarnessJsonlStatus, HarnessLearningStatus,
-    HarnessMemoryStatus, HarnessOperationalLogStatus, HarnessOutboxStatus, HarnessPluginStatus,
+    GatewayRestartCompletionStatus, GatewayRestartHeartbeatStatus, GatewayRestartReceiptStatus,
+    GatewayRestartServiceStatus, GatewayRestartStatusReport, HarnessChannelStatus,
+    HarnessCronSchedulerStatus, HarnessJsonlStatus, HarnessLearningStatus, HarnessMemoryStatus,
+    HarnessOperationalLogStatus, HarnessOutboxStatus, HarnessPluginStatus,
     HarnessRuntimeReceiptStatus, HarnessRuntimeStatus, HarnessStatusOptions, HarnessStatusReport,
-    collect_harness_status,
+    collect_gateway_restart_status, collect_harness_status,
 };
 pub use subagent_lifecycle::{
     SubagentLifecycleCleanup, SubagentLifecycleCloseOptions, SubagentLifecycleReceipt,

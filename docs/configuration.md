@@ -209,7 +209,7 @@ Native cron LLM turns use CronRunStore before worker enqueue:
       "ops": "off"
     },
     "progressDeliveryChannelModes": {
-      "telegram:-1003968507595": "off"
+      "telegram:group-alpha": "off"
     }
   }
 }

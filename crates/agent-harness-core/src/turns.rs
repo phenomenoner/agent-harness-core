@@ -696,6 +696,45 @@ mod tests {
     }
 
     #[test]
+    fn turn_plan_parses_unknown_slash_command_before_agent_dispatch() {
+        let root = temp_root("turn_plan_parses_unknown_slash_command_before_agent_dispatch");
+        let source = write_turn_source(&root);
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+
+        let plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "/unknown value".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.dispatch, TurnDispatch::ChannelCommand);
+        assert_eq!(
+            plan.command_intent,
+            Some(ChannelCommandIntent::UnknownCommand {
+                name: "unknown".to_string(),
+                rest: Some("value".to_string())
+            })
+        );
+        assert!(plan.selected_skills.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn turn_plan_falls_back_to_imported_workspace_for_prompt_files() {
         let root = temp_root("turn_plan_falls_back_to_imported_workspace_for_prompt_files");
         let source = write_turn_source(&root);

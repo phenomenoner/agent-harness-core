@@ -219,7 +219,7 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "1e715bac40b7717c7f2dbf186cdb2a1c5f476b8c9c93d2738f3dd27796a97cf0"
+      "sha256": "9aeaaab58f0206dd72d5351912553ebb8d53410e658cb02b836c9b637495514e"
     },
     {
       "path": "docs/.private/agent-harness-operations-handbook.md",
@@ -541,7 +541,7 @@
       "label": "Final outbox or delivery",
       "group": "gate",
       "state": "release-gate",
-      "summary": "completed turn has exactly one final outbox or terminal notification; duplicate suppression by source queue/completion; final agent-reply excludes progress/narration stream content and implementation-goal read-only review evidence; structured owner/session routing keeps non-main or mismatched-run output as internal evidence; invalid historical outbox rows are retired with skipped-permanent receipts instead of fake delivered receipts; Telegram and Discord delivery receipt trace",
+      "summary": "completed turn has exactly one final outbox or terminal notification; duplicate suppression by source queue/completion; final agent-reply excludes progress/narration stream content and implementation-goal read-only review evidence; structured owner/session routing keeps mismatched-run output as internal evidence while allowing channel-ingress-routed non-main agents to own their own final outbox; invalid historical outbox rows are retired with skipped-permanent receipts instead of fake delivered receipts; Telegram and Discord delivery receipt trace",
       "reviewDocs": "local docs/.private/agent-harness-channel-self-check.md, docs/invariants.md, local docs/.private/release-checklist.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -681,7 +681,7 @@
       "state": "open-gap",
       "summary": "Multi-agent platform isolation",
       "designTarget": "Any configured agent can be added without rebuilding the pipeline, then own its workspace/prompt source, channel state, provider/model settings, memory namespace, context history, runtime lane, worker/subagent leases, and delivery receipts while sharing harness infrastructure.",
-      "currentEvidence": "Imported-agent registry, per-agent session paths, per-agent /model and /think overrides, provider-specific Codex homes, per-agent memory roots, agent-aware runtime dispatch, worker master_agent_id, and subagent lifecycle receipts are implemented. The Xiaoxiaoli freshness regression showed one final-outbox guard still compared shared channel state without preserving agentId; this change fixes that guard and adds a scenario test.",
+      "currentEvidence": "Imported-agent registry, per-agent session paths, per-agent /model and /think overrides, provider-specific Codex homes, per-agent memory roots, agent-aware runtime dispatch, worker master_agent_id, and subagent lifecycle receipts are implemented. The Xiaoxiaoli group final-outbox regression showed one final-owner guard still used main as a proxy for parent ownership; Round17 changes that gate to lane-agent consistency, keeps owner-mismatch suppression, and adds runtime_pipeline::tests::run_runtime_queue_once_writes_final_outbox_for_non_main_agent_owned_group_lane plus runtime_pipeline::tests::run_runtime_queue_once_suppresses_owner_mismatched_agent_final_outbox.",
       "promotionGate": "Add or maintain a reusable matrix that creates a new configured agent and proves independent workspace/prompt files, channel command state, provider/model override, memory/context history, worker lease/subagent lifecycle, final outbox, and delivery trace while sharing the same harness queues and loops.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -693,9 +693,9 @@
       "group": "gap",
       "state": "open-gap",
       "summary": "Virtual session and working-context continuity",
-      "designTarget": "Long tasks should survive repeated compaction or repeated high-risk stream instability by rolling into fresh concrete sessions inside a stable virtual session, carrying a bounded working set so repeated compression or broken stream retries do not silently distort task state. /new is a task-boundary command and must not inherit the previous virtual/task memory context.",
-      "currentEvidence": "context_rollover records compact counters, virtual-session records, working-set memory, session indexes, rollover episodes, and guarded requeue receipts. The current implementation injects a bounded, pointer-only Virtual session working context prompt section from resolve_virtual_session_working_context, emits a missing-reply-metadata hint from same-lane queue anchors, closes prior virtual-session records on /new, backfills codexThreadId from Codex completion capture, separates maxContinuationDepth from compact-count thresholds, exposes stream-unstable continuation knobs, and marks max-depth virtual sessions terminal-failed. Replay and catalog coverage includes context_rollover::tests::three_turn_compact_rollover_replay_writes_continuation_working_set, runtime_pipeline::tests::stream_unstable_retry_continuation_requires_repeated_high_usage_stream_failure, runtime_pipeline::tests::polluted_thread_continuation_runs_at_terminal_failure_and_respects_depth_limit, prompt missing-reply/root-boundary coverage, /new closure coverage, Codex thread-backfill coverage, and the virtual-session-rollover S1-S5 scenario-matrix labels. Live validation has confirmed model-visible working-context prompt injection and a real /new task-boundary readback without carrying prior working-set context. Remaining evidence before promotion is broader live soak plus traced final-delivery continuity across real channel turns.",
-      "promotionGate": "Replay requirements are met for the current implementation. Promote only after live soak demonstrates model-visible continuity through real Telegram/Discord turns, traced final delivery remains correct, and /new task-boundary behavior remains verified without cross-lane or cross-agent substitution.",
+      "designTarget": "Long tasks should survive repeated compaction, repeated high-risk stream instability, or interrupted long-task slice overruns by rolling into fresh concrete sessions inside a stable virtual session, carrying a bounded working set so repeated compression, broken stream retries, or timed-out tool slices do not silently distort task state. /new is a task-boundary command and must not inherit the previous virtual/task memory context.",
+      "currentEvidence": "context_rollover records compact counters, virtual-session records, working-set memory, session indexes, rollover episodes, and guarded requeue receipts. The current implementation injects a bounded, pointer-only Virtual session working context prompt section from resolve_virtual_session_working_context, emits a missing-reply-metadata hint from same-lane queue anchors, closes prior virtual-session records on /new, backfills codexThreadId from Codex completion capture, separates maxContinuationDepth from compact-count thresholds, exposes stream-unstable continuation knobs, surfaces lastInterruption continuation guidance, and marks max-depth virtual sessions terminal-failed. Replay and catalog coverage includes context_rollover::tests::three_turn_compact_rollover_replay_writes_continuation_working_set, runtime_pipeline::tests::stream_unstable_retry_continuation_requires_repeated_high_usage_stream_failure, runtime_pipeline::tests::polluted_thread_continuation_runs_at_terminal_failure_and_respects_depth_limit, runtime_pipeline::tests::tool_timeout_fallback_failure_retry_requeues_continuation, runtime_pipeline::tests::no_final_answer_terminal_interruption_requeues_continuation, prompt missing-reply/root-boundary/interruption guidance coverage, /new closure coverage, Codex thread-backfill coverage, and the virtual-session-rollover S1-S5 scenario-matrix labels. Live validation has confirmed model-visible working-context prompt injection and a real /new task-boundary readback without carrying prior working-set context. Remaining evidence before promotion is broader live soak plus traced final-delivery continuity across real channel turns.",
+      "promotionGate": "Replay requirements are met for the current implementation. Promote only after live soak demonstrates model-visible continuity through real Telegram/Discord turns, traced final delivery remains correct, interrupted long-command slices continue from working-set evidence, and /new task-boundary behavior remains verified without cross-lane or cross-agent substitution.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -732,9 +732,9 @@
       "group": "gap",
       "state": "open-gap",
       "summary": "Codex tool-use timeout recovery",
-      "designTarget": "Long external tools should not be allowed to silently stall the app-server until the parent queue item is dead-lettered. The harness should stop the stalled tool path, surface the timeout to the model, and allow bounded recovery or a clear blocker report.",
-      "currentEvidence": "Round10 adds active tool-use tracking for Codex item events and converts an in-flight tool idle timeout into one fresh-thread recovery prompt with toolUseTimeout receipt metadata. This is intentionally an initial guard: it stops the app-server/tool process and gives the model a bounded continuation prompt, but it is not yet a dedicated per-tool supervisor with resumable cancellation.",
-      "promotionGate": "Promote to full parity only after per-tool cancellation semantics, retry budgets, trace replay, and long-review soak tests prove a timed-out tool can be killed or isolated without losing queue trace, final outbox, or follow-up model control.",
+      "designTarget": "Long external tools should not be allowed to silently stall the app-server until the parent queue item is dead-lettered. The harness should stop the stalled tool path, surface the timeout to the model, and allow bounded recovery, virtual-session continuation, or a clear blocker report.",
+      "currentEvidence": "Round10 adds active tool-use tracking for Codex item events and converts an in-flight tool idle timeout into one fresh-thread recovery prompt with toolUseTimeout receipt metadata. Round17 interrupted-task staging rotates stale timeout stdout before retry recovery, routes failed tool-timeout fallback to virtual-session continuation, carries bounded tool summary into the working-set decision/requeue reason, and keeps provider-outage-shaped timeouts out of the continuation predicate. This remains short of a dedicated per-tool supervisor with resumable cancellation.",
+      "promotionGate": "Promote to full parity only after per-tool cancellation semantics, retry budgets, trace replay, and long-review soak tests prove a timed-out tool can be killed or isolated without losing queue trace, final outbox, continuation prompt evidence, or follow-up model control.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -753,13 +753,39 @@
       ]
     },
     {
+      "id": "gap-runtime-terminal-control-gap",
+      "label": "runtime-terminal-control-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Runtime queue terminal-control authority",
+      "designTarget": "Operator-written queue controls must be authoritative before runtime selection, preparation, lease return, run-once execution, and progress delivery. Terminal run-once receipts, queue-skip control receipts, scoped-stop markers, and quarantine markers must prevent runnable work without manual state surgery and must close visible progress with one final terminal surface before going silent.",
+      "currentEvidence": "Slice A adds a resolver-backed terminal-control check in runtime selection/preparation and stale lease reconciliation, makes historical terminal run-once statuses sticky instead of latest-status-wins, writes at most one suppressed run-once receipt with terminal-control metadata, terminalizes repeated unresumable prepared executions with a quarantine marker, and keeps retries on fresh queue ids. Round16 Slice B extends suppressed runtime early-return paths to write terminal progress evidence, with scoped-stop/no-prepared and quarantine regressions proving one final progress surface followed by silence even after late progress events. The checked-in runtime_pipeline::tests::e2e_1_ghost_queue_replay_from_sanitized_fixture covers the public-safe ghost-queue replay surface; live/candidate-home proof remains a promotion gate.",
+      "promotionGate": "Promote after T1-T6 regression coverage plus checked-in E2E-1 replay and live or candidate-home replay prove terminal-controlled pending queues do not resurrect, suppression receipts are idempotent, progress emits one final terminal surface and then no further status edits, retry uses a fresh runnable id, and no-prepared-execution churn stops without manual queue edits.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-deterministic-cron-freshness-gap",
+      "label": "deterministic-cron-freshness-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Deterministic cron freshness and catch-up",
+      "designTarget": "Cron canon freshness must be evaluated by status/health independently of the keeper job, deterministic cron executions must be answerable by canonical cron id, and restart catch-up behavior must be explicit and receipted per job class. Notification/sender jobs must not present stale source packets as fresh unless an operator forces that path and the receipt says so.",
+      "currentEvidence": "Round16 Slice B adds generic cron-canon monitor evaluation in status/healthz, deterministic worker evidence keyed by canon cron id, per-job catchUpPolicy decisions, and a tracked Dream Director sender freshness guard that suppresses stale source packets by default. Current local evidence covers K1-K6, health/status freshness warnings, deterministic CronRun evidence, catch-up policy receipts, the sender dry-run receipt surface, and checked-in cron_scheduler::tests::e2e_5_cron_outage_replay_from_sanitized_fixture; live Dream Lite freshness reset/current-state decision and live/candidate sender receipt remain cutover gates.",
+      "promotionGate": "Promote after K1-K6, checked-in E2E-5 replay, and live/candidate sender receipt evidence prove stale keeper/source warnings are visible, stale sender packets are suppressed or explicitly forced with receipts, deterministic cron success/failure is queryable by canon id, and restart catch-up policy decisions are audited for analysis, notification, and keeper-class jobs.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
       "id": "gap-external-review-loop-resilience-gap",
       "label": "external-review-loop-resilience-gap",
       "group": "gap",
       "state": "open-gap",
       "summary": "External review loop resilience",
       "designTarget": "External review/second-brain output is progress evidence for the parent task unless the parent queue explicitly reaches final completion. A Claude review result, timeout, auth failure, read-only inspection result, or non-owner agent result must not be mistaken for workflow closure.",
-      "currentEvidence": "Local Round10 gap closure adds codex_runtime::tests::run_codex_runtime_keeps_external_review_recovery_as_evidence_not_final and runtime_pipeline::tests::run_runtime_queue_once_keeps_external_review_evidence_resumable_without_final_outbox, proving review-only recovery output is evidence, the parent queue remains resumable, and no final outbox is written. Round14 staging adds runtime_pipeline::tests::run_runtime_queue_once_suppresses_read_only_review_final_for_implementation_goal and runtime_pipeline::tests::run_runtime_queue_once_suppresses_non_main_agent_final_outbox, proving implementation-goal read-only review text and non-main/owner-mismatched completed output stay off user-facing agent-reply rows.",
+      "currentEvidence": "Local Round10 gap closure adds codex_runtime::tests::run_codex_runtime_keeps_external_review_recovery_as_evidence_not_final and runtime_pipeline::tests::run_runtime_queue_once_keeps_external_review_evidence_resumable_without_final_outbox, proving review-only recovery output is evidence, the parent queue remains resumable, and no final outbox is written. Round14/Round17 staging adds runtime_pipeline::tests::run_runtime_queue_once_suppresses_read_only_review_final_for_implementation_goal and runtime_pipeline::tests::run_runtime_queue_once_suppresses_owner_mismatched_agent_final_outbox, proving implementation-goal read-only review text and owner-mismatched completed output stay off user-facing agent-reply rows while a routed non-main channel parent remains eligible to write its own final.",
       "promotionGate": "Keep the runtime-pipeline replay green and add live/soak evidence before promotion: final outbox closure must only happen after the parent workflow completes or emits an explicit terminal blocker, and structured owner/session identity must match before a completion can become a visible final reply.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -785,8 +811,8 @@
       "state": "open-gap",
       "summary": "First-class command plane",
       "designTarget": "User commands should be parsed as control-plane events before model dispatch, mutate scoped channel/session state deterministically, emit machine-readable command receipts, and skip LLM execution when the command is fully handled by the runtime. Commands should not depend on a chat-facing agent noticing and obeying command-shaped text.",
-      "currentEvidence": "Agent Harness has a command path for /new, /think, /model, /stop, /status, /steer, /btw, and protected restart requests: channel_runtime builds CommandReply steps, channel_state writes scoped state plus command receipts, and command replies do not enqueue agent turns. The gap is that the command registry remains partial and uneven: /fast on currently reaches the chat-facing agent as ordinary text instead of a first-class command, lifecycle commands such as checkpoint/compact are not uniformly represented as pre-model control-plane effects, and unsupported commands do not consistently produce structured skip/unknown-command receipts.",
-      "promotionGate": "Add a central command registry and parser coverage for command-only, command-plus-reply, and command-plus-enqueue cases; emit stable command receipts for applied, unsupported, unknown, and skipped-not-command outcomes; prove handled commands do not create model turns; prove same platform/channel/user but different agentId state isolation; prove /stop cancellation is immediate and source-correlated; document which lifecycle commands are runtime-owned versus model-assisted.",
+      "currentEvidence": "Agent Harness has a command path for /new, /think, /model, /stop, /status, /steer, /btw, and protected restart requests: channel_runtime builds CommandReply steps, channel_state writes scoped state plus command receipts, and command replies do not enqueue agent turns. Round16 Slice B hardens command parsing/receipt uniformity and adds a checked-in agent-harness-cli::tests::e2e_4_restart_gateway_staging_closed_loop_replay for the gateway restart request -> consumption -> heartbeat -> completion ack chain. Remaining live proof is provider/supervisor smoke: a real supervised child restart and Discord delivery evidence, plus any lifecycle commands still intentionally model-assisted.",
+      "promotionGate": "Keep central command registry coverage for command-only, command-plus-reply, and command-plus-enqueue cases; emit stable command receipts for applied, unsupported, unknown, and skipped-not-command outcomes; prove handled commands do not create model turns; prove same platform/channel/user but different agentId state isolation; prove /stop cancellation is immediate and source-correlated; document which lifecycle commands are runtime-owned versus model-assisted; before live promotion, prove the E2E-4 restart loop with a real supervised child and provider-side ack delivery.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -1683,6 +1709,16 @@
       "label": "has gap"
     },
     {
+      "source": "component-provider-request-policy",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
       "source": "gap-codex-startup-executable-stability-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
@@ -1723,9 +1759,79 @@
       "label": "has gap"
     },
     {
+      "source": "gap-runtime-terminal-control-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-progress",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-deterministic-cron-freshness-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-deterministic-cron-freshness-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-deterministic-cron-freshness-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-deterministic-cron-freshness-gap",
+      "label": "has gap"
+    },
+    {
       "source": "gap-external-review-loop-resilience-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
     },
     {
       "source": "component-channel-ingress-channel-runtime",
@@ -1744,6 +1850,11 @@
     },
     {
       "source": "component-runtime-pipeline",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
       "target": "gap-external-review-loop-resilience-gap",
       "label": "has gap"
     },

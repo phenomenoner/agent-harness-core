@@ -99,7 +99,7 @@ pub fn write_windows_supervisor_plan(
             .join("windows-scheduled-tasks"),
     };
     let scripts_dir = output_dir.join("scripts");
-    let stop_dir = output_dir.join("stop");
+    let stop_dir = harness_home.join("state").join("supervisor").join("stop");
     let log_dir = harness_home.join("state").join("logs").join("supervisor");
     fs::create_dir_all(&scripts_dir)?;
     fs::create_dir_all(&stop_dir)?;
@@ -562,6 +562,7 @@ fn write_runner_script(
              $HarnessHome = {}\n\
              $HarnessCli = {}\n\
              $SupervisorStopDir = Join-Path $HarnessHome 'state\\supervisor\\stop'\n\
+             $StopFile = {}\n\
              New-Item -ItemType Directory -Force -Path $LogDir | Out-Null\n\
              $SafeModeState = Join-Path $LogDir '{}-runner-safe-mode.json'\n\
              $SafeModeRestarts = 0\n\
@@ -571,11 +572,12 @@ fn write_runner_script(
               $GenerationId = '{}-supervised-' + $PID + '-' + $StartedAtMs + '-' + $SafeModeRestarts\n\
               $env:AGENT_HARNESS_SERVICE_GENERATION_ID = $GenerationId\n\
               $env:AGENT_HARNESS_SERVICE_STARTED_AT_MS = [string]$StartedAtMs\n\
-              $env:AGENT_HARNESS_SUPERVISOR_LAUNCH_OWNER = 'windows-runtime-runner'\n\
-              $env:AGENT_HARNESS_SUPERVISOR_OBSERVED_ONLY = 'false'\n\
-              $env:AGENT_HARNESS_SUPERVISOR_PARENT_PID = [string]$PID\n\
-               $LogFile = Join-Path $LogDir (\"{}-$(Get-Date -Format yyyyMMdd-HHmmss).log\")\n\
-               {} *> $LogFile\n\
+               $env:AGENT_HARNESS_SUPERVISOR_LAUNCH_OWNER = 'windows-runtime-runner'\n\
+               $env:AGENT_HARNESS_SUPERVISOR_OBSERVED_ONLY = 'false'\n\
+               $env:AGENT_HARNESS_SUPERVISOR_PARENT_PID = [string]$PID\n\
+               $env:AGENT_HARNESS_SUPERVISOR_STOP_FILE = $StopFile\n\
+                $LogFile = Join-Path $LogDir (\"{}-$(Get-Date -Format yyyyMMdd-HHmmss).log\")\n\
+                {} *> $LogFile\n\
                $ExitCode = $LASTEXITCODE\n\
                if ($ExitCode -eq 0) {{ exit 0 }}\n\
                try {{\n\
@@ -605,6 +607,7 @@ fn write_runner_script(
             ps_quote_path(log_dir),
             ps_quote_path(harness_home),
             ps_quote_path(executable),
+            ps_quote_path(stop_file),
             ps_escape_single(log_name),
             ps_escape_single(log_name),
             ps_escape_single(log_name),
@@ -619,10 +622,18 @@ fn write_runner_script(
              $LogDir = {}\n\
              $StopFile = {}\n\
              while ($true) {{\n\
-               New-Item -ItemType Directory -Force -Path $LogDir | Out-Null\n\
-               Get-ChildItem -LiteralPath $LogDir -Filter '{}-*.log' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 20 | Remove-Item -Force -ErrorAction SilentlyContinue\n\
-               $LogFile = Join-Path $LogDir (\"{}-$(Get-Date -Format yyyyMMdd-HHmmss).log\")\n\
-               {} *> $LogFile\n\
+                New-Item -ItemType Directory -Force -Path $LogDir | Out-Null\n\
+                Get-ChildItem -LiteralPath $LogDir -Filter '{}-*.log' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 20 | Remove-Item -Force -ErrorAction SilentlyContinue\n\
+                $StartedAtMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()\n\
+                $GenerationId = '{}-supervised-' + $PID + '-' + $StartedAtMs\n\
+                $env:AGENT_HARNESS_SERVICE_GENERATION_ID = $GenerationId\n\
+                $env:AGENT_HARNESS_SERVICE_STARTED_AT_MS = [string]$StartedAtMs\n\
+                $env:AGENT_HARNESS_SUPERVISOR_LAUNCH_OWNER = 'windows-supervisor-runner'\n\
+                $env:AGENT_HARNESS_SUPERVISOR_OBSERVED_ONLY = 'false'\n\
+                $env:AGENT_HARNESS_SUPERVISOR_PARENT_PID = [string]$PID\n\
+                $env:AGENT_HARNESS_SUPERVISOR_STOP_FILE = $StopFile\n\
+                $LogFile = Join-Path $LogDir (\"{}-$(Get-Date -Format yyyyMMdd-HHmmss).log\")\n\
+                {} *> $LogFile\n\
                $ExitCode = $LASTEXITCODE\n\
                $RestartRequested = $false\n\
                if (Test-Path -LiteralPath $StopFile) {{\n\
@@ -640,6 +651,7 @@ fn write_runner_script(
              }}\n",
             ps_quote_path(log_dir),
             ps_quote_path(stop_file),
+            ps_escape_single(log_name),
             ps_escape_single(log_name),
             ps_escape_single(log_name),
             invocation

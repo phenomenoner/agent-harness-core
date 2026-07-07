@@ -82,6 +82,8 @@ pub struct HealthzSupervisorService {
     pub process_id: Option<i64>,
     pub process_alive: Option<bool>,
     pub supervisor_process_id: Option<i64>,
+    pub parent_pid: Option<i64>,
+    pub watched_stop_file: Option<PathBuf>,
     pub corrupt: bool,
     pub parse_error: Option<String>,
     pub stale: bool,
@@ -104,6 +106,8 @@ pub struct HealthzSupervisorService {
     pub memory_gate_action: Option<String>,
     pub memory_gate_reason: Option<String>,
     pub observed_only: Option<bool>,
+    pub ownership_conflict: bool,
+    pub ownership_conflict_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -182,7 +186,8 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
                     .age_ms
                     .is_some_and(|age_ms| age_ms > options.loop_stale_ms)
                 || unhealthy_state
-                || service.process_alive == Some(false);
+                || service.process_alive == Some(false)
+                || service.ownership_conflict;
             HealthzSupervisorService {
                 service_id: service.service_id.clone(),
                 service_kind: service.service_kind.clone(),
@@ -190,6 +195,8 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
                 process_id: service.process_id,
                 process_alive: service.process_alive,
                 supervisor_process_id: service.supervisor_process_id,
+                parent_pid: service.parent_pid,
+                watched_stop_file: service.watched_stop_file.clone(),
                 corrupt: service.corrupt,
                 parse_error: service.parse_error.clone(),
                 stale,
@@ -212,6 +219,8 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
                 memory_gate_action: service.memory_gate_action.clone(),
                 memory_gate_reason: service.memory_gate_reason.clone(),
                 observed_only: service.observed_only,
+                ownership_conflict: service.ownership_conflict,
+                ownership_conflict_reason: service.ownership_conflict_reason.clone(),
             }
         })
         .collect();
@@ -373,6 +382,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
+        let watched_stop_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("stop")
+            .join("runtime-loop.live.stop");
         write_json_atomic(
             &services_dir.join("runtime-loop.json"),
             &serde_json::json!({
@@ -382,8 +396,10 @@ mod tests {
                 "generationId": "runtime-loop-test-generation",
                 "pid": std::process::id(),
                 "supervisorPid": 4242,
+                "parentPid": 4343,
                 "startedAtMs": now_ms - 1_000,
                 "processStartTimeMs": now_ms - 1_000,
+                "watchedStopFile": watched_stop_file,
                 "lastHeartbeatAtMs": now_ms,
                 "lastSuccessfulIterationAtMs": now_ms,
                 "lastExitAtMs": now_ms - 100,
@@ -421,7 +437,7 @@ mod tests {
             .find(|service| service.service_id == "runtime-loop")
             .unwrap();
         assert!(!runtime_service.corrupt);
-        assert!(!runtime_service.stale);
+        assert!(runtime_service.stale);
         assert_eq!(runtime_service.service_kind.as_deref(), Some("runtime"));
         assert_eq!(
             runtime_service.generation_id.as_deref(),
@@ -433,6 +449,11 @@ mod tests {
         );
         assert_eq!(runtime_service.process_alive, Some(true));
         assert_eq!(runtime_service.supervisor_process_id, Some(4242));
+        assert_eq!(runtime_service.parent_pid, Some(4343));
+        assert_eq!(
+            runtime_service.watched_stop_file.as_ref(),
+            Some(&watched_stop_file)
+        );
         assert_eq!(runtime_service.last_exit_at_ms, Some(now_ms - 100));
         assert_eq!(runtime_service.last_exit_code, Some(1));
         assert_eq!(
@@ -463,6 +484,11 @@ mod tests {
         assert_eq!(runtime_service.desired_state.as_deref(), Some("running"));
         assert_eq!(runtime_service.actual_state.as_deref(), Some("no-work"));
         assert_eq!(runtime_service.observed_only, Some(true));
+        assert!(runtime_service.ownership_conflict);
+        assert_eq!(
+            runtime_service.ownership_conflict_reason.as_deref(),
+            Some("observed-only-owner")
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -706,6 +732,141 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn healthz_surfaces_cron_canon_freshness_warnings() {
+        let root = temp_root("healthz_surfaces_cron_canon_freshness_warnings");
+        let harness_home = root.join(".agent-harness");
+        let state = harness_home.join("state");
+        fs::create_dir_all(state.join("runtime-queue")).unwrap();
+        fs::create_dir_all(state.join("channels")).unwrap();
+        fs::create_dir_all(state.join("logs")).unwrap();
+        fs::create_dir_all(state.join("plugin-sidecar")).unwrap();
+        fs::create_dir_all(state.join("memory")).unwrap();
+        fs::create_dir_all(state.join("cron-scheduler")).unwrap();
+        let heartbeat_dir = state.join("supervisor").join("loop-heartbeats");
+        fs::create_dir_all(&heartbeat_dir).unwrap();
+        let docs_ops = harness_home.join("workspace").join("docs").join("ops");
+        let cron_state = state.join("memory").join("dream-lite-daily");
+        let keeper_state = state.join("memory").join("cron-canon-keeper");
+        fs::create_dir_all(&docs_ops).unwrap();
+        fs::create_dir_all(&cron_state).unwrap();
+        fs::create_dir_all(&keeper_state).unwrap();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        write_json_atomic(
+            &state.join("cron-scheduler").join("latest-tick.json"),
+            &serde_json::json!({
+                "ok": true,
+                "atMs": now_ms - 30_000,
+                "status": "no-work"
+            }),
+        )
+        .unwrap();
+        write_json_atomic(
+            &cron_state.join("latest.json"),
+            &serde_json::json!({
+                "schema": "openclaw.agent-harness.dream-lite-daily.receipt.v1",
+                "ok": true,
+                "generatedAt": "1970-01-01T08:00:01+08:00",
+                "runId": "stale-dream"
+            }),
+        )
+        .unwrap();
+        write_json_atomic(
+            &keeper_state.join("latest-cron-canon-keeper.json"),
+            &serde_json::json!({
+                "schema": "openclaw.agent-harness.cron-canon-keeper.receipt.v1",
+                "ok": false,
+                "status": "warn",
+                "generatedAt": "1970-01-01T00:00:01Z",
+                "findings": [
+                    {
+                        "severity": "warn",
+                        "code": "receipt-not-ok",
+                        "cronId": "cron-canon-keeper",
+                        "message": "keeper observed cron-canon drift",
+                        "details": {
+                            "path": "state/memory/cron-canon-keeper/latest-cron-canon-keeper.json"
+                        }
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+        write_json_atomic(
+            &docs_ops.join("cron-canon.json"),
+            &serde_json::json!({
+                "schema": "openclaw.agent-harness.cron-canon.v1",
+                "paths": {
+                    "keeperReceipt": "state/memory/cron-canon-keeper/latest-cron-canon-keeper.json"
+                },
+                "activeCrons": [
+                    {
+                        "id": "dream-lite-daily",
+                        "enabled": true,
+                        "monitor": {
+                            "type": "latest-json",
+                            "path": "state/memory/dream-lite-daily/latest.json",
+                            "maxAgeHours": 1,
+                            "okField": "ok",
+                            "okValue": true
+                        }
+                    },
+                    {
+                        "id": "cron-canon-keeper",
+                        "enabled": true,
+                        "monitor": {
+                            "type": "latest-json",
+                            "path": "state/memory/cron-canon-keeper/latest-cron-canon-keeper.json",
+                            "maxAgeHours": 1,
+                            "okField": "ok",
+                            "okValue": true
+                        }
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+
+        let report = collect_healthz(HealthzOptions {
+            harness_home,
+            now_ms,
+            loop_stale_ms: 120_000,
+            require_writable_state: false,
+        })
+        .unwrap();
+
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cron canon keeper status=warn"))
+        );
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("dream-lite-daily")
+                && warning.contains("receipt-stale")
+                && warning.contains("ageHours=")
+                && warning.contains("maxAgeHours=1.000")
+        }));
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("cron-canon-keeper") && warning.contains("receipt-not-ok")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn healthz_warns_on_stale_keeper_receipt() {
+        healthz_surfaces_cron_canon_freshness_warnings();
+    }
+
+    #[test]
+    fn healthz_evaluates_all_canon_monitor_blocks_generically() {
+        healthz_surfaces_cron_canon_freshness_warnings();
     }
 
     fn temp_root(test_name: &str) -> PathBuf {

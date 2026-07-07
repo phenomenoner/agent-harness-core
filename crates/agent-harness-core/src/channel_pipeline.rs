@@ -27,6 +27,8 @@ pub struct ChannelRunOnceOptions {
     pub message: String,
     pub inbound_context: Option<String>,
     pub inbound_media_artifacts: Vec<InboundMediaArtifact>,
+    pub inbound_event_kind: Option<String>,
+    pub inbound_event_id: Option<String>,
     pub skill_limit: usize,
     pub now_ms: i64,
     pub codex_executable: Option<PathBuf>,
@@ -75,6 +77,8 @@ pub fn run_channel_once(options: ChannelRunOnceOptions) -> io::Result<ChannelRun
         message: options.message,
         inbound_context: options.inbound_context,
         inbound_media_artifacts: options.inbound_media_artifacts,
+        inbound_event_kind: options.inbound_event_kind,
+        inbound_event_id: options.inbound_event_id,
         skill_limit: options.skill_limit,
         now_ms: options.now_ms,
     })?;
@@ -115,6 +119,7 @@ pub fn run_channel_once(options: ChannelRunOnceOptions) -> io::Result<ChannelRun
             }
         }
         ChannelReceiveStatus::ErrorReplied => ChannelRunOnceStatus::ErrorReplied,
+        ChannelReceiveStatus::DuplicateSuppressed => ChannelRunOnceStatus::Skipped,
         ChannelReceiveStatus::Skipped => ChannelRunOnceStatus::Skipped,
     };
     append_harness_log(
@@ -156,7 +161,8 @@ pub fn run_channel_once(options: ChannelRunOnceOptions) -> io::Result<ChannelRun
 mod tests {
     use super::*;
     use crate::{
-        AgentSource, ChannelOutboundMessageKind, ChannelRunOnceStatus, RuntimeRunOnceStatus,
+        AgentSource, ChannelCommandApplyReport, ChannelCommandEffect, ChannelOutboundMessageKind,
+        ChannelReceiveStatus, ChannelRunOnceStatus, RuntimeRunOnceStatus,
     };
     use std::ffi::OsString;
     use std::fs;
@@ -167,8 +173,203 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn channel_run_once_handles_command_without_runtime() {
-        let root = temp_root("channel_run_once_handles_command_without_runtime");
+    fn c1_unknown_slash_command_structured_receipt_no_model_turn() {
+        let (root, report) =
+            run_channel_command_once("c1_unknown_slash_command_structured_receipt", "/x value");
+
+        assert_command_handled_without_model_turn(&report);
+        let apply = command_apply_report(&report);
+        assert_eq!(apply.receipt.command, Some("unknown-command"));
+        assert!(matches!(
+            apply.receipt.effect,
+            Some(ChannelCommandEffect::UnknownCommand {
+                ref name,
+                ref rest,
+                ref detail,
+            }) if name == "x"
+                && rest.as_deref() == Some("value")
+                && detail.contains("no model turn was started")
+        ));
+        assert!(
+            report.outbox.pending[0]
+                .message
+                .text
+                .contains("Unknown or unsupported command: /x value")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unknown_slash_command_structured_receipt_no_model_turn() {
+        c1_unknown_slash_command_structured_receipt_no_model_turn();
+    }
+
+    #[test]
+    fn c2_command_matrix_no_model_turn_for_fully_handled_channel_commands() {
+        for case in [
+            CommandMatrixCase {
+                name: "new",
+                message: "/new weekly review",
+                command: "new",
+                effect: ExpectedCommandEffect::StartNewSession,
+            },
+            CommandMatrixCase {
+                name: "think_status",
+                message: "/think",
+                command: "think",
+                effect: ExpectedCommandEffect::ShowThinking,
+            },
+            CommandMatrixCase {
+                name: "think_switch",
+                message: "/think high",
+                command: "think",
+                effect: ExpectedCommandEffect::SwitchThinking,
+            },
+            CommandMatrixCase {
+                name: "stop",
+                message: "/stop operator requested",
+                command: "stop",
+                effect: ExpectedCommandEffect::StopCurrentRun,
+            },
+            CommandMatrixCase {
+                name: "restart_gateway",
+                message: "/restart",
+                command: "restart",
+                effect: ExpectedCommandEffect::RestartGateway,
+            },
+            CommandMatrixCase {
+                name: "restart_status",
+                message: "/restart status",
+                command: "restart-status",
+                effect: ExpectedCommandEffect::RestartStatus,
+            },
+            CommandMatrixCase {
+                name: "restart_telegram",
+                message: "/restart telegram reconnect adapter",
+                command: "restart",
+                effect: ExpectedCommandEffect::RestartChannel,
+            },
+            CommandMatrixCase {
+                name: "restart_discord",
+                message: "/restart discord reconnect adapter",
+                command: "restart",
+                effect: ExpectedCommandEffect::RestartChannel,
+            },
+            CommandMatrixCase {
+                name: "steer",
+                message: "/steer keep the reply short",
+                command: "steer",
+                effect: ExpectedCommandEffect::AddSteering,
+            },
+            CommandMatrixCase {
+                name: "btw",
+                message: "/btw verify cron state",
+                command: "btw",
+                effect: ExpectedCommandEffect::AddBtwNote,
+            },
+            CommandMatrixCase {
+                name: "model_status",
+                message: "/model",
+                command: "model",
+                effect: ExpectedCommandEffect::ShowModel,
+            },
+            CommandMatrixCase {
+                name: "model_provider",
+                message: "/model openai",
+                command: "model",
+                effect: ExpectedCommandEffect::ListProviderModels,
+            },
+            CommandMatrixCase {
+                name: "model_switch",
+                message: "/model openai/gpt-5",
+                command: "model",
+                effect: ExpectedCommandEffect::SwitchModel,
+            },
+            CommandMatrixCase {
+                name: "fast_status",
+                message: "/fast",
+                command: "fast",
+                effect: ExpectedCommandEffect::ShowFast,
+            },
+            CommandMatrixCase {
+                name: "fast_switch",
+                message: "/fast on",
+                command: "fast",
+                effect: ExpectedCommandEffect::SwitchFast,
+            },
+            CommandMatrixCase {
+                name: "status",
+                message: "/status channels",
+                command: "status",
+                effect: ExpectedCommandEffect::ShowStatus,
+            },
+            CommandMatrixCase {
+                name: "unknown_x",
+                message: "/x value",
+                command: "unknown-command",
+                effect: ExpectedCommandEffect::UnknownCommand,
+            },
+            CommandMatrixCase {
+                name: "unsupported_fast_argument",
+                message: "/fast turbo",
+                command: "unknown-command",
+                effect: ExpectedCommandEffect::UnknownCommand,
+            },
+        ] {
+            let (root, report) = run_channel_command_once(case.name, case.message);
+            assert_command_handled_without_model_turn(&report);
+            let apply = command_apply_report(&report);
+            assert_eq!(apply.receipt.command, Some(case.command), "{}", case.name);
+            assert_command_effect_kind(
+                apply.receipt.effect.as_ref().expect("command effect"),
+                case.effect,
+                case.name,
+            );
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn command_matrix_no_model_turn_for_fully_handled_channel_commands() {
+        c2_command_matrix_no_model_turn_for_fully_handled_channel_commands();
+    }
+
+    #[derive(Clone, Copy)]
+    struct CommandMatrixCase {
+        name: &'static str,
+        message: &'static str,
+        command: &'static str,
+        effect: ExpectedCommandEffect,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExpectedCommandEffect {
+        StartNewSession,
+        ShowThinking,
+        SwitchThinking,
+        StopCurrentRun,
+        RestartGateway,
+        RestartStatus,
+        RestartChannel,
+        AddSteering,
+        AddBtwNote,
+        ShowModel,
+        ListProviderModels,
+        SwitchModel,
+        ShowFast,
+        SwitchFast,
+        ShowStatus,
+        UnknownCommand,
+    }
+
+    fn run_channel_command_once(test_name: &str, message: &str) -> (PathBuf, ChannelRunOnceReport) {
+        let root = temp_root(&format!(
+            "command_matrix_{}_{}",
+            test_name,
+            normalize_case_name(message)
+        ));
         let source = write_channel_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
 
@@ -182,9 +383,11 @@ mod tests {
             user_id: "user-1".to_string(),
             agent_id: Some("main".to_string()),
             session_key: None,
-            message: "/status".to_string(),
+            message: message.to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1234,
             codex_executable: None,
@@ -196,15 +399,92 @@ mod tests {
         })
         .unwrap();
 
+        (root, report)
+    }
+
+    fn assert_command_handled_without_model_turn(report: &ChannelRunOnceReport) {
         assert_eq!(report.status, ChannelRunOnceStatus::CommandHandled);
+        assert_eq!(report.receive.status, ChannelReceiveStatus::CommandApplied);
         assert!(report.runtime.is_none());
+        assert!(report.receive.queue_id.is_none());
+        assert!(report.receive.queue_enqueue.is_none());
+        assert!(report.receive.command_apply.is_some());
         assert_eq!(report.outbox.pending.len(), 1);
         assert_eq!(
             report.outbox.pending[0].message.kind,
             ChannelOutboundMessageKind::CommandReply
         );
+    }
 
-        let _ = fs::remove_dir_all(root);
+    fn command_apply_report(report: &ChannelRunOnceReport) -> &ChannelCommandApplyReport {
+        report
+            .receive
+            .command_apply
+            .as_ref()
+            .expect("command apply report")
+    }
+
+    fn assert_command_effect_kind(
+        effect: &ChannelCommandEffect,
+        expected: ExpectedCommandEffect,
+        case_name: &str,
+    ) {
+        let matches_expected = matches!(
+            (expected, effect),
+            (
+                ExpectedCommandEffect::StartNewSession,
+                ChannelCommandEffect::StartNewSession { .. }
+            ) | (
+                ExpectedCommandEffect::ShowThinking,
+                ChannelCommandEffect::ShowThinking { .. }
+            ) | (
+                ExpectedCommandEffect::SwitchThinking,
+                ChannelCommandEffect::SwitchThinking { .. }
+            ) | (
+                ExpectedCommandEffect::StopCurrentRun,
+                ChannelCommandEffect::StopCurrentRun { .. }
+            ) | (
+                ExpectedCommandEffect::RestartGateway,
+                ChannelCommandEffect::RestartGateway { .. }
+            ) | (
+                ExpectedCommandEffect::RestartStatus,
+                ChannelCommandEffect::RestartStatus { .. }
+            ) | (
+                ExpectedCommandEffect::RestartChannel,
+                ChannelCommandEffect::RestartChannel { .. }
+            ) | (
+                ExpectedCommandEffect::AddSteering,
+                ChannelCommandEffect::AddSteering { .. }
+            ) | (
+                ExpectedCommandEffect::AddBtwNote,
+                ChannelCommandEffect::AddBtwNote { .. }
+            ) | (
+                ExpectedCommandEffect::ShowModel,
+                ChannelCommandEffect::ShowModel { .. }
+            ) | (
+                ExpectedCommandEffect::ListProviderModels,
+                ChannelCommandEffect::ListProviderModels { .. }
+            ) | (
+                ExpectedCommandEffect::SwitchModel,
+                ChannelCommandEffect::SwitchModel { .. }
+            ) | (
+                ExpectedCommandEffect::ShowFast,
+                ChannelCommandEffect::ShowFast { .. }
+            ) | (
+                ExpectedCommandEffect::SwitchFast,
+                ChannelCommandEffect::SwitchFast { .. }
+            ) | (
+                ExpectedCommandEffect::ShowStatus,
+                ChannelCommandEffect::ShowStatus { .. }
+            ) | (
+                ExpectedCommandEffect::UnknownCommand,
+                ChannelCommandEffect::UnknownCommand { .. }
+            )
+        );
+        assert!(
+            matches_expected,
+            "unexpected command effect for {case_name}"
+        );
     }
 
     #[test]
@@ -232,6 +512,8 @@ mod tests {
             message: "repair memory cron".to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1235,
             codex_executable: Some(fake_codex),
@@ -418,5 +700,17 @@ done
             "agent-harness-channel-pipeline-{test_name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn normalize_case_name(value: &str) -> String {
+        let mut normalized = String::new();
+        for ch in value.chars() {
+            if ch.is_ascii_alphanumeric() {
+                normalized.push(ch.to_ascii_lowercase());
+            } else {
+                normalized.push('_');
+            }
+        }
+        normalized.trim_matches('_').to_string()
     }
 }

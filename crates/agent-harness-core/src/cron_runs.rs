@@ -844,7 +844,7 @@ fn cron_status_from_worker_status(status: &str) -> Option<CronRunStatus> {
         "failed-terminal" => Some(CronRunStatus::FailedTerminal),
         "canceled" => Some(CronRunStatus::Canceled),
         "expired" => Some(CronRunStatus::Expired),
-        "succeeded" => None,
+        "succeeded" => Some(CronRunStatus::Succeeded),
         _ => Some(CronRunStatus::FailedTerminal),
     }
 }

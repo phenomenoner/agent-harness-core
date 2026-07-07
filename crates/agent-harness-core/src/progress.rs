@@ -1,23 +1,30 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::harness_config_candidates;
+use crate::runtime_worker::{
+    QueueTerminalControl, QueueTerminalControlMatch, rebuild_runtime_queue_state_index,
+    resolve_queue_terminal_control_from_index,
+};
 use crate::write_json_atomic;
 
 const AGENT_PROGRESS_EVENT_SCHEMA: &str = "agent-harness.progress-event.v1";
 const AGENT_PROGRESS_DELIVERY_PLAN_SCHEMA: &str = "agent-harness.progress-delivery-plan.v1";
 const AGENT_PROGRESS_DELIVERY_STATE_SCHEMA: &str = "agent-harness.progress-delivery-state.v1";
 const AGENT_PROGRESS_DELIVERY_RECEIPT_SCHEMA: &str = "agent-harness.progress-delivery-receipt.v1";
+const AGENT_PROGRESS_SURFACE_CLAIM_SCHEMA: &str = "agent-harness.progress-surface-claim.v1";
+const AGENT_PROGRESS_SESSION_SUPERSEDE_SCHEMA: &str = "agent-harness.progress-session-supersede.v1";
 const DEFAULT_PREVIEW_CHARS: usize = 120;
 const DEFAULT_CURRENT_STEP_CHARS: usize = 1200;
 const DEFAULT_MAX_NONTERMINAL_UPDATES_PER_LANE: usize = 6;
 const DEFAULT_STATUS_HEARTBEAT_AFTER_BODY_CAP_MS: i64 = 5 * 60 * 1000;
 const TERMINAL_PROGRESS_STATE_RETENTION_MS: i64 = 10 * 60 * 1000;
+const PROGRESS_SURFACE_CLAIM_TTL_MS: i64 = 2 * 60 * 1000;
 const SENSITIVE_PREVIEW: &str = "[redacted sensitive preview]";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +155,37 @@ pub struct AgentProgressDeliveryPlanSummary {
     pub read_to_byte: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentProgressSessionSupersedeOptions {
+    pub harness_home: PathBuf,
+    pub platform: String,
+    pub account_id: Option<String>,
+    pub channel_id: String,
+    pub user_id: String,
+    pub agent_id: Option<String>,
+    pub session_key: String,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProgressSessionSupersedeReport {
+    pub schema: &'static str,
+    pub state_file: PathBuf,
+    pub receipts_file: PathBuf,
+    pub platform: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    pub channel_id: String,
+    pub user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub session_key: String,
+    pub removed_queue_ids: Vec<String>,
+    pub removed_claim_files: Vec<PathBuf>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentProgressDeliveryPending {
@@ -171,6 +209,11 @@ pub struct AgentProgressDeliveryPending {
     pub text_hash: String,
     pub started_at_ms: i64,
     pub latest_at_ms: i64,
+    pub status_surface_key: String,
+    pub idempotency_hit: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_suppressed_reason: Option<String>,
+    pub fresh_send_reason: Option<AgentProgressDeliveryFreshSendReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +254,22 @@ pub struct AgentProgressDeliveryRecordOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentProgressDeliveryRecordContext {
+    pub status_surface_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing_provider_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_send_reason: Option<AgentProgressDeliveryFreshSendReason>,
+    #[serde(default)]
+    pub idempotency_hit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_suppressed_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentProgressDeliveryReceipt {
     pub schema: String,
     pub at_ms: i64,
@@ -230,9 +289,31 @@ pub struct AgentProgressDeliveryReceipt {
     pub event_line: usize,
     pub text_hash: String,
     pub terminal: bool,
+    #[serde(default)]
+    pub status_surface_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing_provider_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_send_reason: Option<AgentProgressDeliveryFreshSendReason>,
+    #[serde(default)]
+    pub idempotency_hit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_suppressed_reason: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentProgressDeliveryFreshSendReason {
+    NoExistingStatusSurface,
+    ExistingProviderMessageExpired,
+    EditProviderNotFound,
+    EditProviderRejectedTerminal,
+    ExplicitNewSurfaceRequested,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,6 +356,8 @@ struct AgentProgressDeliveryState {
     ledger: AgentProgressDeliveryLedgerCursor,
     #[serde(default)]
     compacted_events: BTreeMap<String, Vec<StoredProgressEvent>>,
+    #[serde(default)]
+    superseded_sessions: BTreeMap<String, AgentProgressSupersededSession>,
 }
 
 impl Default for AgentProgressDeliveryState {
@@ -284,8 +367,61 @@ impl Default for AgentProgressDeliveryState {
             queues: BTreeMap::new(),
             ledger: AgentProgressDeliveryLedgerCursor::default(),
             compacted_events: BTreeMap::new(),
+            superseded_sessions: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentProgressSupersededSession {
+    platform: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
+    channel_id: String,
+    user_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_id: Option<String>,
+    session_key: String,
+    superseded_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentProgressSurfaceClaim {
+    schema: String,
+    status_surface_key: String,
+    queue_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_id: Option<String>,
+    platform: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
+    channel_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread_id: Option<String>,
+    user_id: String,
+    session_key: String,
+    message_kind: AgentProgressDeliveryMessageKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_message_id: Option<String>,
+    event_line: usize,
+    text_hash: String,
+    terminal: bool,
+    claimed_at_ms: i64,
+    expires_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProgressSurfaceClaimOutcome {
+    Claimed {
+        fresh_send_reason: AgentProgressDeliveryFreshSendReason,
+    },
+    ExistingProvider {
+        provider_message_id: String,
+    },
+    ActivePending,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -582,6 +718,14 @@ pub fn agent_progress_delivery_receipts_file(harness_home: impl AsRef<Path>) -> 
         .join("progress-delivery-receipts.jsonl")
 }
 
+pub fn agent_progress_session_supersede_receipts_file(harness_home: impl AsRef<Path>) -> PathBuf {
+    harness_home
+        .as_ref()
+        .join("state")
+        .join("progress")
+        .join("session-supersede-receipts.jsonl")
+}
+
 pub fn append_agent_progress_event(
     harness_home: impl AsRef<Path>,
     event: &AgentProgressEvent,
@@ -602,6 +746,101 @@ pub fn append_agent_progress_event(
     Ok(file)
 }
 
+pub fn supersede_agent_progress_session_surfaces(
+    options: AgentProgressSessionSupersedeOptions,
+) -> io::Result<AgentProgressSessionSupersedeReport> {
+    let state_file = agent_progress_delivery_state_file(&options.harness_home);
+    let receipts_file = agent_progress_session_supersede_receipts_file(&options.harness_home);
+    let mut warnings = Vec::new();
+    let mut state = read_delivery_state(&state_file, &mut warnings)?;
+    let superseded = AgentProgressSupersededSession {
+        platform: options.platform.clone(),
+        account_id: options.account_id.clone(),
+        channel_id: options.channel_id.clone(),
+        user_id: options.user_id.clone(),
+        agent_id: options.agent_id.clone(),
+        session_key: options.session_key.clone(),
+        superseded_at_ms: options.now_ms,
+    };
+    state.superseded_sessions.insert(
+        progress_session_key(
+            &options.platform,
+            options.account_id.as_deref(),
+            &options.channel_id,
+            &options.user_id,
+            options.agent_id.as_deref(),
+            &options.session_key,
+        ),
+        superseded.clone(),
+    );
+
+    let removed_queue_ids = state
+        .queues
+        .iter()
+        .filter_map(|(queue_id, cursor)| {
+            progress_cursor_matches_superseded_session(cursor, &superseded)
+                .then(|| queue_id.clone())
+        })
+        .collect::<Vec<_>>();
+    for queue_id in &removed_queue_ids {
+        state.queues.remove(queue_id);
+        state.compacted_events.remove(queue_id);
+    }
+    state.compacted_events.retain(|_, events| {
+        events.retain(|stored| {
+            !progress_event_matches_superseded_session(&stored.event, &superseded)
+        });
+        !events.is_empty()
+    });
+
+    let mut removed_claim_files = Vec::new();
+    let claims_dir = progress_surface_claims_dir(&options.harness_home);
+    if claims_dir.is_dir() {
+        for entry in fs::read_dir(&claims_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            match read_progress_surface_claim(&path) {
+                Ok(Some(claim))
+                    if progress_claim_matches_superseded_session(&claim, &superseded) =>
+                {
+                    match fs::remove_file(&path) {
+                        Ok(()) => removed_claim_files.push(path),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => warnings.push(format!(
+                    "progress surface claim could not be read during supersede at {}: {}",
+                    path.display(),
+                    error
+                )),
+            }
+        }
+    }
+
+    write_delivery_state(&state_file, &state)?;
+    let report = AgentProgressSessionSupersedeReport {
+        schema: AGENT_PROGRESS_SESSION_SUPERSEDE_SCHEMA,
+        state_file,
+        receipts_file: receipts_file.clone(),
+        platform: options.platform,
+        account_id: options.account_id,
+        channel_id: options.channel_id,
+        user_id: options.user_id,
+        agent_id: options.agent_id,
+        session_key: options.session_key,
+        removed_queue_ids,
+        removed_claim_files,
+        warnings,
+    };
+    append_json_line(&receipts_file, &report)?;
+    Ok(report)
+}
+
 pub fn plan_agent_progress_delivery(
     options: AgentProgressDeliveryPlanOptions,
 ) -> io::Result<AgentProgressDeliveryPlanReport> {
@@ -619,6 +858,17 @@ pub fn plan_agent_progress_delivery(
         .max(0);
     let mut state = read_delivery_state(&state_file, &mut warnings)?;
     prune_old_terminal_delivery_state(&mut state, options.now_ms);
+    let queue_dir = options.harness_home.join("state").join("runtime-queue");
+    let terminal_control_index = match rebuild_runtime_queue_state_index(&queue_dir, &mut warnings)
+    {
+        Ok(index) => Some(index),
+        Err(error) => {
+            warnings.push(format!(
+                "progress delivery terminal-control index rebuild failed open: {error}"
+            ));
+            None
+        }
+    };
     let read_result =
         read_progress_events_since_cursor(&events_file, &state.ledger, &mut warnings)?;
     let cached_events = if read_result.reset {
@@ -650,6 +900,7 @@ pub fn plan_agent_progress_delivery(
         ..AgentProgressDeliveryPlanSummary::default()
     };
     let mut by_queue = BTreeMap::<String, Vec<StoredProgressEvent>>::new();
+    let mut terminal_control_close_reasons = BTreeMap::<String, String>::new();
     for (queue_id, queue_events) in all_by_queue {
         let mut kept = Vec::new();
         for stored in queue_events {
@@ -661,6 +912,10 @@ pub fn plan_agent_progress_delivery(
                 summary.skipped_platform += 1;
                 continue;
             }
+            if progress_event_session_superseded(&state, &stored.event) {
+                summary.delivered_current += 1;
+                continue;
+            }
             if !progress_delivery_enabled_for_event(&mute_config, &stored.event) {
                 summary.skipped_muted += 1;
                 continue;
@@ -668,6 +923,44 @@ pub fn plan_agent_progress_delivery(
             kept.push(stored);
         }
         if !kept.is_empty() {
+            let has_terminal_event = kept.iter().any(|stored| is_terminal_event(&stored.event));
+            if !has_terminal_event {
+                let session_key = kept.last().map(|stored| stored.event.session_key.as_str());
+                if let Some(control) = terminal_control_for_progress_queue(
+                    &queue_dir,
+                    terminal_control_index.as_ref(),
+                    &queue_id,
+                    session_key,
+                    &mut warnings,
+                ) {
+                    let _ =
+                        remove_progress_surface_claims_for_queue(&options.harness_home, &queue_id)?;
+                    let cursor = state.queues.get(&queue_id);
+                    let has_open_surface = cursor.is_some_and(|cursor| {
+                        cursor
+                            .provider_message_id_for(AgentProgressDeliveryMessageKind::Body)
+                            .is_some()
+                            || cursor
+                                .provider_message_id_for(AgentProgressDeliveryMessageKind::Status)
+                                .is_some()
+                    });
+                    summary.delivered_current += kept.len();
+                    if !has_open_surface {
+                        state.queues.remove(&queue_id);
+                        state.compacted_events.remove(&queue_id);
+                        continue;
+                    }
+                    let synthetic = terminal_control_suppressed_progress_events(
+                        kept.last().expect("kept is not empty"),
+                        &control,
+                        options.now_ms,
+                    );
+                    kept.clear();
+                    kept.extend(synthetic);
+                    terminal_control_close_reasons
+                        .insert(queue_id.clone(), "terminal-control-present".to_string());
+                }
+            }
             by_queue.insert(queue_id, kept);
         }
     }
@@ -692,6 +985,16 @@ pub fn plan_agent_progress_delivery(
             .collect::<Vec<_>>();
         let terminal = latest_terminal_event(event_refs.as_slice()).is_some();
         let cursor = state.queues.get(&queue_id);
+        if terminal
+            && final_source_delivery_is_still_pending(
+                &options.harness_home,
+                &queue_id,
+                &latest.event,
+                &mut warnings,
+            )?
+        {
+            continue;
+        }
         let body_cap_reached = cursor.is_some_and(|cursor| {
             !terminal
                 && max_nonterminal_updates_per_lane > 0
@@ -780,10 +1083,51 @@ pub fn plan_agent_progress_delivery(
                 summary.volume_limited += 1;
                 continue;
             }
-            let action = if provider_message_id.is_some() {
+            let mut provider_message_id = provider_message_id;
+            let mut action = if provider_message_id.is_some() {
                 AgentProgressDeliveryAction::Edit
             } else {
                 AgentProgressDeliveryAction::Send
+            };
+            let progress_suppressed_reason = terminal_control_close_reasons.get(&queue_id).cloned();
+            if progress_suppressed_reason.is_some() && provider_message_id.is_none() {
+                summary.delivered_current += 1;
+                continue;
+            }
+            let status_surface_key =
+                status_surface_key_for_event(&latest.event, &queue_id, message_kind);
+            let mut idempotency_hit = false;
+            let fresh_send_reason = if provider_message_id.is_none() {
+                match acquire_progress_surface_claim(
+                    &options.harness_home,
+                    &status_surface_key,
+                    &queue_id,
+                    &latest.event,
+                    message_kind,
+                    latest.line_number,
+                    &text_hash,
+                    terminal,
+                    options.now_ms,
+                    &mut warnings,
+                )? {
+                    ProgressSurfaceClaimOutcome::Claimed { fresh_send_reason } => {
+                        Some(fresh_send_reason)
+                    }
+                    ProgressSurfaceClaimOutcome::ExistingProvider {
+                        provider_message_id: existing_provider_message_id,
+                    } => {
+                        provider_message_id = Some(existing_provider_message_id);
+                        action = AgentProgressDeliveryAction::Edit;
+                        idempotency_hit = true;
+                        None
+                    }
+                    ProgressSurfaceClaimOutcome::ActivePending => {
+                        summary.delivered_current += 1;
+                        continue;
+                    }
+                }
+            } else {
+                None
             };
             pending.push(AgentProgressDeliveryPending {
                 queue_id: queue_id.clone(),
@@ -803,6 +1147,10 @@ pub fn plan_agent_progress_delivery(
                 text_hash,
                 started_at_ms: first.event.at_ms,
                 latest_at_ms: latest.event.at_ms,
+                status_surface_key,
+                idempotency_hit,
+                progress_suppressed_reason,
+                fresh_send_reason,
             });
         }
     }
@@ -1053,10 +1401,68 @@ fn progress_delivery_channel_match_keys(event: &AgentProgressEvent) -> Vec<Strin
 pub fn record_agent_progress_delivery(
     options: AgentProgressDeliveryRecordOptions,
 ) -> io::Result<AgentProgressDeliveryReceipt> {
+    let status_surface_key = status_surface_key_from_parts(
+        &options.platform,
+        options.account_id.as_deref(),
+        &options.channel_id,
+        &options.user_id,
+        None,
+        &options.session_key,
+        &options.queue_id,
+        options.message_kind,
+    );
+    let status_surface_key =
+        resolve_progress_surface_key_for_record(&options, &status_surface_key)?;
+    let fresh_send_reason = if options.action == AgentProgressDeliveryAction::Send {
+        Some(AgentProgressDeliveryFreshSendReason::NoExistingStatusSurface)
+    } else {
+        None
+    };
+    let decision = Some(
+        match options.action {
+            AgentProgressDeliveryAction::Send => "send",
+            AgentProgressDeliveryAction::Edit => "edit",
+        }
+        .to_string(),
+    );
+    record_agent_progress_delivery_with_context(
+        options,
+        AgentProgressDeliveryRecordContext {
+            status_surface_key,
+            existing_provider_message_id: None,
+            decision,
+            fresh_send_reason,
+            idempotency_hit: false,
+            progress_suppressed_reason: None,
+        },
+    )
+}
+
+pub fn record_agent_progress_delivery_with_context(
+    options: AgentProgressDeliveryRecordOptions,
+    context: AgentProgressDeliveryRecordContext,
+) -> io::Result<AgentProgressDeliveryReceipt> {
+    let harness_home = options.harness_home.clone();
     let state_file = agent_progress_delivery_state_file(&options.harness_home);
     let receipts_file = agent_progress_delivery_receipts_file(&options.harness_home);
     let mut warnings = Vec::new();
     let mut state = read_delivery_state(&state_file, &mut warnings)?;
+    let fresh_send_reason = if options.action == AgentProgressDeliveryAction::Send {
+        context.fresh_send_reason.or(Some(
+            AgentProgressDeliveryFreshSendReason::NoExistingStatusSurface,
+        ))
+    } else {
+        None
+    };
+    let decision = context.decision.or_else(|| {
+        Some(
+            match options.action {
+                AgentProgressDeliveryAction::Send => "send",
+                AgentProgressDeliveryAction::Edit => "edit",
+            }
+            .to_string(),
+        )
+    });
     let mut receipt = AgentProgressDeliveryReceipt {
         schema: AGENT_PROGRESS_DELIVERY_RECEIPT_SCHEMA.to_string(),
         at_ms: options.now_ms,
@@ -1074,7 +1480,13 @@ pub fn record_agent_progress_delivery(
         event_line: options.event_line,
         text_hash: options.text_hash,
         terminal: options.terminal,
+        status_surface_key: context.status_surface_key,
+        existing_provider_message_id: context.existing_provider_message_id,
+        decision,
         policy_decision: options.policy_decision,
+        fresh_send_reason,
+        idempotency_hit: context.idempotency_hit,
+        progress_suppressed_reason: context.progress_suppressed_reason,
         error: options.error,
     };
 
@@ -1111,8 +1523,14 @@ pub fn record_agent_progress_delivery(
             receipt.terminal,
             receipt.status == AgentProgressDeliveryStatus::Delivered,
         );
+        if receipt.progress_suppressed_reason.as_deref() == Some("terminal-control-present")
+            && progress_cursor_all_terminal_surfaces_recorded(cursor)
+        {
+            state.compacted_events.remove(&receipt.queue_id);
+        }
         write_delivery_state(&state_file, &state)?;
     }
+    update_progress_surface_claim_from_receipt(&harness_home, &receipt)?;
     append_json_line(&receipts_file, &receipt)?;
     Ok(receipt)
 }
@@ -1475,8 +1893,601 @@ fn prune_old_terminal_delivery_state(state: &mut AgentProgressDeliveryState, now
     }
 }
 
+fn progress_cursor_all_terminal_surfaces_recorded(cursor: &AgentProgressDeliveryCursor) -> bool {
+    cursor.terminal
+        && cursor
+            .provider_message_id_for(AgentProgressDeliveryMessageKind::Body)
+            .is_none_or(|_| cursor.terminal_recorded_for(AgentProgressDeliveryMessageKind::Body))
+        && cursor
+            .provider_message_id_for(AgentProgressDeliveryMessageKind::Status)
+            .is_none_or(|_| cursor.terminal_recorded_for(AgentProgressDeliveryMessageKind::Status))
+}
+
+fn final_source_delivery_is_still_pending(
+    harness_home: &Path,
+    queue_id: &str,
+    event: &AgentProgressEvent,
+    warnings: &mut Vec<String>,
+) -> io::Result<bool> {
+    let channel_dir = harness_home.join("state").join("channels");
+    let outbox_file = channel_dir.join("outbox.jsonl");
+    if !outbox_file.is_file() {
+        return Ok(false);
+    }
+
+    let delivery_receipts = read_channel_delivery_receipt_statuses(
+        &channel_dir.join("delivery-receipts.jsonl"),
+        warnings,
+    )?;
+    let text = fs::read_to_string(&outbox_file)?;
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let message: crate::ChannelOutboundMessage = match serde_json::from_str(trimmed) {
+            Ok(message) => message,
+            Err(error) => {
+                warnings.push(format!(
+                    "channel outbox line {} could not be read for progress final-order gate: {}",
+                    index + 1,
+                    error
+                ));
+                continue;
+            }
+        };
+        if message.source_queue_id.as_deref() != Some(queue_id)
+            || message.platform != event.platform
+            || message.account_id != event.account_id
+            || message.channel_id != event.channel_id
+            || message.user_id != event.user_id
+            || message.session_key != event.session_key
+        {
+            continue;
+        }
+
+        let delivery_id = progress_channel_delivery_id(index + 1, trimmed);
+        return Ok(!matches!(
+            delivery_receipts.get(&delivery_id),
+            Some(crate::ChannelDeliveryStatus::Delivered)
+                | Some(crate::ChannelDeliveryStatus::SkippedPermanent)
+        ));
+    }
+
+    Ok(false)
+}
+
+fn read_channel_delivery_receipt_statuses(
+    receipts_file: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<BTreeMap<String, crate::ChannelDeliveryStatus>> {
+    let mut receipts = BTreeMap::new();
+    if !receipts_file.is_file() {
+        return Ok(receipts);
+    }
+    let text = fs::read_to_string(receipts_file)?;
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let receipt: crate::ChannelDeliveryReceipt = match serde_json::from_str(trimmed) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                warnings.push(format!(
+                    "channel delivery receipt line {} could not be read for progress final-order gate: {}",
+                    index + 1,
+                    error
+                ));
+                continue;
+            }
+        };
+        receipts.insert(receipt.delivery_id, receipt.status);
+    }
+    Ok(receipts)
+}
+
+fn progress_channel_delivery_id(line_number: usize, line: &str) -> String {
+    format!("delivery:{line_number}:{}", fnv1a_64_hex(line))
+}
+
 fn write_delivery_state(state_file: &Path, state: &AgentProgressDeliveryState) -> io::Result<()> {
     write_json_atomic(state_file, state)
+}
+
+fn progress_surface_claims_dir(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("progress")
+        .join("surface-claims")
+}
+
+fn progress_surface_claim_file(harness_home: &Path, status_surface_key: &str) -> PathBuf {
+    progress_surface_claims_dir(harness_home)
+        .join(format!("{}.json", fnv1a_64_hex(status_surface_key)))
+}
+
+pub fn latest_agent_progress_event_line_for_queue(
+    harness_home: impl AsRef<Path>,
+    queue_id: &str,
+) -> io::Result<Option<usize>> {
+    let events_file = agent_progress_events_file(harness_home);
+    let mut warnings = Vec::new();
+    let events = read_progress_events_since_cursor(
+        &events_file,
+        &AgentProgressDeliveryLedgerCursor::default(),
+        &mut warnings,
+    )?
+    .events;
+    Ok(events
+        .into_iter()
+        .filter(|stored| stored.event.queue_id == queue_id)
+        .map(|stored| stored.line_number)
+        .max())
+}
+
+pub fn release_agent_progress_surface_claim(
+    harness_home: impl AsRef<Path>,
+    status_surface_key: &str,
+    queue_id: &str,
+) -> io::Result<bool> {
+    let path = progress_surface_claim_file(harness_home.as_ref(), status_surface_key);
+    let Some(claim) = read_progress_surface_claim(&path)? else {
+        return Ok(false);
+    };
+    if claim.queue_id == queue_id
+        && claim
+            .provider_message_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        match fs::remove_file(path) {
+            Ok(()) => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+fn remove_progress_surface_claims_for_queue(
+    harness_home: &Path,
+    queue_id: &str,
+) -> io::Result<usize> {
+    let claims_dir = progress_surface_claims_dir(harness_home);
+    if !claims_dir.is_dir() {
+        return Ok(0);
+    }
+    let mut removed = 0usize;
+    for entry in fs::read_dir(claims_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(claim) = read_progress_surface_claim(&path)? else {
+            continue;
+        };
+        if claim.queue_id == queue_id {
+            match fs::remove_file(path) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn resolve_progress_surface_key_for_record(
+    options: &AgentProgressDeliveryRecordOptions,
+    fallback: &str,
+) -> io::Result<String> {
+    let claims_dir = progress_surface_claims_dir(&options.harness_home);
+    if !claims_dir.is_dir() {
+        return Ok(fallback.to_string());
+    }
+    for entry in fs::read_dir(claims_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(claim) = read_progress_surface_claim(&path)? else {
+            continue;
+        };
+        if progress_surface_claim_matches_record(&claim, options) {
+            return Ok(claim.status_surface_key);
+        }
+    }
+    Ok(fallback.to_string())
+}
+
+fn progress_surface_claim_matches_record(
+    claim: &AgentProgressSurfaceClaim,
+    options: &AgentProgressDeliveryRecordOptions,
+) -> bool {
+    claim.queue_id == options.queue_id
+        && claim.platform == options.platform
+        && claim.account_id == options.account_id
+        && claim.channel_id == options.channel_id
+        && claim.thread_id == options.thread_id
+        && claim.user_id == options.user_id
+        && claim.session_key == options.session_key
+        && claim.message_kind == options.message_kind
+}
+
+fn progress_session_key(
+    platform: &str,
+    account_id: Option<&str>,
+    channel_id: &str,
+    user_id: &str,
+    agent_id: Option<&str>,
+    session_key: &str,
+) -> String {
+    [
+        normalize_surface_part(platform),
+        normalize_surface_part(account_id.unwrap_or("*")),
+        normalize_surface_part(channel_id),
+        normalize_surface_part(user_id),
+        normalize_surface_part(agent_id.unwrap_or("*")),
+        normalize_surface_part(session_key),
+    ]
+    .join(":")
+}
+
+fn progress_event_session_superseded(
+    state: &AgentProgressDeliveryState,
+    event: &AgentProgressEvent,
+) -> bool {
+    state
+        .superseded_sessions
+        .values()
+        .any(|superseded| progress_event_matches_superseded_session(event, superseded))
+}
+
+fn progress_event_matches_superseded_session(
+    event: &AgentProgressEvent,
+    superseded: &AgentProgressSupersededSession,
+) -> bool {
+    event.platform == superseded.platform
+        && option_filter_matches(&superseded.account_id, &event.account_id)
+        && event.channel_id == superseded.channel_id
+        && event.user_id == superseded.user_id
+        && option_filter_matches(&superseded.agent_id, &event.agent_id)
+        && event.session_key == superseded.session_key
+}
+
+fn progress_cursor_matches_superseded_session(
+    cursor: &AgentProgressDeliveryCursor,
+    superseded: &AgentProgressSupersededSession,
+) -> bool {
+    cursor.platform == superseded.platform
+        && option_filter_matches(&superseded.account_id, &cursor.account_id)
+        && cursor.channel_id == superseded.channel_id
+        && cursor.user_id == superseded.user_id
+        && cursor.session_key == superseded.session_key
+}
+
+fn progress_claim_matches_superseded_session(
+    claim: &AgentProgressSurfaceClaim,
+    superseded: &AgentProgressSupersededSession,
+) -> bool {
+    claim.platform == superseded.platform
+        && option_filter_matches(&superseded.account_id, &claim.account_id)
+        && claim.channel_id == superseded.channel_id
+        && claim.user_id == superseded.user_id
+        && option_filter_matches(&superseded.agent_id, &claim.agent_id)
+        && claim.session_key == superseded.session_key
+}
+
+fn option_filter_matches(filter: &Option<String>, value: &Option<String>) -> bool {
+    match filter {
+        Some(filter) => value.as_deref() == Some(filter.as_str()),
+        None => true,
+    }
+}
+
+fn terminal_control_for_progress_queue(
+    queue_dir: &Path,
+    index: Option<&crate::runtime_worker::RuntimeQueueStateIndex>,
+    queue_id: &str,
+    session_key: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Option<QueueTerminalControlMatch> {
+    let Some(index) = index else {
+        return None;
+    };
+    match resolve_queue_terminal_control_from_index(
+        queue_dir,
+        queue_id,
+        session_key,
+        index.queues.get(queue_id),
+    ) {
+        Ok(QueueTerminalControl::Terminal(control)) => Some(control),
+        Ok(QueueTerminalControl::Runnable) => None,
+        Err(error) => {
+            warnings.push(format!(
+                "progress delivery terminal-control resolution failed open for queue `{queue_id}`: {error}"
+            ));
+            None
+        }
+    }
+}
+
+fn terminal_control_suppressed_progress_events(
+    latest: &StoredProgressEvent,
+    control: &QueueTerminalControlMatch,
+    now_ms: i64,
+) -> Vec<StoredProgressEvent> {
+    let context = AgentProgressContext {
+        queue_id: latest.event.queue_id.clone(),
+        agent_id: latest.event.agent_id.clone(),
+        account_id: latest.event.account_id.clone(),
+        thread_id: latest.event.thread_id.clone(),
+        session_key: latest.event.session_key.clone(),
+        platform: latest.event.platform.clone(),
+        channel_id: latest.event.channel_id.clone(),
+        user_id: latest.event.user_id.clone(),
+    };
+    let preview = format!(
+        "suppressed by terminal control: {}",
+        control.source.as_str()
+    );
+    vec![
+        StoredProgressEvent {
+            line_number: latest.line_number,
+            event: AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Terminal,
+                "terminal-control",
+                &preview,
+                AgentProgressStatus::Progress,
+                now_ms,
+            )
+            .source("progress-delivery"),
+        },
+        StoredProgressEvent {
+            line_number: latest.line_number.saturating_add(1),
+            event: AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Runtime,
+                "run",
+                preview,
+                AgentProgressStatus::Completed,
+                now_ms,
+            )
+            .source("progress-delivery"),
+        },
+    ]
+}
+
+fn acquire_progress_surface_claim(
+    harness_home: &Path,
+    status_surface_key: &str,
+    queue_id: &str,
+    event: &AgentProgressEvent,
+    message_kind: AgentProgressDeliveryMessageKind,
+    event_line: usize,
+    text_hash: &str,
+    terminal: bool,
+    now_ms: i64,
+    warnings: &mut Vec<String>,
+) -> io::Result<ProgressSurfaceClaimOutcome> {
+    let path = progress_surface_claim_file(harness_home, status_surface_key);
+    let claim = progress_surface_claim_from_event(
+        status_surface_key,
+        queue_id,
+        event,
+        message_kind,
+        event_line,
+        text_hash,
+        terminal,
+        now_ms,
+    );
+    match create_progress_surface_claim(&path, &claim) {
+        Ok(()) => {
+            return Ok(ProgressSurfaceClaimOutcome::Claimed {
+                fresh_send_reason: AgentProgressDeliveryFreshSendReason::NoExistingStatusSurface,
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+
+    let existing = match read_progress_surface_claim(&path) {
+        Ok(Some(existing)) => existing,
+        Ok(None) => {
+            warnings.push(format!(
+                "progress surface claim disappeared before read: {}",
+                path.display()
+            ));
+            return Ok(ProgressSurfaceClaimOutcome::ActivePending);
+        }
+        Err(error) => {
+            warnings.push(format!(
+                "progress surface claim could not be read at {}: {}",
+                path.display(),
+                error
+            ));
+            return Ok(ProgressSurfaceClaimOutcome::ActivePending);
+        }
+    };
+    if existing.status_surface_key != status_surface_key {
+        warnings.push(format!(
+            "progress surface claim key mismatch at {}: expected {}, found {}",
+            path.display(),
+            status_surface_key,
+            existing.status_surface_key
+        ));
+        return Ok(ProgressSurfaceClaimOutcome::ActivePending);
+    }
+    if let Some(provider_message_id) = existing
+        .provider_message_id
+        .as_ref()
+        .filter(|id| !id.is_empty())
+        .cloned()
+    {
+        return Ok(ProgressSurfaceClaimOutcome::ExistingProvider {
+            provider_message_id,
+        });
+    }
+    if progress_surface_claim_expired(&existing, now_ms) {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        match create_progress_surface_claim(&path, &claim) {
+            Ok(()) => {
+                return Ok(ProgressSurfaceClaimOutcome::Claimed {
+                    fresh_send_reason:
+                        AgentProgressDeliveryFreshSendReason::ExistingProviderMessageExpired,
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Ok(ProgressSurfaceClaimOutcome::ActivePending);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if existing.queue_id == queue_id {
+        write_progress_surface_claim(&path, &claim)?;
+        return Ok(ProgressSurfaceClaimOutcome::Claimed {
+            fresh_send_reason: AgentProgressDeliveryFreshSendReason::NoExistingStatusSurface,
+        });
+    }
+
+    Ok(ProgressSurfaceClaimOutcome::ActivePending)
+}
+
+fn progress_surface_claim_from_event(
+    status_surface_key: &str,
+    queue_id: &str,
+    event: &AgentProgressEvent,
+    message_kind: AgentProgressDeliveryMessageKind,
+    event_line: usize,
+    text_hash: &str,
+    terminal: bool,
+    now_ms: i64,
+) -> AgentProgressSurfaceClaim {
+    AgentProgressSurfaceClaim {
+        schema: AGENT_PROGRESS_SURFACE_CLAIM_SCHEMA.to_string(),
+        status_surface_key: status_surface_key.to_string(),
+        queue_id: queue_id.to_string(),
+        agent_id: event.agent_id.clone(),
+        platform: event.platform.clone(),
+        account_id: event.account_id.clone(),
+        channel_id: event.channel_id.clone(),
+        thread_id: event.thread_id.clone(),
+        user_id: event.user_id.clone(),
+        session_key: event.session_key.clone(),
+        message_kind,
+        provider_message_id: None,
+        event_line,
+        text_hash: text_hash.to_string(),
+        terminal,
+        claimed_at_ms: now_ms,
+        expires_at_ms: now_ms.saturating_add(PROGRESS_SURFACE_CLAIM_TTL_MS),
+        updated_at_ms: now_ms,
+    }
+}
+
+fn progress_surface_claim_from_receipt(
+    receipt: &AgentProgressDeliveryReceipt,
+) -> AgentProgressSurfaceClaim {
+    AgentProgressSurfaceClaim {
+        schema: AGENT_PROGRESS_SURFACE_CLAIM_SCHEMA.to_string(),
+        status_surface_key: receipt.status_surface_key.clone(),
+        queue_id: receipt.queue_id.clone(),
+        agent_id: None,
+        platform: receipt.platform.clone(),
+        account_id: receipt.account_id.clone(),
+        channel_id: receipt.channel_id.clone(),
+        thread_id: receipt.thread_id.clone(),
+        user_id: receipt.user_id.clone(),
+        session_key: receipt.session_key.clone(),
+        message_kind: receipt.message_kind,
+        provider_message_id: receipt.provider_message_id.clone(),
+        event_line: receipt.event_line,
+        text_hash: receipt.text_hash.clone(),
+        terminal: receipt.terminal,
+        claimed_at_ms: receipt.at_ms,
+        expires_at_ms: 0,
+        updated_at_ms: receipt.at_ms,
+    }
+}
+
+fn create_progress_surface_claim(path: &Path, claim: &AgentProgressSurfaceClaim) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(claim).map_err(io::Error::other)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(&bytes)
+}
+
+fn read_progress_surface_claim(path: &Path) -> io::Result<Option<AgentProgressSurfaceClaim>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
+fn write_progress_surface_claim(path: &Path, claim: &AgentProgressSurfaceClaim) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_json_atomic(path, claim)
+}
+
+fn progress_surface_claim_expired(claim: &AgentProgressSurfaceClaim, now_ms: i64) -> bool {
+    claim.provider_message_id.is_none() && claim.expires_at_ms > 0 && now_ms >= claim.expires_at_ms
+}
+
+fn update_progress_surface_claim_from_receipt(
+    harness_home: &Path,
+    receipt: &AgentProgressDeliveryReceipt,
+) -> io::Result<()> {
+    let path = progress_surface_claim_file(harness_home, &receipt.status_surface_key);
+    if receipt.status != AgentProgressDeliveryStatus::Delivered {
+        if receipt.provider_message_id.is_none() {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        return Ok(());
+    }
+    let Some(provider_message_id) = receipt.provider_message_id.clone() else {
+        return Ok(());
+    };
+    let mut claim = read_progress_surface_claim(&path)?
+        .unwrap_or_else(|| progress_surface_claim_from_receipt(receipt));
+    claim.schema = AGENT_PROGRESS_SURFACE_CLAIM_SCHEMA.to_string();
+    claim.status_surface_key = receipt.status_surface_key.clone();
+    claim.queue_id = receipt.queue_id.clone();
+    claim.platform = receipt.platform.clone();
+    claim.account_id = receipt.account_id.clone();
+    claim.channel_id = receipt.channel_id.clone();
+    claim.thread_id = receipt.thread_id.clone();
+    claim.user_id = receipt.user_id.clone();
+    claim.session_key = receipt.session_key.clone();
+    claim.message_kind = receipt.message_kind;
+    claim.provider_message_id = Some(provider_message_id);
+    claim.event_line = receipt.event_line;
+    claim.text_hash = receipt.text_hash.clone();
+    claim.terminal = receipt.terminal;
+    claim.expires_at_ms = 0;
+    claim.updated_at_ms = receipt.at_ms;
+    write_progress_surface_claim(&path, &claim)
 }
 
 fn append_json_line(path: &Path, value: &impl Serialize) -> io::Result<()> {
@@ -1674,6 +2685,66 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     out
 }
 
+fn status_surface_key_for_event(
+    event: &AgentProgressEvent,
+    queue_id: &str,
+    message_kind: AgentProgressDeliveryMessageKind,
+) -> String {
+    status_surface_key_from_parts(
+        &event.platform,
+        event.account_id.as_deref(),
+        &event.channel_id,
+        &event.user_id,
+        event.agent_id.as_deref(),
+        &event.session_key,
+        queue_id,
+        message_kind,
+    )
+}
+
+fn status_surface_key_from_parts(
+    platform: &str,
+    account_id: Option<&str>,
+    channel_id: &str,
+    user_id: &str,
+    agent_id: Option<&str>,
+    session_key: &str,
+    queue_id: &str,
+    message_kind: AgentProgressDeliveryMessageKind,
+) -> String {
+    let message_kind = match message_kind {
+        AgentProgressDeliveryMessageKind::Body => "body",
+        AgentProgressDeliveryMessageKind::Status => "status",
+    };
+    [
+        normalize_surface_part(platform),
+        normalize_surface_part(account_id.unwrap_or("default")),
+        normalize_surface_part(channel_id),
+        normalize_surface_part(user_id),
+        normalize_surface_part(agent_id.unwrap_or("default")),
+        normalize_surface_part(session_key),
+        normalize_surface_part(queue_id),
+        message_kind.to_string(),
+    ]
+    .join(":")
+}
+
+fn normalize_surface_part(value: &str) -> String {
+    let mut normalized = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            normalized.push(ch.to_ascii_lowercase());
+        } else {
+            normalized.push('_');
+        }
+    }
+    if normalized.is_empty() {
+        "unknown".to_string()
+    } else {
+        normalized
+    }
+}
+
 fn fnv1a_64_hex(value: &str) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in value.as_bytes() {
@@ -1709,6 +2780,7 @@ struct RenderedAction {
 mod tests {
     use super::*;
     use crate::config::HARNESS_CONFIG_FILE_NAME;
+    use crate::{ScopedStopOptions, ScopedStopTarget, record_scoped_stop};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -2215,6 +3287,11 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn progress_delivery_successful_edit_does_not_fresh_send() {
+        delivery_plan_uses_send_then_edit_and_rate_limits();
     }
 
     #[test]
@@ -2860,6 +3937,11 @@ mod tests {
 
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn progress_delivery_repeated_events_converge_to_one_provider_message() {
+        progress_surface_volume_replay_converges_without_post_terminal_churn();
     }
 
     #[test]
@@ -3518,6 +4600,159 @@ mod tests {
     }
 
     #[test]
+    fn terminal_progress_waits_until_source_final_delivery_is_delivered() {
+        let root = temp_root("terminal_progress_waits_until_source_final_delivery_is_delivered");
+        let harness_home = root.join(".agent-harness");
+        let context = context();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Todo,
+                "todo",
+                "planning 1 task(s)",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+        )
+        .unwrap();
+
+        let initial = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(initial.pending.len(), 2);
+        for (index, pending) in initial.pending.into_iter().enumerate() {
+            record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+                harness_home: harness_home.clone(),
+                queue_id: pending.queue_id,
+                platform: pending.platform,
+                account_id: pending.account_id,
+                channel_id: pending.channel_id,
+                thread_id: pending.thread_id,
+                user_id: pending.user_id,
+                session_key: pending.session_key,
+                message_kind: pending.message_kind,
+                action: pending.action,
+                status: AgentProgressDeliveryStatus::Delivered,
+                provider_message_id: Some(format!("progress-{index}")),
+                event_line: pending.event_line,
+                text_hash: pending.text_hash,
+                terminal: pending.terminal,
+                policy_decision: Some("test".to_string()),
+                error: None,
+                now_ms: 2000,
+            })
+            .unwrap();
+        }
+
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Runtime,
+                "run",
+                "completed",
+                AgentProgressStatus::Completed,
+                3000,
+            ),
+        )
+        .unwrap();
+        let outbox_dir = harness_home.join("state").join("channels");
+        fs::create_dir_all(&outbox_dir).unwrap();
+        crate::append_jsonl_value(
+            &outbox_dir.join("outbox.jsonl"),
+            &crate::ChannelOutboundMessage {
+                platform: context.platform.clone(),
+                account_id: context.account_id.clone(),
+                channel_id: context.channel_id.clone(),
+                user_id: context.user_id.clone(),
+                session_key: context.session_key.clone(),
+                kind: crate::ChannelOutboundMessageKind::AgentReply,
+                source_queue_id: Some(context.queue_id.clone()),
+                source_completion_file: None,
+                text: "final reply".to_string(),
+                presentation: None,
+                delivery_intent: None,
+                attachments: Vec::new(),
+            },
+        )
+        .unwrap();
+        let final_pending = crate::plan_channel_outbox(crate::ChannelOutboxPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            limit: 10,
+        })
+        .unwrap();
+        let delivery = final_pending
+            .pending
+            .iter()
+            .find(|pending| {
+                pending.message.source_queue_id.as_deref() == Some(context.queue_id.as_str())
+            })
+            .expect("source final outbox should be pending");
+
+        let delayed_terminal = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 4000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert!(
+            delayed_terminal.pending.is_empty(),
+            "terminal progress must wait for source final provider delivery: {:?}",
+            delayed_terminal.pending
+        );
+
+        crate::record_channel_delivery(crate::ChannelDeliveryRecordOptions {
+            harness_home: harness_home.clone(),
+            delivery_id: delivery.delivery_id.clone(),
+            status: crate::ChannelDeliveryStatus::Delivered,
+            platform: context.platform.clone(),
+            account_id: context.account_id.clone(),
+            channel_id: context.channel_id.clone(),
+            user_id: context.user_id.clone(),
+            session_key: context.session_key.clone(),
+            provider_message_id: Some("final-provider-message".to_string()),
+            error: None,
+            now_ms: 5000,
+            rendered_units: Vec::new(),
+            presentation: None,
+        })
+        .unwrap();
+
+        let after_final = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 6000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(after_final.pending.len(), 2);
+        assert!(after_final.pending.iter().all(|pending| pending.terminal));
+        assert!(
+            after_final.pending.iter().any(|pending| {
+                pending.message_kind == AgentProgressDeliveryMessageKind::Status
+            })
+        );
+        assert!(
+            after_final
+                .pending
+                .iter()
+                .any(|pending| { pending.message_kind == AgentProgressDeliveryMessageKind::Body })
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn progress_delivery_cursor_reads_only_new_events_after_offset() {
         let root = temp_root("progress_delivery_cursor_reads_only_new_events_after_offset");
         let harness_home = root.join(".agent-harness");
@@ -3873,14 +5108,14 @@ mod tests {
             r#"{
               "response": {
                 "progressDeliveryAgentModes": { "xiaoxiaoli": "off" },
-                "progressDeliveryChannelModes": { "telegram:-1003968507595": "on" }
+                "progressDeliveryChannelModes": { "telegram:group-alpha": "on" }
               }
             }"#,
         )
         .unwrap();
         let mut context = context();
         context.agent_id = Some("xiaoxiaoli".to_string());
-        context.channel_id = "-1003968507595".to_string();
+        context.channel_id = "group-alpha".to_string();
         append_agent_progress_event(
             &harness_home,
             &AgentProgressEvent::new(
@@ -3907,6 +5142,444 @@ mod tests {
         assert_eq!(plan.summary.skipped_muted, 0);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn progress_surface_claim_reclaims_same_queue_orphan_without_ttl() {
+        let root = temp_root("progress_surface_claim_reclaims_same_queue_orphan_without_ttl");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context(),
+                AgentProgressKind::Todo,
+                "todo",
+                "planning 1 task(s)",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+        )
+        .unwrap();
+
+        let first = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(first.pending.len(), 2);
+        assert!(first.pending.iter().all(|pending| {
+            pending.action == AgentProgressDeliveryAction::Send
+                && !pending.idempotency_hit
+                && pending.fresh_send_reason
+                    == Some(AgentProgressDeliveryFreshSendReason::NoExistingStatusSurface)
+        }));
+
+        let second = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2001,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(second.pending.len(), 2);
+        assert!(second.pending.iter().all(|pending| {
+            pending.action == AgentProgressDeliveryAction::Send
+                && !pending.idempotency_hit
+                && pending.fresh_send_reason
+                    == Some(AgentProgressDeliveryFreshSendReason::NoExistingStatusSurface)
+        }));
+
+        let expired = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2000 + PROGRESS_SURFACE_CLAIM_TTL_MS + 1,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(expired.pending.len(), 2);
+        assert!(expired.pending.iter().all(|pending| {
+            pending.fresh_send_reason
+                == Some(AgentProgressDeliveryFreshSendReason::ExistingProviderMessageExpired)
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn progress_delivery_duplicate_runtime_events_are_idempotent() {
+        progress_surface_claim_reclaims_same_queue_orphan_without_ttl();
+    }
+
+    #[test]
+    fn fresh_send_requires_enumerated_reason_in_receipt() {
+        progress_surface_claim_reclaims_same_queue_orphan_without_ttl();
+    }
+
+    #[test]
+    fn terminal_control_marker_suppresses_cached_nonterminal_ghost_queue() {
+        let root = temp_root("terminal_control_marker_suppresses_cached_nonterminal_ghost_queue");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        let context = context();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Todo,
+                "todo",
+                "planning stale ghost work",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+        )
+        .unwrap();
+
+        let initial = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(initial.pending.len(), 2);
+        for (index, pending) in initial.pending.into_iter().enumerate() {
+            record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+                harness_home: harness_home.clone(),
+                queue_id: pending.queue_id,
+                platform: pending.platform,
+                account_id: pending.account_id,
+                channel_id: pending.channel_id,
+                thread_id: pending.thread_id,
+                user_id: pending.user_id,
+                session_key: pending.session_key,
+                message_kind: pending.message_kind,
+                action: pending.action,
+                status: AgentProgressDeliveryStatus::Delivered,
+                provider_message_id: Some(format!("ghost-provider-{}", index + 1)),
+                event_line: pending.event_line,
+                text_hash: pending.text_hash,
+                terminal: pending.terminal,
+                policy_decision: Some("test".to_string()),
+                error: None,
+                now_ms: 2100,
+            })
+            .unwrap();
+        }
+        record_scoped_stop(ScopedStopOptions {
+            harness_home: harness_home.clone(),
+            target: ScopedStopTarget::QueueItem {
+                queue_id: context.queue_id.clone(),
+            },
+            reason: "operator stopped stale ghost queue".to_string(),
+            now_ms: 3000,
+        })
+        .unwrap();
+
+        let close = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 4000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+
+        assert!(!close.pending.is_empty(), "{:#?}", close.pending);
+        assert_eq!(close.pending.len(), 2, "{:#?}", close.pending);
+        assert!(
+            close.pending.iter().all(|pending| {
+                pending.queue_id == context.queue_id
+                    && pending.terminal
+                    && pending.action == AgentProgressDeliveryAction::Edit
+                    && pending.provider_message_id.is_some()
+                    && pending.progress_suppressed_reason.as_deref()
+                        == Some("terminal-control-present")
+            }),
+            "{:#?}",
+            close.pending
+        );
+        for pending in close.pending {
+            let receipt = record_agent_progress_delivery_with_context(
+                AgentProgressDeliveryRecordOptions {
+                    harness_home: harness_home.clone(),
+                    queue_id: pending.queue_id.clone(),
+                    platform: pending.platform.clone(),
+                    account_id: pending.account_id.clone(),
+                    channel_id: pending.channel_id.clone(),
+                    thread_id: pending.thread_id.clone(),
+                    user_id: pending.user_id.clone(),
+                    session_key: pending.session_key.clone(),
+                    message_kind: pending.message_kind,
+                    action: pending.action,
+                    status: AgentProgressDeliveryStatus::Delivered,
+                    provider_message_id: pending.provider_message_id.clone(),
+                    event_line: pending.event_line,
+                    text_hash: pending.text_hash.clone(),
+                    terminal: pending.terminal,
+                    policy_decision: Some("test".to_string()),
+                    error: None,
+                    now_ms: 4100,
+                },
+                AgentProgressDeliveryRecordContext {
+                    status_surface_key: pending.status_surface_key.clone(),
+                    existing_provider_message_id: pending.provider_message_id.clone(),
+                    decision: Some("edit".to_string()),
+                    fresh_send_reason: pending.fresh_send_reason,
+                    idempotency_hit: pending.idempotency_hit,
+                    progress_suppressed_reason: pending.progress_suppressed_reason.clone(),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                receipt.progress_suppressed_reason.as_deref(),
+                Some("terminal-control-present")
+            );
+        }
+
+        let next = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 5000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert!(next.pending.is_empty(), "{:#?}", next.pending);
+        let state: Value = serde_json::from_str(
+            &fs::read_to_string(agent_progress_delivery_state_file(&harness_home)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            state["compactedEvents"].get(&context.queue_id).is_none(),
+            "{state:#?}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn status_surface_key_matches_pending_receipt_and_claim_with_agent_id() {
+        let root = temp_root("status_surface_key_matches_pending_receipt_and_claim_with_agent_id");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        let mut context = context();
+        context.agent_id = Some("xiaoxiaoli".to_string());
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Todo,
+                "todo",
+                "planning 1 task(s)",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+        )
+        .unwrap();
+
+        let plan = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        let pending = plan
+            .pending
+            .iter()
+            .find(|pending| pending.message_kind == AgentProgressDeliveryMessageKind::Status)
+            .expect("status pending")
+            .clone();
+        assert!(pending.status_surface_key.contains("xiaoxiaoli"));
+
+        let receipt = record_agent_progress_delivery_with_context(
+            AgentProgressDeliveryRecordOptions {
+                harness_home: harness_home.clone(),
+                queue_id: pending.queue_id.clone(),
+                platform: pending.platform.clone(),
+                account_id: pending.account_id.clone(),
+                channel_id: pending.channel_id.clone(),
+                thread_id: pending.thread_id.clone(),
+                user_id: pending.user_id.clone(),
+                session_key: pending.session_key.clone(),
+                message_kind: pending.message_kind,
+                action: pending.action,
+                status: AgentProgressDeliveryStatus::Delivered,
+                provider_message_id: Some("provider-status-1".to_string()),
+                event_line: pending.event_line,
+                text_hash: pending.text_hash.clone(),
+                terminal: pending.terminal,
+                policy_decision: Some("allowed".to_string()),
+                error: None,
+                now_ms: 2100,
+            },
+            AgentProgressDeliveryRecordContext {
+                status_surface_key: pending.status_surface_key.clone(),
+                existing_provider_message_id: pending.provider_message_id.clone(),
+                decision: Some("send".to_string()),
+                fresh_send_reason: pending.fresh_send_reason,
+                idempotency_hit: pending.idempotency_hit,
+                progress_suppressed_reason: pending.progress_suppressed_reason.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(receipt.status_surface_key, pending.status_surface_key);
+        assert_eq!(
+            receipt.fresh_send_reason,
+            Some(AgentProgressDeliveryFreshSendReason::NoExistingStatusSurface)
+        );
+
+        let claim = read_progress_surface_claim(&progress_surface_claim_file(
+            &harness_home,
+            &pending.status_surface_key,
+        ))
+        .unwrap()
+        .expect("surface claim");
+        assert_eq!(claim.agent_id.as_deref(), Some("xiaoxiaoli"));
+        assert_eq!(
+            claim.provider_message_id.as_deref(),
+            Some("provider-status-1")
+        );
+
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::ReadFile,
+                "read",
+                "reading progress.rs",
+                AgentProgressStatus::Started,
+                2200,
+            ),
+        )
+        .unwrap();
+        let next = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 3000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        let edit = next
+            .pending
+            .iter()
+            .find(|pending| pending.message_kind == AgentProgressDeliveryMessageKind::Status)
+            .expect("status edit pending");
+        assert_eq!(edit.action, AgentProgressDeliveryAction::Edit);
+        assert_eq!(
+            edit.provider_message_id.as_deref(),
+            Some("provider-status-1")
+        );
+        assert_eq!(edit.status_surface_key, pending.status_surface_key);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn new_session_supersedes_previous_progress_surfaces() {
+        let root = temp_root("new_session_supersedes_previous_progress_surfaces");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        let context = context();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Todo,
+                "todo",
+                "planning 1 task(s)",
+                AgentProgressStatus::Started,
+                1000,
+            ),
+        )
+        .unwrap();
+
+        let initial = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(initial.pending.len(), 2);
+
+        let report =
+            supersede_agent_progress_session_surfaces(AgentProgressSessionSupersedeOptions {
+                harness_home: harness_home.clone(),
+                platform: context.platform.clone(),
+                account_id: None,
+                channel_id: context.channel_id.clone(),
+                user_id: context.user_id.clone(),
+                agent_id: context.agent_id.clone(),
+                session_key: context.session_key.clone(),
+                now_ms: 2500,
+            })
+            .unwrap();
+        assert_eq!(report.removed_claim_files.len(), 2);
+        assert!(report.receipts_file.is_file());
+
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::ReadFile,
+                "read",
+                "reading old session",
+                AgentProgressStatus::Started,
+                3000,
+            ),
+        )
+        .unwrap();
+        let old_session = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 4000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert!(old_session.pending.is_empty());
+
+        let mut new_context = context.clone();
+        new_context.session_key = "telegram:dm:user:main:session-new".to_string();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &new_context,
+                AgentProgressKind::Todo,
+                "todo",
+                "new session task",
+                AgentProgressStatus::Started,
+                5000,
+            ),
+        )
+        .unwrap();
+        let new_session = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 6000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(new_session.pending.len(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn new_session_hides_old_lane_ghost_status() {
+        new_session_supersedes_previous_progress_surfaces();
     }
 
     #[test]

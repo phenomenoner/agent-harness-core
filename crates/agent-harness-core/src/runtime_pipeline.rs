@@ -7,9 +7,14 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::codex_runtime::{CodexContextRecoveryReceipt, CodexThreadHealthStatus};
+use crate::codex_runtime::{
+    CodexContextRecoveryReceipt, CodexThreadHealthStatus, tool_timeout_summary,
+};
 use crate::rich_presentation::{
     RichMessagePresentation, rich_presentation_from_plain_final_with_attachment_count,
+};
+use crate::runtime_worker::{
+    QueueTerminalControl, record_terminal_control_suppression, resolve_queue_terminal_control,
 };
 use crate::{
     AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
@@ -35,6 +40,7 @@ use crate::{
     release_runtime_queue_lease, requeue_prepared_context_rollover_if_no_parent_siblings,
     resolve_inbound_media_artifact_reference, root_working_session_key, run_codex_runtime,
     run_self_improvement_review_hook, write_json_atomic, write_media_policy_receipt,
+    write_runtime_queue_quarantine_marker,
 };
 
 const RUNTIME_RUN_ONCE_SCHEMA: &str = "agent-harness.runtime-run-once.v1";
@@ -147,6 +153,14 @@ pub struct RuntimeRunOnceReceipt {
     pub child_queue_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child_session_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_control_matched: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_control_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppressed_run_once_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prepared_execution_terminalization_reason: Option<String>,
     pub reason: String,
 }
 
@@ -154,6 +168,7 @@ pub struct RuntimeRunOnceReceipt {
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeRunOnceStatus {
     Completed,
+    Suppressed,
     Skipped,
     LeaseBusy,
     NoWork,
@@ -174,6 +189,7 @@ impl RuntimeRunOnceStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Completed => "completed",
+            Self::Suppressed => "suppressed",
             Self::Skipped => "skipped",
             Self::LeaseBusy => "lease-busy",
             Self::NoWork => "no-work",
@@ -316,6 +332,10 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             continuation: metadata.continuation,
             child_queue_id: None,
             child_session_key: None,
+            terminal_control_matched: None,
+            terminal_control_source: None,
+            suppressed_run_once_reason: None,
+            prepared_execution_terminalization_reason: None,
             reason: "runtime queue lease lock is busy; retrying later".to_string(),
         };
         append_runtime_run_once_log(
@@ -346,9 +366,18 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         let metadata = runtime_run_metadata(&prepare);
         let requested_queue = options.queue_id;
         let requested_specific_queue = requested_queue.is_some();
+        let suppressed_queue = if prepare.receipt.terminal_control_matched == Some(true) {
+            prepare.receipt.queue_id.clone().or(requested_queue)
+        } else {
+            requested_queue
+        };
         let receipt = RuntimeRunOnceReceipt {
-            queue_id: requested_queue,
-            status: RuntimeRunOnceStatus::NoWork,
+            queue_id: suppressed_queue,
+            status: if prepare.receipt.terminal_control_matched == Some(true) {
+                RuntimeRunOnceStatus::Suppressed
+            } else {
+                RuntimeRunOnceStatus::NoWork
+            },
             runtime_class: metadata.runtime_class,
             origin: metadata.origin,
             cron_run_id: metadata.cron_run_id,
@@ -359,18 +388,40 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             continuation: metadata.continuation,
             child_queue_id: None,
             child_session_key: None,
+            terminal_control_matched: prepare.receipt.terminal_control_matched,
+            terminal_control_source: prepare.receipt.terminal_control_source.clone(),
+            suppressed_run_once_reason: prepare.receipt.suppressed_run_once_reason.clone(),
+            prepared_execution_terminalization_reason: None,
             reason: if requested_specific_queue {
-                "requested queue item was not pending or prepared".to_string()
+                if prepare.receipt.terminal_control_matched == Some(true) {
+                    prepare.receipt.reason.clone()
+                } else {
+                    "requested queue item was not pending or prepared".to_string()
+                }
+            } else if prepare.receipt.terminal_control_matched == Some(true) {
+                prepare.receipt.reason.clone()
             } else {
                 "no pending or prepared runtime queue item is available".to_string()
             },
         };
-        append_runtime_run_once_log(
-            &options.harness_home,
-            HarnessLogLevel::Warn,
-            "runtime.run-once.no-work",
-            &receipt,
-        )?;
+        if receipt.status != RuntimeRunOnceStatus::Suppressed {
+            append_runtime_run_once_log(
+                &options.harness_home,
+                HarnessLogLevel::Warn,
+                "runtime.run-once.no-work",
+                &receipt,
+            )?;
+        } else if let Some(queue_id) = receipt.queue_id.as_deref() {
+            append_suppressed_runtime_progress(
+                &options.harness_home,
+                &prepare,
+                None,
+                queue_id,
+                &receipt.reason,
+                &mut warnings,
+            )?;
+        }
+        let append_receipt = receipt.status != RuntimeRunOnceStatus::Suppressed;
         return write_runtime_run_once_report(
             RuntimeRunOnceReport {
                 schema: RUNTIME_RUN_ONCE_SCHEMA,
@@ -385,7 +436,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 outbound_message: None,
                 warnings,
             },
-            true,
+            append_receipt,
         );
     }
 
@@ -397,14 +448,116 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
     warnings.extend(plan.warnings.clone());
 
     if plan.receipt.status == CodexRuntimeReceiptStatus::NoPreparedExecution {
+        if let Some(queue_id) = prepare.receipt.queue_id.as_deref()
+            && let QueueTerminalControl::Terminal(control) = resolve_queue_terminal_control(
+                &options.harness_home,
+                queue_id,
+                prepare.item.as_ref().map(|item| item.session_key.as_str()),
+            )?
+        {
+            let metadata = runtime_run_metadata(&prepare);
+            if let Err(error) = release_runtime_queue_lease(&options.harness_home, queue_id) {
+                warnings.push(format!("runtime queue lease release failed: {error}"));
+            }
+            let _ = record_terminal_control_suppression(
+                &options.harness_home,
+                queue_id,
+                metadata.runtime_class.as_deref(),
+                metadata.origin.as_deref(),
+                metadata.cron_run_id.as_deref(),
+                metadata.scheduled_for_ms,
+                &metadata.continuation,
+                &control,
+            )?;
+            let receipt = RuntimeRunOnceReceipt {
+                queue_id: Some(queue_id.to_string()),
+                status: RuntimeRunOnceStatus::Suppressed,
+                runtime_class: metadata.runtime_class,
+                origin: metadata.origin,
+                cron_run_id: metadata.cron_run_id,
+                scheduled_for_ms: metadata.scheduled_for_ms,
+                execution_dir: plan.execution_dir.clone(),
+                transcript_file: None,
+                outbox_file: None,
+                continuation: metadata.continuation,
+                child_queue_id: None,
+                child_session_key: None,
+                terminal_control_matched: Some(true),
+                terminal_control_source: Some(control.source.as_str().to_string()),
+                suppressed_run_once_reason: Some("terminal-control-present".to_string()),
+                prepared_execution_terminalization_reason: None,
+                reason: format!(
+                    "runtime queue item suppressed before no-prepared execution fallback because terminal control is present: {}: {}",
+                    control.source.as_str(),
+                    control.reason
+                ),
+            };
+            append_suppressed_runtime_progress(
+                &options.harness_home,
+                &prepare,
+                plan.plan.as_ref(),
+                queue_id,
+                &receipt.reason,
+                &mut warnings,
+            )?;
+            return write_runtime_run_once_report(
+                RuntimeRunOnceReport {
+                    schema: RUNTIME_RUN_ONCE_SCHEMA,
+                    harness_home: options.harness_home,
+                    report_file,
+                    receipts_file,
+                    receipt,
+                    prepare: Some(prepare),
+                    plan: Some(plan),
+                    run: None,
+                    outbox_file: None,
+                    outbound_message: None,
+                    warnings,
+                },
+                false,
+            );
+        }
+        let no_prepared_attempts = prepare
+            .receipt
+            .queue_id
+            .as_deref()
+            .map(|queue_id| {
+                count_prior_run_once_status(&receipts_file, queue_id, "no-prepared-execution")
+            })
+            .transpose()?
+            .map(|attempts| attempts.saturating_add(1))
+            .unwrap_or(1);
+        let no_prepared_threshold =
+            no_prepared_execution_terminal_threshold(&options.harness_home).max(1);
         if let Some(queue_id) = prepare.receipt.queue_id.as_deref() {
             if let Err(error) = release_runtime_queue_lease(&options.harness_home, queue_id) {
                 warnings.push(format!("runtime queue lease release failed: {error}"));
             }
         }
+        let terminalization_reason =
+            (no_prepared_attempts >= no_prepared_threshold).then(|| {
+                format!(
+                    "no prepared execution repeated {no_prepared_attempts}/{no_prepared_threshold} times for queue item"
+                )
+            });
+        if let (Some(queue_id), Some(reason)) = (
+            prepare.receipt.queue_id.as_deref(),
+            terminalization_reason.as_deref(),
+        ) {
+            write_runtime_queue_quarantine_marker(
+                &options.harness_home,
+                queue_id,
+                reason,
+                current_log_time_ms()?,
+            )?;
+        }
         let receipt = RuntimeRunOnceReceipt {
             queue_id: prepare.receipt.queue_id.clone(),
-            status: RuntimeRunOnceStatus::NoPreparedExecution,
+            status: if terminalization_reason.is_some() {
+                RuntimeRunOnceStatus::FailedTerminal
+            } else {
+                RuntimeRunOnceStatus::NoPreparedExecution
+            },
             runtime_class: prepare.receipt.runtime_class.clone(),
             origin: prepare.receipt.origin.clone(),
             cron_run_id: prepare.receipt.cron_run_id.clone(),
@@ -415,12 +568,26 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             continuation: prepare.receipt.continuation.clone(),
             child_queue_id: None,
             child_session_key: None,
-            reason: "no prepared runtime execution is available to run".to_string(),
+            terminal_control_matched: None,
+            terminal_control_source: None,
+            suppressed_run_once_reason: None,
+            prepared_execution_terminalization_reason: terminalization_reason.clone(),
+            reason: terminalization_reason
+                .clone()
+                .unwrap_or_else(|| "no prepared runtime execution is available to run".to_string()),
         };
         append_runtime_run_once_log(
             &options.harness_home,
-            HarnessLogLevel::Warn,
-            "runtime.run-once.no-prepared-execution",
+            if receipt.status == RuntimeRunOnceStatus::FailedTerminal {
+                HarnessLogLevel::Error
+            } else {
+                HarnessLogLevel::Warn
+            },
+            if receipt.status == RuntimeRunOnceStatus::FailedTerminal {
+                "runtime.run-once.failed-terminal"
+            } else {
+                "runtime.run-once.no-prepared-execution"
+            },
             &receipt,
         )?;
         return write_runtime_run_once_report(
@@ -620,6 +787,34 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                     "final outbox suppressed: completed response classified as {:?} with disposition {:?}",
                                     input_kind, decision.disposition
                                 ));
+                                let receipt = RuntimeRunOnceReceipt {
+                                    queue_id: run.receipt.queue_id.clone(),
+                                    status: map_run_once_status(run.receipt.status),
+                                    runtime_class: prepare.receipt.runtime_class.clone(),
+                                    origin: prepare.receipt.origin.clone(),
+                                    cron_run_id: prepare.receipt.cron_run_id.clone(),
+                                    scheduled_for_ms: prepare.receipt.scheduled_for_ms,
+                                    execution_dir: run.receipt.execution_dir.clone(),
+                                    transcript_file: run.receipt.transcript_file.clone(),
+                                    outbox_file: None,
+                                    continuation: prepare.receipt.continuation.clone(),
+                                    child_queue_id: None,
+                                    child_session_key: None,
+                                    terminal_control_matched: None,
+                                    terminal_control_source: None,
+                                    suppressed_run_once_reason: None,
+                                    prepared_execution_terminalization_reason: None,
+                                    reason: format!(
+                                        "final outbox suppressed: completed response classified as {:?} with disposition {:?}",
+                                        input_kind, decision.disposition
+                                    ),
+                                };
+                                append_runtime_run_once_log(
+                                    &options.harness_home,
+                                    HarnessLogLevel::Warn,
+                                    "runtime.run-once.final-outbox-suppressed",
+                                    &receipt,
+                                )?;
                             } else {
                                 let (mut text, mut attachments) = split_outbound_media_directives(
                                     &options.harness_home,
@@ -750,6 +945,10 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                 continuation: prepare.receipt.continuation.clone(),
                                 child_queue_id: None,
                                 child_session_key: None,
+                                terminal_control_matched: None,
+                                terminal_control_source: None,
+                                suppressed_run_once_reason: None,
+                                prepared_execution_terminalization_reason: None,
                                 reason: run.receipt.reason.clone(),
                             };
                             append_runtime_run_once_log(
@@ -836,6 +1035,10 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 continuation: prepare.receipt.continuation.clone(),
                 child_queue_id: None,
                 child_session_key: None,
+                terminal_control_matched: None,
+                terminal_control_source: None,
+                suppressed_run_once_reason: None,
+                prepared_execution_terminalization_reason: None,
                 reason: receipt_reason.clone(),
             };
             append_runtime_run_once_log(
@@ -851,7 +1054,24 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 .to_string(),
         );
     } else if receipt_status == RuntimeRunOnceStatus::RetryPending {
-        if let Some(rollover) = maybe_enqueue_stream_unstable_retry_continuation(
+        if let Some(rollover) = maybe_enqueue_tool_timeout_retry_continuation(
+            &options.harness_home,
+            prepare.item.as_ref(),
+            &run,
+            &mut warnings,
+        )? {
+            receipt_reason = format!(
+                "interrupted long-task retry requeued into continuation; childQueueId={}; childSessionKey={}; priorReason={}",
+                rollover.requeued_queue_id, rollover.new_working_session_key, receipt_reason
+            );
+            child_queue_id = Some(rollover.requeued_queue_id.clone());
+            child_session_key = Some(rollover.new_working_session_key.clone());
+            warnings.push(format!(
+                "interrupted long-task retry enqueued continuation queue item {} after tool-timeout fallback failure",
+                rollover.requeued_queue_id
+            ));
+            receipt_status = RuntimeRunOnceStatus::Skipped;
+        } else if let Some(rollover) = maybe_enqueue_stream_unstable_retry_continuation(
             &options.harness_home,
             prepare.item.as_ref(),
             &run,
@@ -895,6 +1115,10 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         continuation: prepare.receipt.continuation.clone(),
         child_queue_id,
         child_session_key,
+        terminal_control_matched: None,
+        terminal_control_source: None,
+        suppressed_run_once_reason: None,
+        prepared_execution_terminalization_reason: None,
         reason: receipt_reason,
     };
     if receipt.status == RuntimeRunOnceStatus::Completed
@@ -928,6 +1152,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         | RuntimeRunOnceStatus::DeadLetter
         | RuntimeRunOnceStatus::FailedTerminal => HarnessLogLevel::Error,
         RuntimeRunOnceStatus::Canceled
+        | RuntimeRunOnceStatus::Suppressed
         | RuntimeRunOnceStatus::Skipped
         | RuntimeRunOnceStatus::RetryPending
         | RuntimeRunOnceStatus::LeaseBusy => HarnessLogLevel::Warn,
@@ -938,6 +1163,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
     };
     let log_event = match receipt.status {
         RuntimeRunOnceStatus::Completed => "runtime.run-once.completed",
+        RuntimeRunOnceStatus::Suppressed => "runtime.run-once.suppressed",
         RuntimeRunOnceStatus::Skipped => "runtime.run-once.skipped",
         RuntimeRunOnceStatus::LeaseBusy => "runtime.run-once.lease-busy",
         RuntimeRunOnceStatus::NoWork => "runtime.run-once.no-work",
@@ -1058,6 +1284,64 @@ fn progress_context_from(
     })
 }
 
+fn progress_context_from_prepared_item(item: &RuntimeQueuePreparedItem) -> AgentProgressContext {
+    AgentProgressContext {
+        queue_id: item.queue_id.clone(),
+        agent_id: Some(item.agent_id.clone()),
+        account_id: item.account_id.clone(),
+        thread_id: item
+            .inbound_context
+            .as_deref()
+            .and_then(|context| context_value(context, "messageThreadId")),
+        session_key: item.session_key.clone(),
+        platform: item.platform.clone(),
+        channel_id: item.channel_id.clone(),
+        user_id: item.user_id.clone(),
+    }
+}
+
+fn append_suppressed_runtime_progress(
+    harness_home: &Path,
+    prepare: &RuntimeQueuePrepareReport,
+    plan: Option<&CodexRuntimePlan>,
+    queue_id: &str,
+    reason: &str,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    let progress_context = if let Some(item) = prepare.item.as_ref() {
+        Some(progress_context_from_prepared_item(item))
+    } else {
+        let channel_context = find_queue_channel_context(harness_home, queue_id, warnings)?;
+        progress_context_from(prepare, plan, channel_context.as_ref())
+    };
+    let Some(context) = progress_context else {
+        let warning = format!(
+            "suppressed runtime progress event skipped because channel context for queue `{queue_id}` could not be resolved"
+        );
+        warnings.push(warning.clone());
+        append_harness_log(
+            harness_home,
+            &HarnessLogEvent::new(
+                current_log_time_ms()?,
+                HarnessLogLevel::Warn,
+                "runtime-queue",
+                "runtime.run-once.suppressed-progress-context-missing",
+                format!("queueId={queue_id} warning={warning}"),
+            ),
+        )?;
+        return Ok(());
+    };
+    append_runtime_progress_finished(
+        harness_home,
+        &context,
+        RuntimeRunOnceStatus::Suppressed,
+        reason,
+        0,
+        warnings,
+    );
+    Ok(())
+}
+
 fn append_runtime_progress_started(
     harness_home: &Path,
     context: &AgentProgressContext,
@@ -1150,7 +1434,9 @@ fn append_runtime_progress_finished(
         return;
     };
     let progress_status = match status {
-        RuntimeRunOnceStatus::Completed => AgentProgressStatus::Completed,
+        RuntimeRunOnceStatus::Completed | RuntimeRunOnceStatus::Suppressed => {
+            AgentProgressStatus::Completed
+        }
         RuntimeRunOnceStatus::Skipped => AgentProgressStatus::Completed,
         RuntimeRunOnceStatus::RetryPending => AgentProgressStatus::Progress,
         _ => AgentProgressStatus::Failed,
@@ -1175,6 +1461,7 @@ fn append_runtime_progress_finished(
 fn runtime_progress_preview(status: RuntimeRunOnceStatus, reason: &str) -> String {
     match status {
         RuntimeRunOnceStatus::Completed => "done".to_string(),
+        RuntimeRunOnceStatus::Suppressed => "suppressed by terminal control".to_string(),
         RuntimeRunOnceStatus::Skipped => "skipped because continuation work was queued".to_string(),
         RuntimeRunOnceStatus::RetryPending => {
             "transient runtime failure; preserving session for retry".to_string()
@@ -1449,13 +1736,13 @@ fn final_outbox_owner_is_channel_parent(
     {
         return false;
     }
-    if session_key_agent_segment(channel_session_key)
-        .as_deref()
-        .is_some_and(|agent| agent != "main")
-    {
-        return false;
-    }
     let agent_id = agent_id.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(lane_agent) = session_key_agent_segment(channel_session_key) {
+        if let Some(agent_id) = agent_id {
+            return agent_id == lane_agent;
+        }
+        return true;
+    }
     if let Some(agent_id) = agent_id {
         return agent_id == "main";
     }
@@ -1552,6 +1839,74 @@ fn read_pending_continuation_candidate(
     Ok(None)
 }
 
+fn maybe_enqueue_tool_timeout_retry_continuation(
+    harness_home: &Path,
+    item: Option<&RuntimeQueuePreparedItem>,
+    run: &CodexRuntimeRunReport,
+    warnings: &mut Vec<String>,
+) -> io::Result<Option<ContextRolloverPreparedRequeueReport>> {
+    let Some(item) = continuation_candidate_for_run(
+        harness_home,
+        item,
+        run.receipt.queue_id.as_deref(),
+        "tool-timeout retry continuation",
+        warnings,
+    )?
+    else {
+        return Ok(None);
+    };
+    if item.runtime_class != "interactive" || item.origin != "channel" {
+        return Ok(None);
+    }
+    if !context_recovery_indicates_interrupted_long_task(&run.receipt) {
+        return Ok(None);
+    }
+    let config = load_context_rollover_config(harness_home)?;
+    if config.rollover_mode == ContextRolloverMode::Disabled {
+        warnings
+            .push("tool-timeout retry continuation skipped: context rollover disabled".to_string());
+        return Ok(None);
+    }
+    let current_index = item.continuation.continuation_index.unwrap_or(0);
+    if current_index >= config.max_continuation_depth {
+        warnings.push(format!(
+            "tool-timeout retry continuation skipped: continuation depth {} reached configured limit {}",
+            current_index, config.max_continuation_depth
+        ));
+        mark_virtual_session_terminal_after_depth_limit(
+            harness_home,
+            &item.session_key,
+            config.max_continuation_depth,
+            warnings,
+        )?;
+        return Ok(None);
+    }
+    let next_index = current_index.saturating_add(1);
+    let root_session = root_working_session_key(&item.session_key);
+    let new_working_session_key = continuation_session_key(&root_session, next_index);
+    let now_ms = current_log_time_ms()?;
+    match requeue_prepared_context_rollover_if_no_parent_siblings(
+        ContextRolloverRequeuePreparedOptions {
+            harness_home: harness_home.to_path_buf(),
+            queue_id: item.queue_id.clone(),
+            new_working_session_key,
+            reason: interrupted_long_task_rollover_reason("retry-pending", run),
+            now_ms,
+        },
+    ) {
+        Ok(report) => Ok(Some(report)),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            warnings.push(format!("tool-timeout retry continuation skipped: {error}"));
+            Ok(None)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            warnings.push(format!("tool-timeout retry continuation skipped: {error}"));
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn maybe_enqueue_polluted_thread_continuation(
     harness_home: &Path,
     item: Option<&RuntimeQueuePreparedItem>,
@@ -1578,7 +1933,10 @@ fn maybe_enqueue_polluted_thread_continuation(
     if item.runtime_class != "interactive" || item.origin != "channel" {
         return Ok(None);
     }
-    if !context_recovery_indicates_polluted_thread(run.receipt.context_recovery.as_ref()) {
+    let interrupted_long_task = context_recovery_indicates_interrupted_long_task(&run.receipt);
+    if !context_recovery_indicates_polluted_thread(run.receipt.context_recovery.as_ref())
+        && !interrupted_long_task
+    {
         return Ok(None);
     }
     let config = load_context_rollover_config(harness_home)?;
@@ -1609,12 +1967,16 @@ fn maybe_enqueue_polluted_thread_continuation(
             harness_home: harness_home.to_path_buf(),
             queue_id: item.queue_id.clone(),
             new_working_session_key,
-            reason: format!(
-                "automatic polluted-thread virtual session recovery after terminal {}; codexStatus={:?}; reason={}",
-                receipt_status.as_str(),
-                run.receipt.status,
-                run.receipt.reason
-            ),
+            reason: if interrupted_long_task {
+                interrupted_long_task_rollover_reason(receipt_status.as_str(), run)
+            } else {
+                format!(
+                    "automatic polluted-thread virtual session recovery after terminal {}; codexStatus={:?}; reason={}",
+                    receipt_status.as_str(),
+                    run.receipt.status,
+                    run.receipt.reason
+                )
+            },
             now_ms,
         },
     ) {
@@ -1752,6 +2114,43 @@ fn mark_virtual_session_terminal_after_depth_limit(
     Ok(())
 }
 
+fn interrupted_long_task_rollover_reason(status: &str, run: &CodexRuntimeRunReport) -> String {
+    let tool = run
+        .receipt
+        .tool_use_timeout
+        .as_ref()
+        .map(tool_timeout_summary)
+        .unwrap_or_else(|| "tool=(none)".to_string());
+    format!(
+        "automatic interrupted long-task virtual session recovery after {}; codexStatus={:?}; {}; reason={}",
+        status, run.receipt.status, tool, run.receipt.reason
+    )
+}
+
+fn context_recovery_indicates_interrupted_long_task(
+    receipt: &crate::CodexRuntimeRunReceipt,
+) -> bool {
+    let recovery_status = receipt
+        .context_recovery
+        .as_ref()
+        .map(|recovery| recovery.status.as_str());
+    if recovery_status == Some("tool-timeout-fallback-failed") {
+        return true;
+    }
+    if receipt.tool_use_timeout.is_some()
+        && matches!(
+            receipt.status,
+            CodexRuntimeRunStatus::Timeout | CodexRuntimeRunStatus::ProtocolError
+        )
+    {
+        return true;
+    }
+    receipt
+        .reason
+        .to_ascii_lowercase()
+        .contains(crate::codex_runtime::NO_FINAL_ANSWER_WITH_NARRATION_MARKER)
+}
+
 fn should_enqueue_stream_unstable_retry_continuation(
     item: &RuntimeContinuationCandidate,
     run: &CodexRuntimeRunReport,
@@ -1873,10 +2272,61 @@ fn count_prior_runtime_failures(receipts_file: &Path, queue_id: &str) -> io::Res
     Ok(failures)
 }
 
+fn count_prior_run_once_status(
+    receipts_file: &Path,
+    queue_id: &str,
+    expected_status: &str,
+) -> io::Result<usize> {
+    if !receipts_file.is_file() {
+        return Ok(0);
+    }
+    let text = fs::read_to_string(receipts_file)?;
+    let mut count = 0usize;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if string_field(&value, &["queueId", "queue_id"]) == Some(queue_id)
+            && string_field(&value, &["status"]) == Some(expected_status)
+        {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
+fn no_prepared_execution_terminal_threshold(harness_home: &Path) -> usize {
+    let config_file = harness_home.join("harness-config.json");
+    let Ok(text) = fs::read_to_string(config_file) else {
+        return 3;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return 3;
+    };
+    value
+        .get("runtime")
+        .and_then(|runtime| runtime.get("noPreparedExecutionTerminalThreshold"))
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(3)
+}
+
 fn is_terminal_run_once_status(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "timeout" | "failed-terminal" | "canceled" | "skipped" | "dead-letter"
+        "completed"
+            | "timeout"
+            | "failed-terminal"
+            | "canceled"
+            | "skipped"
+            | "dead-letter"
+            | "suppressed"
     )
 }
 
@@ -1984,7 +2434,7 @@ fn find_queue_channel_context(
             "runtime queue file not found while resolving channel context: {}",
             queue_file.display()
         ));
-        return Ok(None);
+        return Ok(queue_channel_context_from_queue_id(queue_id));
     }
     let text = fs::read_to_string(&queue_file)?;
     for (index, line) in text.lines().enumerate() {
@@ -2031,7 +2481,31 @@ fn find_queue_channel_context(
     warnings.push(format!(
         "runtime queue item `{queue_id}` was not found while resolving channel context"
     ));
-    Ok(None)
+    Ok(queue_channel_context_from_queue_id(queue_id))
+}
+
+fn queue_channel_context_from_queue_id(queue_id: &str) -> Option<QueueChannelContext> {
+    let mut parts = queue_id.split(':');
+    if parts.next()? != "turn" {
+        return None;
+    }
+    let _created_at = parts.next()?;
+    let platform = parts.next()?.to_string();
+    let channel_id = parts.next()?.to_string();
+    let user_id = parts.next()?.to_string();
+    let agent_id = parts.next()?.to_string();
+    if platform.is_empty() || channel_id.is_empty() || user_id.is_empty() || agent_id.is_empty() {
+        return None;
+    }
+    Some(QueueChannelContext {
+        session_key: format!("{platform}:{channel_id}:{user_id}:{agent_id}"),
+        platform,
+        account_id: None,
+        channel_id,
+        user_id,
+        inbound_context: None,
+        inbound_media_artifacts: Vec::new(),
+    })
 }
 
 fn delivery_intent_from_inbound_context(
@@ -3048,10 +3522,13 @@ fn inbound_media_artifacts_field(value: &Value, keys: &[&str]) -> Vec<InboundMed
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex_runtime::CodexRuntimeUsage;
+    use crate::codex_runtime::{CodexRuntimeUsage, CodexToolUseTimeout};
     use crate::{
-        AgentSource, ChannelReceiveOptions, ChannelReceiveStatus, build_source_skill_index,
-        receive_channel_message,
+        AgentProgressDeliveryMessageKind, AgentProgressDeliveryPlanOptions,
+        AgentProgressDeliveryRecordOptions, AgentProgressDeliveryStatus, AgentSource,
+        ChannelReceiveOptions, ChannelReceiveStatus, ScopedStopOptions, ScopedStopTarget,
+        build_source_skill_index, plan_agent_progress_delivery, receive_channel_message,
+        record_agent_progress_delivery, record_scoped_stop,
     };
     use std::ffi::OsString;
     use std::fs::OpenOptions;
@@ -3433,6 +3910,8 @@ mod tests {
             message: "repair memory cron".to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -3567,6 +4046,8 @@ mod tests {
             message: "send the generated artifact".to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -3889,6 +4370,8 @@ mod tests {
             message: "repair memory cron".to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -3941,6 +4424,8 @@ mod tests {
             message: "repair memory cron".to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -3984,6 +4469,629 @@ mod tests {
     }
 
     #[test]
+    fn prepared_protocol_error_terminalizes_after_threshold() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("prepared_protocol_error_terminalizes_after_threshold");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "repair memory cron".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+        let queue_id = receive.queue_id.unwrap();
+        let prepare = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        let execution_dir = prepare.receipt.execution_dir.clone().unwrap();
+        fs::remove_file(execution_dir.join("execution-receipt.json")).unwrap();
+        release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
+
+        for attempt in 1..=3 {
+            let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+                harness_home: harness_home.clone(),
+                queue_id: Some(queue_id.clone()),
+                codex_executable: None,
+                timeout_ms: 30_000,
+                idle_timeout_ms: 30_000,
+                prompt_options: PromptAssemblyOptions {
+                    harness_home: Some(harness_home.clone()),
+                    ..PromptAssemblyOptions::default()
+                },
+            })
+            .unwrap();
+            if attempt < 3 {
+                assert_eq!(
+                    report.receipt.status,
+                    RuntimeRunOnceStatus::NoPreparedExecution
+                );
+            } else {
+                assert_eq!(report.receipt.status, RuntimeRunOnceStatus::FailedTerminal);
+            }
+        }
+
+        let run_once_receipts = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("run-once-receipts.jsonl"),
+        )
+        .unwrap();
+        assert!(run_once_receipts.contains(r#""status":"failed-terminal""#));
+        assert!(run_once_receipts.contains("preparedExecutionTerminalizationReason"));
+        let quarantine_dir = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("quarantine");
+        assert_eq!(fs::read_dir(quarantine_dir).unwrap().count(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scoped_stop_suppresses_missing_prepared_execution_before_no_prepared_churn() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root =
+            temp_root("scoped_stop_suppresses_missing_prepared_execution_before_no_prepared_churn");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "discord".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "stop ghost queue".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+        let queue_id = receive.queue_id.unwrap();
+        let prepare = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        let execution_dir = prepare.receipt.execution_dir.clone().unwrap();
+        fs::remove_file(execution_dir.join("execution-receipt.json")).unwrap();
+        release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
+        record_scoped_stop(ScopedStopOptions {
+            harness_home: harness_home.clone(),
+            target: ScopedStopTarget::QueueItem {
+                queue_id: queue_id.clone(),
+            },
+            reason: "operator scoped stop for missing prepared execution".to_string(),
+            now_ms: 5678,
+        })
+        .unwrap();
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Suppressed);
+        assert_eq!(report.receipt.terminal_control_matched, Some(true));
+        assert_eq!(
+            report.receipt.terminal_control_source.as_deref(),
+            Some("scoped-stop")
+        );
+        let run_once_receipts = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("run-once-receipts.jsonl"),
+        )
+        .unwrap();
+        assert!(run_once_receipts.contains(r#""status":"suppressed""#));
+        assert!(!run_once_receipts.contains(r#""status":"no-prepared-execution""#));
+        assert_terminal_progress_once_then_silent(&harness_home, "discord", &queue_id);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn untargeted_terminal_control_suppression_appends_progress_with_queue_id() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root =
+            temp_root("untargeted_terminal_control_suppression_appends_progress_with_queue_id");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "discord".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "stop ghost queue".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+        let queue_id = receive.queue_id.unwrap();
+        record_scoped_stop(ScopedStopOptions {
+            harness_home: harness_home.clone(),
+            target: ScopedStopTarget::QueueItem {
+                queue_id: queue_id.clone(),
+            },
+            reason: "operator scoped stop before untargeted selection".to_string(),
+            now_ms: 5678,
+        })
+        .unwrap();
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            codex_executable: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Suppressed);
+        assert_eq!(report.receipt.queue_id.as_deref(), Some(queue_id.as_str()));
+        let progress_events = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("progress-events.jsonl"),
+        )
+        .unwrap();
+        let suppressed_events = progress_events
+            .lines()
+            .filter(|line| {
+                line.contains(&queue_id) && line.contains("suppressed by terminal control")
+            })
+            .count();
+        assert_eq!(suppressed_events, 1, "{progress_events}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quarantine_suppression_records_terminal_progress_once_then_silent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("quarantine_suppression_records_terminal_progress_once_then_silent");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "quarantine this queue".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+        let queue_id = receive.queue_id.unwrap();
+        write_runtime_queue_quarantine_marker(
+            &harness_home,
+            &queue_id,
+            "operator quarantined queue before runtime",
+            5_678,
+        )
+        .unwrap();
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Suppressed);
+        assert_eq!(report.receipt.terminal_control_matched, Some(true));
+        assert_eq!(
+            report.receipt.terminal_control_source.as_deref(),
+            Some("quarantine")
+        );
+        assert_terminal_progress_once_then_silent(&harness_home, "telegram", &queue_id);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_control_queue_gets_one_final_edit_then_silence() {
+        quarantine_suppression_records_terminal_progress_once_then_silent();
+    }
+
+    #[test]
+    fn e2e_1_ghost_queue_replay_from_sanitized_fixture() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Fixture {
+            platform: String,
+            account_id: Option<String>,
+            channel_id: String,
+            user_id: String,
+            agent_id: String,
+            session_key: String,
+            message: String,
+            inbound_event_kind: String,
+            inbound_event_id: String,
+            duplicate_inbound_event_id: String,
+            stop_message: String,
+            stop_inbound_event_kind: String,
+            stop_inbound_event_id: String,
+            first_now_ms: i64,
+            duplicate_now_ms: i64,
+            stop_now_ms: i64,
+            expected: GhostQueueExpected,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct GhostQueueExpected {
+            stop_scope: String,
+            terminal_control_source: String,
+            suppressed_run_once_reason: String,
+            suppression_receipt_count: usize,
+        }
+
+        let fixture: Fixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/round16/e2e1-ghost-queue-replay.json"
+        ))
+        .unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("e2e_1_ghost_queue_replay_from_sanitized_fixture");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+
+        let first = receive_channel_message(ChannelReceiveOptions {
+            source: source.clone(),
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills.clone(),
+            platform: fixture.platform.clone(),
+            account_id: fixture.account_id.clone(),
+            channel_id: fixture.channel_id.clone(),
+            user_id: fixture.user_id.clone(),
+            agent_id: Some(fixture.agent_id.clone()),
+            session_key: Some(fixture.session_key.clone()),
+            message: fixture.message.clone(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: Some(fixture.inbound_event_kind.clone()),
+            inbound_event_id: Some(fixture.inbound_event_id.clone()),
+            skill_limit: 3,
+            now_ms: fixture.first_now_ms,
+        })
+        .unwrap();
+        assert_eq!(first.status, ChannelReceiveStatus::AgentTurnQueued);
+        let queue_id = first.queue_id.clone().unwrap();
+
+        let duplicate = receive_channel_message(ChannelReceiveOptions {
+            source: source.clone(),
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills.clone(),
+            platform: fixture.platform.clone(),
+            account_id: fixture.account_id.clone(),
+            channel_id: fixture.channel_id.clone(),
+            user_id: fixture.user_id.clone(),
+            agent_id: Some(fixture.agent_id.clone()),
+            session_key: Some(fixture.session_key.clone()),
+            message: fixture.message.clone(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: Some(fixture.inbound_event_kind.clone()),
+            inbound_event_id: Some(fixture.duplicate_inbound_event_id.clone()),
+            skill_limit: 3,
+            now_ms: fixture.duplicate_now_ms,
+        })
+        .unwrap();
+        assert_eq!(duplicate.status, ChannelReceiveStatus::DuplicateSuppressed);
+        assert_eq!(
+            duplicate.duplicate_sibling_of.as_deref(),
+            Some(queue_id.as_str())
+        );
+        assert_eq!(duplicate.inbound_canonical_id, first.inbound_canonical_id);
+
+        let prepare = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        let execution_dir = prepare.receipt.execution_dir.clone().unwrap();
+        fs::remove_file(execution_dir.join("execution-receipt.json")).unwrap();
+        release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
+
+        let stop = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: fixture.platform.clone(),
+            account_id: fixture.account_id.clone(),
+            channel_id: fixture.channel_id.clone(),
+            user_id: fixture.user_id.clone(),
+            agent_id: Some(fixture.agent_id.clone()),
+            session_key: Some(fixture.session_key.clone()),
+            message: fixture.stop_message.clone(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: Some(fixture.stop_inbound_event_kind.clone()),
+            inbound_event_id: Some(fixture.stop_inbound_event_id.clone()),
+            skill_limit: 3,
+            now_ms: fixture.stop_now_ms,
+        })
+        .unwrap();
+        assert_eq!(stop.status, ChannelReceiveStatus::CommandApplied);
+        let receipt_text =
+            fs::read_to_string(stop.command_apply.as_ref().unwrap().receipts_file.clone()).unwrap();
+        assert!(
+            receipt_text.contains(&format!(r#""stopScope":"{}""#, fixture.expected.stop_scope))
+        );
+        assert!(receipt_text.contains(&queue_id));
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Suppressed);
+        assert_eq!(report.receipt.terminal_control_matched, Some(true));
+        assert_eq!(
+            report.receipt.terminal_control_source.as_deref(),
+            Some(fixture.expected.terminal_control_source.as_str())
+        );
+        assert_eq!(
+            report.receipt.suppressed_run_once_reason.as_deref(),
+            Some(fixture.expected.suppressed_run_once_reason.as_str())
+        );
+        assert!(report.plan.is_none() || report.run.is_none());
+
+        let run_once_receipts = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("run-once-receipts.jsonl"),
+        )
+        .unwrap();
+        let suppression_count = run_once_receipts
+            .lines()
+            .filter(|line| {
+                line.contains(&queue_id)
+                    && line.contains(r#""status":"suppressed""#)
+                    && line.contains(&format!(
+                        r#""terminalControlSource":"{}""#,
+                        fixture.expected.terminal_control_source
+                    ))
+            })
+            .count();
+        assert_eq!(
+            suppression_count,
+            fixture.expected.suppression_receipt_count
+        );
+        assert!(!run_once_receipts.contains(r#""status":"no-prepared-execution""#));
+        assert_terminal_progress_once_then_silent(&harness_home, &fixture.platform, &queue_id);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn e2e_2_duplicate_ingress_stop_progress_replay() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("e2e_2_duplicate_ingress_stop_progress_replay");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+
+        let first = receive_channel_message(ChannelReceiveOptions {
+            source: source.clone(),
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills.clone(),
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: Some("telegram:dm-42:user-7:main".to_string()),
+            message: "repair memory cron".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: Some("message".to_string()),
+            inbound_event_id: Some("provider-msg-e2e-2-a".to_string()),
+            skill_limit: 3,
+            now_ms: 1000,
+        })
+        .unwrap();
+        assert_eq!(first.status, ChannelReceiveStatus::AgentTurnQueued);
+        let queue_a = first.queue_id.clone().unwrap();
+
+        let duplicate = receive_channel_message(ChannelReceiveOptions {
+            source: source.clone(),
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills.clone(),
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: Some("telegram:dm-42:user-7:main".to_string()),
+            message: "repair memory cron".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: Some("message".to_string()),
+            inbound_event_id: Some("provider-msg-e2e-2-a".to_string()),
+            skill_limit: 3,
+            now_ms: 1001,
+        })
+        .unwrap();
+        assert_eq!(duplicate.status, ChannelReceiveStatus::DuplicateSuppressed);
+        assert_eq!(
+            duplicate.duplicate_sibling_of.as_deref(),
+            Some(queue_a.as_str())
+        );
+
+        let sibling = receive_channel_message(ChannelReceiveOptions {
+            source: source.clone(),
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills.clone(),
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: Some("telegram:dm-42:user-7:main".to_string()),
+            message: "follow-up work".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: Some("message".to_string()),
+            inbound_event_id: Some("provider-msg-e2e-2-b".to_string()),
+            skill_limit: 3,
+            now_ms: 1002,
+        })
+        .unwrap();
+        assert_eq!(sibling.status, ChannelReceiveStatus::AgentTurnQueued);
+        let queue_b = sibling.queue_id.clone().unwrap();
+
+        let stop = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: Some("telegram:dm-42:user-7:main".to_string()),
+            message: "/stop operator replay".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: Some("interaction".to_string()),
+            inbound_event_id: Some("provider-interaction-e2e-2-stop".to_string()),
+            skill_limit: 3,
+            now_ms: 1003,
+        })
+        .unwrap();
+        assert_eq!(stop.status, ChannelReceiveStatus::CommandApplied);
+        let receipt_text =
+            fs::read_to_string(stop.command_apply.as_ref().unwrap().receipts_file.clone()).unwrap();
+        assert!(receipt_text.contains("\"stopScope\":\"active-session-siblings\""));
+        assert!(receipt_text.contains(&queue_a));
+        assert!(receipt_text.contains(&queue_b));
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_a.clone()),
+            codex_executable: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Suppressed);
+        assert_eq!(report.receipt.terminal_control_matched, Some(true));
+        assert_eq!(
+            report.receipt.terminal_control_source.as_deref(),
+            Some("scoped-stop")
+        );
+        assert_terminal_progress_once_then_silent(&harness_home, "telegram", &queue_a);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_runtime_queue_once_records_runtime_failure_error_outbox() {
         let _guard = ENV_LOCK.lock().unwrap();
         let root = temp_root("run_runtime_queue_once_records_runtime_failure_error_outbox");
@@ -4004,6 +5112,8 @@ mod tests {
             message: "run a blocked command".to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -4054,7 +5164,11 @@ mod tests {
             },
         })
         .unwrap();
-        assert_eq!(second.receipt.status, RuntimeRunOnceStatus::NoWork);
+        assert_eq!(second.receipt.status, RuntimeRunOnceStatus::Suppressed);
+        assert_eq!(
+            second.receipt.terminal_control_source.as_deref(),
+            Some("run-once-terminal")
+        );
         assert!(second.run.is_none());
 
         let _ = fs::remove_dir_all(root);
@@ -4234,7 +5348,7 @@ mod tests {
                 Some("complete the package"),
                 "Done."
             ),
-            FinalOutboxInputKind::InternalEvidence
+            FinalOutboxInputKind::AgentReply
         );
         assert_eq!(
             final_outbox_input_kind_for_completed_response(
@@ -4248,6 +5362,55 @@ mod tests {
             ),
             FinalOutboxInputKind::InternalEvidence
         );
+    }
+
+    #[test]
+    fn final_outbox_owner_accepts_lane_agent_and_rejects_owner_mismatch() {
+        assert!(final_outbox_owner_is_channel_parent(
+            Some("main"),
+            Some("telegram:dm-42:user-7:main"),
+            "telegram:dm-42:user-7:main"
+        ));
+        assert!(final_outbox_owner_is_channel_parent(
+            Some("xiaoxiaoli"),
+            Some("telegram:group-alpha:user-limited:xiaoxiaoli"),
+            "telegram:group-alpha:user-limited:xiaoxiaoli"
+        ));
+        assert!(!final_outbox_owner_is_channel_parent(
+            Some("xiaoxiaoli"),
+            Some("telegram:dm-42:user-7:main"),
+            "telegram:dm-42:user-7:main"
+        ));
+        assert!(!final_outbox_owner_is_channel_parent(
+            Some("main"),
+            Some("telegram:group-alpha:user-limited:xiaoxiaoli"),
+            "telegram:group-alpha:user-limited:xiaoxiaoli"
+        ));
+        assert!(!final_outbox_owner_is_channel_parent(
+            Some("xiaoxiaoli"),
+            Some("telegram:group-alpha:user-limited:xiaoxiaoli:old"),
+            "telegram:group-alpha:user-limited:xiaoxiaoli:new"
+        ));
+        assert!(final_outbox_owner_is_channel_parent(
+            Some("xiaoxiaoli"),
+            Some("telegram:group-alpha:user-limited:xiaoxiaoli:cont-1"),
+            "telegram:group-alpha:user-limited:xiaoxiaoli:cont-1"
+        ));
+        assert!(final_outbox_owner_is_channel_parent(
+            Some("xiaoxiaoli"),
+            Some("telegram:group-alpha:user-limited:xiaoxiaoli:session-123"),
+            "telegram:group-alpha:user-limited:xiaoxiaoli:session-123"
+        ));
+        assert!(final_outbox_owner_is_channel_parent(
+            None,
+            Some("telegram:group-alpha:user-limited:xiaoxiaoli"),
+            "telegram:group-alpha:user-limited:xiaoxiaoli"
+        ));
+        assert!(final_outbox_owner_is_channel_parent(
+            Some("main"),
+            Some("legacy-session-key"),
+            "legacy-session-key"
+        ));
     }
 
     #[test]
@@ -4481,6 +5644,136 @@ mod tests {
     }
 
     #[test]
+    fn tool_timeout_fallback_failure_retry_requeues_continuation() {
+        let root = temp_root("tool_timeout_fallback_failure_retry_requeues_continuation");
+        let harness_home = root.join(".agent-harness");
+        let queue_id = "queue-tool-timeout";
+        let session_key = "discord:dm-42:user-7:main";
+        seed_prepared_pending_for_stream_retry(&harness_home, queue_id, session_key);
+        let item = prepared_test_item(queue_id, session_key, None);
+        let run = interrupted_long_task_run(
+            queue_id,
+            CodexRuntimeRunStatus::Timeout,
+            Some("tool-timeout-fallback-failed"),
+            true,
+        );
+        let mut warnings = Vec::new();
+
+        let rollover = maybe_enqueue_tool_timeout_retry_continuation(
+            &harness_home,
+            Some(&item),
+            &run,
+            &mut warnings,
+        )
+        .unwrap()
+        .expect("tool-timeout fallback failure should requeue continuation");
+
+        assert_eq!(rollover.queue_id, queue_id);
+        assert_eq!(
+            rollover.new_working_session_key,
+            "discord:dm-42:user-7:main:cont-1"
+        );
+        let pending = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        assert!(pending.contains("\"requeuedFromQueueId\":\"queue-tool-timeout\""));
+        assert!(pending.contains("\"completionKind\":\"continuation-rollover\""));
+        assert!(pending.contains("interrupted long-task"));
+        assert!(pending.contains("method=pwsh"));
+        assert!(pending.contains("preview=cargo clippy"));
+        assert!(
+            !harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl")
+                .exists()
+        );
+        assert!(warnings.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_final_answer_terminal_interruption_requeues_continuation() {
+        let root = temp_root("no_final_answer_terminal_interruption_requeues_continuation");
+        let harness_home = root.join(".agent-harness");
+        let queue_id = "queue-no-final";
+        let session_key = "discord:dm-42:user-7:main";
+        seed_prepared_pending_for_stream_retry(&harness_home, queue_id, session_key);
+        let item = prepared_test_item(queue_id, session_key, None);
+        let run =
+            interrupted_long_task_run(queue_id, CodexRuntimeRunStatus::ProtocolError, None, false);
+        let mut warnings = Vec::new();
+
+        let rollover = maybe_enqueue_polluted_thread_continuation(
+            &harness_home,
+            Some(&item),
+            &run,
+            RuntimeRunOnceStatus::FailedTerminal,
+            &mut warnings,
+        )
+        .unwrap()
+        .expect("no-final-answer interruption should requeue continuation");
+
+        assert_eq!(rollover.queue_id, queue_id);
+        assert_eq!(
+            rollover.new_working_session_key,
+            "discord:dm-42:user-7:main:cont-1"
+        );
+        let pending = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        assert!(pending.contains("interrupted long-task"));
+        assert!(!pending.contains("polluted-thread"));
+        assert!(warnings.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plain_provider_timeout_does_not_requeue_interrupted_continuation() {
+        let root = temp_root("plain_provider_timeout_does_not_requeue_interrupted_continuation");
+        let harness_home = root.join(".agent-harness");
+        let queue_id = "queue-provider-timeout";
+        let session_key = "discord:dm-42:user-7:main";
+        seed_prepared_pending_for_stream_retry(&harness_home, queue_id, session_key);
+        let item = prepared_test_item(queue_id, session_key, None);
+        let mut run =
+            interrupted_long_task_run(queue_id, CodexRuntimeRunStatus::Timeout, None, false);
+        run.receipt.reason = "provider request timed out before any tool execution".to_string();
+        let mut warnings = Vec::new();
+
+        let rollover = maybe_enqueue_tool_timeout_retry_continuation(
+            &harness_home,
+            Some(&item),
+            &run,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(rollover.is_none());
+        let pending = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        assert!(!pending.contains("\"requeuedFromQueueId\":\"queue-provider-timeout\""));
+        assert!(warnings.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn repeated_stream_disconnect_high_usage_retry_requeues_continuation() {
         let root = temp_root("repeated_stream_disconnect_high_usage_retry_requeues_continuation");
         let harness_home = root.join(".agent-harness");
@@ -4663,6 +5956,8 @@ mod tests {
                 sha256: Some("abc123".to_string()),
                 ..InboundMediaArtifact::default()
             }],
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -4791,6 +6086,8 @@ mod tests {
                 sha256: Some("abc123".to_string()),
                 ..InboundMediaArtifact::default()
             }],
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -4922,6 +6219,8 @@ mod tests {
             message: "keep my session while reconnecting".to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -5028,6 +6327,8 @@ mod tests {
             message: "run claude second brain review then continue implementation".to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -5113,6 +6414,8 @@ mod tests {
                     .to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -5153,9 +6456,109 @@ mod tests {
     }
 
     #[test]
-    fn run_runtime_queue_once_suppresses_non_main_agent_final_outbox() {
+    fn run_runtime_queue_once_writes_final_outbox_for_non_main_agent_owned_group_lane() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let root = temp_root("run_runtime_queue_once_suppresses_non_main_agent_final_outbox");
+        let root = temp_root("run_runtime_queue_once_writes_non_main_group_final_outbox");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: Some("xiaoxiaoli".to_string()),
+            channel_id: "group-alpha".to_string(),
+            user_id: "user-limited".to_string(),
+            agent_id: Some("xiaoxiaoli".to_string()),
+            session_key: None,
+            message: "@xiao2li_bot hello".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: Some("telegram-update".to_string()),
+            inbound_event_id: Some("487831905".to_string()),
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: receive.queue_id.clone(),
+            codex_executable: Some(fake_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert!(report.outbound_message.is_some());
+        let outbox_file = report
+            .outbox_file
+            .as_ref()
+            .expect("owned non-main group lane should write final outbox");
+        let outbox_text = fs::read_to_string(outbox_file).unwrap();
+        let row: serde_json::Value =
+            serde_json::from_str(outbox_text.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            row.get("kind").and_then(serde_json::Value::as_str),
+            Some("agent-reply")
+        );
+        assert_eq!(
+            row.get("platform").and_then(serde_json::Value::as_str),
+            Some("telegram")
+        );
+        assert_eq!(
+            row.get("accountId").and_then(serde_json::Value::as_str),
+            Some("xiaoxiaoli")
+        );
+        assert_eq!(
+            row.get("channelId").and_then(serde_json::Value::as_str),
+            Some("group-alpha")
+        );
+        assert_eq!(
+            row.get("userId").and_then(serde_json::Value::as_str),
+            Some("user-limited")
+        );
+        assert_eq!(
+            row.get("sessionKey").and_then(serde_json::Value::as_str),
+            Some("telegram:group-alpha:user-limited:xiaoxiaoli")
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("classified as InternalEvidence")),
+            "owned non-main channel turn must not be classified as internal evidence"
+        );
+        let log_text = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("logs")
+                .join("harness.jsonl"),
+        )
+        .unwrap_or_default();
+        assert!(!log_text.contains("runtime.run-once.final-outbox-suppressed"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_runtime_queue_once_suppresses_owner_mismatched_agent_final_outbox() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root =
+            temp_root("run_runtime_queue_once_suppresses_owner_mismatched_agent_final_outbox");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
         let skills = build_source_skill_index(&source).unwrap();
@@ -5168,17 +6571,18 @@ mod tests {
             account_id: None,
             channel_id: "dm-42".to_string(),
             user_id: "user-7".to_string(),
-            agent_id: Some("xiaoxiaoli".to_string()),
+            agent_id: Some("main".to_string()),
             session_key: None,
             message: "complete this delegated implementation".to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1234,
         })
         .unwrap();
         assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
-        let delegated_session_key = "telegram:dm-42:user-7:xiaoxiaoli";
         let pending_file = harness_home
             .join("state")
             .join("runtime-queue")
@@ -5186,12 +6590,7 @@ mod tests {
         let pending = fs::read_to_string(&pending_file).unwrap();
         fs::write(
             &pending_file,
-            pending
-                .replace(r#""agentId":"main""#, r#""agentId":"xiaoxiaoli""#)
-                .replace(
-                    r#""sessionKey":"telegram:dm-42:user-7:main""#,
-                    &format!(r#""sessionKey":"{delegated_session_key}""#),
-                ),
+            pending.replace(r#""agentId":"main""#, r#""agentId":"xiaoxiaoli""#),
         )
         .unwrap();
         write_test_channel_session_state(
@@ -5199,8 +6598,8 @@ mod tests {
             "telegram",
             "dm-42",
             "user-7",
-            delegated_session_key,
-            "xiaoxiaoli",
+            "telegram:dm-42:user-7:main",
+            "main",
         );
 
         let codex_home = root.join("codex-home");
@@ -5229,7 +6628,7 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("classified as InternalEvidence")),
-            "non-main completed output must be classified as internal evidence"
+            "owner-mismatched completed output must be classified as internal evidence"
         );
         assert!(
             !harness_home
@@ -5237,6 +6636,19 @@ mod tests {
                 .join("channels")
                 .join("outbox.jsonl")
                 .exists()
+        );
+        let log_text = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("logs")
+                .join("harness.jsonl"),
+        )
+        .unwrap_or_default();
+        assert_eq!(
+            log_text
+                .matches("runtime.run-once.final-outbox-suppressed")
+                .count(),
+            1
         );
 
         let _ = fs::remove_dir_all(root);
@@ -5263,6 +6675,8 @@ mod tests {
             message: "old in-flight request".to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -5283,6 +6697,8 @@ mod tests {
             message: "/new".to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1235,
         })
@@ -5350,6 +6766,8 @@ mod tests {
             message: "ordinary final presentation guard".to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -5484,6 +6902,8 @@ mod tests {
             message: "repair memory cron".to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -5523,7 +6943,11 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(second.receipt.status, RuntimeRunOnceStatus::NoWork);
+        assert_eq!(second.receipt.status, RuntimeRunOnceStatus::Suppressed);
+        assert_eq!(
+            second.receipt.terminal_control_source.as_deref(),
+            Some("run-once-terminal")
+        );
         assert_eq!(
             second.prepare.as_ref().unwrap().receipt.status,
             RuntimeExecutionReceiptStatus::NoPendingItem
@@ -5567,6 +6991,102 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn assert_terminal_progress_once_then_silent(
+        harness_home: &Path,
+        platform: &str,
+        queue_id: &str,
+    ) {
+        let first = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.to_path_buf(),
+            platform: Some(platform.to_string()),
+            now_ms: 6_000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert!(!first.pending.is_empty(), "{:#?}", first.pending);
+        assert!(
+            first
+                .pending
+                .iter()
+                .all(|pending| pending.queue_id == queue_id && pending.terminal),
+            "{:#?}",
+            first.pending
+        );
+        assert!(
+            first.pending.iter().any(|pending| {
+                pending.message_kind == AgentProgressDeliveryMessageKind::Status
+                    && pending.text.contains("Done")
+            }),
+            "{:#?}",
+            first.pending
+        );
+        let seed = first.pending[0].clone();
+        let late_context = AgentProgressContext {
+            queue_id: seed.queue_id.clone(),
+            agent_id: seed.agent_id.clone(),
+            account_id: seed.account_id.clone(),
+            thread_id: seed.thread_id.clone(),
+            session_key: seed.session_key.clone(),
+            platform: seed.platform.clone(),
+            channel_id: seed.channel_id.clone(),
+            user_id: seed.user_id.clone(),
+        };
+        for pending in first.pending {
+            let provider_suffix = match pending.message_kind {
+                AgentProgressDeliveryMessageKind::Body => "body",
+                AgentProgressDeliveryMessageKind::Status => "status",
+            };
+            record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
+                harness_home: harness_home.to_path_buf(),
+                queue_id: pending.queue_id,
+                platform: pending.platform,
+                account_id: pending.account_id,
+                channel_id: pending.channel_id,
+                thread_id: pending.thread_id,
+                user_id: pending.user_id,
+                session_key: pending.session_key,
+                message_kind: pending.message_kind,
+                action: pending.action,
+                status: AgentProgressDeliveryStatus::Delivered,
+                provider_message_id: Some(format!("provider-{provider_suffix}")),
+                event_line: pending.event_line,
+                text_hash: pending.text_hash,
+                terminal: pending.terminal,
+                policy_decision: Some("test".to_string()),
+                error: None,
+                now_ms: 6_500,
+            })
+            .unwrap();
+        }
+        append_agent_progress_event(
+            harness_home,
+            &AgentProgressEvent::new(
+                &late_context,
+                AgentProgressKind::ToolCall,
+                "tool_call",
+                "late progress after terminal control",
+                AgentProgressStatus::Progress,
+                7_000,
+            ),
+        )
+        .unwrap();
+
+        let after_late_event = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.to_path_buf(),
+            platform: Some(platform.to_string()),
+            now_ms: 8_000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert!(
+            after_late_event.pending.is_empty(),
+            "{:#?}",
+            after_late_event.pending
+        );
     }
 
     fn prepared_test_item(
@@ -5701,6 +7221,70 @@ mod tests {
                 media_plan,
                 context_recovery: None,
                 tool_use_timeout: None,
+            },
+            completion: None,
+            stdout_log: None,
+            stderr_log: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn interrupted_long_task_run(
+        queue_id: &str,
+        status: CodexRuntimeRunStatus,
+        recovery_status: Option<&str>,
+        include_tool_timeout: bool,
+    ) -> CodexRuntimeRunReport {
+        let context_recovery = recovery_status.map(|status| CodexContextRecoveryReceipt {
+            status: status.to_string(),
+            thread_health_status: None,
+            queue_id: Some(queue_id.to_string()),
+            session_key: "discord:dm-42:user-7:main".to_string(),
+            original_thread_id: Some("thread-interrupted".to_string()),
+            recovered_thread_id: Some("thread-fallback".to_string()),
+            official_compact_attempts: 0,
+            retry_attempted: true,
+            fallback_policy: "checkpoint-and-new-thread".to_string(),
+            fresh_thread_attempted: true,
+            fresh_thread_succeeded: false,
+            checkpoint_file: None,
+            rollover_file: None,
+            binding_backup_file: None,
+            reason:
+                "Codex tool-use idle timeout fallback also failed. Prior reason: pwsh: cargo clippy"
+                    .to_string(),
+        });
+        CodexRuntimeRunReport {
+            schema: "agent-harness.codex-runtime-run.v1",
+            harness_home: PathBuf::from(".agent-harness"),
+            execution_dir: Some(PathBuf::from("execution")),
+            plan_file: Some(PathBuf::from("codex-runtime-plan.json")),
+            run_file: Some(PathBuf::from("codex-runtime-run.json")),
+            receipts_file: PathBuf::from("codex-runtime-run-receipts.jsonl"),
+            receipt: crate::CodexRuntimeRunReceipt {
+                queue_id: Some(queue_id.to_string()),
+                status,
+                execution_dir: Some(PathBuf::from("execution")),
+                plan_file: Some(PathBuf::from("codex-runtime-plan.json")),
+                run_file: Some(PathBuf::from("codex-runtime-run.json")),
+                completion_file: None,
+                transcript_file: None,
+                trajectory_file: None,
+                codex_binding_file: None,
+                reason: crate::codex_runtime::NO_FINAL_ANSWER_WITH_NARRATION_MARKER.to_string(),
+                elapsed_ms: 1_800_000,
+                event_count: 20_937,
+                usage: None,
+                media_plan: Default::default(),
+                context_recovery,
+                tool_use_timeout: include_tool_timeout.then(|| CodexToolUseTimeout {
+                    method: "pwsh".to_string(),
+                    item_id: Some("cmd-1".to_string()),
+                    item_type: Some("commandExecution".to_string()),
+                    preview: Some("cargo clippy".to_string()),
+                    started_at_ms: Some(1_000),
+                    reason: "tool execution exceeded timeout".to_string(),
+                }),
             },
             completion: None,
             stdout_log: None,
@@ -5855,6 +7439,8 @@ mod tests {
             message: "repair memory cron".to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
             skill_limit: 3,
             now_ms: 1234,
         })
@@ -6487,6 +8073,8 @@ done
         fs::create_dir_all(&workspace).unwrap();
         fs::create_dir_all(&skill).unwrap();
         fs::create_dir_all(home.join("agents").join("main").join("sessions")).unwrap();
+        fs::create_dir_all(home.join("agents").join("xiaoxiaoli").join("sessions")).unwrap();
+        fs::create_dir_all(home.join("agents").join("xiaoxiaoli").join("workspace")).unwrap();
         fs::write(workspace.join("AGENTS.md"), "# Agent").unwrap();
         fs::write(
             skill.join(crate::SKILL_FILE_NAME),
@@ -6499,7 +8087,8 @@ done
               "agents": {
                 "defaults": { "provider": "openai", "model": "codex" },
                 "list": [
-                  { "id": "main", "model": "gpt-5", "enabled": true }
+                  { "id": "main", "model": "gpt-5", "enabled": true },
+                  { "id": "xiaoxiaoli", "model": "gpt-5", "enabled": true }
                 ]
               },
                 "models": {
@@ -6531,6 +8120,14 @@ done
         fs::write(
             home.join("agents")
                 .join("main")
+                .join("sessions")
+                .join("sessions.json"),
+            "{}",
+        )
+        .unwrap();
+        fs::write(
+            home.join("agents")
+                .join("xiaoxiaoli")
                 .join("sessions")
                 .join("sessions.json"),
             "{}",

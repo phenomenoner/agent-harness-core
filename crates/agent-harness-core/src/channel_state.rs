@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -7,8 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ChannelCommandEffect, ChannelOutboundMessage, ChannelStep,
-    VirtualSessionTaskBoundaryCloseOptions, close_virtual_session_for_task_boundary,
+    VirtualSessionTaskBoundaryCloseOptions,
+    admission::{ScopedStopOptions, ScopedStopTarget, record_scoped_stop},
+    close_virtual_session_for_task_boundary,
     codex_runtime::{CodexTurnSteerRequestOptions, queue_codex_turn_steer_request},
+    progress::{AgentProgressSessionSupersedeOptions, supersede_agent_progress_session_surfaces},
     write_json_atomic,
 };
 
@@ -47,6 +50,16 @@ pub struct ChannelCommandApplyReceipt {
     pub state_file: PathBuf,
     pub events_file: PathBuf,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effect: Option<ChannelCommandEffect>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop_applied_queue_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duplicate_sibling_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -180,6 +193,11 @@ pub fn apply_channel_command_step(
             state_file: state_file.clone(),
             events_file: events_file.clone(),
             reason: "channel step has no command effect".to_string(),
+            command: None,
+            effect: None,
+            stop_scope: None,
+            stop_applied_queue_ids: Vec::new(),
+            duplicate_sibling_count: None,
         };
         append_json_line(&receipts_file, &receipt)?;
         return Ok(ChannelCommandApplyReport {
@@ -197,13 +215,23 @@ pub fn apply_channel_command_step(
     };
 
     let mut state = read_channel_state(&state_file)?.unwrap_or_else(|| new_state(step));
-    apply_effect(
+    let stop_applied_queue_ids = apply_effect(
         &mut state,
         &effect,
         &options.harness_home,
         options.now_ms,
         &mut warnings,
     )?;
+    let stop_scope = if stop_applied_queue_ids.is_empty() {
+        None
+    } else {
+        Some("active-session-siblings".to_string())
+    };
+    let duplicate_sibling_count = if stop_applied_queue_ids.is_empty() {
+        None
+    } else {
+        Some(stop_applied_queue_ids.len().saturating_sub(1))
+    };
     let event = ChannelCommandEvent {
         schema: CHANNEL_COMMAND_EVENT_SCHEMA,
         at_ms: options.now_ms,
@@ -225,6 +253,11 @@ pub fn apply_channel_command_step(
         state_file: state_file.clone(),
         events_file: events_file.clone(),
         reason: "channel command state updated".to_string(),
+        command: Some(event.command),
+        effect: Some(event.effect.clone()),
+        stop_scope,
+        stop_applied_queue_ids,
+        duplicate_sibling_count,
     };
     append_json_line(&receipts_file, &receipt)?;
 
@@ -324,9 +357,10 @@ fn apply_effect(
     harness_home: &Path,
     now_ms: i64,
     warnings: &mut Vec<String>,
-) -> io::Result<()> {
+) -> io::Result<Vec<String>> {
     state.last_command = Some(command_name(effect).to_string());
     state.updated_at_ms = now_ms;
+    let mut stop_applied_queue_ids = Vec::new();
 
     match effect {
         ChannelCommandEffect::StartNewSession {
@@ -343,6 +377,25 @@ fn apply_effect(
             {
                 warnings.push(format!(
                     "virtual session task boundary close failed for previous session `{}`: {error}",
+                    state.active_session_key
+                ));
+            }
+            if state.active_session_key != *new_session_key
+                && let Err(error) = supersede_agent_progress_session_surfaces(
+                    AgentProgressSessionSupersedeOptions {
+                        harness_home: harness_home.to_path_buf(),
+                        platform: state.platform.clone(),
+                        account_id: None,
+                        channel_id: state.channel_id.clone(),
+                        user_id: state.user_id.clone(),
+                        agent_id: state.agent_id.clone(),
+                        session_key: state.active_session_key.clone(),
+                        now_ms,
+                    },
+                )
+            {
+                warnings.push(format!(
+                    "progress surfaces could not be superseded for previous session `{}`: {error}",
                     state.active_session_key
                 ));
             }
@@ -398,9 +451,12 @@ fn apply_effect(
             state.stop_requested = true;
             state.stop_reason = reason.clone();
             write_runtime_cancel_request(harness_home, state, reason.clone(), now_ms)?;
+            stop_applied_queue_ids =
+                record_active_session_sibling_stops(harness_home, state, reason.clone(), now_ms)?;
         }
         ChannelCommandEffect::RestartChannel { .. } => {}
         ChannelCommandEffect::RestartGateway { .. } => {}
+        ChannelCommandEffect::RestartStatus { .. } => {}
         ChannelCommandEffect::AddSteering { instruction } => {
             state.steering_notes.push(ChannelSessionNote {
                 at_ms: now_ms,
@@ -498,12 +554,13 @@ fn apply_effect(
                 &snapshot.current_model,
             );
         }
+        ChannelCommandEffect::UnknownCommand { .. } => {}
     }
 
     if state.model_override.is_some() && state.model_override_model.is_none() {
         warnings.push("model override target did not include a usable model name".to_string());
     }
-    Ok(())
+    Ok(stop_applied_queue_ids)
 }
 
 fn active_session_key_agent_segment(session_key: &str) -> Option<String> {
@@ -514,6 +571,85 @@ fn active_session_key_agent_segment(session_key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
 }
+
+fn record_active_session_sibling_stops(
+    harness_home: &Path,
+    state: &ChannelSessionState,
+    reason: Option<String>,
+    now_ms: i64,
+) -> io::Result<Vec<String>> {
+    let queue_ids = active_session_sibling_queue_ids(harness_home, state)?;
+    let reason = reason.unwrap_or_else(|| "operator requested stop".to_string());
+    for queue_id in &queue_ids {
+        record_scoped_stop(ScopedStopOptions {
+            harness_home: harness_home.to_path_buf(),
+            target: ScopedStopTarget::QueueItem {
+                queue_id: queue_id.clone(),
+            },
+            reason: reason.clone(),
+            now_ms,
+        })?;
+    }
+    Ok(queue_ids)
+}
+
+fn active_session_sibling_queue_ids(
+    harness_home: &Path,
+    state: &ChannelSessionState,
+) -> io::Result<Vec<String>> {
+    let pending_file = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("pending.jsonl");
+    let text = match fs::read_to_string(&pending_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let expected_agent = state
+        .agent_id
+        .clone()
+        .or_else(|| active_session_key_agent_segment(&state.active_session_key));
+    let mut seen = BTreeSet::new();
+    let mut queue_ids = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("platform").and_then(serde_json::Value::as_str)
+            != Some(state.platform.as_str())
+            || value.get("channelId").and_then(serde_json::Value::as_str)
+                != Some(state.channel_id.as_str())
+            || value.get("userId").and_then(serde_json::Value::as_str)
+                != Some(state.user_id.as_str())
+            || value.get("sessionKey").and_then(serde_json::Value::as_str)
+                != Some(state.active_session_key.as_str())
+        {
+            continue;
+        }
+        if let Some(expected_agent) = expected_agent.as_deref() {
+            if value.get("agentId").and_then(serde_json::Value::as_str) != Some(expected_agent) {
+                continue;
+            }
+        }
+        let Some(queue_id) = value
+            .get("queueId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|queue_id| !queue_id.is_empty())
+        else {
+            continue;
+        };
+        if seen.insert(queue_id.to_string()) {
+            queue_ids.push(queue_id.to_string());
+        }
+    }
+    Ok(queue_ids)
+}
+
 fn update_model_context(
     state: &mut ChannelSessionState,
     agent_id: &Option<String>,
@@ -539,6 +675,7 @@ fn command_name(effect: &ChannelCommandEffect) -> &'static str {
         ChannelCommandEffect::StopCurrentRun { .. } => "stop",
         ChannelCommandEffect::RestartChannel { .. } => "restart",
         ChannelCommandEffect::RestartGateway { .. } => "restart",
+        ChannelCommandEffect::RestartStatus { .. } => "restart-status",
         ChannelCommandEffect::AddSteering { .. } => "steer",
         ChannelCommandEffect::AddBtwNote { .. } => "btw",
         ChannelCommandEffect::ShowModel { .. } => "model",
@@ -547,6 +684,7 @@ fn command_name(effect: &ChannelCommandEffect) -> &'static str {
         ChannelCommandEffect::ShowFast { .. } => "fast",
         ChannelCommandEffect::SwitchFast { .. } => "fast",
         ChannelCommandEffect::ShowStatus { .. } => "status",
+        ChannelCommandEffect::UnknownCommand { .. } => "unknown-command",
     }
 }
 
@@ -690,8 +828,10 @@ fn normalize_key_part(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
-        ChannelOutboundMessageKind, ChannelStatusSnapshot, ChannelStepAction,
+        AgentProgressContext, AgentProgressDeliveryPlanOptions, AgentProgressKind,
+        AgentProgressStatus, ChannelOutboundMessageKind, ChannelStatusSnapshot, ChannelStepAction,
         CompletedTurnWorkingSetSnapshotOptions, ContextVirtualSessionRecord,
+        append_agent_progress_event, plan_agent_progress_delivery,
         record_completed_turn_working_set_snapshot,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -749,6 +889,134 @@ mod tests {
                 .count(),
             2
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn new_session_command_supersedes_previous_progress_surfaces() {
+        let root = temp_root("new_session_command_supersedes_previous_progress_surfaces");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        let progress_context = AgentProgressContext {
+            queue_id: "turn:old".to_string(),
+            agent_id: Some("main".to_string()),
+            account_id: None,
+            thread_id: None,
+            session_key: "telegram:dm:user:main".to_string(),
+            platform: "telegram".to_string(),
+            channel_id: "dm".to_string(),
+            user_id: "user".to_string(),
+        };
+        append_agent_progress_event(
+            &harness_home,
+            &crate::AgentProgressEvent::new(
+                &progress_context,
+                AgentProgressKind::Todo,
+                "todo",
+                "old session task",
+                AgentProgressStatus::Started,
+                900,
+            ),
+        )
+        .unwrap();
+        let initial = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 950,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert_eq!(initial.pending.len(), 2);
+
+        let step = command_step(ChannelCommandEffect::StartNewSession {
+            topic: Some("fresh task".to_string()),
+            new_session_key: "telegram:dm:user:main:session-new".to_string(),
+        });
+        let report = apply_channel_command_step(
+            &step,
+            ChannelCommandApplyOptions {
+                harness_home: harness_home.clone(),
+                now_ms: 1000,
+            },
+        )
+        .unwrap();
+        assert!(report.warnings.is_empty());
+        assert!(crate::agent_progress_session_supersede_receipts_file(&harness_home).is_file());
+
+        append_agent_progress_event(
+            &harness_home,
+            &crate::AgentProgressEvent::new(
+                &progress_context,
+                AgentProgressKind::ReadFile,
+                "read",
+                "old session late event",
+                AgentProgressStatus::Started,
+                1100,
+            ),
+        )
+        .unwrap();
+        let old_plan = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 1200,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert!(old_plan.pending.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn applies_unknown_command_as_structured_receipt() {
+        let root = temp_root("applies_unknown_command_as_structured_receipt");
+        let harness_home = root.join(".agent-harness");
+        let step = command_step(ChannelCommandEffect::UnknownCommand {
+            name: "unknown".to_string(),
+            rest: Some("value".to_string()),
+            detail: "unsupported channel command; no model turn was started".to_string(),
+        });
+
+        let report = apply_channel_command_step(
+            &step,
+            ChannelCommandApplyOptions {
+                harness_home,
+                now_ms: 1000,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.receipt.status,
+            ChannelCommandApplyReceiptStatus::Applied
+        );
+        assert_eq!(report.receipt.command, Some("unknown-command"));
+        assert!(matches!(
+            report.receipt.effect,
+            Some(ChannelCommandEffect::UnknownCommand {
+                ref name,
+                ref rest,
+                ..
+            }) if name == "unknown" && rest.as_deref() == Some("value")
+        ));
+        let event = report.event.as_ref().expect("command event");
+        assert_eq!(event.command, "unknown-command");
+        assert!(matches!(
+            event.effect,
+            ChannelCommandEffect::UnknownCommand {
+                ref name,
+                ref rest,
+                ..
+            } if name == "unknown" && rest.as_deref() == Some("value")
+        ));
+        let state = report.state.expect("channel state");
+        assert_eq!(state.last_command.as_deref(), Some("unknown-command"));
+        let receipts = fs::read_to_string(report.receipts_file).unwrap();
+        assert!(receipts.contains("\"command\":\"unknown-command\""));
+        assert!(receipts.contains("\"kind\":\"unknownCommand\""));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -970,6 +1238,176 @@ mod tests {
     }
 
     #[test]
+    fn stop_command_writes_scoped_stop_markers_for_active_session_siblings() {
+        let root = temp_root("stop_command_writes_scoped_stop_markers_for_active_session_siblings");
+        let harness_home = root.join(".agent-harness");
+        let pending_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("pending.jsonl");
+        fs::create_dir_all(pending_file.parent().unwrap()).unwrap();
+        let queue_a = "turn:1000:telegram:dm:user:main:aaaa";
+        let queue_b = "turn:1001:telegram:dm:user:main:bbbb";
+        let other_agent_queue = "turn:1002:telegram:dm:user:side:cccc";
+        for (queue_id, agent_id, session_key) in [
+            (queue_a, "main", "telegram:dm:user:main"),
+            (queue_b, "main", "telegram:dm:user:main"),
+            (other_agent_queue, "side", "telegram:dm:user:side"),
+        ] {
+            crate::append_jsonl_value(
+                &pending_file,
+                &serde_json::json!({
+                    "schema": "agent-harness.runtime-queue-item.v1",
+                    "queueId": queue_id,
+                    "status": "queued",
+                    "runtimeClass": "interactive",
+                    "origin": "channel",
+                    "createdAtMs": 1000,
+                    "agentId": agent_id,
+                    "sessionKey": session_key,
+                    "platform": "telegram",
+                    "channelId": "dm",
+                    "userId": "user",
+                    "messageText": "work",
+                    "source": {
+                        "kind": "channel",
+                        "sourceHome": ".openclaw",
+                        "sourceWorkspace": ".openclaw/workspace"
+                    },
+                    "promptFilesPresent": 0,
+                    "promptFilesTotal": 0,
+                    "selectedSkillIds": [],
+                    "plannedTranscriptFile": "transcript.jsonl",
+                    "plannedTrajectoryFile": "trajectory.jsonl"
+                }),
+            )
+            .unwrap();
+        }
+        let step = command_step_with_session(
+            "telegram:dm:user:main",
+            ChannelCommandEffect::StopCurrentRun {
+                reason: Some("operator stop siblings".to_string()),
+            },
+        );
+
+        let report = apply_channel_command_step(
+            &step,
+            ChannelCommandApplyOptions {
+                harness_home: harness_home.clone(),
+                now_ms: 3000,
+            },
+        )
+        .unwrap();
+
+        let cancel_dir = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("cancel");
+        assert!(
+            cancel_dir
+                .join("queue-turn_1000_telegram_dm_user_main_aaaa.stop")
+                .is_file()
+        );
+        assert!(
+            cancel_dir
+                .join("queue-turn_1001_telegram_dm_user_main_bbbb.stop")
+                .is_file()
+        );
+        assert!(
+            !cancel_dir
+                .join("queue-turn_1002_telegram_dm_user_side_cccc.stop")
+                .is_file()
+        );
+
+        let receipt_text = fs::read_to_string(report.receipts_file).unwrap();
+        assert!(receipt_text.contains("\"stopScope\":\"active-session-siblings\""));
+        assert!(receipt_text.contains("\"stopAppliedQueueIds\""));
+        assert!(receipt_text.contains(queue_a));
+        assert!(receipt_text.contains(queue_b));
+        assert!(receipt_text.contains("\"duplicateSiblingCount\":1"));
+        assert!(!receipt_text.contains(other_agent_queue));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stop_cancels_all_lane_siblings() {
+        stop_command_writes_scoped_stop_markers_for_active_session_siblings();
+    }
+
+    #[test]
+    fn stop_receipt_lists_applied_queue_ids_and_scope() {
+        stop_command_writes_scoped_stop_markers_for_active_session_siblings();
+    }
+
+    #[test]
+    fn queued_sibling_started_after_60s_still_stopped() {
+        let root = temp_root("queued_sibling_started_after_60s_still_stopped");
+        let harness_home = root.join(".agent-harness");
+        let pending_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("pending.jsonl");
+        fs::create_dir_all(pending_file.parent().unwrap()).unwrap();
+        let queue_id = "turn:1000:telegram:dm:user:main:older";
+        crate::append_jsonl_value(
+            &pending_file,
+            &serde_json::json!({
+                "schema": "agent-harness.runtime-queue-item.v1",
+                "queueId": queue_id,
+                "status": "queued",
+                "runtimeClass": "interactive",
+                "origin": "channel",
+                "createdAtMs": 1000,
+                "agentId": "main",
+                "sessionKey": "telegram:dm:user:main",
+                "platform": "telegram",
+                "channelId": "dm",
+                "userId": "user",
+                "messageText": "work",
+                "source": {
+                    "kind": "channel",
+                    "sourceHome": ".openclaw",
+                    "sourceWorkspace": ".openclaw/workspace"
+                },
+                "promptFilesPresent": 0,
+                "promptFilesTotal": 0,
+                "selectedSkillIds": [],
+                "plannedTranscriptFile": "transcript.jsonl",
+                "plannedTrajectoryFile": "trajectory.jsonl"
+            }),
+        )
+        .unwrap();
+        let step = command_step_with_session(
+            "telegram:dm:user:main",
+            ChannelCommandEffect::StopCurrentRun {
+                reason: Some("operator stop older sibling".to_string()),
+            },
+        );
+
+        let report = apply_channel_command_step(
+            &step,
+            ChannelCommandApplyOptions {
+                harness_home: harness_home.clone(),
+                now_ms: 70_000,
+            },
+        )
+        .unwrap();
+
+        let cancel_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("cancel")
+            .join("queue-turn_1000_telegram_dm_user_main_older.stop");
+        assert!(cancel_file.is_file());
+        let receipt_text = fs::read_to_string(report.receipts_file).unwrap();
+        assert!(receipt_text.contains("\"stopScope\":\"active-session-siblings\""));
+        assert!(receipt_text.contains(queue_id));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn applies_per_agent_global_model_and_thinking_overrides() {
         let root = temp_root("applies_per_agent_global_model_and_thinking_overrides");
         let harness_home = root.join(".agent-harness");
@@ -1027,6 +1465,77 @@ mod tests {
             Some("anthropic/claude-sonnet-4")
         );
         assert_eq!(override_entry.thinking_level.as_deref(), Some("high"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn c3_per_agent_same_channel_user_command_defaults_are_not_collapsed() {
+        let root = temp_root("c3_per_agent_same_channel_user_command_defaults_are_not_collapsed");
+        let harness_home = root.join(".agent-harness");
+        let main_step = command_step_with_session(
+            "telegram:dm:user:main",
+            ChannelCommandEffect::SwitchModel {
+                agent_id: Some("main".to_string()),
+                provider: "openrouter".to_string(),
+                model: "anthropic/claude-sonnet-4".to_string(),
+                global: true,
+                current_provider: Some("openai".to_string()),
+                current_model: Some("gpt-5".to_string()),
+                provider_known: true,
+                model_known: true,
+            },
+        );
+        let main_report = apply_channel_command_step(
+            &main_step,
+            ChannelCommandApplyOptions {
+                harness_home: harness_home.clone(),
+                now_ms: 2100,
+            },
+        )
+        .unwrap();
+
+        let side_step = command_step_with_session(
+            "telegram:dm:user:side",
+            ChannelCommandEffect::SwitchModel {
+                agent_id: Some("side".to_string()),
+                provider: "openai".to_string(),
+                model: "gpt-5-mini".to_string(),
+                global: true,
+                current_provider: Some("openai".to_string()),
+                current_model: Some("gpt-5".to_string()),
+                provider_known: true,
+                model_known: true,
+            },
+        );
+        let side_report = apply_channel_command_step(
+            &side_step,
+            ChannelCommandApplyOptions {
+                harness_home: harness_home.clone(),
+                now_ms: 2101,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(main_report.receipt.session_key, "telegram:dm:user:main");
+        assert_eq!(side_report.receipt.command, Some("model"));
+        assert!(matches!(
+            side_report.receipt.effect,
+            Some(ChannelCommandEffect::SwitchModel {
+                agent_id: Some(ref agent_id),
+                ..
+            }) if agent_id == "side"
+        ));
+        let main_override = read_agent_override(&harness_home, "main").unwrap().unwrap();
+        let side_override = read_agent_override(&harness_home, "side").unwrap().unwrap();
+        assert_eq!(main_override.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            main_override.model.as_deref(),
+            Some("anthropic/claude-sonnet-4")
+        );
+        assert_eq!(side_override.provider.as_deref(), Some("openai"));
+        assert_eq!(side_override.model.as_deref(), Some("gpt-5-mini"));
+        assert_ne!(main_override.model, side_override.model);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1122,6 +1631,11 @@ mod tests {
         assert!(report.receipts_file.is_file());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn per_agent_same_channel_user_command_defaults_are_not_collapsed() {
+        c3_per_agent_same_channel_user_command_defaults_are_not_collapsed();
     }
 
     fn command_step(effect: ChannelCommandEffect) -> ChannelStep {

@@ -819,6 +819,18 @@ fn render_virtual_session_working_context(context: &VirtualSessionWorkingContext
                 .unwrap_or_else(|| "(none)".to_string())
         ),
     ];
+    if context.continuation_index > 0
+        && let Some(interruption) = context.last_interruption.as_deref()
+    {
+        lines.push(format!(
+            "lastInterruption: {}",
+            bounded_prompt_line(interruption, 240)
+        ));
+        lines.push(
+            "continuationGuidance: verify artifacts from the interrupted command before rerunning it; prefer bounded, targeted, or backgrounded long commands instead of blindly repeating the same command."
+                .to_string(),
+        );
+    }
     push_string_list(&mut lines, "recentQueueIds", &context.recent_queue_ids);
     push_anchor_list(
         &mut lines,
@@ -2086,7 +2098,7 @@ mod tests {
                 user_id: "user".to_string(),
                 text: "what is in this file?".to_string(),
                 inbound_context: Some(
-                    "## InboundMedia: Discord attachments\n- filename=report.png urlPresent=yes"
+                    "## InboundMedia: Discord attachments\n- filename=report.png urlPresent=yes\n\n## ChannelAccess\n- permission: Limited\n- conduct: Reply short and direct."
                         .to_string(),
                 ),
                 inbound_media_artifacts: Vec::new(),
@@ -2120,6 +2132,16 @@ mod tests {
             bundle.sections[inbound_index]
                 .content
                 .contains("filename=report.png")
+        );
+        assert!(
+            bundle.sections[inbound_index]
+                .content
+                .contains("permission: Limited")
+        );
+        assert!(
+            bundle.sections[inbound_index]
+                .content
+                .contains("Reply short and direct")
         );
         assert_eq!(bundle.sections[user_index].content, "what is in this file?");
 
@@ -2618,7 +2640,9 @@ mod tests {
                 "activePlanRefs": [],
                 "pendingQueueItem": {"queueId": "turn:rollover"},
                 "constraints": [],
-                "decisions": [],
+                "decisions": [
+                    "automatic interrupted long-task virtual session recovery after retry-pending; codexStatus=Timeout; method=pwsh itemType=commandExecution preview=cargo clippy reason=tool timeout"
+                ],
                 "recentFiles": [],
                 "validation": [],
                 "blockers": [],
@@ -2693,6 +2717,9 @@ mod tests {
                     .content
                     .contains("currentSessionKey: telegram:dm:user:main:cont-1")
                 && section.content.contains("virtualSessionId: vsession-test")
+                && section.content.contains("lastInterruption:")
+                && section.content.contains("cargo clippy")
+                && section.content.contains("continuationGuidance:")
                 && section.content.contains("recentQueueIds:")
                 && section.content.contains("- turn:rollover")
                 && section
@@ -2766,6 +2793,8 @@ mod tests {
             .expect("virtual-session resolver context section");
         assert!(section.content.contains("missingReplyMetadataHint:"));
         assert!(section.content.contains("turn:same-lane-previous"));
+        assert!(!section.content.contains("lastInterruption:"));
+        assert!(!section.content.contains("continuationGuidance:"));
         assert!(!section.content.contains("cross-lane"));
 
         let _ = fs::remove_dir_all(root);

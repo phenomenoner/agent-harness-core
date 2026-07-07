@@ -642,6 +642,10 @@ fn sync_cron_run_after_worker_result(
     let Some(cron_run_id) = string_path_any(&job.payload, &["cronRunId", "cron_run_id"]) else {
         return Ok(());
     };
+    if result.status == WorkerJobStatus::Succeeded && job.kind != WorkerJobKind::DeterministicShell
+    {
+        return Ok(());
+    }
     mark_cron_run_worker_status(
         harness_home,
         cron_run_id,
@@ -768,7 +772,13 @@ fn read_runtime_terminal_ids(path: &Path) -> io::Result<std::collections::BTreeS
     for (queue_id, status) in latest {
         if matches!(
             status.as_str(),
-            "completed" | "timeout" | "failed-terminal" | "canceled" | "skipped" | "dead-letter"
+            "completed"
+                | "timeout"
+                | "failed-terminal"
+                | "canceled"
+                | "skipped"
+                | "dead-letter"
+                | "suppressed"
         ) {
             terminal.insert(queue_id);
         }
@@ -1778,6 +1788,7 @@ fn queue_llm_worker_turn(
         user_id: user_id.to_string(),
         message_text: message_text.to_string(),
         inbound_context: string_path(&job.payload, "inboundContext").map(ToString::to_string),
+        inbound_canonical_id: None,
         inbound_media_artifacts: Vec::new(),
         provider: string_path(&job.payload, "provider").map(ToString::to_string),
         model: string_path(&job.payload, "model").map(ToString::to_string),
@@ -2648,6 +2659,31 @@ mod tests {
 
         let status = collect_worker_status(WorkerStatusOptions { harness_home }).unwrap();
         assert_eq!(status.blocked.blocked_by_group_limit, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn downstream_runtime_status_treats_suppressed_run_once_as_terminal() {
+        let root = temp_root("downstream_runtime_status_treats_suppressed_run_once_as_terminal");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        fs::write(
+            queue_dir.join("pending.jsonl"),
+            r#"{"queueId":"q-suppressed","platform":"telegram","runtimeClass":"interactive","origin":"channel"}"#,
+        )
+        .unwrap();
+        fs::write(
+            queue_dir.join("run-once-receipts.jsonl"),
+            r#"{"queueId":"q-suppressed","status":"suppressed","reason":"terminal-control-present"}"#,
+        )
+        .unwrap();
+
+        let status = collect_downstream_runtime_status(&harness_home).unwrap();
+
+        assert_eq!(status.open_runtime_items, 0);
+        assert_eq!(status.open_cron_runtime_items, 0);
 
         let _ = fs::remove_dir_all(root);
     }

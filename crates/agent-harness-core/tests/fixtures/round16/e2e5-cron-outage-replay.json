@@ -1,0 +1,83 @@
+{
+  "schema": "agent-harness.round16.e2e5-cron-outage-replay.v1",
+  "nowMs": 1700000000000,
+  "sourceMaxAgeHours": 36,
+  "missedDailySlotMs": 86400000,
+  "restartSlotMs": 86460000,
+  "staleSource": {
+    "runId": "fixture-dream-lite-stale",
+    "generatedAt": "2023-11-11T22:13:20Z",
+    "ageHours": 72,
+    "opinionText": "Synthetic stale Dream Lite packet."
+  },
+  "cronCanon": {
+    "schema": "openclaw.agent-harness.cron-canon.v1",
+    "paths": {
+      "keeperReceipt": "state/memory/cron-canon-keeper/latest-cron-canon-keeper.json"
+    },
+    "activeCrons": [
+      {
+        "id": "canon-analysis-daily",
+        "kind": "deterministic-crontab",
+        "enabled": true,
+        "schedule": "0 0 * * *",
+        "sourcePath": "workspace/tools/cron-runner/crontab/openclaw-mem.crontab",
+        "script": "workspace/tools/cron-runner/jobs/analysis.ps1",
+        "catchUpPolicy": "run-late-once",
+        "monitor": {
+          "type": "latest-json",
+          "path": "state/memory/dream-lite-daily/latest.json",
+          "maxAgeHours": 36,
+          "okField": "ok",
+          "okValue": true
+        }
+      },
+      {
+        "id": "dream-director-notification",
+        "kind": "deterministic-crontab",
+        "enabled": true,
+        "schedule": "0 0 * * *",
+        "sourcePath": "workspace/tools/cron-runner/crontab/openclaw-mem.crontab",
+        "script": "workspace/tools/cron-runner/jobs/notify.ps1",
+        "catchUpPolicy": "guard-source-freshness",
+        "monitor": {
+          "type": "latest-json",
+          "path": "state/memory/dream-lite-director/latest-send.json",
+          "maxAgeHours": 36,
+          "okField": "ok",
+          "okValue": true
+        }
+      },
+      {
+        "id": "cron-canon-keeper",
+        "kind": "deterministic-crontab",
+        "enabled": true,
+        "schedule": "0 0 * * *",
+        "sourcePath": "workspace/tools/cron-runner/crontab/openclaw-mem.crontab",
+        "script": "workspace/tools/cron-runner/jobs/keeper.ps1",
+        "catchUpPolicy": "run-immediately-on-restart",
+        "monitor": {
+          "type": "latest-json",
+          "path": "state/memory/cron-canon-keeper/latest-cron-canon-keeper.json",
+          "maxAgeHours": 1,
+          "okField": "ok",
+          "okValue": true
+        }
+      }
+    ]
+  },
+  "expected": {
+    "healthWarningCronIds": [
+      "canon-analysis-daily",
+      "dream-director-notification",
+      "cron-canon-keeper"
+    ],
+    "suppressedSenderStatus": "stale-source-suppressed",
+    "suppressedSenderReason": "source-age-exceeded",
+    "catchUp": {
+      "canon-analysis-daily": "run-late-once",
+      "dream-director-notification": "guard-source-freshness",
+      "cron-canon-keeper": "run-immediately-on-restart"
+    }
+  }
+}

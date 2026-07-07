@@ -8,9 +8,10 @@ use serde_json::Value;
 
 use crate::{
     AgentRegistry, ChannelCommandIntent, DEFAULT_THINKING_LEVEL, FastCommandMode,
-    InboundMediaArtifact, RichMessagePresentation, THINKING_LEVELS, TurnDispatch, TurnPlan,
-    XHIGH_THINKING_LEVEL, inspect_codex_approval_policy, inspect_codex_sandbox,
-    inspect_codex_sandbox_policy, normalize_thinking_level,
+    GatewayRestartStatusReport, InboundMediaArtifact, RichMessagePresentation, THINKING_LEVELS,
+    TurnDispatch, TurnPlan, XHIGH_THINKING_LEVEL, collect_gateway_restart_status,
+    inspect_codex_approval_policy, inspect_codex_sandbox, inspect_codex_sandbox_policy,
+    normalize_thinking_level,
 };
 
 const CHANNEL_STEP_SCHEMA: &str = "agent-harness.channel-step.v1";
@@ -76,6 +77,11 @@ pub enum ChannelCommandEffect {
         reason: Option<String>,
         request_file: Option<PathBuf>,
         receipt_file: Option<PathBuf>,
+    },
+    RestartStatus {
+        status: String,
+        detail: String,
+        report: Option<GatewayRestartStatusReport>,
     },
     AddSteering {
         instruction: String,
@@ -147,6 +153,11 @@ pub enum ChannelCommandEffect {
     ShowStatus {
         scope: Option<String>,
         snapshot: ChannelStatusSnapshot,
+    },
+    UnknownCommand {
+        name: String,
+        rest: Option<String>,
+        detail: String,
     },
 }
 
@@ -435,6 +446,7 @@ fn command_effect(
         ChannelCommandIntent::RestartGateway { reason } => {
             restart_gateway_effect(turn, reason, warnings)
         }
+        ChannelCommandIntent::RestartStatus => restart_status_effect(turn, warnings),
         ChannelCommandIntent::AddSteering { instruction } => {
             ChannelCommandEffect::AddSteering { instruction }
         }
@@ -447,6 +459,38 @@ fn command_effect(
             snapshot: status_snapshot(registry, turn, scope.clone()),
             scope,
         },
+        ChannelCommandIntent::UnknownCommand { name, rest } => {
+            ChannelCommandEffect::UnknownCommand {
+                name,
+                rest,
+                detail: "unsupported channel command; no model turn was started".to_string(),
+            }
+        }
+    }
+}
+
+fn restart_status_effect(turn: &TurnPlan, warnings: &mut Vec<String>) -> ChannelCommandEffect {
+    let Some(harness_home) = turn.harness_home.as_ref() else {
+        return ChannelCommandEffect::RestartStatus {
+            status: "missing-harness-home".to_string(),
+            detail: "restart status requires a harness home".to_string(),
+            report: None,
+        };
+    };
+    match collect_gateway_restart_status(harness_home) {
+        Ok(report) => ChannelCommandEffect::RestartStatus {
+            status: "ok".to_string(),
+            detail: restart_status_summary(&report),
+            report: Some(report),
+        },
+        Err(error) => {
+            warnings.push(format!("failed to read restart status: {error}"));
+            ChannelCommandEffect::RestartStatus {
+                status: "failed".to_string(),
+                detail: error.to_string(),
+                report: None,
+            }
+        }
     }
 }
 
@@ -590,7 +634,10 @@ fn write_channel_restart_request(
 ) -> io::Result<ChannelRestartFiles> {
     let at_ms = current_time_ms();
     let reason = normalize_restart_reason(reason, "channel /restart command requested");
-    let stop_file = channel_restart_stop_file(harness_home, service_id);
+    if let Some(conflict) = channel_restart_owner_conflict(harness_home, service_id)? {
+        return Err(io::Error::other(conflict));
+    }
+    let stop_file = channel_restart_stop_file(harness_home, service_id)?;
     if let Some(parent) = stop_file.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -721,27 +768,140 @@ fn restart_service_id(platform: &str) -> Option<&'static str> {
     }
 }
 
-fn channel_restart_stop_file(harness_home: &Path, service_id: &str) -> PathBuf {
-    let plan_file = harness_home
-        .join("state")
-        .join("supervisor")
-        .join("windows-scheduled-tasks")
-        .join("supervisor-plan.json");
-    if let Ok(text) = fs::read_to_string(&plan_file) {
-        if let Ok(value) = serde_json::from_str::<Value>(&text) {
-            if let Some(stop_file) = value
-                .get("tasks")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .find(|task| task.get("component").and_then(Value::as_str) == Some(service_id))
-                .and_then(|task| task.get("stopFile").and_then(Value::as_str))
-            {
-                return PathBuf::from(stop_file);
-            }
+fn channel_restart_stop_file(harness_home: &Path, service_id: &str) -> io::Result<PathBuf> {
+    let heartbeat_file = channel_restart_owner_file(harness_home, "loop-heartbeats", service_id);
+    let heartbeat = read_channel_restart_owner_json(&heartbeat_file)?;
+    if let Some(stop_file) = heartbeat
+        .as_ref()
+        .filter(|value| channel_restart_owner_is_live(value))
+        .and_then(channel_restart_watched_stop_file)
+    {
+        return Ok(stop_file);
+    }
+
+    let service_file = channel_restart_owner_file(harness_home, "services", service_id);
+    let service = read_channel_restart_owner_json(&service_file)?;
+    if let Some(stop_file) = service
+        .as_ref()
+        .filter(|value| channel_restart_owner_is_live(value))
+        .and_then(channel_restart_watched_stop_file)
+    {
+        return Ok(stop_file);
+    }
+
+    Ok(crate::loop_health::supervisor_stop_file_path(
+        harness_home,
+        service_id,
+    ))
+}
+
+fn channel_restart_owner_conflict(
+    harness_home: &Path,
+    service_id: &str,
+) -> io::Result<Option<String>> {
+    let service_file = channel_restart_owner_file(harness_home, "services", service_id);
+    let service = read_channel_restart_owner_json(&service_file)?;
+    if let Some(service) = &service {
+        if service
+            .get("ownershipConflict")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(Some(format!(
+                "ownership-ambiguous: {service_id} service registry already reports ownership conflict"
+            )));
         }
     }
-    crate::loop_health::supervisor_stop_file_path(harness_home, service_id)
+
+    let heartbeat_file = channel_restart_owner_file(harness_home, "loop-heartbeats", service_id);
+    let heartbeat = read_channel_restart_owner_json(&heartbeat_file)?;
+    let service_alive = service.as_ref().is_some_and(channel_restart_owner_is_live);
+    let heartbeat_alive = heartbeat
+        .as_ref()
+        .is_some_and(channel_restart_owner_is_live);
+
+    if service_alive
+        && service
+            .as_ref()
+            .and_then(|value| value.get("observedOnly"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return Ok(Some(format!(
+            "ownership-ambiguous: {service_id} is live but observed-only; stop-file path is not machine-owned"
+        )));
+    }
+    if heartbeat_alive
+        && heartbeat
+            .as_ref()
+            .and_then(|value| value.get("observedOnly"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return Ok(Some(format!(
+            "ownership-ambiguous: {service_id} heartbeat is live but observed-only; stop-file path is not machine-owned"
+        )));
+    }
+
+    let service_generation = service
+        .as_ref()
+        .and_then(|value| value.get("generationId"))
+        .and_then(Value::as_str);
+    let heartbeat_generation = heartbeat
+        .as_ref()
+        .and_then(|value| value.get("generationId"))
+        .and_then(Value::as_str);
+    if service_alive
+        && heartbeat_alive
+        && service_generation.is_some()
+        && heartbeat_generation.is_some()
+        && service_generation != heartbeat_generation
+    {
+        return Ok(Some(format!(
+            "ownership-ambiguous: {service_id} service registry and heartbeat generations differ"
+        )));
+    }
+    Ok(None)
+}
+
+fn channel_restart_owner_file(harness_home: &Path, folder: &str, service_id: &str) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("supervisor")
+        .join(folder)
+        .join(format!("{service_id}.json"))
+}
+
+fn read_channel_restart_owner_json(path: &Path) -> io::Result<Option<Value>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
+fn channel_restart_owner_process_id(value: &Value) -> Option<i64> {
+    value
+        .get("pid")
+        .or_else(|| value.get("processId"))
+        .and_then(Value::as_i64)
+}
+
+fn channel_restart_owner_is_live(value: &Value) -> bool {
+    channel_restart_owner_process_id(value).and_then(crate::loop_health::process_alive_for_pid)
+        == Some(true)
+}
+
+fn channel_restart_watched_stop_file(value: &Value) -> Option<PathBuf> {
+    value
+        .get("watchedStopFile")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn thinking_command_effect(
@@ -1201,6 +1361,13 @@ fn command_reply_text(effect: &ChannelCommandEffect) -> String {
                 format!("Restart request status: {status}\n{detail}")
             }
         }
+        ChannelCommandEffect::RestartStatus { status, detail, .. } => {
+            if status == "ok" {
+                detail.clone()
+            } else {
+                format!("Restart status failed: {detail}")
+            }
+        }
         ChannelCommandEffect::AddSteering { instruction } => {
             format!("Steering note recorded for this session: {instruction}")
         }
@@ -1305,6 +1472,16 @@ fn command_reply_text(effect: &ChannelCommandEffect) -> String {
             )
         }
         ChannelCommandEffect::ShowStatus { snapshot, .. } => status_reply_text(snapshot),
+        ChannelCommandEffect::UnknownCommand { name, rest, detail } => {
+            let mut text = format!("Unknown or unsupported command: /{name}");
+            if let Some(rest) = rest {
+                text.push(' ');
+                text.push_str(rest);
+            }
+            text.push('\n');
+            text.push_str(detail);
+            text
+        }
     }
 }
 
@@ -1384,6 +1561,38 @@ fn status_reply_text(snapshot: &ChannelStatusSnapshot) -> String {
             snapshot.plugins_total
         ),
     }
+}
+
+fn restart_status_summary(report: &GatewayRestartStatusReport) -> String {
+    let latest_request = report
+        .latest_request
+        .as_ref()
+        .and_then(|value| value.at_ms)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let consumed = report
+        .latest_consumption
+        .as_ref()
+        .and_then(|value| value.consumed_at_ms)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let completion = report
+        .latest_completion
+        .as_ref()
+        .and_then(|value| value.heartbeat_at_ms)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "Restart status:\nLatest request at: {latest_request}\nConsumed at: {consumed}\nCompletion heartbeat at: {completion}\nGateway service: {}\nGateway generation: {}\nGateway heartbeat: {}",
+        report.service.status.as_deref().unwrap_or("-"),
+        report
+            .service
+            .generation_id
+            .as_deref()
+            .or(report.heartbeat.generation_id.as_deref())
+            .unwrap_or("-"),
+        report.heartbeat.status.as_deref().unwrap_or("-")
+    )
 }
 
 fn status_snapshot(
@@ -1681,6 +1890,57 @@ mod tests {
     }
 
     #[test]
+    fn channel_step_replies_to_unknown_slash_command_without_agent_turn() {
+        let root = temp_root("channel_step_replies_to_unknown_slash_command_without_agent_turn");
+        let source = write_channel_source(&root);
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "/unknown value".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        let step = build_channel_step(&registry, &turn);
+
+        assert_eq!(step.action, ChannelStepAction::ReplyOnly);
+        assert!(step.agent_turn.is_none());
+        assert_eq!(step.outbound_messages.len(), 1);
+        assert_eq!(
+            step.outbound_messages[0].kind,
+            ChannelOutboundMessageKind::CommandReply
+        );
+        assert!(
+            step.outbound_messages[0]
+                .text
+                .contains("no model turn was started")
+        );
+        assert!(matches!(
+            step.command_effect,
+            Some(ChannelCommandEffect::UnknownCommand {
+                ref name,
+                ref rest,
+                ..
+            }) if name == "unknown" && rest.as_deref() == Some("value")
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn channel_step_requests_channel_restart_stop_file() {
         let root = temp_root("channel_step_requests_channel_restart_stop_file");
         let source = write_channel_source(&root);
@@ -1689,13 +1949,15 @@ mod tests {
             .join("state")
             .join("supervisor")
             .join("windows-scheduled-tasks");
-        let stop_file = supervisor_dir.join("stop").join("telegram-loop.stop");
-        fs::create_dir_all(stop_file.parent().unwrap()).unwrap();
+        let stale_plan_stop_file = supervisor_dir.join("stop").join("telegram-loop.stop");
+        let stop_file =
+            crate::loop_health::supervisor_stop_file_path(&harness_home, "telegram-loop");
+        fs::create_dir_all(stale_plan_stop_file.parent().unwrap()).unwrap();
         fs::write(
             supervisor_dir.join("supervisor-plan.json"),
             serde_json::to_string(&serde_json::json!({
                 "tasks": [
-                    { "component": "telegram-loop", "stopFile": stop_file }
+                    { "component": "telegram-loop", "stopFile": stale_plan_stop_file }
                 ]
             }))
             .unwrap(),
@@ -1738,12 +2000,15 @@ mod tests {
                 ref service_id,
                 ref status,
                 ref reason,
+                stop_file: ref effect_stop_file,
                 ..
             }) if platform == "telegram"
                 && service_id.as_deref() == Some("telegram-loop")
                 && status == "requested"
                 && reason.as_deref() == Some("reconnect adapter")
+                && effect_stop_file.as_ref() == Some(&stop_file)
         ));
+        assert!(!stale_plan_stop_file.is_file());
         let stop_value: Value = serde_json::from_slice(&fs::read(&stop_file).unwrap()).unwrap();
         assert_eq!(
             stop_value["schema"],
@@ -1763,6 +2028,187 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_restart_prefers_live_watched_stop_file() {
+        let root = temp_root("channel_restart_prefers_live_watched_stop_file");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let service_id = "telegram-loop";
+        let pid = std::process::id();
+        let generation_id = "telegram-loop-live-generation";
+        let watched_stop_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("live-stop-files")
+            .join("telegram-loop.live.stop");
+        let canonical_stop_file =
+            crate::loop_health::supervisor_stop_file_path(&harness_home, service_id);
+        let services_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        let heartbeat_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("loop-heartbeats");
+        fs::create_dir_all(&services_dir).unwrap();
+        fs::create_dir_all(&heartbeat_dir).unwrap();
+        fs::write(
+            services_dir.join(format!("{service_id}.json")),
+            serde_json::to_string(&serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": service_id,
+                "serviceKind": "telegram-ingress",
+                "pid": pid,
+                "processId": pid,
+                "generationId": generation_id,
+                "launchOwner": "rust-supervisor-run",
+                "observedOnly": false,
+                "status": "running",
+                "actualState": "running",
+                "watchedStopFile": watched_stop_file
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            heartbeat_dir.join(format!("{service_id}.json")),
+            serde_json::to_string(&serde_json::json!({
+                "schema": "agent-harness.loop-heartbeat.v1",
+                "serviceId": service_id,
+                "processId": pid,
+                "generationId": generation_id,
+                "launchOwner": "rust-supervisor-run",
+                "observedOnly": false,
+                "status": "heartbeat",
+                "atMs": 10_000,
+                "watchedStopFile": watched_stop_file
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "operator".to_string(),
+                text: "/restart telegram reconnect adapter".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        let step = build_channel_step(&registry, &turn);
+
+        assert_eq!(step.action, ChannelStepAction::ReplyOnly);
+        assert!(step.agent_turn.is_none());
+        assert!(matches!(
+            step.command_effect,
+            Some(ChannelCommandEffect::RestartChannel {
+                ref status,
+                stop_file: ref effect_stop_file,
+                ..
+            }) if status == "requested" && effect_stop_file.as_ref() == Some(&watched_stop_file)
+        ));
+        assert!(watched_stop_file.is_file());
+        assert!(!canonical_stop_file.exists());
+        let stop_value: Value =
+            serde_json::from_slice(&fs::read(&watched_stop_file).unwrap()).unwrap();
+        assert_eq!(stop_value["serviceId"], service_id);
+        assert_eq!(stop_value["createdBy"], "channel-restart-command");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_restart_fails_when_live_owner_is_observed_only() {
+        let root = temp_root("channel_restart_fails_when_live_owner_is_observed_only");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let services_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        fs::create_dir_all(&services_dir).unwrap();
+        fs::write(
+            services_dir.join("telegram-loop.json"),
+            serde_json::to_string(&serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "telegram-loop",
+                "serviceKind": "telegram-ingress",
+                "pid": std::process::id(),
+                "processId": std::process::id(),
+                "generationId": "manual-telegram-loop",
+                "launchOwner": "external-runner-observe-only",
+                "observedOnly": true,
+                "status": "running",
+                "actualState": "running"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let stop_file =
+            crate::loop_health::supervisor_stop_file_path(&harness_home, "telegram-loop");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "operator".to_string(),
+                text: "/restart telegram reconnect adapter".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        let step = build_channel_step(&registry, &turn);
+
+        assert_eq!(step.action, ChannelStepAction::ReplyOnly);
+        assert!(step.agent_turn.is_none());
+        assert!(
+            step.outbound_messages[0]
+                .text
+                .contains("ownership-ambiguous")
+        );
+        assert!(matches!(
+            step.command_effect,
+            Some(ChannelCommandEffect::RestartChannel {
+                ref status,
+                ref detail,
+                stop_file: None,
+                ..
+            }) if status == "failed" && detail.contains("ownership-ambiguous")
+        ));
+        assert!(!stop_file.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_restart_stop_file_targets_live_owner_or_fails_explicit() {
+        channel_restart_prefers_live_watched_stop_file();
+        channel_restart_fails_when_live_owner_is_observed_only();
     }
 
     #[test]
@@ -1828,6 +2274,68 @@ mod tests {
                 .join("gateway-restart-requests.jsonl")
                 .is_file()
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_step_replies_to_restart_status_without_agent_turn() {
+        let root = temp_root("channel_step_replies_to_restart_status_without_agent_turn");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let supervisor_dir = harness_home.join("state").join("supervisor");
+        fs::create_dir_all(&supervisor_dir).unwrap();
+        fs::write(
+            supervisor_dir.join("gateway-restart-requests.jsonl"),
+            "{\"status\":\"requested\",\"requestFile\":\"request.json\",\"atMs\":1000}\n\
+             {\"status\":\"consumed\",\"requestFile\":\"request.json\",\"consumedRequestFile\":\"consumed.json\",\"consumedAtMs\":1100,\"consumedBy\":\"discord-gateway-loop\",\"generationId\":\"gateway-generation-1\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            supervisor_dir.join("gateway-restart-completions.jsonl"),
+            "{\"status\":\"completed\",\"requestFile\":\"request.json\",\"consumedRequestFile\":\"consumed.json\",\"heartbeatAtMs\":1200,\"heartbeatStatus\":\"spawning\",\"heartbeatGenerationId\":\"gateway-generation-1\"}\n",
+        )
+        .unwrap();
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "discord".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "operator".to_string(),
+                text: "/restart status".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        let step = build_channel_step(&registry, &turn);
+
+        assert_eq!(step.action, ChannelStepAction::ReplyOnly);
+        assert!(step.agent_turn.is_none());
+        assert!(step.outbound_messages[0].text.contains("Restart status"));
+        assert!(step.outbound_messages[0].text.contains("Consumed at: 1100"));
+        assert!(matches!(
+            step.command_effect,
+            Some(ChannelCommandEffect::RestartStatus {
+                ref status,
+                report: Some(ref report),
+                ..
+            }) if status == "ok"
+                && report
+                    .latest_completion
+                    .as_ref()
+                    .and_then(|completion| completion.heartbeat_at_ms)
+                    == Some(1200)
+        ));
 
         let _ = fs::remove_dir_all(root);
     }

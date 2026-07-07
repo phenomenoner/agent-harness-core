@@ -4,6 +4,51 @@
 
 No unreleased changes.
 
+## v0.5.0 - 2026-07-07
+
+### Changed
+
+- Hardened terminal-control lifecycle handling so durable stop, skip,
+  quarantine, restart, cron-freshness, and sender-source controls are consulted
+  before runtime execution, progress delivery, restart completion, or
+  sender-class cron notification.
+- Added Dream Director freshness checks that suppress stale source packets,
+  normalize relative-home source paths, and expose deterministic freshness and
+  catch-up decisions for queued notification work.
+- Added loop diagnostics and readback surfaces for resource-exhaustion and
+  restart-control troubleshooting.
+- Made cron-canon status parsing tolerate UTF-8 BOM JSON receipts and expanded
+  cron freshness monitoring so stale cron state is reported as actionable
+  status/health evidence instead of parser noise.
+- Repaired progress/final ordering for channel transports by using queue-local
+  wake freshness, preserving first progress sends, reclaiming same-queue orphan
+  progress surfaces, and waiting for the source final delivery before terminal
+  progress closure.
+- Repaired final-outbox ownership for configured non-main channel agents:
+  completed turns now write a final reply when the run agent matches the
+  lane-owning agent, while owner-mismatched runs remain internal evidence.
+- Hardened interrupted long-task recovery so terminal tool-timeout and
+  no-final-answer interruption classes can roll to bounded virtual-session
+  continuation when recovery gates allow it, while provider-outage-shaped
+  failures stay out of the continuation predicate.
+- Expanded the scenario matrix and topology documentation with
+  terminal-control, restart-control-plane, cron-freshness, progress-ordering,
+  non-main final-owner, and interrupted-task recovery gates.
+
+### Verification
+
+- Added checked-in replay coverage for sanitized ghost-queue suppression,
+  restart-control staging closure, and cron-outage stale-source
+  suppression/catch-up.
+- Added focused regressions for queue skip/sticky terminal control, scoped stop
+  suppression, lease reconciliation, terminal-control progress closure,
+  queue-local progress ordering, final delivery before terminal progress,
+  non-main final-owner routing, owner-mismatch suppression, and interrupted
+  virtual-session continuation.
+- Refreshed the schema registry, scenario matrix, release checklist, topology
+  contract, invariants, configuration docs, and generated topology explorer for
+  the new lifecycle and recovery gates.
+
 ## v0.4.0 - 2026-07-03
 
 ### Difference from v0.3.0

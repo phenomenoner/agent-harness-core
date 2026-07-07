@@ -1,0 +1,26 @@
+{
+  "schema": "agent-harness.round16.e2e1-ghost-queue-replay.v1",
+  "platform": "discord",
+  "accountId": "fixture-account",
+  "channelId": "fixture-channel",
+  "userId": "fixture-user",
+  "agentId": "main",
+  "sessionKey": "discord:fixture-channel:fixture-user:main",
+  "message": "fixture ghost queue work",
+  "inboundEventKind": "message",
+  "inboundEventId": "fixture-provider-message-1",
+  "duplicateInboundEventId": "fixture-provider-message-1",
+  "stopMessage": "/stop fixture ghost replay",
+  "stopInboundEventKind": "interaction",
+  "stopInboundEventId": "fixture-provider-stop-1",
+  "firstNowMs": 1000,
+  "duplicateNowMs": 1001,
+  "stopNowMs": 1002,
+  "expected": {
+    "duplicateStatus": "duplicate-suppressed",
+    "stopScope": "active-session-siblings",
+    "terminalControlSource": "scoped-stop",
+    "suppressedRunOnceReason": "terminal-control-present",
+    "suppressionReceiptCount": 1
+  }
+}

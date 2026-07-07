@@ -34,7 +34,7 @@ pub struct HarnessStatusOptions {
     pub harness_home: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HarnessStatusReport {
     pub schema: &'static str,
@@ -124,6 +124,7 @@ pub struct HarnessLoopStatus {
     pub heartbeats: Vec<HarnessLoopHeartbeatStatus>,
     pub services_dir: PathBuf,
     pub services: Vec<HarnessSupervisorServiceStatus>,
+    pub gateway_restart_requests: HarnessJsonlStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -138,6 +139,12 @@ pub struct HarnessLoopHeartbeatStatus {
     pub iteration: Option<i64>,
     pub process_id: Option<i64>,
     pub process_alive: Option<bool>,
+    pub generation_id: Option<String>,
+    pub parent_pid: Option<i64>,
+    pub process_start_time_ms: Option<i64>,
+    pub watched_stop_file: Option<PathBuf>,
+    pub launch_owner: Option<String>,
+    pub observed_only: Option<bool>,
     pub at_ms: Option<i64>,
     pub age_ms: Option<i64>,
     pub detail: Option<String>,
@@ -164,6 +171,7 @@ pub struct HarnessSupervisorServiceStatus {
     pub process_id: Option<i64>,
     pub process_alive: Option<bool>,
     pub supervisor_process_id: Option<i64>,
+    pub parent_pid: Option<i64>,
     pub started_at_ms: Option<i64>,
     pub process_start_time_ms: Option<i64>,
     pub last_heartbeat_at_ms: Option<i64>,
@@ -186,9 +194,12 @@ pub struct HarnessSupervisorServiceStatus {
     pub detail: Option<String>,
     pub launch_owner: Option<String>,
     pub observed_only: Option<bool>,
+    pub watched_stop_file: Option<PathBuf>,
+    pub ownership_conflict: bool,
+    pub ownership_conflict_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HarnessCronSchedulerStatus {
     pub state_dir: PathBuf,
@@ -206,6 +217,39 @@ pub struct HarnessCronSchedulerStatus {
     pub latest_skipped_policy: Option<i64>,
     pub latest_errors: Option<i64>,
     pub receipts: HarnessJsonlStatus,
+    pub canon: HarnessCronCanonStatus,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessCronCanonStatus {
+    pub canon_path: PathBuf,
+    pub canon_present: bool,
+    pub keeper_receipt_path: PathBuf,
+    pub keeper_receipt_present: bool,
+    pub keeper_status: Option<String>,
+    pub keeper_ok: Option<bool>,
+    pub keeper_age_ms: Option<i64>,
+    pub keeper_age_hours: Option<f64>,
+    pub monitor_count: usize,
+    pub finding_count: usize,
+    pub stale_count: usize,
+    pub findings: Vec<HarnessCronCanonFinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessCronCanonFinding {
+    pub severity: String,
+    pub code: String,
+    pub cron_id: String,
+    pub message: String,
+    pub path: Option<PathBuf>,
+    pub age_ms: Option<i64>,
+    pub max_age_ms: Option<i64>,
+    pub age_hours: Option<f64>,
+    pub max_age_hours: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -344,6 +388,94 @@ pub struct HarnessJsonlStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GatewayRestartStatusReport {
+    pub schema: &'static str,
+    pub harness_home: PathBuf,
+    pub requests: HarnessJsonlStatus,
+    pub completions: HarnessJsonlStatus,
+    pub latest_request: Option<GatewayRestartReceiptStatus>,
+    pub latest_consumption: Option<GatewayRestartReceiptStatus>,
+    pub latest_completion: Option<GatewayRestartCompletionStatus>,
+    pub service: GatewayRestartServiceStatus,
+    pub heartbeat: GatewayRestartHeartbeatStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayRestartReceiptStatus {
+    pub status: Option<String>,
+    pub request_file: Option<PathBuf>,
+    pub consumed_request_file: Option<PathBuf>,
+    pub receipt_file: Option<PathBuf>,
+    pub reason: Option<String>,
+    pub requesting_platform: Option<String>,
+    pub channel_id: Option<String>,
+    pub user_id: Option<String>,
+    pub session_key: Option<String>,
+    pub at_ms: Option<i64>,
+    pub consumed_at_ms: Option<i64>,
+    pub consumed_by: Option<String>,
+    pub consumer_pid: Option<i64>,
+    pub parent_pid: Option<i64>,
+    pub generation_id: Option<String>,
+    pub process_start_time_ms: Option<i64>,
+    pub stop_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayRestartCompletionStatus {
+    pub status: Option<String>,
+    pub request_file: Option<PathBuf>,
+    pub consumed_request_file: Option<PathBuf>,
+    pub consumed_at_ms: Option<i64>,
+    pub consumed_by: Option<String>,
+    pub consumer_pid: Option<i64>,
+    pub generation_id: Option<String>,
+    pub process_start_time_ms: Option<i64>,
+    pub heartbeat_status: Option<String>,
+    pub heartbeat_generation_id: Option<String>,
+    pub heartbeat_process_id: Option<i64>,
+    pub heartbeat_at_ms: Option<i64>,
+    pub notified: Option<bool>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayRestartServiceStatus {
+    pub service_file: PathBuf,
+    pub present: bool,
+    pub corrupt: bool,
+    pub parse_error: Option<String>,
+    pub status: Option<String>,
+    pub actual_state: Option<String>,
+    pub generation_id: Option<String>,
+    pub process_id: Option<i64>,
+    pub process_alive: Option<bool>,
+    pub supervisor_process_id: Option<i64>,
+    pub process_start_time_ms: Option<i64>,
+    pub last_heartbeat_at_ms: Option<i64>,
+    pub launch_owner: Option<String>,
+    pub observed_only: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayRestartHeartbeatStatus {
+    pub heartbeat_file: PathBuf,
+    pub present: bool,
+    pub corrupt: bool,
+    pub parse_error: Option<String>,
+    pub status: Option<String>,
+    pub generation_id: Option<String>,
+    pub process_id: Option<i64>,
+    pub process_alive: Option<bool>,
+    pub at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HarnessRuntimeReceiptStatus {
     pub path: PathBuf,
     pub line_number: usize,
@@ -370,6 +502,7 @@ pub fn collect_harness_status(options: HarnessStatusOptions) -> io::Result<Harne
         harness_home: options.harness_home.clone(),
     })?;
     let cron_scheduler = cron_scheduler_status(&options.harness_home)?;
+    warnings.extend(cron_scheduler.warnings.clone());
     let cron_runs = cron_runs_status(&options.harness_home)?;
     let memory = memory_status(&options.harness_home)?;
     let learning = learning_status(&options.harness_home)?;
@@ -391,6 +524,29 @@ pub fn collect_harness_status(options: HarnessStatusOptions) -> io::Result<Harne
         plugins,
         logs,
         warnings,
+    })
+}
+
+pub fn collect_gateway_restart_status(
+    harness_home: impl AsRef<Path>,
+) -> io::Result<GatewayRestartStatusReport> {
+    let harness_home = harness_home.as_ref();
+    let supervisor_dir = harness_home.join("state").join("supervisor");
+    let requests_file = supervisor_dir.join("gateway-restart-requests.jsonl");
+    let completions_file = supervisor_dir.join("gateway-restart-completions.jsonl");
+    let latest_request = latest_gateway_restart_receipt(&requests_file, Some("requested"))?;
+    let latest_consumption = latest_gateway_restart_receipt(&requests_file, Some("consumed"))?;
+    let latest_completion = latest_gateway_restart_completion(&completions_file)?;
+    Ok(GatewayRestartStatusReport {
+        schema: "agent-harness.gateway-restart-status.v1",
+        harness_home: harness_home.to_path_buf(),
+        requests: jsonl_status(requests_file)?,
+        completions: jsonl_status(completions_file)?,
+        latest_request,
+        latest_consumption,
+        latest_completion,
+        service: gateway_restart_service_status(harness_home)?,
+        heartbeat: gateway_restart_heartbeat_status(harness_home)?,
     })
 }
 
@@ -444,6 +600,12 @@ fn loop_status(harness_home: &Path) -> io::Result<HarnessLoopStatus> {
         heartbeats,
         services_dir,
         services,
+        gateway_restart_requests: jsonl_status(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("gateway-restart-requests.jsonl"),
+        )?,
     })
 }
 
@@ -489,6 +651,7 @@ fn read_supervisor_services(
                     process_id: None,
                     process_alive: None,
                     supervisor_process_id: None,
+                    parent_pid: None,
                     started_at_ms: None,
                     process_start_time_ms: None,
                     last_heartbeat_at_ms: None,
@@ -511,6 +674,9 @@ fn read_supervisor_services(
                     detail: None,
                     launch_owner: None,
                     observed_only: None,
+                    watched_stop_file: None,
+                    ownership_conflict: false,
+                    ownership_conflict_reason: None,
                 });
                 continue;
             }
@@ -528,6 +694,8 @@ fn read_supervisor_services(
             process_id,
             process_alive: process_id.and_then(process_alive_for_pid),
             supervisor_process_id: i64_path(&value, &["supervisorPid"]),
+            parent_pid: i64_path(&value, &["parentPid"])
+                .or_else(|| i64_path(&value, &["supervisorPid"])),
             started_at_ms: i64_path(&value, &["startedAtMs"]),
             process_start_time_ms: i64_path(&value, &["processStartTimeMs"]),
             last_heartbeat_at_ms,
@@ -550,6 +718,18 @@ fn read_supervisor_services(
             detail: string_path(&value, &["detail"]),
             launch_owner: string_path(&value, &["launchOwner"]),
             observed_only: bool_path(&value, &["observedOnly"]),
+            watched_stop_file: pathbuf_path(&value, &["watchedStopFile"]),
+            ownership_conflict: bool_path(&value, &["ownershipConflict"])
+                .unwrap_or_else(|| bool_path(&value, &["observedOnly"]).unwrap_or(false)),
+            ownership_conflict_reason: string_path(&value, &["ownershipConflictReason"]).or_else(
+                || {
+                    if bool_path(&value, &["observedOnly"]) == Some(true) {
+                        Some("observed-only-owner".to_string())
+                    } else {
+                        None
+                    }
+                },
+            ),
         });
     }
 
@@ -584,6 +764,28 @@ fn apply_fresh_heartbeat_precedence_to_services(
 
         service.process_id = heartbeat.process_id.or(service.process_id);
         service.process_alive = heartbeat.process_alive.or(service.process_alive);
+        if heartbeat.watched_stop_file.is_some() {
+            service.watched_stop_file = heartbeat.watched_stop_file.clone();
+        }
+        if heartbeat.generation_id.is_some()
+            && service.generation_id.is_some()
+            && heartbeat.generation_id != service.generation_id
+        {
+            service.ownership_conflict = true;
+            service.ownership_conflict_reason = Some("generation-mismatch".to_string());
+        }
+        if heartbeat.observed_only == Some(true) || service.observed_only == Some(true) {
+            service.ownership_conflict = true;
+            service
+                .ownership_conflict_reason
+                .get_or_insert_with(|| "observed-only-owner".to_string());
+        }
+        if heartbeat.launch_owner.is_some() {
+            service.launch_owner = heartbeat.launch_owner.clone();
+        }
+        if heartbeat.observed_only.is_some() {
+            service.observed_only = heartbeat.observed_only;
+        }
         service.last_heartbeat_at_ms = heartbeat.at_ms.or(service.last_heartbeat_at_ms);
         service.age_ms = service
             .last_heartbeat_at_ms
@@ -644,6 +846,8 @@ fn cron_scheduler_status(harness_home: &Path) -> io::Result<HarnessCronScheduler
     let latest = fs::read_to_string(&loop_last_file)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let canon = cron_canon_status(harness_home, epoch_ms().unwrap_or(0))?;
+    let warnings = cron_canon_warnings(&canon);
     Ok(HarnessCronSchedulerStatus {
         state_dir: state_dir.clone(),
         database_present: database.is_file(),
@@ -678,7 +882,445 @@ fn cron_scheduler_status(harness_home: &Path) -> io::Result<HarnessCronScheduler
             .and_then(|value| i64_path(value, &["summary", "errors"])),
         loop_last_file,
         receipts: jsonl_status(state_dir.join("receipts.jsonl"))?,
+        canon,
+        warnings,
     })
+}
+
+fn cron_canon_status(harness_home: &Path, now_ms: i64) -> io::Result<HarnessCronCanonStatus> {
+    let canon_path = harness_home
+        .join("workspace")
+        .join("docs")
+        .join("ops")
+        .join("cron-canon.json");
+    let mut status = HarnessCronCanonStatus {
+        canon_path: canon_path.clone(),
+        canon_present: canon_path.is_file(),
+        keeper_receipt_path: harness_home
+            .join("state")
+            .join("ops")
+            .join("cron-canon")
+            .join("latest-cron-canon-keeper.json"),
+        ..HarnessCronCanonStatus::default()
+    };
+    let Some(canon) = read_json_file(&canon_path) else {
+        return Ok(status);
+    };
+    if let Some(keeper_receipt) = string_path(&canon, &["paths", "keeperReceipt"]) {
+        status.keeper_receipt_path = resolve_harness_path(harness_home, &keeper_receipt);
+    }
+    status.keeper_receipt_present = status.keeper_receipt_path.is_file();
+    if let Some(keeper) = read_json_file(&status.keeper_receipt_path) {
+        status.keeper_status = string_path(&keeper, &["status"]);
+        status.keeper_ok = bool_path(&keeper, &["ok"]);
+        status.keeper_age_ms = latest_receipt_age_ms(&status.keeper_receipt_path, &keeper, now_ms);
+        status.keeper_age_hours = status.keeper_age_ms.map(ms_to_hours);
+        append_keeper_findings(&mut status.findings, &keeper);
+    }
+    if let Some(active_crons) = canon.get("activeCrons").and_then(Value::as_array) {
+        for cron in active_crons {
+            if bool_path(cron, &["enabled"]) == Some(false) {
+                continue;
+            }
+            let cron_id = string_path(cron, &["id"]).unwrap_or_else(|| "unknown".to_string());
+            let Some(monitor) = cron.get("monitor") else {
+                continue;
+            };
+            if string_path(monitor, &["type"]).as_deref() != Some("latest-json") {
+                continue;
+            }
+            status.monitor_count += 1;
+            evaluate_latest_json_monitor(harness_home, now_ms, &cron_id, monitor, &mut status);
+        }
+    }
+    status.finding_count = status.findings.len();
+    status.stale_count = status
+        .findings
+        .iter()
+        .filter(|finding| finding.code.contains("stale"))
+        .count();
+    Ok(status)
+}
+
+fn cron_canon_warnings(status: &HarnessCronCanonStatus) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if status.canon_present && !status.keeper_receipt_present {
+        warnings.push(format!(
+            "cron canon keeper receipt is missing: {}",
+            status.keeper_receipt_path.display()
+        ));
+    }
+    if let Some(keeper_status) = status.keeper_status.as_deref()
+        && keeper_status != "ok"
+    {
+        warnings.push(format!("cron canon keeper status={keeper_status}"));
+    }
+    if status.keeper_ok == Some(false) {
+        warnings.push("cron canon keeper reported ok=false".to_string());
+    }
+    for finding in &status.findings {
+        warnings.push(format!(
+            "cron canon {} {} {}: {}{}{}",
+            finding.severity,
+            finding.cron_id,
+            finding.code,
+            finding.message,
+            finding
+                .age_hours
+                .map(|age| format!(" ageHours={age:.3}"))
+                .unwrap_or_default(),
+            finding
+                .max_age_hours
+                .map(|max| format!(" maxAgeHours={max:.3}"))
+                .unwrap_or_default()
+        ));
+    }
+    warnings
+}
+
+fn evaluate_latest_json_monitor(
+    harness_home: &Path,
+    now_ms: i64,
+    cron_id: &str,
+    monitor: &Value,
+    status: &mut HarnessCronCanonStatus,
+) {
+    let latest_path = if let Some(path) = string_path(monitor, &["path"]) {
+        let path = resolve_harness_path(harness_home, &path);
+        path.is_file().then_some(path)
+    } else if let Some(path_glob) = string_path(monitor, &["pathGlob"]) {
+        latest_glob_match(harness_home, &path_glob)
+    } else {
+        None
+    };
+    let Some(path) = latest_path else {
+        status.findings.push(HarnessCronCanonFinding {
+            severity: "warn".to_string(),
+            code: "receipt-missing".to_string(),
+            cron_id: cron_id.to_string(),
+            message: "Expected receipt file is missing.".to_string(),
+            path: None,
+            age_ms: None,
+            max_age_ms: monitor_max_age_ms(monitor),
+            age_hours: None,
+            max_age_hours: monitor_max_age_ms(monitor).map(ms_to_hours),
+        });
+        return;
+    };
+    let Some(json) = read_json_file(&path) else {
+        status.findings.push(HarnessCronCanonFinding {
+            severity: "warn".to_string(),
+            code: "receipt-invalid-json".to_string(),
+            cron_id: cron_id.to_string(),
+            message: "Latest receipt is not valid JSON.".to_string(),
+            path: Some(path),
+            age_ms: None,
+            max_age_ms: monitor_max_age_ms(monitor),
+            age_hours: None,
+            max_age_hours: monitor_max_age_ms(monitor).map(ms_to_hours),
+        });
+        return;
+    };
+    if let (Some(age_ms), Some(max_age_ms)) = (
+        latest_receipt_age_ms(&path, &json, now_ms),
+        monitor_max_age_ms(monitor),
+    ) && age_ms > max_age_ms
+    {
+        status.findings.push(HarnessCronCanonFinding {
+            severity: "warn".to_string(),
+            code: "receipt-stale".to_string(),
+            cron_id: cron_id.to_string(),
+            message: "Latest receipt is older than canon allows.".to_string(),
+            path: Some(path.clone()),
+            age_ms: Some(age_ms),
+            max_age_ms: Some(max_age_ms),
+            age_hours: Some(ms_to_hours(age_ms)),
+            max_age_hours: Some(ms_to_hours(max_age_ms)),
+        });
+    }
+    if let Some(ok_field) = string_path(monitor, &["okField"]) {
+        let actual = json.get(&ok_field);
+        let expected = monitor.get("okValue");
+        if actual != expected {
+            status.findings.push(HarnessCronCanonFinding {
+                severity: "warn".to_string(),
+                code: "receipt-not-ok".to_string(),
+                cron_id: cron_id.to_string(),
+                message: "Latest receipt ok field does not match canon.".to_string(),
+                path: Some(path),
+                age_ms: None,
+                max_age_ms: monitor_max_age_ms(monitor),
+                age_hours: None,
+                max_age_hours: monitor_max_age_ms(monitor).map(ms_to_hours),
+            });
+        }
+    }
+}
+
+fn append_keeper_findings(findings: &mut Vec<HarnessCronCanonFinding>, keeper: &Value) {
+    let Some(items) = keeper.get("findings").and_then(Value::as_array) else {
+        return;
+    };
+    for item in items {
+        let details = item.get("details").unwrap_or(&Value::Null);
+        findings.push(HarnessCronCanonFinding {
+            severity: string_path(item, &["severity"]).unwrap_or_else(|| "warn".to_string()),
+            code: string_path(item, &["code"]).unwrap_or_else(|| "keeper-finding".to_string()),
+            cron_id: string_path(item, &["cronId"]).unwrap_or_else(|| "unknown".to_string()),
+            message: string_path(item, &["message"]).unwrap_or_default(),
+            path: string_path(details, &["path"]).map(PathBuf::from),
+            age_ms: details
+                .get("ageHours")
+                .and_then(Value::as_f64)
+                .map(|hours| (hours * 3_600_000.0).round() as i64),
+            max_age_ms: details
+                .get("maxAgeHours")
+                .and_then(Value::as_f64)
+                .map(|hours| (hours * 3_600_000.0).round() as i64),
+            age_hours: details.get("ageHours").and_then(Value::as_f64),
+            max_age_hours: details.get("maxAgeHours").and_then(Value::as_f64),
+        });
+    }
+}
+
+fn monitor_max_age_ms(monitor: &Value) -> Option<i64> {
+    monitor
+        .get("maxAgeHours")
+        .and_then(Value::as_f64)
+        .map(|hours| (hours * 3_600_000.0).round() as i64)
+}
+
+fn latest_receipt_age_ms(path: &Path, json: &Value, now_ms: i64) -> Option<i64> {
+    let receipt_ms = i64_path(json, &["generatedAtMs"])
+        .or_else(|| i64_path(json, &["atMs"]))
+        .or_else(|| string_path(json, &["generatedAt"]).and_then(|value| parse_rfc3339_ms(&value)))
+        .or_else(|| file_modified_ms(path));
+    receipt_ms.map(|receipt_ms| now_ms.saturating_sub(receipt_ms))
+}
+
+fn ms_to_hours(ms: i64) -> f64 {
+    ms as f64 / 3_600_000.0
+}
+
+fn parse_rfc3339_ms(value: &str) -> Option<i64> {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() < 20 {
+        return None;
+    }
+    let year = parse_digits_i32(bytes, 0, 4)?;
+    expect_byte(bytes, 4, b'-')?;
+    let month = parse_digits_u32(bytes, 5, 7)?;
+    expect_byte(bytes, 7, b'-')?;
+    let day = parse_digits_u32(bytes, 8, 10)?;
+    match *bytes.get(10)? {
+        b'T' | b't' | b' ' => {}
+        _ => return None,
+    }
+    let hour = parse_digits_u32(bytes, 11, 13)?;
+    expect_byte(bytes, 13, b':')?;
+    let minute = parse_digits_u32(bytes, 14, 16)?;
+    expect_byte(bytes, 16, b':')?;
+    let second = parse_digits_u32(bytes, 17, 19)?;
+    if month == 0
+        || month > 12
+        || day == 0
+        || day > days_in_month(year, month)?
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let mut index = 19;
+    let mut millis = 0_i64;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let fraction_start = index;
+        let mut fraction_millis = 0_i64;
+        let mut millis_digits = 0_usize;
+        while let Some(byte) = bytes.get(index)
+            && byte.is_ascii_digit()
+        {
+            if millis_digits < 3 {
+                fraction_millis = fraction_millis * 10 + i64::from(byte - b'0');
+                millis_digits += 1;
+            }
+            index += 1;
+        }
+        if index == fraction_start {
+            return None;
+        }
+        while millis_digits < 3 {
+            fraction_millis *= 10;
+            millis_digits += 1;
+        }
+        millis = fraction_millis;
+    }
+    let offset_ms = match bytes.get(index).copied()? {
+        b'Z' | b'z' => {
+            if index + 1 != bytes.len() {
+                return None;
+            }
+            0_i64
+        }
+        b'+' | b'-' => {
+            let sign = if bytes[index] == b'+' { 1_i64 } else { -1_i64 };
+            let offset_hour = parse_digits_u32(bytes, index + 1, index + 3)?;
+            expect_byte(bytes, index + 3, b':')?;
+            let offset_minute = parse_digits_u32(bytes, index + 4, index + 6)?;
+            if index + 6 != bytes.len() || offset_hour > 23 || offset_minute > 59 {
+                return None;
+            }
+            sign * i64::from(offset_hour * 60 + offset_minute) * 60_000
+        }
+        _ => return None,
+    };
+    let days = days_from_civil(year, month, day)?;
+    let local_ms = days
+        .checked_mul(86_400_000)?
+        .checked_add(i64::from(hour) * 3_600_000)?
+        .checked_add(i64::from(minute) * 60_000)?
+        .checked_add(i64::from(second) * 1_000)?
+        .checked_add(millis)?;
+    local_ms.checked_sub(offset_ms)
+}
+
+fn parse_digits_i32(bytes: &[u8], start: usize, end: usize) -> Option<i32> {
+    let value = parse_digits_u32(bytes, start, end)?;
+    i32::try_from(value).ok()
+}
+
+fn parse_digits_u32(bytes: &[u8], start: usize, end: usize) -> Option<u32> {
+    if start >= end || end > bytes.len() {
+        return None;
+    }
+    let mut value = 0_u32;
+    for byte in &bytes[start..end] {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
+    }
+    Some(value)
+}
+
+fn expect_byte(bytes: &[u8], index: usize, expected: u8) -> Option<()> {
+    (*bytes.get(index)? == expected).then_some(())
+}
+
+fn days_in_month(year: i32, month: u32) -> Option<u32> {
+    Some(match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => return None,
+    })
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = i32::try_from(month).ok()?;
+    let day = i32::try_from(day).ok()?;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * month_prime + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(i64::from(era) * 146_097 + i64::from(doe) - 719_468)
+}
+
+fn file_modified_ms(path: &Path) -> Option<i64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    system_time_ms(modified)
+}
+
+fn system_time_ms(value: SystemTime) -> Option<i64> {
+    let duration = value.duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(duration.as_millis()).ok()
+}
+
+fn read_json_file(path: &Path) -> Option<Value> {
+    let text = fs::read_to_string(path).ok()?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    serde_json::from_str::<Value>(text).ok()
+}
+
+fn resolve_harness_path(harness_home: &Path, value: &str) -> PathBuf {
+    let normalized = value.replace('/', "\\");
+    let path = PathBuf::from(normalized);
+    if path.is_absolute() {
+        path
+    } else {
+        harness_home.join(path)
+    }
+}
+
+fn latest_glob_match(harness_home: &Path, pattern: &str) -> Option<PathBuf> {
+    let mut matches = Vec::new();
+    let normalized = pattern.replace('\\', "/");
+    let parts: Vec<_> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    collect_glob_matches(harness_home, &parts, &mut matches);
+    matches
+        .into_iter()
+        .max_by_key(|path| file_modified_ms(path).unwrap_or(0))
+}
+
+fn collect_glob_matches(base: &Path, parts: &[&str], matches: &mut Vec<PathBuf>) {
+    if parts.is_empty() {
+        if base.is_file() {
+            matches.push(base.to_path_buf());
+        }
+        return;
+    }
+    let (part, rest) = parts.split_first().expect("non-empty parts");
+    if part.contains('*') || part.contains('?') {
+        let Ok(entries) = fs::read_dir(base) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if wildcard_match(part, &name) {
+                collect_glob_matches(&entry.path(), rest, matches);
+            }
+        }
+    } else {
+        collect_glob_matches(&base.join(part), rest, matches);
+    }
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let (mut p, mut v, mut star, mut match_after_star) = (0usize, 0usize, None, 0usize);
+    while v < value.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p].eq_ignore_ascii_case(&value[v])) {
+            p += 1;
+            v += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            match_after_star = v;
+            p += 1;
+        } else if let Some(star_pos) = star {
+            p = star_pos + 1;
+            match_after_star += 1;
+            v = match_after_star;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 fn cron_runs_status(harness_home: &Path) -> io::Result<HarnessCronRunStatus> {
@@ -720,6 +1362,12 @@ fn read_loop_heartbeat(
                 iteration: None,
                 process_id: None,
                 process_alive: None,
+                generation_id: None,
+                parent_pid: None,
+                process_start_time_ms: None,
+                watched_stop_file: None,
+                launch_owner: None,
+                observed_only: None,
                 at_ms: None,
                 age_ms: None,
                 detail: None,
@@ -748,6 +1396,12 @@ fn read_loop_heartbeat(
                 iteration: None,
                 process_id: None,
                 process_alive: None,
+                generation_id: None,
+                parent_pid: None,
+                process_start_time_ms: None,
+                watched_stop_file: None,
+                launch_owner: None,
+                observed_only: None,
                 at_ms: None,
                 age_ms: None,
                 detail: None,
@@ -774,6 +1428,12 @@ fn read_loop_heartbeat(
         iteration: i64_path(&value, &["iteration"]),
         process_id,
         process_alive: process_id.and_then(process_alive_for_pid),
+        generation_id: string_path(&value, &["generationId"]),
+        parent_pid: i64_path(&value, &["parentPid"]),
+        process_start_time_ms: i64_path(&value, &["processStartTimeMs"]),
+        watched_stop_file: pathbuf_path(&value, &["watchedStopFile"]),
+        launch_owner: string_path(&value, &["launchOwner"]),
+        observed_only: bool_path(&value, &["observedOnly"]),
         at_ms,
         age_ms: at_ms.map(|at_ms| now_ms.saturating_sub(at_ms)),
         detail: string_path(&value, &["detail"]),
@@ -880,6 +1540,7 @@ fn runtime_status(
             "canceled",
             "skipped",
             "dead-letter",
+            "suppressed",
         ],
         warnings,
         "runtime run-once receipts",
@@ -1339,6 +2000,214 @@ fn latest_non_idle_runtime_receipt(path: &Path) -> io::Result<Option<HarnessRunt
         });
     }
     Ok(latest)
+}
+
+fn latest_gateway_restart_receipt(
+    path: &Path,
+    status_filter: Option<&str>,
+) -> io::Result<Option<GatewayRestartReceiptStatus>> {
+    let Some(sample) = read_tail_sample(path, STATUS_JSONL_SAMPLE_BYTES)? else {
+        return Ok(None);
+    };
+    let mut latest = None;
+    for line in sample.text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let status = string_path(&value, &["status"]);
+        if let Some(filter) = status_filter
+            && status.as_deref() != Some(filter)
+        {
+            continue;
+        }
+        latest = Some(GatewayRestartReceiptStatus {
+            status,
+            request_file: pathbuf_path(&value, &["requestFile"]),
+            consumed_request_file: pathbuf_path(&value, &["consumedRequestFile"]),
+            receipt_file: pathbuf_path(&value, &["receiptFile"]),
+            reason: string_path(&value, &["reason"]),
+            requesting_platform: string_path(&value, &["requestingPlatform"])
+                .or_else(|| string_path(&value, &["platform"])),
+            channel_id: string_path(&value, &["channelId"]),
+            user_id: string_path(&value, &["userId"]),
+            session_key: string_path(&value, &["sessionKey"]),
+            at_ms: i64_path(&value, &["atMs"]),
+            consumed_at_ms: i64_path(&value, &["consumedAtMs"]),
+            consumed_by: string_path(&value, &["consumedBy"]),
+            consumer_pid: i64_path(&value, &["consumerPid"]),
+            parent_pid: i64_path(&value, &["parentPid"]),
+            generation_id: string_path(&value, &["generationId"]),
+            process_start_time_ms: i64_path(&value, &["processStartTimeMs"]),
+            stop_file: pathbuf_path(&value, &["stopFile"]),
+        });
+    }
+    Ok(latest)
+}
+
+fn latest_gateway_restart_completion(
+    path: &Path,
+) -> io::Result<Option<GatewayRestartCompletionStatus>> {
+    let Some(sample) = read_tail_sample(path, STATUS_JSONL_SAMPLE_BYTES)? else {
+        return Ok(None);
+    };
+    let mut latest = None;
+    for line in sample.text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        latest = Some(GatewayRestartCompletionStatus {
+            status: string_path(&value, &["status"]),
+            request_file: pathbuf_path(&value, &["requestFile"]),
+            consumed_request_file: pathbuf_path(&value, &["consumedRequestFile"]),
+            consumed_at_ms: i64_path(&value, &["consumedAtMs"]),
+            consumed_by: string_path(&value, &["consumedBy"]),
+            consumer_pid: i64_path(&value, &["consumerPid"]),
+            generation_id: string_path(&value, &["generationId"]),
+            process_start_time_ms: i64_path(&value, &["processStartTimeMs"]),
+            heartbeat_status: string_path(&value, &["heartbeatStatus"]),
+            heartbeat_generation_id: string_path(&value, &["heartbeatGenerationId"]),
+            heartbeat_process_id: i64_path(&value, &["heartbeatProcessId"]),
+            heartbeat_at_ms: i64_path(&value, &["heartbeatAtMs"]),
+            notified: bool_path(&value, &["notified"]),
+            message: string_path(&value, &["message"]),
+        });
+    }
+    Ok(latest)
+}
+
+fn gateway_restart_service_status(harness_home: &Path) -> io::Result<GatewayRestartServiceStatus> {
+    let service_file = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("services")
+        .join("discord-gateway-loop.json");
+    let text = match fs::read_to_string(&service_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(GatewayRestartServiceStatus {
+                service_file,
+                present: false,
+                corrupt: false,
+                parse_error: None,
+                status: None,
+                actual_state: None,
+                generation_id: None,
+                process_id: None,
+                process_alive: None,
+                supervisor_process_id: None,
+                process_start_time_ms: None,
+                last_heartbeat_at_ms: None,
+                launch_owner: None,
+                observed_only: None,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(GatewayRestartServiceStatus {
+                service_file,
+                present: true,
+                corrupt: true,
+                parse_error: Some(error.to_string()),
+                status: None,
+                actual_state: None,
+                generation_id: None,
+                process_id: None,
+                process_alive: None,
+                supervisor_process_id: None,
+                process_start_time_ms: None,
+                last_heartbeat_at_ms: None,
+                launch_owner: None,
+                observed_only: None,
+            });
+        }
+    };
+    let process_id = i64_path(&value, &["pid"]).or_else(|| i64_path(&value, &["processId"]));
+    Ok(GatewayRestartServiceStatus {
+        service_file,
+        present: true,
+        corrupt: false,
+        parse_error: None,
+        status: string_path(&value, &["status"]),
+        actual_state: string_path(&value, &["actualState"]),
+        generation_id: string_path(&value, &["generationId"]),
+        process_id,
+        process_alive: process_id.and_then(process_alive_for_pid),
+        supervisor_process_id: i64_path(&value, &["supervisorPid"]),
+        process_start_time_ms: i64_path(&value, &["processStartTimeMs"]),
+        last_heartbeat_at_ms: i64_path(&value, &["lastHeartbeatAtMs"]),
+        launch_owner: string_path(&value, &["launchOwner"]),
+        observed_only: bool_path(&value, &["observedOnly"]),
+    })
+}
+
+fn gateway_restart_heartbeat_status(
+    harness_home: &Path,
+) -> io::Result<GatewayRestartHeartbeatStatus> {
+    let heartbeat_file = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("loop-heartbeats")
+        .join("discord-gateway-loop.json");
+    let text = match fs::read_to_string(&heartbeat_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(GatewayRestartHeartbeatStatus {
+                heartbeat_file,
+                present: false,
+                corrupt: false,
+                parse_error: None,
+                status: None,
+                generation_id: None,
+                process_id: None,
+                process_alive: None,
+                at_ms: None,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(GatewayRestartHeartbeatStatus {
+                heartbeat_file,
+                present: true,
+                corrupt: true,
+                parse_error: Some(error.to_string()),
+                status: None,
+                generation_id: None,
+                process_id: None,
+                process_alive: None,
+                at_ms: None,
+            });
+        }
+    };
+    let process_id = i64_path(&value, &["processId"]);
+    Ok(GatewayRestartHeartbeatStatus {
+        heartbeat_file,
+        present: true,
+        corrupt: false,
+        parse_error: None,
+        status: string_path(&value, &["status"]),
+        generation_id: string_path(&value, &["generationId"]),
+        process_id,
+        process_alive: process_id.and_then(process_alive_for_pid),
+        at_ms: i64_path(&value, &["atMs"]),
+    })
+}
+
+fn pathbuf_path(value: &Value, path: &[&str]) -> Option<PathBuf> {
+    string_path(value, path).map(PathBuf::from)
 }
 
 fn jsonl_status(path: PathBuf) -> io::Result<HarnessJsonlStatus> {
@@ -2022,6 +2891,35 @@ mod tests {
     }
 
     #[test]
+    fn collect_status_treats_suppressed_run_once_as_terminal() {
+        let root = temp_root("collect_status_treats_suppressed_run_once_as_terminal");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        fs::write(
+            queue_dir.join("pending.jsonl"),
+            r#"{"queueId":"q-suppressed","platform":"telegram","runtimeClass":"interactive","origin":"channel"}"#,
+        )
+        .unwrap();
+        fs::write(
+            queue_dir.join("run-once-receipts.jsonl"),
+            r#"{"queueId":"q-suppressed","status":"suppressed","reason":"terminal-control-present"}"#,
+        )
+        .unwrap();
+
+        let report = collect_harness_status(HarnessStatusOptions { harness_home }).unwrap();
+
+        assert_eq!(report.runtime.queued_items, 1);
+        assert_eq!(report.runtime.open_items, 0);
+        assert_eq!(
+            report.runtime.run_once_receipts.latest_status.as_deref(),
+            Some("suppressed")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn loop_status_reports_stop_file_and_missing_process() {
         let root = temp_root("loop_status_reports_stop_file_and_missing_process");
         let harness_home = root.join(".agent-harness");
@@ -2107,6 +3005,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
+        let watched_stop_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("stop")
+            .join("runtime-loop.live.stop");
         fs::write(
             services_dir.join("runtime-loop.json"),
             serde_json::to_string(&serde_json::json!({
@@ -2116,8 +3019,10 @@ mod tests {
                 "generationId": "runtime-loop-test-generation",
                 "pid": std::process::id(),
                 "supervisorPid": 4242,
+                "parentPid": 4343,
                 "processStartTimeMs": now_ms - 500,
                 "startedAtMs": now_ms - 500,
+                "watchedStopFile": watched_stop_file,
                 "lastHeartbeatAtMs": now_ms - 10,
                 "lastSuccessfulIterationAtMs": now_ms - 10,
                 "lastExitAtMs": now_ms - 5,
@@ -2164,8 +3069,13 @@ mod tests {
         );
         assert_eq!(runtime_service.process_alive, Some(true));
         assert_eq!(runtime_service.supervisor_process_id, Some(4242));
+        assert_eq!(runtime_service.parent_pid, Some(4343));
         assert_eq!(runtime_service.started_at_ms, Some(now_ms - 500));
         assert_eq!(runtime_service.process_start_time_ms, Some(now_ms - 500));
+        assert_eq!(
+            runtime_service.watched_stop_file.as_ref(),
+            Some(&watched_stop_file)
+        );
         assert_eq!(runtime_service.last_heartbeat_at_ms, Some(now_ms - 10));
         assert_eq!(
             runtime_service.last_successful_iteration_at_ms,
@@ -2207,12 +3117,136 @@ mod tests {
             Some("external-runner-observe-only")
         );
         assert_eq!(runtime_service.observed_only, Some(true));
+        assert!(runtime_service.ownership_conflict);
+        assert_eq!(
+            runtime_service.ownership_conflict_reason.as_deref(),
+            Some("observed-only-owner")
+        );
 
         let mut warnings = Vec::new();
         append_loop_health_warnings(&loops, &mut warnings);
         assert!(warnings.is_empty(), "{warnings:?}");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loop_status_reads_gateway_restart_request_receipts() {
+        let root = temp_root("loop_status_reads_gateway_restart_request_receipts");
+        let harness_home = root.join(".agent-harness");
+        let supervisor_dir = harness_home.join("state").join("supervisor");
+        fs::create_dir_all(&supervisor_dir).unwrap();
+        fs::write(
+            supervisor_dir.join("gateway-restart-requests.jsonl"),
+            "{\"status\":\"requested\",\"reason\":\"operator command\"}\n\
+             {\"status\":\"consumed\",\"reason\":\"restart request consumed\"}\n",
+        )
+        .unwrap();
+
+        let loops = loop_status(&harness_home).unwrap();
+
+        assert!(loops.gateway_restart_requests.exists);
+        assert_eq!(loops.gateway_restart_requests.lines, 2);
+        assert_eq!(
+            loops.gateway_restart_requests.latest_status.as_deref(),
+            Some("consumed")
+        );
+        assert_eq!(
+            loops.gateway_restart_requests.latest_reason.as_deref(),
+            Some("restart request consumed")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gateway_restart_status_reads_request_consumption_completion_and_generation() {
+        let root =
+            temp_root("gateway_restart_status_reads_request_consumption_completion_and_generation");
+        let harness_home = root.join(".agent-harness");
+        let supervisor_dir = harness_home.join("state").join("supervisor");
+        let services_dir = supervisor_dir.join("services");
+        let heartbeat_dir = supervisor_dir.join("loop-heartbeats");
+        fs::create_dir_all(&services_dir).unwrap();
+        fs::create_dir_all(&heartbeat_dir).unwrap();
+        fs::write(
+            supervisor_dir.join("gateway-restart-requests.jsonl"),
+            "{\"status\":\"requested\",\"requestFile\":\"request.json\",\"reason\":\"operator\",\"requestingPlatform\":\"discord\",\"channelId\":\"dm-1\",\"userId\":\"u-1\",\"sessionKey\":\"discord:dm-1:u-1\",\"atMs\":1000}\n\
+             {\"status\":\"consumed\",\"requestFile\":\"request.json\",\"consumedRequestFile\":\"consumed.json\",\"consumedAtMs\":1100,\"consumedBy\":\"discord-gateway-loop\",\"consumerPid\":42,\"generationId\":\"gateway-generation-1\",\"processStartTimeMs\":900,\"stopFile\":\"gateway.stop\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            supervisor_dir.join("gateway-restart-completions.jsonl"),
+            "{\"status\":\"completed\",\"requestFile\":\"request.json\",\"consumedRequestFile\":\"consumed.json\",\"consumedAtMs\":1100,\"consumedBy\":\"discord-gateway-loop\",\"consumerPid\":42,\"generationId\":\"gateway-generation-1\",\"processStartTimeMs\":900,\"heartbeatStatus\":\"spawning\",\"heartbeatGenerationId\":\"gateway-generation-1\",\"heartbeatProcessId\":42,\"heartbeatAtMs\":1200,\"notified\":true,\"message\":\"done\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            services_dir.join("discord-gateway-loop.json"),
+            serde_json::to_string(&serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "discord-gateway-loop",
+                "serviceKind": "discord-gateway",
+                "status": "spawning",
+                "actualState": "spawning",
+                "generationId": "gateway-generation-1",
+                "pid": std::process::id(),
+                "processId": std::process::id(),
+                "supervisorPid": 1234,
+                "processStartTimeMs": 900,
+                "lastHeartbeatAtMs": 1200,
+                "launchOwner": "rust-supervisor-run",
+                "observedOnly": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            heartbeat_dir.join("discord-gateway-loop.json"),
+            serde_json::to_string(&serde_json::json!({
+                "schema": "agent-harness.loop-heartbeat.v1",
+                "serviceId": "discord-gateway-loop",
+                "status": "spawning",
+                "generationId": "gateway-generation-1",
+                "processId": std::process::id(),
+                "atMs": 1200
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = collect_gateway_restart_status(&harness_home).unwrap();
+
+        assert_eq!(
+            report.latest_request.as_ref().and_then(|value| value.at_ms),
+            Some(1000)
+        );
+        assert_eq!(
+            report
+                .latest_consumption
+                .as_ref()
+                .and_then(|value| value.consumed_at_ms),
+            Some(1100)
+        );
+        assert_eq!(
+            report
+                .latest_completion
+                .as_ref()
+                .and_then(|value| value.heartbeat_at_ms),
+            Some(1200)
+        );
+        assert_eq!(
+            report.service.generation_id.as_deref(),
+            Some("gateway-generation-1")
+        );
+        assert_eq!(report.service.process_alive, Some(true));
+        assert_eq!(report.heartbeat.status.as_deref(), Some("spawning"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restart_status_reads_request_consumption_generation_chain() {
+        gateway_restart_status_reads_request_consumption_completion_and_generation();
     }
 
     #[test]
@@ -2715,6 +3749,251 @@ mod tests {
             Some(cron_run.run_id.as_str())
         );
         assert_eq!(latest.scheduled_for_ms, Some(1000));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collect_status_reports_cron_scheduler_tick_age_and_canon_findings() {
+        let root = temp_root("collect_status_reports_cron_scheduler_tick_age_and_canon_findings");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(harness_home.join("state").join("runtime-queue")).unwrap();
+        fs::create_dir_all(harness_home.join("state").join("channels")).unwrap();
+        fs::create_dir_all(harness_home.join("state").join("logs")).unwrap();
+        fs::create_dir_all(harness_home.join("state").join("plugin-sidecar")).unwrap();
+        fs::create_dir_all(harness_home.join("state").join("memory")).unwrap();
+        fs::create_dir_all(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("loop-heartbeats"),
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join("state").join("harness-registry.json"),
+            r#"{
+              "agents": [{"id":"main","enabled":true}],
+              "providers": [],
+              "channels": {"telegram": false, "discord": false},
+              "plugins": []
+            }"#,
+        )
+        .unwrap();
+        let canon_dir = harness_home.join("workspace").join("docs").join("ops");
+        let dream_dir = harness_home
+            .join("state")
+            .join("memory")
+            .join("dream-lite-daily");
+        let keeper_dir = harness_home.join("state").join("ops").join("cron-canon");
+        fs::create_dir_all(&canon_dir).unwrap();
+        fs::create_dir_all(&dream_dir).unwrap();
+        fs::create_dir_all(&keeper_dir).unwrap();
+        fs::write(
+            dream_dir.join("latest.json"),
+            serde_json::json!({
+                "schema": "openclaw.mem.dream-lite.receipt.v1",
+                "generatedAt": "1970-01-01T08:00:01+08:00",
+                "ok": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            keeper_dir.join("latest-cron-canon-keeper.json"),
+            serde_json::json!({
+                "schema": "openclaw.agent-harness.cron-canon-keeper.receipt.v1",
+                "generatedAt": "1970-01-01T00:00:01Z",
+                "ok": false,
+                "status": "warn",
+                "findings": [{
+                    "severity": "warn",
+                    "code": "receipt-stale",
+                    "cronId": "keeper-forwarded",
+                    "message": "Latest receipt is older than canon allows.",
+                    "details": {
+                        "path": dream_dir.join("latest.json"),
+                        "ageHours": 100,
+                        "maxAgeHours": 36
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            canon_dir.join("cron-canon.json"),
+            serde_json::json!({
+                "schema": "openclaw.agent-harness.cron-canon.v1",
+                "paths": {
+                    "keeperReceipt": "state/ops/cron-canon/latest-cron-canon-keeper.json"
+                },
+                "activeCrons": [
+                    {
+                        "id": "openclaw-mem-dream-lite-daily-0320",
+                        "enabled": true,
+                        "kind": "deterministic-crontab",
+                        "monitor": {
+                            "type": "latest-json",
+                            "path": "state/memory/dream-lite-daily/latest.json",
+                            "maxAgeHours": 36,
+                            "okField": "ok",
+                            "okValue": true
+                        }
+                    },
+                    {
+                        "id": "cron-canon-keeper-daily-0920",
+                        "enabled": true,
+                        "kind": "deterministic-crontab",
+                        "monitor": {
+                            "type": "latest-json",
+                            "path": "state/ops/cron-canon/latest-cron-canon-keeper.json",
+                            "maxAgeHours": 36,
+                            "okField": "ok",
+                            "okValue": true
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let report = collect_harness_status(HarnessStatusOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+
+        assert!(report.cron_scheduler.canon.canon_present);
+        assert_eq!(report.cron_scheduler.canon.monitor_count, 2);
+        assert!(
+            report
+                .cron_scheduler
+                .canon
+                .keeper_age_hours
+                .is_some_and(|age| age > 36.0)
+        );
+        assert_eq!(
+            report.cron_scheduler.canon.keeper_status.as_deref(),
+            Some("warn")
+        );
+        assert!(report.cron_scheduler.canon.stale_count >= 2);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("cron canon keeper status=warn") })
+        );
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("openclaw-mem-dream-lite-daily-0320")
+                && warning.contains("receipt-stale")
+                && warning.contains("ageHours=")
+                && warning.contains("maxAgeHours=36.000")
+        }));
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("cron-canon-keeper-daily-0920") && warning.contains("receipt-not-ok")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn collect_status_accepts_utf8_bom_cron_canon_and_monitor_receipts() {
+        let root = temp_root("collect_status_accepts_utf8_bom_cron_canon_and_monitor_receipts");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(harness_home.join("state").join("runtime-queue")).unwrap();
+        fs::create_dir_all(harness_home.join("state").join("channels")).unwrap();
+        fs::create_dir_all(harness_home.join("state").join("logs")).unwrap();
+        fs::create_dir_all(harness_home.join("state").join("plugin-sidecar")).unwrap();
+        fs::create_dir_all(harness_home.join("state").join("memory")).unwrap();
+        fs::create_dir_all(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("loop-heartbeats"),
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join("state").join("harness-registry.json"),
+            r#"{
+              "agents": [{"id":"main","enabled":true}],
+              "providers": [],
+              "channels": {"telegram": false, "discord": false},
+              "plugins": []
+            }"#,
+        )
+        .unwrap();
+        let canon_dir = harness_home.join("workspace").join("docs").join("ops");
+        let keeper_dir = harness_home.join("state").join("ops").join("cron-canon");
+        let health_dir = harness_home.join("state").join("ops").join("health");
+        fs::create_dir_all(&canon_dir).unwrap();
+        fs::create_dir_all(&keeper_dir).unwrap();
+        fs::create_dir_all(&health_dir).unwrap();
+        fs::write(
+            keeper_dir.join("latest-cron-canon-keeper.json"),
+            format!(
+                "\u{feff}{}",
+                serde_json::json!({
+                    "schema": "openclaw.agent-harness.cron-canon-keeper.receipt.v1",
+                    "ok": true,
+                    "status": "ok",
+                    "findings": []
+                })
+            ),
+        )
+        .unwrap();
+        fs::write(
+            health_dir.join("latest-health.json"),
+            format!(
+                "\u{feff}{}",
+                serde_json::json!({
+                    "schema": "openclaw.agent-harness.health-check.receipt.v1",
+                    "ok": true
+                })
+            ),
+        )
+        .unwrap();
+        fs::write(
+            canon_dir.join("cron-canon.json"),
+            format!(
+                "\u{feff}{}",
+                serde_json::json!({
+                    "schema": "openclaw.agent-harness.cron-canon.v1",
+                    "paths": {
+                        "keeperReceipt": "state/ops/cron-canon/latest-cron-canon-keeper.json"
+                    },
+                    "activeCrons": [{
+                        "id": "agent-harness-health-q4h",
+                        "enabled": true,
+                        "kind": "deterministic-crontab",
+                        "monitor": {
+                            "type": "latest-json",
+                            "path": "state/ops/health/latest-health.json",
+                            "maxAgeHours": 8,
+                            "okField": "ok",
+                            "okValue": true
+                        }
+                    }]
+                })
+            ),
+        )
+        .unwrap();
+
+        let report = collect_harness_status(HarnessStatusOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+
+        assert!(report.cron_scheduler.canon.canon_present);
+        assert_eq!(report.cron_scheduler.canon.monitor_count, 1);
+        assert_eq!(report.cron_scheduler.canon.finding_count, 0);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("receipt-invalid-json")),
+            "{:?}",
+            report.warnings
+        );
 
         let _ = fs::remove_dir_all(root);
     }

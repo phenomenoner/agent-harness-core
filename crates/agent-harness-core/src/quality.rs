@@ -104,8 +104,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I10",
-            statement: "active Codex tool-use idle timeouts are stopped and routed through bounded recovery or an explicit terminal trace instead of directly dead-lettering the parent task",
-            owner: "codex_runtime/runtime_pipeline/trace",
+            statement: "active Codex tool-use idle timeouts are stopped and routed through bounded recovery, virtual-session continuation, or an explicit terminal trace instead of directly dead-lettering the parent task",
+            owner: "codex_runtime/runtime_pipeline/trace/context_rollover/prompt",
         },
         InvariantEntry {
             id: "I11",
@@ -119,7 +119,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I13",
-            statement: "inline-image, native-image-input, or oversized-output polluted Codex threads rotate to fresh-thread recovery before the next turn, while successful official compaction and repeated high-usage stream-unstable retries still feed bounded context-rollover continuity",
+            statement: "inline-image, native-image-input, oversized-output polluted Codex threads, interrupted long-task terminal failures, and repeated high-usage stream-unstable retries feed bounded context-rollover continuity before parent error delivery when continuation gates allow it",
             owner: "codex_runtime/context_rollover/runtime_queue/prompt/runtime_pipeline",
         },
         InvariantEntry {
@@ -137,6 +137,11 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
             statement: "outbound channel attachments originate only from policy-validated local paths or resolvable harness artifacts; directive-like text inside protected spans is never delivered; rejected directives leave a visible note plus a machine-readable receipt",
             owner: "runtime_pipeline/media_delivery_policy/channel_delivery",
         },
+        InvariantEntry {
+            id: "I17",
+            statement: "durable control artifacts are authoritative before runtime execution, progress delivery, restart consumption, and sender-class cron notification",
+            owner: "runtime_worker/runtime_pipeline/runtime_queue/progress/channel_runtime/dream_director/cron_scheduler",
+        },
     ]
 }
 
@@ -145,7 +150,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.runtime-run-once.v1",
             owner_module: "runtime_pipeline",
-            compatibility: "append-only JSONL, additive fields only in v1",
+            compatibility: "append-only JSONL, additive fields only in v1 including terminalControlMatched, terminalControlSource, suppressedRunOnceReason, and preparedExecutionTerminalizationReason",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.codex-runtime-run.v1",
@@ -180,7 +185,12 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.runtime-queue-control.v1",
             owner_module: "runtime_queue",
-            compatibility: "append-only receipts; retry creates fresh ids",
+            compatibility: "append-only receipts; queue-skip is terminal control evidence and retry creates fresh ids",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.runtime-queue-quarantine.v1",
+            owner_module: "runtime_worker",
+            compatibility: "per-queue marker JSON is additive in v1 and rebuildable from terminalization evidence; presence is terminal control evidence",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.runtime-queue-leases.v1",
@@ -205,7 +215,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.progress-delivery-state.v1",
             owner_module: "progress",
-            compatibility: "state JSON may add cursor/cache/counter fields in v1; existing lane cursors remain readable",
+            compatibility: "state JSON may add cursor/cache/counter fields in v1; existing lane cursors remain readable; progressSuppressedReason is additive on delivery receipts/pending context",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.codex-context-preflight.v1",
@@ -286,6 +296,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             schema: "agent-harness.cron-runs.v1",
             owner_module: "cron_runs",
             compatibility: "SQLite state table; additive columns only in v1; status enum changes require migration",
+        },
+        SchemaRegistryEntry {
+            schema: "openclaw.mem.dream-director.send-receipt.v1",
+            owner_module: "dream_director",
+            compatibility: "additive receipt fields only in v1; stale-source suppression remains fail-closed unless force override is receipted",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.config-validation.v1",
@@ -550,7 +565,7 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "Telegram and Discord delivery receipt trace",
                 "final agent-reply excludes progress/narration stream content",
                 "implementation-goal read-only review evidence does not become final agent-reply",
-                "structured owner/session routing suppresses non-main or mismatched-run completed output from final outbox",
+                "structured owner/session routing suppresses owner-mismatched completed output while allowing non-main owned channel lanes to write final outbox",
                 "invalid or suppressed outbox rows can be retired with skipped-permanent receipts without counting as delivered",
             ],
             runnable_tests: vec![
@@ -559,10 +574,78 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "runtime_pipeline::tests::already_recorded_completion_repair_keeps_progress_panel_out_of_final_outbox",
                 "runtime_pipeline::tests::already_recorded_completion_repair_keeps_progress_panel_out_of_discord_final_outbox",
                 "runtime_pipeline::tests::run_runtime_queue_once_suppresses_read_only_review_final_for_implementation_goal",
-                "runtime_pipeline::tests::run_runtime_queue_once_suppresses_non_main_agent_final_outbox",
+                "runtime_pipeline::tests::run_runtime_queue_once_suppresses_owner_mismatched_agent_final_outbox",
+                "runtime_pipeline::tests::run_runtime_queue_once_writes_final_outbox_for_non_main_agent_owned_group_lane",
                 "trace::tests::trace_harness_event_detects_terminal_runtime_status",
             ],
             promotion_gate: "Prove completed turns converge to one final/terminal surface with reconstructable queue-to-delivery trace.",
+        },
+        ScenarioMatrixEntry {
+            id: "runtime-terminal-control",
+            title: "Runtime terminal-control authority",
+            changed_areas: vec![
+                "runtime worker",
+                "runtime pipeline",
+                "runtime queue",
+                "lease reconciliation",
+            ],
+            required_invariants: vec!["I3", "I4", "I7", "I17"],
+            required_evidence: vec![
+                "queue-skip receipts remain sticky terminal evidence after later non-terminal rows",
+                "scoped-stop markers block selection, preparation, and stale lease return",
+                "terminal-controlled queues append at most one suppressed run-once receipt",
+                "unresumable prepared executions terminalize after the no-prepared threshold and write quarantine markers",
+                "lease reconcile re-checks terminal controls before returning stale-owner work to the pool",
+                "operator retry of a terminal queue creates a fresh runnable id instead of resurrecting the original",
+                "terminal-control suppression writes one final progress surface and then stays silent after late progress events",
+                "progress delivery consumes terminal-control evidence before rendering cached non-terminal ghost progress",
+                "checked-in sanitized ghost-queue replay plus live or candidate-home evidence show no continuing no-prepared-execution churn",
+            ],
+            runnable_tests: vec![
+                "runtime_worker::tests::queue_skip_receipt_is_sticky_terminal",
+                "runtime_worker::tests::scoped_stop_marker_blocks_selection_prepare_and_lease",
+                "runtime_worker::tests::suppressed_receipt_emitted_at_most_once",
+                "runtime_worker::tests::lease_reconcile_respects_terminal_controls",
+                "runtime_worker::tests::queue_retry_of_terminal_item_creates_fresh_runnable_id_only",
+                "runtime_pipeline::tests::prepared_protocol_error_terminalizes_after_threshold",
+                "runtime_pipeline::tests::scoped_stop_suppresses_missing_prepared_execution_before_no_prepared_churn",
+                "runtime_pipeline::tests::terminal_control_queue_gets_one_final_edit_then_silence",
+                "runtime_pipeline::tests::untargeted_terminal_control_suppression_appends_progress_with_queue_id",
+                "progress::tests::terminal_control_marker_suppresses_cached_nonterminal_ghost_queue",
+                "runtime_pipeline::tests::e2e_1_ghost_queue_replay_from_sanitized_fixture",
+            ],
+            promotion_gate: "Run the focused T1-T6/P5 regression pack plus the checked-in E2E-1 sanitized ghost replay and a live or candidate-home replay of a terminal-controlled pending queue; promotion requires exactly one suppression receipt, one final terminal progress surface, no later status edits, and no recurring no-prepared-execution churn.",
+        },
+        ScenarioMatrixEntry {
+            id: "restart-control-plane",
+            title: "Gateway and channel restart closed loop",
+            changed_areas: vec![
+                "channel runtime",
+                "channel state",
+                "gateway restart",
+                "supervisor loop heartbeat",
+                "channel outbox",
+            ],
+            required_invariants: vec!["I7", "I8", "I17"],
+            required_evidence: vec![
+                "/restart gateway command is parsed pre-model and writes a protected request",
+                "gateway restart consumer moves the request and receipts consumer/process identity",
+                "fresh gateway heartbeat closes the request with a completion notice on the requesting lane",
+                "/restart status reads request, consumption, completion, and heartbeat generation state",
+                "channel restart commands target the live owner's watched stop file or fail explicit ownership ambiguity",
+                "checked-in E2E-4 staging replay proves request to consumption to heartbeat to completion ack",
+            ],
+            runnable_tests: vec![
+                "channel_state::tests::gateway_restart_completion_ack_receipts_and_notifies_requesting_lane",
+                "channel_state::tests::gateway_restart_status_reads_request_consumption_completion_and_generation",
+                "channel_runtime::tests::channel_restart_prefers_live_watched_stop_file",
+                "channel_runtime::tests::channel_restart_fails_when_live_owner_is_observed_only",
+                "channel_runtime::tests::channel_step_requests_channel_restart_stop_file",
+                "channel_runtime::tests::channel_step_replies_to_restart_status_without_agent_turn",
+                "agent-harness-cli::tests::consume_gateway_restart_request_moves_file_and_receipts",
+                "agent-harness-cli::tests::e2e_4_restart_gateway_staging_closed_loop_replay",
+            ],
+            promotion_gate: "Run the focused R-series tests plus the checked-in E2E-4 staging replay. Live promotion still requires real supervised child restart and provider-side Discord delivery evidence, not only synthetic heartbeat closure.",
         },
         ScenarioMatrixEntry {
             id: "virtual-session-rollover",
@@ -580,7 +663,11 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "second official compact success recorded",
                 "continuation session or structured skip receipt",
                 "inline-image polluted bound thread uses preflight fresh-thread rollover before turn/start",
+                "interrupted tool-timeout fallback failure can requeue a guarded continuation before retry churn",
+                "no-final-answer interrupted terminal failure can requeue a guarded continuation before parent error delivery",
                 "repeated high-usage stream disconnect can requeue a guarded continuation before terminal dead-letter",
+                "plain provider outage timeout does not enter interrupted-task continuation",
+                "stale timeout stdout capture is rotated before retry recovery can impersonate completion",
                 "working-set prompt injection",
                 "final outbox/delivery trace from continuation queue item",
                 "/new boundary does not inherit previous-task memory context",
@@ -598,16 +685,20 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "context_rollover::tests::compact_counter_deduplicates_successful_attempt_key",
                 "context_rollover::tests::prepared_auto_requeue_blocks_parent_session_sibling",
                 "runtime_pipeline::tests::polluted_thread_continuation_runs_at_terminal_failure_and_respects_depth_limit",
+                "runtime_pipeline::tests::tool_timeout_fallback_failure_retry_requeues_continuation",
+                "runtime_pipeline::tests::no_final_answer_terminal_interruption_requeues_continuation",
+                "runtime_pipeline::tests::plain_provider_timeout_does_not_requeue_interrupted_continuation",
                 "runtime_pipeline::tests::stream_unstable_retry_continuation_requires_repeated_high_usage_stream_failure",
                 "runtime_pipeline::tests::repeated_stream_disconnect_high_usage_retry_requeues_continuation",
                 "runtime_pipeline::tests::stream_unstable_retry_continuation_tombstones_parent_queue_item",
+                "codex_runtime::tests::retry_after_timeout_rotates_stale_stdout_before_recovery",
                 "prompt::tests::prompt_bundle_new_command_boundary_skips_prior_task_memory_context",
                 "prompt::tests::prompt_bundle_includes_virtual_session_resolver_context_section",
                 "prompt::tests::prompt_bundle_missing_reply_metadata_hint_uses_resolver_queue_ids",
                 "channel_state::tests::new_session_command_closes_previous_virtual_session_record",
                 "context_rollover::tests::virtual_session_thread_backfill_updates_matching_working_session",
             ],
-            promotion_gate: "Force high-context compact rollover and repeated high-usage stream-unstable retry scenarios, then prove rollover/final-delivery parity across Discord/TG identity axes.",
+            promotion_gate: "Force high-context compact rollover, interrupted long-task rollover, and repeated high-usage stream-unstable retry scenarios, then prove rollover/final-delivery parity across Discord/TG identity axes.",
         },
         ScenarioMatrixEntry {
             id: "progress-surface-volume",
@@ -625,19 +716,64 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "immediate current-step update for new assistant execution summary",
                 "repeated text-hash suppression",
                 "terminal progress convergence",
+                "terminal progress closes only after source final provider delivery when a source final outbox row exists",
                 "no post-terminal edit churn",
                 "final outbox contains only final answer",
                 "internal worker results summarized without leaking raw worker final text into action progress",
+                "queue-local wake preemption with first-surface sends preserved",
+                "same-queue providerless orphan surface claims are reclaimed without TTL wait",
             ],
             runnable_tests: vec![
-                "progress::tests::progress_surface_volume_replay_converges_without_post_terminal_churn",
+                "progress::tests::progress_delivery_repeated_events_converge_to_one_provider_message",
+                "progress::tests::progress_delivery_successful_edit_does_not_fresh_send",
+                "progress::tests::progress_delivery_duplicate_runtime_events_are_idempotent",
+                "progress::tests::fresh_send_requires_enumerated_reason_in_receipt",
+                "progress::tests::new_session_hides_old_lane_ghost_status",
                 "progress::tests::delivery_plan_status_heartbeat_after_body_cap_is_channel_agnostic",
                 "progress::tests::delivery_plan_status_updates_immediately_for_new_current_step_after_body_cap",
                 "progress::tests::action_stream_summarizes_internal_worker_results_instead_of_raw_final_text",
                 "progress::tests::action_stream_summarizes_structured_subagent_notifications_without_source_label",
+                "progress::tests::progress_surface_claim_reclaims_same_queue_orphan_without_ttl",
+                "progress::tests::terminal_progress_waits_until_source_final_delivery_is_delivered",
+                "agent-harness-cli::tests::progress_delivery_preempts_nonterminal_pending_when_wake_advances",
                 "codex_runtime::tests::run_codex_runtime_rejects_stdout_recovery_narration_without_final_answer",
             ],
             promotion_gate: "Replay Telegram and Discord long-running turns through progress caps, recovery, final outbox, and terminal convergence.",
+        },
+        ScenarioMatrixEntry {
+            id: "cron-freshness-canon",
+            title: "Cron freshness canon and deterministic catch-up",
+            changed_areas: vec![
+                "cron scheduler",
+                "deterministic cron",
+                "cron runs",
+                "status",
+                "health",
+                "configuration",
+                "Dream Director sender",
+            ],
+            required_invariants: vec!["I7", "I17"],
+            required_evidence: vec![
+                "cronScheduler run caps are accepted by config validation",
+                "cron-canon monitor blocks surface stale source or keeper receipts in status/health",
+                "deterministic cron jobs produce cron-run evidence keyed by canonical cron id",
+                "late deterministic slots follow an explicit catch-up policy",
+                "sender-class jobs suppress stale sources unless an explicit force override is receipted",
+            ],
+            runnable_tests: vec![
+                "config::tests::validate_harness_config_accepts_cron_scheduler_run_caps",
+                "cron_scheduler::tests::deterministic_cron_execution_reportable_by_canon_id",
+                "cron_scheduler::tests::restart_catch_up_respects_per_job_policy",
+                "status::tests::collect_status_reports_cron_scheduler_tick_age_and_canon_findings",
+                "health::tests::healthz_warns_on_stale_keeper_receipt",
+                "health::tests::healthz_evaluates_all_canon_monitor_blocks_generically",
+                "workers::tests::deterministic_shell_job_writes_audit_and_succeeds",
+                "dream_director::tests::dream_director_sender_suppresses_stale_source",
+                "dream_director::tests::dream_director_sender_sends_fresh_source_with_freshness_metadata",
+                "dream_director::tests::dream_director_sender_accepts_absolute_source_path_from_relative_home",
+                "cron_scheduler::tests::e2e_5_cron_outage_replay_from_sanitized_fixture",
+            ],
+            promotion_gate: "Before cutover, prove cron config validation, deterministic cron evidence, catch-up policy, health/status freshness warnings, and stale-source sender suppression with the Round16 E2E-5 cron freshness fixture pack.",
         },
         ScenarioMatrixEntry {
             id: "multi-agent-memory-compartment",
@@ -661,7 +797,8 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "memory recall excludes private main/global imported context unless allowed",
                 "session-history retrieval rejects wrong-lane concrete candidates and preserves only explicit project/global fallback",
                 "worker/subagent lease ownership remains agent-scoped",
-                "non-main agent completed output sharing platform/channel/user axes is internal evidence, not parent final outbox",
+                "owner-mismatched completed output sharing platform/channel/user axes is internal evidence, not parent final outbox",
+                "configured non-main agent group-lane completion writes a first-class final outbox row on its own lane",
                 "final outbox and delivery receipts preserve agent/lane ownership",
             ],
             runnable_tests: vec![
@@ -670,7 +807,8 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "prompt::tests::prompt_bundle_hides_main_operation_plan_from_other_agent",
                 "runtime_worker::tests::prepare_runtime_queue_item_respects_agent_channel_lease_limit",
                 "runtime_pipeline::tests::channel_session_freshness_does_not_cross_suppress_other_agent",
-                "runtime_pipeline::tests::run_runtime_queue_once_suppresses_non_main_agent_final_outbox",
+                "runtime_pipeline::tests::run_runtime_queue_once_suppresses_owner_mismatched_agent_final_outbox",
+                "runtime_pipeline::tests::run_runtime_queue_once_writes_final_outbox_for_non_main_agent_owned_group_lane",
                 "memory::tests::non_main_memory_prompt_context_excludes_global_imported_snapshot_by_default",
                 "memory::tests::public_agent_read_path_smoke_surfaces_source_allow_list_and_filtered_counts",
                 "memory_pack::tests::retrieval_scope_session_requires_same_agent_and_session_key",
@@ -857,6 +995,8 @@ pub fn release_checklist() -> ReleaseChecklist {
             "docs/skills/help stale guidance review completed",
             "topology contract impact matrix reviewed for changed modules",
             "channel/runtime changes passed the agent-boundary scenario matrix",
+            "runtime terminal-control changes passed sticky terminal, suppression idempotency, final progress surface silence, lease reconcile, prepared-terminalization, retry-fresh-id, and live ghost-queue replay checks",
+            "Round16 control-plane lifecycle changes passed exact T/D/S/P/V/K/R/C selectors plus E2E-1..E2E-5, or retain an explicit no-cutover blocker for missing E2E fixture, staging, or live evidence",
             "prompt/memory changes passed /new task-boundary and per-agent memory recall checks",
             "channel session history search/retrieval changes passed lane-bound candidate classification checks",
             "openclaw-mem bridge ownership changes passed configured-bridge and fallback gates",
@@ -866,7 +1006,10 @@ pub fn release_checklist() -> ReleaseChecklist {
             "context rollover changes passed official-compact accounting and polluted-thread recovery checks",
             "virtual-session working-context changes passed resolver exact-lane, CLI read surface, root snapshot enrichment, and carry-forward inheritance checks",
             "progress delivery changes passed edit-volume replay checks",
+            "progress final-order changes passed source final provider-delivery-before-terminal-progress replay checks",
+            "progress ordering changes passed queue-local preemption, first-surface send, orphan-claim recovery, and terminal-control ghost-close replay checks",
             "progress panel lane-cap heartbeat/current-step checks passed across channel platforms",
+            "cron freshness changes passed config run-cap validation, cron-canon health/status warnings, deterministic catch-up, and stale-source sender suppression checks",
             "Codex tool-use timeout changes passed bounded recovery checks",
             "artifact/context hygiene changes passed generic artifact prompt/progress redaction and Discord attachment extraction checks",
             "public hygiene report passed",
@@ -908,6 +1051,16 @@ mod tests {
             scenario_matrix
                 .iter()
                 .any(|entry| entry.id == "final-outbox-delivery-trace")
+        );
+        assert!(
+            scenario_matrix
+                .iter()
+                .any(|entry| entry.id == "runtime-terminal-control")
+        );
+        assert!(
+            scenario_matrix
+                .iter()
+                .any(|entry| entry.id == "restart-control-plane")
         );
         assert!(
             scenario_matrix
@@ -959,6 +1112,10 @@ mod tests {
                 .required_items
                 .contains(&"channel/runtime changes passed the agent-boundary scenario matrix")
         );
+        assert!(
+            release_checklist().required_items.contains(&"runtime terminal-control changes passed sticky terminal, suppression idempotency, final progress surface silence, lease reconcile, prepared-terminalization, retry-fresh-id, and live ghost-queue replay checks")
+        );
+        assert!(release_checklist().required_items.contains(&"Round16 control-plane lifecycle changes passed exact T/D/S/P/V/K/R/C selectors plus E2E-1..E2E-5, or retain an explicit no-cutover blocker for missing E2E fixture, staging, or live evidence"));
         assert!(release_checklist().required_items.contains(
             &"prompt/memory changes passed /new task-boundary and per-agent memory recall checks"
         ));
@@ -980,6 +1137,9 @@ mod tests {
                 .required_items
                 .contains(&"progress delivery changes passed edit-volume replay checks")
         );
+        assert!(release_checklist().required_items.contains(
+            &"progress ordering changes passed queue-local preemption, first-surface send, orphan-claim recovery, and terminal-control ghost-close replay checks"
+        ));
         assert!(release_checklist().required_items.contains(
             &"progress panel lane-cap heartbeat/current-step checks passed across channel platforms"
         ));
@@ -1069,6 +1229,51 @@ mod tests {
                 "missing Cutover B runnable test: {runnable}"
             );
         }
+    }
+
+    #[test]
+    fn quality_catalogs_include_cron_freshness_canon_gate() {
+        let scenario_matrix = scenario_matrix_catalog();
+        let entry = scenario_matrix
+            .iter()
+            .find(|entry| entry.id == "cron-freshness-canon")
+            .expect("cron freshness scenario matrix entry");
+
+        assert!(entry.required_invariants.contains(&"I17"));
+        assert!(
+            entry.runnable_tests.contains(
+                &"config::tests::validate_harness_config_accepts_cron_scheduler_run_caps"
+            )
+        );
+        assert!(
+            entry
+                .runnable_tests
+                .contains(&"dream_director::tests::dream_director_sender_suppresses_stale_source")
+        );
+        assert!(entry.runnable_tests.contains(
+            &"dream_director::tests::dream_director_sender_sends_fresh_source_with_freshness_metadata"
+        ));
+        assert!(entry.promotion_gate.contains("cron freshness fixture"));
+        assert!(release_checklist().required_items.contains(&"cron freshness changes passed config run-cap validation, cron-canon health/status warnings, deterministic catch-up, and stale-source sender suppression checks"));
+    }
+
+    #[test]
+    fn quality_catalogs_include_restart_control_plane_gate() {
+        let scenario_matrix = scenario_matrix_catalog();
+        let entry = scenario_matrix
+            .iter()
+            .find(|entry| entry.id == "restart-control-plane")
+            .expect("restart-control-plane matrix entry");
+
+        assert!(entry.required_invariants.contains(&"I17"));
+        assert!(entry.runnable_tests.contains(
+            &"agent-harness-cli::tests::e2e_4_restart_gateway_staging_closed_loop_replay"
+        ));
+        assert!(
+            entry
+                .promotion_gate
+                .contains("real supervised child restart")
+        );
     }
 
     fn temp_root(test_name: &str) -> PathBuf {

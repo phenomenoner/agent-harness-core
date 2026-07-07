@@ -41,6 +41,8 @@ pub struct VirtualSessionWorkingContext {
     pub predecessor_session_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_set_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_interruption: Option<String>,
     pub recent_queue_ids: Vec<String>,
     pub evidence_anchors: VirtualSessionEvidenceAnchors,
     pub operation_plans: Vec<String>,
@@ -174,6 +176,14 @@ pub fn resolve_virtual_session_working_context(
     let working_set_file = indexed
         .as_ref()
         .map(|(index, _)| index.working_set_file.clone());
+    let last_interruption = indexed.as_ref().and_then(|(_, memory)| {
+        memory
+            .decisions
+            .iter()
+            .rev()
+            .find(|decision| decision.contains("interrupted long-task"))
+            .cloned()
+    });
 
     if let Some(record) = read_virtual_session_record(&query.harness_home, &virtual_session_id)? {
         if string_field(&record, &["platform"]) != Some(query.platform.as_str())
@@ -237,6 +247,7 @@ pub fn resolve_virtual_session_working_context(
         continuation_index,
         predecessor_session_key,
         working_set_file,
+        last_interruption,
         recent_queue_ids,
         evidence_anchors,
         operation_plans,
@@ -264,6 +275,7 @@ fn empty_envelope(
         continuation_index: 0,
         predecessor_session_key: None,
         working_set_file: None,
+        last_interruption: None,
         recent_queue_ids: Vec::new(),
         evidence_anchors: VirtualSessionEvidenceAnchors::default(),
         operation_plans: Vec::new(),

@@ -8,10 +8,10 @@ use serde_json::{Value, json};
 
 use crate::{
     AgentSource, CronRunAdmitOptions, CronRunStatus, DeterministicCronPlanAction,
-    DeterministicCronPlanInput, DeterministicCronSchedule, NativeCronPlanAction,
-    NativeCronPlanEntry, NativeCronPlanInput, NativeCronSchedule, WorkerEnqueueOptions,
-    WorkerEnqueueReport, WorkerJobKind, admit_cron_run, append_harness_log, append_jsonl_value,
-    config::harness_config_candidates, cron_run_active_count_for_agent,
+    DeterministicCronPlanEntry, DeterministicCronPlanInput, DeterministicCronSchedule,
+    NativeCronPlanAction, NativeCronPlanEntry, NativeCronPlanInput, NativeCronSchedule,
+    WorkerEnqueueOptions, WorkerEnqueueReport, WorkerJobKind, admit_cron_run, append_harness_log,
+    append_jsonl_value, config::harness_config_candidates, cron_run_active_count_for_agent,
     cron_run_active_count_for_job, cron_run_id, cron_run_is_quarantined, current_log_time_ms,
     enqueue_worker_job, get_cron_run_by_slot, load_agent_registry, load_deterministic_cron_store,
     load_native_cron_store, mark_cron_run_worker_enqueued, plan_deterministic_cron,
@@ -182,6 +182,10 @@ pub struct CronSchedulerJobDecision {
     pub worker_job_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catch_up_decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missed_slots: Vec<i64>,
     pub decision: CronSchedulerJobDecisionStatus,
     pub reason: String,
 }
@@ -194,6 +198,25 @@ pub enum CronSchedulerJobDecisionStatus {
     SkippedDuplicate,
     SkippedPolicy,
     Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CronSchedulerCatchUpDecision {
+    decision: String,
+    missed_slots: Vec<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeterministicCatchUpPlan {
+    Enqueue {
+        scheduled_for_ms: i64,
+        decision: String,
+        missed_slots: Vec<i64>,
+    },
+    Suppress {
+        decision: String,
+        missed_slots: Vec<i64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1079,6 +1102,9 @@ fn collect_deterministic_cron_decisions(
     let source_id = stable_source_id("deterministic-cron", &options.source.workspace);
     let master_agent = "main".to_string();
     let master_session = format!("worker-group:cron-scheduler:{source_id}");
+    let previous_tick_ms = database
+        .parent()
+        .and_then(|scheduler_dir| last_scheduler_tick_ms(scheduler_dir).ok().flatten());
 
     for entry in &plan.entries {
         if report.summary.enqueued >= config.max_enqueue_per_tick {
@@ -1120,64 +1146,156 @@ fn collect_deterministic_cron_decisions(
             );
             continue;
         }
-        let scheduled_for_ms = match deterministic_due_slot(&entry.schedule, options.now_ms) {
-            Ok(Some(value)) => value,
-            Ok(None) => {
-                push_decision(
-                    report,
-                    "deterministic-cron",
-                    &source_id,
-                    &entry.entry_id,
-                    options.now_ms,
-                    CronSchedulerJobDecisionStatus::SkippedPolicy,
-                    "schedule is not due in the current scheduler slot",
-                    None,
-                );
-                continue;
-            }
-            Err(error) => {
-                push_decision(
-                    report,
-                    "deterministic-cron",
-                    &source_id,
-                    &entry.entry_id,
-                    options.now_ms,
-                    CronSchedulerJobDecisionStatus::Error,
-                    &error,
-                    None,
-                );
-                continue;
-            }
-        };
+        let evidence_entry_id = deterministic_cron_evidence_entry_id(&options.harness_home, entry);
+        let catch_up_policy =
+            deterministic_cron_canon_catch_up_policy(&options.harness_home, entry);
+        let (scheduled_for_ms, catch_up) =
+            match deterministic_due_slot(&entry.schedule, options.now_ms) {
+                Ok(Some(value)) => (value, None),
+                Ok(None) => {
+                    match deterministic_catch_up_decision(
+                        &entry.schedule,
+                        previous_tick_ms,
+                        options.now_ms,
+                        config.max_catchup_per_tick,
+                        catch_up_policy.as_deref(),
+                    )
+                    .map_err(io::Error::other)?
+                    {
+                        Some(DeterministicCatchUpPlan::Enqueue {
+                            scheduled_for_ms,
+                            decision,
+                            missed_slots,
+                        }) => (
+                            scheduled_for_ms,
+                            Some(CronSchedulerCatchUpDecision {
+                                decision,
+                                missed_slots,
+                            }),
+                        ),
+                        Some(DeterministicCatchUpPlan::Suppress {
+                            decision,
+                            missed_slots,
+                        }) => {
+                            push_decision_with_catch_up(
+                                report,
+                                "deterministic-cron",
+                                &source_id,
+                                &evidence_entry_id,
+                                options.now_ms,
+                                CronSchedulerJobDecisionStatus::SkippedPolicy,
+                                "catch-up policy suppressed missed deterministic cron slots",
+                                None,
+                                Some(CronSchedulerCatchUpDecision {
+                                    decision,
+                                    missed_slots,
+                                }),
+                            );
+                            continue;
+                        }
+                        None => {
+                            push_decision(
+                                report,
+                                "deterministic-cron",
+                                &source_id,
+                                &evidence_entry_id,
+                                options.now_ms,
+                                CronSchedulerJobDecisionStatus::SkippedPolicy,
+                                "schedule is not due in the current scheduler slot",
+                                None,
+                            );
+                            continue;
+                        }
+                    }
+                }
+                Err(error) => {
+                    push_decision(
+                        report,
+                        "deterministic-cron",
+                        &source_id,
+                        &evidence_entry_id,
+                        options.now_ms,
+                        CronSchedulerJobDecisionStatus::Error,
+                        &error,
+                        None,
+                    );
+                    continue;
+                }
+            };
         report.summary.due_candidates += 1;
         if options.dry_run {
-            push_decision(
+            push_decision_with_catch_up(
                 report,
                 "deterministic-cron",
                 &source_id,
-                &entry.entry_id,
+                &evidence_entry_id,
                 scheduled_for_ms,
                 CronSchedulerJobDecisionStatus::SkippedPolicy,
                 "dry-run: due deterministic cron command would enqueue",
                 None,
+                catch_up.clone(),
             );
             continue;
+        }
+        let retry_pending_run = get_cron_run_by_slot(
+            &options.harness_home,
+            "deterministic-cron",
+            &source_id,
+            &evidence_entry_id,
+            scheduled_for_ms,
+        )?
+        .filter(|run| run.status == CronRunStatus::RetryPending && !run.quarantined);
+        if retry_pending_run.is_some() {
+            let cleared = delete_watermark(
+                database,
+                "deterministic-cron",
+                &source_id,
+                &evidence_entry_id,
+                scheduled_for_ms,
+            )?;
+            if cleared > 0 {
+                report.warnings.push(format!(
+                    "cleared {cleared} cron scheduler watermark(s) for retry-pending deterministic cron slot `{}`",
+                    evidence_entry_id
+                ));
+            }
         }
         if watermark_exists(
             database,
             "deterministic-cron",
             &source_id,
-            &entry.entry_id,
+            &evidence_entry_id,
             scheduled_for_ms,
         )? {
             push_decision(
                 report,
                 "deterministic-cron",
                 &source_id,
-                &entry.entry_id,
+                &evidence_entry_id,
                 scheduled_for_ms,
                 CronSchedulerJobDecisionStatus::SkippedDuplicate,
                 "watermark already exists for this scheduled slot",
+                None,
+            );
+            continue;
+        }
+        if evidence_entry_id != entry.entry_id
+            && watermark_exists(
+                database,
+                "deterministic-cron",
+                &source_id,
+                &entry.entry_id,
+                scheduled_for_ms,
+            )?
+        {
+            push_decision(
+                report,
+                "deterministic-cron",
+                &source_id,
+                &evidence_entry_id,
+                scheduled_for_ms,
+                CronSchedulerJobDecisionStatus::SkippedDuplicate,
+                "legacy deterministic entry watermark already exists for this scheduled slot",
                 None,
             );
             continue;
@@ -1187,7 +1305,7 @@ fn collect_deterministic_cron_decisions(
                 report,
                 "deterministic-cron",
                 &source_id,
-                &entry.entry_id,
+                &evidence_entry_id,
                 scheduled_for_ms,
                 CronSchedulerJobDecisionStatus::Error,
                 "deterministic cron entry had no script path",
@@ -1195,19 +1313,47 @@ fn collect_deterministic_cron_decisions(
             );
             continue;
         };
+        let agent_id = "cron-scheduler".to_string();
+        let session_policy = "one-shot";
+        let session_key = deterministic_cron_session_key(&evidence_entry_id, scheduled_for_ms);
+        let run_id = cron_run_id(
+            "deterministic-cron",
+            &source_id,
+            &evidence_entry_id,
+            scheduled_for_ms,
+        );
+        let cron_run = admit_cron_run(CronRunAdmitOptions {
+            harness_home: options.harness_home.clone(),
+            source_kind: "deterministic-cron".to_string(),
+            source_id: source_id.clone(),
+            entry_id: evidence_entry_id.clone(),
+            agent_id: agent_id.clone(),
+            scheduled_for_ms,
+            runtime_class: "deterministic-shell".to_string(),
+            session_key: session_key.clone(),
+            session_policy: session_policy.to_string(),
+            max_attempts: 3,
+            now_ms: options.now_ms,
+        })?;
         let idempotency_key = scheduler_idempotency_key(
             "deterministic-cron",
             &source_id,
-            &entry.entry_id,
+            &evidence_entry_id,
             scheduled_for_ms,
-            0,
+            cron_run.attempt,
         );
         let cwd = script_path.parent().unwrap_or(Path::new(".")).to_path_buf();
         let payload = json!({
             "adapter": "cron-scheduler",
             "sourceKind": "deterministic-cron",
-            "sourceId": source_id,
-            "entryId": entry.entry_id,
+            "sourceId": &source_id,
+            "entryId": &evidence_entry_id,
+            "deterministicEntryId": &entry.entry_id,
+            "cronCanonId": if evidence_entry_id != entry.entry_id {
+                Some(evidence_entry_id.as_str())
+            } else {
+                None::<&str>
+            },
             "scheduledForMs": scheduled_for_ms,
             "runnerKind": entry.runner_kind,
             "command": entry.command,
@@ -1215,6 +1361,17 @@ fn collect_deterministic_cron_decisions(
             "cwd": cwd,
             "argv": [],
             "dryRun": !config.deterministic_cron.execute_shell,
+            "agentId": &agent_id,
+            "sessionKey": &session_key,
+            "sessionPolicy": session_policy,
+            "runtimeClass": "deterministic-shell",
+            "origin": "cron-scheduler",
+            "cronRunId": &run_id,
+            "catchUpDecision": catch_up.as_ref().map(|value| value.decision.as_str()),
+            "missedSlots": catch_up
+                .as_ref()
+                .map(|value| value.missed_slots.clone())
+                .unwrap_or_default(),
             "sourceHome": &options.source.home,
             "sourceWorkspace": &options.source.workspace,
             "runtimeWorkspace": &options.runtime_workspace,
@@ -1244,11 +1401,17 @@ fn collect_deterministic_cron_decisions(
             )),
             now_ms: options.now_ms,
         })?;
+        mark_cron_run_worker_enqueued(
+            &options.harness_home,
+            &cron_run.run_id,
+            &enqueue.job.job_id,
+            options.now_ms,
+        )?;
         insert_watermark(
             database,
             "deterministic-cron",
             &source_id,
-            &entry.entry_id,
+            &evidence_entry_id,
             scheduled_for_ms,
             options.now_ms,
             &enqueue.job.job_id,
@@ -1259,11 +1422,11 @@ fn collect_deterministic_cron_decisions(
                 "worker idempotency key already existed"
             },
         )?;
-        push_decision(
+        push_decision_with_catch_up(
             report,
             "deterministic-cron",
             &source_id,
-            &entry.entry_id,
+            &evidence_entry_id,
             scheduled_for_ms,
             if enqueue.inserted {
                 CronSchedulerJobDecisionStatus::Enqueued
@@ -1276,6 +1439,7 @@ fn collect_deterministic_cron_decisions(
                 "worker idempotency key already existed"
             },
             Some((enqueue, idempotency_key)),
+            catch_up,
         );
     }
     Ok(())
@@ -1290,6 +1454,30 @@ fn push_decision(
     decision: CronSchedulerJobDecisionStatus,
     reason: &str,
     enqueue: Option<(WorkerEnqueueReport, String)>,
+) {
+    push_decision_with_catch_up(
+        report,
+        source_kind,
+        source_id,
+        entry_id,
+        scheduled_for_ms,
+        decision,
+        reason,
+        enqueue,
+        None,
+    );
+}
+
+fn push_decision_with_catch_up(
+    report: &mut CronSchedulerRunOnceReport,
+    source_kind: &str,
+    source_id: &str,
+    entry_id: &str,
+    scheduled_for_ms: i64,
+    decision: CronSchedulerJobDecisionStatus,
+    reason: &str,
+    enqueue: Option<(WorkerEnqueueReport, String)>,
+    catch_up: Option<CronSchedulerCatchUpDecision>,
 ) {
     match decision {
         CronSchedulerJobDecisionStatus::Enqueued => report.summary.enqueued += 1,
@@ -1316,6 +1504,8 @@ fn push_decision(
             .as_ref()
             .map(|(report, _)| report.job.job_id.clone()),
         idempotency_key: enqueue.map(|(_, key)| key),
+        catch_up_decision: catch_up.as_ref().map(|value| value.decision.clone()),
+        missed_slots: catch_up.map(|value| value.missed_slots).unwrap_or_default(),
         decision,
         reason: reason.to_string(),
     });
@@ -1819,6 +2009,198 @@ fn deterministic_due_slot(
     }
 }
 
+fn deterministic_cron_evidence_entry_id(
+    harness_home: &Path,
+    entry: &DeterministicCronPlanEntry,
+) -> String {
+    deterministic_cron_canon_id(harness_home, entry).unwrap_or_else(|| entry.entry_id.clone())
+}
+
+fn deterministic_cron_canon_id(
+    harness_home: &Path,
+    entry: &DeterministicCronPlanEntry,
+) -> Option<String> {
+    deterministic_cron_canon_field(harness_home, entry, "id")
+}
+
+fn deterministic_cron_canon_catch_up_policy(
+    harness_home: &Path,
+    entry: &DeterministicCronPlanEntry,
+) -> Option<String> {
+    deterministic_cron_canon_field(harness_home, entry, "catchUpPolicy")
+}
+
+fn deterministic_cron_canon_field(
+    harness_home: &Path,
+    entry: &DeterministicCronPlanEntry,
+    field: &str,
+) -> Option<String> {
+    let canon_path = harness_home
+        .join("workspace")
+        .join("docs")
+        .join("ops")
+        .join("cron-canon.json");
+    let canon: Value = serde_json::from_str(&fs::read_to_string(canon_path).ok()?).ok()?;
+    let active_crons = canon.get("activeCrons")?.as_array()?;
+    active_crons.iter().find_map(|cron| {
+        if cron
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind != "deterministic-crontab")
+        {
+            return None;
+        }
+        if cron.get("enabled").and_then(Value::as_bool) == Some(false) {
+            return None;
+        }
+        if !deterministic_cron_canon_matches_entry(harness_home, cron, entry) {
+            return None;
+        }
+        cron.get(field)
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    })
+}
+
+fn deterministic_cron_canon_matches_entry(
+    harness_home: &Path,
+    cron: &Value,
+    entry: &DeterministicCronPlanEntry,
+) -> bool {
+    let Some(script_path) = entry.script_path.as_deref() else {
+        return false;
+    };
+    let Some(script) = cron.get("script").and_then(Value::as_str) else {
+        return false;
+    };
+    if !path_matches_canon_text(harness_home, script_path, script) {
+        return false;
+    }
+    if let Some(source_path) = cron.get("sourcePath").and_then(Value::as_str)
+        && !path_matches_canon_text(harness_home, &entry.crontab_file, source_path)
+    {
+        return false;
+    }
+    if let Some(schedule) = cron.get("schedule").and_then(Value::as_str)
+        && deterministic_schedule_text(&entry.schedule).as_deref() != Some(schedule)
+    {
+        return false;
+    }
+    true
+}
+
+fn deterministic_schedule_text(schedule: &DeterministicCronSchedule) -> Option<String> {
+    match schedule {
+        DeterministicCronSchedule::Cron { expression } => Some(expression.clone()),
+        DeterministicCronSchedule::Macro { name } => Some(name.clone()),
+        DeterministicCronSchedule::Unsupported { .. } => None,
+    }
+}
+
+fn path_matches_canon_text(harness_home: &Path, actual: &Path, canon_text: &str) -> bool {
+    let actual = normalize_path_text(&actual.display().to_string());
+    let canon_text = normalize_path_text(canon_text);
+    let resolved = if Path::new(canon_text.as_str()).is_absolute() {
+        PathBuf::from(canon_text.as_str())
+    } else {
+        harness_home.join(canon_text.replace('/', std::path::MAIN_SEPARATOR_STR))
+    };
+    let resolved = normalize_path_text(&resolved.display().to_string());
+    actual == resolved || actual.ends_with(&format!("/{canon_text}"))
+}
+
+fn normalize_path_text(value: &str) -> String {
+    value.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn deterministic_cron_session_key(entry_id: &str, scheduled_for_ms: i64) -> String {
+    format!(
+        "cron:deterministic:{}:{}",
+        normalize_key_part(entry_id),
+        scheduled_for_ms
+    )
+}
+
+fn deterministic_catch_up_decision(
+    schedule: &DeterministicCronSchedule,
+    previous_tick_ms: Option<i64>,
+    now_ms: i64,
+    max_catchup_per_tick: usize,
+    policy: Option<&str>,
+) -> Result<Option<DeterministicCatchUpPlan>, String> {
+    let Some(previous_tick_ms) = previous_tick_ms else {
+        return Ok(None);
+    };
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    let missed_slots = missed_deterministic_due_slots(
+        schedule,
+        previous_tick_ms,
+        now_ms,
+        max_catchup_per_tick.max(1),
+    )?;
+    if missed_slots.is_empty() {
+        return Ok(None);
+    }
+    match policy {
+        "run-late-once" => Ok(Some(DeterministicCatchUpPlan::Enqueue {
+            scheduled_for_ms: missed_slots[missed_slots.len() - 1],
+            decision: "run-late-once".to_string(),
+            missed_slots,
+        })),
+        "run-immediately-on-restart" => Ok(Some(DeterministicCatchUpPlan::Enqueue {
+            scheduled_for_ms: floor_to_minute(now_ms),
+            decision: "run-immediately-on-restart".to_string(),
+            missed_slots,
+        })),
+        "guard-source-freshness" => Ok(Some(DeterministicCatchUpPlan::Suppress {
+            decision: "guard-source-freshness".to_string(),
+            missed_slots,
+        })),
+        other => Ok(Some(DeterministicCatchUpPlan::Suppress {
+            decision: format!("unsupported-policy:{other}"),
+            missed_slots,
+        })),
+    }
+}
+
+fn missed_deterministic_due_slots(
+    schedule: &DeterministicCronSchedule,
+    previous_tick_ms: i64,
+    now_ms: i64,
+    max_slots: usize,
+) -> Result<Vec<i64>, String> {
+    let mut missed = Vec::new();
+    let mut slot = floor_to_minute(previous_tick_ms) + 60_000;
+    let end = floor_to_minute(now_ms).saturating_sub(60_000);
+    while slot <= end && missed.len() < max_slots {
+        if deterministic_due_slot(schedule, slot)?.is_some() {
+            missed.push(slot);
+        }
+        slot = slot.saturating_add(60_000);
+    }
+    Ok(missed)
+}
+
+fn last_scheduler_tick_ms(scheduler_dir: &Path) -> io::Result<Option<i64>> {
+    let receipts_file = scheduler_dir.join("receipts.jsonl");
+    let Ok(text) = fs::read_to_string(receipts_file) else {
+        return Ok(None);
+    };
+    for line in text.lines().rev() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("schema").and_then(Value::as_str) == Some(CRON_SCHEDULER_TICK_SCHEMA)
+            && let Some(now_ms) = value.get("nowMs").and_then(Value::as_i64)
+        {
+            return Ok(Some(now_ms));
+        }
+    }
+    Ok(None)
+}
+
 fn cron_expression_due_slot(expression: &str, now_ms: i64) -> Result<Option<i64>, String> {
     cron_expression_due_slot_with_timezone(expression, None, now_ms)
 }
@@ -2231,6 +2613,434 @@ mod tests {
     }
 
     #[test]
+    fn run_once_enqueues_deterministic_cron_with_canon_cron_run_evidence() {
+        let root = temp_root("run_once_enqueues_deterministic_cron_with_canon_cron_run_evidence");
+        let harness_home = root.join(".agent-harness");
+        let source = write_deterministic_source_with_canon(&harness_home);
+        fs::create_dir_all(&harness_home).unwrap();
+
+        let options = CronSchedulerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            source,
+            runtime_workspace: None,
+            now_ms: 1_234,
+            dry_run: false,
+            enabled_override: Some(true),
+            native_enabled_override: Some(false),
+            deterministic_enabled_override: Some(true),
+            resume_cron_override: None,
+            include_registered_cron_override: None,
+            allow_deterministic_run_override: Some(true),
+            execute_shell_override: Some(false),
+            max_catchup_per_tick_override: None,
+            max_enqueue_per_tick_override: None,
+        };
+
+        let first = run_cron_scheduler_once(options.clone()).unwrap();
+        assert_eq!(first.status, CronSchedulerTickStatus::Completed);
+        assert_eq!(first.summary.enqueued, 1);
+        assert_eq!(first.decisions.len(), 1);
+        assert_eq!(first.decisions[0].entry_id, "canon-deterministic-daily");
+        assert_eq!(first.decisions[0].scheduled_for_ms, 0);
+        assert_eq!(
+            first.decisions[0].decision,
+            CronSchedulerJobDecisionStatus::Enqueued
+        );
+
+        let cron_runs = crate::collect_cron_run_summary(&harness_home).unwrap();
+        assert_eq!(cron_runs.summary.active, 1);
+        let cron_run = cron_runs.runs.first().unwrap();
+        assert_eq!(cron_run.status, CronRunStatus::WorkerEnqueued);
+        assert_eq!(cron_run.source_kind, "deterministic-cron");
+        assert_eq!(cron_run.agent_id, "cron-scheduler");
+        assert_eq!(cron_run.entry_id, "canon-deterministic-daily");
+        assert_eq!(cron_run.scheduled_for_ms, 0);
+        assert_eq!(cron_run.runtime_class, "deterministic-shell");
+        assert_eq!(cron_run.session_policy, "one-shot");
+        assert_eq!(
+            cron_run.session_key,
+            "cron:deterministic:canon-deterministic-daily:0"
+        );
+        assert_eq!(cron_run.attempt, 0);
+        assert!(
+            crate::get_cron_run_by_slot(
+                &harness_home,
+                "deterministic-cron",
+                &cron_run.source_id,
+                "canon-deterministic-daily",
+                0,
+            )
+            .unwrap()
+            .is_some()
+        );
+
+        let worker_conn = Connection::open(crate::worker_db_file(&harness_home)).unwrap();
+        let (payload_json, idempotency_key, lane): (String, String, String) = worker_conn
+            .query_row(
+                "SELECT payload_json, idempotency_key, lane FROM jobs ORDER BY created_at_ms ASC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(lane, "shell");
+        assert_eq!(payload["entryId"], "canon-deterministic-daily");
+        assert_eq!(payload["cronCanonId"], "canon-deterministic-daily");
+        assert_eq!(payload["cronRunId"], cron_run.run_id.as_str());
+        assert_eq!(payload["agentId"], "cron-scheduler");
+        assert_eq!(payload["sessionPolicy"], "one-shot");
+        assert_eq!(payload["runtimeClass"], "deterministic-shell");
+        assert_ne!(payload["deterministicEntryId"], payload["entryId"]);
+        assert!(!idempotency_key.contains(":attempt:"));
+
+        let worker_run = crate::run_worker_once(crate::WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("shell".to_string()),
+            worker_id: "cron-terminal-test".to_string(),
+            lease_ms: 60_000,
+            now_ms: 2_000,
+        })
+        .unwrap();
+        assert_eq!(worker_run.status, crate::WorkerRunOnceStatus::Completed);
+        assert_eq!(
+            worker_run.result.as_ref().unwrap().status,
+            crate::WorkerJobStatus::Succeeded
+        );
+        assert!(
+            worker_run
+                .result
+                .as_ref()
+                .unwrap()
+                .reason
+                .contains("deterministic shell")
+        );
+        let terminal_runs = crate::collect_cron_run_summary(&harness_home).unwrap();
+        let updated_cron_run = terminal_runs
+            .runs
+            .iter()
+            .find(|run| run.run_id == cron_run.run_id)
+            .unwrap();
+        assert_eq!(updated_cron_run.status, CronRunStatus::Succeeded);
+
+        let second = run_cron_scheduler_once(options).unwrap();
+        assert_eq!(second.summary.skipped_duplicate, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deterministic_cron_execution_reportable_by_canon_id() {
+        run_once_enqueues_deterministic_cron_with_canon_cron_run_evidence();
+    }
+
+    #[test]
+    fn run_once_applies_deterministic_catch_up_policies_from_cron_canon() {
+        let root = temp_root("run_once_applies_deterministic_catch_up_policies_from_cron_canon");
+        let harness_home = root.join(".agent-harness");
+        let source = write_deterministic_source_with_catchup_canon(&harness_home);
+        let scheduler_dir = harness_home.join("state").join("cron-scheduler");
+        fs::create_dir_all(&scheduler_dir).unwrap();
+        fs::write(
+            scheduler_dir.join("receipts.jsonl"),
+            format!(
+                r#"{{"schema":"{CRON_SCHEDULER_TICK_SCHEMA}","status":"completed","nowMs":1000,"summary":{{}}}}"#
+            ),
+        )
+        .unwrap();
+        let missed_daily_slot = 86_400_000;
+        let restart_slot = missed_daily_slot + 60_000;
+
+        let report = run_cron_scheduler_once(CronSchedulerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            source,
+            runtime_workspace: None,
+            now_ms: restart_slot + 1_234,
+            dry_run: false,
+            enabled_override: Some(true),
+            native_enabled_override: Some(false),
+            deterministic_enabled_override: Some(true),
+            resume_cron_override: None,
+            include_registered_cron_override: None,
+            allow_deterministic_run_override: Some(true),
+            execute_shell_override: Some(false),
+            max_catchup_per_tick_override: Some(3),
+            max_enqueue_per_tick_override: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, CronSchedulerTickStatus::Completed);
+        assert_eq!(report.summary.enqueued, 2);
+        assert_eq!(report.summary.skipped_policy, 1);
+        let analysis = report
+            .decisions
+            .iter()
+            .find(|decision| decision.entry_id == "canon-analysis-daily")
+            .unwrap();
+        assert_eq!(analysis.decision, CronSchedulerJobDecisionStatus::Enqueued);
+        assert_eq!(analysis.scheduled_for_ms, missed_daily_slot);
+        assert_eq!(analysis.catch_up_decision.as_deref(), Some("run-late-once"));
+        assert_eq!(analysis.missed_slots, vec![missed_daily_slot]);
+        let notification = report
+            .decisions
+            .iter()
+            .find(|decision| decision.entry_id == "canon-notification-daily")
+            .unwrap();
+        assert_eq!(
+            notification.decision,
+            CronSchedulerJobDecisionStatus::SkippedPolicy
+        );
+        assert_eq!(
+            notification.catch_up_decision.as_deref(),
+            Some("guard-source-freshness")
+        );
+        assert_eq!(notification.missed_slots, vec![missed_daily_slot]);
+        let keeper = report
+            .decisions
+            .iter()
+            .find(|decision| decision.entry_id == "canon-keeper-daily")
+            .unwrap();
+        assert_eq!(keeper.decision, CronSchedulerJobDecisionStatus::Enqueued);
+        assert_eq!(keeper.scheduled_for_ms, restart_slot);
+        assert_eq!(
+            keeper.catch_up_decision.as_deref(),
+            Some("run-immediately-on-restart")
+        );
+        assert_eq!(keeper.missed_slots, vec![missed_daily_slot]);
+
+        let cron_runs = crate::collect_cron_run_summary(&harness_home).unwrap();
+        assert_eq!(cron_runs.runs.len(), 2);
+        assert!(
+            cron_runs
+                .runs
+                .iter()
+                .any(|run| run.entry_id == "canon-analysis-daily"
+                    && run.scheduled_for_ms == missed_daily_slot)
+        );
+        assert!(cron_runs.runs.iter().any(
+            |run| run.entry_id == "canon-keeper-daily" && run.scheduled_for_ms == restart_slot
+        ));
+
+        let worker_conn = Connection::open(crate::worker_db_file(&harness_home)).unwrap();
+        let payloads: Vec<String> = {
+            let mut stmt = worker_conn
+                .prepare("SELECT payload_json FROM jobs ORDER BY created_at_ms ASC")
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(payloads.len(), 2);
+        let payload_values = payloads
+            .iter()
+            .map(|payload| serde_json::from_str::<Value>(payload).unwrap())
+            .collect::<Vec<_>>();
+        assert!(payload_values.iter().any(|payload| {
+            payload["entryId"] == "canon-analysis-daily"
+                && payload["catchUpDecision"] == "run-late-once"
+                && payload["missedSlots"][0] == missed_daily_slot
+        }));
+        assert!(payload_values.iter().any(|payload| {
+            payload["entryId"] == "canon-keeper-daily"
+                && payload["catchUpDecision"] == "run-immediately-on-restart"
+                && payload["missedSlots"][0] == missed_daily_slot
+        }));
+        let receipt_values = fs::read_to_string(scheduler_dir.join("receipts.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let persisted_suppression = receipt_values
+            .iter()
+            .find(|receipt| {
+                receipt["schema"] == CRON_SCHEDULER_JOB_DECISION_SCHEMA
+                    && receipt["entryId"] == "canon-notification-daily"
+            })
+            .unwrap();
+        assert_eq!(persisted_suppression["decision"], "skipped-policy");
+        assert_eq!(
+            persisted_suppression["catchUpDecision"],
+            "guard-source-freshness"
+        );
+        assert_eq!(persisted_suppression["missedSlots"][0], missed_daily_slot);
+        assert_eq!(
+            persisted_suppression["reason"],
+            "catch-up policy suppressed missed deterministic cron slots"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Round16CronOutageFixture {
+        now_ms: i64,
+        source_max_age_hours: f64,
+        missed_daily_slot_ms: i64,
+        restart_slot_ms: i64,
+        stale_source: Round16StaleSourceFixture,
+        cron_canon: Value,
+        expected: Round16CronOutageExpected,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Round16StaleSourceFixture {
+        run_id: String,
+        generated_at: String,
+        age_hours: i64,
+        opinion_text: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Round16CronOutageExpected {
+        health_warning_cron_ids: Vec<String>,
+        suppressed_sender_status: String,
+        suppressed_sender_reason: String,
+        catch_up: std::collections::BTreeMap<String, String>,
+    }
+
+    #[test]
+    fn e2e_5_cron_outage_replay_from_sanitized_fixture() {
+        let fixture: Round16CronOutageFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/round16/e2e5-cron-outage-replay.json"
+        ))
+        .unwrap();
+        let root = temp_root("e2e_5_cron_outage_replay_from_sanitized_fixture");
+        let harness_home = root.join(".agent-harness");
+        let source = write_round16_cron_outage_source(&harness_home, &fixture.cron_canon);
+        seed_round16_cron_outage_receipts(&harness_home, &fixture);
+
+        let health = crate::collect_healthz(crate::HealthzOptions {
+            harness_home: harness_home.clone(),
+            now_ms: fixture.now_ms,
+            loop_stale_ms: 120_000,
+            require_writable_state: false,
+        })
+        .unwrap();
+        for cron_id in &fixture.expected.health_warning_cron_ids {
+            assert!(
+                health
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(cron_id) && warning.contains("receipt")),
+                "missing health warning for {cron_id}: {:?}",
+                health.warnings
+            );
+        }
+        let status = crate::collect_harness_status(crate::HarnessStatusOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+        assert!(status.cron_scheduler.canon.stale_count >= 2);
+        assert!(
+            status
+                .cron_scheduler
+                .canon
+                .findings
+                .iter()
+                .any(|finding| finding.cron_id == "cron-canon-keeper"
+                    && finding.code == "receipt-not-ok")
+        );
+
+        let sender = crate::run_dream_director_send(crate::DreamDirectorSendOptions {
+            harness_home: harness_home.clone(),
+            target: "fixture-operator".to_string(),
+            max_chars: crate::DEFAULT_DREAM_DIRECTOR_MAX_CHARS,
+            source_max_age_hours: fixture.source_max_age_hours,
+            dry_run: true,
+            force: false,
+            now_ms: fixture.now_ms,
+        })
+        .unwrap();
+        assert!(!sender.receipt.ok);
+        assert_eq!(
+            sender.receipt.status,
+            fixture.expected.suppressed_sender_status
+        );
+        assert_eq!(
+            sender.receipt.stale_reason.as_deref(),
+            Some(fixture.expected.suppressed_sender_reason.as_str())
+        );
+        assert_eq!(
+            sender.receipt.source_run_id.as_deref(),
+            Some(fixture.stale_source.run_id.as_str())
+        );
+
+        let scheduler_dir = harness_home.join("state").join("cron-scheduler");
+        fs::create_dir_all(&scheduler_dir).unwrap();
+        fs::write(
+            scheduler_dir.join("receipts.jsonl"),
+            format!(
+                r#"{{"schema":"{CRON_SCHEDULER_TICK_SCHEMA}","status":"completed","nowMs":1000,"summary":{{}}}}"#
+            ),
+        )
+        .unwrap();
+        let report = run_cron_scheduler_once(CronSchedulerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            source,
+            runtime_workspace: None,
+            now_ms: fixture.restart_slot_ms + 1_234,
+            dry_run: false,
+            enabled_override: Some(true),
+            native_enabled_override: Some(false),
+            deterministic_enabled_override: Some(true),
+            resume_cron_override: None,
+            include_registered_cron_override: None,
+            allow_deterministic_run_override: Some(true),
+            execute_shell_override: Some(false),
+            max_catchup_per_tick_override: Some(3),
+            max_enqueue_per_tick_override: None,
+        })
+        .unwrap();
+        assert_eq!(report.status, CronSchedulerTickStatus::Completed);
+        assert_eq!(report.summary.enqueued, 2);
+        assert_eq!(report.summary.skipped_policy, 1);
+        for (entry_id, expected_policy) in &fixture.expected.catch_up {
+            let decision = report
+                .decisions
+                .iter()
+                .find(|decision| decision.entry_id == *entry_id)
+                .unwrap_or_else(|| panic!("missing decision for {entry_id}"));
+            assert_eq!(
+                decision.catch_up_decision.as_deref(),
+                Some(expected_policy.as_str())
+            );
+            assert_eq!(decision.missed_slots, vec![fixture.missed_daily_slot_ms]);
+        }
+        let suppressed = report
+            .decisions
+            .iter()
+            .find(|decision| decision.entry_id == "dream-director-notification")
+            .unwrap();
+        assert_eq!(
+            suppressed.decision,
+            CronSchedulerJobDecisionStatus::SkippedPolicy
+        );
+        let cron_runs = crate::collect_cron_run_summary(&harness_home).unwrap();
+        assert!(cron_runs.runs.iter().any(|run| {
+            run.entry_id == "canon-analysis-daily"
+                && run.scheduled_for_ms == fixture.missed_daily_slot_ms
+        }));
+        assert!(cron_runs.runs.iter().any(|run| {
+            run.entry_id == "cron-canon-keeper" && run.scheduled_for_ms == fixture.restart_slot_ms
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dream_lite_cron_outage_replay_suppresses_stale_sender_and_catches_up() {
+        e2e_5_cron_outage_replay_from_sanitized_fixture();
+    }
+
+    #[test]
+    fn restart_catch_up_respects_per_job_policy() {
+        run_once_applies_deterministic_catch_up_policies_from_cron_canon();
+    }
+
+    #[test]
     fn run_once_enqueues_imported_expr_cron_with_native_timezone() {
         let root = temp_root("run_once_enqueues_imported_expr_cron_with_native_timezone");
         let source = write_expr_cron_source(&root);
@@ -2453,6 +3263,220 @@ mod tests {
         )
         .unwrap();
         AgentSource::with_workspace(home, workspace)
+    }
+
+    fn write_deterministic_source_with_canon(harness_home: &Path) -> AgentSource {
+        let home = harness_home.to_path_buf();
+        let workspace = home.join("workspace");
+        let runner = workspace.join("tools").join("cron-runner");
+        fs::create_dir_all(runner.join("crontab")).unwrap();
+        fs::create_dir_all(runner.join("jobs")).unwrap();
+        fs::create_dir_all(workspace.join("docs").join("ops")).unwrap();
+        fs::write(
+            runner.join("crontab").join("openclaw-mem.crontab"),
+            "0 0 * * * jobs/canon.ps1\n",
+        )
+        .unwrap();
+        fs::write(runner.join("jobs").join("canon.ps1"), "Write-Output 'ok'\n").unwrap();
+        fs::write(
+            workspace.join("docs").join("ops").join("cron-canon.json"),
+            r#"{
+              "schema": "openclaw.agent-harness.cron-canon.v1",
+              "activeCrons": [
+                {
+                  "id": "canon-deterministic-daily",
+                  "kind": "deterministic-crontab",
+                  "enabled": true,
+                  "schedule": "0 0 * * *",
+                  "sourcePath": "workspace/tools/cron-runner/crontab/openclaw-mem.crontab",
+                  "script": "workspace/tools/cron-runner/jobs/canon.ps1",
+                  "monitor": {
+                    "type": "latest-json",
+                    "path": "state/canon/latest.json",
+                    "maxAgeHours": 24,
+                    "okField": "ok",
+                    "okValue": true
+                  }
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        AgentSource::with_workspace(home, workspace)
+    }
+
+    fn write_deterministic_source_with_catchup_canon(harness_home: &Path) -> AgentSource {
+        let home = harness_home.to_path_buf();
+        let workspace = home.join("workspace");
+        let runner = workspace.join("tools").join("cron-runner");
+        fs::create_dir_all(runner.join("crontab")).unwrap();
+        fs::create_dir_all(runner.join("jobs")).unwrap();
+        fs::create_dir_all(workspace.join("docs").join("ops")).unwrap();
+        fs::write(
+            runner.join("crontab").join("openclaw-mem.crontab"),
+            "0 0 * * * jobs/analysis.ps1\n0 0 * * * jobs/notify.ps1\n0 0 * * * jobs/keeper.ps1\n",
+        )
+        .unwrap();
+        for script in ["analysis.ps1", "notify.ps1", "keeper.ps1"] {
+            fs::write(
+                runner.join("jobs").join(script),
+                format!("Write-Output '{script}'\n"),
+            )
+            .unwrap();
+        }
+        fs::write(
+            workspace.join("docs").join("ops").join("cron-canon.json"),
+            r#"{
+              "schema": "openclaw.agent-harness.cron-canon.v1",
+              "activeCrons": [
+                {
+                  "id": "canon-analysis-daily",
+                  "kind": "deterministic-crontab",
+                  "enabled": true,
+                  "schedule": "0 0 * * *",
+                  "sourcePath": "workspace/tools/cron-runner/crontab/openclaw-mem.crontab",
+                  "script": "workspace/tools/cron-runner/jobs/analysis.ps1",
+                  "catchUpPolicy": "run-late-once",
+                  "monitor": {
+                    "type": "latest-json",
+                    "path": "state/canon/analysis.json",
+                    "maxAgeHours": 36,
+                    "okField": "ok",
+                    "okValue": true
+                  }
+                },
+                {
+                  "id": "canon-notification-daily",
+                  "kind": "deterministic-crontab",
+                  "enabled": true,
+                  "schedule": "0 0 * * *",
+                  "sourcePath": "workspace/tools/cron-runner/crontab/openclaw-mem.crontab",
+                  "script": "workspace/tools/cron-runner/jobs/notify.ps1",
+                  "catchUpPolicy": "guard-source-freshness",
+                  "monitor": {
+                    "type": "latest-json",
+                    "path": "state/canon/notify.json",
+                    "maxAgeHours": 36,
+                    "okField": "ok",
+                    "okValue": true
+                  }
+                },
+                {
+                  "id": "canon-keeper-daily",
+                  "kind": "deterministic-crontab",
+                  "enabled": true,
+                  "schedule": "0 0 * * *",
+                  "sourcePath": "workspace/tools/cron-runner/crontab/openclaw-mem.crontab",
+                  "script": "workspace/tools/cron-runner/jobs/keeper.ps1",
+                  "catchUpPolicy": "run-immediately-on-restart",
+                  "monitor": {
+                    "type": "latest-json",
+                    "path": "state/canon/keeper.json",
+                    "maxAgeHours": 36,
+                    "okField": "ok",
+                    "okValue": true
+                  }
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        AgentSource::with_workspace(home, workspace)
+    }
+
+    fn write_round16_cron_outage_source(harness_home: &Path, cron_canon: &Value) -> AgentSource {
+        let home = harness_home.to_path_buf();
+        let workspace = home.join("workspace");
+        let runner = workspace.join("tools").join("cron-runner");
+        fs::create_dir_all(runner.join("crontab")).unwrap();
+        fs::create_dir_all(runner.join("jobs")).unwrap();
+        fs::create_dir_all(workspace.join("docs").join("ops")).unwrap();
+        fs::write(
+            runner.join("crontab").join("openclaw-mem.crontab"),
+            "0 0 * * * jobs/analysis.ps1\n0 0 * * * jobs/notify.ps1\n0 0 * * * jobs/keeper.ps1\n",
+        )
+        .unwrap();
+        for script in ["analysis.ps1", "notify.ps1", "keeper.ps1"] {
+            fs::write(
+                runner.join("jobs").join(script),
+                format!("Write-Output '{script}'\n"),
+            )
+            .unwrap();
+        }
+        write_json_atomic(
+            &workspace.join("docs").join("ops").join("cron-canon.json"),
+            cron_canon,
+        )
+        .unwrap();
+        AgentSource::with_workspace(home, workspace)
+    }
+
+    fn seed_round16_cron_outage_receipts(harness_home: &Path, fixture: &Round16CronOutageFixture) {
+        let stale_generated_at_ms = fixture.now_ms - fixture.stale_source.age_hours * 3_600_000;
+        let daily_dir = crate::dream_director_daily_state_dir(harness_home);
+        let opinion_path = daily_dir
+            .join("runs")
+            .join(&fixture.stale_source.run_id)
+            .join("director-opinion.md");
+        fs::create_dir_all(opinion_path.parent().unwrap()).unwrap();
+        fs::write(&opinion_path, &fixture.stale_source.opinion_text).unwrap();
+        write_json_atomic(
+            &daily_dir.join("latest.json"),
+            &json!({
+                "ok": true,
+                "runId": fixture.stale_source.run_id,
+                "generatedAtMs": stale_generated_at_ms,
+                "generatedAt": fixture.stale_source.generated_at,
+                "directorOpinion": opinion_path
+            }),
+        )
+        .unwrap();
+        write_json_atomic(
+            &harness_home
+                .join("state")
+                .join("memory")
+                .join("dream-lite-director")
+                .join("latest-send.json"),
+            &json!({
+                "ok": false,
+                "status": "stale-source-suppressed",
+                "generatedAtMs": stale_generated_at_ms,
+                "stale": true
+            }),
+        )
+        .unwrap();
+        write_json_atomic(
+            &harness_home
+                .join("state")
+                .join("memory")
+                .join("cron-canon-keeper")
+                .join("latest-cron-canon-keeper.json"),
+            &json!({
+                "schema": "openclaw.agent-harness.cron-canon-keeper.receipt.v1",
+                "ok": false,
+                "status": "warn",
+                "generatedAt": fixture.stale_source.generated_at,
+                "findings": [
+                    {
+                        "severity": "warn",
+                        "code": "receipt-not-ok",
+                        "cronId": "cron-canon-keeper",
+                        "message": "synthetic keeper replay warning",
+                        "details": {
+                            "path": "state/memory/cron-canon-keeper/latest-cron-canon-keeper.json"
+                        }
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+        for path in [
+            harness_home.join("state").join("runtime-queue"),
+            harness_home.join("state").join("channels"),
+            harness_home.join("state").join("logs"),
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
     }
 
     fn temp_root(test_name: &str) -> PathBuf {

@@ -16,6 +16,7 @@ const RUNTIME_QUEUE_CONTROL_SCHEMA: &str = "agent-harness.runtime-queue-control.
 pub struct RuntimeQueueEnqueueOptions {
     pub harness_home: PathBuf,
     pub runtime_workspace: Option<PathBuf>,
+    pub inbound_canonical_id: Option<String>,
     pub now_ms: i64,
 }
 
@@ -55,6 +56,8 @@ pub struct RuntimeQueueItem {
     pub message_text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inbound_context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbound_canonical_id: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub inbound_media_artifacts: Vec<InboundMediaArtifact>,
     pub provider: Option<String>,
@@ -95,6 +98,8 @@ pub enum RuntimeQueueSourceKind {
 pub struct RuntimeQueueReceipt {
     pub queue_id: Option<String>,
     pub status: RuntimeQueueReceiptStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbound_canonical_id: Option<String>,
     pub queue_file: PathBuf,
     pub receipts_file: PathBuf,
     pub reason: String,
@@ -190,6 +195,7 @@ pub fn enqueue_channel_step(
             RuntimeQueueReceipt {
                 queue_id: Some(item.queue_id.clone()),
                 status: RuntimeQueueReceiptStatus::Queued,
+                inbound_canonical_id: item.inbound_canonical_id.clone(),
                 queue_file: queue_file.clone(),
                 receipts_file: receipts_file.clone(),
                 reason: "agent turn appended to runtime queue".to_string(),
@@ -198,6 +204,7 @@ pub fn enqueue_channel_step(
         None => RuntimeQueueReceipt {
             queue_id: None,
             status: RuntimeQueueReceiptStatus::SkippedNotAgentTurn,
+            inbound_canonical_id: None,
             queue_file: queue_file.clone(),
             receipts_file: receipts_file.clone(),
             reason: format!("channel step action {:?} is not an agent turn", step.action),
@@ -355,6 +362,7 @@ fn build_queue_item(
         user_id: step.user_id.clone(),
         message_text: step.message_text.clone(),
         inbound_context: step.inbound_context.clone(),
+        inbound_canonical_id: options.inbound_canonical_id.clone(),
         inbound_media_artifacts: step.inbound_media_artifacts.clone(),
         provider: agent_turn.provider.clone(),
         model: agent_turn.model.clone(),
@@ -499,6 +507,7 @@ mod tests {
             RuntimeQueueEnqueueOptions {
                 harness_home: root.join(".agent-harness"),
                 runtime_workspace: None,
+                inbound_canonical_id: None,
                 now_ms: 1234,
             },
         )
@@ -617,6 +626,7 @@ mod tests {
             RuntimeQueueEnqueueOptions {
                 harness_home,
                 runtime_workspace: None,
+                inbound_canonical_id: None,
                 now_ms: 1234,
             },
         )
@@ -687,6 +697,7 @@ mod tests {
             RuntimeQueueEnqueueOptions {
                 harness_home: harness_home.clone(),
                 runtime_workspace: None,
+                inbound_canonical_id: None,
                 now_ms: 1234,
             },
         )
@@ -795,6 +806,7 @@ mod tests {
             RuntimeQueueEnqueueOptions {
                 harness_home: root.join(".agent-harness"),
                 runtime_workspace: None,
+                inbound_canonical_id: None,
                 now_ms: 1234,
             },
         )

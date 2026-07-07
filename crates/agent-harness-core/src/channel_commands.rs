@@ -34,6 +34,10 @@ pub enum ChannelCommand {
     Status {
         scope: Option<String>,
     },
+    Unknown {
+        name: String,
+        rest: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -60,6 +64,7 @@ pub enum ChannelCommandIntent {
     RestartGateway {
         reason: Option<String>,
     },
+    RestartStatus,
     RestartChannel {
         target: Option<String>,
         reason: Option<String>,
@@ -81,6 +86,10 @@ pub enum ChannelCommandIntent {
     ShowStatus {
         scope: Option<String>,
     },
+    UnknownCommand {
+        name: String,
+        rest: Option<String>,
+    },
 }
 
 pub const DEFAULT_THINKING_LEVEL: &str = "medium";
@@ -99,6 +108,7 @@ impl ChannelCommand {
             ChannelCommand::Model { .. } => "model",
             ChannelCommand::Fast { .. } => "fast",
             ChannelCommand::Status { .. } => "status",
+            ChannelCommand::Unknown { .. } => "unknown-command",
         }
     }
 
@@ -110,6 +120,7 @@ impl ChannelCommand {
             }
             ChannelCommand::Stop { reason } => ChannelCommandIntent::StopCurrentRun { reason },
             ChannelCommand::Restart { target, reason } => match target.as_deref() {
+                Some("status") => ChannelCommandIntent::RestartStatus,
                 Some("channel") | Some("tg") | Some("telegram") | Some("discord")
                 | Some("current") => ChannelCommandIntent::RestartChannel { target, reason },
                 Some("gateway") | None => ChannelCommandIntent::RestartGateway { reason },
@@ -124,6 +135,9 @@ impl ChannelCommand {
             }
             ChannelCommand::Fast { mode, global } => ChannelCommandIntent::Fast { mode, global },
             ChannelCommand::Status { scope } => ChannelCommandIntent::ShowStatus { scope },
+            ChannelCommand::Unknown { name, rest } => {
+                ChannelCommandIntent::UnknownCommand { name, rest }
+            }
         }
     }
 }
@@ -133,7 +147,11 @@ pub fn parse_channel_command(input: &str) -> Option<ChannelCommand> {
     let command_text = trimmed.strip_prefix('/')?.trim_start();
     let (name, rest) = split_command(command_text);
 
-    match name.to_ascii_lowercase().as_str() {
+    let normalized_name = normalize_command_name(name);
+    if normalized_name == "skill" {
+        return None;
+    }
+    let command = match normalized_name.as_str() {
         "new" => Some(ChannelCommand::New {
             topic: optional_text(rest),
         }),
@@ -159,7 +177,13 @@ pub fn parse_channel_command(input: &str) -> Option<ChannelCommand> {
             scope: optional_text(rest),
         }),
         _ => None,
-    }
+    };
+    command.or_else(|| {
+        Some(ChannelCommand::Unknown {
+            name: normalized_name,
+            rest: optional_text(rest),
+        })
+    })
 }
 
 pub fn parse_channel_command_intent(input: &str) -> Option<ChannelCommandIntent> {
@@ -195,6 +219,7 @@ fn optional_restart_target(value: &str) -> (Option<String>, Option<String>) {
     let (first, rest) = split_command(trimmed);
     match first.to_ascii_lowercase().as_str() {
         "gateway" => (Some(first.to_ascii_lowercase()), optional_text(rest)),
+        "status" => (Some(first.to_ascii_lowercase()), None),
         "current" | "channel" | "tg" | "telegram" | "discord" => {
             (Some(first.to_ascii_lowercase()), optional_text(rest))
         }
@@ -208,6 +233,15 @@ fn required_text(value: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+fn normalize_command_name(name: &str) -> String {
+    let normalized = name.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        "unknown".to_string()
+    } else {
+        normalized
     }
 }
 
@@ -306,8 +340,20 @@ mod tests {
                 note: "this belongs to current thread".to_string()
             })
         );
-        assert_eq!(parse_channel_command("/steer"), None);
-        assert_eq!(parse_channel_command("/btw"), None);
+        assert_eq!(
+            parse_channel_command("/steer"),
+            Some(ChannelCommand::Unknown {
+                name: "steer".to_string(),
+                rest: None
+            })
+        );
+        assert_eq!(
+            parse_channel_command("/btw"),
+            Some(ChannelCommand::Unknown {
+                name: "btw".to_string(),
+                rest: None
+            })
+        );
     }
 
     #[test]
@@ -392,7 +438,13 @@ mod tests {
                 global: false
             })
         );
-        assert_eq!(parse_channel_command("/fast turbo"), None);
+        assert_eq!(
+            parse_channel_command("/fast turbo"),
+            Some(ChannelCommand::Unknown {
+                name: "fast".to_string(),
+                rest: Some("turbo".to_string())
+            })
+        );
     }
 
     #[test]
@@ -425,6 +477,10 @@ mod tests {
         assert_eq!(
             parse_channel_command_intent("/restart gateway"),
             Some(ChannelCommandIntent::RestartGateway { reason: None })
+        );
+        assert_eq!(
+            parse_channel_command_intent("/restart status"),
+            Some(ChannelCommandIntent::RestartStatus)
         );
         assert_eq!(
             parse_channel_command_intent("/restart channel reconnect websocket"),
@@ -494,6 +550,13 @@ mod tests {
                 global: true
             })
         );
+        assert_eq!(
+            parse_channel_command_intent("/bogus value"),
+            Some(ChannelCommandIntent::UnknownCommand {
+                name: "bogus".to_string(),
+                rest: Some("value".to_string())
+            })
+        );
     }
 
     #[test]
@@ -504,12 +567,31 @@ mod tests {
         assert_eq!(command.name(), "status");
         let command = parse_channel_command("/fast on").unwrap();
         assert_eq!(command.name(), "fast");
+        let command = parse_channel_command("/unknown").unwrap();
+        assert_eq!(command.name(), "unknown-command");
     }
 
     #[test]
-    fn ignores_plain_messages_and_unknown_commands() {
+    fn ignores_plain_messages_and_captures_unknown_slash_commands() {
         assert_eq!(parse_channel_command("hello"), None);
-        assert_eq!(parse_channel_command("/unknown value"), None);
+        assert_eq!(
+            parse_channel_command("/skill memory-cron repair memory cron"),
+            None
+        );
+        assert_eq!(
+            parse_channel_command("/unknown value"),
+            Some(ChannelCommand::Unknown {
+                name: "unknown".to_string(),
+                rest: Some("value".to_string())
+            })
+        );
+        assert_eq!(
+            parse_channel_command("/"),
+            Some(ChannelCommand::Unknown {
+                name: "unknown".to_string(),
+                rest: None
+            })
+        );
     }
 
     #[test]

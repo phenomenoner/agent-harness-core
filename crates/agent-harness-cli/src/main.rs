@@ -19,48 +19,52 @@ mod telegram_media;
 
 use agent_harness_core::{
     ActivationReadinessOptions, ActivationReadinessReport, AdmissionDecisionOptions,
-    AgentProgressDeliveryAction, AgentProgressDeliveryPending, AgentProgressDeliveryPlanOptions,
-    AgentProgressDeliveryRecordOptions, AgentProgressDeliveryStatus, AgentRegistry, AgentSource,
-    ArtifactExtractionSummary, AssistantNarrationMode, BackgroundTaskListOptions,
-    BackgroundTaskRecord, BackgroundTaskUpsertOptions, BudgetAcquireOptions,
-    BuiltinHarnessSkillSyncOptions, BuiltinHarnessSkillSyncReport, ChannelCommand,
-    ChannelCommandApplyOptions, ChannelCommandApplyReport, ChannelDeliveryIntentKind,
+    AgentProgressDeliveryAction, AgentProgressDeliveryFreshSendReason,
+    AgentProgressDeliveryPending, AgentProgressDeliveryPlanOptions,
+    AgentProgressDeliveryRecordContext, AgentProgressDeliveryRecordOptions,
+    AgentProgressDeliveryStatus, AgentRegistry, AgentSource, ArtifactExtractionSummary,
+    AssistantNarrationMode, BackgroundTaskListOptions, BackgroundTaskRecord,
+    BackgroundTaskUpsertOptions, BudgetAcquireOptions, BuiltinHarnessSkillSyncOptions,
+    BuiltinHarnessSkillSyncReport, ChannelCommand, ChannelCommandApplyOptions,
+    ChannelCommandApplyReport, ChannelDeliveryIntentKind,
     ChannelDeliveryPresentationFallbackReason, ChannelDeliveryPresentationReceipt,
     ChannelDeliveryReceipt, ChannelDeliveryRecordOptions, ChannelDeliveryRenderedUnitKind,
     ChannelDeliveryRenderedUnitReceipt, ChannelDeliveryStatus, ChannelDeliveryUnitStatus,
     ChannelIdentityLookup, ChannelIdentityResolutionStatus, ChannelOutboundAttachment,
-    ChannelOutboundAttachmentKind, ChannelOutboundMessage, ChannelOutboxPlanOptions,
-    ChannelOutboxPlanReport, ChannelReceiveOptions, ChannelReceiveReport, ChannelRunOnceOptions,
-    ChannelRunOnceReport, ChannelStep, CodexRuntimeCompletionOptions, CodexRuntimeCompletionReport,
-    CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReport, CodexRuntimePlanOptions,
-    CodexRuntimePlanReport, CodexRuntimePreflightOptions, CodexRuntimePreflightReport,
-    CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy, ContextPackParseOptions,
-    ContextRolloverRequeuePreparedOptions, CreateOperationPlanOptions, CronRunControlAction,
-    CronRunControlOptions, CronRunListOptions, CronSchedulerLintStatus,
-    CronSchedulerRunOnceOptions, CronSchedulerTickStatus, DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM,
+    ChannelOutboundAttachmentKind, ChannelOutboundMessage, ChannelOutboundMessageKind,
+    ChannelOutboxPlanOptions, ChannelOutboxPlanReport, ChannelReceiveOptions, ChannelReceiveReport,
+    ChannelRunOnceOptions, ChannelRunOnceReport, ChannelStep, CodexRuntimeCompletionOptions,
+    CodexRuntimeCompletionReport, CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReport,
+    CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimePreflightOptions,
+    CodexRuntimePreflightReport, CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy,
+    ContextPackParseOptions, ContextRolloverRequeuePreparedOptions, CreateOperationPlanOptions,
+    CronRunControlAction, CronRunControlOptions, CronRunListOptions, CronSchedulerLintStatus,
+    CronSchedulerRunOnceOptions, CronSchedulerTickStatus, DEFAULT_DREAM_DIRECTOR_MAX_CHARS,
+    DEFAULT_DREAM_DIRECTOR_SOURCE_MAX_AGE_HOURS, DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM,
     DEFAULT_MEMORY_BACKFILL_BATCH_SIZE, DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS,
     DEFAULT_MEMORY_BACKFILL_MAX_ITEMS, DEFAULT_MEMORY_BACKFILL_RATE_LIMIT_PER_MINUTE,
     DEFAULT_MEMORY_BACKFILL_RETRY_CAP, DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION,
     DEFAULT_MEMORY_OWNER_HEARTBEAT_MAX_AGE_MS, DeterministicCronPlan, DeterministicCronPlanInput,
-    DeterministicCronWorkerEnqueueOptions, DriftCheckOptions, DryRunImportOptions,
-    ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel, HarnessLogRotationOptions,
-    HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport, HealthzOptions,
-    ImportPhaseStatus, ImportReport, InboundMediaArtifact, InboundMediaDownloadStatus,
-    InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant, LearningProposalOptions,
-    LiveControlAction, McpRequestOptions, MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport,
-    MemoryCanvasWorkerStatus, MemoryCredentialsExportOptions, MemoryCredentialsExportReport,
-    MemoryEmbeddingBackfillLane, MemoryEmbeddingBackfillOptions, MemoryEmbeddingBackfillReport,
-    MemoryHookAdapterOptions, MemoryHookKind, MemoryOwnerEndpointProbeOptions,
-    MemoryOwnerEnsureOptions, MemoryOwnerHeartbeatOptions, MemoryOwnerPromotionOptions,
-    MemoryOwnerRecoveryOptions, MemoryOwnerShadowKind, MemoryOwnerShadowOptions,
-    MemoryOwnerTrustScopeOptions, MemorySearchOptions, MemorySearchReport,
-    MemoryVectorRecallOptions, MemoryVectorRecallReport, MemoryVectorRecallStatus, NativeCronPlan,
-    NativeCronPlanInput, NativeCronWorkerEnqueueOptions, OpenClawMemLocalOwnerPrepareOptions,
-    OpenClawMemReadPathSmokeOptions, OpenClawMemServiceProposeOptions,
-    OpenClawMemServiceRecallOptions, OpenClawMemServiceStatus, OpenClawMemServiceStatusOptions,
-    OpenClawMemServiceStoreOptions, OperationPlanAddItemOptions, OperationPlanBlockOptions,
-    OperationPlanCommentOptions, OperationPlanCompleteOptions, OperationPlanDelegateItemOptions,
-    OperationPlanItemStatus, OperationPlanPromoteDependenciesOptions, OperationPlanShowOptions,
+    DeterministicCronWorkerEnqueueOptions, DreamDirectorSendOptions, DriftCheckOptions,
+    DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel,
+    HarnessLogRotationOptions, HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport,
+    HealthzOptions, ImportPhaseStatus, ImportReport, InboundMediaArtifact,
+    InboundMediaDownloadStatus, InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant,
+    LearningProposalOptions, LiveControlAction, McpRequestOptions, MemoryCanvasWorkerOptions,
+    MemoryCanvasWorkerReport, MemoryCanvasWorkerStatus, MemoryCredentialsExportOptions,
+    MemoryCredentialsExportReport, MemoryEmbeddingBackfillLane, MemoryEmbeddingBackfillOptions,
+    MemoryEmbeddingBackfillReport, MemoryHookAdapterOptions, MemoryHookKind,
+    MemoryOwnerEndpointProbeOptions, MemoryOwnerEnsureOptions, MemoryOwnerHeartbeatOptions,
+    MemoryOwnerPromotionOptions, MemoryOwnerRecoveryOptions, MemoryOwnerShadowKind,
+    MemoryOwnerShadowOptions, MemoryOwnerTrustScopeOptions, MemorySearchOptions,
+    MemorySearchReport, MemoryVectorRecallOptions, MemoryVectorRecallReport,
+    MemoryVectorRecallStatus, NativeCronPlan, NativeCronPlanInput, NativeCronWorkerEnqueueOptions,
+    OpenClawMemLocalOwnerPrepareOptions, OpenClawMemReadPathSmokeOptions,
+    OpenClawMemServiceProposeOptions, OpenClawMemServiceRecallOptions, OpenClawMemServiceStatus,
+    OpenClawMemServiceStatusOptions, OpenClawMemServiceStoreOptions, OperationPlanAddItemOptions,
+    OperationPlanBlockOptions, OperationPlanCommentOptions, OperationPlanCompleteOptions,
+    OperationPlanDelegateItemOptions, OperationPlanItemStatus,
+    OperationPlanPromoteDependenciesOptions, OperationPlanShowOptions,
     OperationPlanUpdateItemOptions, OpsBackupOptions, OpsControlAction, OpsControlOptions,
     OpsCutoverApplyOptions, OpsCutoverApproveOptions, OpsCutoverReceiptOptions,
     OpsCutoverRequestOptions, OpsCutoverStatusOptions, PromptAssemblyOptions, PromptBundle,
@@ -87,38 +91,39 @@ use agent_harness_core::{
     block_operation_plan, build_channel_step, build_dry_run_report, build_harness_skill_index,
     build_import_plan, build_runtime_skill_index, build_source_skill_index, build_turn_plan,
     cancel_worker_job, check_activation_readiness, check_config_drift, check_tool_description_pin,
-    collect_harness_metrics, collect_harness_status, collect_healthz,
-    collect_inbound_media_cache_report, collect_ops_cutover_status, collect_token_efficiency,
-    collect_worker_status, comment_on_operation_plan, compare_channel_turn_shadow,
-    complete_operation_plan, control_cron_run, control_runtime_queue_item,
-    create_learning_proposal, create_operation_plan, create_ops_backup,
+    collect_gateway_restart_status, collect_harness_metrics, collect_harness_status,
+    collect_healthz, collect_inbound_media_cache_report, collect_ops_cutover_status,
+    collect_token_efficiency, collect_worker_status, comment_on_operation_plan,
+    compare_channel_turn_shadow, complete_operation_plan, control_cron_run,
+    control_runtime_queue_item, create_learning_proposal, create_operation_plan, create_ops_backup,
     create_skill_archive_proposal, create_skill_learning_proposal, current_log_time_ms,
     default_supervisor_child_specs, delegate_operation_plan_item, enqueue_channel_step,
     enqueue_deterministic_cron_workers, enqueue_native_cron_workers, enqueue_subagent_workers,
     enqueue_worker_job, ensure_memory_owner_state, evaluate_admission, evaluate_prompt_reduction,
     evaluate_supervisor_children, execute_import, export_harness_registry_files,
     export_memory_credentials, get_vault_secret, handle_mcp_request, inspect_openclaw_mem_service,
-    inspect_runtime_queue_capacity, invariant_catalog, inventory, lint_cron_scheduler,
-    list_background_tasks, list_cron_runs, list_operation_plans, list_skill_proposals,
-    load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
-    load_subagent_ledger, parse_channel_command, parse_context_pack, plan_agent_progress_delivery,
-    plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron, plan_native_cron,
-    plan_subagents, preflight_codex_runtime, prepare_openclaw_mem_local_owner,
-    prepare_runtime_queue_item, probe_codex_runtime_launch,
-    promote_operation_plan_items_from_dependencies, propose_openclaw_mem_service_memory,
-    put_vault_secret, reap_stale_worker_jobs, recall_openclaw_mem_service, receive_channel_message,
-    reconcile_supervisor_inventory, record_agent_progress_delivery, record_channel_delivery,
+    inspect_runtime_queue_capacity, invariant_catalog, inventory,
+    latest_agent_progress_event_line_for_queue, lint_cron_scheduler, list_background_tasks,
+    list_cron_runs, list_operation_plans, list_skill_proposals, load_agent_registry,
+    load_deterministic_cron_store, load_native_cron_store, load_subagent_ledger,
+    parse_channel_command, parse_context_pack, plan_agent_progress_delivery, plan_channel_outbox,
+    plan_codex_runtime, plan_deterministic_cron, plan_native_cron, plan_subagents,
+    preflight_codex_runtime, prepare_openclaw_mem_local_owner, prepare_runtime_queue_item,
+    probe_codex_runtime_launch, promote_operation_plan_items_from_dependencies,
+    propose_openclaw_mem_service_memory, put_vault_secret, reap_stale_worker_jobs,
+    recall_openclaw_mem_service, receive_channel_message, reconcile_supervisor_inventory,
+    record_agent_progress_delivery_with_context, record_channel_delivery,
     record_channel_turn_shadow, record_codex_runtime_completion,
     record_memory_owner_endpoint_probe, record_memory_owner_heartbeat,
     record_memory_owner_shadow_receipt, record_memory_owner_trust_scope_receipt,
     record_ops_control, record_ops_cutover_apply, record_ops_cutover_approval,
     record_ops_cutover_receipt, record_ops_cutover_request, record_scoped_stop,
     record_subagent_lifecycle, record_supervise_deploy_canary, recover_memory_owner_state,
-    reject_skill_proposal, release_checklist, render_rich_presentation_batch_for_discord,
-    render_rich_presentation_batch_for_telegram, request_memory_owner_promotion,
-    requeue_prepared_context_rollover, resolve_channel_identity,
+    reject_skill_proposal, release_agent_progress_surface_claim, release_checklist,
+    render_rich_presentation_batch_for_discord, render_rich_presentation_batch_for_telegram,
+    request_memory_owner_promotion, requeue_prepared_context_rollover, resolve_channel_identity,
     resolve_virtual_session_working_context, rotate_harness_log_if_needed, run_channel_once,
-    run_codex_runtime, run_cron_scheduler_once, run_memory_canvas_worker,
+    run_codex_runtime, run_cron_scheduler_once, run_dream_director_send, run_memory_canvas_worker,
     run_memory_embedding_backfill, run_memory_hook_adapter, run_openclaw_mem_read_path_smoke,
     run_public_hygiene, run_runtime_queue_once, run_worker_once,
     runtime_worker::reconcile_runtime_queue_leases_for_generation, scan_security_boundaries,
@@ -218,6 +223,8 @@ fn main() {
         "ops-cutover-status" => run_ops_cutover_status(&rest),
         "ops-cutover-receipt" => run_ops_cutover_receipt(&rest),
         "ops-control" => run_ops_control(&rest),
+        "restart-status" => run_restart_status(&rest),
+        "resource-exhaustion-readback" => run_resource_exhaustion_readback(&rest),
         "supervisor-reconcile" => run_supervisor_reconcile(&rest),
         "supervisor-run" => run_supervisor_run(&rest),
         "supervisor-plan" => run_supervisor_plan(&rest),
@@ -277,6 +284,7 @@ fn main() {
         "cron-scheduler-lint" => run_cron_scheduler_lint(&rest),
         "cron-scheduler-run-once" => run_cron_scheduler_run_once(&rest),
         "cron-scheduler-loop" => run_cron_scheduler_loop(&rest),
+        "dream-director-send" => run_dream_director_send_cli(&rest),
         "context-rollover" => run_context_rollover(&rest),
         "virtual-session-context" => run_virtual_session_context(&rest),
         "subagent-plan" => run_subagent_plan(&rest),
@@ -525,6 +533,78 @@ fn run_harness_status(args: &[String]) -> Result<(), String> {
         print_harness_status_report(&report);
     }
     Ok(())
+}
+
+fn run_restart_status(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(args, "restart-status", &[], &["--json"])?;
+    let report = collect_gateway_restart_status(&options.target_home).map_err(|err| {
+        format!(
+            "failed to collect gateway restart status for {}: {err}",
+            options.target_home.display()
+        )
+    })?;
+    if options.has_flag("--json") {
+        print_json(&report)
+    } else {
+        println!("Gateway restart status");
+        println!(
+            "  latest request: {}",
+            report
+                .latest_request
+                .as_ref()
+                .and_then(|value| value.at_ms)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        );
+        println!(
+            "  consumed: {}",
+            report
+                .latest_consumption
+                .as_ref()
+                .and_then(|value| value.consumed_at_ms)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        );
+        println!(
+            "  completion heartbeat: {}",
+            report
+                .latest_completion
+                .as_ref()
+                .and_then(|value| value.heartbeat_at_ms)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        );
+        println!(
+            "  service: status={} generation={}",
+            report.service.status.as_deref().unwrap_or("-"),
+            report.service.generation_id.as_deref().unwrap_or("-")
+        );
+        println!(
+            "  heartbeat: status={} generation={}",
+            report.heartbeat.status.as_deref().unwrap_or("-"),
+            report.heartbeat.generation_id.as_deref().unwrap_or("-")
+        );
+        Ok(())
+    }
+}
+
+fn run_resource_exhaustion_readback(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(
+        args,
+        "resource-exhaustion-readback",
+        &["--limit", "--max-bytes"],
+        &["--json"],
+    )?;
+    let limit = options.optional_usize("--limit")?.unwrap_or(3);
+    let max_bytes = options.optional_usize("--max-bytes")?.unwrap_or(64 * 1024);
+    let report = agent_harness_core::loop_diagnostics::collect_resource_exhaustion_readback(
+        agent_harness_core::loop_diagnostics::ResourceExhaustionReadbackOptions {
+            limit,
+            max_bytes,
+        },
+    )
+    .map_err(|err| format!("failed to collect resource-exhaustion readback: {err}"))?;
+    print_json(&report)
 }
 
 fn run_round7_receipt(args: &[String]) -> Result<(), String> {
@@ -2607,6 +2687,8 @@ fn run_channel_receive(args: &[String]) -> Result<(), String> {
         message: args.turn.message,
         inbound_context: None,
         inbound_media_artifacts: Vec::new(),
+        inbound_event_kind: None,
+        inbound_event_id: None,
         skill_limit: args.turn.skill_limit,
         now_ms: args.now_ms,
     })
@@ -2631,6 +2713,8 @@ fn run_channel_run_once(args: &[String]) -> Result<(), String> {
         message: args.turn.message,
         inbound_context: None,
         inbound_media_artifacts: Vec::new(),
+        inbound_event_kind: None,
+        inbound_event_id: None,
         skill_limit: args.turn.skill_limit,
         now_ms: args.now_ms,
         codex_executable: args.codex_exe,
@@ -3051,15 +3135,21 @@ fn run_progress_delivery_loop(args: &[String]) -> Result<(), String> {
                     "progress-delivery-loop iteration {iterations} failed ({consecutive_errors}/{}): {error}",
                     args.max_consecutive_errors
                 );
+                let log_time_ms = current_log_time_ms().map_err(|err| err.to_string())?;
+                let diagnostics = loop_error_diagnostics_suffix(
+                    &args.send.target_home,
+                    "progress-delivery-loop",
+                    log_time_ms,
+                );
                 append_harness_log(
                     &args.send.target_home,
                     &HarnessLogEvent::new(
-                        current_log_time_ms().map_err(|err| err.to_string())?,
+                        log_time_ms,
                         HarnessLogLevel::Warn,
                         "progress",
                         "progress.delivery-loop-error",
                         format!(
-                            "iteration={iterations} consecutiveErrors={consecutive_errors}/{} error={error}",
+                            "iteration={iterations} consecutiveErrors={consecutive_errors}/{} error={error}{diagnostics}",
                             args.max_consecutive_errors
                         ),
                     ),
@@ -3121,6 +3211,8 @@ fn run_supervisor_reconcile(args: &[String]) -> Result<(), String> {
             "iteration": iteration,
             "dryRun": !args.apply,
             "applied": args.apply,
+            "autoReconcile": args.auto_reconcile,
+            "launchBackoffMs": args.restart_delay_ms,
             "launches": launches,
             "inventory": report,
         });
@@ -3157,6 +3249,35 @@ fn run_supervisor_run(args: &[String]) -> Result<(), String> {
             started_at_ms,
             launches
         );
+        if let Some(conflict) = supervisor_launch_owner_conflict(
+            &args.target_home,
+            &args.service,
+            Some(std::process::id()),
+        )? {
+            append_supervisor_launch_receipt(
+                &args.target_home,
+                serde_json::json!({
+                    "schema": "agent-harness.supervisor-launch-receipt.v1",
+                    "status": "launch-refused-owner-alive",
+                    "serviceId": args.service,
+                    "reason": "live owner from another generation or launch path is already running",
+                    "requestedGenerationId": generation_id,
+                    "conflict": conflict,
+                    "atMs": current_time_ms()?,
+                }),
+            )?;
+            write_supervisor_run_state(
+                &args,
+                None,
+                None,
+                "launch-refused-owner-alive",
+                "live owner from another generation or launch path is already running",
+            )?;
+            return Err(format!(
+                "supervisor-run {} refused launch: live owner is already running",
+                args.service
+            ));
+        }
         let mut command = Command::new(&args.harness_cli);
         command
             .args(supervisor_child_args(&args))
@@ -3173,6 +3294,12 @@ fn run_supervisor_run(args: &[String]) -> Result<(), String> {
             .env(
                 "AGENT_HARNESS_SUPERVISOR_PARENT_PID",
                 std::process::id().to_string(),
+            )
+            .env(
+                "AGENT_HARNESS_SUPERVISOR_STOP_FILE",
+                supervisor_run_watched_stop_file(&args)
+                    .display()
+                    .to_string(),
             )
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
@@ -3191,6 +3318,19 @@ fn run_supervisor_run(args: &[String]) -> Result<(), String> {
             }
         };
         let child_pid = child.id();
+        append_supervisor_launch_receipt(
+            &args.target_home,
+            serde_json::json!({
+                "schema": "agent-harness.supervisor-launch-receipt.v1",
+                "status": "launched",
+                "serviceId": args.service,
+                "pid": child_pid,
+                "generationId": generation_id,
+                "launchOwner": "rust-supervisor-run",
+                "supervisorPid": std::process::id(),
+                "atMs": started_at_ms,
+            }),
+        )?;
         write_supervisor_run_state(
             &args,
             Some(SupervisedChildRuntimeState {
@@ -3522,6 +3662,12 @@ fn supervisor_run_supported_service(service: &str) -> bool {
     ) || service.starts_with("telegram-loop-")
 }
 
+fn supervisor_run_watched_stop_file(args: &SupervisorRunArgs) -> PathBuf {
+    args.stop_file.clone().unwrap_or_else(|| {
+        agent_harness_core::loop_health::supervisor_stop_file_path(&args.target_home, &args.service)
+    })
+}
+
 fn push_optional_path_arg(args: &mut Vec<String>, flag: &str, value: Option<&PathBuf>) {
     if let Some(value) = value {
         args.extend([flag.to_string(), value.display().to_string()]);
@@ -3567,6 +3713,7 @@ fn write_supervisor_run_state(
         "supervisorPid": std::process::id(),
         "processStartTimeMs": runtime.as_ref().map(|runtime| runtime.started_at_ms),
         "startedAtMs": runtime.as_ref().map(|runtime| runtime.started_at_ms),
+        "parentPid": std::process::id(),
         "lastHeartbeatAtMs": now_ms,
         "lastSuccessfulIterationAtMs": if actual_state == "running" { Some(now_ms) } else { None },
         "lastExitAtMs": runtime.as_ref().and_then(|runtime| runtime.last_exit_at_ms),
@@ -3581,6 +3728,7 @@ fn write_supervisor_run_state(
         "detail": detail,
         "launchOwner": "rust-supervisor-run",
         "observedOnly": false,
+        "watchedStopFile": supervisor_run_watched_stop_file(args),
         "servicePriority": supervisor_service_priority(&args.service),
         "deliveryLane": supervisor_delivery_lane(&args.service),
         "restartDelayMs": args.restart_delay_ms,
@@ -3645,13 +3793,41 @@ fn execute_progress_delivery_once(
     for pending in pending_items {
         if let Some(sequence) = args.preempt_after_wake_sequence {
             let current_sequence = read_loop_wake_sequence(&args.target_home, "progress-delivery");
-            if progress_delivery_should_preempt_stale_pending(&pending, sequence, current_sequence)
-            {
-                warnings.push(format!(
-                    "progress delivery plan for {} was preempted by a newer progress wake; replanning before non-terminal delivery",
-                    pending.queue_id
-                ));
-                break;
+            if current_sequence > sequence {
+                let latest_queue_event_line = latest_agent_progress_event_line_for_queue(
+                    &args.target_home,
+                    &pending.queue_id,
+                )
+                .map_err(|err| err.to_string())?;
+                if progress_delivery_should_preempt_stale_pending(&pending, latest_queue_event_line)
+                {
+                    let warning = format!(
+                        "progress delivery plan for {} was preempted by newer events for the same queue; skipping stale non-terminal pending",
+                        pending.queue_id
+                    );
+                    warnings.push(warning.clone());
+                    if pending.fresh_send_reason.is_some() && pending.provider_message_id.is_none()
+                    {
+                        let _ = release_agent_progress_surface_claim(
+                            &args.target_home,
+                            &pending.status_surface_key,
+                            &pending.queue_id,
+                        )
+                        .map_err(|err| err.to_string())?;
+                    }
+                    append_harness_log(
+                        &args.target_home,
+                        &HarnessLogEvent::new(
+                            current_log_time_ms().map_err(|err| err.to_string())?,
+                            HarnessLogLevel::Info,
+                            "progress",
+                            "progress.delivery-preempted",
+                            warning,
+                        ),
+                    )
+                    .map_err(|err| err.to_string())?;
+                    continue;
+                }
             }
         }
         let policy_decision = match progress_delivery_allowed(&policy, &pending, args) {
@@ -3764,10 +3940,16 @@ fn progress_delivery_pending_priority(pending: &AgentProgressDeliveryPending) ->
 
 fn progress_delivery_should_preempt_stale_pending(
     pending: &AgentProgressDeliveryPending,
-    previous_sequence: u64,
-    current_sequence: u64,
+    latest_queue_event_line: Option<usize>,
 ) -> bool {
-    !pending.terminal && current_sequence > previous_sequence
+    if pending.terminal {
+        return false;
+    }
+    if pending.action == AgentProgressDeliveryAction::Send && pending.provider_message_id.is_none()
+    {
+        return false;
+    }
+    latest_queue_event_line.is_some_and(|line| line > pending.event_line)
 }
 
 fn progress_delivery_account_id<'a>(
@@ -3906,28 +4088,65 @@ fn record_progress_delivery(
     policy_decision: Option<String>,
     error: Option<String>,
 ) -> Result<(), String> {
-    record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
-        harness_home: args.target_home.clone(),
-        queue_id: pending.queue_id.clone(),
-        platform: pending.platform.clone(),
-        account_id: pending.account_id.clone(),
-        channel_id: pending.channel_id.clone(),
-        thread_id: pending.thread_id.clone(),
-        user_id: pending.user_id.clone(),
-        session_key: pending.session_key.clone(),
-        message_kind: pending.message_kind,
-        action,
-        status,
-        provider_message_id,
-        event_line: pending.event_line,
-        text_hash: pending.text_hash.clone(),
-        terminal: pending.terminal,
-        policy_decision,
-        error,
-        now_ms: current_time_ms()?,
-    })
+    let decision = Some(
+        match action {
+            AgentProgressDeliveryAction::Send => "send",
+            AgentProgressDeliveryAction::Edit => "edit",
+        }
+        .to_string(),
+    );
+    let existing_provider_message_id = pending.provider_message_id.clone();
+    let fresh_send_reason = progress_delivery_fresh_send_reason(pending, action);
+    record_agent_progress_delivery_with_context(
+        AgentProgressDeliveryRecordOptions {
+            harness_home: args.target_home.clone(),
+            queue_id: pending.queue_id.clone(),
+            platform: pending.platform.clone(),
+            account_id: pending.account_id.clone(),
+            channel_id: pending.channel_id.clone(),
+            thread_id: pending.thread_id.clone(),
+            user_id: pending.user_id.clone(),
+            session_key: pending.session_key.clone(),
+            message_kind: pending.message_kind,
+            action,
+            status,
+            provider_message_id,
+            event_line: pending.event_line,
+            text_hash: pending.text_hash.clone(),
+            terminal: pending.terminal,
+            policy_decision,
+            error,
+            now_ms: current_time_ms()?,
+        },
+        AgentProgressDeliveryRecordContext {
+            status_surface_key: pending.status_surface_key.clone(),
+            existing_provider_message_id,
+            decision,
+            fresh_send_reason,
+            idempotency_hit: pending.idempotency_hit,
+            progress_suppressed_reason: pending.progress_suppressed_reason.clone(),
+        },
+    )
     .map(|_| ())
     .map_err(|err| err.to_string())
+}
+
+fn progress_delivery_fresh_send_reason(
+    pending: &AgentProgressDeliveryPending,
+    action: AgentProgressDeliveryAction,
+) -> Option<AgentProgressDeliveryFreshSendReason> {
+    if action != AgentProgressDeliveryAction::Send {
+        return None;
+    }
+    pending.fresh_send_reason.or_else(|| {
+        pending
+            .provider_message_id
+            .as_ref()
+            .map(|_| AgentProgressDeliveryFreshSendReason::EditProviderNotFound)
+            .or(Some(
+                AgentProgressDeliveryFreshSendReason::NoExistingStatusSurface,
+            ))
+    })
 }
 
 fn progress_delivery_allowed(
@@ -4121,15 +4340,21 @@ fn run_telegram_loop(args: &[String]) -> Result<(), String> {
                     "{} iteration {iterations} failed ({consecutive_errors}/{}): {error}",
                     args.loop_name, args.max_consecutive_errors
                 );
+                let log_time_ms = current_log_time_ms().unwrap_or(0);
+                let diagnostics = loop_error_diagnostics_suffix(
+                    &args.poll.target_home,
+                    &args.loop_name,
+                    log_time_ms,
+                );
                 let _ = append_harness_log(
                     &args.poll.target_home,
                     &HarnessLogEvent::new(
-                        current_log_time_ms().unwrap_or(0),
+                        log_time_ms,
                         HarnessLogLevel::Warn,
                         "telegram",
                         "telegram.loop-error",
                         format!(
-                            "iteration={iterations} consecutiveErrors={consecutive_errors} error={error}"
+                            "iteration={iterations} consecutiveErrors={consecutive_errors} error={error}{diagnostics}"
                         ),
                     ),
                 );
@@ -4295,7 +4520,7 @@ fn execute_telegram_poll_once(
             write_telegram_offset(&offset_file, next_offset)?;
             continue;
         };
-        let inbound_context = telegram_inbound_context(message);
+        let mut inbound_context = telegram_inbound_context(message);
         let Some(text) = telegram_message_text(message, inbound_context.is_some()) else {
             skipped_updates += 1;
             write_telegram_offset(&offset_file, next_offset)?;
@@ -4361,6 +4586,8 @@ fn execute_telegram_poll_once(
             write_telegram_offset(&offset_file, next_offset)?;
             continue;
         }
+        inbound_context =
+            append_channel_access_inbound_context(inbound_context, permission, chat_type);
         if let Some(media_group_id) = message
             .get("media_group_id")
             .and_then(serde_json::Value::as_str)
@@ -4422,6 +4649,8 @@ fn execute_telegram_poll_once(
             message: text,
             inbound_context,
             inbound_media_artifacts: media.artifacts,
+            inbound_event_kind: Some("telegram-update".to_string()),
+            inbound_event_id: Some(update_id.to_string()),
             skill_limit: args.skill_limit,
             now_ms: current_time_ms()?,
             codex_executable: args.codex_exe.clone(),
@@ -4649,8 +4878,14 @@ fn execute_telegram_media_group_flush<F: telegram_media::TelegramMediaFetcher>(
         agent_id: identity.agent_id.clone(),
         session_key: None,
         message: text,
-        inbound_context: telegram_media_group_inbound_context(flush),
+        inbound_context: append_channel_access_inbound_context(
+            telegram_media_group_inbound_context(flush),
+            permission,
+            chat_type,
+        ),
         inbound_media_artifacts,
+        inbound_event_kind: Some("telegram-media-group".to_string()),
+        inbound_event_id: Some(flush.media_group_id.clone()),
         skill_limit: args.skill_limit,
         now_ms: current_time_ms()?,
         codex_executable: args.codex_exe.clone(),
@@ -5022,15 +5257,21 @@ fn run_discord_outbox_loop(args: &[String]) -> Result<(), String> {
                     "discord-outbox-loop iteration {iterations} failed ({consecutive_errors}/{}): {error}",
                     args.max_consecutive_errors
                 );
+                let log_time_ms = current_log_time_ms().unwrap_or(0);
+                let diagnostics = loop_error_diagnostics_suffix(
+                    &args.send.target_home,
+                    "discord-outbox-loop",
+                    log_time_ms,
+                );
                 let _ = append_harness_log(
                     &args.send.target_home,
                     &HarnessLogEvent::new(
-                        current_log_time_ms().unwrap_or(0),
+                        log_time_ms,
                         HarnessLogLevel::Warn,
                         "discord",
                         "discord.outbox-loop-error",
                         format!(
-                            "iteration={iterations} consecutiveErrors={consecutive_errors} error={error}"
+                            "iteration={iterations} consecutiveErrors={consecutive_errors} error={error}{diagnostics}"
                         ),
                     ),
                 );
@@ -5467,6 +5708,11 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
                                 run: None,
                             }
                         } else {
+                            message.inbound_context = append_channel_access_inbound_context(
+                                message.inbound_context.take(),
+                                permission,
+                                discord_chat_type(&message),
+                            );
                             attach_discord_message_artifacts(
                                 &args.target_home,
                                 &mut message,
@@ -5502,6 +5748,8 @@ fn run_discord_event_run_once(args: &[String]) -> Result<(), String> {
                                 message: message_text,
                                 inbound_context: message.inbound_context.clone(),
                                 inbound_media_artifacts: message.inbound_media_artifacts.clone(),
+                                inbound_event_kind: Some("discord-message".to_string()),
+                                inbound_event_id: Some(message.message_id.clone()),
                                 skill_limit: args.skill_limit,
                                 now_ms: current_time_ms()?,
                                 codex_executable: args.codex_exe.clone(),
@@ -5723,15 +5971,21 @@ fn run_discord_gateway_loop(args: &[String]) -> Result<(), String> {
                     iterations,
                     &format!("consecutiveErrors={consecutive_errors} error={error}"),
                 )?;
+                let log_time_ms = current_log_time_ms().map_err(|err| err.to_string())?;
+                let diagnostics = loop_error_diagnostics_suffix(
+                    &args.target_home,
+                    "discord-gateway-loop",
+                    log_time_ms,
+                );
                 append_harness_log(
                     &args.target_home,
                     &HarnessLogEvent::new(
-                        current_log_time_ms().map_err(|err| err.to_string())?,
+                        log_time_ms,
                         HarnessLogLevel::Warn,
                         "discord",
                         "discord.gateway-loop-error",
                         format!(
-                            "iteration={iterations} consecutiveErrors={consecutive_errors} error={error}"
+                            "iteration={iterations} consecutiveErrors={consecutive_errors} error={error}{diagnostics}"
                         ),
                     ),
                 )
@@ -5758,15 +6012,21 @@ fn run_discord_gateway_loop(args: &[String]) -> Result<(), String> {
                     iterations,
                     &format!("consecutiveErrors={consecutive_errors} error={error}"),
                 )?;
+                let log_time_ms = current_log_time_ms().map_err(|err| err.to_string())?;
+                let diagnostics = loop_error_diagnostics_suffix(
+                    &args.target_home,
+                    "discord-gateway-loop",
+                    log_time_ms,
+                );
                 append_harness_log(
                     &args.target_home,
                     &HarnessLogEvent::new(
-                        current_log_time_ms().map_err(|err| err.to_string())?,
+                        log_time_ms,
                         HarnessLogLevel::Warn,
                         "discord",
                         "discord.gateway-loop-error",
                         format!(
-                            "iteration={iterations} consecutiveErrors={consecutive_errors} error={error}"
+                            "iteration={iterations} consecutiveErrors={consecutive_errors} error={error}{diagnostics}"
                         ),
                     ),
                 )
@@ -5876,6 +6136,16 @@ fn consume_gateway_restart_request(
             .and_then(serde_json::Value::as_str)
             .unwrap_or("gateway restart requested")
             .to_string();
+        let consumer_pid = std::process::id();
+        let parent_pid = env_i64("AGENT_HARNESS_SUPERVISOR_PARENT_PID");
+        let generation_id = env::var("AGENT_HARNESS_SERVICE_GENERATION_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let process_start_time_ms = env_i64("AGENT_HARNESS_SERVICE_STARTED_AT_MS");
+        let stop_file = agent_harness_core::loop_health::supervisor_stop_file_path(
+            harness_home,
+            "discord-gateway-loop",
+        );
         if let Some(object) = value.as_object_mut() {
             object.insert(
                 "status".to_string(),
@@ -5892,6 +6162,32 @@ fn consume_gateway_restart_request(
             object.insert(
                 "consumedRequestFile".to_string(),
                 serde_json::Value::String(request_file.display().to_string()),
+            );
+            object.insert(
+                "consumerPid".to_string(),
+                serde_json::Value::Number(u64::from(consumer_pid).into()),
+            );
+            if let Some(parent_pid) = parent_pid {
+                object.insert(
+                    "parentPid".to_string(),
+                    serde_json::Value::Number(parent_pid.into()),
+                );
+            }
+            if let Some(generation_id) = generation_id {
+                object.insert(
+                    "generationId".to_string(),
+                    serde_json::Value::String(generation_id),
+                );
+            }
+            if let Some(process_start_time_ms) = process_start_time_ms {
+                object.insert(
+                    "processStartTimeMs".to_string(),
+                    serde_json::Value::Number(process_start_time_ms.into()),
+                );
+            }
+            object.insert(
+                "stopFile".to_string(),
+                serde_json::Value::String(stop_file.display().to_string()),
             );
         }
         let consumed_dir = request_dir.join("consumed");
@@ -6128,6 +6424,7 @@ fn run_queue_enqueue(args: &[String]) -> Result<(), String> {
         RuntimeQueueEnqueueOptions {
             harness_home: args.target_home,
             runtime_workspace: None,
+            inbound_canonical_id: None,
             now_ms: args.now_ms,
         },
     )
@@ -7115,6 +7412,65 @@ fn run_cron_scheduler_run_once(args: &[String]) -> Result<(), String> {
     print_json(&report)
 }
 
+fn run_dream_director_send_cli(args: &[String]) -> Result<(), String> {
+    let args = SimpleOptions::parse(
+        args,
+        "dream-director-send",
+        &[
+            "--target",
+            "--max-chars",
+            "--source-max-age-hours",
+            "--now-ms",
+        ],
+        &["--dry-run", "--force", "--json"],
+    )?;
+    let now_ms = args
+        .optional_i64("--now-ms")?
+        .unwrap_or(current_log_time_ms().map_err(|err| err.to_string())?);
+    let source_max_age_hours = args
+        .optional("--source-max-age-hours")
+        .map(|value| parse_f64(value, "--source-max-age-hours"))
+        .transpose()?
+        .unwrap_or(DEFAULT_DREAM_DIRECTOR_SOURCE_MAX_AGE_HOURS);
+    if source_max_age_hours <= 0.0 {
+        return Err("--source-max-age-hours must be positive".to_string());
+    }
+    let report = run_dream_director_send(DreamDirectorSendOptions {
+        harness_home: args.target_home.clone(),
+        target: args
+            .optional("--target")
+            .unwrap_or("ck-private")
+            .to_string(),
+        max_chars: args
+            .optional_usize("--max-chars")?
+            .unwrap_or(DEFAULT_DREAM_DIRECTOR_MAX_CHARS),
+        source_max_age_hours,
+        dry_run: args.has_flag("--dry-run"),
+        force: args.has_flag("--force"),
+        now_ms,
+    })
+    .map_err(|err| err.to_string())?;
+    if args.has_flag("--json") {
+        print_json(&report)?;
+    } else {
+        println!("{}", dream_director_cli_status_line(&report.receipt.status));
+        println!("Receipt: {}", report.receipt_file.display());
+    }
+    if report.receipt.status == "provider-send-deferred" {
+        Err("dream-director-send provider send is not implemented; use --dry-run or the existing live sender".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn dream_director_cli_status_line(status: &str) -> String {
+    match status {
+        "dry-run" => "DRY_RUN_OK".to_string(),
+        "stale-source-suppressed" => "STALE_SOURCE_SUPPRESSED".to_string(),
+        other => other.replace('-', "_").to_ascii_uppercase(),
+    }
+}
+
 fn run_cron_scheduler_loop(args: &[String]) -> Result<(), String> {
     let args = cron_scheduler_loop_args_from_args(args)?;
     let mut iterations = 0usize;
@@ -7199,14 +7555,20 @@ fn run_cron_scheduler_loop(args: &[String]) -> Result<(), String> {
             Err(error) => {
                 let detail = error.to_string();
                 consecutive_errors = consecutive_errors.saturating_add(1);
+                let log_time_ms = current_log_time_ms().unwrap_or(0);
+                let diagnostics = loop_error_diagnostics_suffix(
+                    &args.run_once.target_home,
+                    "cron-scheduler-loop",
+                    log_time_ms,
+                );
                 append_harness_log(
                     &args.run_once.target_home,
                     &HarnessLogEvent::new(
-                        current_log_time_ms().unwrap_or(0),
+                        log_time_ms,
                         HarnessLogLevel::Warn,
                         "cron-scheduler",
                         "cron-scheduler.loop-error",
-                        format!("iteration {iterations} failed: {detail}"),
+                        format!("iteration {iterations} failed: {detail}{diagnostics}"),
                     ),
                 )
                 .map_err(|err| err.to_string())?;
@@ -8779,6 +9141,35 @@ enum ChannelPermission {
     Limited,
 }
 
+fn append_channel_access_inbound_context(
+    existing: Option<String>,
+    permission: ChannelPermission,
+    chat_type: Option<&str>,
+) -> Option<String> {
+    if permission == ChannelPermission::Admin {
+        return existing;
+    }
+    let chat_type = chat_type
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    let section = format!(
+        "## ChannelAccess\n- permission: Limited\n- chatType: {chat_type}\n- conduct: Reply short and direct. Do not expose internal workspace paths, harness layout, or admin-only command guidance to limited channel users."
+    );
+    Some(match existing {
+        Some(existing) if !existing.trim().is_empty() => format!("{existing}\n\n{section}"),
+        _ => section,
+    })
+}
+
+fn discord_chat_type(message: &DiscordGatewayMessage) -> Option<&'static str> {
+    if message.guild_id.is_some() {
+        Some("guild")
+    } else {
+        Some("dm")
+    }
+}
+
 struct TelegramLoopArgs {
     poll: TelegramPollOnceArgs,
     loop_name: String,
@@ -9160,6 +9551,7 @@ struct SupervisorReconcileArgs {
     desired_services: Option<Vec<SupervisorInventoryServiceConfig>>,
     explicit_desired_input: bool,
     allow_default_apply: bool,
+    auto_reconcile: bool,
     apply: bool,
     dry_run: bool,
     iterations: usize,
@@ -10985,6 +11377,7 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
             "--no-telegram",
             "--include-discord",
             "--no-discord",
+            "--auto-reconcile",
         ],
     )?;
     let config = read_harness_config_json(&options.target_home)?;
@@ -10995,6 +11388,11 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
     let config_manage_all = supervisor_config
         .and_then(|value| bool_child(value, "manageAllLoops"))
         .unwrap_or(false);
+    let config_auto_reconcile = supervisor_config
+        .and_then(|value| bool_child(value, "autoReconcile"))
+        .unwrap_or(false);
+    let auto_reconcile = options.has_flag("--auto-reconcile") || config_auto_reconcile;
+    let apply = options.has_flag("--apply") || (auto_reconcile && !options.has_flag("--dry-run"));
     let desired_services = options
         .optional_text_input("--desired-services-json", "--desired-services-file")?
         .map(|text| {
@@ -11118,8 +11516,9 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
         desired_services,
         explicit_desired_input,
         allow_default_apply: supervisor_enabled,
-        apply: options.has_flag("--apply"),
-        dry_run: options.has_flag("--dry-run") || !options.has_flag("--apply"),
+        auto_reconcile,
+        apply,
+        dry_run: options.has_flag("--dry-run") || !apply,
         iterations,
         idle_ms,
         restart_delay_ms,
@@ -11377,27 +11776,242 @@ fn launch_supervisor_reconcile_commands(
                 launch.service_id
             ));
         }
+        if let Some(conflict) =
+            supervisor_launch_owner_conflict(&args.target_home, &launch.service_id, None)?
+        {
+            let record = serde_json::json!({
+                "schema": "agent-harness.supervisor-launch-receipt.v1",
+                "status": "launch-refused-owner-alive",
+                "serviceId": launch.service_id,
+                "reason": "live owner from another generation or launch path is already running",
+                "conflict": conflict,
+                "command": launch.command,
+                "atMs": current_time_ms()?,
+            });
+            append_supervisor_launch_receipt(&args.target_home, record.clone())?;
+            launches.push(record);
+            continue;
+        }
+        if args.auto_reconcile {
+            let now_ms = current_time_ms()?;
+            if let Some(backoff) = supervisor_launch_backoff(
+                &args.target_home,
+                &launch.service_id,
+                now_ms,
+                args.restart_delay_ms,
+            )? {
+                let record = serde_json::json!({
+                    "schema": "agent-harness.supervisor-launch-receipt.v1",
+                    "status": "launch-skipped-backoff",
+                    "serviceId": launch.service_id,
+                    "reason": "auto-reconcile launch backoff is still active",
+                    "command": launch.command,
+                    "autoReconcile": true,
+                    "launchBackoffMs": args.restart_delay_ms,
+                    "lastLaunchStatus": backoff.status,
+                    "lastLaunchAtMs": backoff.last_launch_at_ms,
+                    "backoffUntilMs": backoff.backoff_until_ms,
+                    "atMs": now_ms,
+                });
+                append_supervisor_launch_receipt(&args.target_home, record.clone())?;
+                launches.push(record);
+                continue;
+            }
+        }
         let child_args = &launch.command[1..];
-        let child = Command::new(&args.harness_cli)
+        let child = match Command::new(&args.harness_cli)
             .args(child_args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|err| {
-                format!(
+        {
+            Ok(child) => child,
+            Err(err) => {
+                let record = serde_json::json!({
+                    "schema": "agent-harness.supervisor-launch-receipt.v1",
+                    "status": "launch-failed",
+                    "serviceId": launch.service_id,
+                    "reason": err.to_string(),
+                    "command": launch.command,
+                    "autoReconcile": args.auto_reconcile,
+                    "atMs": current_time_ms()?,
+                });
+                append_supervisor_launch_receipt(&args.target_home, record.clone())?;
+                if args.auto_reconcile {
+                    launches.push(record);
+                    continue;
+                }
+                return Err(format!(
                     "failed to launch supervisor-run for {} with {}: {err}",
                     launch.service_id,
                     args.harness_cli.display()
-                )
-            })?;
-        launches.push(serde_json::json!({
+                ));
+            }
+        };
+        let record = serde_json::json!({
+            "schema": "agent-harness.supervisor-launch-receipt.v1",
+            "status": "launched",
             "serviceId": launch.service_id,
             "pid": child.id(),
             "command": launch.command,
-        }));
+            "autoReconcile": args.auto_reconcile,
+            "atMs": current_time_ms()?,
+        });
+        append_supervisor_launch_receipt(&args.target_home, record.clone())?;
+        launches.push(record);
     }
     Ok(launches)
+}
+
+#[derive(Debug, Clone)]
+struct SupervisorLaunchBackoff {
+    status: String,
+    last_launch_at_ms: i64,
+    backoff_until_ms: i64,
+}
+
+fn supervisor_launch_backoff(
+    harness_home: &Path,
+    service_id: &str,
+    now_ms: i64,
+    backoff_ms: i64,
+) -> Result<Option<SupervisorLaunchBackoff>, String> {
+    if backoff_ms <= 0 {
+        return Ok(None);
+    }
+    let path = supervisor_launch_receipts_file(harness_home);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read supervisor launch receipts {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let mut latest: Option<SupervisorLaunchBackoff> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if value.get("serviceId").and_then(serde_json::Value::as_str) != Some(service_id) {
+            continue;
+        }
+        let status = value
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !matches!(status, "launched" | "launch-failed") {
+            continue;
+        }
+        let Some(at_ms) = value.get("atMs").and_then(serde_json::Value::as_i64) else {
+            continue;
+        };
+        if latest
+            .as_ref()
+            .is_some_and(|current| current.last_launch_at_ms >= at_ms)
+        {
+            continue;
+        }
+        latest = Some(SupervisorLaunchBackoff {
+            status: status.to_string(),
+            last_launch_at_ms: at_ms,
+            backoff_until_ms: at_ms.saturating_add(backoff_ms),
+        });
+    }
+    Ok(latest.filter(|backoff| now_ms < backoff.backoff_until_ms))
+}
+
+fn supervisor_launch_owner_conflict(
+    harness_home: &Path,
+    service_id: &str,
+    current_supervisor_pid: Option<u32>,
+) -> Result<Option<serde_json::Value>, String> {
+    let service_file = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("services")
+        .join(format!("{service_id}.json"));
+    let text = match fs::read_to_string(&service_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read supervisor service state {}: {error}",
+                service_file.display()
+            ));
+        }
+    };
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
+        format!(
+            "invalid supervisor service state {}: {err}",
+            service_file.display()
+        )
+    })?;
+    let process_id = value
+        .get("pid")
+        .or_else(|| value.get("processId"))
+        .and_then(serde_json::Value::as_i64);
+    let Some(process_id) = process_id else {
+        return Ok(None);
+    };
+    if agent_harness_core::loop_health::process_alive_for_pid(process_id) != Some(true) {
+        return Ok(None);
+    }
+    let supervisor_pid = value
+        .get("supervisorPid")
+        .and_then(serde_json::Value::as_i64);
+    let same_supervisor = current_supervisor_pid
+        .map(i64::from)
+        .is_some_and(|current| supervisor_pid == Some(current));
+    let launch_owner = value
+        .get("launchOwner")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let observed_only = value
+        .get("observedOnly")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    if same_supervisor && launch_owner == "rust-supervisor-run" && !observed_only {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::json!({
+        "serviceFile": service_file,
+        "pid": process_id,
+        "supervisorPid": supervisor_pid,
+        "generationId": value.get("generationId").and_then(serde_json::Value::as_str),
+        "launchOwner": launch_owner,
+        "observedOnly": observed_only,
+    })))
+}
+
+fn append_supervisor_launch_receipt(
+    harness_home: &Path,
+    receipt: serde_json::Value,
+) -> Result<(), String> {
+    let path = supervisor_launch_receipts_file(harness_home);
+    append_jsonl_value(&path, &receipt)
+        .map(|_| ())
+        .map_err(|err| {
+            format!(
+                "failed to append supervisor launch receipt {}: {err}",
+                path.display()
+            )
+        })
+}
+
+fn supervisor_launch_receipts_file(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("supervisor")
+        .join("launch-receipts.jsonl")
 }
 
 fn supervisor_loop_enabled(
@@ -14467,17 +15081,11 @@ fn is_harness_home_arg(flag: &str) -> bool {
 }
 
 fn parse_required_harness_home(args: &[String]) -> Result<PathBuf, String> {
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            flag if is_harness_home_arg(flag) => {
-                i += 1;
-                return parse_harness_home_path(args, i, flag);
-            }
-            other => return Err(format!("unknown arg: {other}")),
-        }
+    match args.first().map(String::as_str) {
+        Some(flag) if is_harness_home_arg(flag) => parse_harness_home_path(args, 1, flag),
+        Some(other) => Err(format!("unknown arg: {other}")),
+        None => Err("--harness-home is required".to_string()),
     }
-    Err("--harness-home is required".to_string())
 }
 
 fn parse_harness_home_path(args: &[String], index: usize, flag: &str) -> Result<PathBuf, String> {
@@ -18702,6 +19310,14 @@ fn parse_u64(value: &str, flag: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("{flag} requires a positive integer, got: {value}"))
 }
 
+fn parse_f64(value: &str, flag: &str) -> Result<f64, String> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| format!("{flag} requires a finite number, got: {value}"))
+}
+
 fn required_arg<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str, String> {
     args.get(index)
         .map(String::as_str)
@@ -19004,7 +19620,13 @@ fn terminal_runtime_queue_ids(path: &Path) -> Result<BTreeSet<String>, String> {
 fn is_runtime_terminal_status(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "timeout" | "failed-terminal" | "canceled" | "skipped" | "dead-letter"
+        "completed"
+            | "timeout"
+            | "failed-terminal"
+            | "canceled"
+            | "skipped"
+            | "dead-letter"
+            | "suppressed"
     )
 }
 
@@ -19057,12 +19679,16 @@ fn write_loop_heartbeat(
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| loop_generation_id(name, process_id, started_at_ms));
+    let watched_stop_file = watched_supervisor_stop_file(harness_home, name);
     let heartbeat = serde_json::json!({
         "schema": "agent-harness.loop-heartbeat.v1",
         "name": name,
         "serviceId": name,
         "serviceKind": loop_service_kind(name),
         "generationId": generation_id,
+        "parentPid": env_i64("AGENT_HARNESS_SUPERVISOR_PARENT_PID"),
+        "processStartTimeMs": started_at_ms,
+        "watchedStopFile": watched_stop_file,
         "status": status,
         "iteration": iteration,
         "detail": detail,
@@ -19083,13 +19709,214 @@ fn write_loop_heartbeat(
         started_at_ms,
         &generation_id,
         &file,
-    )
+        &watched_stop_file,
+    )?;
+    if name == "discord-gateway-loop" {
+        record_gateway_restart_completion_ack(
+            harness_home,
+            status,
+            at_ms,
+            process_id,
+            &generation_id,
+        )?;
+    }
+    Ok(())
 }
 
 static LOOP_PROCESS_STARTED_AT_MS: OnceLock<i64> = OnceLock::new();
 
 fn loop_generation_id(name: &str, process_id: u32, started_at_ms: i64) -> String {
     format!("{name}-{process_id}-{started_at_ms}")
+}
+
+fn watched_supervisor_stop_file(harness_home: &Path, name: &str) -> PathBuf {
+    env::var("AGENT_HARNESS_SUPERVISOR_STOP_FILE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            agent_harness_core::loop_health::supervisor_stop_file_path(harness_home, name)
+        })
+}
+
+fn record_gateway_restart_completion_ack(
+    harness_home: &Path,
+    heartbeat_status: &str,
+    heartbeat_at_ms: i64,
+    heartbeat_process_id: u32,
+    heartbeat_generation_id: &str,
+) -> Result<(), String> {
+    let requests_file = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("gateway-restart-requests.jsonl");
+    let completions_file = harness_home
+        .join("state")
+        .join("supervisor")
+        .join("gateway-restart-completions.jsonl");
+    let requests = match fs::read_to_string(&requests_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "failed to read gateway restart requests {}: {error}",
+                requests_file.display()
+            ));
+        }
+    };
+    let completed_keys = gateway_restart_completed_keys(&completions_file)?;
+    for line in requests.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if value.get("status").and_then(serde_json::Value::as_str) != Some("consumed") {
+            continue;
+        }
+        let Some(request_key) = gateway_restart_request_key(&value) else {
+            continue;
+        };
+        if completed_keys.contains(&request_key) {
+            continue;
+        }
+        let consumed_at_ms = value
+            .get("consumedAtMs")
+            .and_then(serde_json::Value::as_i64);
+        let consumed_by = value
+            .get("consumedBy")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("discord-gateway-loop");
+        let generation_id = value
+            .get("generationId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        let message = format!(
+            "Gateway restart completed: consumed at {} by {} generation {}; heartbeat at {} status={} generation={}.",
+            consumed_at_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            consumed_by,
+            generation_id,
+            heartbeat_at_ms,
+            heartbeat_status,
+            heartbeat_generation_id
+        );
+        let notified = append_gateway_restart_completion_outbox(harness_home, &value, &message)?;
+        let receipt = serde_json::json!({
+            "schema": "agent-harness.gateway-restart-completion.v1",
+            "status": "completed",
+            "requestFile": value.get("requestFile").cloned(),
+            "consumedRequestFile": value.get("consumedRequestFile").cloned(),
+            "consumedAtMs": consumed_at_ms,
+            "consumedBy": value.get("consumedBy").cloned(),
+            "consumerPid": value.get("consumerPid").cloned(),
+            "generationId": value.get("generationId").cloned(),
+            "processStartTimeMs": value.get("processStartTimeMs").cloned(),
+            "heartbeatStatus": heartbeat_status,
+            "heartbeatGenerationId": heartbeat_generation_id,
+            "heartbeatProcessId": heartbeat_process_id,
+            "heartbeatAtMs": heartbeat_at_ms,
+            "requestingPlatform": value.get("requestingPlatform").cloned(),
+            "channelId": value.get("channelId").cloned(),
+            "userId": value.get("userId").cloned(),
+            "sessionKey": value.get("sessionKey").cloned(),
+            "notified": notified,
+            "message": message,
+        });
+        append_jsonl_value(&completions_file, &receipt).map_err(|err| {
+            format!(
+                "failed to append gateway restart completion {}: {err}",
+                completions_file.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn append_gateway_restart_completion_outbox(
+    harness_home: &Path,
+    request: &serde_json::Value,
+    message: &str,
+) -> Result<bool, String> {
+    let platform = request
+        .get("requestingPlatform")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty() && *value != "gateway");
+    let channel_id = request.get("channelId").and_then(serde_json::Value::as_str);
+    let user_id = request.get("userId").and_then(serde_json::Value::as_str);
+    let session_key = request
+        .get("sessionKey")
+        .and_then(serde_json::Value::as_str);
+    let (Some(platform), Some(channel_id), Some(user_id), Some(session_key)) =
+        (platform, channel_id, user_id, session_key)
+    else {
+        return Ok(false);
+    };
+    let outbox_file = harness_home
+        .join("state")
+        .join("channels")
+        .join("outbox.jsonl");
+    if let Some(parent) = outbox_file.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let outbound = ChannelOutboundMessage {
+        platform: platform.to_string(),
+        account_id: None,
+        channel_id: channel_id.to_string(),
+        user_id: user_id.to_string(),
+        session_key: session_key.to_string(),
+        kind: ChannelOutboundMessageKind::CommandReply,
+        source_queue_id: None,
+        source_completion_file: None,
+        text: message.to_string(),
+        presentation: None,
+        delivery_intent: None,
+        attachments: Vec::new(),
+    };
+    append_jsonl_value(&outbox_file, &outbound)
+        .map(|_| true)
+        .map_err(|err| format!("failed to append gateway restart completion outbox: {err}"))
+}
+
+fn gateway_restart_completed_keys(path: &Path) -> Result<BTreeSet<String>, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeSet::new());
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to read gateway restart completions {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let mut keys = BTreeSet::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if let Some(key) = gateway_restart_request_key(&value) {
+            keys.insert(key);
+        }
+    }
+    Ok(keys)
+}
+
+fn gateway_restart_request_key(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("consumedRequestFile")
+        .or_else(|| value.get("requestFile"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn loop_service_kind(name: &str) -> &'static str {
@@ -19147,6 +19974,7 @@ fn write_supervisor_service_state(
     started_at_ms: i64,
     generation_id: &str,
     heartbeat_file: &Path,
+    watched_stop_file: &Path,
 ) -> Result<(), String> {
     let dir = harness_home
         .join("state")
@@ -19176,9 +20004,11 @@ fn write_supervisor_service_state(
         "actualState": status,
         "detail": detail,
         "heartbeatFile": heartbeat_file.display().to_string(),
+        "watchedStopFile": watched_stop_file,
         "launchOwner": launch_owner,
         "observedOnly": observed_only,
         "supervisorPid": supervisor_pid,
+        "parentPid": supervisor_pid,
     });
     let file = dir.join(format!("{name}.json"));
     write_json_atomic(&file, &service).map_err(|err| {
@@ -20521,20 +21351,70 @@ fn append_runtime_loop_error_log(
     max_consecutive_errors: usize,
     error: &str,
 ) -> Result<(), String> {
+    let log_time_ms = current_log_time_ms().map_err(|err| err.to_string())?;
+    let diagnostics = loop_error_diagnostics_suffix(harness_home, "runtime-loop", log_time_ms);
     append_harness_log(
         harness_home,
         &HarnessLogEvent::new(
-            current_log_time_ms().map_err(|err| err.to_string())?,
+            log_time_ms,
             HarnessLogLevel::Warn,
             "runtime",
             "runtime.loop-error",
             format!(
-                "iteration={iteration} consecutiveErrors={consecutive_errors}/{max_consecutive_errors} error={error}"
+                "iteration={iteration} consecutiveErrors={consecutive_errors}/{max_consecutive_errors} error={error}{diagnostics}"
             ),
         ),
     )
     .map(|_| ())
     .map_err(|err| err.to_string())
+}
+
+fn loop_error_diagnostics_suffix(harness_home: &Path, component: &str, at_ms: i64) -> String {
+    let report = agent_harness_core::loop_diagnostics::collect_loop_error_diagnostics(
+        harness_home,
+        component,
+        at_ms,
+    );
+    let process = report.process;
+    let queue = report.runtime_queue;
+    let mut suffix = format!(
+        " memoryAvailable={} workingSetBytes={} peakWorkingSetBytes={} commitBytes={} privateBytes={} queuePendingItems={} queueOpenItems={} queueActiveLeases={} queueTerminalReceipts={} queueTerminalQueueIds={} diagnosticsWarnings={}",
+        process.available,
+        optional_u64_diagnostics_value(process.working_set_bytes),
+        optional_u64_diagnostics_value(process.peak_working_set_bytes),
+        optional_u64_diagnostics_value(process.commit_bytes),
+        optional_u64_diagnostics_value(process.private_bytes),
+        queue.pending_items,
+        queue.open_items,
+        queue.active_leases,
+        queue.terminal_receipts,
+        queue.terminal_queue_ids,
+        queue.warnings.len()
+    );
+    if let Some(error) = process.error.as_deref() {
+        suffix.push_str(" memoryError=");
+        suffix.push_str(&sanitize_diagnostics_log_value(error));
+    }
+    suffix
+}
+
+fn optional_u64_diagnostics_value(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn sanitize_diagnostics_log_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || ch.is_whitespace() {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect()
 }
 
 fn append_runtime_loop_safe_mode_log(
@@ -20611,6 +21491,7 @@ fn runtime_run_once_report_is_idle(report: &RuntimeRunOnceReport) -> bool {
 fn runtime_run_once_status_label(status: RuntimeRunOnceStatus) -> &'static str {
     match status {
         RuntimeRunOnceStatus::Completed => "completed",
+        RuntimeRunOnceStatus::Suppressed => "suppressed",
         RuntimeRunOnceStatus::Skipped => "skipped",
         RuntimeRunOnceStatus::LeaseBusy => "lease-busy",
         RuntimeRunOnceStatus::NoWork => "no-work",
@@ -21037,6 +21918,9 @@ fn print_help() {
     );
     println!("  config-validate Validate harness-config.json with fail-closed schema checks");
     println!("  log-rotate      Rotate harness.jsonl and receipt the rotation decision");
+    println!(
+        "  resource-exhaustion-readback Read recent Windows Resource-Exhaustion-Detector events"
+    );
     println!("  queue-retry     Requeue one runtime item with a fresh retry queue id");
     println!("  queue-skip      Terminally skip one runtime item with a receipt");
     println!("  healthz         Emit readiness/liveness JSON for staging gates");
@@ -21317,7 +22201,41 @@ mod tests {
         rich_presentation_from_plain_final,
         rich_presentation_from_plain_final_with_attachment_count,
     };
+    use std::ffi::OsString;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarRestore {
+        name: &'static str,
+        value: Option<OsString>,
+    }
+
+    impl EnvVarRestore {
+        fn set(name: &'static str, value: &str) -> Self {
+            let restore = Self {
+                name,
+                value: env::var_os(name),
+            };
+            unsafe {
+                env::set_var(name, value);
+            }
+            restore
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(value) = &self.value {
+                    env::set_var(self.name, value);
+                } else {
+                    env::remove_var(self.name);
+                }
+            }
+        }
+    }
 
     struct StaticDiscordAttachmentFetcher {
         bytes_by_url: BTreeMap<String, Vec<u8>>,
@@ -21987,6 +22905,13 @@ mod tests {
             text_hash: "hash".to_string(),
             started_at_ms: 1,
             latest_at_ms: 1,
+            status_surface_key: format!(
+                "{}:default:{}:{}:main:session-1:queue-1:body",
+                platform, channel_id, user_id
+            ),
+            idempotency_hit: false,
+            progress_suppressed_reason: None,
+            fresh_send_reason: Some(AgentProgressDeliveryFreshSendReason::NoExistingStatusSurface),
         }
     }
 
@@ -22036,31 +22961,244 @@ mod tests {
     #[test]
     fn progress_delivery_preempts_nonterminal_pending_when_wake_advances() {
         let stale = progress_pending("telegram", "dm-1", "operator");
-        assert!(progress_delivery_should_preempt_stale_pending(
-            &stale, 10, 11
+        assert!(!progress_delivery_should_preempt_stale_pending(
+            &stale,
+            Some(2)
         ));
 
-        let mut terminal = stale.clone();
+        let mut stale_edit = stale.clone();
+        stale_edit.action = AgentProgressDeliveryAction::Edit;
+        stale_edit.provider_message_id = Some("provider-1".to_string());
+        assert!(progress_delivery_should_preempt_stale_pending(
+            &stale_edit,
+            Some(2)
+        ));
+
+        let mut terminal = stale_edit.clone();
         terminal.terminal = true;
         assert!(!progress_delivery_should_preempt_stale_pending(
-            &terminal, 10, 11
+            &terminal,
+            Some(2)
         ));
         assert!(!progress_delivery_should_preempt_stale_pending(
-            &stale, 10, 10
+            &stale_edit,
+            Some(1)
         ));
     }
 
+    #[test]
+    fn progress_delivery_preempt_continues_to_next_pending_lane() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _telegram_admin = EnvVarRestore::set("AGENT_HARNESS_TELEGRAM_ADMIN_USER_IDS", "");
+        let _telegram_allowed = EnvVarRestore::set("AGENT_HARNESS_TELEGRAM_ALLOWED_USER_IDS", "");
+
+        let root = cli_temp_root("progress_delivery_preempt_continues_to_next_pending_lane");
+        let harness_home = root.join(".agent-harness");
+        let context_1 = agent_harness_core::AgentProgressContext {
+            queue_id: "turn:1:telegram:dm-1:operator:main:session-1".to_string(),
+            agent_id: Some("main".to_string()),
+            account_id: None,
+            thread_id: None,
+            session_key: "telegram:dm-1:operator:main:session-1".to_string(),
+            platform: "telegram".to_string(),
+            channel_id: "dm-1".to_string(),
+            user_id: "operator".to_string(),
+        };
+        let context_2 = agent_harness_core::AgentProgressContext {
+            queue_id: "turn:2:telegram:dm-2:operator:main:session-2".to_string(),
+            agent_id: Some("main".to_string()),
+            account_id: None,
+            thread_id: None,
+            session_key: "telegram:dm-2:operator:main:session-2".to_string(),
+            platform: "telegram".to_string(),
+            channel_id: "dm-2".to_string(),
+            user_id: "operator".to_string(),
+        };
+
+        agent_harness_core::append_agent_progress_event(
+            &harness_home,
+            &agent_harness_core::AgentProgressEvent::new(
+                &context_1,
+                agent_harness_core::AgentProgressKind::Todo,
+                "todo",
+                "planning first lane",
+                agent_harness_core::AgentProgressStatus::Started,
+                1_000,
+            ),
+        )
+        .unwrap();
+        agent_harness_core::append_agent_progress_event(
+            &harness_home,
+            &agent_harness_core::AgentProgressEvent::new(
+                &context_2,
+                agent_harness_core::AgentProgressKind::Todo,
+                "todo",
+                "planning second lane",
+                agent_harness_core::AgentProgressStatus::Started,
+                1_100,
+            ),
+        )
+        .unwrap();
+
+        let first_plan = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2_000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert!(first_plan.pending.len() >= 4, "{first_plan:?}");
+
+        for pending in first_plan
+            .pending
+            .iter()
+            .filter(|pending| pending.queue_id == context_1.queue_id)
+        {
+            record_agent_progress_delivery_with_context(
+                AgentProgressDeliveryRecordOptions {
+                    harness_home: harness_home.clone(),
+                    queue_id: pending.queue_id.clone(),
+                    platform: pending.platform.clone(),
+                    account_id: pending.account_id.clone(),
+                    channel_id: pending.channel_id.clone(),
+                    thread_id: pending.thread_id.clone(),
+                    user_id: pending.user_id.clone(),
+                    session_key: pending.session_key.clone(),
+                    message_kind: pending.message_kind,
+                    action: pending.action,
+                    status: AgentProgressDeliveryStatus::Delivered,
+                    provider_message_id: Some(format!("provider-{:?}", pending.message_kind)),
+                    event_line: pending.event_line,
+                    text_hash: pending.text_hash.clone(),
+                    terminal: pending.terminal,
+                    policy_decision: Some("test".to_string()),
+                    error: None,
+                    now_ms: 2_000,
+                },
+                AgentProgressDeliveryRecordContext {
+                    status_surface_key: pending.status_surface_key.clone(),
+                    existing_provider_message_id: pending.provider_message_id.clone(),
+                    decision: Some("test".to_string()),
+                    fresh_send_reason: pending.fresh_send_reason,
+                    idempotency_hit: pending.idempotency_hit,
+                    progress_suppressed_reason: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let preempt_sequence = read_loop_wake_sequence(&harness_home, "progress-delivery");
+        agent_harness_core::append_agent_progress_event(
+            &harness_home,
+            &agent_harness_core::AgentProgressEvent::new(
+                &context_1,
+                agent_harness_core::AgentProgressKind::ToolCall,
+                "tool_call",
+                "newer first-lane work",
+                agent_harness_core::AgentProgressStatus::Progress,
+                3_000,
+            ),
+        )
+        .unwrap();
+
+        let events_len = fs::metadata(agent_harness_core::agent_progress_events_file(
+            &harness_home,
+        ))
+        .unwrap()
+        .len();
+        let state_file = agent_harness_core::agent_progress_delivery_state_file(&harness_home);
+        let mut state_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        state_json["ledger"]["offsetBytes"] = serde_json::json!(events_len);
+        state_json["ledger"]["lineNumber"] = serde_json::json!(3);
+        fs::write(
+            &state_file,
+            serde_json::to_string_pretty(&state_json).unwrap(),
+        )
+        .unwrap();
+
+        let mut args = progress_args();
+        args.target_home = harness_home.clone();
+        args.preempt_after_wake_sequence = Some(preempt_sequence);
+        let report = execute_progress_delivery_once(&args).unwrap();
+
+        assert!(report.pending_count >= 3, "{report:?}");
+        assert_eq!(report.sent_messages, 0);
+        assert_eq!(report.edited_messages, 0);
+        assert!(
+            report.skipped_denied >= 2,
+            "stale preempt must continue to later pending lanes: {report:?}"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("preempted by newer events for the same queue")),
+            "{report:?}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn cli_temp_root(name: &str) -> PathBuf {
-        let millis = SystemTime::now()
+        let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_millis();
+            .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "agent-harness-cli-test-{name}-{}-{millis}",
+            "agent-harness-cli-test-{name}-{}-{nanos}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&path);
         path
+    }
+
+    fn write_cli_channel_source(root: &Path) -> AgentSource {
+        let home = root.join(".openclaw");
+        let workspace = home.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(home.join("agents").join("main").join("sessions")).unwrap();
+        fs::write(workspace.join("AGENTS.md"), "# Agent").unwrap();
+        fs::write(
+            home.join("openclaw.json"),
+            r#"{
+              "agents": {
+                "defaults": { "provider": "openai", "model": "codex" },
+                "list": [
+                  { "id": "main", "model": "gpt-5", "enabled": true }
+                ]
+              },
+              "models": {
+                "providers": {
+                  "openai": { "apiKey": "${OPENAI_API_KEY}" }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join("agents")
+                .join("main")
+                .join("sessions")
+                .join("sessions.json"),
+            "{}",
+        )
+        .unwrap();
+        AgentSource::with_workspace(home, workspace)
+    }
+
+    fn write_cli_supervisor_service_state(
+        harness_home: &Path,
+        service_id: &str,
+        value: serde_json::Value,
+    ) {
+        let services_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("services");
+        fs::create_dir_all(&services_dir).unwrap();
+        write_json_atomic(&services_dir.join(format!("{service_id}.json")), &value).unwrap();
     }
 
     #[test]
@@ -22127,6 +23265,76 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn supervisor_reconcile_auto_reconcile_is_flag_gated() {
+        let root = cli_temp_root("supervisor_reconcile_auto_reconcile_is_flag_gated");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            serde_json::json!({
+                "supervisor": {
+                    "enabled": true,
+                    "manageAllLoops": true
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let default_args = supervisor_reconcile_args_from_args(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+        ])
+        .unwrap();
+        assert!(!default_args.auto_reconcile);
+        assert!(!default_args.apply);
+        assert!(default_args.dry_run);
+
+        let cli_auto_args = supervisor_reconcile_args_from_args(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+            "--auto-reconcile".to_string(),
+        ])
+        .unwrap();
+        assert!(cli_auto_args.auto_reconcile);
+        assert!(cli_auto_args.apply);
+        assert!(!cli_auto_args.dry_run);
+
+        fs::write(
+            harness_home.join("harness-config.json"),
+            serde_json::json!({
+                "supervisor": {
+                    "enabled": true,
+                    "manageAllLoops": true,
+                    "autoReconcile": true
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let config_auto_args = supervisor_reconcile_args_from_args(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+        ])
+        .unwrap();
+        assert!(config_auto_args.auto_reconcile);
+        assert!(config_auto_args.apply);
+        assert!(!config_auto_args.dry_run);
+
+        let dry_run_args = supervisor_reconcile_args_from_args(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+            "--dry-run".to_string(),
+        ])
+        .unwrap();
+        assert!(dry_run_args.auto_reconcile);
+        assert!(!dry_run_args.apply);
+        assert!(dry_run_args.dry_run);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn arg_value(args: &[String], flag: &str) -> Option<String> {
         args.windows(2)
             .find(|pair| pair[0] == flag)
@@ -22134,11 +23342,78 @@ mod tests {
     }
 
     #[test]
+    fn dream_director_send_cli_dry_run_writes_freshness_receipt() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let root = cli_temp_root("dream_director_send_cli_dry_run_writes_freshness_receipt");
+        let harness_home = root.join(".agent-harness");
+        let daily_dir = agent_harness_core::dream_director_daily_state_dir(&harness_home);
+        let opinion_path = daily_dir
+            .join("runs")
+            .join("cli-fresh")
+            .join("director-opinion.md");
+        fs::create_dir_all(opinion_path.parent().unwrap()).unwrap();
+        fs::write(&opinion_path, "fresh cli opinion").unwrap();
+        let now_ms = 1_700_000_000_000_i64;
+        let source_ms = now_ms - 3_600_000;
+        fs::create_dir_all(&daily_dir).unwrap();
+        fs::write(
+            daily_dir.join("latest.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "runId": "cli-fresh-run",
+                "generatedAtMs": source_ms,
+                "generatedAt": "2023-11-14T21:13:20Z",
+                "directorOpinion": opinion_path.to_string_lossy()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        run_dream_director_send_cli(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+            "--dry-run".to_string(),
+            "--target".to_string(),
+            "ck-private".to_string(),
+            "--now-ms".to_string(),
+            now_ms.to_string(),
+        ])
+        .unwrap();
+
+        let receipt_file = agent_harness_core::dream_director_send_receipt_file(&harness_home);
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipt_file).unwrap()).unwrap();
+        assert_eq!(receipt["status"], "dry-run");
+        assert_eq!(receipt["ok"], true);
+        assert_eq!(receipt["stale"], false);
+        assert_eq!(receipt["sourceRunId"], "cli-fresh-run");
+        assert_eq!(receipt["sourceAgeHours"], 1.0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn write_loop_heartbeat_replaces_json_atomically() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let root = cli_temp_root("write_loop_heartbeat_replaces_json_atomically");
         let harness_home = root.join(".agent-harness");
-        let expected_observed_only =
-            env_bool("AGENT_HARNESS_SUPERVISOR_OBSERVED_ONLY").unwrap_or(true);
+        let watched_stop_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("stop")
+            .join("runtime-loop.live.stop");
+        let _generation = EnvVarRestore::set(
+            "AGENT_HARNESS_SERVICE_GENERATION_ID",
+            "runtime-loop-generation-test",
+        );
+        let _parent_pid = EnvVarRestore::set("AGENT_HARNESS_SUPERVISOR_PARENT_PID", "12345");
+        let _started_at = EnvVarRestore::set("AGENT_HARNESS_SERVICE_STARTED_AT_MS", "67890");
+        let _stop_file = EnvVarRestore::set(
+            "AGENT_HARNESS_SUPERVISOR_STOP_FILE",
+            &watched_stop_file.display().to_string(),
+        );
+        let _observed_only = EnvVarRestore::set("AGENT_HARNESS_SUPERVISOR_OBSERVED_ONLY", "false");
+        let expected_observed_only = false;
 
         write_loop_heartbeat(&harness_home, "runtime-loop", "running", 1, "first").unwrap();
         write_loop_heartbeat(&harness_home, "runtime-loop", "no-work", 2, "second").unwrap();
@@ -22159,10 +23434,12 @@ mod tests {
             value["processId"].as_u64(),
             Some(u64::from(std::process::id()))
         );
-        assert!(
-            value["generationId"]
-                .as_str()
-                .is_some_and(|value| value.starts_with("runtime-loop-"))
+        assert_eq!(value["generationId"], "runtime-loop-generation-test");
+        assert_eq!(value["parentPid"], 12345);
+        assert_eq!(value["processStartTimeMs"], 67890);
+        assert_eq!(
+            value["watchedStopFile"],
+            watched_stop_file.display().to_string()
         );
 
         let service_file = harness_home
@@ -22184,6 +23461,14 @@ mod tests {
             Some(u64::from(std::process::id()))
         );
         assert_eq!(service["generationId"], value["generationId"]);
+        assert_eq!(service["parentPid"], 12345);
+        assert_eq!(service["supervisorPid"], 12345);
+        assert_eq!(service["processStartTimeMs"], 67890);
+        assert_eq!(service["startedAtMs"], 67890);
+        assert_eq!(
+            service["watchedStopFile"],
+            watched_stop_file.display().to_string()
+        );
         assert_eq!(service["lastHeartbeatAtMs"], value["atMs"]);
         assert_eq!(service["lastSuccessfulIterationAtMs"], value["atMs"]);
         assert_eq!(service["iteration"], 2);
@@ -22213,6 +23498,13 @@ mod tests {
 
     #[test]
     fn consume_gateway_restart_request_moves_file_and_receipts() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _parent_pid = EnvVarRestore::set("AGENT_HARNESS_SUPERVISOR_PARENT_PID", "12345");
+        let _generation = EnvVarRestore::set(
+            "AGENT_HARNESS_SERVICE_GENERATION_ID",
+            "gateway-generation-7",
+        );
+        let _started_at = EnvVarRestore::set("AGENT_HARNESS_SERVICE_STARTED_AT_MS", "67890");
         let root = cli_temp_root("consume_gateway_restart_request_moves_file_and_receipts");
         let harness_home = root.join(".agent-harness");
         let request_dir = harness_home
@@ -22248,12 +23540,550 @@ mod tests {
         assert_eq!(value["status"], "consumed");
         assert_eq!(value["consumedBy"], "discord-gateway-loop");
         assert!(value["consumedAtMs"].as_i64().is_some());
+        assert_eq!(value["consumerPid"], u64::from(std::process::id()));
+        assert_eq!(value["parentPid"], 12345);
+        assert_eq!(value["generationId"], "gateway-generation-7");
+        assert_eq!(value["processStartTimeMs"], 67890);
+        assert_eq!(
+            value["stopFile"],
+            agent_harness_core::loop_health::supervisor_stop_file_path(
+                &harness_home,
+                "discord-gateway-loop"
+            )
+            .display()
+            .to_string()
+        );
         let receipt_file = harness_home
             .join("state")
             .join("supervisor")
             .join("gateway-restart-requests.jsonl");
         let receipt_text = fs::read_to_string(receipt_file).unwrap();
         assert!(receipt_text.contains("\"status\":\"consumed\""));
+        assert!(receipt_text.contains("\"consumerPid\""));
+        assert!(receipt_text.contains("\"generationId\":\"gateway-generation-7\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gateway_restart_consumed_receipt_includes_consumer_generation() {
+        consume_gateway_restart_request_moves_file_and_receipts();
+    }
+
+    #[test]
+    fn gateway_restart_staging_replay_closes_loop_from_channel_run_once() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _parent_pid = EnvVarRestore::set("AGENT_HARNESS_SUPERVISOR_PARENT_PID", "12345");
+        let _generation = EnvVarRestore::set(
+            "AGENT_HARNESS_SERVICE_GENERATION_ID",
+            "gateway-generation-new",
+        );
+        let _started_at = EnvVarRestore::set("AGENT_HARNESS_SERVICE_STARTED_AT_MS", "67890");
+        let root =
+            cli_temp_root("gateway_restart_staging_replay_closes_loop_from_channel_run_once");
+        let harness_home = root.join(".agent-harness");
+        let source = write_cli_channel_source(&root);
+
+        let request = run_channel_once(ChannelRunOnceOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            platform: "discord".to_string(),
+            account_id: None,
+            channel_id: "fixture-dm".to_string(),
+            user_id: "fixture-operator".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: Some("discord:fixture-dm:fixture-operator:main".to_string()),
+            message: "/restart gateway".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: Some("interaction".to_string()),
+            inbound_event_id: Some("fixture-restart-request".to_string()),
+            skill_limit: 3,
+            now_ms: 1_000,
+            codex_executable: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+            outbox_limit: 10,
+            run_runtime: false,
+        })
+        .unwrap();
+        assert_eq!(
+            request.status,
+            agent_harness_core::ChannelRunOnceStatus::CommandHandled
+        );
+        assert_eq!(
+            request.receive.status,
+            agent_harness_core::ChannelReceiveStatus::CommandApplied
+        );
+
+        let consumed = consume_gateway_restart_request(&harness_home, "discord-gateway-loop")
+            .unwrap()
+            .expect("expected pending gateway restart request");
+        assert!(!consumed.request_file.exists());
+        assert!(
+            consumed
+                .detail
+                .contains("gateway /restart command requested")
+        );
+        write_loop_heartbeat(
+            &harness_home,
+            "discord-gateway-loop",
+            "running",
+            1,
+            "staging replay replacement heartbeat",
+        )
+        .unwrap();
+
+        let report = collect_gateway_restart_status(&harness_home).unwrap();
+        assert_eq!(
+            report
+                .latest_request
+                .as_ref()
+                .and_then(|value| value.session_key.as_deref()),
+            Some("discord:fixture-dm:fixture-operator:main")
+        );
+        assert_eq!(
+            report
+                .latest_consumption
+                .as_ref()
+                .and_then(|value| value.generation_id.as_deref()),
+            Some("gateway-generation-new")
+        );
+        assert_eq!(
+            report
+                .latest_completion
+                .as_ref()
+                .and_then(|value| value.heartbeat_generation_id.as_deref()),
+            Some("gateway-generation-new")
+        );
+        assert_eq!(
+            report.service.generation_id.as_deref(),
+            Some("gateway-generation-new")
+        );
+        assert_eq!(
+            report.heartbeat.generation_id.as_deref(),
+            Some("gateway-generation-new")
+        );
+
+        let outbox_text = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(outbox_text.lines().count(), 2);
+        assert!(outbox_text.contains("protected gateway restart request recorded"));
+        assert!(outbox_text.contains("Gateway restart completed"));
+        assert!(outbox_text.contains("gateway-generation-new"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn e2e_4_restart_gateway_staging_closed_loop_replay() {
+        gateway_restart_staging_replay_closes_loop_from_channel_run_once();
+    }
+
+    #[test]
+    fn gateway_restart_completion_ack_receipts_and_notifies_requesting_lane() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _parent_pid = EnvVarRestore::set("AGENT_HARNESS_SUPERVISOR_PARENT_PID", "12345");
+        let _generation = EnvVarRestore::set(
+            "AGENT_HARNESS_SERVICE_GENERATION_ID",
+            "gateway-generation-7",
+        );
+        let _started_at = EnvVarRestore::set("AGENT_HARNESS_SERVICE_STARTED_AT_MS", "67890");
+        let root =
+            cli_temp_root("gateway_restart_completion_ack_receipts_and_notifies_requesting_lane");
+        let harness_home = root.join(".agent-harness");
+        let request_dir = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("gateway-restart-requests");
+        fs::create_dir_all(&request_dir).unwrap();
+        fs::write(
+            request_dir.join("1000-operator.json"),
+            serde_json::to_string(&serde_json::json!({
+                "schema": "agent-harness.gateway-restart-request.v1",
+                "status": "requested",
+                "target": "gateway",
+                "reason": "operator requested restart",
+                "requestingPlatform": "discord",
+                "channelId": "dm-1",
+                "userId": "operator",
+                "sessionKey": "discord:dm-1:operator:main"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        consume_gateway_restart_request(&harness_home, "discord-gateway-loop")
+            .unwrap()
+            .expect("expected pending request");
+        record_gateway_restart_completion_ack(
+            &harness_home,
+            "spawning",
+            12_000,
+            std::process::id(),
+            "gateway-generation-7",
+        )
+        .unwrap();
+        record_gateway_restart_completion_ack(
+            &harness_home,
+            "spawning",
+            12_001,
+            std::process::id(),
+            "gateway-generation-7",
+        )
+        .unwrap();
+
+        let completions_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("gateway-restart-completions.jsonl");
+        let completions_text = fs::read_to_string(completions_file).unwrap();
+        assert_eq!(completions_text.lines().count(), 1);
+        assert!(completions_text.contains("\"status\":\"completed\""));
+        assert!(completions_text.contains("\"notified\":true"));
+        assert!(completions_text.contains("\"heartbeatGenerationId\":\"gateway-generation-7\""));
+
+        let outbox_text = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(outbox_text.lines().count(), 1);
+        assert!(outbox_text.contains("\"platform\":\"discord\""));
+        assert!(outbox_text.contains("Gateway restart completed"));
+        assert!(outbox_text.contains("gateway-generation-7"));
+
+        let report = collect_gateway_restart_status(&harness_home).unwrap();
+        assert_eq!(
+            report
+                .latest_completion
+                .as_ref()
+                .and_then(|value| value.heartbeat_at_ms),
+            Some(12_000)
+        );
+        assert_eq!(
+            report
+                .latest_completion
+                .as_ref()
+                .and_then(|value| value.notified),
+            Some(true)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restart_completion_ack_reports_new_generation_heartbeat() {
+        gateway_restart_completion_ack_receipts_and_notifies_requesting_lane();
+    }
+
+    #[test]
+    fn supervisor_launch_guard_detects_live_observed_owner() {
+        let root = cli_temp_root("supervisor_launch_guard_detects_live_observed_owner");
+        let harness_home = root.join(".agent-harness");
+        write_cli_supervisor_service_state(
+            &harness_home,
+            "discord-gateway-loop",
+            serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "discord-gateway-loop",
+                "serviceKind": "discord-gateway",
+                "pid": std::process::id(),
+                "processId": std::process::id(),
+                "generationId": "direct-live-generation",
+                "launchOwner": "external-runner-observe-only",
+                "observedOnly": true,
+                "status": "running",
+                "actualState": "running",
+            }),
+        );
+
+        let conflict =
+            supervisor_launch_owner_conflict(&harness_home, "discord-gateway-loop", None)
+                .unwrap()
+                .expect("live observed-only owner should block launch");
+
+        assert_eq!(
+            conflict["pid"].as_u64(),
+            Some(u64::from(std::process::id()))
+        );
+        assert_eq!(conflict["generationId"], "direct-live-generation");
+        assert_eq!(conflict["launchOwner"], "external-runner-observe-only");
+        assert_eq!(conflict["observedOnly"], true);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_refused_when_other_owner_alive() {
+        supervisor_launch_guard_detects_live_observed_owner();
+    }
+
+    #[test]
+    fn supervisor_reconcile_apply_receipts_refused_live_owner() {
+        let root = cli_temp_root("supervisor_reconcile_apply_receipts_refused_live_owner");
+        let harness_home = root.join(".agent-harness");
+        write_cli_supervisor_service_state(
+            &harness_home,
+            "discord-gateway-loop",
+            serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "discord-gateway-loop",
+                "serviceKind": "discord-gateway",
+                "pid": std::process::id(),
+                "processId": std::process::id(),
+                "generationId": "direct-live-generation",
+                "launchOwner": "external-runner-observe-only",
+                "observedOnly": true,
+                "status": "running",
+                "actualState": "running",
+            }),
+        );
+        let args = supervisor_reconcile_args_from_args(&[
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--all".to_string(),
+            "--apply".to_string(),
+            "--harness-cli".to_string(),
+            root.join("agent-harness.exe").display().to_string(),
+        ])
+        .unwrap();
+
+        let launches = launch_supervisor_reconcile_commands(
+            &args,
+            &[SupervisorLaunchCommand {
+                service_id: "discord-gateway-loop".to_string(),
+                command: vec![
+                    "agent-harness".to_string(),
+                    "supervisor-run".to_string(),
+                    "--service".to_string(),
+                    "discord-gateway-loop".to_string(),
+                ],
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0]["status"], "launch-refused-owner-alive");
+        assert_eq!(launches[0]["serviceId"], "discord-gateway-loop");
+        let receipt_text = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("supervisor")
+                .join("launch-receipts.jsonl"),
+        )
+        .unwrap();
+        assert!(receipt_text.contains("\"status\":\"launch-refused-owner-alive\""));
+        assert!(receipt_text.contains("\"generationId\":\"direct-live-generation\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn supervisor_reconcile_auto_reconcile_launches_once_then_backs_off() {
+        let root =
+            cli_temp_root("supervisor_reconcile_auto_reconcile_launches_once_then_backs_off");
+        let harness_home = root.join(".agent-harness");
+        write_cli_supervisor_service_state(
+            &harness_home,
+            "worker-loop",
+            serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "worker-loop",
+                "serviceKind": "worker",
+                "pid": 9_999_999_i64,
+                "processId": 9_999_999_i64,
+                "generationId": "dead-worker-generation",
+                "launchOwner": "rust-supervisor-run",
+                "observedOnly": false,
+                "status": "stale",
+                "desiredState": "running",
+                "actualState": "stale"
+            }),
+        );
+        let args = supervisor_reconcile_args_from_args(&[
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--all".to_string(),
+            "--auto-reconcile".to_string(),
+            "--restart-delay-ms".to_string(),
+            "60000".to_string(),
+            "--harness-cli".to_string(),
+            "where.exe".to_string(),
+        ])
+        .unwrap();
+        let command = SupervisorLaunchCommand {
+            service_id: "worker-loop".to_string(),
+            command: vec![
+                "agent-harness".to_string(),
+                "supervisor-run".to_string(),
+                "--service".to_string(),
+                "worker-loop".to_string(),
+            ],
+        };
+
+        let first =
+            launch_supervisor_reconcile_commands(&args, std::slice::from_ref(&command)).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["status"], "launched");
+        assert_eq!(first[0]["autoReconcile"], true);
+
+        let second = launch_supervisor_reconcile_commands(&args, &[command]).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0]["status"], "launch-skipped-backoff");
+        assert_eq!(second[0]["serviceId"], "worker-loop");
+        assert_eq!(second[0]["lastLaunchStatus"], "launched");
+        assert!(second[0]["backoffUntilMs"].as_i64().is_some());
+
+        let receipt_text =
+            fs::read_to_string(supervisor_launch_receipts_file(&harness_home)).unwrap();
+        assert!(receipt_text.contains("\"status\":\"launched\""));
+        assert!(receipt_text.contains("\"status\":\"launch-skipped-backoff\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auto_reconcile_launches_replacement_generation_with_receipt_and_backoff() {
+        supervisor_reconcile_auto_reconcile_launches_once_then_backs_off();
+    }
+
+    #[test]
+    fn e2e_3_oom_dead_pid_stale_registry_replay() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let root = cli_temp_root("e2e_3_oom_dead_pid_stale_registry_replay");
+        let harness_home = root.join(".agent-harness");
+        write_cli_supervisor_service_state(
+            &harness_home,
+            "telegram-loop",
+            serde_json::json!({
+                "schema": "agent-harness.supervisor-service-state.v1",
+                "serviceId": "telegram-loop",
+                "serviceKind": "telegram-ingress",
+                "pid": -1,
+                "processId": -1,
+                "generationId": "oom-dead-generation",
+                "launchOwner": "rust-supervisor-run",
+                "observedOnly": false,
+                "status": "stale",
+                "desiredState": "running",
+                "actualState": "stale",
+                "lastHeartbeatAtMs": 1_000
+            }),
+        );
+        let desired = SupervisorInventoryServiceConfig {
+            enabled: true,
+            service_id: "telegram-loop".to_string(),
+            service_kind: "telegram-ingress".to_string(),
+            args: Vec::new(),
+            priority: "critical".to_string(),
+            restart_delay_ms: 60_000,
+            heartbeat_timeout_ms: Some(30_000),
+        };
+        let initial = reconcile_supervisor_inventory(SupervisorInventoryOptions {
+            harness_home: harness_home.clone(),
+            desired_services: vec![desired.clone()],
+            now_ms: Some(120_000),
+            default_heartbeat_timeout_ms: Some(30_000),
+        })
+        .unwrap();
+        assert_eq!(initial.stale.len(), 1);
+        assert_eq!(initial.stale[0].service_id, "telegram-loop");
+        assert_eq!(initial.stale[0].process_alive, Some(false));
+        assert_eq!(initial.launch_commands.len(), 1);
+        assert_eq!(initial.launch_commands[0].service_id, "telegram-loop");
+
+        let args = supervisor_reconcile_args_from_args(&[
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--all".to_string(),
+            "--auto-reconcile".to_string(),
+            "--restart-delay-ms".to_string(),
+            "60000".to_string(),
+            "--harness-cli".to_string(),
+            "where.exe".to_string(),
+        ])
+        .unwrap();
+        let launches = launch_supervisor_reconcile_commands(&args, &initial.launch_commands)
+            .expect("auto-reconcile launch receipt");
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0]["status"], "launched");
+        assert_eq!(launches[0]["serviceId"], "telegram-loop");
+        assert_eq!(launches[0]["autoReconcile"], true);
+
+        let watched_stop_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("stop")
+            .join("telegram-loop.stop");
+        let _generation = EnvVarRestore::set(
+            "AGENT_HARNESS_SERVICE_GENERATION_ID",
+            "telegram-loop-generation-2",
+        );
+        let _parent_pid = EnvVarRestore::set("AGENT_HARNESS_SUPERVISOR_PARENT_PID", "54321");
+        let _started_at = EnvVarRestore::set("AGENT_HARNESS_SERVICE_STARTED_AT_MS", "121000");
+        let _stop_file = EnvVarRestore::set(
+            "AGENT_HARNESS_SUPERVISOR_STOP_FILE",
+            &watched_stop_file.display().to_string(),
+        );
+        let _observed_only = EnvVarRestore::set("AGENT_HARNESS_SUPERVISOR_OBSERVED_ONLY", "false");
+        write_loop_heartbeat(
+            &harness_home,
+            "telegram-loop",
+            "running",
+            1,
+            "replacement generation heartbeat",
+        )
+        .unwrap();
+
+        let recovered = reconcile_supervisor_inventory(SupervisorInventoryOptions {
+            harness_home: harness_home.clone(),
+            desired_services: vec![desired],
+            now_ms: None,
+            default_heartbeat_timeout_ms: Some(30_000),
+        })
+        .unwrap();
+        assert!(recovered.stale.is_empty());
+        assert_eq!(recovered.running.len(), 1);
+        let running = &recovered.running[0];
+        assert_eq!(running.service_id, "telegram-loop");
+        assert_eq!(
+            running.generation_id.as_deref(),
+            Some("telegram-loop-generation-2")
+        );
+        assert_eq!(running.parent_pid, Some(54321));
+        assert_eq!(running.process_start_time_ms, Some(121000));
+        assert_eq!(running.watched_stop_file.as_ref(), Some(&watched_stop_file));
+
+        let duplicate_launch =
+            launch_supervisor_reconcile_commands(&args, &recovered.launch_commands).unwrap();
+        assert!(duplicate_launch.is_empty());
+        let refused = launch_supervisor_reconcile_commands(&args, &initial.launch_commands)
+            .expect("live-owner guard receipt");
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0]["status"], "launch-refused-owner-alive");
+        assert_eq!(refused[0]["serviceId"], "telegram-loop");
+        assert_eq!(
+            refused[0]["conflict"]["generationId"],
+            "telegram-loop-generation-2"
+        );
+
+        let receipt_text =
+            fs::read_to_string(supervisor_launch_receipts_file(&harness_home)).unwrap();
+        assert!(receipt_text.contains("\"status\":\"launched\""));
+        assert!(receipt_text.contains("\"status\":\"launch-refused-owner-alive\""));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -22516,6 +24346,70 @@ mod tests {
     }
 
     #[test]
+    fn runtime_loop_error_log_records_memory_and_queue_diagnostics() {
+        let root = cli_temp_root("runtime_loop_error_log_records_memory_and_queue_diagnostics");
+        let queue_dir = root.join("state").join("runtime-queue");
+        fs::create_dir_all(queue_dir.join("classes").join("interactive")).unwrap();
+        fs::write(
+            queue_dir.join("pending.jsonl"),
+            [
+                serde_json::json!({"queueId": "queue-open", "status": "queued"}).to_string(),
+                serde_json::json!({"queueId": "queue-done", "status": "queued"}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        fs::write(
+            queue_dir.join("run-once-receipts.jsonl"),
+            serde_json::json!({"queueId": "queue-done", "status": "completed"}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            queue_dir
+                .join("classes")
+                .join("interactive")
+                .join("runtime-leases.json"),
+            serde_json::json!({
+                "schema": "agent-harness.runtime-queue-leases.v1",
+                "leases": {
+                    "queue-open": {
+                        "queueId": "queue-open",
+                        "leaseExpiresAtMs": 999999
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        append_runtime_loop_error_log(&root, 7, 2, 5, "boom").unwrap();
+
+        let log_file = root.join("state").join("logs").join("harness.jsonl");
+        let log_text = fs::read_to_string(&log_file).unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(log_text.lines().next().unwrap()).unwrap();
+        assert_eq!(event["event"], "runtime.loop-error");
+        let message = event["message"].as_str().unwrap();
+        assert!(message.contains("memoryAvailable="), "{message}");
+        assert!(message.contains("workingSetBytes="), "{message}");
+        assert!(message.contains("commitBytes="), "{message}");
+        assert!(message.contains("privateBytes="), "{message}");
+        assert!(message.contains("queuePendingItems=2"), "{message}");
+        assert!(message.contains("queueOpenItems=1"), "{message}");
+        assert!(message.contains("queueActiveLeases=1"), "{message}");
+        assert!(message.contains("queueTerminalReceipts=1"), "{message}");
+        assert!(message.contains("queueTerminalQueueIds=1"), "{message}");
+        assert!(message.contains("diagnosticsWarnings=0"), "{message}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loop_error_receipt_records_memory_context() {
+        runtime_loop_error_log_records_memory_and_queue_diagnostics();
+    }
+
+    #[test]
     fn runtime_loop_lease_busy_does_not_count_as_error() {
         let root = cli_temp_root("runtime_loop_lease_busy_does_not_count_as_error");
         fs::create_dir_all(
@@ -22567,6 +24461,10 @@ mod tests {
                     continuation: agent_harness_core::RuntimeContinuationMetadata::legacy(),
                     child_queue_id: None,
                     child_session_key: None,
+                    terminal_control_matched: None,
+                    terminal_control_source: None,
+                    suppressed_run_once_reason: None,
+                    prepared_execution_terminalization_reason: None,
                     reason: "runtime queue lease lock is busy; retrying later".to_string(),
                 },
                 prepare: None,
@@ -22810,6 +24708,32 @@ mod tests {
             channel_permission_allows_text(ChannelPermission::Limited, "/model openai/gpt-5")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn channel_access_context_is_added_for_limited_group_users_only() {
+        let limited = append_channel_access_inbound_context(
+            Some("## ReferencedMessage\n- messageId: 9".to_string()),
+            ChannelPermission::Limited,
+            Some("supergroup"),
+        )
+        .unwrap();
+        assert!(limited.contains("## ReferencedMessage"));
+        assert!(limited.contains("## ChannelAccess"));
+        assert!(limited.contains("permission: Limited"));
+        assert!(limited.contains("chatType: supergroup"));
+        assert!(limited.contains("Reply short and direct"));
+        assert!(limited.contains("Do not expose internal workspace paths"));
+        assert!(limited.contains("admin-only command guidance"));
+
+        let admin = append_channel_access_inbound_context(
+            Some("## ReferencedMessage\n- messageId: 9".to_string()),
+            ChannelPermission::Admin,
+            Some("private"),
+        )
+        .unwrap();
+        assert!(admin.contains("## ReferencedMessage"));
+        assert!(!admin.contains("## ChannelAccess"));
     }
 
     #[test]

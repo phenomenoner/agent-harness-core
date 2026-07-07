@@ -40,7 +40,6 @@ pub fn supervisor_stop_file_path(harness_home: impl AsRef<Path>, name: &str) -> 
         .as_ref()
         .join("state")
         .join("supervisor")
-        .join("windows-scheduled-tasks")
         .join("stop")
         .join(format!("{name}.stop"))
 }
@@ -93,6 +92,7 @@ fn supervisor_stop_file_candidates(harness_home: &Path, name: &str) -> [PathBuf;
         harness_home
             .join("state")
             .join("supervisor")
+            .join("windows-scheduled-tasks")
             .join("stop")
             .join(format!("{name}.stop")),
     ]

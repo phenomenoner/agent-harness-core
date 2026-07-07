@@ -44,6 +44,9 @@ const CODEX_BINDING_SCHEMA: &str = "agent-harness.codex-binding.v1";
 const CODEX_ACTIVE_TURN_SCHEMA: &str = "agent-harness.codex-active-turn.v1";
 const CODEX_TURN_STEER_REQUEST_SCHEMA: &str = "agent-harness.codex-turn-steer-request.v1";
 const CODEX_TURN_STEER_RECEIPT_SCHEMA: &str = "agent-harness.codex-turn-steer-receipt.v1";
+const RUNTIME_CANCEL_CONSUMPTION_SCHEMA: &str = "agent-harness.runtime-cancel-consumption.v1";
+pub(crate) const NO_FINAL_ANSWER_WITH_NARRATION_MARKER: &str =
+    "codex app-server completed without final_answer while progress-panel narration was active";
 const CODEX_APP_SERVER_DEVELOPER_INSTRUCTIONS: &str = "\
 This Codex app-server thread backs an imported agent harness session. Codex owns \
 the backend system prompt, tool schemas, MCP/tool inventory, sandbox, approvals, \
@@ -1760,9 +1763,7 @@ fn finish_codex_runtime_run(
                     .to_string(),
             );
             status = CodexRuntimeRunStatus::ProtocolError;
-            reason =
-                "codex app-server completed without final_answer while progress-panel narration was active"
-                    .to_string();
+            reason = NO_FINAL_ANSWER_WITH_NARRATION_MARKER.to_string();
         } else {
             warnings.push("Codex app-server completed without captured assistant text".to_string());
             status = CodexRuntimeRunStatus::ProtocolError;
@@ -1793,6 +1794,15 @@ fn finish_codex_runtime_run(
     } else {
         None
     };
+    if should_rotate_stale_stdout_log(&status, &run_result)
+        && let Some(stale_stdout_log) = rotate_stale_stdout_log(
+            run_result.stdout_log.as_deref(),
+            finished_at_ms,
+            &mut warnings,
+        )?
+    {
+        run_result.stdout_log = Some(stale_stdout_log);
+    }
     let receipt = CodexRuntimeRunReceipt {
         queue_id: plan.queue_id.clone(),
         status,
@@ -1864,6 +1874,48 @@ fn finish_codex_runtime_run(
         },
         true,
     )
+}
+
+fn should_rotate_stale_stdout_log(
+    status: &CodexRuntimeRunStatus,
+    run_result: &CodexAppServerRunResult,
+) -> bool {
+    !run_result.assistant_final_found
+        && ((matches!(
+            status,
+            CodexRuntimeRunStatus::Timeout | CodexRuntimeRunStatus::ProtocolError
+        ) && run_result
+            .context_recovery
+            .as_ref()
+            .is_some_and(|recovery| {
+                recovery.status == "tool-timeout-fallback-failed"
+                    || recovery.status == "tool-timeout-fallback-succeeded"
+            }))
+            || *status == CodexRuntimeRunStatus::Timeout)
+}
+
+fn rotate_stale_stdout_log(
+    stdout_log: Option<&Path>,
+    finished_at_ms: i64,
+    warnings: &mut Vec<String>,
+) -> io::Result<Option<PathBuf>> {
+    let Some(stdout_log) = stdout_log else {
+        return Ok(None);
+    };
+    if !stdout_log.is_file() {
+        return Ok(None);
+    }
+    let stale_name = match stdout_log.file_name().and_then(|name| name.to_str()) {
+        Some(name) => format!("{name}.stale-{finished_at_ms}.jsonl"),
+        None => format!("codex-runtime-run.stdout.stale-{finished_at_ms}.jsonl"),
+    };
+    let stale_path = stdout_log.with_file_name(stale_name);
+    fs::rename(stdout_log, &stale_path)?;
+    warnings.push(format!(
+        "rotated stale Codex stdout capture without final_answer to {}",
+        stale_path.display()
+    ));
+    Ok(Some(stale_path))
 }
 
 fn recover_completed_codex_run_from_stdout_log(
@@ -3098,18 +3150,38 @@ struct RuntimeCancelRequest {
     reason: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeCancelConsumptionReceipt {
+    schema: &'static str,
+    at_ms: i64,
+    request_file: PathBuf,
+    queue_id: Option<String>,
+    session_key: String,
+    reason: String,
+}
+
 struct RuntimeCancelCheck {
     path: PathBuf,
+    receipt_file: PathBuf,
+    session_key: String,
+    queue_id: Option<String>,
 }
 
 impl RuntimeCancelCheck {
-    fn new(harness_home: &Path, session_key: &str) -> Self {
+    fn new(harness_home: &Path, session_key: &str, queue_id: Option<String>) -> Self {
         Self {
             path: harness_home
                 .join("state")
                 .join("runtime-queue")
                 .join("cancel-requests")
                 .join(format!("{}.json", normalize_key_part(session_key))),
+            receipt_file: harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("cancel-consumptions.jsonl"),
+            session_key: session_key.to_string(),
+            queue_id,
         }
     }
 
@@ -3125,13 +3197,22 @@ impl RuntimeCancelCheck {
         if now_ms.saturating_sub(request.at_ms) > RUNTIME_CANCEL_REQUEST_MAX_AGE_MS {
             return Ok(None);
         }
-        let _ = fs::remove_file(&self.path);
-        Ok(Some(
-            request
-                .reason
-                .filter(|reason| !reason.trim().is_empty())
-                .unwrap_or_else(|| "operator requested stop".to_string()),
-        ))
+        let reason = request
+            .reason
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or_else(|| "operator requested stop".to_string());
+        append_json_line(
+            &self.receipt_file,
+            &RuntimeCancelConsumptionReceipt {
+                schema: RUNTIME_CANCEL_CONSUMPTION_SCHEMA,
+                at_ms: now_ms,
+                request_file: self.path.clone(),
+                queue_id: self.queue_id.clone(),
+                session_key: self.session_key.clone(),
+                reason: reason.clone(),
+            },
+        )?;
+        Ok(Some(reason))
     }
 }
 
@@ -3285,7 +3366,8 @@ fn drive_codex_app_server(
     let (line_rx, mut reader_handle) = spawn_stdout_reader(stdout, stdout_log.clone());
     let mut timeouts = CodexProtocolTimeouts::new(timeout_ms, idle_timeout_ms);
     let mut state = CodexProtocolState::default();
-    let cancel_check = RuntimeCancelCheck::new(harness_home, &plan.session_key);
+    let cancel_check =
+        RuntimeCancelCheck::new(harness_home, &plan.session_key, plan.queue_id.clone());
     let mut progress =
         progress_context.map(|context| CodexProgressEmitter::new(harness_home, context));
     emit_codex_runtime_status(
@@ -5053,7 +5135,7 @@ fn write_tool_timeout_fallback_prompt(
     Ok(fallback_prompt_file)
 }
 
-fn tool_timeout_summary(tool: &CodexToolUseTimeout) -> String {
+pub(crate) fn tool_timeout_summary(tool: &CodexToolUseTimeout) -> String {
     let mut parts = vec![format!("method={}", tool.method)];
     if let Some(item_type) = tool.item_type.as_deref() {
         parts.push(format!("type={}", truncate_for_notice(item_type, 80)));
@@ -11725,6 +11807,66 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_timeout_rotates_stale_stdout_before_recovery() {
+        let root = temp_root("retry_after_timeout_rotates_stale_stdout_before_recovery");
+        let harness_home = root.join(".agent-harness");
+        let source = write_codex_runtime_source(&root);
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let execution_dir = plan_report.execution_dir.as_ref().unwrap();
+        let stdout_log = execution_dir.join("codex-runtime-run.stdout.jsonl");
+        fs::write(
+            &stdout_log,
+            r#"{"id":1,"result":{"thread":{"id":"thread-stale"}}}
+{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-progress","text":"Still running cargo clippy.","phase":"commentary"},"threadId":"thread-stale","completedAtMs":1234}}
+{"method":"turn/completed","params":{"threadId":"thread-stale","turn":{"id":"turn-stale","status":"completed","usage":{"inputTokens":10,"outputTokens":5,"totalTokens":15}}}}
+"#,
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+
+        let stale_path = rotate_stale_stdout_log(Some(&stdout_log), 42_000, &mut warnings).unwrap();
+
+        assert!(!stdout_log.exists());
+        let stale_path = stale_path.expect("stale stdout should rotate");
+        assert!(stale_path.is_file());
+        assert!(
+            stale_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("stale-42000")
+        );
+        assert!(
+            recover_completed_codex_run_from_stdout_log(
+                &serde_json::from_slice(&fs::read(plan_file).unwrap()).unwrap(),
+                &stdout_log,
+                None,
+                &AssistantNarrationConfig {
+                    mode: AssistantNarrationMode::ProgressPanel,
+                    ..AssistantNarrationConfig::default()
+                },
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("rotated stale"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_codex_runtime_does_not_block_on_open_stdout_after_terminal_event() {
         let root =
             temp_root("run_codex_runtime_does_not_block_on_open_stdout_after_terminal_event");
@@ -11964,7 +12106,7 @@ mod tests {
             harness_home,
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 10_000,
+            timeout_ms: 20_000,
             idle_timeout_ms: 3_000,
             progress_context: None,
         })
@@ -12016,7 +12158,7 @@ mod tests {
             harness_home,
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 10_000,
+            timeout_ms: 20_000,
             idle_timeout_ms: 3_000,
             progress_context: None,
         })
@@ -12628,9 +12770,63 @@ mod tests {
         assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Canceled);
         assert!(report.receipt.reason.contains("test stop"));
         assert!(report.completion.is_none());
-        assert!(!cancel_file.exists());
+        assert!(cancel_file.exists());
+        let consumption_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("cancel-consumptions.jsonl");
+        let consumption_text = fs::read_to_string(consumption_file).unwrap();
+        assert!(consumption_text.contains("test stop"));
+        assert!(consumption_text.contains("\"queueId\""));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_cancel_request_survives_first_consumer_for_sibling_queue() {
+        let root = temp_root("runtime_cancel_request_survives_first_consumer_for_sibling_queue");
+        let harness_home = root.join(".agent-harness");
+        let session_key = "telegram:dm-42:user-7:main";
+        let cancel_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("cancel-requests")
+            .join(format!("{}.json", normalize_key_part(session_key)));
+        write_json_atomic(
+            &cancel_file,
+            &serde_json::json!({
+                "schema": "agent-harness.runtime-cancel-request.v1",
+                "atMs": current_log_time_ms().unwrap(),
+                "sessionKey": session_key,
+                "reason": "sibling stop"
+            }),
+        )
+        .unwrap();
+
+        let first =
+            RuntimeCancelCheck::new(&harness_home, session_key, Some("queue-a".to_string()));
+        let second =
+            RuntimeCancelCheck::new(&harness_home, session_key, Some("queue-b".to_string()));
+
+        assert_eq!(first.poll().unwrap().as_deref(), Some("sibling stop"));
+        assert!(cancel_file.exists());
+        assert_eq!(second.poll().unwrap().as_deref(), Some("sibling stop"));
+        assert!(cancel_file.exists());
+
+        let consumption_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("cancel-consumptions.jsonl");
+        let consumption_text = fs::read_to_string(consumption_file).unwrap();
+        assert!(consumption_text.contains("queue-a"));
+        assert!(consumption_text.contains("queue-b"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stop_marker_survives_first_consumer() {
+        runtime_cancel_request_survives_first_consumer_for_sibling_queue();
     }
 
     #[test]
@@ -13099,6 +13295,7 @@ mod tests {
             RuntimeQueueEnqueueOptions {
                 harness_home: harness_home.to_path_buf(),
                 runtime_workspace,
+                inbound_canonical_id: None,
                 now_ms,
             },
         )

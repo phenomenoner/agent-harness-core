@@ -537,9 +537,11 @@ fn validate_cron_scheduler_object(path: &str, value: &Value, errors: &mut Vec<St
         match key.as_str() {
             "enabled" => expect_bool(path_key(path, key), child, errors),
             "intervalMs" => expect_positive_i64(path_key(path, key), child, errors),
-            "maxCatchupPerTick" | "maxEnqueuePerTick" => {
-                expect_positive_u64(path_key(path, key), child, errors)
-            }
+            "maxCatchupPerTick"
+            | "maxEnqueuePerTick"
+            | "maxActiveRunsPerJob"
+            | "maxActiveRunsPerAgent"
+            | "maxQueuedPerAgent" => expect_positive_u64(path_key(path, key), child, errors),
             "nativeCron" => validate_cron_scheduler_native(path_key(path, key), child, errors),
             "deterministicCron" => {
                 validate_cron_scheduler_deterministic(path_key(path, key), child, errors)
@@ -589,7 +591,9 @@ fn validate_supervisor_object(path: &str, value: &Value, errors: &mut Vec<String
     };
     for (key, child) in object {
         match key.as_str() {
-            "enabled" | "manageAllLoops" => expect_bool(path_key(path, key), child, errors),
+            "enabled" | "manageAllLoops" | "autoReconcile" => {
+                expect_bool(path_key(path, key), child, errors)
+            }
             "defaultHeartbeatTimeoutMs" | "restartDelayMs" | "idleMs" => {
                 expect_positive_i64(path_key(path, key), child, errors)
             }
@@ -1103,7 +1107,7 @@ mod tests {
                 "telegramFormattingChannelModes": { "telegram:dm-42": "plain" },
                 "progressDeliveryMode": "on",
                 "progressDeliveryAgentModes": { "xiaoxiaoli": "off" },
-                "progressDeliveryChannelModes": { "telegram:-1003968507595": "muted" }
+                "progressDeliveryChannelModes": { "telegram:group-alpha": "muted" }
               },
               "security": {
                 "codexApprovalPolicy": "accept",
@@ -1118,9 +1122,10 @@ mod tests {
                 "rateLeaseLimit": 0,
                 "rateLeaseWindowMs": 60000
               },
-              "supervisor": {
+                "supervisor": {
                 "enabled": true,
                 "manageAllLoops": true,
+                "autoReconcile": false,
                 "defaultHeartbeatTimeoutMs": 120000,
                 "restartDelayMs": 60000,
                 "runtimeLoop": { "enabled": true, "runtimeConcurrency": 1, "childIterations": 0 },
@@ -1393,6 +1398,38 @@ mod tests {
                 .iter()
                 .any(|error| { error.contains("rolloverMode") && error.contains("fresh-thread") })
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validate_harness_config_accepts_cron_scheduler_run_caps() {
+        let root = temp_root("validate_harness_config_accepts_cron_scheduler_run_caps");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "schema": "agent-harness.config.v1",
+              "cronScheduler": {
+                "enabled": true,
+                "intervalMs": 60000,
+                "maxCatchupPerTick": 3,
+                "maxEnqueuePerTick": 10,
+                "maxActiveRunsPerJob": 1,
+                "maxActiveRunsPerAgent": 4,
+                "maxQueuedPerAgent": 20,
+                "nativeCron": { "enabled": true, "resumeCron": true, "includeRegisteredCron": false },
+                "deterministicCron": { "enabled": true, "allowDeterministicRun": true, "executeShell": false }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let report = validate_harness_config(&harness_home).unwrap();
+
+        assert_eq!(report.status, HarnessConfigValidationStatus::Valid);
+        assert!(report.errors.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }

@@ -26,6 +26,9 @@ const RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA: &str = "agent-harness.runtime-queue-p
 const RUNTIME_QUEUE_LEASES_SCHEMA: &str = "agent-harness.runtime-queue-leases.v1";
 const RUNTIME_QUEUE_LEASE_RECONCILIATION_SCHEMA: &str =
     "agent-harness.runtime-queue-lease-reconciliation.v1";
+const RUNTIME_QUEUE_STATE_INDEX_SCHEMA: &str = "agent-harness.runtime-queue-state-index.v1";
+const RUNTIME_QUEUE_QUARANTINE_SCHEMA: &str = "agent-harness.runtime-queue-quarantine.v1";
+const TERMINAL_CONTROL_SUPPRESSION_REASON: &str = "terminal-control-present";
 const RUNTIME_LOOP_SERVICE_ID: &str = "runtime-loop";
 const DEFAULT_RUNTIME_LEASE_MS: i64 = 30 * 60 * 1000;
 const RUNTIME_LEASE_ACQUIRE_LOCK_RETRY_MS: u64 = 2_000;
@@ -167,6 +170,12 @@ pub struct RuntimeExecutionReceipt {
     pub inbound_media_artifacts: Vec<InboundMediaArtifact>,
     #[serde(default, flatten)]
     pub continuation: RuntimeContinuationMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_control_matched: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_control_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suppressed_run_once_reason: Option<String>,
     pub reason: String,
 }
 
@@ -179,6 +188,62 @@ pub enum RuntimeExecutionReceiptStatus {
     StaleOwnerReaped,
     LeaseBusy,
     NoPendingItem,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalControlSource {
+    QueueSkip,
+    ScopedStop,
+    RunOnceTerminal,
+    Quarantine,
+}
+
+impl TerminalControlSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::QueueSkip => "queue-skip",
+            Self::ScopedStop => "scoped-stop",
+            Self::RunOnceTerminal => "run-once-terminal",
+            Self::Quarantine => "quarantine",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueTerminalControlMatch {
+    pub source: TerminalControlSource,
+    pub reason: String,
+    pub suppression_recorded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueTerminalControl {
+    Runnable,
+    Terminal(QueueTerminalControlMatch),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeQueueStateIndex {
+    #[serde(default = "runtime_queue_state_index_schema")]
+    schema: String,
+    #[serde(default)]
+    pub(crate) queues: BTreeMap<String, RuntimeQueueStateIndexEntry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeQueueStateIndexEntry {
+    #[serde(default)]
+    terminal_ever: bool,
+    #[serde(default)]
+    suppression_recorded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_control_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -324,7 +389,12 @@ pub fn prepare_runtime_queue_item(
     let preliminary_pending_items = read_pending_items(&queue_file, &mut warnings)?;
     let prepared_receipts = read_prepared_receipts(&execution_receipts_file, &mut warnings)?;
     let run_once_receipts_file = queue_dir.join("run-once-receipts.jsonl");
-    let terminal_run_ids = read_terminal_run_once_ids(&run_once_receipts_file, &mut warnings)?;
+    let mut terminal_run_ids = read_terminal_run_once_ids(&run_once_receipts_file, &mut warnings)?;
+    terminal_run_ids.extend(pending_terminal_control_ids(
+        &options.harness_home,
+        &preliminary_pending_items,
+        &mut warnings,
+    )?);
     let retry_pending_run_ids =
         read_retry_pending_run_once_ids(&run_once_receipts_file, &mut warnings)?;
     let lock_runtime_class = select_lock_runtime_class(
@@ -354,6 +424,9 @@ pub fn prepare_runtime_queue_item(
                 runtime_workspace: None,
                 inbound_media_artifacts: Vec::new(),
                 continuation: RuntimeContinuationMetadata::legacy(),
+                terminal_control_matched: None,
+                terminal_control_source: None,
+                suppressed_run_once_reason: None,
                 reason: format!(
                     "runtime queue lease lock is busy for class `{lock_runtime_class}`"
                 ),
@@ -386,6 +459,79 @@ pub fn prepare_runtime_queue_item(
         .cloned()
         .map(|item| (item.queue_id.clone(), item))
         .collect::<HashMap<_, _>>();
+    if let Some(requested_queue_id) = options.queue_id.as_deref() {
+        let session_key = pending_by_id
+            .get(requested_queue_id)
+            .map(|item| item.session_key.as_str());
+        if let QueueTerminalControl::Terminal(control) =
+            resolve_queue_terminal_control(&options.harness_home, requested_queue_id, session_key)?
+        {
+            if let Some(pending) = pending_by_id.get(requested_queue_id) {
+                record_terminal_control_suppression(
+                    &options.harness_home,
+                    requested_queue_id,
+                    Some(&pending.runtime_class),
+                    Some(&pending.origin),
+                    pending.cron_run_id.as_deref(),
+                    pending.scheduled_for_ms,
+                    &pending.continuation,
+                    &control,
+                )?;
+                write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+                let receipt = terminal_control_no_pending_receipt(
+                    requested_queue_id,
+                    Some(pending.runtime_class.clone()),
+                    Some(pending.origin.clone()),
+                    pending.cron_run_id.clone(),
+                    pending.scheduled_for_ms,
+                    pending.continuation.clone(),
+                    &control,
+                );
+                append_json_line(&execution_receipts_file, &receipt)?;
+                return Ok(RuntimeQueuePrepareReport {
+                    schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
+                    harness_home: options.harness_home,
+                    queue_file,
+                    execution_receipts_file,
+                    item: None,
+                    receipt,
+                    warnings,
+                });
+            }
+            if let Some(prepared) = prepared_receipts.get(requested_queue_id) {
+                record_terminal_control_suppression(
+                    &options.harness_home,
+                    requested_queue_id,
+                    prepared.runtime_class.as_deref(),
+                    prepared.origin.as_deref(),
+                    prepared.cron_run_id.as_deref(),
+                    prepared.scheduled_for_ms,
+                    &prepared.continuation,
+                    &control,
+                )?;
+                write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+                let receipt = terminal_control_no_pending_receipt(
+                    requested_queue_id,
+                    prepared.runtime_class.clone(),
+                    prepared.origin.clone(),
+                    prepared.cron_run_id.clone(),
+                    prepared.scheduled_for_ms,
+                    prepared.continuation.clone(),
+                    &control,
+                );
+                append_json_line(&execution_receipts_file, &receipt)?;
+                return Ok(RuntimeQueuePrepareReport {
+                    schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
+                    harness_home: options.harness_home,
+                    queue_file,
+                    execution_receipts_file,
+                    item: None,
+                    receipt,
+                    warnings,
+                });
+            }
+        }
+    }
     if let Some(requested_queue_id) = options.queue_id.as_deref()
         && terminal_run_ids.contains(requested_queue_id)
     {
@@ -414,6 +560,9 @@ pub fn prepare_runtime_queue_item(
                 .get(requested_queue_id)
                 .map(|item| item.continuation.clone())
                 .unwrap_or_else(RuntimeContinuationMetadata::legacy),
+            terminal_control_matched: None,
+            terminal_control_source: None,
+            suppressed_run_once_reason: None,
             reason: "requested runtime queue item already has a terminal run receipt".to_string(),
         };
         append_json_line(&execution_receipts_file, &receipt)?;
@@ -430,6 +579,57 @@ pub fn prepare_runtime_queue_item(
     if let Some(requested_queue_id) = options.queue_id.as_deref()
         && let Some(prepared) = prepared_receipts.get(requested_queue_id)
     {
+        let pending = pending_by_id.get(requested_queue_id);
+        let session_key = pending.map(|item| item.session_key.as_str());
+        if let QueueTerminalControl::Terminal(control) =
+            resolve_queue_terminal_control(&options.harness_home, requested_queue_id, session_key)?
+        {
+            let runtime_class = pending
+                .map(|item| item.runtime_class.clone())
+                .or_else(|| prepared.runtime_class.clone());
+            let origin = pending
+                .map(|item| item.origin.clone())
+                .or_else(|| prepared.origin.clone());
+            let cron_run_id = pending
+                .and_then(|item| item.cron_run_id.clone())
+                .or_else(|| prepared.cron_run_id.clone());
+            let scheduled_for_ms = pending
+                .and_then(|item| item.scheduled_for_ms)
+                .or(prepared.scheduled_for_ms);
+            let continuation = pending
+                .map(|item| item.continuation.clone())
+                .unwrap_or_else(|| prepared.continuation.clone());
+            record_terminal_control_suppression(
+                &options.harness_home,
+                requested_queue_id,
+                runtime_class.as_deref(),
+                origin.as_deref(),
+                cron_run_id.as_deref(),
+                scheduled_for_ms,
+                &continuation,
+                &control,
+            )?;
+            write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+            let receipt = terminal_control_no_pending_receipt(
+                requested_queue_id,
+                runtime_class,
+                origin,
+                cron_run_id,
+                scheduled_for_ms,
+                continuation,
+                &control,
+            );
+            append_json_line(&execution_receipts_file, &receipt)?;
+            return Ok(RuntimeQueuePrepareReport {
+                schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
+                harness_home: options.harness_home,
+                queue_file,
+                execution_receipts_file,
+                item: None,
+                receipt,
+                warnings,
+            });
+        }
         if lease_state.leases.contains_key(requested_queue_id) {
             let receipt = RuntimeExecutionReceipt {
                 queue_id: Some(requested_queue_id.to_string()),
@@ -444,6 +644,9 @@ pub fn prepare_runtime_queue_item(
                 runtime_workspace: None,
                 inbound_media_artifacts: Vec::new(),
                 continuation: prepared.continuation.clone(),
+                terminal_control_matched: None,
+                terminal_control_source: None,
+                suppressed_run_once_reason: None,
                 reason: "requested runtime queue item is already leased".to_string(),
             };
             write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
@@ -477,6 +680,9 @@ pub fn prepare_runtime_queue_item(
                     runtime_workspace: None,
                     inbound_media_artifacts: Vec::new(),
                     continuation: pending.continuation.clone(),
+                    terminal_control_matched: None,
+                    terminal_control_source: None,
+                    suppressed_run_once_reason: None,
                     reason: format!("runtime queue item blocked by {blocker}"),
                 };
                 write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
@@ -507,6 +713,9 @@ pub fn prepare_runtime_queue_item(
                     runtime_workspace: None,
                     inbound_media_artifacts: Vec::new(),
                     continuation: pending.continuation.clone(),
+                    terminal_control_matched: None,
+                    terminal_control_source: None,
+                    suppressed_run_once_reason: None,
                     reason: format!("runtime queue capacity blocked by {blocker}"),
                 };
                 write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
@@ -540,6 +749,9 @@ pub fn prepare_runtime_queue_item(
                     runtime_workspace: None,
                     inbound_media_artifacts: Vec::new(),
                     continuation: pending.continuation.clone(),
+                    terminal_control_matched: None,
+                    terminal_control_source: None,
+                    suppressed_run_once_reason: None,
                     reason: format!("runtime queue item blocked by {blocker}"),
                 };
                 write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
@@ -580,6 +792,9 @@ pub fn prepare_runtime_queue_item(
             runtime_workspace: prepared.runtime_workspace.clone(),
             inbound_media_artifacts: prepared.inbound_media_artifacts.clone(),
             continuation: prepared.continuation.clone(),
+            terminal_control_matched: None,
+            terminal_control_source: None,
+            suppressed_run_once_reason: None,
             reason: "requested runtime queue item was already prepared".to_string(),
         };
         append_json_line(&execution_receipts_file, &receipt)?;
@@ -611,6 +826,27 @@ pub fn prepare_runtime_queue_item(
         }) {
             if let Some(pending) = pending_by_id.get(queue_id) {
                 if pending.runtime_class != lock_runtime_class {
+                    continue;
+                }
+                if let QueueTerminalControl::Terminal(control) = resolve_queue_terminal_control(
+                    &options.harness_home,
+                    &pending.queue_id,
+                    Some(&pending.session_key),
+                )? {
+                    warnings.push(format!(
+                        "prepared runtime queue item `{queue_id}` suppressed by terminal control {}",
+                        control.source.as_str()
+                    ));
+                    record_terminal_control_suppression(
+                        &options.harness_home,
+                        &pending.queue_id,
+                        Some(&pending.runtime_class),
+                        Some(&pending.origin),
+                        pending.cron_run_id.as_deref(),
+                        pending.scheduled_for_ms,
+                        &pending.continuation,
+                        &control,
+                    )?;
                     continue;
                 }
                 if let Some(blocker) =
@@ -662,6 +898,9 @@ pub fn prepare_runtime_queue_item(
                     runtime_workspace: prepared.runtime_workspace.clone(),
                     inbound_media_artifacts: prepared.inbound_media_artifacts.clone(),
                     continuation: prepared.continuation.clone(),
+                    terminal_control_matched: None,
+                    terminal_control_source: None,
+                    suppressed_run_once_reason: None,
                     reason:
                         "resuming previously prepared runtime queue item without terminal run receipt"
                             .to_string(),
@@ -711,6 +950,51 @@ pub fn prepare_runtime_queue_item(
     )?
     else {
         write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+        if options.queue_id.is_none() {
+            let mut terminal_candidates = pending_by_id.values().collect::<Vec<_>>();
+            terminal_candidates.sort_by(|left, right| {
+                runtime_selection_key(left)
+                    .cmp(&runtime_selection_key(right))
+                    .then_with(|| left.queue_id.cmp(&right.queue_id))
+            });
+            for pending in terminal_candidates {
+                if let QueueTerminalControl::Terminal(control) = resolve_queue_terminal_control(
+                    &options.harness_home,
+                    &pending.queue_id,
+                    Some(&pending.session_key),
+                )? {
+                    record_terminal_control_suppression(
+                        &options.harness_home,
+                        &pending.queue_id,
+                        Some(&pending.runtime_class),
+                        Some(&pending.origin),
+                        pending.cron_run_id.as_deref(),
+                        pending.scheduled_for_ms,
+                        &pending.continuation,
+                        &control,
+                    )?;
+                    let receipt = terminal_control_no_pending_receipt(
+                        &pending.queue_id,
+                        Some(pending.runtime_class.clone()),
+                        Some(pending.origin.clone()),
+                        pending.cron_run_id.clone(),
+                        pending.scheduled_for_ms,
+                        pending.continuation.clone(),
+                        &control,
+                    );
+                    append_json_line(&execution_receipts_file, &receipt)?;
+                    return Ok(RuntimeQueuePrepareReport {
+                        schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
+                        harness_home: options.harness_home,
+                        queue_file,
+                        execution_receipts_file,
+                        item: None,
+                        receipt,
+                        warnings,
+                    });
+                }
+            }
+        }
         let receipt = RuntimeExecutionReceipt {
             queue_id: options.queue_id,
             status: RuntimeExecutionReceiptStatus::NoPendingItem,
@@ -724,6 +1008,9 @@ pub fn prepare_runtime_queue_item(
             runtime_workspace: None,
             inbound_media_artifacts: Vec::new(),
             continuation: RuntimeContinuationMetadata::legacy(),
+            terminal_control_matched: None,
+            terminal_control_source: None,
+            suppressed_run_once_reason: None,
             reason: "no matching queued runtime item found".to_string(),
         };
         append_json_line(&execution_receipts_file, &receipt)?;
@@ -859,6 +1146,9 @@ pub fn prepare_runtime_queue_item(
         runtime_workspace: pending.runtime_workspace,
         inbound_media_artifacts: item.inbound_media_artifacts.clone(),
         continuation: item.continuation.clone(),
+        terminal_control_matched: None,
+        terminal_control_source: None,
+        suppressed_run_once_reason: None,
         reason: "prompt bundle prepared; Codex runtime adapter not invoked yet".to_string(),
     };
     write_json_atomic(&receipt_file, &receipt)?;
@@ -1275,6 +1565,10 @@ fn runtime_queue_leases_schema() -> String {
     RUNTIME_QUEUE_LEASES_SCHEMA.to_string()
 }
 
+fn runtime_queue_state_index_schema() -> String {
+    RUNTIME_QUEUE_STATE_INDEX_SCHEMA.to_string()
+}
+
 fn default_interactive_runtime_class() -> String {
     "interactive".to_string()
 }
@@ -1625,6 +1919,12 @@ pub fn reconcile_runtime_queue_leases_for_generation(
         reaped_leases: Vec::new(),
         warnings: Vec::new(),
     };
+    let pending_file = queue_dir.join("pending.jsonl");
+    let pending_items = read_pending_items(&pending_file, &mut report.warnings)?;
+    let pending_by_id = pending_items
+        .iter()
+        .map(|item| (item.queue_id.clone(), item.clone()))
+        .collect::<HashMap<_, _>>();
 
     for runtime_class in runtime_classes_for_release(&queue_dir) {
         let Some(_lease_lock) = acquire_runtime_queue_lease_lock_with_retry(
@@ -1663,6 +1963,28 @@ pub fn reconcile_runtime_queue_leases_for_generation(
                 "runtime queue lease owner {} belonged to exited supervisor serviceId={service_id} generationId={generation_id}",
                 lease.owner.display_label()
             );
+            if let Some(pending) = pending_by_id.get(&queue_id)
+                && let QueueTerminalControl::Terminal(control) = resolve_queue_terminal_control(
+                    &harness_home,
+                    &queue_id,
+                    Some(&pending.session_key),
+                )?
+            {
+                record_terminal_control_suppression(
+                    &harness_home,
+                    &queue_id,
+                    Some(&pending.runtime_class),
+                    Some(&pending.origin),
+                    pending.cron_run_id.as_deref(),
+                    pending.scheduled_for_ms,
+                    &pending.continuation,
+                    &control,
+                )?;
+                report.warnings.push(format!(
+                    "reaped runtime queue lease `{queue_id}` remains suppressed by terminal control {}",
+                    control.source.as_str()
+                ));
+            }
             append_json_line(
                 &receipts_file,
                 &serde_json::json!({
@@ -1721,6 +2043,342 @@ fn runtime_classes_for_release(queue_dir: &Path) -> Vec<String> {
         }
     }
     classes
+}
+
+pub fn resolve_queue_terminal_control(
+    harness_home: impl AsRef<Path>,
+    queue_id: &str,
+    session_key: Option<&str>,
+) -> io::Result<QueueTerminalControl> {
+    let queue_dir = harness_home.as_ref().join("state").join("runtime-queue");
+    let mut warnings = Vec::new();
+    let index = rebuild_runtime_queue_state_index(&queue_dir, &mut warnings)?;
+    resolve_queue_terminal_control_from_index(
+        &queue_dir,
+        queue_id,
+        session_key,
+        index.queues.get(queue_id),
+    )
+}
+
+pub(crate) fn resolve_queue_terminal_control_from_index(
+    queue_dir: &Path,
+    queue_id: &str,
+    session_key: Option<&str>,
+    indexed: Option<&RuntimeQueueStateIndexEntry>,
+) -> io::Result<QueueTerminalControl> {
+    let suppression_recorded = indexed
+        .map(|entry| entry.suppression_recorded)
+        .unwrap_or(false);
+
+    if let Some(reason) = quarantine_marker_reason(&queue_dir, queue_id)? {
+        return Ok(QueueTerminalControl::Terminal(QueueTerminalControlMatch {
+            source: TerminalControlSource::Quarantine,
+            reason,
+            suppression_recorded,
+        }));
+    }
+    if let Some(reason) = scoped_stop_marker_reason(&queue_dir, queue_id, session_key)? {
+        return Ok(QueueTerminalControl::Terminal(QueueTerminalControlMatch {
+            source: TerminalControlSource::ScopedStop,
+            reason,
+            suppression_recorded,
+        }));
+    }
+    if let Some(reason) = queue_skip_control_reason(&queue_dir, queue_id)? {
+        return Ok(QueueTerminalControl::Terminal(QueueTerminalControlMatch {
+            source: TerminalControlSource::QueueSkip,
+            reason,
+            suppression_recorded,
+        }));
+    }
+    if let Some(entry) = indexed
+        && entry.terminal_ever
+    {
+        let status = entry.terminal_status.as_deref().unwrap_or("terminal");
+        let reason = entry
+            .terminal_reason
+            .clone()
+            .unwrap_or_else(|| format!("historical terminal run-once status `{status}`"));
+        return Ok(QueueTerminalControl::Terminal(QueueTerminalControlMatch {
+            source: TerminalControlSource::RunOnceTerminal,
+            reason,
+            suppression_recorded,
+        }));
+    }
+    Ok(QueueTerminalControl::Runnable)
+}
+
+pub fn write_runtime_queue_quarantine_marker(
+    harness_home: impl AsRef<Path>,
+    queue_id: &str,
+    reason: &str,
+    now_ms: i64,
+) -> io::Result<PathBuf> {
+    let quarantine_dir = harness_home
+        .as_ref()
+        .join("state")
+        .join("runtime-queue")
+        .join("quarantine");
+    fs::create_dir_all(&quarantine_dir)?;
+    let marker_file = quarantine_dir.join(format!("{}.json", normalize_key_part(queue_id)));
+    let marker = serde_json::json!({
+        "schema": RUNTIME_QUEUE_QUARANTINE_SCHEMA,
+        "queueId": queue_id,
+        "status": "quarantined",
+        "reason": reason,
+        "atMs": now_ms
+    });
+    write_json_atomic(&marker_file, &marker)?;
+    Ok(marker_file)
+}
+
+pub(crate) fn record_terminal_control_suppression(
+    harness_home: &Path,
+    queue_id: &str,
+    runtime_class: Option<&str>,
+    origin: Option<&str>,
+    cron_run_id: Option<&str>,
+    scheduled_for_ms: Option<i64>,
+    continuation: &RuntimeContinuationMetadata,
+    control: &QueueTerminalControlMatch,
+) -> io::Result<bool> {
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    fs::create_dir_all(&queue_dir)?;
+    let mut warnings = Vec::new();
+    let mut index = rebuild_runtime_queue_state_index(&queue_dir, &mut warnings)?;
+    let entry = index.queues.entry(queue_id.to_string()).or_default();
+    if entry.suppression_recorded {
+        return Ok(false);
+    }
+    let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+    let receipt = serde_json::json!({
+        "schema": "agent-harness.runtime-run-once.v1",
+        "queueId": queue_id,
+        "status": "suppressed",
+        "runtimeClass": runtime_class,
+        "origin": origin,
+        "cronRunId": cron_run_id,
+        "scheduledForMs": scheduled_for_ms,
+        "continuation": continuation,
+        "terminalControlMatched": true,
+        "terminalControlSource": control.source.as_str(),
+        "suppressedRunOnceReason": TERMINAL_CONTROL_SUPPRESSION_REASON,
+        "reason": format!(
+            "runtime queue item suppressed because terminal control is present: {}: {}",
+            control.source.as_str(),
+            control.reason
+        )
+    });
+    append_json_line(&receipts_file, &receipt)?;
+    entry.suppression_recorded = true;
+    entry.terminal_control_source = Some(control.source.as_str().to_string());
+    write_runtime_queue_state_index(&queue_dir, &index)?;
+    Ok(true)
+}
+
+fn terminal_control_no_pending_receipt(
+    queue_id: &str,
+    runtime_class: Option<String>,
+    origin: Option<String>,
+    cron_run_id: Option<String>,
+    scheduled_for_ms: Option<i64>,
+    continuation: RuntimeContinuationMetadata,
+    control: &QueueTerminalControlMatch,
+) -> RuntimeExecutionReceipt {
+    RuntimeExecutionReceipt {
+        queue_id: Some(queue_id.to_string()),
+        status: RuntimeExecutionReceiptStatus::NoPendingItem,
+        runtime_class,
+        origin,
+        cron_run_id,
+        scheduled_for_ms,
+        execution_dir: None,
+        prompt_bundle_json: None,
+        prompt_markdown: None,
+        runtime_workspace: None,
+        inbound_media_artifacts: Vec::new(),
+        continuation,
+        terminal_control_matched: Some(true),
+        terminal_control_source: Some(control.source.as_str().to_string()),
+        suppressed_run_once_reason: Some(TERMINAL_CONTROL_SUPPRESSION_REASON.to_string()),
+        reason: format!(
+            "runtime queue item matched terminal control {}: {}",
+            control.source.as_str(),
+            control.reason
+        ),
+    }
+}
+
+fn pending_terminal_control_ids(
+    harness_home: &Path,
+    pending_items: &[PendingQueueItem],
+    warnings: &mut Vec<String>,
+) -> io::Result<HashSet<String>> {
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let index = rebuild_runtime_queue_state_index(&queue_dir, warnings)?;
+    let mut ids = HashSet::new();
+    for item in pending_items {
+        match resolve_queue_terminal_control_from_index(
+            &queue_dir,
+            &item.queue_id,
+            Some(&item.session_key),
+            index.queues.get(&item.queue_id),
+        )? {
+            QueueTerminalControl::Runnable => {}
+            QueueTerminalControl::Terminal(control) => {
+                warnings.push(format!(
+                    "runtime queue item `{}` has terminal control {}; excluding from selection",
+                    item.queue_id,
+                    control.source.as_str()
+                ));
+                ids.insert(item.queue_id.clone());
+            }
+        }
+    }
+    Ok(ids)
+}
+
+pub(crate) fn rebuild_runtime_queue_state_index(
+    queue_dir: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<RuntimeQueueStateIndex> {
+    let mut index = RuntimeQueueStateIndex {
+        schema: runtime_queue_state_index_schema(),
+        queues: BTreeMap::new(),
+    };
+    let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+    if receipts_file.is_file() {
+        let text = fs::read_to_string(&receipts_file)?;
+        for (line_index, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let value: Value = match serde_json::from_str(trimmed) {
+                Ok(value) => value,
+                Err(error) => {
+                    warnings.push(format!(
+                        "runtime run-once receipt line {} is not valid JSON while rebuilding queue-state index: {}",
+                        line_index + 1,
+                        error
+                    ));
+                    continue;
+                }
+            };
+            let Some(queue_id) = string_field(&value, &["queueId", "queue_id"]) else {
+                continue;
+            };
+            let Some(status) = string_field(&value, &["status"]) else {
+                continue;
+            };
+            let entry = index.queues.entry(queue_id.to_string()).or_default();
+            if status == "suppressed" {
+                entry.suppression_recorded = true;
+                if let Some(source) = string_field(&value, &["terminalControlSource"]) {
+                    entry.terminal_control_source = Some(source.to_string());
+                }
+                continue;
+            }
+            if is_terminal_run_once_status(status) {
+                entry.terminal_ever = true;
+                entry.terminal_status = Some(status.to_string());
+                entry.terminal_reason = string_field(&value, &["reason"]).map(ToString::to_string);
+                entry.terminal_control_source.get_or_insert_with(|| {
+                    TerminalControlSource::RunOnceTerminal.as_str().to_string()
+                });
+            }
+        }
+    }
+    write_runtime_queue_state_index(queue_dir, &index)?;
+    Ok(index)
+}
+
+fn write_runtime_queue_state_index(
+    queue_dir: &Path,
+    index: &RuntimeQueueStateIndex,
+) -> io::Result<()> {
+    write_json_atomic(&queue_dir.join("queue-state-index.json"), index)
+}
+
+fn queue_skip_control_reason(queue_dir: &Path, queue_id: &str) -> io::Result<Option<String>> {
+    let receipts_file = queue_dir.join("control-receipts.jsonl");
+    if !receipts_file.is_file() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(receipts_file)?;
+    let mut reason = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let id = string_field(&value, &["originalQueueId", "queueId", "queue_id"]);
+        if id != Some(queue_id) {
+            continue;
+        }
+        let action = string_field(&value, &["action"]);
+        let status = string_field(&value, &["status"]);
+        if action == Some("skip") || status == Some("skipped") {
+            reason = Some(
+                string_field(&value, &["reason"])
+                    .unwrap_or("queue-skip control receipt matched")
+                    .to_string(),
+            );
+        }
+    }
+    Ok(reason)
+}
+
+fn scoped_stop_marker_reason(
+    queue_dir: &Path,
+    queue_id: &str,
+    session_key: Option<&str>,
+) -> io::Result<Option<String>> {
+    let cancel_dir = queue_dir.join("cancel");
+    let queue_marker = cancel_dir.join(format!("queue-{}.stop", normalize_key_part(queue_id)));
+    if let Some(reason) = marker_reason(&queue_marker)? {
+        return Ok(Some(reason));
+    }
+    if let Some(session_key) = session_key {
+        let turn_marker = cancel_dir.join(format!("turn-{}.stop", normalize_key_part(session_key)));
+        if let Some(reason) = marker_reason(&turn_marker)? {
+            return Ok(Some(reason));
+        }
+    }
+    Ok(None)
+}
+
+fn quarantine_marker_reason(queue_dir: &Path, queue_id: &str) -> io::Result<Option<String>> {
+    let marker_file = queue_dir
+        .join("quarantine")
+        .join(format!("{}.json", normalize_key_part(queue_id)));
+    marker_reason(&marker_file)
+}
+
+fn marker_reason(path: &Path) -> io::Result<Option<String>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(path)?;
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(_) => {
+            return Ok(Some(format!(
+                "terminal control marker exists at {}",
+                path.display()
+            )));
+        }
+    };
+    Ok(Some(
+        string_field(&value, &["reason"])
+            .unwrap_or("terminal control marker exists")
+            .to_string(),
+    ))
 }
 
 fn runtime_capacity_blocker(
@@ -1970,6 +2628,9 @@ fn lease_acquired_receipt(item: &PendingQueueItem, reason: &str) -> RuntimeExecu
         runtime_workspace: item.runtime_workspace.clone(),
         inbound_media_artifacts: item.inbound_media_artifacts.clone(),
         continuation: item.continuation.clone(),
+        terminal_control_matched: None,
+        terminal_control_source: None,
+        suppressed_run_once_reason: None,
         reason: reason.to_string(),
     }
 }
@@ -2208,6 +2869,26 @@ fn select_pending_item(
         if requested_queue_id.is_some_and(|requested| requested != item.queue_id) {
             continue;
         }
+        if let QueueTerminalControl::Terminal(control) =
+            resolve_queue_terminal_control(harness_home, &item.queue_id, Some(&item.session_key))?
+        {
+            warnings.push(format!(
+                "runtime queue item `{}` suppressed by terminal control {}; skipping",
+                item.queue_id,
+                control.source.as_str()
+            ));
+            record_terminal_control_suppression(
+                harness_home,
+                &item.queue_id,
+                Some(&item.runtime_class),
+                Some(&item.origin),
+                item.cron_run_id.as_deref(),
+                item.scheduled_for_ms,
+                &item.continuation,
+                &control,
+            )?;
+            continue;
+        }
         if prepared_ids.contains(&item.queue_id) {
             warnings.push(format!(
                 "runtime queue item `{}` already has a prepared receipt; skipping",
@@ -2374,7 +3055,7 @@ fn read_terminal_run_once_ids(
     receipts_file: &Path,
     warnings: &mut Vec<String>,
 ) -> io::Result<HashSet<String>> {
-    read_run_once_ids_by_latest_status(receipts_file, warnings, is_terminal_run_once_status)
+    read_run_once_ids_by_any_status(receipts_file, warnings, is_terminal_run_once_status)
 }
 
 fn read_retry_pending_run_once_ids(
@@ -2425,10 +3106,55 @@ where
         .collect())
 }
 
+fn read_run_once_ids_by_any_status<F>(
+    receipts_file: &Path,
+    warnings: &mut Vec<String>,
+    predicate: F,
+) -> io::Result<HashSet<String>>
+where
+    F: Fn(&str) -> bool,
+{
+    let mut ids = HashSet::new();
+    if !receipts_file.is_file() {
+        return Ok(ids);
+    }
+
+    let text = fs::read_to_string(receipts_file)?;
+    for (index, line) in text.lines().enumerate() {
+        let line_number = index + 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(error) => {
+                warnings.push(format!(
+                    "runtime run-once receipt line {line_number} is not valid JSON: {error}"
+                ));
+                continue;
+            }
+        };
+        if let Some(queue_id) = string_field(&value, &["queueId", "queue_id"])
+            && let Some(status) = string_field(&value, &["status"])
+            && predicate(status)
+        {
+            ids.insert(queue_id.to_string());
+        }
+    }
+    Ok(ids)
+}
+
 fn is_terminal_run_once_status(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "timeout" | "failed-terminal" | "canceled" | "skipped" | "dead-letter"
+        "completed"
+            | "timeout"
+            | "failed-terminal"
+            | "canceled"
+            | "skipped"
+            | "dead-letter"
+            | "suppressed"
     )
 }
 
@@ -2688,10 +3414,12 @@ mod tests {
     use crate::{
         ArtifactExtractionSummary, ChannelSessionState, ContextCompactAttemptOptions,
         ContextRolloverLane, InboundMediaArtifact, InboundMediaDownloadStatus,
-        InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant, RuntimeQueueEnqueueOptions,
-        TurnPlanInput, build_channel_step, build_source_skill_index, build_turn_plan,
-        channel_session_state_file, enqueue_channel_step, inbound_media_attachment_root,
-        read_channel_session_state, record_context_compact_attempt,
+        InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant, RuntimeQueueControlAction,
+        RuntimeQueueControlOptions, RuntimeQueueEnqueueOptions, ScopedStopOptions,
+        ScopedStopTarget, TurnPlanInput, build_channel_step, build_source_skill_index,
+        build_turn_plan, channel_session_state_file, control_runtime_queue_item,
+        enqueue_channel_step, inbound_media_attachment_root, read_channel_session_state,
+        record_context_compact_attempt, record_scoped_stop,
     };
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2893,6 +3621,7 @@ mod tests {
             RuntimeQueueEnqueueOptions {
                 harness_home: harness_home.clone(),
                 runtime_workspace: None,
+                inbound_canonical_id: None,
                 now_ms: 1234,
             },
         )
@@ -2979,6 +3708,7 @@ mod tests {
             RuntimeQueueEnqueueOptions {
                 harness_home: harness_home.clone(),
                 runtime_workspace: Some(drift_workspace.clone()),
+                inbound_canonical_id: None,
                 now_ms: 1234,
             },
         )
@@ -3421,6 +4151,372 @@ mod tests {
         );
         assert_eq!(report.receipt.queue_id.as_deref(), Some(cron_queue_id));
         assert_eq!(report.receipt.runtime_class.as_deref(), Some("cron"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn queue_skip_receipt_is_sticky_terminal_after_later_non_terminal_receipt() {
+        let root = temp_root("queue_skip_receipt_is_sticky_terminal");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_fixture_turn_with_text(&source, &harness_home, "stale duplicate turn", 1000);
+        let queue_dir = queue_dir(&harness_home);
+        let pending_text = fs::read_to_string(queue_dir.join("pending.jsonl")).unwrap();
+        let item: Value = serde_json::from_str(pending_text.lines().next().unwrap()).unwrap();
+        let queue_id = item["queueId"].as_str().unwrap().to_string();
+
+        append_json_line(
+            &queue_dir.join("run-once-receipts.jsonl"),
+            &serde_json::json!({
+                "queueId": queue_id,
+                "status": "skipped",
+                "reason": "operator skipped stale duplicate"
+            }),
+        )
+        .unwrap();
+        append_json_line(
+            &queue_dir.join("run-once-receipts.jsonl"),
+            &serde_json::json!({
+                "queueId": queue_id,
+                "status": "no-prepared-execution",
+                "reason": "late churn after operator skip"
+            }),
+        )
+        .unwrap();
+
+        let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+
+        assert!(report.item.is_none());
+        assert_eq!(
+            report.receipt.status,
+            RuntimeExecutionReceiptStatus::NoPendingItem
+        );
+        assert!(
+            report.receipt.reason.contains("terminal control")
+                || report.receipt.reason.contains("terminal run receipt"),
+            "{}",
+            report.receipt.reason
+        );
+        let leases = read_runtime_queue_leases(&queue_dir, "interactive", &mut Vec::new()).unwrap();
+        assert!(!leases.leases.contains_key(&queue_id));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn queue_skip_receipt_is_sticky_terminal() {
+        queue_skip_receipt_is_sticky_terminal_after_later_non_terminal_receipt();
+    }
+
+    #[test]
+    fn prepared_queue_skip_control_blocks_explicit_resume() {
+        let root = temp_root("prepared_queue_skip_control_blocks_explicit_resume");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_fixture_turn(&source, &harness_home);
+        let queue_dir = queue_dir(&harness_home);
+
+        let prepared = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        let queue_id = prepared.receipt.queue_id.clone().unwrap();
+        assert_eq!(
+            prepared.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+        release_runtime_queue_lease(&harness_home, &queue_id).unwrap();
+        append_json_line(
+            &queue_dir.join("control-receipts.jsonl"),
+            &serde_json::json!({
+                "schema": "agent-harness.runtime-queue-control.v1",
+                "action": "skip",
+                "status": "skipped",
+                "originalQueueId": queue_id,
+                "reason": "manual operator request"
+            }),
+        )
+        .unwrap();
+        append_json_line(
+            &queue_dir.join("run-once-receipts.jsonl"),
+            &serde_json::json!({
+                "queueId": queue_id,
+                "status": "no-prepared-execution",
+                "reason": "late no-prepared churn after skip"
+            }),
+        )
+        .unwrap();
+
+        let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+
+        assert!(report.item.is_none());
+        assert_eq!(
+            report.receipt.status,
+            RuntimeExecutionReceiptStatus::NoPendingItem
+        );
+        assert_eq!(report.receipt.terminal_control_matched, Some(true));
+        assert_eq!(
+            report.receipt.terminal_control_source.as_deref(),
+            Some(TerminalControlSource::QueueSkip.as_str())
+        );
+        let run_once_receipts =
+            fs::read_to_string(queue_dir.join("run-once-receipts.jsonl")).unwrap();
+        assert_eq!(
+            count_run_once_status(&run_once_receipts, &queue_id, "suppressed"),
+            1
+        );
+        let execution_receipts =
+            fs::read_to_string(queue_dir.join("execution-receipts.jsonl")).unwrap();
+        assert!(
+            !execution_receipts
+                .contains("runtime queue lease acquired for requested prepared item resume")
+        );
+        let leases = read_runtime_queue_leases(&queue_dir, "interactive", &mut Vec::new()).unwrap();
+        assert!(!leases.leases.contains_key(&queue_id));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scoped_stop_marker_blocks_selection_prepare_and_lease() {
+        let root = temp_root("scoped_stop_marker_blocks_selection_prepare_and_lease");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_fixture_turn_with_session(
+            &source,
+            &harness_home,
+            "telegram",
+            "dm-42",
+            "user-7",
+            "telegram:dm-42:user-7:main",
+            "stop this queued turn",
+            1000,
+        );
+        let queue_dir = queue_dir(&harness_home);
+        let pending_text = fs::read_to_string(queue_dir.join("pending.jsonl")).unwrap();
+        let item: Value = serde_json::from_str(pending_text.lines().next().unwrap()).unwrap();
+        let queue_id = item["queueId"].as_str().unwrap().to_string();
+        record_scoped_stop(ScopedStopOptions {
+            harness_home: harness_home.clone(),
+            target: ScopedStopTarget::QueueItem {
+                queue_id: queue_id.clone(),
+            },
+            reason: "operator stopped stale queued turn".to_string(),
+            now_ms: 1100,
+        })
+        .unwrap();
+
+        let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+
+        assert!(report.item.is_none());
+        assert_eq!(
+            report.receipt.status,
+            RuntimeExecutionReceiptStatus::NoPendingItem
+        );
+        assert!(report.receipt.reason.contains("terminal control"));
+        let leases = read_runtime_queue_leases(&queue_dir, "interactive", &mut Vec::new()).unwrap();
+        assert!(!leases.leases.contains_key(&queue_id));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn suppressed_receipt_emitted_at_most_once() {
+        let root = temp_root("suppressed_receipt_emitted_at_most_once");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_fixture_turn_with_text(&source, &harness_home, "stale duplicate turn", 1000);
+        let queue_dir = queue_dir(&harness_home);
+        let pending_text = fs::read_to_string(queue_dir.join("pending.jsonl")).unwrap();
+        let item: Value = serde_json::from_str(pending_text.lines().next().unwrap()).unwrap();
+        let queue_id = item["queueId"].as_str().unwrap().to_string();
+        record_scoped_stop(ScopedStopOptions {
+            harness_home: harness_home.clone(),
+            target: ScopedStopTarget::QueueItem {
+                queue_id: queue_id.clone(),
+            },
+            reason: "operator stopped stale queued turn".to_string(),
+            now_ms: 1100,
+        })
+        .unwrap();
+
+        for _ in 0..3 {
+            let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+                harness_home: harness_home.clone(),
+                queue_id: Some(queue_id.clone()),
+                prompt_options: PromptAssemblyOptions::default(),
+            })
+            .unwrap();
+            assert!(report.item.is_none());
+        }
+
+        let run_once_receipts =
+            fs::read_to_string(queue_dir.join("run-once-receipts.jsonl")).unwrap();
+        assert_eq!(
+            count_run_once_status(&run_once_receipts, &queue_id, "suppressed"),
+            1
+        );
+        assert!(run_once_receipts.contains(r#""terminalControlMatched":true"#));
+        assert!(
+            run_once_receipts.contains(r#""suppressedRunOnceReason":"terminal-control-present""#)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lease_reconcile_respects_terminal_controls() {
+        let root = temp_root("lease_reconcile_respects_terminal_controls");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_fixture_turn_with_text(&source, &harness_home, "stale leased turn", 1000);
+        let queue_dir = queue_dir(&harness_home);
+        let pending_text = fs::read_to_string(queue_dir.join("pending.jsonl")).unwrap();
+        let item: Value = serde_json::from_str(pending_text.lines().next().unwrap()).unwrap();
+        let queue_id = item["queueId"].as_str().unwrap().to_string();
+        let generation_id = "runtime-loop-supervised-terminal-control-test";
+        let now_ms = current_log_time_ms().unwrap();
+        let mut lease_state = RuntimeQueueLeaseState {
+            schema: runtime_queue_leases_schema(),
+            leases: BTreeMap::new(),
+        };
+        lease_state.leases.insert(
+            queue_id.clone(),
+            RuntimeQueueLease {
+                queue_id: queue_id.clone(),
+                agent_id: "main".to_string(),
+                runtime_class: "interactive".to_string(),
+                origin: "channel".to_string(),
+                cron_run_id: None,
+                platform: "telegram".to_string(),
+                account_id: None,
+                channel_id: "dm-42".to_string(),
+                user_id: Some("user-7".to_string()),
+                session_key: "telegram:dm-42:user-7:main".to_string(),
+                session_lane_key: None,
+                owner: RuntimeQueueLeaseOwner::Envelope(RuntimeQueueLeaseOwnerEnvelope {
+                    kind: "supervisor-child".to_string(),
+                    service_id: RUNTIME_LOOP_SERVICE_ID.to_string(),
+                    generation_id: generation_id.to_string(),
+                    pid: 12_345,
+                    process_start_time_ms: now_ms.saturating_sub(1_000),
+                    acquired_at_ms: now_ms,
+                }),
+                started_at_ms: now_ms,
+                lease_expires_at_ms: now_ms.saturating_add(60_000),
+            },
+        );
+        write_runtime_queue_leases(&queue_dir, "interactive", &lease_state).unwrap();
+        append_json_line(
+            &queue_dir.join("run-once-receipts.jsonl"),
+            &serde_json::json!({
+                "queueId": queue_id,
+                "status": "skipped",
+                "reason": "operator skipped stale leased turn"
+            }),
+        )
+        .unwrap();
+
+        let report = reconcile_runtime_queue_leases_for_generation(
+            &harness_home,
+            RUNTIME_LOOP_SERVICE_ID,
+            generation_id,
+            now_ms.saturating_add(10),
+        )
+        .unwrap();
+        assert_eq!(report.reaped_leases.len(), 1);
+
+        let prepare = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+
+        assert!(prepare.item.is_none());
+        assert_eq!(
+            prepare.receipt.status,
+            RuntimeExecutionReceiptStatus::NoPendingItem
+        );
+        assert!(prepare.receipt.reason.contains("terminal control"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn queue_retry_of_terminal_item_creates_fresh_runnable_id_only() {
+        let root = temp_root("queue_retry_of_terminal_item_creates_fresh_runnable_id_only");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_fixture_turn_with_text(&source, &harness_home, "retry stale turn", 1000);
+        let queue_dir = queue_dir(&harness_home);
+        let pending_text = fs::read_to_string(queue_dir.join("pending.jsonl")).unwrap();
+        let item: Value = serde_json::from_str(pending_text.lines().next().unwrap()).unwrap();
+        let original_queue_id = item["queueId"].as_str().unwrap().to_string();
+        control_runtime_queue_item(RuntimeQueueControlOptions {
+            harness_home: harness_home.clone(),
+            queue_id: original_queue_id.clone(),
+            action: RuntimeQueueControlAction::Skip,
+            reason: "operator confirmed original is stale".to_string(),
+            now_ms: 1100,
+        })
+        .unwrap();
+        let retry = control_runtime_queue_item(RuntimeQueueControlOptions {
+            harness_home: harness_home.clone(),
+            queue_id: original_queue_id.clone(),
+            action: RuntimeQueueControlAction::Retry,
+            reason: "operator requested fresh retry".to_string(),
+            now_ms: 1200,
+        })
+        .unwrap();
+        let retry_queue_id = retry.new_queue_id.unwrap();
+        append_json_line(
+            &queue_dir.join("run-once-receipts.jsonl"),
+            &serde_json::json!({
+                "queueId": original_queue_id,
+                "status": "no-prepared-execution",
+                "reason": "late churn after original skip"
+            }),
+        )
+        .unwrap();
+
+        let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+        assert_eq!(
+            report.receipt.queue_id.as_deref(),
+            Some(retry_queue_id.as_str())
+        );
+        assert_ne!(
+            report.receipt.queue_id.as_deref(),
+            Some(original_queue_id.as_str())
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4320,7 +5416,14 @@ mod tests {
             after_timeout.receipt.status,
             RuntimeExecutionReceiptStatus::NoPendingItem
         );
-        assert_eq!(after_timeout.receipt.queue_id, None);
+        assert_eq!(
+            after_timeout.receipt.queue_id.as_deref(),
+            Some(queue_id.as_str())
+        );
+        assert_eq!(
+            after_timeout.receipt.terminal_control_source.as_deref(),
+            Some("run-once-terminal")
+        );
 
         writeln!(
             run_once_file,
@@ -4345,7 +5448,11 @@ mod tests {
             RuntimeExecutionReceiptStatus::NoPendingItem
         );
         assert!(explicit.receipt.execution_dir.is_none());
-        assert!(explicit.receipt.reason.contains("terminal run receipt"));
+        assert!(explicit.receipt.reason.contains("terminal control"));
+        assert_eq!(
+            explicit.receipt.terminal_control_source.as_deref(),
+            Some("run-once-terminal")
+        );
 
         let after_terminal = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
             harness_home,
@@ -4462,6 +5569,7 @@ mod tests {
             RuntimeQueueEnqueueOptions {
                 harness_home: harness_home.to_path_buf(),
                 runtime_workspace: None,
+                inbound_canonical_id: None,
                 now_ms,
             },
         )
@@ -4635,5 +5743,16 @@ mod tests {
             "agent-harness-runtime-worker-{test_name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn count_run_once_status(receipts: &str, queue_id: &str, status: &str) -> usize {
+        receipts
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| {
+                value.get("queueId").and_then(Value::as_str) == Some(queue_id)
+                    && value.get("status").and_then(Value::as_str) == Some(status)
+            })
+            .count()
     }
 }

@@ -64,6 +64,7 @@
 
 - Do not stop, restart, or replace the live `.agent-harness` gateway unless the task explicitly calls for cutover or live operation.
 - Use staging target directories for tests and builds until the cutover step is intentionally reached.
+- For post-cutover or repair verification that needs provider-visible evidence (progress ordering, working indicator, final delivery on a real model turn), use the external controlled long-turn smoke procedure in `docs/.private/live-lane-smoke-verification-runbook.md` when it exists: it injects one turn through real channel ingress without stopping any live loop, and documents the required `channel-receive` form, pollution pitfalls, monitoring receipts, and pass criteria. It requires explicit operator approval because the smoke delivers real messages to the live lane.
 
 ## Post-Task Cleanup
 
@@ -80,8 +81,8 @@
 
 ## Sub-Agent Delegation Preference
 
-- When sub-agent tooling is available and the task is inside CK's authorized delegation envelope, use sub-agents by default to accelerate bounded sidecar tasks such as read-only codebase inspection, plan/diff review, documentation gap checks, and test matrix review, unless the user explicitly asks not to use sub-agents.
-- CK's authorized delegation envelope includes requests that explicitly mention sub-agents, delegation, parallel work, reviewer loops, smoke checks, long-running ops work, or workflows naturally split across bounded sidecar inspection/verification tasks. It excludes tiny single-answer replies, destructive/live-control operations, auth or permission changes, external posts/messages, purchases/trades/spend, and any task where CK explicitly says not to delegate.
+- When sub-agent tooling is available, use sub-agents by default for repo-development work unless CK explicitly says not to use sub-agents for the current task. Treat this as an opt-out default, not an opt-in feature.
+- The default sub-agent scope includes bounded sidecar work such as read-only codebase inspection, plan/diff review, documentation gap checks, test matrix review, smoke-check design, long-running ops inspection, and separable implementation tasks with disjoint file ownership. It still excludes tiny single-answer replies, destructive/live-control operations, auth or permission changes, external posts/messages, purchases/trades/spend, and any task where CK explicitly says not to delegate.
 - For implementation work that can be split into disjoint code ownership, prefer delegating bounded coding subtasks to `gpt-5.3-codex-spark` worker sub-agents, with `gpt-5.4-mini` as the fallback when Spark is unavailable, spawn is rejected, or a narrower retry is appropriate. Use Codex-authenticated worker lanes only; if provider/auth routing is not visible in the sub-agent receipt, record Codex-auth status as unverified rather than assuming it.
 - Every sub-agent assignment must have a bounded scope and an expected output. When waiting for a sub-agent, always use an explicit `timeout_ms` instead of an unbounded wait.
 - If a sub-agent wait times out, inspect whether the result is needed on the critical path. If it is not critical, continue locally; if it is critical, retry at most once with a shorter, clearer prompt and timeout.
