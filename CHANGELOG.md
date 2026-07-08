@@ -4,6 +4,21 @@
 
 No unreleased changes.
 
+## v0.6.1 - 2026-07-08
+
+### Documentation
+
+- Clarified release/hotfix public hygiene rules in `DOC-GUIDELINES.md`: public
+  tags must come from public-safe commits, live validation belongs in sanitized
+  changelog summaries, and raw cutover receipts or local scratch evidence must
+  stay under ignored private paths.
+
+### Verification
+
+- Docs-only hotfix; no runtime behavior changed.
+- Passed `git diff --check` and `agent-harness public-hygiene` against a
+  tracked-file public export with `forbiddenHits=[]` before push/tag.
+
 ## v0.6.0 - 2026-07-08
 
 ### Changed

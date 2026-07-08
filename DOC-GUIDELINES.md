@@ -49,6 +49,8 @@ The README is optimized for human skimming and for generative/search engines (GE
 - All tracked documents are public: they must pass `agent-harness public-hygiene`. Write everything as if it is already on GitHub — because it is.
 - `docs/.private/`, `tools/.private/`, `.debug/`, and `.external/` are local-only and ignored. Do not force-add from those paths unless the file has been deliberately promoted and sanitized into a public path.
 - Redact by default. Receipts-style summaries (names, lengths, statuses) are fine; raw values are not.
+- Release and hotfix tags must be cut from a public-safe commit. Summarize live validation in `CHANGELOG.md` with sanitized command names, status counts, and release-level outcomes; keep raw receipts, channel/user ids, machine-specific handoffs, and cutover scratch evidence in ignored private paths.
+- Before pushing or tagging a release/hotfix, run `git diff --check` and `agent-harness public-hygiene` against a tracked-file public export. Do not use a raw workspace root containing ignored private directories as proof of public hygiene.
 
 ## Formatting Conventions
 
