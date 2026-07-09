@@ -10,6 +10,8 @@ const BUILTIN_HARNESS_SKILL_SYNC_SCHEMA: &str = "agent-harness.builtin-skill-syn
 const BUILTIN_HARNESS_SKILL_MANIFEST_SCHEMA: &str = "agent-harness.builtin-skill-manifest.v1";
 const AGENT_WINDOWS_HARNESS_SKILL_ID: &str = "agent-windows-harness";
 const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.22";
+const SKILL_AUTHORING_STANDARD_SKILL_ID: &str = "skill-authoring-standard";
+const SKILL_AUTHORING_STANDARD_SKILL_VERSION: &str = "0.1.0";
 
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
@@ -307,6 +309,72 @@ When a task reveals a repeatable operation:
 5. Preserve user-modified skills unless explicitly forced.
 "#;
 
+const SKILL_AUTHORING_STANDARD_SKILL: &str = r#"---
+name: skill-authoring-standard
+description: Author, review, and maintain Agent Harness skills with proposal-mediated autonomous review/apply, lint, guard, lifecycle receipts, and reversible archives.
+version: 0.1.0
+platforms: [windows]
+metadata:
+  agent_harness:
+    category: skill-ecosystem
+    tags: [skills, authoring, autonomous-apply, lint, guard, lifecycle, packs, review]
+---
+
+# Skill Authoring Standard
+
+## When to Use
+
+Use this skill when creating, updating, reviewing, importing, exporting, archiving, restoring, or diagnosing Agent Harness skills.
+
+Use it when a turn involves:
+
+- `skill-synthesize`, `skill-apply`, `skill-lint`, `skill-guard`, `skill-curator-run`, `skill-pack-*`, `skill-restore`, `skill-pin`, `skill-view`, or `skill-doctor`
+- autonomous skill learning from a successful complex task
+- replacing stale procedures with a narrower skill
+- reviewing a skill proposal before apply
+- deciding whether a skill can be selected into a prompt
+
+## Authoring Rules
+
+1. Keep skills operational. A skill should tell the agent when to use it, what invariant it protects, and the concrete workflow to follow.
+2. Keep the frontmatter stable: `name`, `description`, `version`, and `metadata.agent_harness.category` should be present.
+3. Use specific tags that match likely task language. Tags are selection evidence, not decoration.
+4. Do not store secrets, raw transcripts, credentials, private channel ids, or one-off debug dumps.
+5. Prefer narrow replacement over broad append-only growth. Remove stale or contradictory guidance when the new version supersedes it.
+6. Include verification notes for risky procedures, especially live operations, autonomous apply, provider routing, memory, channel identity, or supervisor control.
+
+## Autonomous Review And Apply
+
+Autonomous review/apply is a first-class skill ecosystem path. The safe shape is not manual-only; the safe shape is a structured apply pipeline:
+
+1. Generate or receive a proposal with target path, expected checksum when replacing, body checksum, and source evidence.
+2. Run lint before apply. Block malformed frontmatter, missing identity, unsupported operation shape, or trigger collisions.
+3. Run guard before apply. Block dangerous instructions, credential capture, prompt-injection patterns, or unrelated control-plane changes.
+4. Approve, quarantine, or block through an explicit decision receipt.
+5. Apply approved changes through the same checksum and backup/archive path used by operator-approved changes.
+6. Record usage and apply receipts so later doctor/status checks can explain what happened.
+
+`--propose-only` is an operator escape hatch. It should not be treated as the default mode for this feature family.
+
+## Lifecycle Rules
+
+- Archive by move, not delete. Restores must be possible from the archive path.
+- Pinning protects active skills from curator archiving.
+- Pack imports must write lock/provenance receipts and should be removable as a unit.
+- Agent-created skills remain subject to the same lint, guard, doctor, and selection checks as bundled skills.
+
+## Review Checklist
+
+Before considering a skill change complete:
+
+1. The skill indexes with the expected id, source kind, category, and tags.
+2. A relevant query selects the skill without requiring exact title matching.
+3. Lint and guard pass, or failures are intentionally recorded and not applied.
+4. Autonomous apply receipts show approved/applied for default synthesis, or blocked/quarantined for unsafe proposals.
+5. `skill-doctor --json` reports the ecosystem status expected for the staging home.
+6. Public docs and schema registry describe the behavior without implying manual-only mutation.
+"#;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuiltinHarnessSkillSyncOptions {
     pub harness_home: PathBuf,
@@ -374,20 +442,35 @@ pub fn sync_builtin_harness_skills(
     let mut receipts = Vec::new();
     let mut summary = BuiltinHarnessSkillSyncSummary::default();
 
-    let receipt = sync_one_builtin_skill(
-        &options.harness_home,
-        options.force,
-        &mut manifest,
-        AGENT_WINDOWS_HARNESS_SKILL_ID,
-        AGENT_WINDOWS_HARNESS_SKILL_VERSION,
-        AGENT_WINDOWS_HARNESS_SKILL,
-    )?;
-    match receipt.status {
-        BuiltinHarnessSkillSyncStatus::Written => summary.written += 1,
-        BuiltinHarnessSkillSyncStatus::AlreadyCurrent => summary.already_current += 1,
-        BuiltinHarnessSkillSyncStatus::SkippedUserModified => summary.skipped_user_modified += 1,
+    for (skill_id, version, content) in [
+        (
+            AGENT_WINDOWS_HARNESS_SKILL_ID,
+            AGENT_WINDOWS_HARNESS_SKILL_VERSION,
+            AGENT_WINDOWS_HARNESS_SKILL,
+        ),
+        (
+            SKILL_AUTHORING_STANDARD_SKILL_ID,
+            SKILL_AUTHORING_STANDARD_SKILL_VERSION,
+            SKILL_AUTHORING_STANDARD_SKILL,
+        ),
+    ] {
+        let receipt = sync_one_builtin_skill(
+            &options.harness_home,
+            options.force,
+            &mut manifest,
+            skill_id,
+            version,
+            content,
+        )?;
+        match receipt.status {
+            BuiltinHarnessSkillSyncStatus::Written => summary.written += 1,
+            BuiltinHarnessSkillSyncStatus::AlreadyCurrent => summary.already_current += 1,
+            BuiltinHarnessSkillSyncStatus::SkippedUserModified => {
+                summary.skipped_user_modified += 1
+            }
+        }
+        receipts.push(receipt);
     }
-    receipts.push(receipt);
 
     write_manifest(&manifest_file, &manifest)?;
 
@@ -554,7 +637,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(report.summary.written, 1);
+        assert_eq!(report.summary.written, 2);
         assert!(report.manifest_file.is_file());
         assert!(
             harness_home
@@ -564,13 +647,21 @@ mod tests {
                 .join(SKILL_FILE_NAME)
                 .is_file()
         );
+        assert!(
+            harness_home
+                .join("skills")
+                .join(HARNESS_BUILTIN_SKILL_NAMESPACE)
+                .join(SKILL_AUTHORING_STANDARD_SKILL_ID)
+                .join(SKILL_FILE_NAME)
+                .is_file()
+        );
 
         let second = sync_builtin_harness_skills(BuiltinHarnessSkillSyncOptions {
             harness_home,
             force: false,
         })
         .unwrap();
-        assert_eq!(second.summary.already_current, 1);
+        assert_eq!(second.summary.already_current, 2);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -593,6 +684,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(skipped.summary.skipped_user_modified, 1);
+        assert_eq!(skipped.summary.already_current, 1);
         assert_eq!(
             fs::read_to_string(&skill_file).unwrap(),
             "# User Modified\n"
@@ -604,6 +696,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(forced.summary.written, 1);
+        assert_eq!(forced.summary.already_current, 1);
         assert!(
             fs::read_to_string(skill_file)
                 .unwrap()

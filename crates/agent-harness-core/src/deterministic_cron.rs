@@ -139,7 +139,7 @@ pub fn load_deterministic_cron_store(source: &AgentSource) -> io::Result<Determi
     ] {
         runners.push(load_runner(
             kind,
-            source.workspace.join("tools").join(relative),
+            deterministic_runner_root(source, relative),
             &mut warnings,
         )?);
     }
@@ -165,6 +165,21 @@ pub fn load_deterministic_cron_store(source: &AgentSource) -> io::Result<Determi
         entries,
         warnings,
     })
+}
+
+fn deterministic_runner_root(source: &AgentSource, relative: &str) -> PathBuf {
+    let primary = source.workspace.join("tools").join(relative);
+    if primary.exists() {
+        return primary;
+    }
+
+    let harness_workspace = source.home.join("workspace");
+    let fallback = harness_workspace.join("tools").join(relative);
+    if fallback != primary && fallback.exists() {
+        return fallback;
+    }
+
+    primary
 }
 
 pub fn plan_deterministic_cron(
@@ -589,6 +604,50 @@ mod tests {
                 entry.command == "jobs/rotate.ps1"
                     && matches!(entry.schedule, DeterministicCronSchedule::Macro { ref name } if name == "@daily")
             })
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_store_falls_back_to_harness_workspace_runner() {
+        let root = temp_root("load_store_falls_back_to_harness_workspace_runner");
+        let home = root.join(".agent-harness");
+        let workspace = home.join("workspace");
+        let expected_runner = workspace.join("tools").join("cron-runner");
+        fs::create_dir_all(expected_runner.join("crontab")).unwrap();
+        fs::create_dir_all(expected_runner.join("jobs")).unwrap();
+        fs::write(
+            expected_runner.join("crontab").join("openclaw-mem.crontab"),
+            "30 1 * * * powershell -NoProfile -File jobs/backup.ps1\n",
+        )
+        .unwrap();
+        fs::write(
+            expected_runner.join("jobs").join("backup.ps1"),
+            "Write-Output ok\n",
+        )
+        .unwrap();
+        let source = AgentSource::with_workspace(&home, root.join("repo-root"));
+
+        let store = load_deterministic_cron_store(&source).unwrap();
+
+        assert_eq!(store.summary.runners_found, 1);
+        assert_eq!(store.summary.crontab_files, 1);
+        assert_eq!(store.summary.entries, 1);
+        assert!(
+            store
+                .runners
+                .iter()
+                .any(|runner| runner.root == expected_runner)
+        );
+        assert!(store.entries.iter().any(|entry| {
+            entry.crontab_file == expected_runner.join("crontab").join("openclaw-mem.crontab")
+        }));
+        assert!(
+            store
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("backup-cron-runner"))
         );
 
         let _ = fs::remove_dir_all(root);

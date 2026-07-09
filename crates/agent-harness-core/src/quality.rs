@@ -152,6 +152,11 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
             statement: "a verification command interrupted by a newer same-lane turn records structured interruption evidence and resume guidance instead of being reported as a failed test",
             owner: "codex_runtime/runtime_pipeline/virtual_session_context/prompt",
         },
+        InvariantEntry {
+            id: "I20",
+            statement: "skill ecosystem mutation is proposal-mediated but autonomous review/apply is a first-class path; lint/guard gates run before prompt exposure or apply, archive is reversible move-not-delete, and selection/view/apply decisions leave receipts",
+            owner: "skills/skill_apply/skill_guard/skill_lint/skill_curator/prompt",
+        },
     ]
 }
 
@@ -453,6 +458,21 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "append-only receipts; idempotency keys and action names remain stable in v1",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.builtin-skill-sync.v1",
+            owner_module: "harness_skills",
+            compatibility: "builtin skill sync receipts are additive; user-modified skills remain protected unless forced",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.builtin-skill-manifest.v1",
+            owner_module: "harness_skills",
+            compatibility: "manifest entries keep skill id, path, version, and fingerprint stable in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-index.v1",
+            owner_module: "skills",
+            compatibility: "index output may add summary facets in v1; skill ids, source kinds, paths, checksums, and frontmatter fields remain stable",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.skill-invocation-envelope.v1",
             owner_module: "skill_envelope",
             compatibility: "byte-framed envelope; declared length/checksum fields are stable in v1",
@@ -460,7 +480,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.skill-selection.v1",
             owner_module: "skills",
-            compatibility: "append-only selection receipts; matcher metadata and score components may add fields in v1",
+            compatibility: "append-only selection receipts; matcherVersion=v3/tokenizer=mixed-v1 and additive skill catalog fields remain v1-compatible",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.prompt-injection-ledger.v2",
@@ -475,17 +495,77 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.skill-usage-snapshot.v1",
             owner_module: "skill_usage",
-            compatibility: "derived compact status artifact; rebuildable from skill-usage JSONL",
+            compatibility: "derived compact status artifact; additive by-skill action counters are rebuildable from skill-usage JSONL",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-lint-receipt.v1",
+            owner_module: "skill_lint",
+            compatibility: "append-only lint receipts; finding codes and severities are additive in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-guard-receipt.v1",
+            owner_module: "skill_guard",
+            compatibility: "append-only guard receipts; verdict semantics safe/caution/dangerous remain stable in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-lifecycle.v1",
+            owner_module: "skill_curator",
+            compatibility: "state JSON may add lifecycle metadata in v1; archive remains restorable move semantics",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-curator.v1",
+            owner_module: "skill_curator",
+            compatibility: "per-run reports are additive; dry-run must not mutate skill files",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-restore.v1",
+            owner_module: "skill_curator",
+            compatibility: "restore receipts are additive; archive source and restored target paths remain stable in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-pin.v1",
+            owner_module: "skill_curator",
+            compatibility: "pin receipts are additive; pinned/unpinned lifecycle protection remains stable in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-pack.v1",
+            owner_module: "skill_pack",
+            compatibility: "pack manifest is checksum-guarded; additive manifest fields allowed in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-pack-lock.v1",
+            owner_module: "skill_pack",
+            compatibility: "lockfile may add metadata in v1; installed path checksum entries remain stable",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-pack-receipt.v1",
+            owner_module: "skill_pack",
+            compatibility: "import/export/remove receipts are additive; installed path and checksum evidence remains stable in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-synthesis-receipt.v1",
+            owner_module: "skill_synthesis",
+            compatibility: "append-only synthesis receipts; proposal ids and target paths are stable evidence anchors",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-autonomous-apply-receipt.v1",
+            owner_module: "skill_apply",
+            compatibility: "append-only autonomous review receipts; approve, quarantine, and blocked decisions are stable in v1",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.skill-proposal.v1",
             owner_module: "skill_learning",
-            compatibility: "append-only proposal state records; apply requires checksum match and explicit operator action",
+            compatibility: "append-only proposal state records; apply requires checksum match and operator-approved or autonomously reviewed action",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.skill-apply-receipt.v1",
             owner_module: "skill_apply",
             compatibility: "append-only apply receipts; stale-base quarantine semantics are stable in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-doctor.v1",
+            owner_module: "skill_doctor",
+            compatibility: "aggregate health reports are additive in v1; non-receipt read-only runs preserve report shape",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.learning-review.v1",
@@ -1003,6 +1083,7 @@ pub fn release_checklist() -> ReleaseChecklist {
             "scenario matrix gate reviewed for changed components",
             "CHANGELOG.md updated",
             "docs/skills/help stale guidance review completed",
+            "skill ecosystem changes passed selection, autonomous synthesis/apply, lint, guard, lifecycle, pack, doctor, and closed-loop scenario gates",
             "topology contract impact matrix reviewed for changed modules",
             "channel/runtime changes passed the agent-boundary scenario matrix",
             "runtime terminal-control changes passed sticky terminal, suppression idempotency, final progress surface silence, lease reconcile, prepared-terminalization, retry-fresh-id, and live ghost-queue replay checks",

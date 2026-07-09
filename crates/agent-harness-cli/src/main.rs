@@ -74,68 +74,77 @@ use agent_harness_core::{
     RuntimeQueueControlOptions, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
     RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeRunOnceOptions,
     RuntimeRunOnceReport, RuntimeRunOnceStatus, ScopedStopOptions, ScopedStopTarget,
-    SecurityScanOptions, SkillApplyOptions, SkillArchiveOptions, SkillIndex,
+    SecurityScanOptions, SkillApplyOptions, SkillArchiveOptions, SkillAutonomousApplyOptions,
+    SkillDoctorOptions, SkillDoctorStatus, SkillGuardOptions, SkillIndex,
     SkillLearningProposalOperation, SkillLearningProposalStatus, SkillLearningSignal,
-    SkillProposalActionOptions, SkillProposalListOptions, SkillProposeOptions, SkillSelectionQuery,
-    SubagentLifecycleCloseOptions, SubagentLifecycleRecordOptions, SubagentLifecycleShowOptions,
-    SubagentLifecycleShowReport, SubagentLifecycleState, SubagentPlan, SubagentPlanInput,
-    SubagentWorkerEnqueueOptions, SuperviseDeployCanaryOptions, SupervisionEvaluateOptions,
-    SupervisorChildState, SupervisorInventoryOptions, SupervisorInventoryServiceConfig,
-    SupervisorLaunchCommand, TaskEntityOptions, TaskStatus, TokenEfficiencyOptions, TraceOptions,
-    TurnPlan, TurnPlanInput, VaultGetOptions, VaultPutOptions, VirtualSessionContextQuery,
-    VirtualSessionWorkingContext, WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport,
-    WorkerCancelOptions, WorkerEnqueueOptions, WorkerEnqueueReport, WorkerJobKind,
-    WorkerReapStaleOptions, WorkerRunOnceOptions, WorkerRunOnceReport, WorkerRunOnceStatus,
-    WorkerStatusOptions, acquire_budget, add_operation_plan_item, append_harness_log,
-    append_jsonl_value, apply_channel_command_step, apply_skill_proposal, assemble_prompt_bundle,
-    block_operation_plan, build_channel_step, build_dry_run_report, build_harness_skill_index,
-    build_import_plan, build_runtime_skill_index, build_source_skill_index, build_turn_plan,
-    cancel_worker_job, check_activation_readiness, check_config_drift, check_tool_description_pin,
-    collect_gateway_restart_status, collect_harness_metrics, collect_harness_status,
-    collect_healthz, collect_inbound_media_cache_report, collect_ops_cutover_status,
-    collect_token_efficiency, collect_worker_status, comment_on_operation_plan,
-    compare_channel_turn_shadow, complete_operation_plan, control_cron_run,
-    control_runtime_queue_item, create_learning_proposal, create_operation_plan, create_ops_backup,
+    SkillLifecycleCuratorOptions, SkillLifecycleCuratorReport, SkillLintOptions,
+    SkillPackConflictPolicy, SkillPackExportOptions, SkillPackImportOptions,
+    SkillPackRemoveOptions, SkillPinOptions, SkillProposalActionOptions, SkillProposalListOptions,
+    SkillProposeOptions, SkillRestoreOptions, SkillSelectionQuery, SkillSynthesisOptions,
+    SkillViewOptions, SubagentLifecycleCloseOptions, SubagentLifecycleRecordOptions,
+    SubagentLifecycleShowOptions, SubagentLifecycleShowReport, SubagentLifecycleState,
+    SubagentPlan, SubagentPlanInput, SubagentWorkerEnqueueOptions, SuperviseDeployCanaryOptions,
+    SupervisionEvaluateOptions, SupervisorChildState, SupervisorInventoryOptions,
+    SupervisorInventoryServiceConfig, SupervisorLaunchCommand, TaskEntityOptions, TaskStatus,
+    TokenEfficiencyOptions, TraceOptions, TurnPlan, TurnPlanInput, VaultGetOptions,
+    VaultPutOptions, VirtualSessionContextQuery, VirtualSessionWorkingContext,
+    WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport, WorkerCancelOptions,
+    WorkerEnqueueOptions, WorkerEnqueueReport, WorkerJobKind, WorkerReapStaleOptions,
+    WorkerRunOnceOptions, WorkerRunOnceReport, WorkerRunOnceStatus, WorkerStatusOptions,
+    acquire_budget, add_operation_plan_item, append_harness_log, append_jsonl_value,
+    apply_channel_command_step, apply_skill_proposal, assemble_prompt_bundle,
+    autonomous_apply_skill_proposal, block_operation_plan, build_channel_step,
+    build_dry_run_report, build_harness_skill_index, build_import_plan, build_runtime_skill_index,
+    build_source_skill_index, build_turn_plan, cancel_worker_job, check_activation_readiness,
+    check_config_drift, check_tool_description_pin, collect_gateway_restart_status,
+    collect_harness_metrics, collect_harness_status, collect_healthz,
+    collect_inbound_media_cache_report, collect_ops_cutover_status, collect_token_efficiency,
+    collect_worker_status, comment_on_operation_plan, compare_channel_turn_shadow,
+    complete_operation_plan, control_cron_run, control_runtime_queue_item,
+    create_learning_proposal, create_operation_plan, create_ops_backup,
     create_skill_archive_proposal, create_skill_learning_proposal, current_log_time_ms,
     default_supervisor_child_specs, delegate_operation_plan_item, enqueue_channel_step,
     enqueue_deterministic_cron_workers, enqueue_native_cron_workers, enqueue_subagent_workers,
     enqueue_worker_job, ensure_memory_owner_state, evaluate_admission, evaluate_prompt_reduction,
     evaluate_supervisor_children, execute_import, export_harness_registry_files,
-    export_memory_credentials, get_vault_secret, handle_mcp_request, inspect_openclaw_mem_service,
-    inspect_runtime_queue_capacity, invariant_catalog, inventory,
-    latest_agent_progress_event_line_for_queue, lint_cron_scheduler, list_background_tasks,
-    list_cron_runs, list_operation_plans, list_skill_proposals, load_agent_registry,
-    load_deterministic_cron_store, load_native_cron_store, load_subagent_ledger,
-    parse_channel_command, parse_context_pack, plan_agent_progress_delivery, plan_channel_outbox,
-    plan_codex_runtime, plan_deterministic_cron, plan_native_cron, plan_subagents,
-    preflight_codex_runtime, prepare_openclaw_mem_local_owner, prepare_runtime_queue_item,
-    probe_codex_runtime_launch, promote_operation_plan_items_from_dependencies,
-    propose_openclaw_mem_service_memory, put_vault_secret, reap_stale_worker_jobs,
-    recall_openclaw_mem_service, receive_channel_message, reconcile_supervisor_inventory,
-    record_agent_progress_delivery_with_context, record_channel_delivery,
-    record_channel_turn_shadow, record_codex_runtime_completion,
+    export_memory_credentials, export_skill_pack, get_vault_secret, handle_mcp_request,
+    import_skill_pack, inspect_openclaw_mem_service, inspect_runtime_queue_capacity,
+    invariant_catalog, inventory, latest_agent_progress_event_line_for_queue, lint_cron_scheduler,
+    lint_skill_file, list_background_tasks, list_cron_runs, list_operation_plans,
+    list_skill_proposals, load_agent_registry, load_deterministic_cron_store,
+    load_native_cron_store, load_subagent_ledger, parse_channel_command, parse_context_pack,
+    plan_agent_progress_delivery, plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron,
+    plan_native_cron, plan_subagents, preflight_codex_runtime, prepare_openclaw_mem_local_owner,
+    prepare_runtime_queue_item, probe_codex_runtime_launch,
+    promote_operation_plan_items_from_dependencies, propose_openclaw_mem_service_memory,
+    put_vault_secret, reap_stale_worker_jobs, recall_openclaw_mem_service, receive_channel_message,
+    reconcile_supervisor_inventory, record_agent_progress_delivery_with_context,
+    record_channel_delivery, record_channel_turn_shadow, record_codex_runtime_completion,
     record_memory_owner_endpoint_probe, record_memory_owner_heartbeat,
     record_memory_owner_shadow_receipt, record_memory_owner_trust_scope_receipt,
     record_ops_control, record_ops_cutover_apply, record_ops_cutover_approval,
     record_ops_cutover_receipt, record_ops_cutover_request, record_scoped_stop,
     record_subagent_lifecycle, record_supervise_deploy_canary, recover_memory_owner_state,
     reject_skill_proposal, release_agent_progress_surface_claim, release_checklist,
-    render_rich_presentation_batch_for_discord, render_rich_presentation_batch_for_telegram,
-    request_memory_owner_promotion, requeue_prepared_context_rollover, resolve_channel_identity,
-    resolve_virtual_session_working_context, rotate_harness_log_if_needed, run_channel_once,
-    run_codex_runtime, run_cron_scheduler_once, run_dream_director_send, run_memory_canvas_worker,
-    run_memory_embedding_backfill, run_memory_hook_adapter, run_openclaw_mem_read_path_smoke,
-    run_public_hygiene, run_runtime_queue_once, run_worker_once,
-    runtime_worker::reconcile_runtime_queue_leases_for_generation, scan_security_boundaries,
-    scenario_matrix_catalog, schema_registry_entries, search_imported_memory,
-    search_imported_vector_memory, select_skills, show_operation_plan, show_subagent_lifecycle,
+    remove_skill_pack, render_rich_presentation_batch_for_discord,
+    render_rich_presentation_batch_for_telegram, request_memory_owner_promotion,
+    requeue_prepared_context_rollover, resolve_channel_identity,
+    resolve_virtual_session_working_context, restore_skill_from_archive,
+    rotate_harness_log_if_needed, run_channel_once, run_codex_runtime, run_cron_scheduler_once,
+    run_dream_director_send, run_memory_canvas_worker, run_memory_embedding_backfill,
+    run_memory_hook_adapter, run_openclaw_mem_read_path_smoke, run_public_hygiene,
+    run_runtime_queue_once, run_skill_doctor, run_skill_guard, run_skill_lifecycle_curator,
+    run_worker_once, runtime_worker::reconcile_runtime_queue_leases_for_generation,
+    scan_security_boundaries, scenario_matrix_catalog, schema_registry_entries,
+    search_imported_memory, search_imported_vector_memory, select_skills, set_skill_pin,
+    show_operation_plan, show_subagent_lifecycle, skill_curator_receipts_dir,
     store_openclaw_mem_service_memory, subagent_lifecycle_receipts_file,
-    subagent_lifecycle_snapshot_file, sync_builtin_harness_skills, tool_description_hash,
-    trace_harness_event, update_operation_plan_item, upsert_background_task,
-    validate_harness_config, write_channel_step, write_deterministic_cron_plan, write_json_atomic,
-    write_memory_search_receipt, write_memory_vector_recall_receipt, write_native_cron_plan,
-    write_prompt_bundle, write_report_files, write_skill_index, write_subagent_plan,
-    write_task_entity, write_turn_plan, write_windows_supervisor_plan,
+    subagent_lifecycle_snapshot_file, sync_builtin_harness_skills, synthesize_skill,
+    tool_description_hash, trace_harness_event, update_operation_plan_item, upsert_background_task,
+    validate_harness_config, view_skill, write_channel_step, write_deterministic_cron_plan,
+    write_json_atomic, write_memory_search_receipt, write_memory_vector_recall_receipt,
+    write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
+    write_subagent_plan, write_task_entity, write_turn_plan, write_windows_supervisor_plan,
 };
 
 const DEFAULT_CODEX_TIMEOUT_MS: u64 = 30 * 60 * 1000;
@@ -230,6 +239,17 @@ fn main() {
         "supervisor-plan" => run_supervisor_plan(&rest),
         "harness-skills-sync" => run_harness_skills_sync(&rest),
         "skills" => run_skills(&rest),
+        "skill-view" => run_skill_view(&rest),
+        "skill-synthesize" => run_skill_synthesize(&rest),
+        "skill-doctor" => run_skill_doctor_cli(&rest),
+        "skill-lint" => run_skill_lint(&rest),
+        "skill-guard" => run_skill_guard_cli(&rest),
+        "skill-curator-run" => run_skill_curator_run(&rest),
+        "skill-restore" => run_skill_restore(&rest),
+        "skill-pin" => run_skill_pin(&rest),
+        "skill-pack-export" => run_skill_pack_export(&rest),
+        "skill-pack-import" => run_skill_pack_import(&rest),
+        "skill-pack-remove" => run_skill_pack_remove(&rest),
         "skill-propose" => run_skill_propose(&rest),
         "skill-proposals" => run_skill_proposals(&rest),
         "skill-apply" => run_skill_apply(&rest),
@@ -2294,8 +2314,10 @@ fn run_skills(args: &[String]) -> Result<(), String> {
                 agent_mode: None,
                 available_tools: Vec::new(),
                 available_toolsets: Vec::new(),
-                fts_enabled: false,
+                fts_enabled: true,
                 vector_tie_break_enabled: false,
+                usage_snapshot: None,
+                usage_prior_enabled: false,
                 limit: args.limit,
             },
         );
@@ -2318,6 +2340,592 @@ fn run_skills(args: &[String]) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+fn run_skill_view(args: &[String]) -> Result<(), String> {
+    let mut harness_home = PathBuf::from(".agent-harness");
+    let mut skill_id: Option<String> = None;
+    let mut file: Option<PathBuf> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--harness-home" | "--target-home" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("--harness-home requires a path".to_string());
+                };
+                harness_home = PathBuf::from(value);
+            }
+            "--skill" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("--skill requires an id".to_string());
+                };
+                skill_id = Some(value.clone());
+            }
+            "--file" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("--file requires a relative path".to_string());
+                };
+                file = Some(PathBuf::from(value));
+            }
+            "--help" | "-h" => {
+                println!(
+                    "Usage: agent-harness skill-view --skill <id> [--file <relative>] [--harness-home <path>]"
+                );
+                return Ok(());
+            }
+            value if !value.starts_with('-') && skill_id.is_none() => {
+                skill_id = Some(value.to_string());
+            }
+            other => return Err(format!("unknown skill-view argument `{other}`")),
+        }
+        index += 1;
+    }
+    let Some(skill_id) = skill_id else {
+        return Err("skill-view requires --skill <id>".to_string());
+    };
+    let report = view_skill(SkillViewOptions {
+        harness_home,
+        skill_id,
+        file,
+        now_ms: current_log_time_ms().unwrap_or(0),
+    })
+    .map_err(|err| err.to_string())?;
+    println!("{}", report.content);
+    Ok(())
+}
+
+fn run_skill_synthesize(args: &[String]) -> Result<(), String> {
+    let mut harness_home = PathBuf::from(".agent-harness");
+    let mut skill_id: Option<String> = None;
+    let mut task_summary: Option<String> = None;
+    let mut evidence = String::new();
+    let mut propose_only = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--harness-home" | "--target-home" => {
+                index += 1;
+                harness_home = PathBuf::from(required_arg(args, index, "--harness-home")?);
+            }
+            "--skill" | "--skill-id" => {
+                index += 1;
+                skill_id = Some(required_arg(args, index, "--skill")?.to_string());
+            }
+            "--summary" | "--task-summary" => {
+                index += 1;
+                task_summary = Some(required_arg(args, index, "--summary")?.to_string());
+            }
+            "--evidence" => {
+                index += 1;
+                evidence = required_arg(args, index, "--evidence")?.to_string();
+            }
+            "--evidence-file" => {
+                index += 1;
+                evidence = fs::read_to_string(required_arg(args, index, "--evidence-file")?)
+                    .map_err(|err| err.to_string())?;
+            }
+            "--propose-only" => {
+                propose_only = true;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "Usage: agent-harness skill-synthesize --skill <id> --summary <text> [--evidence <text>|--evidence-file <path>] [--propose-only] [--harness-home <path>]"
+                );
+                return Ok(());
+            }
+            other => return Err(format!("unknown skill-synthesize arg: {other}")),
+        }
+        index += 1;
+    }
+    let report = synthesize_skill(SkillSynthesisOptions {
+        harness_home,
+        skill_id: skill_id.ok_or_else(|| "--skill is required".to_string())?,
+        task_summary: task_summary.ok_or_else(|| "--summary is required".to_string())?,
+        evidence,
+        propose_only,
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+    })
+    .map_err(|err| err.to_string())?;
+    println!("Skill synthesis proposal: {}", report.proposal.proposal_id);
+    println!("Target: {}", report.target_path.display());
+    if let Some(apply) = report.autonomous_apply {
+        println!("Autonomous review: {:?}", apply.decision);
+        println!("Skill apply: {}", apply.apply_report.status.as_str());
+    } else {
+        println!("Skill apply: propose-only");
+    }
+    Ok(())
+}
+
+fn run_skill_doctor_cli(args: &[String]) -> Result<(), String> {
+    let mut harness_home = PathBuf::from(".agent-harness");
+    let mut write_receipt = true;
+    let mut json = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--harness-home" | "--target-home" => {
+                index += 1;
+                harness_home = PathBuf::from(required_arg(args, index, "--harness-home")?);
+            }
+            "--no-receipt" => write_receipt = false,
+            "--json" => json = true,
+            "--help" | "-h" => {
+                println!(
+                    "Usage: agent-harness skill-doctor [--harness-home <path>] [--json] [--no-receipt]"
+                );
+                return Ok(());
+            }
+            other => return Err(format!("unknown skill-doctor arg: {other}")),
+        }
+        index += 1;
+    }
+    let report = run_skill_doctor(SkillDoctorOptions {
+        harness_home,
+        write_receipt,
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+    })
+    .map_err(|err| err.to_string())?;
+    if json {
+        print_json(&report)?;
+    } else {
+        println!("Skill doctor: {:?}", report.status);
+        println!("Skills: {}", report.summary.total_skills);
+        println!("Agent-created: {}", report.summary.agent_created_skills);
+        println!("Packs: {}", report.summary.pack_skills);
+        println!("Lint errors: {}", report.summary.lint_errors);
+        println!("Guard dangerous: {}", report.summary.guard_dangerous);
+        println!("Findings: {}", report.findings.len());
+        println!("Receipts: {}", report.receipts_file.display());
+    }
+    if report.status == SkillDoctorStatus::Error {
+        Err("skill-doctor found blocking skill ecosystem errors".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn run_skill_lint(args: &[String]) -> Result<(), String> {
+    let mut harness_home = PathBuf::from(".agent-harness");
+    let mut target_path: Option<PathBuf> = None;
+    let mut skill_id: Option<String> = None;
+    let mut body: Option<String> = None;
+    let mut support_file_paths = Vec::new();
+    let mut scan_trigger_collisions = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--harness-home" | "--target-home" => {
+                index += 1;
+                harness_home = PathBuf::from(required_arg(args, index, "--harness-home")?);
+            }
+            "--target-path" | "--file" => {
+                index += 1;
+                target_path = Some(PathBuf::from(required_arg(args, index, "--target-path")?));
+            }
+            "--skill" => {
+                index += 1;
+                skill_id = Some(required_arg(args, index, "--skill")?.to_string());
+            }
+            "--body" => {
+                index += 1;
+                body = Some(required_arg(args, index, "--body")?.to_string());
+            }
+            "--body-file" => {
+                index += 1;
+                body = Some(
+                    fs::read_to_string(required_arg(args, index, "--body-file")?)
+                        .map_err(|err| err.to_string())?,
+                );
+            }
+            "--support-file" => {
+                index += 1;
+                support_file_paths.push(PathBuf::from(required_arg(
+                    args,
+                    index,
+                    "--support-file",
+                )?));
+            }
+            "--scan-trigger-collisions" => scan_trigger_collisions = true,
+            other => return Err(format!("unknown skill-lint arg: {other}")),
+        }
+        index += 1;
+    }
+    let report = lint_skill_file(SkillLintOptions {
+        harness_home,
+        target_path: target_path.ok_or_else(|| "--target-path is required".to_string())?,
+        target_skill_id: skill_id,
+        replacement_body: body,
+        support_file_paths,
+        scan_trigger_collisions,
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+    })
+    .map_err(|err| err.to_string())?;
+    println!("Skill lint: {:?}", report.status);
+    println!("Findings: {}", report.summary.findings);
+    println!("Receipts: {}", report.receipts_file.display());
+    Ok(())
+}
+
+fn run_skill_guard_cli(args: &[String]) -> Result<(), String> {
+    let mut harness_home = PathBuf::from(".agent-harness");
+    let mut target_path: Option<PathBuf> = None;
+    let mut skill_id: Option<String> = None;
+    let mut body: Option<String> = None;
+    let mut support_file_paths = Vec::new();
+    let mut trusted = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--harness-home" | "--target-home" => {
+                index += 1;
+                harness_home = PathBuf::from(required_arg(args, index, "--harness-home")?);
+            }
+            "--target-path" | "--file" => {
+                index += 1;
+                target_path = Some(PathBuf::from(required_arg(args, index, "--target-path")?));
+            }
+            "--skill" => {
+                index += 1;
+                skill_id = Some(required_arg(args, index, "--skill")?.to_string());
+            }
+            "--body" => {
+                index += 1;
+                body = Some(required_arg(args, index, "--body")?.to_string());
+            }
+            "--body-file" => {
+                index += 1;
+                body = Some(
+                    fs::read_to_string(required_arg(args, index, "--body-file")?)
+                        .map_err(|err| err.to_string())?,
+                );
+            }
+            "--support-file" => {
+                index += 1;
+                support_file_paths.push(PathBuf::from(required_arg(
+                    args,
+                    index,
+                    "--support-file",
+                )?));
+            }
+            "--trusted" => trusted = true,
+            other => return Err(format!("unknown skill-guard arg: {other}")),
+        }
+        index += 1;
+    }
+    let report = run_skill_guard(SkillGuardOptions {
+        harness_home,
+        target_skill_id: skill_id.ok_or_else(|| "--skill is required".to_string())?,
+        target_path: target_path.ok_or_else(|| "--target-path is required".to_string())?,
+        body,
+        support_file_paths,
+        trusted,
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+    })
+    .map_err(|err| err.to_string())?;
+    println!("Skill guard: {:?}", report.verdict);
+    println!("Findings: {}", report.findings.len());
+    println!("Receipts: {}", report.receipts_file.display());
+    Ok(())
+}
+
+fn run_skill_curator_run(args: &[String]) -> Result<(), String> {
+    let mut options = SkillLifecycleCuratorOptions::default();
+    let mut idle_gated = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--harness-home" | "--target-home" => {
+                index += 1;
+                options.harness_home = PathBuf::from(required_arg(args, index, "--harness-home")?);
+            }
+            "--dry-run" => options.dry_run = true,
+            "--idle-gated" => idle_gated = true,
+            "--include-builtins" => options.include_builtins = true,
+            "--skill" => {
+                index += 1;
+                options
+                    .target_skill_ids
+                    .get_or_insert_with(Vec::new)
+                    .push(required_arg(args, index, "--skill")?.to_string());
+            }
+            "--stale-after-days" => {
+                index += 1;
+                options.stale_after_days = required_arg(args, index, "--stale-after-days")?
+                    .parse()
+                    .map_err(|_| "--stale-after-days must be an integer".to_string())?;
+            }
+            "--archive-after-days" => {
+                index += 1;
+                options.archive_after_days = required_arg(args, index, "--archive-after-days")?
+                    .parse()
+                    .map_err(|_| "--archive-after-days must be an integer".to_string())?;
+            }
+            other => return Err(format!("unknown skill-curator-run arg: {other}")),
+        }
+        index += 1;
+    }
+    options.now_ms = current_log_time_ms().map_err(|err| err.to_string())?;
+    if idle_gated {
+        if let Some(report_file) = defer_skill_curator_if_busy(&options)? {
+            println!("Skill curator: deferred");
+            println!("Evaluated: 0");
+            println!("Proposals: 0");
+            println!("Report: {}", report_file.display());
+            return Ok(());
+        }
+    }
+    let report = run_skill_lifecycle_curator(options).map_err(|err| err.to_string())?;
+    println!("Skill curator: {}", report.status);
+    println!("Evaluated: {}", report.evaluated);
+    println!("Proposals: {}", report.proposals_created);
+    if let Some(report_file) = report.report_file {
+        println!("Report: {}", report_file.display());
+    }
+    Ok(())
+}
+
+fn defer_skill_curator_if_busy(
+    options: &SkillLifecycleCuratorOptions,
+) -> Result<Option<PathBuf>, String> {
+    let status = collect_harness_status(HarnessStatusOptions {
+        harness_home: options.harness_home.clone(),
+    })
+    .map_err(|err| err.to_string())?;
+    let runtime_busy = status.runtime.open_items > 0
+        || status.runtime.queued_items > 0
+        || status.runtime.prepared_items > 0
+        || status.runtime.cron_open_items > 0
+        || status.runtime.cron_queued_items > 0;
+    let worker_busy = status.workers.totals.pending > 0
+        || status.workers.totals.leased > 0
+        || status.workers.totals.running > 0;
+    if !runtime_busy && !worker_busy {
+        return Ok(None);
+    }
+    let mut report = SkillLifecycleCuratorReport {
+        schema: "agent-harness.skill-curator.v1",
+        harness_home: options.harness_home.clone(),
+        status: "deferred".to_string(),
+        now_ms: options.now_ms,
+        dry_run: true,
+        evaluated: 0,
+        active: 0,
+        stale: 0,
+        archived: 0,
+        pinned: 0,
+        skipped_builtins: 0,
+        proposals_created: 0,
+        proposal_ids: Vec::new(),
+        reason: format!(
+            "idle gate deferred: runtimeOpenItems={}, runtimeQueuedItems={}, runtimePreparedItems={}, cronOpenItems={}, cronQueuedItems={}, workerPending={}, workerLeased={}, workerRunning={}",
+            status.runtime.open_items,
+            status.runtime.queued_items,
+            status.runtime.prepared_items,
+            status.runtime.cron_open_items,
+            status.runtime.cron_queued_items,
+            status.workers.totals.pending,
+            status.workers.totals.leased,
+            status.workers.totals.running
+        ),
+        clusters: Vec::new(),
+        report_file: None,
+    };
+    let dir = skill_curator_receipts_dir(&options.harness_home);
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let file = dir.join(format!(
+        "{}-skill-curator-deferred.json",
+        options.now_ms.max(0)
+    ));
+    report.report_file = Some(file.clone());
+    write_json_atomic(&file, &report).map_err(|err| err.to_string())?;
+    Ok(Some(file))
+}
+
+fn run_skill_restore(args: &[String]) -> Result<(), String> {
+    let mut harness_home = PathBuf::from(".agent-harness");
+    let mut skill_id: Option<String> = None;
+    let mut target_path: Option<PathBuf> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--harness-home" | "--target-home" => {
+                index += 1;
+                harness_home = PathBuf::from(required_arg(args, index, "--harness-home")?);
+            }
+            "--skill" => {
+                index += 1;
+                skill_id = Some(required_arg(args, index, "--skill")?.to_string());
+            }
+            "--target-path" => {
+                index += 1;
+                target_path = Some(PathBuf::from(required_arg(args, index, "--target-path")?));
+            }
+            other => return Err(format!("unknown skill-restore arg: {other}")),
+        }
+        index += 1;
+    }
+    let report = restore_skill_from_archive(SkillRestoreOptions {
+        harness_home,
+        target_skill_id: skill_id.ok_or_else(|| "--skill is required".to_string())?,
+        target_path,
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+    })
+    .map_err(|err| err.to_string())?;
+    println!("Skill restored: {}", report.target_skill_id);
+    println!("Restored to: {}", report.restored_to.display());
+    Ok(())
+}
+
+fn run_skill_pin(args: &[String]) -> Result<(), String> {
+    let mut harness_home = PathBuf::from(".agent-harness");
+    let mut skill_id: Option<String> = None;
+    let mut pinned = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--harness-home" | "--target-home" => {
+                index += 1;
+                harness_home = PathBuf::from(required_arg(args, index, "--harness-home")?);
+            }
+            "--skill" => {
+                index += 1;
+                skill_id = Some(required_arg(args, index, "--skill")?.to_string());
+            }
+            "--pin" => pinned = true,
+            "--unpin" => pinned = false,
+            other => return Err(format!("unknown skill-pin arg: {other}")),
+        }
+        index += 1;
+    }
+    let report = set_skill_pin(SkillPinOptions {
+        harness_home,
+        target_skill_id: skill_id.ok_or_else(|| "--skill is required".to_string())?,
+        pinned,
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+    })
+    .map_err(|err| err.to_string())?;
+    println!("Skill pin: {} -> {}", report.target_skill_id, report.pinned);
+    Ok(())
+}
+
+fn run_skill_pack_export(args: &[String]) -> Result<(), String> {
+    let mut harness_home = PathBuf::from(".agent-harness");
+    let mut pack_id: Option<String> = None;
+    let mut output_dir: Option<PathBuf> = None;
+    let mut skill_ids = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--harness-home" | "--target-home" => {
+                index += 1;
+                harness_home = PathBuf::from(required_arg(args, index, "--harness-home")?);
+            }
+            "--pack" | "--pack-id" => {
+                index += 1;
+                pack_id = Some(required_arg(args, index, "--pack")?.to_string());
+            }
+            "--output-dir" => {
+                index += 1;
+                output_dir = Some(PathBuf::from(required_arg(args, index, "--output-dir")?));
+            }
+            "--skill" => {
+                index += 1;
+                skill_ids.push(required_arg(args, index, "--skill")?.to_string());
+            }
+            other => return Err(format!("unknown skill-pack-export arg: {other}")),
+        }
+        index += 1;
+    }
+    let report = export_skill_pack(SkillPackExportOptions {
+        harness_home,
+        pack_id: pack_id.ok_or_else(|| "--pack is required".to_string())?,
+        output_dir: output_dir.ok_or_else(|| "--output-dir is required".to_string())?,
+        skill_ids,
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+    })
+    .map_err(|err| err.to_string())?;
+    println!("Skill pack export: {:?}", report.status);
+    println!("Pack: {}", report.pack_dir.display());
+    Ok(())
+}
+
+fn run_skill_pack_import(args: &[String]) -> Result<(), String> {
+    let mut harness_home = PathBuf::from(".agent-harness");
+    let mut pack_dir: Option<PathBuf> = None;
+    let mut conflict_policy = SkillPackConflictPolicy::Skip;
+    let mut dry_run = false;
+    let mut trusted = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--harness-home" | "--target-home" => {
+                index += 1;
+                harness_home = PathBuf::from(required_arg(args, index, "--harness-home")?);
+            }
+            "--pack-dir" => {
+                index += 1;
+                pack_dir = Some(PathBuf::from(required_arg(args, index, "--pack-dir")?));
+            }
+            "--conflict-policy" => {
+                index += 1;
+                conflict_policy = match required_arg(args, index, "--conflict-policy")? {
+                    "skip" => SkillPackConflictPolicy::Skip,
+                    "rename" => SkillPackConflictPolicy::Rename,
+                    "proposal" => SkillPackConflictPolicy::Proposal,
+                    other => return Err(format!("unknown conflict policy `{other}`")),
+                };
+            }
+            "--dry-run" => dry_run = true,
+            "--trusted" => trusted = true,
+            other => return Err(format!("unknown skill-pack-import arg: {other}")),
+        }
+        index += 1;
+    }
+    let report = import_skill_pack(SkillPackImportOptions {
+        harness_home,
+        pack_dir: pack_dir.ok_or_else(|| "--pack-dir is required".to_string())?,
+        conflict_policy,
+        dry_run,
+        trusted,
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+    })
+    .map_err(|err| err.to_string())?;
+    println!("Skill pack import: {:?}", report.status);
+    println!("Skills: {}", report.skills.len());
+    Ok(())
+}
+
+fn run_skill_pack_remove(args: &[String]) -> Result<(), String> {
+    let mut harness_home = PathBuf::from(".agent-harness");
+    let mut pack_id: Option<String> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--harness-home" | "--target-home" => {
+                index += 1;
+                harness_home = PathBuf::from(required_arg(args, index, "--harness-home")?);
+            }
+            "--pack" | "--pack-id" => {
+                index += 1;
+                pack_id = Some(required_arg(args, index, "--pack")?.to_string());
+            }
+            other => return Err(format!("unknown skill-pack-remove arg: {other}")),
+        }
+        index += 1;
+    }
+    let report = remove_skill_pack(SkillPackRemoveOptions {
+        harness_home,
+        pack_id: pack_id.ok_or_else(|| "--pack is required".to_string())?,
+        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+    })
+    .map_err(|err| err.to_string())?;
+    println!("Skill pack remove: {:?}", report.status);
+    println!("Skills: {}", report.skills.len());
     Ok(())
 }
 
@@ -2441,6 +3049,7 @@ fn run_skill_apply(args: &[String]) -> Result<(), String> {
     let mut harness_home = None;
     let mut proposal_id = None;
     let mut operator = None;
+    let mut autonomous = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2452,21 +3061,40 @@ fn run_skill_apply(args: &[String]) -> Result<(), String> {
                 i += 1;
                 proposal_id = Some(required_arg(args, i, "--proposal")?.to_string());
             }
-            "--operator" => {
+            "--operator" | "--reviewer" => {
                 i += 1;
                 operator = Some(required_arg(args, i, "--operator")?.to_string());
+            }
+            "--autonomous" => {
+                autonomous = true;
             }
             other => return Err(format!("unknown skill-apply arg: {other}")),
         }
         i += 1;
     }
-    let report = apply_skill_proposal(SkillApplyOptions {
-        harness_home: harness_home.ok_or_else(|| "--harness-home is required".to_string())?,
-        proposal_id: proposal_id.ok_or_else(|| "--proposal is required".to_string())?,
-        operator,
-        now_ms: current_log_time_ms().map_err(|err| err.to_string())?,
-    })
-    .map_err(|err| err.to_string())?;
+    let harness_home = harness_home.ok_or_else(|| "--harness-home is required".to_string())?;
+    let proposal_id = proposal_id.ok_or_else(|| "--proposal is required".to_string())?;
+    let now_ms = current_log_time_ms().map_err(|err| err.to_string())?;
+    let report = if autonomous {
+        let report = autonomous_apply_skill_proposal(SkillAutonomousApplyOptions {
+            harness_home,
+            proposal_id,
+            reviewer: operator,
+            now_ms,
+        })
+        .map_err(|err| err.to_string())?;
+        println!("Autonomous review: {:?}", report.decision);
+        println!("Autonomous reason: {}", report.reason);
+        report.apply_report
+    } else {
+        apply_skill_proposal(SkillApplyOptions {
+            harness_home,
+            proposal_id,
+            operator,
+            now_ms,
+        })
+        .map_err(|err| err.to_string())?
+    };
     println!("Skill apply: {}", report.status.as_str());
     println!("Reason: {}", report.reason);
     if let Some(target) = report.target_path {
@@ -8483,10 +9111,7 @@ fn cron_scheduler_run_once_args_from_args(
         i += 1;
     }
 
-    let source = match workspace {
-        Some(workspace) => AgentSource::with_workspace(home, workspace),
-        None => AgentSource::new(home),
-    };
+    let source = source_with_imported_workspace_default(home, workspace);
     Ok(CronSchedulerRunOnceArgs {
         source,
         runtime_workspace,
@@ -11460,11 +12085,14 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
         .map(|path| absolute_path(&path))
         .transpose()?
         .or(inferred_workspace);
+    let inferred_runtime_workspace =
+        infer_supervisor_reconcile_runtime_workspace(&options.target_home, &source_home)?;
     let runtime_workspace = options
         .optional("--runtime-workspace")
         .map(PathBuf::from)
         .map(|path| absolute_path(&path))
         .transpose()?
+        .or(inferred_runtime_workspace)
         .or_else(|| workspace.clone());
     let restart_delay_ms = options
         .optional_i64("--restart-delay-ms")?
@@ -11568,6 +12196,19 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
 }
 
 fn infer_supervisor_reconcile_workspace(
+    target_home: &Path,
+    source_home: &Path,
+) -> Result<Option<PathBuf>, String> {
+    for home in [source_home, target_home] {
+        let home = absolute_path(home)?;
+        if home.file_name().and_then(|name| name.to_str()) == Some(".agent-harness") {
+            return Ok(Some(home.join("workspace")));
+        }
+    }
+    Ok(None)
+}
+
+fn infer_supervisor_reconcile_runtime_workspace(
     target_home: &Path,
     source_home: &Path,
 ) -> Result<Option<PathBuf>, String> {
@@ -14891,10 +15532,7 @@ fn worker_adapter_enqueue_args_from_args(
         i += 1;
     }
 
-    let source = match workspace {
-        Some(workspace) => AgentSource::with_workspace(home, workspace),
-        None => AgentSource::new(home),
-    };
+    let source = source_with_imported_workspace_default(home, workspace);
 
     Ok(WorkerAdapterEnqueueArgs {
         source,
@@ -14959,10 +15597,7 @@ fn deterministic_cron_plan_args_from_args(
         i += 1;
     }
 
-    let source = match workspace {
-        Some(workspace) => AgentSource::with_workspace(home, workspace),
-        None => AgentSource::new(home),
-    };
+    let source = source_with_imported_workspace_default(home, workspace);
 
     Ok(DeterministicCronPlanArgs {
         source,
@@ -15041,6 +15676,23 @@ fn default_source_home() -> PathBuf {
     }
 
     PathBuf::from(".openclaw")
+}
+
+fn source_with_imported_workspace_default(
+    home: PathBuf,
+    workspace: Option<PathBuf>,
+) -> AgentSource {
+    match workspace {
+        Some(workspace) => AgentSource::with_workspace(home, workspace),
+        None => {
+            let imported_workspace = home.join("workspace");
+            if imported_workspace.is_dir() {
+                AgentSource::with_workspace(home, imported_workspace)
+            } else {
+                AgentSource::new(home)
+            }
+        }
+    }
 }
 
 fn default_harness_home() -> PathBuf {
@@ -22185,9 +22837,26 @@ fn print_help() {
     println!("  supervisor-plan Generate Windows scheduled-task scripts for harness loops");
     println!("  harness-skills-sync Sync bundled harness operation skills");
     println!("  skills          Build a skill-first index and optionally match a task");
+    println!("  skill-view      Print a skill body or support file with traversal guards");
+    println!(
+        "  skill-synthesize Create an agent skill from task evidence and autonomously apply by default"
+    );
+    println!("  skill-doctor    Aggregate skill lint, guard, lifecycle, and pack health");
+    println!("  skill-lint      Lint a skill body and write a lint receipt");
+    println!("  skill-guard     Guard-scan skill content and write a guard receipt");
+    println!(
+        "  skill-curator-run Run skill lifecycle curation and clustering; --idle-gated defers when runtime/worker work is open"
+    );
+    println!("  skill-restore   Restore a skill from the lifecycle archive");
+    println!("  skill-pin       Pin or unpin a skill for lifecycle protection");
+    println!("  skill-pack-export Export selected skills as a file-based pack");
+    println!("  skill-pack-import Import a file-based skill pack with checksum checks");
+    println!("  skill-pack-remove Remove an imported pack using its lockfile");
     println!("  skill-propose   Record a checksum-guarded skill change proposal");
     println!("  skill-proposals List skill change proposals");
-    println!("  skill-apply     Apply a reviewed skill proposal with stale-base quarantine");
+    println!(
+        "  skill-apply     Apply a reviewed or autonomous skill proposal with safety receipts"
+    );
     println!("  skill-reject    Reject a skill proposal");
     println!("  skill-archive   Record an archive proposal for a skill");
     println!("  turn-plan       Plan routing, commands, prompts, and skills for one turn");
@@ -22973,6 +23642,7 @@ mod tests {
             }"#,
         )
         .unwrap();
+        fs::create_dir_all(harness_home.join("workspace")).unwrap();
 
         let args = supervisor_reconcile_args_from_args(&[
             "--target-home".to_string(),
@@ -23430,10 +24100,12 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(args.workspace.as_deref(), Some(root.as_path()));
+        let harness_workspace = harness_home.join("workspace");
+        assert_eq!(args.workspace.as_deref(), Some(harness_workspace.as_path()));
         assert_eq!(args.runtime_workspace.as_deref(), Some(root.as_path()));
 
         let root_text = root.to_string_lossy().to_string();
+        let harness_workspace_text = harness_workspace.to_string_lossy().to_string();
         let services = supervisor_reconcile_desired_services(&args).unwrap();
         let runtime = services
             .iter()
@@ -23441,7 +24113,7 @@ mod tests {
             .unwrap();
         let runtime_workspace = arg_value(&runtime.args, "--runtime-workspace");
         let workspace = arg_value(&runtime.args, "--workspace");
-        assert_eq!(workspace.as_deref(), Some(root_text.as_str()));
+        assert_eq!(workspace.as_deref(), Some(harness_workspace_text.as_str()));
         assert_eq!(runtime_workspace.as_deref(), Some(root_text.as_str()));
 
         let xiaoxiaoli = services
@@ -23460,6 +24132,42 @@ mod tests {
             arg_value(&xiaoxiaoli.args, "--telegram-account").as_deref(),
             Some("xiaoxiaoli")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deterministic_cron_surfaces_default_to_imported_workspace_under_source_home() {
+        let root = cli_temp_root(
+            "deterministic_cron_surfaces_default_to_imported_workspace_under_source_home",
+        );
+        let source_home = root.join(".agent-harness");
+        let imported_workspace = source_home.join("workspace");
+        fs::create_dir_all(&imported_workspace).unwrap();
+
+        let source_home_arg = source_home.display().to_string();
+
+        let scheduler = cron_scheduler_run_once_args_from_args(&[
+            "--source-home".to_string(),
+            source_home_arg.clone(),
+        ])
+        .unwrap();
+        assert_eq!(scheduler.source.home, source_home);
+        assert_eq!(scheduler.source.workspace, imported_workspace);
+
+        let enqueue = worker_adapter_enqueue_args_from_args(&[
+            "--source-home".to_string(),
+            source_home_arg.clone(),
+        ])
+        .unwrap();
+        assert_eq!(enqueue.source.home, source_home);
+        assert_eq!(enqueue.source.workspace, imported_workspace);
+
+        let plan =
+            deterministic_cron_plan_args_from_args(&["--source-home".to_string(), source_home_arg])
+                .unwrap();
+        assert_eq!(plan.source.home, source_home);
+        assert_eq!(plan.source.workspace, imported_workspace);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -24451,6 +25159,50 @@ mod tests {
     }
 
     #[test]
+    fn skill_curator_run_idle_gated_defers_when_runtime_open() {
+        let root = cli_temp_root("skill_curator_run_idle_gated_defers_when_runtime_open");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        fs::write(
+            queue_dir.join("pending.jsonl"),
+            r#"{"queueId":"turn:busy","runtimeClass":"interactive","origin":"channel"}"#,
+        )
+        .unwrap();
+
+        run_skill_curator_run(&[
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--idle-gated".to_string(),
+        ])
+        .unwrap();
+
+        let reports_dir = skill_curator_receipts_dir(&harness_home);
+        let report_file = fs::read_dir(&reports_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("-skill-curator-deferred.json"))
+            })
+            .expect("deferred curator report");
+        let report: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(report_file).unwrap()).unwrap();
+        assert_eq!(report["status"], "deferred");
+        assert_eq!(report["proposalsCreated"], 0);
+        assert!(
+            report["reason"]
+                .as_str()
+                .unwrap()
+                .contains("runtimeOpenItems=1")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn skill_apply_cli_proposes_and_applies_replacement() {
         let root = cli_temp_root("skill_apply_cli_proposes_and_applies_replacement");
         let harness_home = root.join(".agent-harness");
@@ -24498,6 +25250,102 @@ mod tests {
             fs::read_to_string(&skill_file)
                 .unwrap()
                 .contains("New body")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_apply_cli_autonomous_applies_agent_created_create() {
+        let root = cli_temp_root("skill_apply_cli_autonomous_applies_agent_created_create");
+        let harness_home = root.join(".agent-harness");
+        let skill_file = harness_home
+            .join("skills")
+            .join("agent-created")
+            .join("auto-cli")
+            .join("SKILL.md");
+        let body = "---\nname: auto-cli\ndescription: Apply via autonomous CLI.\ncategory: operations\n---\n# Auto CLI\n";
+
+        run_skill_propose(&[
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--skill".to_string(),
+            "agent-created:auto-cli".to_string(),
+            "--target-path".to_string(),
+            skill_file.display().to_string(),
+            "--operation".to_string(),
+            "create".to_string(),
+            "--body".to_string(),
+            body.to_string(),
+        ])
+        .unwrap();
+        let proposals_text = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("learning")
+                .join("skill-proposals.jsonl"),
+        )
+        .unwrap();
+        let proposal: serde_json::Value =
+            serde_json::from_str(proposals_text.lines().next().unwrap()).unwrap();
+        let proposal_id = proposal
+            .get("proposalId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string();
+
+        run_skill_apply(&[
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--proposal".to_string(),
+            proposal_id,
+            "--autonomous".to_string(),
+        ])
+        .unwrap();
+
+        assert!(skill_file.is_file());
+        assert!(
+            harness_home
+                .join("state")
+                .join("learning")
+                .join("skill-autonomous-apply-receipts.jsonl")
+                .is_file()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_synthesize_cli_autonomously_creates_skill_by_default() {
+        let root = cli_temp_root("skill_synthesize_cli_autonomously_creates_skill_by_default");
+        let harness_home = root.join(".agent-harness");
+
+        run_skill_synthesize(&[
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--skill".to_string(),
+            "agent-created:cli-synth".to_string(),
+            "--summary".to_string(),
+            "Reuse a verified CLI synthesis workflow".to_string(),
+            "--evidence".to_string(),
+            "test evidence: focused cli synthesis test".to_string(),
+        ])
+        .unwrap();
+
+        assert!(
+            harness_home
+                .join("skills")
+                .join("agent-created")
+                .join("cli-synth")
+                .join("SKILL.md")
+                .is_file()
+        );
+        assert!(
+            harness_home
+                .join("state")
+                .join("skills")
+                .join("synthesis-receipts.jsonl")
+                .is_file()
         );
 
         let _ = fs::remove_dir_all(root);

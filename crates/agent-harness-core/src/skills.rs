@@ -7,13 +7,15 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 use crate::skill_envelope::skill_body_checksum;
-use crate::{AgentSource, SKILL_FILE_NAME, append_jsonl_value, current_log_time_ms};
+use crate::{
+    AgentSource, SKILL_FILE_NAME, SkillUsageSnapshot, append_jsonl_value, current_log_time_ms,
+};
 
 const SKILL_INDEX_SCHEMA: &str = "agent-harness.skill-index.v1";
 pub const SKILL_SELECTION_RECEIPT_SCHEMA: &str = "agent-harness.skill-selection.v1";
 pub const SKILL_MATCHER_NAME: &str = "agent-harness-skill-matcher";
-pub const SKILL_MATCHER_VERSION: &str = "v2";
-pub const SKILL_MATCHER_TOKENIZER: &str = "ascii-alnum-v1";
+pub const SKILL_MATCHER_VERSION: &str = "v3";
+pub const SKILL_MATCHER_TOKENIZER: &str = "mixed-v1";
 const IMPORTED_SKILL_NAMESPACE: &str = "legacy-imports";
 const OPENCLAW_IMPORTED_SKILL_NAMESPACE: &str = "openclaw-imports";
 pub const HARNESS_BUILTIN_SKILL_NAMESPACE: &str = "agent-harness-core";
@@ -37,6 +39,8 @@ pub enum SkillSourceKind {
     ImportedManaged,
     ImportedProjectAgent,
     HarnessBuiltin,
+    AgentCreated,
+    Pack,
 }
 
 impl SkillSourceKind {
@@ -49,6 +53,8 @@ impl SkillSourceKind {
             SkillSourceKind::ImportedManaged => "imported-managed",
             SkillSourceKind::ImportedProjectAgent => "imported-project-agent",
             SkillSourceKind::HarnessBuiltin => "harness-builtin",
+            SkillSourceKind::AgentCreated => "agent-created",
+            SkillSourceKind::Pack => "pack",
         }
     }
 }
@@ -76,6 +82,10 @@ pub struct SkillIndexSummary {
     pub imported_managed_skills: usize,
     pub imported_project_agent_skills: usize,
     pub harness_builtin_skills: usize,
+    pub agent_created_skills: usize,
+    pub pack_skills: usize,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_category: BTreeMap<String, usize>,
     pub skills_with_references: usize,
     pub skills_with_templates: usize,
     pub skills_with_scripts: usize,
@@ -122,6 +132,16 @@ pub struct SkillFrontmatter {
     pub channels: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_mode: Option<SkillDeliveryMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_skills: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +176,8 @@ pub struct SkillSelectionQuery {
     pub available_toolsets: Vec<String>,
     pub fts_enabled: bool,
     pub vector_tie_break_enabled: bool,
+    pub usage_snapshot: Option<SkillUsageSnapshot>,
+    pub usage_prior_enabled: bool,
     pub limit: usize,
 }
 
@@ -166,6 +188,12 @@ pub struct SkillSelection {
     pub original_id: String,
     pub source_kind: SkillSourceKind,
     pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     pub directory: PathBuf,
     pub score: usize,
     pub score_components: Vec<SkillScoreComponent>,
@@ -252,6 +280,8 @@ pub fn build_harness_skill_index(harness_home: impl AsRef<Path>) -> io::Result<S
     let builtin_root = harness_home
         .join("skills")
         .join(HARNESS_BUILTIN_SKILL_NAMESPACE);
+    let agent_created_root = harness_home.join("skills").join("agent-created");
+    let packs_root = harness_home.join("skills").join("packs");
     let mut skills = Vec::new();
     for imported_root in imported_roots {
         add_skill_root(
@@ -271,6 +301,12 @@ pub fn build_harness_skill_index(harness_home: impl AsRef<Path>) -> io::Result<S
         )?;
     }
     add_skill_root(&mut skills, SkillSourceKind::HarnessBuiltin, &builtin_root)?;
+    add_skill_root(
+        &mut skills,
+        SkillSourceKind::AgentCreated,
+        &agent_created_root,
+    )?;
+    add_pack_skill_roots(&mut skills, &packs_root)?;
     skills.sort_by(|left, right| left.id.cmp(&right.id));
 
     Ok(SkillIndex {
@@ -351,6 +387,9 @@ pub fn select_skills(index: &SkillIndex, query: &SkillSelectionQuery) -> Vec<Ski
             original_id: skill.original_id.clone(),
             source_kind: skill.source_kind,
             title: skill.title.clone(),
+            description: skill.description.clone(),
+            category: skill.frontmatter.category.clone(),
+            tags: skill.frontmatter.tags.clone(),
             directory: skill.directory.clone(),
             score,
             score_components,
@@ -451,13 +490,68 @@ fn add_skill_root(
         }
 
         let directory = entry.path();
-        let skill_file = directory.join(SKILL_FILE_NAME);
-        if !skill_file.is_file() {
+        let Some(name) = directory.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') {
             continue;
         }
-        skills.push(read_skill_record(source_kind, &directory, &skill_file)?);
+        let skill_file = directory.join(SKILL_FILE_NAME);
+        if skill_file.is_file() {
+            skills.push(read_skill_record(
+                source_kind,
+                &directory,
+                &skill_file,
+                None,
+            )?);
+            continue;
+        }
+        for child in fs::read_dir(&directory)? {
+            let child = child?;
+            if !child.file_type()?.is_dir() {
+                continue;
+            }
+            let child_directory = child.path();
+            let Some(child_name) = child_directory.file_name().and_then(|value| value.to_str())
+            else {
+                continue;
+            };
+            if child_name.starts_with('.') {
+                continue;
+            }
+            let child_skill_file = child_directory.join(SKILL_FILE_NAME);
+            if child_skill_file.is_file() {
+                skills.push(read_skill_record(
+                    source_kind,
+                    &child_directory,
+                    &child_skill_file,
+                    Some(name),
+                )?);
+            }
+        }
     }
 
+    Ok(())
+}
+
+fn add_pack_skill_roots(skills: &mut Vec<SkillRecord>, packs_root: &Path) -> io::Result<()> {
+    if !packs_root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(packs_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let pack_root = entry.path();
+        let Some(pack_name) = pack_root.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if pack_name.starts_with('.') {
+            continue;
+        }
+        add_skill_root(skills, SkillSourceKind::Pack, &pack_root)?;
+    }
     Ok(())
 }
 
@@ -465,6 +559,7 @@ fn read_skill_record(
     source_kind: SkillSourceKind,
     directory: &Path,
     skill_file: &Path,
+    inferred_category: Option<&str>,
 ) -> io::Result<SkillRecord> {
     let original_id = directory
         .file_name()
@@ -473,11 +568,15 @@ fn read_skill_record(
         .to_string();
     let bytes = fs::read(skill_file)?;
     let body = String::from_utf8_lossy(&bytes);
-    let metadata = parse_skill_metadata(&body, &original_id);
+    let mut metadata = parse_skill_metadata(&body, &original_id);
+    if metadata.frontmatter.category.is_none() {
+        metadata.frontmatter.category = inferred_category.map(ToString::to_string);
+    }
     let keywords = skill_keywords(
         &original_id,
         &metadata.title,
         metadata.description.as_deref(),
+        &metadata.frontmatter,
         &body,
     );
     let has_references = directory.join("references").is_dir();
@@ -548,6 +647,14 @@ fn parse_skill_metadata(body: &str, fallback_id: &str) -> SkillMetadata {
 }
 
 fn parse_skill_frontmatter(body: &str) -> SkillFrontmatter {
+    let mut tags = frontmatter_values(body, &["tags", "tag"]);
+    tags.extend(frontmatter_nested_values(
+        body,
+        &["metadata", "agent_harness"],
+        &["tags", "tag"],
+    ));
+    tags.sort();
+    tags.dedup();
     SkillFrontmatter {
         triggers: frontmatter_values(body, &["triggers", "trigger"]),
         conditions: frontmatter_values(body, &["conditions", "condition"]),
@@ -561,6 +668,13 @@ fn parse_skill_frontmatter(body: &str) -> SkillFrontmatter {
         channels: frontmatter_values(body, &["channels", "channel"]),
         delivery_mode: frontmatter_value(body, &["deliveryMode", "delivery_mode"])
             .and_then(|value| parse_delivery_mode(&value)),
+        category: frontmatter_value(body, &["category"]).or_else(|| {
+            frontmatter_nested_value(body, &["metadata", "agent_harness"], &["category"])
+        }),
+        tags,
+        version: frontmatter_value(body, &["version"]),
+        author: frontmatter_value(body, &["author"]),
+        related_skills: frontmatter_values(body, &["relatedSkills", "related_skills"]),
     }
 }
 
@@ -631,6 +745,72 @@ fn frontmatter_values(body: &str, keys: &[&str]) -> Vec<String> {
     values.into_iter().collect()
 }
 
+fn frontmatter_nested_value(body: &str, parents: &[&str], keys: &[&str]) -> Option<String> {
+    frontmatter_nested_values(body, parents, keys)
+        .into_iter()
+        .next()
+}
+
+fn frontmatter_nested_values(body: &str, parents: &[&str], keys: &[&str]) -> Vec<String> {
+    let Some(block) = frontmatter_block(body) else {
+        return Vec::new();
+    };
+    let mut values = BTreeSet::new();
+    let mut path: Vec<(usize, String)> = Vec::new();
+    let mut lines = block.iter().peekable();
+    while let Some(line) = lines.next() {
+        let indent = leading_whitespace_count(line);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        while path
+            .last()
+            .is_some_and(|(path_indent, _)| *path_indent >= indent)
+        {
+            path.pop();
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let normalized_key = normalize_frontmatter_key(key);
+        if value.trim().is_empty() {
+            path.push((indent, normalized_key));
+            continue;
+        }
+        let current_path = path.iter().map(|(_, key)| key.as_str()).collect::<Vec<_>>();
+        let parents_match = current_path.len() == parents.len()
+            && current_path
+                .iter()
+                .zip(parents.iter())
+                .all(|(left, right)| frontmatter_key_matches(left, right));
+        if parents_match
+            && keys
+                .iter()
+                .any(|candidate| frontmatter_key_matches(&normalized_key, candidate))
+        {
+            extend_yaml_values(&mut values, value);
+            while let Some(next) = lines.peek() {
+                let next_trimmed = next.trim();
+                if next_trimmed.is_empty() {
+                    lines.next();
+                    continue;
+                }
+                if leading_whitespace_count(next) <= indent {
+                    break;
+                }
+                if next_trimmed.starts_with("- ") {
+                    extend_yaml_values(&mut values, next_trimmed.trim_start_matches("- "));
+                    lines.next();
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    values.into_iter().collect()
+}
+
 fn frontmatter_block(body: &str) -> Option<Vec<&str>> {
     let mut lines = body.lines();
     if lines.next().map(str::trim) != Some("---") {
@@ -658,6 +838,21 @@ fn extend_yaml_values(values: &mut BTreeSet<String>, value: &str) {
             values.insert(item);
         }
     }
+}
+
+fn leading_whitespace_count(value: &str) -> usize {
+    value
+        .chars()
+        .take_while(|ch| matches!(ch, ' ' | '\t'))
+        .count()
+}
+
+fn normalize_frontmatter_key(value: &str) -> String {
+    value.trim().replace('-', "_").to_ascii_lowercase()
+}
+
+fn frontmatter_key_matches(left: &str, right: &str) -> bool {
+    normalize_frontmatter_key(left) == normalize_frontmatter_key(right)
 }
 
 fn parse_delivery_mode(value: &str) -> Option<SkillDeliveryMode> {
@@ -703,6 +898,7 @@ fn skill_keywords(
     original_id: &str,
     title: &str,
     description: Option<&str>,
+    frontmatter: &SkillFrontmatter,
     body: &str,
 ) -> Vec<String> {
     let mut tokens = BTreeSet::new();
@@ -710,6 +906,12 @@ fn skill_keywords(
     extend_tokens(&mut tokens, title);
     if let Some(description) = description {
         extend_tokens(&mut tokens, description);
+    }
+    if let Some(category) = &frontmatter.category {
+        extend_tokens(&mut tokens, category);
+    }
+    for tag in &frontmatter.tags {
+        extend_tokens(&mut tokens, tag);
     }
     extend_tokens(&mut tokens, &body.chars().take(6000).collect::<String>());
     tokens.into_iter().take(MAX_KEYWORDS).collect()
@@ -731,15 +933,22 @@ fn query_tokens(query: &SkillSelectionQuery) -> BTreeSet<String> {
 }
 
 fn extend_tokens(tokens: &mut BTreeSet<String>, text: &str) {
-    let mut token = String::new();
+    let mut ascii_token = String::new();
+    let mut cjk_run = String::new();
     for ch in text.chars() {
         if ch.is_ascii_alphanumeric() {
-            token.push(ch.to_ascii_lowercase());
+            push_cjk_run_tokens(tokens, &mut cjk_run);
+            ascii_token.push(ch.to_ascii_lowercase());
+        } else if is_cjk_token_char(ch) {
+            push_token(tokens, &mut ascii_token);
+            cjk_run.push(ch);
         } else {
-            push_token(tokens, &mut token);
+            push_token(tokens, &mut ascii_token);
+            push_cjk_run_tokens(tokens, &mut cjk_run);
         }
     }
-    push_token(tokens, &mut token);
+    push_token(tokens, &mut ascii_token);
+    push_cjk_run_tokens(tokens, &mut cjk_run);
 }
 
 fn push_token(tokens: &mut BTreeSet<String>, token: &mut String) {
@@ -748,6 +957,32 @@ fn push_token(tokens: &mut BTreeSet<String>, token: &mut String) {
     } else {
         token.clear();
     }
+}
+
+fn push_cjk_run_tokens(tokens: &mut BTreeSet<String>, run: &mut String) {
+    if run.is_empty() {
+        return;
+    }
+    let chars = run.chars().collect::<Vec<_>>();
+    if chars.len() == 1 {
+        tokens.insert(chars[0].to_string());
+    } else {
+        for pair in chars.windows(2) {
+            tokens.insert(pair.iter().collect());
+        }
+    }
+    run.clear();
+}
+
+fn is_cjk_token_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0x3040..=0x30FF
+            | 0xAC00..=0xD7AF
+            | 0xF900..=0xFAFF
+    )
 }
 
 fn score_skill(
@@ -795,6 +1030,13 @@ fn score_skill(
         .map(token_set)
         .unwrap_or_default();
     let keyword_tokens: BTreeSet<String> = skill.keywords.iter().cloned().collect();
+    let tag_tokens = values_token_set(&skill.frontmatter.tags);
+    let category_tokens = skill
+        .frontmatter
+        .category
+        .as_deref()
+        .map(token_set)
+        .unwrap_or_default();
 
     let id_matches = count_matches(query_tokens, &id_tokens);
     if id_matches > 0 {
@@ -857,6 +1099,30 @@ fn score_skill(
         reasons.push(format!("{trigger_matches} declared trigger match(es)"));
     }
 
+    let tag_matches = count_matches(query_tokens, &tag_tokens);
+    if tag_matches > 0 {
+        let component_score = tag_matches * 10;
+        score += component_score;
+        components.push(SkillScoreComponent {
+            name: "tags".to_string(),
+            score: component_score,
+            matches: tag_matches,
+        });
+        reasons.push(format!("{tag_matches} tag token match(es)"));
+    }
+
+    let category_matches = count_matches(query_tokens, &category_tokens);
+    if category_matches > 0 {
+        let component_score = category_matches * 6;
+        score += component_score;
+        components.push(SkillScoreComponent {
+            name: "category".to_string(),
+            score: component_score,
+            matches: category_matches,
+        });
+        reasons.push(format!("{category_matches} category token match(es)"));
+    }
+
     if query
         .agent_id
         .as_deref()
@@ -899,7 +1165,34 @@ fn score_skill(
         reasons.push("SQLite FTS5/BM25 match".to_string());
     }
 
+    if query.usage_prior_enabled
+        && let Some(snapshot) = query.usage_snapshot.as_ref()
+    {
+        let usage_score = usage_prior_score(snapshot, &skill.id);
+        if usage_score > 0 {
+            score += usage_score;
+            components.push(SkillScoreComponent {
+                name: "usage-prior".to_string(),
+                score: usage_score,
+                matches: usage_score,
+            });
+            reasons.push(format!("usage prior boost {usage_score}"));
+        }
+    }
+
     Some((score, components, reasons))
+}
+
+fn usage_prior_score(snapshot: &SkillUsageSnapshot, skill_id: &str) -> usize {
+    snapshot
+        .by_skill_action
+        .get(skill_id)
+        .map(|actions| {
+            actions.get("injected").copied().unwrap_or(0)
+                + actions.get("invoked").copied().unwrap_or(0)
+        })
+        .unwrap_or(0)
+        .min(8)
 }
 
 fn sqlite_fts_scores(
@@ -1172,6 +1465,11 @@ fn summarize_skills(skills: &[SkillRecord]) -> SkillIndexSummary {
             SkillSourceKind::ImportedManaged => summary.imported_managed_skills += 1,
             SkillSourceKind::ImportedProjectAgent => summary.imported_project_agent_skills += 1,
             SkillSourceKind::HarnessBuiltin => summary.harness_builtin_skills += 1,
+            SkillSourceKind::AgentCreated => summary.agent_created_skills += 1,
+            SkillSourceKind::Pack => summary.pack_skills += 1,
+        }
+        if let Some(category) = skill.frontmatter.category.as_ref() {
+            *summary.by_category.entry(category.clone()).or_default() += 1;
         }
         if skill.has_references {
             summary.skills_with_references += 1;
@@ -1211,6 +1509,8 @@ fn count_regular_files(root: &Path) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SkillUsageSnapshot;
+    use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1262,6 +1562,80 @@ mod tests {
                     && skill.title == "Memory Cron"
                     && skill.has_references)
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_frontmatter_v2_parses_nested_agent_harness_metadata() {
+        let root = temp_root("skill_frontmatter_v2_parses_nested_agent_harness_metadata");
+        let home = root.join(".openclaw");
+        let workspace = home.join("workspace");
+        let skill = workspace.join("skills").join("agent-windows-harness");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join(SKILL_FILE_NAME),
+            "---\nname: agent-windows-harness\ndescription: Operate the Windows harness.\nversion: 0.1.22\nauthor: agent-harness-core\nrelatedSkills: [skill-authoring-standard]\nmetadata:\n  agent_harness:\n    category: operations\n    tags: [windows, cutover, health]\n---\n# Agent Windows Harness\n\nOperate the harness.\n",
+        )
+        .unwrap();
+
+        let index =
+            build_source_skill_index(&AgentSource::with_workspace(&home, &workspace)).unwrap();
+        let record = index
+            .skills
+            .iter()
+            .find(|skill| skill.original_id == "agent-windows-harness")
+            .unwrap();
+
+        assert_eq!(record.frontmatter.category.as_deref(), Some("operations"));
+        assert_eq!(record.frontmatter.version.as_deref(), Some("0.1.22"));
+        assert_eq!(
+            record.frontmatter.author.as_deref(),
+            Some("agent-harness-core")
+        );
+        assert!(record.frontmatter.tags.contains(&"cutover".to_string()));
+        assert!(
+            record
+                .frontmatter
+                .related_skills
+                .contains(&"skill-authoring-standard".to_string())
+        );
+        assert!(record.keywords.contains(&"operations".to_string()));
+        assert!(record.keywords.contains(&"cutover".to_string()));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn source_skill_index_discovers_one_level_category_dirs_and_excludes_archive() {
+        let root =
+            temp_root("source_skill_index_discovers_one_level_category_dirs_and_excludes_archive");
+        let home = root.join(".openclaw");
+        let workspace = home.join("workspace");
+        let category_skill = workspace
+            .join("skills")
+            .join("trading")
+            .join("neoapi-orders");
+        let archived_skill = workspace.join("skills").join(".archive").join("old-skill");
+        fs::create_dir_all(&category_skill).unwrap();
+        fs::create_dir_all(&archived_skill).unwrap();
+        fs::write(
+            category_skill.join(SKILL_FILE_NAME),
+            "---\ndescription: Place NeoAPI orders.\n---\n# NeoAPI Orders\n",
+        )
+        .unwrap();
+        fs::write(archived_skill.join(SKILL_FILE_NAME), "# Old Skill\n").unwrap();
+
+        let index =
+            build_source_skill_index(&AgentSource::with_workspace(&home, &workspace)).unwrap();
+
+        assert_eq!(index.summary.total_skills, 1);
+        assert_eq!(index.skills[0].id, "workspace:neoapi-orders");
+        assert_eq!(
+            index.skills[0].frontmatter.category.as_deref(),
+            Some("trading")
+        );
+        assert_eq!(index.summary.by_category.get("trading"), Some(&1));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1429,6 +1803,8 @@ mod tests {
                 available_toolsets: Vec::new(),
                 fts_enabled: false,
                 vector_tie_break_enabled: false,
+                usage_snapshot: None,
+                usage_prior_enabled: false,
                 limit: 2,
             },
         );
@@ -1440,6 +1816,107 @@ mod tests {
                 .reasons
                 .iter()
                 .any(|reason| reason.contains("id"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_selection_scores_tags_category_and_bounded_usage_prior() {
+        let root = temp_root("skill_selection_scores_tags_category_and_bounded_usage_prior");
+        let home = root.join(".openclaw");
+        let workspace = home.join("workspace");
+        let frequent_skill = workspace.join("skills").join("orders-primer");
+        let idle_skill = workspace.join("skills").join("orders-review");
+        let lexical_skill = workspace.join("skills").join("neoapi-direct-orders");
+        fs::create_dir_all(&frequent_skill).unwrap();
+        fs::create_dir_all(&idle_skill).unwrap();
+        fs::create_dir_all(&lexical_skill).unwrap();
+        fs::write(
+            frequent_skill.join(SKILL_FILE_NAME),
+            "---\ncategory: trading\ntags: [orders]\n---\n# Orders Primer\n\nHandle order workflows.\n",
+        )
+        .unwrap();
+        fs::write(
+            idle_skill.join(SKILL_FILE_NAME),
+            "---\ncategory: trading\ntags: [orders]\n---\n# Orders Review\n\nHandle order workflows.\n",
+        )
+        .unwrap();
+        fs::write(
+            lexical_skill.join(SKILL_FILE_NAME),
+            "---\ncategory: trading\ntags: [orders]\n---\n# NeoAPI Direct Orders\n\nUse direct neoapi order routing.\n",
+        )
+        .unwrap();
+        let index =
+            build_source_skill_index(&AgentSource::with_workspace(&home, &workspace)).unwrap();
+        let mut by_skill_action = BTreeMap::new();
+        by_skill_action.insert(
+            "workspace:orders-primer".to_string(),
+            BTreeMap::from([
+                ("injected".to_string(), 20usize),
+                ("invoked".to_string(), 5usize),
+            ]),
+        );
+        let snapshot = SkillUsageSnapshot {
+            schema: "agent-harness.skill-usage-snapshot.v1".to_string(),
+            harness_home: home.clone(),
+            events_file: home
+                .join("state")
+                .join("learning")
+                .join("skill-usage.jsonl"),
+            total_events: 25,
+            by_action: BTreeMap::new(),
+            by_skill: BTreeMap::new(),
+            by_skill_action,
+            by_provenance: BTreeMap::new(),
+            latest_at_ms: Some(25),
+        };
+
+        let selections = select_skills(
+            &index,
+            &SkillSelectionQuery {
+                text: "neoapi trading orders".to_string(),
+                agent_id: None,
+                channel: None,
+                workspace: None,
+                agent_mode: None,
+                available_tools: Vec::new(),
+                available_toolsets: Vec::new(),
+                fts_enabled: false,
+                vector_tie_break_enabled: false,
+                usage_snapshot: Some(snapshot),
+                usage_prior_enabled: true,
+                limit: 3,
+            },
+        );
+
+        assert_eq!(selections[0].skill_id, "workspace:neoapi-direct-orders");
+        let frequent = selections
+            .iter()
+            .find(|skill| skill.skill_id == "workspace:orders-primer")
+            .unwrap();
+        let idle = selections
+            .iter()
+            .find(|skill| skill.skill_id == "workspace:orders-review")
+            .unwrap();
+        assert!(frequent.score > idle.score);
+        assert!(
+            frequent
+                .score_components
+                .iter()
+                .any(|component| component.name == "usage-prior" && component.score == 8)
+        );
+        assert!(
+            frequent
+                .score_components
+                .iter()
+                .any(|component| component.name == "tags")
+        );
+        assert!(
+            frequent
+                .score_components
+                .iter()
+                .any(|component| component.name == "category")
         );
 
         let _ = fs::remove_dir_all(root);
@@ -1476,6 +1953,8 @@ mod tests {
             available_toolsets: Vec::new(),
             fts_enabled: false,
             vector_tie_break_enabled: false,
+            usage_snapshot: None,
+            usage_prior_enabled: false,
             limit: 5,
         };
         let selections = select_skills(&index, &query);

@@ -40,9 +40,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn skill_matcher_info_exposes_v2_defaults() {
+    fn skill_matcher_info_exposes_v3_mixed_tokenizer_defaults() {
         let info = skill_matcher_info();
-        assert_eq!(info.version, "v2");
+        assert_eq!(info.version, "v3");
+        assert_eq!(info.tokenizer, "mixed-v1");
         assert!(!info.vector_enabled_by_default);
         assert_eq!(info.stages[0], "explicit-invocation-or-skill-id");
     }
@@ -73,6 +74,8 @@ mod tests {
                 available_toolsets: Vec::new(),
                 fts_enabled: false,
                 vector_tie_break_enabled: false,
+                usage_snapshot: None,
+                usage_prior_enabled: false,
                 limit: 5,
             },
         );
@@ -117,6 +120,8 @@ mod tests {
                 available_toolsets: Vec::new(),
                 fts_enabled: true,
                 vector_tie_break_enabled: false,
+                usage_snapshot: None,
+                usage_prior_enabled: false,
                 limit: 5,
             },
         );
@@ -127,6 +132,50 @@ mod tests {
                 .score_components
                 .iter()
                 .any(|component| component.name == "sqlite-fts5-bm25")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_matcher_mixed_tokenizer_selects_cjk_trigger_skill() {
+        let root = temp_root("skill_matcher_mixed_tokenizer_selects_cjk_trigger_skill");
+        let home = root.join(".openclaw");
+        let workspace = home.join("workspace");
+        let skill = workspace.join("skills").join("neoapi-orders");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join(SKILL_FILE_NAME),
+            "---\ntriggers: [下單, 富邦, neoapi]\ncategory: trading\ntags: [neoapi, orders]\n---\n# NeoAPI Orders\n\nUse when placing Fubon Neo orders.\n",
+        )
+        .unwrap();
+        let index =
+            build_source_skill_index(&AgentSource::with_workspace(&home, &workspace)).unwrap();
+
+        let selections = select_skills(
+            &index,
+            &SkillSelectionQuery {
+                text: "幫我用富邦下單".to_string(),
+                agent_id: None,
+                channel: None,
+                workspace: None,
+                agent_mode: None,
+                available_tools: Vec::new(),
+                available_toolsets: Vec::new(),
+                fts_enabled: false,
+                vector_tie_break_enabled: false,
+                usage_snapshot: None,
+                usage_prior_enabled: false,
+                limit: 5,
+            },
+        );
+
+        assert_eq!(selections[0].skill_id, "workspace:neoapi-orders");
+        assert!(
+            selections[0]
+                .score_components
+                .iter()
+                .any(|component| component.name == "declared-triggers")
         );
 
         let _ = fs::remove_dir_all(root);

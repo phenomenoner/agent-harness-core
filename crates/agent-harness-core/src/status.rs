@@ -17,13 +17,15 @@ use crate::memory::{
 };
 use crate::memory_owner::{MemoryOwnerState, read_memory_owner_state_or_default};
 use crate::skill_apply::skill_apply_receipts_file;
+use crate::skill_doctor::skill_doctor_receipts_file;
 use crate::skill_learning::skill_proposals_file;
 use crate::skill_usage::{skill_usage_events_file, skill_usage_snapshot_file};
 use crate::{
     ActivationReadinessOptions, ActivationReadinessReport, ActivationReadinessStatus,
-    ChannelOutboxPlanSummary, CronRunSummary, WorkerStatusOptions, WorkerStatusReport,
-    check_activation_readiness, collect_cron_run_summary, collect_worker_status, cron_runs_db_file,
-    harness_log_file,
+    ChannelOutboxPlanSummary, CronRunSummary, SkillDoctorOptions, SkillDoctorStatus,
+    SkillDoctorSummary, WorkerStatusOptions, WorkerStatusReport, check_activation_readiness,
+    collect_cron_run_summary, collect_worker_status, cron_runs_db_file, harness_log_file,
+    run_skill_doctor,
 };
 
 const HARNESS_STATUS_SCHEMA: &str = "agent-harness.status.v1";
@@ -49,6 +51,7 @@ pub struct HarnessStatusReport {
     pub cron_runs: HarnessCronRunStatus,
     pub memory: HarnessMemoryStatus,
     pub learning: HarnessLearningStatus,
+    pub skills: HarnessSkillStatus,
     pub plugins: HarnessPluginStatus,
     pub logs: HarnessOperationalLogStatus,
     pub warnings: Vec<String>,
@@ -345,6 +348,17 @@ pub struct HarnessLearningStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HarnessSkillStatus {
+    pub status: SkillDoctorStatus,
+    pub summary: SkillDoctorSummary,
+    pub findings: usize,
+    pub error_findings: usize,
+    pub warning_findings: usize,
+    pub doctor_receipts_file: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HarnessPluginStatus {
     pub catalog_file: PathBuf,
     pub catalog_present: bool,
@@ -506,12 +520,14 @@ pub fn collect_harness_status(options: HarnessStatusOptions) -> io::Result<Harne
     let cron_runs = cron_runs_status(&options.harness_home)?;
     let memory = memory_status(&options.harness_home)?;
     let learning = learning_status(&options.harness_home)?;
+    let skills = skill_status(&options.harness_home, &mut warnings)?;
     let plugins = plugin_status(&options.harness_home)?;
+    let ready = readiness.ready && skills.status != SkillDoctorStatus::Error;
 
     Ok(HarnessStatusReport {
         schema: HARNESS_STATUS_SCHEMA,
         harness_home: options.harness_home,
-        ready: readiness.ready,
+        ready,
         readiness,
         runtime,
         channels,
@@ -521,6 +537,7 @@ pub fn collect_harness_status(options: HarnessStatusOptions) -> io::Result<Harne
         cron_runs,
         memory,
         learning,
+        skills,
         plugins,
         logs,
         warnings,
@@ -558,6 +575,40 @@ fn learning_status(harness_home: &Path) -> io::Result<HarnessLearningStatus> {
         skill_usage_snapshot_file: snapshot_file,
         skill_proposals: jsonl_status(skill_proposals_file(harness_home))?,
         skill_apply_receipts: jsonl_status(skill_apply_receipts_file(harness_home))?,
+    })
+}
+
+fn skill_status(harness_home: &Path, warnings: &mut Vec<String>) -> io::Result<HarnessSkillStatus> {
+    let report = run_skill_doctor(SkillDoctorOptions {
+        harness_home: harness_home.to_path_buf(),
+        write_receipt: false,
+        now_ms: epoch_ms().unwrap_or(0),
+    })?;
+    if report.status == SkillDoctorStatus::Error {
+        warnings
+            .push("skill doctor reports errors; autonomous skill apply is not ready".to_string());
+    } else if report.status == SkillDoctorStatus::Warn {
+        warnings.push(
+            "skill doctor reports warnings; inspect status.skills before cutover".to_string(),
+        );
+    }
+    let error_findings = report
+        .findings
+        .iter()
+        .filter(|finding| finding.status == SkillDoctorStatus::Error)
+        .count();
+    let warning_findings = report
+        .findings
+        .iter()
+        .filter(|finding| finding.status == SkillDoctorStatus::Warn)
+        .count();
+    Ok(HarnessSkillStatus {
+        status: report.status,
+        summary: report.summary,
+        findings: report.findings.len(),
+        error_findings,
+        warning_findings,
+        doctor_receipts_file: skill_doctor_receipts_file(harness_home),
     })
 }
 
@@ -2886,6 +2937,9 @@ mod tests {
                 .copied(),
             Some(true)
         );
+        assert_eq!(report.skills.status, SkillDoctorStatus::Warn);
+        assert_eq!(report.skills.summary.total_skills, 0);
+        assert_eq!(report.skills.warning_findings, 1);
 
         let _ = fs::remove_dir_all(root);
     }

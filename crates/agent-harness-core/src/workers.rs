@@ -15,8 +15,9 @@ use crate::{
     RuntimeQueueItemStatus, RuntimeQueueSource, RuntimeQueueSourceKind,
     SelfImprovementNotificationTarget, SelfImprovementReviewMode, SkillApplyOptions,
     SkillLearningProposalOperation, SkillLearningProposalStatus, SkillLearningSignal,
-    SkillProposeOptions, append_harness_log, append_self_improvement_notification,
-    apply_skill_proposal, build_self_improvement_replacement_body, collect_cron_run_summary,
+    SkillProposeOptions, SkillSynthesisOptions, append_harness_log,
+    append_self_improvement_notification, apply_skill_proposal,
+    build_self_improvement_replacement_body, collect_cron_run_summary,
     config::{
         HarnessConfigValidationReport, HarnessConfigValidationStatus, validate_harness_config,
     },
@@ -33,6 +34,7 @@ use crate::{
         SubagentLifecycleRecordOptions, SubagentLifecycleShowOptions, SubagentLifecycleState,
         record_subagent_lifecycle, show_subagent_lifecycle,
     },
+    synthesize_skill,
 };
 
 const WORKER_STORE_SCHEMA: &str = "agent-harness.worker-store.v1";
@@ -217,6 +219,7 @@ pub enum WorkerJobKind {
     MemoryMaintenance,
     MemoryEmbeddingBackfill,
     LearningReview,
+    SkillSynthesis,
     PluginCall,
 }
 
@@ -230,6 +233,7 @@ impl WorkerJobKind {
             Self::MemoryMaintenance => "memory_maintenance",
             Self::MemoryEmbeddingBackfill => "memory_embedding_backfill",
             Self::LearningReview => "learning_review",
+            Self::SkillSynthesis => "skill_synthesis",
             Self::PluginCall => "plugin_call",
         }
     }
@@ -242,6 +246,7 @@ impl WorkerJobKind {
             Self::MemoryMaintenance => "maintenance",
             Self::MemoryEmbeddingBackfill => "memory_embedding_backfill",
             Self::LearningReview => "learning_review",
+            Self::SkillSynthesis => "skill_synthesis",
             Self::PluginCall => "plugin",
         }
     }
@@ -262,6 +267,9 @@ impl std::str::FromStr for WorkerJobKind {
             }
             "learning_review" | "learning-review" | "skill-learning-review" => {
                 Ok(Self::LearningReview)
+            }
+            "skill_synthesis" | "skill-synthesis" | "skill-synthesis-review" => {
+                Ok(Self::SkillSynthesis)
             }
             "plugin_call" | "plugin-call" => Ok(Self::PluginCall),
             other => Err(format!("unsupported worker job kind: {other}")),
@@ -1336,6 +1344,7 @@ fn execute_worker_job(
             run_memory_embedding_backfill_job(harness_home, job, now_ms)
         }
         WorkerJobKind::LearningReview => run_learning_review_job(harness_home, job, now_ms),
+        WorkerJobKind::SkillSynthesis => run_skill_synthesis_job(harness_home, job, now_ms),
         WorkerJobKind::MemoryMaintenance | WorkerJobKind::PluginCall => {
             Ok(WorkerJobExecutionResult {
                 status: WorkerJobStatus::Succeeded,
@@ -1490,6 +1499,71 @@ fn run_learning_review_job(
             "review": report,
             "mode": mode.as_str(),
             "applyReports": apply_reports,
+        })),
+    })
+}
+
+fn run_skill_synthesis_job(
+    harness_home: &Path,
+    job: &WorkerJob,
+    now_ms: i64,
+) -> io::Result<WorkerJobExecutionResult> {
+    let skill_id = string_path_any(&job.payload, &["skillId", "skill_id", "targetSkillId"])
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "skill synthesis job requires skillId",
+            )
+        })?
+        .to_string();
+    let task_summary = string_path_any(
+        &job.payload,
+        &["taskSummary", "task_summary", "summary", "text"],
+    )
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "skill synthesis job requires taskSummary or summary",
+        )
+    })?
+    .to_string();
+    let evidence = string_path_any(&job.payload, &["evidence", "signalText", "signal_text"])
+        .unwrap_or("")
+        .to_string();
+    let propose_only = bool_payload(&job.payload, &["proposeOnly", "propose_only"], false);
+    let report = synthesize_skill(SkillSynthesisOptions {
+        harness_home: harness_home.to_path_buf(),
+        skill_id,
+        task_summary,
+        evidence,
+        propose_only,
+        now_ms,
+    })?;
+    let apply_decision = report.autonomous_apply.as_ref().map(|apply| apply.decision);
+    let apply_status = report
+        .autonomous_apply
+        .as_ref()
+        .map(|apply| apply.apply_report.status);
+    let applied_path = report.target_path.clone();
+    Ok(WorkerJobExecutionResult {
+        status: WorkerJobStatus::Succeeded,
+        reason: if report.autonomous_apply.is_some() {
+            "skill synthesis autonomously reviewed and applied proposal".to_string()
+        } else {
+            "skill synthesis recorded proposal without apply".to_string()
+        },
+        audit_path: Some(skill_learning_audit_path(harness_home)),
+        artifact_refs: Some(json!({
+            "proposalId": report.proposal.proposal_id,
+            "targetPath": applied_path,
+            "synthesisReceipts": report.receipts_file,
+            "proposals": crate::skill_proposals_file(harness_home),
+            "autonomousApplyReceipts": crate::skill_autonomous_apply_receipts_file(harness_home),
+        })),
+        result: Some(json!({
+            "synthesis": report,
+            "autonomousApplyDecision": apply_decision,
+            "applyStatus": apply_status,
         })),
     })
 }
@@ -3297,6 +3371,62 @@ mod tests {
         let result = run.result.unwrap();
         assert_eq!(result.status, WorkerJobStatus::Succeeded);
         assert!(result.audit_path.unwrap().is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_synthesis_worker_autonomously_creates_agent_skill() {
+        let root = temp_root("skill_synthesis_worker_autonomously_creates_agent_skill");
+        let harness_home = root.join(".agent-harness");
+        enqueue_worker_job(WorkerEnqueueOptions {
+            harness_home: harness_home.clone(),
+            kind: WorkerJobKind::SkillSynthesis,
+            lane: Some("skill_synthesis".to_string()),
+            payload: json!({
+                "skillId": "agent-created:follow-up-debugging",
+                "taskSummary": "Debug repeated follow-up failures with focused receipts",
+                "evidence": "Tests: follow_up_debugging_replay_green",
+            }),
+            idempotency_key: Some("skill-synthesis:queue-synth-1".to_string()),
+            parent_job_id: None,
+            job_group_id: Some("queue-synth-1".to_string()),
+            master_agent_id: Some("main".to_string()),
+            master_session_key: Some("session-1".to_string()),
+            wake_policy: None,
+            source: Some("runtime-completion-skill-synthesis".to_string()),
+            priority: 0,
+            available_at_ms: Some(1000),
+            max_attempts: 1,
+            timeout_ms: Some(DEFAULT_TIMEOUT_MS),
+            cascade_timeout_ms: None,
+            rate_key: Some("skill-synthesis:follow-up-debugging".to_string()),
+            concurrency_group_key: Some("skill-synthesis:follow-up-debugging".to_string()),
+            now_ms: 1000,
+        })
+        .unwrap();
+
+        let run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("skill_synthesis".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1001,
+        })
+        .unwrap();
+
+        assert_eq!(run.status, WorkerRunOnceStatus::Completed);
+        let result = run.result.unwrap();
+        assert_eq!(result.status, WorkerJobStatus::Succeeded);
+        assert!(
+            harness_home
+                .join("skills")
+                .join("agent-created")
+                .join("follow-up-debugging")
+                .join(crate::SKILL_FILE_NAME)
+                .is_file()
+        );
+        assert!(crate::skill_autonomous_apply_receipts_file(&harness_home).is_file());
 
         let _ = fs::remove_dir_all(root);
     }

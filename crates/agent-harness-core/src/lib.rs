@@ -40,6 +40,7 @@ pub mod memory_contracts;
 pub mod memory_owner;
 pub mod memory_pack;
 pub mod metrics;
+pub mod nudge;
 pub mod operation_plan;
 pub mod ops;
 pub mod progress;
@@ -56,10 +57,17 @@ pub mod runtime_worker;
 pub mod security;
 pub mod self_improvement;
 pub mod skill_apply;
+pub mod skill_curator;
+pub mod skill_doctor;
 pub mod skill_envelope;
+pub mod skill_guard;
 pub mod skill_learning;
+pub mod skill_lint;
 pub mod skill_matcher;
+pub mod skill_pack;
+pub mod skill_synthesis;
 pub mod skill_usage;
+pub mod skill_view;
 pub mod skills;
 pub mod status;
 pub mod subagent_lifecycle;
@@ -227,8 +235,8 @@ pub use harness_skills::{
     builtin_harness_skill_manifest_file, sync_builtin_harness_skills,
 };
 pub use health::{
-    HealthzLoop, HealthzOptions, HealthzOutbox, HealthzQueue, HealthzReport, HealthzState,
-    collect_healthz,
+    HealthzLoop, HealthzOptions, HealthzOutbox, HealthzQueue, HealthzReport, HealthzSkills,
+    HealthzState, collect_healthz,
 };
 pub use importer::{
     ConfigSemantics, ConflictPolicy, DryRunImportOptions, ExecuteImportOptions, ImportAction,
@@ -372,6 +380,11 @@ pub use memory_pack::{
     retrieve_pack_artifact, validate_pack_canary_schema, write_pack_strategy_config,
 };
 pub use metrics::{HarnessMetricsOptions, HarnessMetricsReport, collect_harness_metrics};
+pub use nudge::{
+    NudgeConfig, NudgeDueInfo, PerSessionNudgeState, advance_learning_nudge_counters,
+    learning_nudge_state_file, load_memory_nudge_config, load_skill_nudge_config,
+    reset_session_nudge_state, should_trigger_nudge,
+};
 pub use operation_plan::{
     CreateOperationPlanOptions, OperationPlan, OperationPlanAddItemOptions,
     OperationPlanAddItemReport, OperationPlanBlockOptions, OperationPlanBlockReport,
@@ -475,15 +488,33 @@ pub use self_improvement::{
     run_self_improvement_review_hook, self_improvement_review_receipts_file,
 };
 pub use skill_apply::{
-    SkillApplyOptions, SkillApplyReport, SkillApplyStatus, SkillProposalActionOptions,
+    SkillApplyOptions, SkillApplyReport, SkillApplyStatus, SkillAutonomousApplyOptions,
+    SkillAutonomousApplyReport, SkillAutonomousReviewDecision, SkillProposalActionOptions,
     SkillProposalActionReport, SkillProposalActionStatus, SkillProposalListOptions,
-    SkillProposalListReport, apply_skill_proposal, list_skill_proposals, reject_skill_proposal,
-    skill_apply_receipts_file,
+    SkillProposalListReport, apply_skill_proposal, autonomous_apply_skill_proposal,
+    list_skill_proposals, reject_skill_proposal, skill_apply_receipts_file,
+    skill_autonomous_apply_receipts_file,
+};
+pub use skill_curator::{
+    SkillCuratorOptions as SkillLifecycleCuratorOptions,
+    SkillCuratorReport as SkillLifecycleCuratorReport, SkillLifecycleRecord, SkillLifecycleState,
+    SkillLifecycleStore, SkillPinOptions, SkillPinReport, SkillRestoreOptions, SkillRestoreReport,
+    mark_skill_archived, move_skill_to_archive, read_skill_lifecycle_store,
+    restore_skill_from_archive, run_skill_curator as run_skill_lifecycle_curator, set_skill_pin,
+    skill_curator_receipts_dir, skill_lifecycle_file,
+};
+pub use skill_doctor::{
+    SkillDoctorFinding, SkillDoctorOptions, SkillDoctorReport, SkillDoctorStatus,
+    SkillDoctorSummary, run_skill_doctor, skill_doctor_receipts_file,
 };
 pub use skill_envelope::{
     SKILL_INVOCATION_ENVELOPE_SCHEMA, SkillEnvelopeError, SkillInvocationEnvelope,
     extract_user_instruction_from_skill_envelope, render_skill_invocation_envelope,
     skill_body_checksum, strip_skill_envelopes_for_memory,
+};
+pub use skill_guard::{
+    SkillGuardFinding, SkillGuardOptions, SkillGuardReport, SkillGuardVerdict, run_skill_guard,
+    skill_guard_receipts_file,
 };
 pub use skill_learning::{
     LearningReviewOptions, LearningReviewReport, SkillArchiveOptions, SkillCuratorOptions,
@@ -492,12 +523,26 @@ pub use skill_learning::{
     build_self_improvement_replacement_body, create_skill_archive_proposal,
     create_skill_learning_proposal, run_learning_review, run_skill_curator, skill_proposals_file,
 };
+pub use skill_lint::{
+    SkillLintFinding, SkillLintOptions, SkillLintReport, SkillLintSeverity, SkillLintStatus,
+    SkillLintSummary, lint_skill_file, skill_lint_receipts_file,
+};
 pub use skill_matcher::{SkillMatcherInfo, skill_matcher_info};
+pub use skill_pack::{
+    SkillPackAction, SkillPackConflictPolicy, SkillPackExportOptions, SkillPackImportOptions,
+    SkillPackLock, SkillPackManifest, SkillPackManifestSkill, SkillPackRemoveOptions,
+    SkillPackReport, SkillPackStatus, export_skill_pack, import_skill_pack, remove_skill_pack,
+    skill_pack_lock_file, skill_pack_receipts_file,
+};
+pub use skill_synthesis::{
+    SkillSynthesisOptions, SkillSynthesisReport, skill_synthesis_receipts_file, synthesize_skill,
+};
 pub use skill_usage::{
     SkillUsageAction, SkillUsageEventOptions, SkillUsageProvenance, SkillUsageRecord,
     SkillUsageReport, SkillUsageSnapshot, collect_skill_usage_snapshot, record_skill_usage_event,
     record_skill_usage_from_prompt_bundle, skill_usage_events_file, skill_usage_snapshot_file,
 };
+pub use skill_view::{SkillViewOptions, SkillViewReport, view_skill};
 pub use skills::{
     HARNESS_BUILTIN_SKILL_NAMESPACE, SKILL_SELECTION_RECEIPT_SCHEMA, SkillDeliveryMode,
     SkillFrontmatter, SkillIndex, SkillIndexFile, SkillIndexOrigin, SkillIndexSummary, SkillRecord,
@@ -511,8 +556,8 @@ pub use status::{
     GatewayRestartServiceStatus, GatewayRestartStatusReport, HarnessChannelStatus,
     HarnessCronSchedulerStatus, HarnessJsonlStatus, HarnessLearningStatus, HarnessMemoryStatus,
     HarnessOperationalLogStatus, HarnessOutboxStatus, HarnessPluginStatus,
-    HarnessRuntimeReceiptStatus, HarnessRuntimeStatus, HarnessStatusOptions, HarnessStatusReport,
-    collect_gateway_restart_status, collect_harness_status,
+    HarnessRuntimeReceiptStatus, HarnessRuntimeStatus, HarnessSkillStatus, HarnessStatusOptions,
+    HarnessStatusReport, collect_gateway_restart_status, collect_harness_status,
 };
 pub use subagent_lifecycle::{
     SubagentLifecycleCleanup, SubagentLifecycleCloseOptions, SubagentLifecycleReceipt,

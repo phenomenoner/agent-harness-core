@@ -61,13 +61,28 @@ The authoritative in-code registry is `agent_harness_core::quality::schema_regis
 | `agent-harness.operation-plan-event.v1` | `operation_plan` | Append-only plan event records; additive fields only in v1. | Implemented in staging. |
 | `agent-harness.operation-plan-comment.v1` | `operation_plan` | Append-only comments; additive fields only in v1. | Implemented in staging. |
 | `agent-harness.operation-plan-receipt.v1` | `operation_plan` | Append-only receipts; idempotency keys and action names remain stable in v1. | Implemented in staging. |
+| `agent-harness.builtin-skill-sync.v1` | `harness_skills` | Builtin skill sync receipts are additive; user-modified skills remain protected unless forced. | Skill ecosystem staged contract. |
+| `agent-harness.builtin-skill-manifest.v1` | `harness_skills` | Builtin manifest entries keep skill id, path, version, and fingerprint stable in v1. | Skill ecosystem staged contract. |
+| `agent-harness.skill-index.v1` | `skills` | Skill index output may add summary facets in v1; skill ids, source kinds, paths, checksums, and frontmatter fields remain stable evidence anchors. | Skill ecosystem staged contract. |
 | `agent-harness.skill-invocation-envelope.v1` | `skill_envelope` | Byte-framed envelope with declared lengths/checksum; parser must ignore nested sentinel text inside body bytes. | Implemented in staging. |
-| `agent-harness.skill-selection.v1` | `skills` | Append-only selection receipts with matcher metadata, delivery mode, body checksum, score components, and deterministic tie-breaks. | Implemented in staging. |
+| `agent-harness.skill-selection.v1` | `skills` | Append-only selection receipts with matcher metadata, delivery mode, body checksum, score components, and deterministic tie-breaks. | Matcher v3 uses tokenizer `mixed-v1` and adds CJK, tag/category, FTS, usage-prior, and catalog metadata fields without a schema break. |
 | `agent-harness.prompt-injection-ledger.v2` | `prompt` | V2 skill entries are keyed by session, agent, skill id, body checksum, and delivery mode; v1 path/fingerprint ledgers remain readable for migration. | Implemented in staging. |
 | `agent-harness.skill-usage.v1` | `skill_usage` | Append-only skill usage/provenance JSONL; action enum additions require status and curator compatibility tests. | Implemented in staging. |
-| `agent-harness.skill-usage-snapshot.v1` | `skill_usage` | Derived compact status/curator artifact rebuildable from `skill-usage.jsonl`. | Implemented in staging. |
-| `agent-harness.skill-proposal.v1` | `skill_learning` | Append-only proposal state records; apply remains checksum-guarded and operator-mediated. | Implemented in staging. |
+| `agent-harness.skill-usage-snapshot.v1` | `skill_usage` | Derived compact status/curator artifact rebuildable from `skill-usage.jsonl`. | Adds by-skill action counters for bounded usage-prior scoring. |
+| `agent-harness.skill-lint-receipt.v1` | `skill_lint` | Append-only lint receipts; finding codes and severities are additive in v1. | Skill ecosystem staged contract. |
+| `agent-harness.skill-guard-receipt.v1` | `skill_guard` | Append-only guard receipts; verdict semantics safe/caution/dangerous remain stable in v1. | Skill ecosystem staged contract. |
+| `agent-harness.skill-lifecycle.v1` | `skill_curator` | State JSON may add lifecycle metadata in v1; archive remains restorable move semantics. | Skill ecosystem staged contract. |
+| `agent-harness.skill-curator.v1` | `skill_curator` | Per-run reports are additive; dry-run must not mutate skill files. | Skill ecosystem staged contract. |
+| `agent-harness.skill-restore.v1` | `skill_curator` | Restore receipts are additive; archive source and restored target paths remain stable in v1. | Skill ecosystem staged contract. |
+| `agent-harness.skill-pin.v1` | `skill_curator` | Pin receipts are additive; pinned/unpinned state remains the lifecycle protection contract in v1. | Skill ecosystem staged contract. |
+| `agent-harness.skill-pack.v1` | `skill_pack` | Pack manifest is checksum-guarded; additive manifest fields are allowed in v1. | Skill ecosystem staged contract. |
+| `agent-harness.skill-pack-lock.v1` | `skill_pack` | Lockfile may add metadata in v1; installed path checksum entries remain stable. | Skill ecosystem staged contract. |
+| `agent-harness.skill-pack-receipt.v1` | `skill_pack` | Import/export/remove receipts are additive; installed path and checksum evidence remains stable in v1. | Skill ecosystem staged contract. |
+| `agent-harness.skill-synthesis-receipt.v1` | `skill_synthesis` | Append-only synthesis receipts; proposal ids and target paths are stable evidence anchors. | Skill ecosystem staged contract. |
+| `agent-harness.skill-autonomous-apply-receipt.v1` | `skill_apply` | Append-only autonomous review receipts; approve, quarantine, and blocked decisions are stable in v1. | Skill ecosystem staged contract; autonomous review/apply is the default synthesis path unless `--propose-only` is requested. |
+| `agent-harness.skill-proposal.v1` | `skill_learning` | Append-only proposal state records; apply remains checksum-guarded and may be operator-approved or autonomously reviewed/applied. | Implemented in staging. |
 | `agent-harness.skill-apply-receipt.v1` | `skill_apply` | Append-only apply receipts; stale-base quarantine and backup-before-mutation semantics are stable in v1. | Implemented in staging. |
+| `agent-harness.skill-doctor.v1` | `skill_doctor` | Aggregate health reports are additive in v1; non-receipt read-only runs preserve report shape. | Skill ecosystem staged contract. |
 | `agent-harness.learning-review.v1` | `skill_learning` | Deterministic learning-review report; worker jobs may propose but never mutate skill files directly. | Implemented in staging. |
 | `agent-harness.self-improvement-review.v1` | `self_improvement` | Append-only review hook receipts; apply mode aliases are additive and replacements remain checksum-guarded. | Implemented in staging. |
 | `agent-harness.drift-report.v1` | `autonomy` | Additive fields only in v1. | Implemented in staging. |

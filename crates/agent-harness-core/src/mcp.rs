@@ -110,6 +110,7 @@ fn supported_tools() -> Vec<&'static str> {
         "harness.healthz",
         "harness.trace",
         "harness.vision_analyze",
+        "skill_view",
         "mem_status",
         "mem_search",
         "mem_pack",
@@ -126,6 +127,7 @@ fn tool_description(name: &str) -> &'static str {
         "harness.vision_analyze" => {
             "Analyze a harness-contained inbound image artifact by artifactUri or localPath."
         }
+        "skill_view" => "Return a skill body or support file with traversal guards.",
         "mem_status" => {
             "Return sanitized OpenClawMem adapter status, capability, and readiness metadata."
         }
@@ -146,6 +148,7 @@ fn tool_description(name: &str) -> &'static str {
 fn call_tool(options: &McpRequestOptions, id: Value, tool: &str) -> (Value, McpToolReceipt) {
     match tool {
         "harness.vision_analyze" => call_vision_analyze(options, id, tool),
+        "skill_view" => call_skill_view(options, id, tool),
         "mem_status" => call_mem_status(options, id, tool),
         "mem_search" => call_mem_search(options, id, tool),
         "mem_pack" => call_mem_pack(options, id, tool),
@@ -167,6 +170,73 @@ fn call_tool(options: &McpRequestOptions, id: Value, tool: &str) -> (Value, McpT
                 allowed: true,
                 status: "called".to_string(),
                 reason: "tool call passed allow-list and budget preflight placeholder".to_string(),
+            },
+        ),
+    }
+}
+
+fn call_skill_view(options: &McpRequestOptions, id: Value, tool: &str) -> (Value, McpToolReceipt) {
+    let Some(harness_home) = options.harness_home.as_ref() else {
+        return error_response(id, -32602, "skill_view requires harness_home", Some(tool));
+    };
+    let arguments = options
+        .request
+        .pointer("/params/arguments")
+        .unwrap_or(&Value::Null);
+    let Some(skill_id) = arguments
+        .get("skill")
+        .or_else(|| arguments.get("skillId"))
+        .or_else(|| arguments.get("name"))
+        .and_then(Value::as_str)
+    else {
+        return error_response(id, -32602, "skill_view requires skill", Some(tool));
+    };
+    let file = arguments
+        .get("file")
+        .or_else(|| arguments.get("filePath"))
+        .or_else(|| arguments.get("file_path"))
+        .and_then(Value::as_str)
+        .map(std::path::PathBuf::from);
+    match crate::view_skill(crate::SkillViewOptions {
+        harness_home: harness_home.clone(),
+        skill_id: skill_id.to_string(),
+        file,
+        now_ms: crate::current_log_time_ms().unwrap_or(0),
+    }) {
+        Ok(report) => (
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [
+                        { "type": "text", "text": report.content }
+                    ],
+                    "isError": false
+                }
+            }),
+            McpToolReceipt {
+                tool: Some(tool.to_string()),
+                allowed: true,
+                status: "called".to_string(),
+                reason: "skill_view read completed".to_string(),
+            },
+        ),
+        Err(error) => (
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [
+                        { "type": "text", "text": error.to_string() }
+                    ],
+                    "isError": true
+                }
+            }),
+            McpToolReceipt {
+                tool: Some(tool.to_string()),
+                allowed: true,
+                status: "failed".to_string(),
+                reason: "skill_view read failed".to_string(),
             },
         ),
     }
@@ -755,6 +825,53 @@ mod tests {
         assert!(text.contains(r#""width":4"#));
         assert!(text.contains(r#""height":5"#));
         assert!(!text.contains("file_id"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_skill_view_reads_body_and_blocks_traversal() {
+        let root = temp_root("mcp_skill_view_reads_body_and_blocks_traversal");
+        let harness_home = root.join(".agent-harness");
+        let skill = harness_home
+            .join("skills")
+            .join("agent-created")
+            .join("general")
+            .join("demo");
+        fs::create_dir_all(skill.join("references")).unwrap();
+        fs::write(
+            skill.join(crate::SKILL_FILE_NAME),
+            "# Demo\n\nUse this skill.\n",
+        )
+        .unwrap();
+        fs::write(skill.join("references").join("ok.md"), "ok").unwrap();
+
+        let (response, receipt) = handle_mcp_request(McpRequestOptions {
+            request: json!({"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"skill_view","arguments":{"skill":"demo"}}}),
+            allowed_tools: BTreeSet::from(["skill_view".to_string()]),
+            harness_home: Some(harness_home.clone()),
+        });
+
+        assert!(receipt.allowed);
+        assert_eq!(receipt.status, "called");
+        assert!(
+            response
+                .pointer("/result/content/0/text")
+                .and_then(Value::as_str)
+                .unwrap()
+                .contains("Use this skill")
+        );
+
+        let (blocked, blocked_receipt) = handle_mcp_request(McpRequestOptions {
+            request: json!({"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"skill_view","arguments":{"skill":"demo","file":"../secret.md"}}}),
+            allowed_tools: BTreeSet::from(["skill_view".to_string()]),
+            harness_home: Some(harness_home),
+        });
+        assert_eq!(blocked_receipt.status, "failed");
+        assert_eq!(
+            blocked.pointer("/result/isError").and_then(Value::as_bool),
+            Some(true)
+        );
 
         let _ = fs::remove_dir_all(root);
     }

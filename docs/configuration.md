@@ -14,6 +14,80 @@ Agent Harness Core reads most operator state from a harness home directory suppl
 
 Use `--source-home` for imported prompt files, registry, skills, and legacy context. Use `--runtime-workspace` only for the Codex working directory. Prompt assembly falls back to the imported source workspace when the runtime workspace does not contain prompt files.
 
+## Skill Ecosystem
+
+`skills/` is indexed from operator-authored, imported, bundled, agent-created, and pack namespaces. Category subdirectories are supported one level below each root, and `.archive/` or other dot directories are excluded from discovery.
+
+`harness-config.json` can configure the skill matcher, catalog, taxonomy, lint, guard, synthesis, nudges, and curator. Defaults keep mutation paths proposal-mediated, autonomous-first, and checksum guarded:
+
+```json
+{
+  "skills": {
+    "matcher": {
+      "ftsEnabled": true,
+      "usagePriorEnabled": true,
+      "minScore": 0
+    },
+    "catalog": {
+      "enabled": true,
+      "limit": 8
+    },
+    "taxonomy": {
+      "categories": [
+        "operations",
+        "channels",
+        "memory",
+        "runtime",
+        "trading",
+        "research",
+        "media",
+        "development",
+        "self-improvement",
+        "general"
+      ]
+    },
+    "guard": {
+      "agentCreated": true,
+      "packPolicy": "default"
+    },
+    "lint": {
+      "enforceOnApply": true
+    }
+  },
+  "learning": {
+    "skillSynthesis": {
+      "enabled": true,
+      "mode": "auto",
+      "dailyCap": 3,
+      "minToolCalls": 5,
+      "minAssistantChars": 600
+    },
+    "skillNudge": {
+      "enabled": true,
+      "turnInterval": 8
+    },
+    "memoryNudge": {
+      "enabled": true,
+      "turnInterval": 6
+    },
+    "curator": {
+      "enabled": true,
+      "mode": "propose",
+      "intervalHours": 168,
+      "staleAfterDays": 30,
+      "archiveAfterDays": 90,
+      "consolidate": true,
+      "minClusterSize": 2,
+      "includeNamespaces": ["agent-created"]
+    }
+  }
+}
+```
+
+`learning.skillSynthesis.mode = "auto"` is the default skill-learning posture: a complex successful turn that did not use a matching skill can enqueue a `skill_synthesis` worker job, generate a proposal, run autonomous lint/guard review, and apply approved agent-created skills through the normal checksum/backup receipt path. Use `"propose-only"` only when the operator wants synthesis proposals recorded without autonomous apply.
+
+Unknown taxonomy categories do not fail config validation; `skill-lint` reports category quality issues so operators can add categories without breaking older binaries. `skill-view` can print a selected skill body or support file and records a `viewed` usage event.
+
 ## Memory Bridge
 
 When `mem-engine` is the active memory owner, the harness can route status,

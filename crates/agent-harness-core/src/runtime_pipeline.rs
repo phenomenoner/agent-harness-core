@@ -29,11 +29,11 @@ use crate::{
     ResponseToneContext, RuntimeContinuationMetadata, RuntimeExecutionReceiptStatus,
     RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeQueuePreparedItem,
     SelfImprovementNotificationTarget, SelfImprovementReviewHookOptions,
-    VirtualSessionTerminalOptions, append_agent_progress_event, append_harness_log,
-    apply_response_tone, attachment_kind_from_path, continuation_session_key, current_log_time_ms,
-    evaluate_outbound_media_path, inspect_runtime_backoff_policy, is_deliverable_media_path,
-    load_assistant_narration_config, load_context_rollover_config, load_harness_media_config,
-    load_response_tone_config, mark_cron_run_runtime_status_by_queue_id,
+    VirtualSessionTerminalOptions, advance_learning_nudge_counters, append_agent_progress_event,
+    append_harness_log, apply_response_tone, attachment_kind_from_path, continuation_session_key,
+    current_log_time_ms, evaluate_outbound_media_path, inspect_runtime_backoff_policy,
+    is_deliverable_media_path, load_assistant_narration_config, load_context_rollover_config,
+    load_harness_media_config, load_response_tone_config, mark_cron_run_runtime_status_by_queue_id,
     mark_virtual_session_terminal, plan_codex_runtime, prepare_runtime_queue_item,
     read_channel_session_state, record_completed_turn_working_set_snapshot,
     record_memory_lifecycle_turn, record_skill_usage_from_prompt_bundle,
@@ -232,6 +232,66 @@ fn should_run_self_improvement_hook(
         && !codex_plan
             .map(|plan| plan.continuation.should_suppress_self_improvement())
             .unwrap_or(false)
+}
+
+fn count_transcript_tool_calls(path: Option<&Path>) -> usize {
+    let Some(path) = path else {
+        return 0;
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return 0;
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(json_value_mentions_tool_call)
+        .count()
+}
+
+fn count_prompt_bundle_sections(path: &Path) -> usize {
+    let Ok(text) = fs::read_to_string(path) else {
+        return 0;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return 0;
+    };
+    value
+        .get("sections")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn json_value_mentions_tool_call(value: &Value) -> bool {
+    if value
+        .get("item_type")
+        .or_else(|| value.get("itemType"))
+        .or_else(|| value.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(is_tool_call_type)
+    {
+        return true;
+    }
+    if value
+        .get("method")
+        .and_then(Value::as_str)
+        .is_some_and(|method| method.contains("tool") || method == "item/started")
+        && value
+            .get("item")
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(is_tool_call_type)
+    {
+        return true;
+    }
+    value.get("item").is_some_and(json_value_mentions_tool_call)
+}
+
+fn is_tool_call_type(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    normalized.contains("tool")
+        || normalized == "commandexecution"
+        || normalized == "function_call"
+        || normalized == "functioncall"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1198,6 +1258,23 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         && let Some(codex_plan) = plan.plan.as_ref()
         && should_run_self_improvement_hook(receipt.status, &receipt.continuation, Some(codex_plan))
     {
+        if let Some(session_key) = channel_context_for_self_improvement
+            .as_ref()
+            .map(|context| context.session_key.as_str())
+        {
+            let prompt_sections = count_prompt_bundle_sections(&codex_plan.prompt_bundle_json);
+            if let Err(error) = advance_learning_nudge_counters(
+                &options.harness_home,
+                session_key,
+                prompt_sections,
+                current_log_time_ms()?,
+            ) {
+                warnings.push(format!("learning nudge counter update failed: {error}"));
+            }
+        } else {
+            warnings
+                .push("learning nudge counter update skipped: no channel session key".to_string());
+        }
         let notification_target = channel_context_for_self_improvement
             .as_ref()
             .map(|context| SelfImprovementNotificationTarget {
@@ -1221,6 +1298,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 .map(|context| context.session_key.clone()),
             agent_id: codex_plan.agent_id.clone(),
             notification_target,
+            tool_call_count: count_transcript_tool_calls(run.receipt.transcript_file.as_deref()),
             now_ms: current_log_time_ms()?,
         }) {
             Ok(report) => warnings.extend(report.warnings),

@@ -29,7 +29,7 @@ Delivery discipline:
 
 - Soak window: every deployed phase needs at least one week of live soak before the next deployment window. Development may continue during soak, but deployment waits for green SLOs.
 - Cut line: every phase keeps P0/P1/P2 priority. If scope slips, cut P2 items instead of carrying the whole phase forward.
-- Feature flags: new behavior is config-gated, defaults off unless explicitly decided otherwise, and writes receipts when toggled. Default-on behavior must be limited to safe modes such as learning propose-only, or happen only after soak evidence.
+- Feature flags: new behavior is config-gated, defaults off unless explicitly decided otherwise, and writes receipts when toggled. The skill ecosystem is an explicit exception as of 2026-07-09: autonomous review/apply is first-class when it stays proposal-mediated, lint/guard-gated, checksum/backup-protected, and receipt-backed.
 - Storage rule: queue-like, lease-like, or hot-polled lifecycle state belongs in the SQLite worker store. Entity documents and audit trails stay as JSON documents or JSONL receipts.
 - Schema rule: every new receipt/state schema gets a name, version, compatibility note, and old-version reader for at least one release cycle when a breaking change is introduced.
 - Review-aligned acceptance: every completed backlog item must name the review dimension it improves and leave reviewable evidence: automated tests, deterministic simulation seeds, live soak summary, receipt-chain sample, benchmark, security test fixture, CI result, or operator drill receipt.
@@ -43,7 +43,7 @@ These decisions remove several planning blockers:
 - Unattended Windows operation should follow the service-wrapper recommendation: WinSW/service-wrapper style supervision is the primary target, while Task Scheduler remains a generated fallback/compatibility path.
 - Canary deploy must support fake-only canary. A small live-model canary is optional and stronger, not required when credentials or cost policy make it unsuitable.
 - OpenRouter live smoke should use the legacy OpenClaw source key and `小小梨` agent settings when executed by the live/main-agent operator path. This coding-planning session does not extract secrets or run that smoke unless the operator explicitly provides the exact safe command/channel boundary.
-- Learning loop policy is default-on in safe propose-only mode. Auto-apply is a config option and must remain opt-in per scope. Bundled, imported, and agent-created skills may all be proposed for patch/archive; mutation requires receipts and backups. Direct destructive deletion remains outside the default policy unless an operator explicitly enables it.
+- Learning loop policy was updated on 2026-07-09 for the skill ecosystem: autonomous review/apply is a first-class default path for synthesized agent-created skills. `propose-only` remains an opt-out/operator review mode, while every mutation still requires proposal records, lint/guard review, checksum/backup protection, and receipts. Direct destructive deletion remains outside the default policy unless an operator explicitly enables it.
 - Plugin real invocation policy follows the recommended conservative model: explicit allow-list, timeout, per-agent/per-channel permissions, receipt trail, and fixture coverage before enabling.
 
 ## Staging Implementation Status - 2026-06-12
@@ -61,6 +61,7 @@ Latest staging evidence:
 - `cargo test --workspace --target-dir target\staging-test-workspace` passed with 16 CLI tests, 207 core tests, and 0 doc-tests.
 - `cargo tree --workspace --duplicates` was run locally; the only duplicate tree is `webpki-roots` through `ureq`/TLS. A network-backed advisory audit remains a release gate when `cargo audit` or an equivalent advisory DB is available.
 - No live `.agent-harness` loop was stopped, restarted, or cut over. All tests used staging target dirs.
+- 2026-07-09 skill ecosystem staging evidence added matcher v3/CJK selection, agent-created synthesis worker enqueue, autonomous apply receipts, lint/guard gates, lifecycle archive/restore, packs, `skill-doctor`, status/healthz skills readiness, and a closed-loop selection -> synthesis/apply -> re-selection scenario. Live cutover remains pending explicit operator approval.
 
 ### Item Coverage Matrix
 
@@ -106,7 +107,7 @@ Latest staging evidence:
 | P5.4 Native MCP Server | Scaffold implemented; pending broader fixtures | In-process JSON-RPC handler, `mcp-request` CLI, initialize/list/call/allow-list test. | Long-running stdio server and protocol fixture corpus. |
 | P5.5 Chaining | Scaffold implemented; pending broader fixtures | Task/budget foundations and MCP allow-list preflight exist. | Bounded chaining runner and depth/loop tests. |
 | P5.6 Drift Detection | Implemented/staging-tested | `check_config_drift`, `drift-check` CLI, hash diff test. | Live intended-vs-active config sample. |
-| P5.7 Learning Loop | Implemented/staging-tested | `create_learning_proposal`, `learning-propose` CLI; default propose-only, auto-apply opt-in but still reviewed/quarantined; injection scan test. | Operator review/apply/archive workflow and backup receipts. |
+| P5.7 Learning Loop | Implemented/staging-tested | `create_learning_proposal`, autonomous `skill-synthesize`, `skill_synthesis` worker jobs, proposal/lint/guard/autonomous-apply receipts, `skill-doctor`, and closed-loop skill re-selection tests. `propose-only` remains an explicit opt-out. | Explicit operator approval before live cutover; post-cutover passive receipt soak. |
 | T1 Invariants Catalog | Implemented/staging-tested | `invariant_catalog`, `invariants` CLI, `docs/invariants.md`. | Keep invariant IDs attached to future simulation failures. |
 | T2 Seeded Deterministic Simulation | Scaffold implemented; pending broader fixtures | Invariants and focused race/unit tests exist. | Add seeded crash/interleaving simulation harness with replayable seeds. |
 | T3 Scenario Replay Evals | Scaffold implemented; pending broader fixtures | Trace, prompt golden, security, and queue-shadow fixtures form replay primitives. | Sanitized traffic replay corpus. |
@@ -167,7 +168,7 @@ Minimum evidence bundle for each phase:
 | P2 | Seven-day shadow summary, divergence receipts if any, race tests, performance fixture for large ledgers, backup/compact manifest. | Persistence, concurrency, error recovery, testing |
 | P3 | Scoped `/stop` tests, collect/interrupt tests, burst/admission tests, background registry status sample, long-task heartbeat/blockage receipts. | Concurrency, operations, observability, recovery |
 | P4 | Token reports, golden prompt bundle diffs, >=30% token reduction proof, cache-prefix assertions, recall/skill citation ledger samples. | Token efficiency, observability, testing |
-| P5 | Budget race tests, native MCP protocol fixtures, tool-call latency benchmark, proposal/quarantine receipts, learning-loop default-on/propose-only proof, and auto-apply-off-by-default proof. | Extensibility, safety, maturity, token efficiency |
+| P5 | Budget race tests, native MCP protocol fixtures, tool-call latency benchmark, proposal/quarantine receipts, skill learning default autonomous review/apply proof, and `propose-only` opt-out proof. | Extensibility, safety, maturity, token efficiency |
 | T | `docs/invariants.md`, seeded simulation output, sanitized replay fixtures, restore drill receipt. | Testing, persistence, recovery |
 | M | ContextPack fixtures, ingest idempotency test, MCP memory fail-open proof, tool-description hash drift test, provenance trace sample, full-parity gap ledger for graph/autonomous matching. | Extensibility, security, observability |
 | P6 | Vault migration/rotation proof, shell hardening tests, adversarial injection fixtures, dependency audit, trust-boundary doc. | Security, maturity |
@@ -735,7 +736,7 @@ Acceptance standard:
 
 Implementation steps:
 
-- Add config root with learning enabled by default in safe propose-only mode; auto-apply stays opt-in by config and scope.
+- Add config root with skill learning enabled by default through proposal-mediated autonomous review/apply; `propose-only` stays available as an operator opt-out by config and scope.
 - Implement skill provenance and proposal CLI: `skill-propose`, `skill-apply`, `skill-proposals`, injection scan, never-delete archive, agent-created provenance frontmatter.
 - Append skill usage receipts with selected skills and run outcome.
 - Add transcript/session search using SQLite FTS5 trigram tokenizer for CJK.
@@ -746,7 +747,7 @@ Implementation steps:
 
 Acceptance standard:
 
-- Learning is default-on only for propose-only behavior; auto-apply defaults off and requires explicit config.
+- Skill learning is default-on through autonomous review/apply for synthesized agent-created skills; `propose-only` records proposals without applying them when explicitly configured.
 - Admin DM can propose; lower-trust contexts are quarantined unless explicitly allowed.
 - Bundled, imported, and agent-created skills may all receive patch/archive proposals.
 - Any skill mutation writes backup artifacts and receipts before applying.

@@ -622,10 +622,24 @@ fn skill_index_section(skills: &[SkillSelection]) -> PromptSection {
     let mut content = String::new();
     content.push_str("Selected skill index. This stable region lists matched skills; only sections with deliveryMode=injected-body or deliveryMode=invocation-envelope include full skill bodies in this prompt.\n");
     for skill in skills {
+        let description = skill
+            .description
+            .as_deref()
+            .map(single_line)
+            .unwrap_or_else(|| "(none)".to_string());
+        let category = skill.category.as_deref().unwrap_or("uncategorized");
+        let tags = if skill.tags.is_empty() {
+            "(none)".to_string()
+        } else {
+            skill.tags.join(",")
+        };
         content.push_str(&format!(
-            "- skillId={} title={} source={:?} deliveryMode={} score={} bodyChecksum={} reasons={}\n",
+            "- skillId={} title={} description={} category={} tags={} source={:?} deliveryMode={} score={} bodyChecksum={} reasons={}\n",
             skill.skill_id,
             skill.title,
+            description,
+            category,
+            tags,
             skill.source_kind,
             skill.delivery_mode.as_str(),
             skill.score,
@@ -633,6 +647,9 @@ fn skill_index_section(skills: &[SkillSelection]) -> PromptSection {
             skill.reasons.join("; ")
         ));
     }
+    content.push_str(
+        "To retrieve any listed skill body on a later turn, invoke it with `$<skill-id>` followed by the task instruction.\n",
+    );
     let bytes = content.len();
     PromptSection {
         kind: PromptSectionKind::SkillIndex,
@@ -2053,6 +2070,10 @@ mod tests {
                 .content
                 .contains("deliveryMode=invocation-envelope")
         );
+        assert!(skill_index.content.contains("description="));
+        assert!(skill_index.content.contains("category="));
+        assert!(skill_index.content.contains("tags="));
+        assert!(skill_index.content.contains("$<skill-id>"));
         let skill_section = bundle
             .sections
             .iter()

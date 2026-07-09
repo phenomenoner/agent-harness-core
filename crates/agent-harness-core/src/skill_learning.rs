@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -535,6 +535,21 @@ pub fn validate_skill_target_path(
         ));
     }
     if !skill_dir.is_dir() {
+        if skill_dir
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "skill target path contains traversal",
+            ));
+        }
+        if approved_skill_roots(harness_home)
+            .into_iter()
+            .any(|root| skill_dir.starts_with(root))
+        {
+            return Ok(skill_dir.join(SKILL_FILE_NAME));
+        }
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "skill target directory does not exist",

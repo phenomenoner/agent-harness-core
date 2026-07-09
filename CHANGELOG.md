@@ -1,8 +1,19 @@
 # Changelog
 
-## Unreleased
+## v0.7.0 - 2026-07-09
 
-No unreleased changes.
+### Changed
+
+- Promoted the skill ecosystem to a closed autonomous loop: matcher v3/CJK selection, richer skill metadata, catalog retrieval, `skill-view`, agent-created synthesis, autonomous lint/guard review and apply, lifecycle archive/restore, packs, and `skill-doctor` health checks.
+- Made autonomous skill synthesis/apply the default first-class path for this feature family; `propose-only` remains an explicit opt-out mode.
+- Added `status --json` and `healthz` skill readiness summaries backed by `skill-doctor`.
+- Corrected supervisor reconcile defaults so live `.agent-harness` source workspace resolves to `.agent-harness\workspace`; `runtime-workspace` remains the explicit execution cwd/sandbox root.
+
+### Verification
+
+- Added focused regressions for skill selection, synthesis worker enqueue, autonomous apply, lint/guard gates, lifecycle, packs, doctor, nudge counters, and the closed-loop selection -> synthesis/apply -> re-selection scenario.
+- Passed `cargo fmt --all -- --check` and the full workspace test suite in a staging target directory before tagging.
+- This tag is a checkpoint release: local operator cutover verification passed its initial read-only checks, while the remaining passive live-confirmation and soak windows continue under local operator observation.
 
 ## v0.6.1 - 2026-07-08
 

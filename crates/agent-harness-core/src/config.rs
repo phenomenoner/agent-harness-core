@@ -111,6 +111,7 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
         "supervisor",
         "channelIdentity",
         "liveControlGuard",
+        "skills",
     ];
     let has_known_section = object
         .keys()
@@ -145,6 +146,7 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
             "liveControlGuard" => {
                 validate_live_control_guard_object("$.liveControlGuard", child, errors)
             }
+            "skills" => validate_skills_object("$.skills", child, errors),
             other => errors.push(format!("unknown harness-config key `{other}` at $")),
         }
     }
@@ -820,6 +822,85 @@ fn validate_worker_dispatch_object(path: &str, value: &Value, errors: &mut Vec<S
     }
 }
 
+fn validate_skills_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "matcher" => validate_skill_matcher_object(path_key(path, key), child, errors),
+            "catalog" => validate_skill_catalog_object(path_key(path, key), child, errors),
+            "taxonomy" => validate_skill_taxonomy_object(path_key(path, key), child, errors),
+            "guard" => validate_skill_guard_object(path_key(path, key), child, errors),
+            "lint" => validate_skill_lint_object(path_key(path, key), child, errors),
+            other => errors.push(format!("unknown skills config key `{other}` at {path}")),
+        }
+    }
+}
+
+fn validate_skill_matcher_object(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(&path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "ftsEnabled" | "usagePriorEnabled" => expect_bool(path_key(&path, key), child, errors),
+            "minScore" => expect_u64(path_key(&path, key), child, errors),
+            other => errors.push(format!("unknown skills.matcher key `{other}` at {path}")),
+        }
+    }
+}
+
+fn validate_skill_catalog_object(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(&path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "enabled" => expect_bool(path_key(&path, key), child, errors),
+            "limit" => expect_positive_u64(path_key(&path, key), child, errors),
+            other => errors.push(format!("unknown skills.catalog key `{other}` at {path}")),
+        }
+    }
+}
+
+fn validate_skill_taxonomy_object(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(&path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "categories" => validate_string_array(path_key(&path, key), child, errors),
+            other => errors.push(format!("unknown skills.taxonomy key `{other}` at {path}")),
+        }
+    }
+}
+
+fn validate_skill_guard_object(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(&path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "agentCreated" => expect_bool(path_key(&path, key), child, errors),
+            "packPolicy" => expect_string(path_key(&path, key), child, errors),
+            other => errors.push(format!("unknown skills.guard key `{other}` at {path}")),
+        }
+    }
+}
+
+fn validate_skill_lint_object(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(&path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "enforceOnApply" => expect_bool(path_key(&path, key), child, errors),
+            other => errors.push(format!("unknown skills.lint key `{other}` at {path}")),
+        }
+    }
+}
+
 fn validate_learning_object(path: &str, value: &Value, errors: &mut Vec<String>) {
     let Some(object) = expect_object(path, value, errors) else {
         return;
@@ -827,6 +908,8 @@ fn validate_learning_object(path: &str, value: &Value, errors: &mut Vec<String>)
     for (key, child) in object {
         match key.as_str() {
             "skillLearning"
+            | "skillSynthesis"
+            | "skillNudge"
             | "memoryNudge"
             | "backgroundReview"
             | "selfImprovementReview"
@@ -844,7 +927,7 @@ fn validate_learning_section(path: String, value: &Value, errors: &mut Vec<Strin
     };
     for (key, child) in object {
         match key.as_str() {
-            "enabled" | "usageWeighted" | "notify" => {
+            "enabled" | "usageWeighted" | "notify" | "consolidate" => {
                 expect_bool(path_key(&path, key), child, errors)
             }
             "mode" => expect_enum(
@@ -852,8 +935,11 @@ fn validate_learning_section(path: String, value: &Value, errors: &mut Vec<Strin
                 child,
                 &[
                     "propose-only",
+                    "propose",
                     "propose-record-only",
                     "record-only",
+                    "dry-run",
+                    "dry_run",
                     "dispatch-and-replace",
                     "dispatch-and-replacement",
                     "auto",
@@ -887,9 +973,10 @@ fn validate_learning_section(path: String, value: &Value, errors: &mut Vec<Strin
             ),
             "tokenizer" => expect_enum(path_key(&path, key), child, &["trigram"], errors),
             "provider" => expect_string(path_key(&path, key), child, errors),
-            "turnInterval" | "dailyJobCap" | "dailyCap" | "intervalHours" | "maxSelectedSkills" => {
-                expect_positive_u64(path_key(&path, key), child, errors)
-            }
+            "turnInterval" | "dailyJobCap" | "dailyCap" | "intervalHours" | "maxSelectedSkills"
+            | "minToolCalls" | "minAssistantChars" | "staleAfterDays" | "archiveAfterDays"
+            | "minClusterSize" => expect_positive_u64(path_key(&path, key), child, errors),
+            "includeNamespaces" => validate_string_array(path_key(&path, key), child, errors),
             other => errors.push(format!("unknown learning section key `{other}` at {path}")),
         }
     }
@@ -1430,6 +1517,49 @@ mod tests {
 
         assert_eq!(report.status, HarnessConfigValidationStatus::Valid);
         assert!(report.errors.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validate_harness_config_accepts_skill_ecosystem_sections() {
+        let root = temp_root("validate_harness_config_accepts_skill_ecosystem_sections");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "schema": "agent-harness.config.v1",
+              "skills": {
+                "matcher": { "ftsEnabled": true, "usagePriorEnabled": true, "minScore": 0 },
+                "catalog": { "enabled": true, "limit": 8 },
+                "taxonomy": { "categories": ["operations", "channels", "memory", "runtime", "trading", "research", "media", "development", "self-improvement", "general"] },
+                "guard": { "agentCreated": true, "packPolicy": "default" },
+                "lint": { "enforceOnApply": true }
+              },
+              "learning": {
+                "skillSynthesis": { "enabled": true, "mode": "auto", "dailyCap": 3, "minToolCalls": 5, "minAssistantChars": 600 },
+                "skillNudge": { "enabled": true, "turnInterval": 8 },
+                "memoryNudge": { "enabled": true, "turnInterval": 6 },
+                "curator": {
+                  "enabled": true,
+                  "mode": "propose",
+                  "intervalHours": 168,
+                  "staleAfterDays": 30,
+                  "archiveAfterDays": 90,
+                  "consolidate": true,
+                  "minClusterSize": 2,
+                  "includeNamespaces": ["agent-created"]
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let report = validate_harness_config(&harness_home).unwrap();
+
+        assert_eq!(report.status, HarnessConfigValidationStatus::Valid);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
 
         let _ = fs::remove_dir_all(root);
     }

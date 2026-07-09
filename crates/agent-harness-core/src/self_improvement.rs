@@ -14,6 +14,10 @@ use crate::{
 const SELF_IMPROVEMENT_REVIEW_SCHEMA: &str = "agent-harness.self-improvement-review.v1";
 const SELF_IMPROVEMENT_DEFAULT_DAILY_CAP: usize = 24;
 const SELF_IMPROVEMENT_DEFAULT_MAX_SELECTED_SKILLS: usize = 1;
+const SKILL_SYNTHESIS_DEFAULT_DAILY_CAP: usize = 3;
+const SKILL_SYNTHESIS_DEFAULT_MIN_TOOL_CALLS: usize = 5;
+const SKILL_SYNTHESIS_DEFAULT_MIN_ASSISTANT_CHARS: usize = 600;
+const DAY_MS: i64 = 86_400_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -39,6 +43,11 @@ pub struct SelfImprovementReviewConfig {
     pub notify: bool,
     pub daily_cap: usize,
     pub max_selected_skills: usize,
+    pub skill_synthesis_enabled: bool,
+    pub skill_synthesis_autonomous_apply: bool,
+    pub skill_synthesis_daily_cap: usize,
+    pub skill_synthesis_min_tool_calls: usize,
+    pub skill_synthesis_min_assistant_chars: usize,
     pub warnings: Vec<String>,
 }
 
@@ -50,6 +59,11 @@ impl Default for SelfImprovementReviewConfig {
             notify: true,
             daily_cap: SELF_IMPROVEMENT_DEFAULT_DAILY_CAP,
             max_selected_skills: SELF_IMPROVEMENT_DEFAULT_MAX_SELECTED_SKILLS,
+            skill_synthesis_enabled: true,
+            skill_synthesis_autonomous_apply: true,
+            skill_synthesis_daily_cap: SKILL_SYNTHESIS_DEFAULT_DAILY_CAP,
+            skill_synthesis_min_tool_calls: SKILL_SYNTHESIS_DEFAULT_MIN_TOOL_CALLS,
+            skill_synthesis_min_assistant_chars: SKILL_SYNTHESIS_DEFAULT_MIN_ASSISTANT_CHARS,
             warnings: Vec::new(),
         }
     }
@@ -64,6 +78,7 @@ pub struct SelfImprovementReviewHookOptions {
     pub session_key: Option<String>,
     pub agent_id: Option<String>,
     pub notification_target: Option<SelfImprovementNotificationTarget>,
+    pub tool_call_count: usize,
     pub now_ms: i64,
 }
 
@@ -89,8 +104,13 @@ pub struct SelfImprovementReviewHookReport {
     pub jobs_enqueued: usize,
     pub job_ids: Vec<String>,
     pub target_skill_ids: Vec<String>,
+    #[serde(default)]
+    pub skill_synthesis_enqueued: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_synthesis_job_id: Option<String>,
     pub reason: String,
     pub warnings: Vec<String>,
+    pub now_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +199,43 @@ pub fn load_self_improvement_review_config(
             .unwrap_or(SELF_IMPROVEMENT_DEFAULT_MAX_SELECTED_SKILLS)
             .max(1);
     }
+    if let Some(section) = value
+        .get("learning")
+        .and_then(|learning| learning.get("skillSynthesis"))
+        .and_then(Value::as_object)
+    {
+        if let Some(enabled) = section.get("enabled").and_then(Value::as_bool) {
+            config.skill_synthesis_enabled = enabled;
+        }
+        if let Some(mode) = section.get("mode").and_then(Value::as_str) {
+            match mode.trim().to_ascii_lowercase().as_str() {
+                "off" | "disabled" => config.skill_synthesis_enabled = false,
+                "propose-only" | "propose" | "propose-record-only" | "record-only" | "record" => {
+                    config.skill_synthesis_autonomous_apply = false;
+                }
+                "auto" | "apply" | "dispatch-and-replace" | "dispatch-and-replacement" => {
+                    config.skill_synthesis_autonomous_apply = true;
+                }
+                other => config
+                    .warnings
+                    .push(format!("unknown skillSynthesis mode `{other}`; using auto")),
+            }
+        }
+        if let Some(cap) = section.get("dailyCap").and_then(Value::as_u64) {
+            config.skill_synthesis_daily_cap = usize::try_from(cap)
+                .unwrap_or(SKILL_SYNTHESIS_DEFAULT_DAILY_CAP)
+                .max(1);
+        }
+        if let Some(min_tool_calls) = section.get("minToolCalls").and_then(Value::as_u64) {
+            config.skill_synthesis_min_tool_calls =
+                usize::try_from(min_tool_calls).unwrap_or(SKILL_SYNTHESIS_DEFAULT_MIN_TOOL_CALLS);
+        }
+        if let Some(min_assistant_chars) = section.get("minAssistantChars").and_then(Value::as_u64)
+        {
+            config.skill_synthesis_min_assistant_chars = usize::try_from(min_assistant_chars)
+                .unwrap_or(SKILL_SYNTHESIS_DEFAULT_MIN_ASSISTANT_CHARS);
+        }
+    }
     Ok(config)
 }
 
@@ -198,12 +255,47 @@ pub fn run_self_improvement_review_hook(
             jobs_enqueued: 0,
             job_ids: Vec::new(),
             target_skill_ids: Vec::new(),
+            skill_synthesis_enqueued: false,
+            skill_synthesis_job_id: None,
             reason: "self-improvement review is disabled by config".to_string(),
             warnings,
+            now_ms: options.now_ms,
         });
     }
     let targets = selected_skill_targets(&options.prompt_bundle_json, config.max_selected_skills)?;
     if targets.is_empty() {
+        if let Some((report, skill_id)) =
+            maybe_enqueue_skill_synthesis(&options, &config, &receipts_file, &mut warnings)?
+        {
+            let job_id = report.job.job_id.clone();
+            let inserted = report.inserted;
+            if !inserted {
+                warnings.push(format!(
+                    "skill synthesis reused existing worker job {}: {}",
+                    report.job.job_id, report.reason
+                ));
+            }
+            return write_report(SelfImprovementReviewHookReport {
+                schema: SELF_IMPROVEMENT_REVIEW_SCHEMA,
+                harness_home: options.harness_home,
+                receipts_file,
+                status: if inserted { "enqueued" } else { "skipped" }.to_string(),
+                mode: config.mode,
+                jobs_enqueued: usize::from(inserted),
+                job_ids: vec![job_id.clone()],
+                target_skill_ids: vec![skill_id],
+                skill_synthesis_enqueued: inserted,
+                skill_synthesis_job_id: Some(job_id),
+                reason: if inserted {
+                    "skill synthesis job enqueued after completed no-skill runtime turn"
+                } else {
+                    "skill synthesis debounce reused an existing worker job"
+                }
+                .to_string(),
+                warnings,
+                now_ms: options.now_ms,
+            });
+        }
         return write_report(SelfImprovementReviewHookReport {
             schema: SELF_IMPROVEMENT_REVIEW_SCHEMA,
             harness_home: options.harness_home,
@@ -213,8 +305,11 @@ pub fn run_self_improvement_review_hook(
             jobs_enqueued: 0,
             job_ids: Vec::new(),
             target_skill_ids: Vec::new(),
+            skill_synthesis_enqueued: false,
+            skill_synthesis_job_id: None,
             reason: "completed turn had no concrete selected skill target".to_string(),
             warnings,
+            now_ms: options.now_ms,
         });
     }
 
@@ -277,8 +372,11 @@ pub fn run_self_improvement_review_hook(
         jobs_enqueued: job_ids.len(),
         job_ids,
         target_skill_ids,
+        skill_synthesis_enqueued: false,
+        skill_synthesis_job_id: None,
         reason: "self-improvement review job enqueued after completed runtime turn".to_string(),
         warnings,
+        now_ms: options.now_ms,
     })
 }
 
@@ -331,6 +429,154 @@ fn collect_enqueue_report(
             "self-improvement review reused existing worker job {}: {}",
             report.job.job_id, report.reason
         ));
+    }
+}
+
+fn maybe_enqueue_skill_synthesis(
+    options: &SelfImprovementReviewHookOptions,
+    config: &SelfImprovementReviewConfig,
+    receipts_file: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<Option<(WorkerEnqueueReport, String)>> {
+    if !config.skill_synthesis_enabled {
+        warnings.push(
+            "skill synthesis skipped because learning.skillSynthesis is disabled".to_string(),
+        );
+        return Ok(None);
+    }
+    let assistant_chars = options.assistant_text.chars().count();
+    let complex_enough = options.tool_call_count >= config.skill_synthesis_min_tool_calls
+        || assistant_chars >= config.skill_synthesis_min_assistant_chars;
+    if !complex_enough {
+        warnings.push(format!(
+            "skill synthesis skipped because complexity gate was not met: toolCalls={} minToolCalls={} assistantChars={} minAssistantChars={}",
+            options.tool_call_count,
+            config.skill_synthesis_min_tool_calls,
+            assistant_chars,
+            config.skill_synthesis_min_assistant_chars
+        ));
+        return Ok(None);
+    }
+    let today_count = count_skill_synthesis_enqueued_today(receipts_file, options.now_ms)?;
+    if today_count >= config.skill_synthesis_daily_cap {
+        warnings.push(format!(
+            "skill synthesis skipped because daily cap {} is already reached",
+            config.skill_synthesis_daily_cap
+        ));
+        return Ok(None);
+    }
+
+    let skill_slug = skill_synthesis_slug(&options.assistant_text, options.queue_id.as_deref());
+    let skill_id = format!("agent-created:{skill_slug}");
+    let payload = json!({
+        "source": "runtime-completion-skill-synthesis",
+        "skillId": skill_id.clone(),
+        "taskSummary": skill_synthesis_summary(&options.assistant_text),
+        "evidence": self_improvement_signal_text(&options.assistant_text),
+        "sourceTurn": options.queue_id.clone(),
+        "agentId": options.agent_id.clone(),
+        "proposeOnly": !config.skill_synthesis_autonomous_apply,
+        "toolCallCount": options.tool_call_count,
+    });
+    let report = enqueue_worker_job(WorkerEnqueueOptions {
+        harness_home: options.harness_home.clone(),
+        kind: WorkerJobKind::SkillSynthesis,
+        lane: Some("skill_synthesis".to_string()),
+        payload,
+        idempotency_key: Some(format!(
+            "skill-synthesis:{}",
+            options.queue_id.as_deref().unwrap_or(skill_slug.as_str())
+        )),
+        parent_job_id: None,
+        job_group_id: options.queue_id.clone(),
+        master_agent_id: options.agent_id.clone(),
+        master_session_key: options.session_key.clone(),
+        wake_policy: None,
+        source: Some("runtime-completion-skill-synthesis".to_string()),
+        priority: 45,
+        available_at_ms: Some(options.now_ms),
+        max_attempts: 1,
+        timeout_ms: Some(300_000),
+        cascade_timeout_ms: None,
+        rate_key: Some(format!("skill-synthesis:{skill_slug}")),
+        concurrency_group_key: Some(format!("skill-synthesis:{skill_slug}")),
+        now_ms: options.now_ms,
+    })?;
+    Ok(Some((report, skill_id)))
+}
+
+fn count_skill_synthesis_enqueued_today(receipts_file: &Path, now_ms: i64) -> io::Result<usize> {
+    if !receipts_file.is_file() {
+        return Ok(0);
+    }
+    let day = now_ms.div_euclid(DAY_MS);
+    let text = fs::read_to_string(receipts_file)?;
+    Ok(text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|value| {
+            value
+                .get("skillSynthesisEnqueued")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && value
+                    .get("nowMs")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|then| then.div_euclid(DAY_MS) == day)
+        })
+        .count())
+}
+
+fn skill_synthesis_slug(text: &str, fallback: Option<&str>) -> String {
+    let source = text
+        .split_whitespace()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in source.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            slug.push(lower);
+            last_dash = false;
+        } else if !last_dash && !slug.is_empty() {
+            slug.push('-');
+            last_dash = true;
+        }
+        if slug.len() >= 48 {
+            break;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        let fallback_slug = fallback
+            .unwrap_or("learned-workflow")
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+            .take(48)
+            .collect::<String>();
+        if fallback_slug.is_empty() {
+            "learned-workflow".to_string()
+        } else {
+            fallback_slug
+        }
+    } else {
+        slug
+    }
+}
+
+fn skill_synthesis_summary(text: &str) -> String {
+    let mut summary = text.trim().replace(['\r', '\n'], " ");
+    if summary.chars().count() > 220 {
+        summary = summary.chars().take(220).collect();
+    }
+    if summary.is_empty() {
+        "Learn a reusable workflow from a completed no-skill turn".to_string()
+    } else {
+        summary
     }
 }
 
@@ -461,6 +707,7 @@ mod tests {
             session_key: Some("session-1".to_string()),
             agent_id: Some("main".to_string()),
             notification_target: None,
+            tool_call_count: 0,
             now_ms: 1000,
         })
         .unwrap();
@@ -471,6 +718,47 @@ mod tests {
             report.target_skill_ids,
             vec!["workspace:quiet-cron-watchdogs".to_string()]
         );
+        assert!(self_improvement_review_receipts_file(&harness_home).is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn self_improvement_hook_enqueues_skill_synthesis_for_complex_no_skill_turn() {
+        let root =
+            temp_root("self_improvement_hook_enqueues_skill_synthesis_for_complex_no_skill_turn");
+        let harness_home = root.join(".agent-harness");
+        let prompt_bundle = root.join("prompt-bundle.json");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            &prompt_bundle,
+            serde_json::to_string(&json!({
+                "schema": "agent-harness.prompt-bundle.v1",
+                "selectedSkills": [],
+                "sections": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = run_self_improvement_review_hook(SelfImprovementReviewHookOptions {
+            harness_home: harness_home.clone(),
+            prompt_bundle_json: prompt_bundle,
+            assistant_text: "Debugged a novel flaky queue replay by collecting receipts, isolating the retry boundary, and adding a focused regression.".to_string(),
+            queue_id: Some("queue-synthesis-1".to_string()),
+            session_key: Some("session-1".to_string()),
+            agent_id: Some("main".to_string()),
+            notification_target: None,
+            tool_call_count: 5,
+            now_ms: 1000,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, "enqueued");
+        assert_eq!(report.jobs_enqueued, 1);
+        assert!(report.skill_synthesis_enqueued);
+        assert_eq!(report.target_skill_ids.len(), 1);
+        assert!(report.target_skill_ids[0].starts_with("agent-created:"));
         assert!(self_improvement_review_receipts_file(&harness_home).is_file());
 
         let _ = fs::remove_dir_all(root);

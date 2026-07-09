@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-use crate::{HarnessStatusOptions, collect_harness_status};
+use crate::{HarnessStatusOptions, SkillDoctorStatus, SkillDoctorSummary, collect_harness_status};
 
 const HEALTHZ_SCHEMA: &str = "agent-harness.healthz.v1";
 
@@ -28,6 +28,7 @@ pub struct HealthzReport {
     pub outbox: HealthzOutbox,
     pub loops: Vec<HealthzLoop>,
     pub supervisor_services: Vec<HealthzSupervisorService>,
+    pub skills: HealthzSkills,
     pub state: HealthzState,
     pub warnings: Vec<String>,
 }
@@ -116,6 +117,18 @@ pub struct HealthzState {
     pub state_dir: PathBuf,
     pub writable: bool,
     pub disk_free_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthzSkills {
+    pub ready: bool,
+    pub status: SkillDoctorStatus,
+    pub summary: SkillDoctorSummary,
+    pub findings: usize,
+    pub error_findings: usize,
+    pub warning_findings: usize,
+    pub doctor_receipts_file: PathBuf,
 }
 
 pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
@@ -243,6 +256,10 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
             "runtime-loop is not ready; channel ingress may queue without replies".to_string(),
         );
     }
+    let skills_ready = status.skills.status != SkillDoctorStatus::Error;
+    if !skills_ready {
+        warnings.push("skill doctor is not ready; autonomous skill apply is blocked".to_string());
+    }
     if loops
         .iter()
         .any(|item| item.name == "progress-delivery-loop" && item.stale)
@@ -257,7 +274,8 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
         .filter(|item| item.name != "progress-delivery-loop")
         .all(|item| !item.stale)
         && !runtime_loop_unhealthy;
-    let ready = status.ready && live && (!options.require_writable_state || state.writable);
+    let ready =
+        status.ready && live && skills_ready && (!options.require_writable_state || state.writable);
     Ok(HealthzReport {
         schema: HEALTHZ_SCHEMA,
         harness_home: options.harness_home,
@@ -280,6 +298,15 @@ pub fn collect_healthz(options: HealthzOptions) -> io::Result<HealthzReport> {
         },
         loops,
         supervisor_services,
+        skills: HealthzSkills {
+            ready: skills_ready,
+            status: status.skills.status,
+            summary: status.skills.summary.clone(),
+            findings: status.skills.findings,
+            error_findings: status.skills.error_findings,
+            warning_findings: status.skills.warning_findings,
+            doctor_receipts_file: status.skills.doctor_receipts_file.clone(),
+        },
         state,
         warnings,
     })
@@ -362,6 +389,9 @@ mod tests {
                 .iter()
                 .any(|item| item.name == "runtime-loop" && item.stale)
         );
+        assert!(report.skills.ready);
+        assert_eq!(report.skills.status, SkillDoctorStatus::Warn);
+        assert_eq!(report.skills.summary.total_skills, 0);
 
         let _ = fs::remove_dir_all(root);
     }

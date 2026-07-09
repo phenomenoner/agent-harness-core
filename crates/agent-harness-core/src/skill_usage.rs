@@ -133,6 +133,8 @@ pub struct SkillUsageSnapshot {
     pub total_events: usize,
     pub by_action: BTreeMap<String, usize>,
     pub by_skill: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub by_skill_action: BTreeMap<String, BTreeMap<String, usize>>,
     pub by_provenance: BTreeMap<String, usize>,
     pub latest_at_ms: Option<i64>,
 }
@@ -310,6 +312,12 @@ pub fn collect_skill_usage_snapshot(
         snapshot.total_events += 1;
         if let Some(action) = action {
             *snapshot.by_action.entry(action.to_string()).or_default() += 1;
+            *snapshot
+                .by_skill_action
+                .entry(skill_id.clone())
+                .or_default()
+                .entry(action.to_string())
+                .or_default() += 1;
         }
         *snapshot.by_skill.entry(skill_id).or_default() += 1;
         if let Some(provenance) = provenance {
@@ -336,6 +344,8 @@ pub fn classify_skill_provenance(source_kind: Option<SkillSourceKind>) -> SkillU
         Some(SkillSourceKind::Workspace | SkillSourceKind::Managed) => {
             SkillUsageProvenance::OperatorAuthoredSkill
         }
+        Some(SkillSourceKind::AgentCreated) => SkillUsageProvenance::AgentCreatedSkill,
+        Some(SkillSourceKind::Pack) => SkillUsageProvenance::ExternalProjectSkill,
         Some(SkillSourceKind::ProjectAgent) => SkillUsageProvenance::ExternalProjectSkill,
         None => SkillUsageProvenance::Unknown,
     }
@@ -394,6 +404,8 @@ fn source_kind_from_value(value: Option<&Value>) -> Option<SkillSourceKind> {
         "imported-managed" => Some(SkillSourceKind::ImportedManaged),
         "imported-project-agent" => Some(SkillSourceKind::ImportedProjectAgent),
         "harness-builtin" => Some(SkillSourceKind::HarnessBuiltin),
+        "agent-created" => Some(SkillSourceKind::AgentCreated),
+        "pack" => Some(SkillSourceKind::Pack),
         _ => None,
     }
 }

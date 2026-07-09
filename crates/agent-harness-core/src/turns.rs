@@ -3,11 +3,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::{
     AgentOverride, AgentProfile, AgentRegistry, AgentSource, ChannelCommand, ChannelCommandIntent,
     ChannelSessionState, DEFAULT_THINKING_LEVEL, InboundMediaArtifact, PROMPT_FILE_NAMES,
-    SkillIndex, SkillSelection, SkillSelectionQuery, parse_channel_command, read_agent_override,
+    SkillIndex, SkillSelection, SkillSelectionQuery, collect_skill_usage_snapshot,
+    config::harness_config_candidates, parse_channel_command, read_agent_override,
     read_channel_session_state, select_skills, write_skill_selection_receipt,
 };
 
@@ -198,6 +200,21 @@ pub fn build_turn_plan(
     let (prompt_workspace, prompt_files) =
         prompt_files_for_selected_agent(source, selected_agent, &mut warnings)?;
     let skill_query_text = channel_state_query_text(&input.text, channel_state.as_ref());
+    let skill_config = input
+        .harness_home
+        .as_ref()
+        .map(|harness_home| load_skill_selection_config(harness_home))
+        .transpose()?
+        .unwrap_or_default();
+    let usage_snapshot = if input.harness_home.is_some() && skill_config.usage_prior_enabled {
+        input
+            .harness_home
+            .as_ref()
+            .map(collect_skill_usage_snapshot)
+            .transpose()?
+    } else {
+        None
+    };
     let skill_query = SkillSelectionQuery {
         text: skill_query_text,
         agent_id: agent.as_ref().map(|agent| agent.id.clone()),
@@ -209,8 +226,10 @@ pub fn build_turn_plan(
         agent_mode: None,
         available_tools: Vec::new(),
         available_toolsets: Vec::new(),
-        fts_enabled: false,
+        fts_enabled: skill_config.fts_enabled,
         vector_tie_break_enabled: false,
+        usage_snapshot,
+        usage_prior_enabled: skill_config.usage_prior_enabled,
         limit: input.skill_limit,
     };
     let selected_skills = if dispatch == TurnDispatch::AgentTurn {
@@ -252,6 +271,49 @@ pub fn build_turn_plan(
         selected_skills,
         warnings,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SkillSelectionConfig {
+    fts_enabled: bool,
+    usage_prior_enabled: bool,
+}
+
+impl Default for SkillSelectionConfig {
+    fn default() -> Self {
+        Self {
+            fts_enabled: true,
+            usage_prior_enabled: true,
+        }
+    }
+}
+
+fn load_skill_selection_config(harness_home: &Path) -> io::Result<SkillSelectionConfig> {
+    let mut config = SkillSelectionConfig::default();
+    let Some(config_file) = harness_config_candidates(harness_home)
+        .into_iter()
+        .find(|path| path.is_file())
+    else {
+        return Ok(config);
+    };
+    let text = fs::read_to_string(config_file)?;
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return Ok(config);
+    };
+    let Some(matcher) = value
+        .get("skills")
+        .and_then(|skills| skills.get("matcher"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(config);
+    };
+    if let Some(enabled) = matcher.get("ftsEnabled").and_then(Value::as_bool) {
+        config.fts_enabled = enabled;
+    }
+    if let Some(enabled) = matcher.get("usagePriorEnabled").and_then(Value::as_bool) {
+        config.usage_prior_enabled = enabled;
+    }
+    Ok(config)
 }
 
 fn provider_request_policy_from_state(
