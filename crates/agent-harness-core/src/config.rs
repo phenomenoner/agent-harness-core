@@ -177,20 +177,16 @@ fn validate_orchestration_object(path: &str, value: &Value, errors: &mut Vec<Str
     }
 }
 
-fn validate_orchestration_features_object(
-    path: &str,
-    value: &Value,
-    errors: &mut Vec<String>,
-) {
+fn validate_orchestration_features_object(path: &str, value: &Value, errors: &mut Vec<String>) {
     let Some(object) = expect_object(path, value, errors) else {
         return;
     };
     for (key, child) in object {
         match key.as_str() {
-            "modelCatalogV2" => validate_model_catalog_v2_object(&path_key(path, key), child, errors),
-            other => errors.push(format!(
-                "unknown orchestration feature `{other}` at {path}"
-            )),
+            "modelCatalogV2" => {
+                validate_model_catalog_v2_object(&path_key(path, key), child, errors)
+            }
+            other => errors.push(format!("unknown orchestration feature `{other}` at {path}")),
         }
     }
 }
