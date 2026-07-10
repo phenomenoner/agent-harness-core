@@ -6262,6 +6262,36 @@ struct InFlightCodexTurnSteer {
     file: PathBuf,
 }
 
+const CODEX_FOREIGN_EVENT_WARNING_LIMIT: usize = 8;
+const CODEX_SCOPE_PREVIEW_LIMIT: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexEventScope {
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+}
+
+impl CodexEventScope {
+    fn from_json(value: &Value) -> Self {
+        Self {
+            thread_id: extract_thread_id(value),
+            turn_id: extract_turn_id(value),
+        }
+    }
+}
+
+fn bounded_codex_scope(value: Option<&str>) -> String {
+    let value = value.unwrap_or("<none>");
+    let mut preview = value
+        .chars()
+        .take(CODEX_SCOPE_PREVIEW_LIMIT)
+        .collect::<String>();
+    if value.chars().count() > CODEX_SCOPE_PREVIEW_LIMIT {
+        preview.push('…');
+    }
+    preview
+}
+
 struct CodexTurnSteerBridge {
     harness_home: PathBuf,
     binding_file: PathBuf,
@@ -6269,6 +6299,8 @@ struct CodexTurnSteerBridge {
     turn_start_request_id: i64,
     next_rpc_id: i64,
     in_flight: BTreeMap<i64, InFlightCodexTurnSteer>,
+    foreign_scope_observed: bool,
+    quarantined_event_count: usize,
 }
 
 impl CodexTurnSteerBridge {
@@ -6309,7 +6341,69 @@ impl CodexTurnSteerBridge {
             turn_start_request_id,
             next_rpc_id: 10_000,
             in_flight: BTreeMap::new(),
+            foreign_scope_observed: false,
+            quarantined_event_count: 0,
         })
+    }
+
+    fn owns_event(&mut self, value: &Value, state: &mut CodexProtocolState) -> io::Result<bool> {
+        if json_id(value).is_some() {
+            return Ok(true);
+        }
+
+        let scope = CodexEventScope::from_json(value);
+        let method = json_method(value).unwrap_or("<unknown>");
+        if scope
+            .thread_id
+            .as_deref()
+            .is_some_and(|thread_id| thread_id != self.binding.thread_id)
+        {
+            return Ok(self.quarantine_event(state, method, &scope, "thread-mismatch"));
+        }
+
+        if let Some(turn_id) = scope.turn_id.as_deref() {
+            match self.binding.active_turn_id.as_deref() {
+                Some(active_turn_id) if active_turn_id != turn_id => {
+                    return Ok(self.quarantine_event(state, method, &scope, "turn-mismatch"));
+                }
+                Some(_) => {}
+                None => self.set_active_turn_id(turn_id.to_string())?,
+            }
+        } else if scope.thread_id.is_none() && self.foreign_scope_observed {
+            return Ok(self.quarantine_event(
+                state,
+                method,
+                &scope,
+                "ambiguous-unscoped-after-foreign",
+            ));
+        }
+
+        Ok(true)
+    }
+
+    fn quarantine_event(
+        &mut self,
+        state: &mut CodexProtocolState,
+        method: &str,
+        scope: &CodexEventScope,
+        reason: &str,
+    ) -> bool {
+        self.foreign_scope_observed = true;
+        self.quarantined_event_count = self.quarantined_event_count.saturating_add(1);
+        if self.quarantined_event_count <= CODEX_FOREIGN_EVENT_WARNING_LIMIT {
+            state.warnings.push(format!(
+                "quarantined foreign Codex event: reason={reason}; method={}; threadId={}; turnId={}",
+                bounded_codex_scope(Some(method)),
+                bounded_codex_scope(scope.thread_id.as_deref()),
+                bounded_codex_scope(scope.turn_id.as_deref())
+            ));
+        } else if self.quarantined_event_count == CODEX_FOREIGN_EVENT_WARNING_LIMIT + 1 {
+            state.warnings.push(format!(
+                "additional foreign Codex event metadata omitted after {} quarantined events",
+                CODEX_FOREIGN_EVENT_WARNING_LIMIT
+            ));
+        }
+        false
     }
 
     fn observe_json(
@@ -6520,6 +6614,15 @@ impl CodexTurnSteerBridge {
     }
 
     fn set_active_turn_id(&mut self, turn_id: String) -> io::Result<()> {
+        if self
+            .binding
+            .active_turn_id
+            .as_deref()
+            .is_some_and(|active_turn_id| active_turn_id != turn_id)
+        {
+            return Ok(());
+        }
+
         if self.binding.active_turn_id.as_deref() == Some(turn_id.as_str()) {
             return Ok(());
         }
@@ -6627,6 +6730,7 @@ fn wait_for_thread_start(
     loop {
         match receive_protocol_event(line_rx, child, state, timeouts, cancel_check, None)? {
             ProtocolEvent::Json(value) => {
+                record_protocol_usage_event(&value, state);
                 if let Some(error) = protocol_error(&value) {
                     return Ok(ProtocolWait::Failed(error));
                 }
@@ -6723,6 +6827,7 @@ fn wait_for_context_compaction_completed(
         match receive_protocol_event(line_rx, child, state, timeouts, cancel_check, poll_interval)?
         {
             ProtocolEvent::Json(value) => {
+                record_protocol_usage_event(&value, state);
                 if let Some(error) = protocol_error(&value) {
                     return Ok(ProtocolWait::Failed(error));
                 }
@@ -6795,6 +6900,13 @@ fn wait_for_turn_completed(
         match receive_protocol_event(line_rx, child, state, timeouts, cancel_check, poll_interval)?
         {
             ProtocolEvent::Json(value) => {
+                if let Some(bridge) = steer_bridge.as_deref_mut()
+                    && !bridge.owns_event(&value, state)?
+                {
+                    continue;
+                }
+                record_protocol_usage_event(&value, state);
+
                 if let Some(bridge) = steer_bridge.as_deref_mut()
                     && bridge.observe_json(&value, stdin, state)?
                 {
@@ -6880,10 +6992,7 @@ fn receive_protocol_event(
                 state.event_count += 1;
                 timeouts.note_event();
                 return match serde_json::from_str::<Value>(&line) {
-                    Ok(value) => {
-                        record_protocol_usage_event(&value, state);
-                        Ok(ProtocolEvent::Json(value))
-                    }
+                    Ok(value) => Ok(ProtocolEvent::Json(value)),
                     Err(error) => Ok(ProtocolEvent::Failed(format!(
                         "codex app-server stdout line was not valid JSON: {error}"
                     ))),
@@ -11682,6 +11791,59 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
     }
+    #[test]
+    fn run_codex_runtime_codex_owned_turn_ignores_child_final_and_completion() {
+        let root =
+            temp_root("run_codex_runtime_codex_owned_turn_ignores_child_final_and_completion");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = interleaved_parent_child_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert_eq!(
+            report
+                .receipt
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.total_tokens),
+            Some(42),
+            "foreign child usage must not overwrite the parent turn usage"
+        );
+        let transcript_file = report.completion.unwrap().transcript_file.unwrap();
+        let transcript = fs::read_to_string(transcript_file).unwrap();
+        assert!(transcript.contains("Exact parent final."));
+        assert!(!transcript.contains("CHILD FINAL MUST BE QUARANTINED"));
+        assert!(!transcript.contains("CROSS THREAD CHILD TEXT"));
+
+        let active_binding_file =
+            codex_active_turn_binding_file(&harness_home, "telegram:dm-42:user-7:main");
+        let active_binding: Value =
+            serde_json::from_slice(&fs::read(active_binding_file).unwrap()).unwrap();
+        assert_eq!(active_binding["activeTurnId"], "turn-parent");
+        assert_eq!(active_binding["threadId"], "thread-test");
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn run_codex_runtime_accepts_final_answer_before_not_loaded_empty_turn_completed() {
@@ -13712,6 +13874,55 @@ while ($true) {
             ],
         )
     }
+    #[cfg(windows)]
+    fn interleaved_parent_child_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("interleaved-parent-child-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-parent","kind":"regular"}}}')
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-child","kind":"subAgent"}}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-child","item":{"type":"agentMessage","id":"child-final","text":"CHILD FINAL MUST BE QUARANTINED","phase":"final_answer"}}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"threadId":"thread-child","turnId":"turn-parent","item":{"type":"agentMessage","id":"cross-thread-child","text":"CROSS THREAD CHILD TEXT","phase":"final_answer"}}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-child","status":"completed","usage":{"inputTokens":900,"outputTokens":99,"totalTokens":999}}}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-parent","item":{"type":"agentMessage","id":"parent-final","text":"Exact parent final.","phase":"final_answer"}}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-parent","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
 
     #[cfg(windows)]
     fn interrupted_command_app_server_command(
@@ -14660,6 +14871,37 @@ while IFS= read -r line; do
         *'"method":"turn/start"'*)
             printf '%s\n' "{\"method\":\"item/agentMessage/delta\",\"params\":{\"delta\":\"Fake assistant reply. method=${thread_method:-unknown}\"}}"
             printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        (PathBuf::from("sh"), vec![script.display().to_string()])
+    }
+    #[cfg(not(windows))]
+    fn interleaved_parent_child_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("interleaved-parent-child-app-server.sh");
+        fs::write(
+            &script,
+            r#"
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-parent","kind":"regular"}}}'
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-child","kind":"subAgent"}}}'
+            printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-child","item":{"type":"agentMessage","id":"child-final","text":"CHILD FINAL MUST BE QUARANTINED","phase":"final_answer"}}}'
+            printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread-child","turnId":"turn-parent","item":{"type":"agentMessage","id":"cross-thread-child","text":"CROSS THREAD CHILD TEXT","phase":"final_answer"}}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-child","status":"completed","usage":{"inputTokens":900,"outputTokens":99,"totalTokens":999}}}}'
+            printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-parent","item":{"type":"agentMessage","id":"parent-final","text":"Exact parent final.","phase":"final_answer"}}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-parent","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}'
             exit 0
             ;;
     esac
