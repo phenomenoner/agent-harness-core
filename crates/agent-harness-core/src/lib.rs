@@ -36,6 +36,7 @@ pub mod media;
 pub mod media_delivery_policy;
 pub mod memory;
 pub mod memory_backfill;
+pub mod model_catalog;
 pub mod memory_contracts;
 pub mod memory_owner;
 pub mod memory_pack;

@@ -99,6 +99,7 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
         "security",
         "workerDispatch",
         "learning",
+        "orchestration",
         "staging",
         "codex",
         "codexContext",
@@ -128,6 +129,7 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
             "security" => validate_security_object("$.security", child, errors),
             "workerDispatch" => validate_worker_dispatch_object("$.workerDispatch", child, errors),
             "learning" => validate_learning_object("$.learning", child, errors),
+            "orchestration" => validate_orchestration_object("$.orchestration", child, errors),
             "staging" => validate_staging_object("$.staging", child, errors),
             "codex" => validate_codex_object("$.codex", child, errors),
             "codexContext" => validate_codex_context_object("$.codexContext", child, errors),
@@ -156,6 +158,59 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
             "codex/runtime security aliases are accepted for compatibility; prefer security.* keys"
                 .to_string(),
         );
+    }
+}
+
+fn validate_orchestration_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "features" => {
+                validate_orchestration_features_object(&path_key(path, key), child, errors)
+            }
+            other => errors.push(format!(
+                "unknown orchestration config key `{other}` at {path}"
+            )),
+        }
+    }
+}
+
+fn validate_orchestration_features_object(
+    path: &str,
+    value: &Value,
+    errors: &mut Vec<String>,
+) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "modelCatalogV2" => validate_model_catalog_v2_object(&path_key(path, key), child, errors),
+            other => errors.push(format!(
+                "unknown orchestration feature `{other}` at {path}"
+            )),
+        }
+    }
+}
+
+fn validate_model_catalog_v2_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "mode" => expect_enum(
+                path_key(path, key),
+                child,
+                &["off", "shadow", "authoritative"],
+                errors,
+            ),
+            other => errors.push(format!(
+                "unknown modelCatalogV2 config key `{other}` at {path}"
+            )),
+        }
     }
 }
 
@@ -1582,6 +1637,61 @@ mod tests {
         let report = validate_harness_config(&harness_home).unwrap();
 
         assert_eq!(report.status, HarnessConfigValidationStatus::Valid);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_catalog_config_accepts_validated_v2_rollout_namespace() {
+        let root = temp_root("model_catalog_config_accepts_validated_v2_rollout_namespace");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "orchestration": {
+                "features": {
+                  "modelCatalogV2": { "mode": "authoritative" }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let report = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(report.status, HarnessConfigValidationStatus::Valid);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_catalog_config_rejects_unknown_mode_at_exact_path() {
+        let root = temp_root("model_catalog_config_rejects_unknown_mode_at_exact_path");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "orchestration": {
+                "features": {
+                  "modelCatalogV2": { "mode": "turbo" }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let report = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(report.status, HarnessConfigValidationStatus::Invalid);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("$.orchestration.features.modelCatalogV2.mode")),
+            "{:?}",
+            report.errors
+        );
 
         let _ = fs::remove_dir_all(root);
     }
