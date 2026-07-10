@@ -83,6 +83,38 @@ const CODEX_THREAD_TOOL_OUTPUT_BYTES_LIMIT: u64 = 1_000_000;
 const CODEX_ROLLOUT_SCAN_MAX_FILES: usize = 256;
 const DEFAULT_HIGH_CONTEXT_USAGE_COMPACT_TOKEN_LIMIT: u64 = 120_000;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum OwnedCodexEventsRolloutMode {
+    #[default]
+    Off,
+    Shadow,
+    Authoritative,
+}
+
+fn owned_codex_events_rollout_mode(harness_home: &Path) -> OwnedCodexEventsRolloutMode {
+    let Some(config_file) = crate::harness_config_candidates(harness_home)
+        .into_iter()
+        .find(|path| path.is_file())
+    else {
+        return OwnedCodexEventsRolloutMode::Off;
+    };
+    let Ok(text) = fs::read_to_string(config_file) else {
+        return OwnedCodexEventsRolloutMode::Off;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return OwnedCodexEventsRolloutMode::Off;
+    };
+    match value
+        .pointer("/orchestration/features/ownedCodexEventsV2/mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some("shadow") => OwnedCodexEventsRolloutMode::Shadow,
+        Some("authoritative") => OwnedCodexEventsRolloutMode::Authoritative,
+        _ => OwnedCodexEventsRolloutMode::Off,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum CodexWindowsSandboxMode {
@@ -6264,11 +6296,13 @@ struct InFlightCodexTurnSteer {
 
 const CODEX_FOREIGN_EVENT_WARNING_LIMIT: usize = 8;
 const CODEX_SCOPE_PREVIEW_LIMIT: usize = 64;
+const CODEX_OWNED_ITEM_ID_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CodexEventScope {
     thread_id: Option<String>,
     turn_id: Option<String>,
+    item_id: Option<String>,
 }
 
 impl CodexEventScope {
@@ -6276,8 +6310,64 @@ impl CodexEventScope {
         Self {
             thread_id: extract_thread_id(value),
             turn_id: extract_turn_id(value),
+            item_id: extract_agent_event_item_id(value),
         }
     }
+}
+
+fn extract_agent_event_item_id(value: &Value) -> Option<String> {
+    let method = json_method(value).unwrap_or_default();
+    let method_is_agent = method.contains("agentMessage")
+        || method.contains("agent_message")
+        || method.contains("agent-message")
+        || method.contains("message/delta");
+    let item_is_agent = value
+        .pointer("/params/item")
+        .and_then(|item| string_field(item, &["type"]))
+        .is_some_and(|item_type| {
+            item_type.eq_ignore_ascii_case("agentMessage")
+                || item_type.eq_ignore_ascii_case("agent_message")
+                || item_type.eq_ignore_ascii_case("agent-message")
+        });
+    if !method_is_agent && !item_is_agent {
+        return None;
+    }
+    first_string_pointer(
+        value,
+        &[
+            "/params/item/id",
+            "/params/itemId",
+            "/params/message/id",
+            "/params/id",
+        ],
+    )
+}
+
+fn is_regular_turn_started(value: &Value) -> bool {
+    if !matches!(json_method(value), Some("turn/started")) {
+        return false;
+    }
+    match first_string_pointer(value, &["/params/turn/kind", "/result/turn/kind"]).map(|kind| {
+        kind.trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_', ' '], "")
+    }) {
+        None => true,
+        Some(kind) => kind == "regular",
+    }
+}
+
+fn is_child_turn_started(value: &Value) -> bool {
+    if !matches!(json_method(value), Some("turn/started")) {
+        return false;
+    }
+    first_string_pointer(value, &["/params/turn/kind", "/result/turn/kind"])
+        .map(|kind| {
+            kind.trim()
+                .to_ascii_lowercase()
+                .replace(['-', '_', ' '], "")
+        })
+        .is_some_and(|kind| matches!(kind.as_str(), "subagent" | "child"))
 }
 
 fn bounded_codex_scope(value: Option<&str>) -> String {
@@ -6299,8 +6389,11 @@ struct CodexTurnSteerBridge {
     turn_start_request_id: i64,
     next_rpc_id: i64,
     in_flight: BTreeMap<i64, InFlightCodexTurnSteer>,
+    rollout_mode: OwnedCodexEventsRolloutMode,
+    owned_turn_id: Option<String>,
+    owned_item_ids: Vec<String>,
     foreign_scope_observed: bool,
-    quarantined_event_count: usize,
+    divergent_event_count: usize,
 }
 
 impl CodexTurnSteerBridge {
@@ -6341,13 +6434,19 @@ impl CodexTurnSteerBridge {
             turn_start_request_id,
             next_rpc_id: 10_000,
             in_flight: BTreeMap::new(),
+            rollout_mode: owned_codex_events_rollout_mode(harness_home),
+            owned_turn_id: None,
+            owned_item_ids: Vec::new(),
             foreign_scope_observed: false,
-            quarantined_event_count: 0,
+            divergent_event_count: 0,
         })
     }
 
     fn owns_event(&mut self, value: &Value, state: &mut CodexProtocolState) -> io::Result<bool> {
         if json_id(value).is_some() {
+            return Ok(true);
+        }
+        if self.rollout_mode == OwnedCodexEventsRolloutMode::Off {
             return Ok(true);
         }
 
@@ -6358,19 +6457,41 @@ impl CodexTurnSteerBridge {
             .as_deref()
             .is_some_and(|thread_id| thread_id != self.binding.thread_id)
         {
-            return Ok(self.quarantine_event(state, method, &scope, "thread-mismatch"));
+            return Ok(self.divergent_event(state, method, &scope, "thread-mismatch"));
         }
 
         if let Some(turn_id) = scope.turn_id.as_deref() {
-            match self.binding.active_turn_id.as_deref() {
-                Some(active_turn_id) if active_turn_id != turn_id => {
-                    return Ok(self.quarantine_event(state, method, &scope, "turn-mismatch"));
+            match self.owned_turn_id.as_deref() {
+                Some(owned_turn_id) if owned_turn_id != turn_id => {
+                    return Ok(self.divergent_event(state, method, &scope, "turn-mismatch"));
                 }
-                Some(_) => {}
-                None => self.set_active_turn_id(turn_id.to_string())?,
+                Some(_) => self.remember_owned_item(scope.item_id.as_deref()),
+                None if is_regular_turn_started(value)
+                    && scope.thread_id.as_deref() == Some(self.binding.thread_id.as_str()) =>
+                {
+                    self.bind_owned_turn(turn_id.to_string())?;
+                }
+                None if is_child_turn_started(value) => {
+                    return Ok(self.divergent_event(
+                        state,
+                        method,
+                        &scope,
+                        "child-turn-start-before-owner",
+                    ));
+                }
+                None => {
+                    return Ok(self.divergent_event(state, method, &scope, "owner-turn-unbound"));
+                }
             }
         } else if scope.thread_id.is_none() && self.foreign_scope_observed {
-            return Ok(self.quarantine_event(
+            if scope
+                .item_id
+                .as_deref()
+                .is_some_and(|item_id| self.owned_item_ids.iter().any(|owned| owned == item_id))
+            {
+                return Ok(true);
+            }
+            return Ok(self.divergent_event(
                 state,
                 method,
                 &scope,
@@ -6381,7 +6502,7 @@ impl CodexTurnSteerBridge {
         Ok(true)
     }
 
-    fn quarantine_event(
+    fn divergent_event(
         &mut self,
         state: &mut CodexProtocolState,
         method: &str,
@@ -6389,21 +6510,56 @@ impl CodexTurnSteerBridge {
         reason: &str,
     ) -> bool {
         self.foreign_scope_observed = true;
-        self.quarantined_event_count = self.quarantined_event_count.saturating_add(1);
-        if self.quarantined_event_count <= CODEX_FOREIGN_EVENT_WARNING_LIMIT {
+        self.divergent_event_count = self.divergent_event_count.saturating_add(1);
+        if self.divergent_event_count <= CODEX_FOREIGN_EVENT_WARNING_LIMIT {
+            let prefix = match self.rollout_mode {
+                OwnedCodexEventsRolloutMode::Shadow => "ownedCodexEventsV2 shadow divergence",
+                OwnedCodexEventsRolloutMode::Authoritative => "quarantined foreign Codex event",
+                OwnedCodexEventsRolloutMode::Off => return true,
+            };
             state.warnings.push(format!(
-                "quarantined foreign Codex event: reason={reason}; method={}; threadId={}; turnId={}",
+                "{prefix}: reason={reason}; method={}; threadId={}; turnId={}",
                 bounded_codex_scope(Some(method)),
                 bounded_codex_scope(scope.thread_id.as_deref()),
                 bounded_codex_scope(scope.turn_id.as_deref())
             ));
-        } else if self.quarantined_event_count == CODEX_FOREIGN_EVENT_WARNING_LIMIT + 1 {
+        } else if self.divergent_event_count == CODEX_FOREIGN_EVENT_WARNING_LIMIT + 1 {
             state.warnings.push(format!(
-                "additional foreign Codex event metadata omitted after {} quarantined events",
+                "additional ownedCodexEventsV2 divergence metadata omitted after {} events",
                 CODEX_FOREIGN_EVENT_WARNING_LIMIT
             ));
         }
-        false
+        self.rollout_mode != OwnedCodexEventsRolloutMode::Authoritative
+    }
+
+    fn bind_owned_turn(&mut self, turn_id: String) -> io::Result<()> {
+        if self
+            .owned_turn_id
+            .as_deref()
+            .is_some_and(|owned_turn_id| owned_turn_id != turn_id)
+        {
+            return Ok(());
+        }
+        if self.owned_turn_id.is_none() {
+            self.owned_turn_id = Some(turn_id.clone());
+        }
+        if self.rollout_mode == OwnedCodexEventsRolloutMode::Authoritative {
+            self.set_active_turn_id(turn_id)?;
+        }
+        Ok(())
+    }
+
+    fn remember_owned_item(&mut self, item_id: Option<&str>) {
+        let Some(item_id) = item_id.map(str::trim).filter(|item_id| !item_id.is_empty()) else {
+            return;
+        };
+        if self.owned_item_ids.iter().any(|owned| owned == item_id) {
+            return;
+        }
+        if self.owned_item_ids.len() >= CODEX_OWNED_ITEM_ID_LIMIT {
+            self.owned_item_ids.remove(0);
+        }
+        self.owned_item_ids.push(item_id.to_string());
     }
 
     fn observe_json(
@@ -6416,6 +6572,9 @@ impl CodexTurnSteerBridge {
             return Ok(true);
         }
         if let Some(turn_id) = extract_active_turn_started_id(value, self.turn_start_request_id) {
+            if self.rollout_mode != OwnedCodexEventsRolloutMode::Off {
+                self.bind_owned_turn(turn_id.clone())?;
+            }
             self.set_active_turn_id(turn_id)?;
         }
         self.drain_pending(stdin, state)?;
@@ -6614,11 +6773,12 @@ impl CodexTurnSteerBridge {
     }
 
     fn set_active_turn_id(&mut self, turn_id: String) -> io::Result<()> {
-        if self
-            .binding
-            .active_turn_id
-            .as_deref()
-            .is_some_and(|active_turn_id| active_turn_id != turn_id)
+        if self.rollout_mode == OwnedCodexEventsRolloutMode::Authoritative
+            && self
+                .binding
+                .active_turn_id
+                .as_deref()
+                .is_some_and(|active_turn_id| active_turn_id != turn_id)
         {
             return Ok(());
         }
@@ -11797,6 +11957,7 @@ mod tests {
             temp_root("run_codex_runtime_codex_owned_turn_ignores_child_final_and_completion");
         let source = write_codex_runtime_source(&root);
         let harness_home = root.join(".agent-harness");
+        write_owned_codex_events_mode(&harness_home, "authoritative");
         enqueue_and_prepare(&source, &harness_home);
         let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
             harness_home: harness_home.clone(),
@@ -11841,6 +12002,279 @@ mod tests {
             serde_json::from_slice(&fs::read(active_binding_file).unwrap()).unwrap();
         assert_eq!(active_binding["activeTurnId"], "turn-parent");
         assert_eq!(active_binding["threadId"], "thread-test");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_owned_events_default_off_preserves_legacy_child_authority() {
+        let root = temp_root(
+            "run_codex_runtime_owned_events_default_off_preserves_legacy_child_authority",
+        );
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = interleaved_parent_child_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert_eq!(
+            report
+                .receipt
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.total_tokens),
+            Some(999),
+            "default-off must retain the pre-rollout authority decision"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("foreign Codex event")),
+            "off mode must not emit ownership divergence warnings: {:?}",
+            report.warnings
+        );
+        let transcript = fs::read_to_string(
+            report
+                .completion
+                .as_ref()
+                .unwrap()
+                .transcript_file
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(transcript.contains("CROSS THREAD CHILD TEXT"));
+        let binding: Value = serde_json::from_slice(
+            &fs::read(codex_active_turn_binding_file(
+                &harness_home,
+                "telegram:dm-42:user-7:main",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(binding["activeTurnId"], "turn-child");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_owned_events_shadow_observes_without_changing_legacy_authority() {
+        let root = temp_root(
+            "run_codex_runtime_owned_events_shadow_observes_without_changing_legacy_authority",
+        );
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_owned_codex_events_mode(&harness_home, "shadow");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = interleaved_parent_child_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert_eq!(
+            report
+                .receipt
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.total_tokens),
+            Some(999),
+            "shadow mode must observe only and retain legacy authority"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("ownedCodexEventsV2 shadow divergence")),
+            "shadow mode must record bounded divergence metadata: {:?}",
+            report.warnings
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("CHILD FINAL MUST BE QUARANTINED")),
+            "foreign assistant text must not leak into warnings: {:?}",
+            report.warnings
+        );
+        let transcript = fs::read_to_string(
+            report
+                .completion
+                .as_ref()
+                .unwrap()
+                .transcript_file
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(transcript.contains("CROSS THREAD CHILD TEXT"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_owned_events_authoritative_child_completion_before_parent_start_waits_for_parent()
+     {
+        let root = temp_root(
+            "run_codex_runtime_owned_events_authoritative_child_completion_before_parent_start_waits_for_parent",
+        );
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_owned_codex_events_mode(&harness_home, "authoritative");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let events = [
+            r#"{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-child","kind":"subAgent"}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-child","item":{"type":"agentMessage","id":"child-first-final","text":"EARLY CHILD FINAL","phase":"final_answer"}}}"#,
+            r#"{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-child","status":"completed","usage":{"inputTokens":900,"outputTokens":99,"totalTokens":999}}}}"#,
+            r#"{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-parent","kind":"regular"}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-parent","item":{"type":"agentMessage","id":"parent-final","text":"Parent wins after early child completion.","phase":"final_answer"}}}"#,
+            r#"{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-parent","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}"#,
+        ];
+        let (executable, arguments) =
+            scripted_owned_events_app_server_command(&root, "child-first", &events);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert_eq!(
+            report
+                .receipt
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.total_tokens),
+            Some(42)
+        );
+        let transcript = fs::read_to_string(
+            report
+                .completion
+                .as_ref()
+                .unwrap()
+                .transcript_file
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(transcript.contains("Parent wins after early child completion."));
+        assert!(!transcript.contains("EARLY CHILD FINAL"));
+        let binding: Value = serde_json::from_slice(
+            &fs::read(codex_active_turn_binding_file(
+                &harness_home,
+                "telegram:dm-42:user-7:main",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(binding["activeTurnId"], "turn-parent");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_owned_events_authoritative_accepts_owned_item_delta_after_foreign_scope() {
+        let root = temp_root(
+            "run_codex_runtime_owned_events_authoritative_accepts_owned_item_delta_after_foreign_scope",
+        );
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_owned_codex_events_mode(&harness_home, "authoritative");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let events = [
+            r#"{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-parent","kind":"regular"}}}"#,
+            r#"{"method":"item/started","params":{"threadId":"thread-test","turnId":"turn-parent","item":{"type":"agentMessage","id":"owned-parent-message","phase":"final_answer"}}}"#,
+            r#"{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-child","kind":"subAgent"}}}"#,
+            r#"{"method":"item/agentMessage/delta","params":{"itemId":"owned-parent-message","delta":"Owned correlated delta."}}"#,
+            r#"{"method":"item/agentMessage/delta","params":{"itemId":"uncorrelated-message","delta":"UNCORRELATED FOREIGN DELTA"}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-parent","item":{"type":"agentMessage","id":"owned-parent-message","phase":"final_answer"}}}"#,
+            r#"{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-parent","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}"#,
+        ];
+        let (executable, arguments) =
+            scripted_owned_events_app_server_command(&root, "owned-item-correlation", &events);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let transcript = fs::read_to_string(
+            report
+                .completion
+                .as_ref()
+                .unwrap()
+                .transcript_file
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(transcript.contains("Owned correlated delta."));
+        assert!(!transcript.contains("UNCORRELATED FOREIGN DELTA"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -13743,6 +14177,17 @@ mod tests {
         fs::write(plan_file, serde_json::to_string_pretty(&value).unwrap()).unwrap();
     }
 
+    fn write_owned_codex_events_mode(harness_home: &Path, mode: &str) {
+        fs::create_dir_all(harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            format!(
+                r#"{{"orchestration":{{"features":{{"ownedCodexEventsV2":{{"mode":"{mode}"}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
     fn latest_prepared_execution_dir(harness_home: &Path) -> PathBuf {
         fs::read_to_string(
             harness_home
@@ -13856,6 +14301,59 @@ while ($true) {
 "#,
         )
         .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
+
+    #[cfg(windows)]
+    fn scripted_owned_events_app_server_command(
+        root: &Path,
+        name: &str,
+        events: &[&str],
+    ) -> (PathBuf, Vec<String>) {
+        let script = root.join(format!("scripted-owned-events-{name}.ps1"));
+        let mut script_text = r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+"#
+        .to_string();
+        for event in events {
+            script_text.push_str("        [Console]::Out.WriteLine('");
+            script_text.push_str(&event.replace('\'', "''"));
+            script_text.push_str("')\n");
+        }
+        script_text.push_str(
+            r#"        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        );
+        fs::write(&script, script_text).unwrap();
         let system_powershell =
             PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
         let executable = if system_powershell.is_file() {
@@ -14878,6 +15376,40 @@ done
 "#,
         )
         .unwrap();
+        (PathBuf::from("sh"), vec![script.display().to_string()])
+    }
+    #[cfg(not(windows))]
+    fn scripted_owned_events_app_server_command(
+        root: &Path,
+        name: &str,
+        events: &[&str],
+    ) -> (PathBuf, Vec<String>) {
+        let script = root.join(format!("scripted-owned-events-{name}.sh"));
+        let mut script_text = r#"
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+"#
+        .to_string();
+        for event in events {
+            script_text.push_str("            printf '%s\\n' '");
+            script_text.push_str(&event.replace('\'', "'\"'\"'"));
+            script_text.push_str("'\n");
+        }
+        script_text.push_str(
+            r#"            exit 0
+            ;;
+    esac
+done
+"#,
+        );
+        fs::write(&script, script_text).unwrap();
         (PathBuf::from("sh"), vec![script.display().to_string()])
     }
     #[cfg(not(windows))]

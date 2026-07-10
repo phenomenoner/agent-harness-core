@@ -186,6 +186,9 @@ fn validate_orchestration_features_object(path: &str, value: &Value, errors: &mu
             "modelCatalogV2" => {
                 validate_model_catalog_v2_object(&path_key(path, key), child, errors)
             }
+            "ownedCodexEventsV2" => {
+                validate_owned_codex_events_v2_object(&path_key(path, key), child, errors)
+            }
             other => errors.push(format!("unknown orchestration feature `{other}` at {path}")),
         }
     }
@@ -205,6 +208,25 @@ fn validate_model_catalog_v2_object(path: &str, value: &Value, errors: &mut Vec<
             ),
             other => errors.push(format!(
                 "unknown modelCatalogV2 config key `{other}` at {path}"
+            )),
+        }
+    }
+}
+
+fn validate_owned_codex_events_v2_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "mode" => expect_enum(
+                path_key(path, key),
+                child,
+                &["off", "shadow", "authoritative"],
+                errors,
+            ),
+            other => errors.push(format!(
+                "unknown ownedCodexEventsV2 config key `{other}` at {path}"
             )),
         }
     }
@@ -1685,6 +1707,64 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.contains("$.orchestration.features.modelCatalogV2.mode")),
+            "{:?}",
+            report.errors
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owned_codex_events_config_accepts_all_rollout_modes() {
+        let root = temp_root("owned_codex_events_config_accepts_all_rollout_modes");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+
+        for mode in ["off", "shadow", "authoritative"] {
+            fs::write(
+                harness_home.join(HARNESS_CONFIG_FILE_NAME),
+                format!(
+                    r#"{{"orchestration":{{"features":{{"ownedCodexEventsV2":{{"mode":"{mode}"}}}}}}}}"#
+                ),
+            )
+            .unwrap();
+
+            let report = validate_harness_config(&harness_home).unwrap();
+            assert_eq!(
+                report.status,
+                HarnessConfigValidationStatus::Valid,
+                "mode={mode}; errors={:?}",
+                report.errors
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owned_codex_events_config_rejects_unknown_mode_at_exact_path() {
+        let root = temp_root("owned_codex_events_config_rejects_unknown_mode_at_exact_path");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "orchestration": {
+                "features": {
+                  "ownedCodexEventsV2": { "mode": "turbo" }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let report = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(report.status, HarnessConfigValidationStatus::Invalid);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("$.orchestration.features.ownedCodexEventsV2.mode")),
             "{:?}",
             report.errors
         );
