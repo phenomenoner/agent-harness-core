@@ -11,7 +11,6 @@ use crate::{
     GatewayRestartStatusReport, InboundMediaArtifact, RichMessagePresentation, THINKING_LEVELS,
     TurnDispatch, TurnPlan, XHIGH_THINKING_LEVEL, collect_gateway_restart_status,
     inspect_codex_approval_policy, inspect_codex_sandbox, inspect_codex_sandbox_policy,
-    normalize_thinking_level,
 };
 
 const CHANNEL_STEP_SCHEMA: &str = "agent-harness.channel-step.v1";
@@ -904,6 +903,31 @@ fn channel_restart_watched_stop_file(value: &Value) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn load_model_catalog_for_turn(
+    turn: &TurnPlan,
+) -> Option<crate::model_catalog::ModelCapabilityCatalog> {
+    let harness_home = turn.harness_home.as_deref()?;
+    let cache_file = harness_home.join("codex-home").join("models_cache.json");
+    let text = fs::read_to_string(cache_file).ok()?;
+    crate::model_catalog::parse_codex_model_catalog(&text).ok()
+}
+
+fn thinking_resolution_for_turn(
+    turn: &TurnPlan,
+    requested_effort: &str,
+) -> crate::model_catalog::ReasoningResolutionReceipt {
+    let catalog = load_model_catalog_for_turn(turn);
+    let mode = crate::model_catalog::model_catalog_rollout_mode(turn.harness_home.as_deref());
+    crate::model_catalog::resolve_reasoning_effort(
+        catalog.as_ref(),
+        mode,
+        turn.model_policy.provider.as_deref().unwrap_or_default(),
+        turn.model_policy.model.as_deref().unwrap_or_default(),
+        requested_effort,
+        crate::model_catalog::UnsupportedReasoningPolicy::Reject,
+    )
+}
+
 fn thinking_command_effect(
     turn: &TurnPlan,
     level: Option<String>,
@@ -917,11 +941,21 @@ fn thinking_command_effect(
     let current_level = current_thinking_level(turn);
     match level {
         Some(level) => {
-            let normalized = normalize_thinking_level(&level)
+            let resolution = thinking_resolution_for_turn(turn, &level);
+            let accepted_by_catalog = matches!(
+                resolution.status,
+                crate::model_catalog::ReasoningResolutionStatus::Accepted
+                    | crate::model_catalog::ReasoningResolutionStatus::Fallback
+            );
+            let normalized = resolution
+                .effective_effort
+                .clone()
                 .unwrap_or_else(|| level.trim().to_ascii_lowercase());
-            let valid = available_levels
-                .iter()
-                .any(|candidate| candidate == &normalized);
+            let valid = accepted_by_catalog
+                || (!resolution.authoritative
+                    && available_levels
+                        .iter()
+                        .any(|candidate| candidate == &normalized));
             ChannelCommandEffect::SwitchThinking {
                 agent_id,
                 provider,
@@ -1182,9 +1216,50 @@ fn write_codex_models_cache_for_test(harness_home: &Path) {
             {
               "slug": "gpt-5.4-mini",
               "service_tiers": []
+            },
+            {
+              "slug": "gpt-5.6-sol",
+              "default_reasoning_level": "low",
+              "supported_reasoning_levels": [
+                { "effort": "low" },
+                { "effort": "medium" },
+                { "effort": "high" },
+                { "effort": "xhigh" },
+                { "effort": "max" },
+                { "effort": "ultra" }
+              ],
+              "service_tiers": [
+                { "id": "priority", "name": "Fast" }
+              ],
+              "comp_hash": 3000
+            },
+            {
+              "slug": "gpt-5.6-luna",
+              "default_reasoning_level": "medium",
+              "supported_reasoning_levels": [
+                { "effort": "low" },
+                { "effort": "medium" },
+                { "effort": "high" },
+                { "effort": "xhigh" },
+                { "effort": "max" }
+              ],
+              "service_tiers": [
+                { "id": "priority", "name": "Fast" }
+              ],
+              "comp_hash": "3000"
             }
           ]
         }"#,
+    )
+    .unwrap();
+}
+
+#[cfg(test)]
+fn write_model_catalog_mode_for_test(harness_home: &Path, mode: &str) {
+    fs::create_dir_all(harness_home).unwrap();
+    fs::write(
+        harness_home.join(crate::HARNESS_CONFIG_FILE_NAME),
+        format!(r#"{{"orchestration":{{"features":{{"modelCatalogV2":{{"mode":"{mode}"}}}}}}}}"#),
     )
     .unwrap();
 }
@@ -1764,6 +1839,18 @@ fn split_provider_model_target(target: &str) -> Option<(String, String)> {
 }
 
 fn available_thinking_levels(turn: &TurnPlan) -> Vec<String> {
+    let mode = crate::model_catalog::model_catalog_rollout_mode(turn.harness_home.as_deref());
+    if mode == crate::model_catalog::ModelCatalogRolloutMode::Authoritative
+        && let Some(catalog) = load_model_catalog_for_turn(turn)
+        && let Some(route) = catalog.exact_route(
+            turn.model_policy.provider.as_deref().unwrap_or_default(),
+            turn.model_policy.model.as_deref().unwrap_or_default(),
+        )
+        && !route.supported_reasoning_efforts.is_empty()
+    {
+        return route.supported_reasoning_efforts.clone();
+    }
+
     let mut levels = THINKING_LEVELS
         .iter()
         .map(|level| (*level).to_string())
@@ -2626,6 +2713,173 @@ mod tests {
     }
 
     #[test]
+    fn model_catalog_authoritative_channel_preserves_sol_max_and_ultra() {
+        let root = temp_root("model_catalog_authoritative_channel_preserves_sol_max_and_ultra");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_codex_models_cache_for_test(&harness_home);
+        write_model_catalog_mode_for_test(&harness_home, "authoritative");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let expected = vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        for effort in ["max", "ultra"] {
+            let turn = build_turn_plan(
+                &source,
+                &registry,
+                &skills,
+                TurnPlanInput {
+                    harness_home: Some(harness_home.clone()),
+                    platform: "telegram".to_string(),
+                    channel_id: "dm".to_string(),
+                    user_id: "user".to_string(),
+                    text: format!("/think {effort}"),
+                    inbound_context: None,
+                    inbound_media_artifacts: Vec::new(),
+                    requested_agent_id: Some("main56sol".to_string()),
+                    session_hint: None,
+                    skill_limit: 3,
+                },
+            )
+            .unwrap();
+            let step = build_channel_step(&registry, &turn);
+            let Some(ChannelCommandEffect::SwitchThinking {
+                level,
+                valid,
+                available_levels,
+                ..
+            }) = step.command_effect
+            else {
+                panic!("expected SwitchThinking for Sol {effort}");
+            };
+            assert_eq!(level, effort);
+            assert!(valid, "Sol {effort} should be accepted");
+            assert_eq!(available_levels, expected);
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_catalog_authoritative_channel_rejects_luna_ultra_without_state_coercion() {
+        let root =
+            temp_root("model_catalog_authoritative_channel_rejects_luna_ultra_without_coercion");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_codex_models_cache_for_test(&harness_home);
+        write_model_catalog_mode_for_test(&harness_home, "authoritative");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "/think ultra".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main56luna".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let step = build_channel_step(&registry, &turn);
+        let Some(ChannelCommandEffect::SwitchThinking {
+            ref level,
+            valid,
+            ref available_levels,
+            ..
+        }) = step.command_effect
+        else {
+            panic!("expected SwitchThinking for Luna ultra");
+        };
+        assert_eq!(level, "ultra");
+        assert!(!valid);
+        assert_eq!(
+            available_levels,
+            &["low", "medium", "high", "xhigh", "max"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+
+        let report = crate::apply_channel_command_step(
+            &step,
+            crate::ChannelCommandApplyOptions {
+                harness_home: harness_home.clone(),
+                now_ms: 42,
+            },
+        )
+        .unwrap();
+        let state = report
+            .state
+            .expect("invalid command still records channel state");
+        assert_ne!(state.thinking_level.as_deref(), Some("xhigh"));
+        assert_ne!(state.thinking_level.as_deref(), Some("ultra"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_catalog_shadow_channel_keeps_legacy_authority_and_observes_catalog() {
+        let root =
+            temp_root("model_catalog_shadow_channel_keeps_legacy_authority_and_observes_catalog");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_codex_models_cache_for_test(&harness_home);
+        write_model_catalog_mode_for_test(&harness_home, "shadow");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "/think max".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main56sol".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        let receipt = thinking_resolution_for_turn(&turn, "max");
+        assert_eq!(
+            receipt.status,
+            crate::model_catalog::ReasoningResolutionStatus::Shadow
+        );
+        assert_eq!(receipt.effective_effort.as_deref(), Some("xhigh"));
+        assert_eq!(receipt.catalog_effective_effort.as_deref(), Some("max"));
+        assert!(!receipt.authoritative);
+
+        let step = build_channel_step(&registry, &turn);
+        assert!(matches!(
+            step.command_effect,
+            Some(ChannelCommandEffect::SwitchThinking {
+                ref level,
+                valid,
+                ..
+            }) if level == "xhigh" && valid
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn channel_step_reports_and_switches_fast_mode_with_route_capability() {
         let root = temp_root("channel_step_reports_and_switches_fast_mode");
         let source = write_channel_source(&root);
@@ -2898,13 +3152,17 @@ mod tests {
                   "model": "codex",
                   "models": {
                     "openai/gpt-5": {},
+                    "openai/gpt-5.6-sol": {},
+                    "openai/gpt-5.6-luna": {},
                     "openai/gpt-5.5": {},
                     "openrouter/anthropic/claude-sonnet-4": {}
                   }
                 },
                 "list": [
                   { "id": "main", "model": "gpt-5", "enabled": true },
-                  { "id": "main55", "model": "gpt-5.5", "enabled": true }
+                  { "id": "main55", "model": "gpt-5.5", "enabled": true },
+                  { "id": "main56sol", "model": "gpt-5.6-sol", "enabled": true },
+                  { "id": "main56luna", "model": "gpt-5.6-luna", "enabled": true }
                 ]
               },
               "models": {
@@ -2913,7 +3171,9 @@ mod tests {
                     "apiKey": "${OPENAI_API_KEY}",
                     "models": [
                       { "id": "gpt-5" },
-                      { "id": "gpt-5.5" }
+                      { "id": "gpt-5.5" },
+                      { "id": "gpt-5.6-sol" },
+                      { "id": "gpt-5.6-luna" }
                     ]
                   },
                   "openrouter": {
