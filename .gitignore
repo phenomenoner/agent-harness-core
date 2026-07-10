@@ -23,6 +23,8 @@ secrets/
 .agent-harness/
 .agent-harness-*/
 .learnings/
+.understand-anything/
+.worktrees/
 openspec/
 docs/.private/
 tools/.private/
