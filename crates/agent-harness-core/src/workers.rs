@@ -578,7 +578,8 @@ pub fn run_worker_once(options: WorkerRunOnceOptions) -> io::Result<WorkerRunOnc
         None,
         None,
     )?;
-    let result =
+    let result = normalize_exhausted_retryable_result(
+        &job,
         match execute_worker_job(&options.harness_home, &conn, &job, &config, options.now_ms) {
             Ok(result) => result,
             Err(error) => WorkerJobExecutionResult {
@@ -588,7 +589,8 @@ pub fn run_worker_once(options: WorkerRunOnceOptions) -> io::Result<WorkerRunOnc
                 artifact_refs: Some(json!({"error": error.to_string()})),
                 result: None,
             },
-        };
+        },
+    );
     let terminal = result.status.is_terminal();
     let rescheduled = result.status == WorkerJobStatus::Pending;
     persist_execution_result(&conn, &job, &result, options.now_ms)?;
@@ -1743,9 +1745,7 @@ fn run_deterministic_shell_job(
     let stdout = capped_string(&output.stdout);
     let stderr = capped_string(&output.stderr);
     let exit_code = output.status.code();
-    let status = if timed_out {
-        WorkerJobStatus::FailedRetryable
-    } else if output.status.success() {
+    let status = if !timed_out && output.status.success() {
         WorkerJobStatus::Succeeded
     } else if job.attempt < job.max_attempts {
         WorkerJobStatus::FailedRetryable
@@ -1770,15 +1770,21 @@ fn run_deterministic_shell_job(
         &audit_path,
         serde_json::to_vec_pretty(&audit).map_err(io::Error::other)?,
     )?;
+    let reason = if status == WorkerJobStatus::Succeeded {
+        "deterministic shell job completed".to_string()
+    } else if timed_out {
+        "deterministic shell job timed out".to_string()
+    } else {
+        format!("deterministic shell job exited with code {:?}", exit_code)
+    };
+    let reason = if status == WorkerJobStatus::FailedTerminal && job.attempt >= job.max_attempts {
+        format!("{reason}; {}", exhausted_retry_stop_reason(job))
+    } else {
+        reason
+    };
     Ok(WorkerJobExecutionResult {
         status,
-        reason: if status == WorkerJobStatus::Succeeded {
-            "deterministic shell job completed".to_string()
-        } else if timed_out {
-            "deterministic shell job timed out".to_string()
-        } else {
-            format!("deterministic shell job exited with code {:?}", exit_code)
-        },
+        reason,
         audit_path: Some(audit_path.clone()),
         artifact_refs: Some(json!({"auditPath": audit_path})),
         result: Some(audit),
@@ -2175,29 +2181,51 @@ fn run_watchdog_job(
     })
 }
 
+fn exhausted_retry_stop_reason(job: &WorkerJob) -> String {
+    format!(
+        "retry attempts exhausted at attempt {} of {}",
+        job.attempt, job.max_attempts
+    )
+}
+
+fn normalize_exhausted_retryable_result(
+    job: &WorkerJob,
+    mut result: WorkerJobExecutionResult,
+) -> WorkerJobExecutionResult {
+    if result.status == WorkerJobStatus::FailedRetryable && job.attempt >= job.max_attempts {
+        result.status = WorkerJobStatus::FailedTerminal;
+        let stop_reason = exhausted_retry_stop_reason(job);
+        if !result.reason.contains("retry attempts exhausted") {
+            result.reason = format!("{}; {stop_reason}", result.reason);
+        }
+        if let Some(Value::Object(payload)) = result.result.as_mut() {
+            payload.insert(
+                "status".to_string(),
+                Value::String(WorkerJobStatus::FailedTerminal.as_str().to_string()),
+            );
+            payload.insert("stopReason".to_string(), Value::String(stop_reason));
+        }
+    }
+    result
+}
+
 fn persist_execution_result(
     conn: &Connection,
     job: &WorkerJob,
     result: &WorkerJobExecutionResult,
     now_ms: i64,
 ) -> io::Result<()> {
+    let result = normalize_exhausted_retryable_result(job, result.clone());
     if result.status == WorkerJobStatus::Pending {
         return Ok(());
     }
-    let finished_at = if result.status.is_terminal() {
-        Some(now_ms)
+    let status = if result.status == WorkerJobStatus::FailedRetryable {
+        WorkerJobStatus::Pending
     } else {
-        None
+        result.status
     };
-    let status =
-        if result.status == WorkerJobStatus::FailedRetryable && job.attempt < job.max_attempts {
-            WorkerJobStatus::Pending
-        } else {
-            result.status
-        };
-    let available_at = if result.status == WorkerJobStatus::FailedRetryable
-        && status == WorkerJobStatus::Pending
-    {
+    let finished_at = status.is_terminal().then_some(now_ms);
+    let available_at = if status == WorkerJobStatus::Pending {
         now_ms.saturating_add(backoff_ms(job.attempt))
     } else {
         job.available_at_ms
@@ -3374,6 +3402,109 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
     }
+    #[test]
+    fn deterministic_shell_final_timeout_is_terminal_and_next_job_runs() {
+        let root = temp_root("deterministic_shell_final_timeout_is_terminal_and_next_job_runs");
+        let harness_home = root.join(".agent-harness");
+        let script_dir = harness_home.join("state").join("workers").join("scripts");
+        fs::create_dir_all(&script_dir).unwrap();
+        let timeout_script = write_timeout_script(&script_dir);
+        let cron_run = crate::admit_cron_run(crate::CronRunAdmitOptions {
+            harness_home: harness_home.clone(),
+            source_kind: "native-cron".to_string(),
+            source_id: "source-1".to_string(),
+            entry_id: "final-timeout".to_string(),
+            agent_id: "agent-a".to_string(),
+            scheduled_for_ms: 42,
+            runtime_class: "cron".to_string(),
+            session_key: "cron:agent-a:final-timeout:42".to_string(),
+            session_policy: "one-shot".to_string(),
+            max_attempts: 1,
+            now_ms: 1000,
+        })
+        .unwrap();
+
+        let mut timeout = shell_options(&harness_home, "final-timeout", 1000);
+        timeout.payload = json!({
+            "scriptPath": timeout_script,
+            "cwd": script_dir,
+            "cronRunId": &cron_run.run_id,
+        });
+        timeout.max_attempts = 1;
+        timeout.timeout_ms = Some(10);
+        let timeout_job = enqueue_worker_job(timeout).unwrap();
+        crate::mark_cron_run_worker_enqueued(
+            &harness_home,
+            &cron_run.run_id,
+            &timeout_job.job.job_id,
+            1001,
+        )
+        .unwrap();
+
+        let next_job = enqueue_worker_job(shell_options(&harness_home, "next-job", 1001)).unwrap();
+        let timed_out = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("shell".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1002,
+        })
+        .unwrap();
+
+        assert_eq!(timed_out.status, WorkerRunOnceStatus::Failed);
+        let result = timed_out.result.as_ref().unwrap();
+        assert_eq!(result.status, WorkerJobStatus::FailedTerminal);
+        assert!(result.reason.contains("timed out"));
+        assert!(result.reason.contains("retry attempts exhausted"));
+        let persisted = timed_out.job.as_ref().unwrap();
+        assert_eq!(persisted.status, WorkerJobStatus::FailedTerminal);
+        assert_eq!(persisted.attempt, persisted.max_attempts);
+        assert!(persisted.lease_owner.is_none());
+        assert!(persisted.lease_expires_at_ms.is_none());
+        assert_eq!(persisted.finished_at_ms, Some(1002));
+
+        let runs = crate::collect_cron_run_summary(&harness_home).unwrap();
+        let updated = runs
+            .runs
+            .iter()
+            .find(|run| run.run_id == cron_run.run_id)
+            .unwrap();
+        assert_eq!(updated.status, crate::CronRunStatus::FailedTerminal);
+        assert!(
+            updated
+                .failure_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("retry attempts exhausted")
+        );
+
+        let next = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("shell".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1003,
+        })
+        .unwrap();
+        assert_eq!(next.status, WorkerRunOnceStatus::Completed);
+        assert_eq!(next.job.as_ref().unwrap().job_id, next_job.job.job_id);
+        assert_eq!(
+            next.result.as_ref().unwrap().status,
+            WorkerJobStatus::Succeeded
+        );
+
+        let worker_status = collect_worker_status(WorkerStatusOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+        assert_eq!(worker_status.totals.leased, 0);
+        assert_eq!(worker_status.totals.running, 0);
+        assert_eq!(worker_status.totals.failed_retryable, 0);
+        assert_eq!(worker_status.totals.failed_terminal, 1);
+        assert_eq!(worker_status.totals.succeeded, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn skill_synthesis_worker_autonomously_creates_agent_skill() {
@@ -3848,6 +3979,25 @@ mod tests {
             rate_key: Some("llm:provider:test".to_string()),
             concurrency_group_key: Some("master:main".to_string()),
             now_ms,
+        }
+    }
+    fn write_timeout_script(script_dir: &Path) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let script = script_dir.join("timeout.ps1");
+            fs::write(&script, "Start-Sleep -Milliseconds 500\r\n").unwrap();
+            script
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let script = script_dir.join("timeout.sh");
+            fs::write(&script, "#!/bin/sh\nsleep 1\n").unwrap();
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+            script
         }
     }
 
