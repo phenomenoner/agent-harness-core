@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 pub mod activation;
 pub mod admission;
 pub mod autonomy;
+pub mod backend_reasoning;
 pub mod background;
 pub mod channel_commands;
 pub mod channel_delivery;
