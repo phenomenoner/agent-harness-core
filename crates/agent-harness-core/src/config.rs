@@ -217,6 +217,9 @@ fn validate_owned_codex_events_v2_object(path: &str, value: &Value, errors: &mut
     let Some(object) = expect_object(path, value, errors) else {
         return;
     };
+    if !object.contains_key("mode") {
+        errors.push(format!("{}.mode is required", path));
+    }
     for (key, child) in object {
         match key.as_str() {
             "mode" => expect_enum(
@@ -225,6 +228,7 @@ fn validate_owned_codex_events_v2_object(path: &str, value: &Value, errors: &mut
                 &["off", "shadow", "authoritative"],
                 errors,
             ),
+            "enabledAgentIds" => validate_string_array(path_key(path, key), child, errors),
             other => errors.push(format!(
                 "unknown ownedCodexEventsV2 config key `{other}` at {path}"
             )),
@@ -1765,6 +1769,100 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.contains("$.orchestration.features.ownedCodexEventsV2.mode")),
+            "{:?}",
+            report.errors
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owned_codex_events_config_accepts_optional_agent_cohort() {
+        let root = temp_root("owned_codex_events_config_accepts_optional_agent_cohort");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "orchestration": {
+                "features": {
+                  "ownedCodexEventsV2": {
+                    "mode": "authoritative",
+                    "enabledAgentIds": ["main", "xiaoxiaoli"]
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let report = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(
+            report.status,
+            HarnessConfigValidationStatus::Valid,
+            "errors={:?}",
+            report.errors
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owned_codex_events_config_requires_mode_when_feature_block_exists() {
+        let root = temp_root("owned_codex_events_config_requires_mode_when_feature_block_exists");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "orchestration": {
+                "features": {
+                  "ownedCodexEventsV2": { "enabledAgentIds": ["main"] }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let report = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(report.status, HarnessConfigValidationStatus::Invalid);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("$.orchestration.features.ownedCodexEventsV2.mode")),
+            "{:?}",
+            report.errors
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn owned_codex_events_config_rejects_non_string_agent_cohort_member() {
+        let root = temp_root("owned_codex_events_config_rejects_non_string_agent_cohort_member");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "orchestration": {
+                "features": {
+                  "ownedCodexEventsV2": {
+                    "mode": "authoritative",
+                    "enabledAgentIds": ["main", 7]
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let report = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(report.status, HarnessConfigValidationStatus::Invalid);
+        assert!(
+            report.errors.iter().any(|error| error
+                .contains("$.orchestration.features.ownedCodexEventsV2.enabledAgentIds[1]")),
             "{:?}",
             report.errors
         );
