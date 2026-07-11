@@ -198,6 +198,9 @@ fn validate_model_catalog_v2_object(path: &str, value: &Value, errors: &mut Vec<
     let Some(object) = expect_object(path, value, errors) else {
         return;
     };
+    if !object.contains_key("mode") {
+        errors.push(format!("{}.mode is required", path));
+    }
     for (key, child) in object {
         match key.as_str() {
             "mode" => expect_enum(
@@ -206,6 +209,7 @@ fn validate_model_catalog_v2_object(path: &str, value: &Value, errors: &mut Vec<
                 &["off", "shadow", "authoritative"],
                 errors,
             ),
+            "enabledAgentIds" => validate_nonempty_string_array(path_key(path, key), child, errors),
             other => errors.push(format!(
                 "unknown modelCatalogV2 config key `{other}` at {path}"
             )),
@@ -1095,6 +1099,29 @@ fn validate_string_array(path: String, value: &Value, errors: &mut Vec<String>) 
     }
 }
 
+fn validate_nonempty_string_array(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(values) = value.as_array() else {
+        errors.push(format!(
+            "{path} must be a non-empty array of non-empty strings"
+        ));
+        return;
+    };
+    if values.is_empty() {
+        errors.push(format!("{path} must not be empty"));
+        return;
+    }
+    for (index, child) in values.iter().enumerate() {
+        let item_path = format!("{path}[{index}]");
+        let Some(value) = child.as_str() else {
+            errors.push(format!("{item_path} must be a string"));
+            continue;
+        };
+        if value.trim().is_empty() {
+            errors.push(format!("{item_path} must not be blank"));
+        }
+    }
+}
+
 fn expect_object<'a>(
     path: &str,
     value: &'a Value,
@@ -1716,6 +1743,143 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_catalog_config_accepts_optional_agent_cohort() {
+        let root = temp_root("model_catalog_config_accepts_optional_agent_cohort");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "orchestration": {
+                "features": {
+                  "modelCatalogV2": {
+                    "mode": "authoritative",
+                    "enabledAgentIds": ["main", "xiaoxiaoli"]
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let report = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(
+            report.status,
+            HarnessConfigValidationStatus::Valid,
+            "errors={:?}",
+            report.errors
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_catalog_config_requires_mode_when_feature_block_exists() {
+        let root = temp_root("model_catalog_config_requires_mode_when_feature_block_exists");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "orchestration": {
+                "features": {
+                  "modelCatalogV2": { "enabledAgentIds": ["main"] }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let report = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(report.status, HarnessConfigValidationStatus::Invalid);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("$.orchestration.features.modelCatalogV2.mode")),
+            "{:?}",
+            report.errors
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_catalog_config_rejects_non_string_agent_cohort_member() {
+        let root = temp_root("model_catalog_config_rejects_non_string_agent_cohort_member");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "orchestration": {
+                "features": {
+                  "modelCatalogV2": {
+                    "mode": "authoritative",
+                    "enabledAgentIds": ["main", 7]
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let report = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(report.status, HarnessConfigValidationStatus::Invalid);
+        assert!(
+            report.errors.iter().any(|error| error
+                .contains("$.orchestration.features.modelCatalogV2.enabledAgentIds[1]")),
+            "{:?}",
+            report.errors
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_catalog_config_rejects_empty_or_blank_agent_cohort() {
+        for (suffix, cohort) in [("empty", "[]"), ("blank", r#"["main", "   "]"#)] {
+            let root = temp_root(&format!(
+                "model_catalog_config_rejects_empty_or_blank_agent_cohort_{suffix}"
+            ));
+            let harness_home = root.join(".agent-harness");
+            fs::create_dir_all(&harness_home).unwrap();
+            fs::write(
+                harness_home.join(HARNESS_CONFIG_FILE_NAME),
+                format!(
+                    r#"{{
+                      "orchestration": {{
+                        "features": {{
+                          "modelCatalogV2": {{
+                            "mode": "authoritative",
+                            "enabledAgentIds": {cohort}
+                          }}
+                        }}
+                      }}
+                    }}"#
+                ),
+            )
+            .unwrap();
+
+            let report = validate_harness_config(&harness_home).unwrap();
+            assert_eq!(
+                report.status,
+                HarnessConfigValidationStatus::Invalid,
+                "{suffix}: {:?}",
+                report.errors
+            );
+            assert!(
+                report.errors.iter().any(|error| error
+                    .contains("$.orchestration.features.modelCatalogV2.enabledAgentIds")),
+                "{suffix}: {:?}",
+                report.errors
+            );
+
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]

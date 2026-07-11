@@ -912,12 +912,21 @@ fn load_model_catalog_for_turn(
     crate::model_catalog::parse_codex_model_catalog(&text).ok()
 }
 
+fn model_catalog_rollout_mode_for_turn(
+    turn: &TurnPlan,
+) -> crate::model_catalog::ModelCatalogRolloutMode {
+    crate::model_catalog::model_catalog_rollout_mode_for_agent(
+        turn.harness_home.as_deref(),
+        turn.agent.as_ref().map(|agent| agent.id.as_str()),
+    )
+}
+
 fn thinking_resolution_for_turn(
     turn: &TurnPlan,
     requested_effort: &str,
 ) -> crate::model_catalog::ReasoningResolutionReceipt {
     let catalog = load_model_catalog_for_turn(turn);
-    let mode = crate::model_catalog::model_catalog_rollout_mode(turn.harness_home.as_deref());
+    let mode = model_catalog_rollout_mode_for_turn(turn);
     crate::model_catalog::resolve_reasoning_effort(
         catalog.as_ref(),
         mode,
@@ -1260,6 +1269,30 @@ fn write_model_catalog_mode_for_test(harness_home: &Path, mode: &str) {
     fs::write(
         harness_home.join(crate::HARNESS_CONFIG_FILE_NAME),
         format!(r#"{{"orchestration":{{"features":{{"modelCatalogV2":{{"mode":"{mode}"}}}}}}}}"#),
+    )
+    .unwrap();
+}
+
+#[cfg(test)]
+fn write_model_catalog_cohort_for_test(
+    harness_home: &Path,
+    mode: &str,
+    enabled_agent_ids: &[&str],
+) {
+    fs::create_dir_all(harness_home).unwrap();
+    let config = serde_json::json!({
+        "orchestration": {
+            "features": {
+                "modelCatalogV2": {
+                    "mode": mode,
+                    "enabledAgentIds": enabled_agent_ids,
+                }
+            }
+        }
+    });
+    fs::write(
+        harness_home.join(crate::HARNESS_CONFIG_FILE_NAME),
+        serde_json::to_vec(&config).unwrap(),
     )
     .unwrap();
 }
@@ -1839,7 +1872,7 @@ fn split_provider_model_target(target: &str) -> Option<(String, String)> {
 }
 
 fn available_thinking_levels(turn: &TurnPlan) -> Vec<String> {
-    let mode = crate::model_catalog::model_catalog_rollout_mode(turn.harness_home.as_deref());
+    let mode = model_catalog_rollout_mode_for_turn(turn);
     if mode == crate::model_catalog::ModelCatalogRolloutMode::Authoritative
         && let Some(catalog) = load_model_catalog_for_turn(turn)
         && let Some(route) = catalog.exact_route(
@@ -2759,6 +2792,68 @@ mod tests {
             assert!(valid, "Sol {effort} should be accepted");
             assert_eq!(available_levels, expected);
         }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_catalog_agent_cohort_controls_resolution_and_advertised_levels() {
+        let root = temp_root("model_catalog_agent_cohort_controls_resolution");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_codex_models_cache_for_test(&harness_home);
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+
+        let build_ultra_step = || {
+            let turn = build_turn_plan(
+                &source,
+                &registry,
+                &skills,
+                TurnPlanInput {
+                    harness_home: Some(harness_home.clone()),
+                    platform: "telegram".to_string(),
+                    channel_id: "dm".to_string(),
+                    user_id: "user".to_string(),
+                    text: "/think ultra".to_string(),
+                    inbound_context: None,
+                    inbound_media_artifacts: Vec::new(),
+                    requested_agent_id: Some("main56sol".to_string()),
+                    session_hint: None,
+                    skill_limit: 3,
+                },
+            )
+            .unwrap();
+            build_channel_step(&registry, &turn)
+        };
+
+        write_model_catalog_cohort_for_test(&harness_home, "authoritative", &["main56sol"]);
+        let included = build_ultra_step();
+        let Some(ChannelCommandEffect::SwitchThinking {
+            valid,
+            available_levels,
+            ..
+        }) = included.command_effect
+        else {
+            panic!("expected included Sol cohort to produce SwitchThinking");
+        };
+        assert!(valid, "included Sol cohort should accept ultra");
+        assert!(available_levels.iter().any(|level| level == "max"));
+        assert!(available_levels.iter().any(|level| level == "ultra"));
+
+        write_model_catalog_cohort_for_test(&harness_home, "authoritative", &["main56luna"]);
+        let excluded = build_ultra_step();
+        let Some(ChannelCommandEffect::SwitchThinking {
+            valid,
+            available_levels,
+            ..
+        }) = excluded.command_effect
+        else {
+            panic!("expected excluded Sol cohort to produce SwitchThinking");
+        };
+        assert!(!valid, "excluded Sol cohort must keep legacy authority");
+        assert!(!available_levels.iter().any(|level| level == "max"));
+        assert!(!available_levels.iter().any(|level| level == "ultra"));
 
         let _ = fs::remove_dir_all(root);
     }

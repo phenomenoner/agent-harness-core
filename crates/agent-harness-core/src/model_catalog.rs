@@ -201,7 +201,17 @@ impl<'a> From<&'a ModelCapability> for CatalogRevisionModelProjection<'a> {
     }
 }
 
+/// Backward-compatible identity-less lookup. When a cohort is configured it
+/// remains off unless the cohort contains `*`; agent-scoped callers should use
+/// [`model_catalog_rollout_mode_for_agent`] so configured identities stay exact.
 pub fn model_catalog_rollout_mode(harness_home: Option<&Path>) -> ModelCatalogRolloutMode {
+    model_catalog_rollout_mode_for_agent(harness_home, None)
+}
+
+pub fn model_catalog_rollout_mode_for_agent(
+    harness_home: Option<&Path>,
+    agent_id: Option<&str>,
+) -> ModelCatalogRolloutMode {
     let Some(harness_home) = harness_home else {
         return ModelCatalogRolloutMode::Off;
     };
@@ -217,15 +227,44 @@ pub fn model_catalog_rollout_mode(harness_home: Option<&Path>) -> ModelCatalogRo
     let Ok(value) = serde_json::from_str::<Value>(&text) else {
         return ModelCatalogRolloutMode::Off;
     };
-    match value
-        .pointer("/orchestration/features/modelCatalogV2/mode")
-        .and_then(Value::as_str)
-        .map(str::trim)
-    {
+    let Some(feature) = value
+        .pointer("/orchestration/features/modelCatalogV2")
+        .and_then(Value::as_object)
+    else {
+        return ModelCatalogRolloutMode::Off;
+    };
+    let mode = match feature.get("mode").and_then(Value::as_str) {
         Some("shadow") => ModelCatalogRolloutMode::Shadow,
         Some("authoritative") => ModelCatalogRolloutMode::Authoritative,
         _ => ModelCatalogRolloutMode::Off,
+    };
+    let Some(cohort) = feature.get("enabledAgentIds") else {
+        return mode;
+    };
+    let Some(cohort) = cohort.as_array() else {
+        return ModelCatalogRolloutMode::Off;
+    };
+    if cohort.is_empty() {
+        return ModelCatalogRolloutMode::Off;
     }
+
+    let requested_agent_id = agent_id.map(str::trim).filter(|value| !value.is_empty());
+    let mut included = false;
+    for member in cohort {
+        let Some(member) = member.as_str() else {
+            return ModelCatalogRolloutMode::Off;
+        };
+        let member = member.trim();
+        if member.is_empty() {
+            return ModelCatalogRolloutMode::Off;
+        }
+        if member == "*" || requested_agent_id.is_some_and(|agent_id| agent_id == member) {
+            included = true;
+        }
+    }
+    included
+        .then_some(mode)
+        .unwrap_or(ModelCatalogRolloutMode::Off)
 }
 
 pub fn resolve_reasoning_effort(
@@ -936,6 +975,129 @@ mod tests {
             model_catalog_rollout_mode(Some(&harness_home)),
             ModelCatalogRolloutMode::Authoritative
         );
+
+        let _ = fs::remove_dir_all(harness_home);
+    }
+
+    #[test]
+    fn model_catalog_rollout_mode_applies_exact_and_wildcard_agent_cohorts() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let harness_home = std::env::temp_dir().join(format!(
+            "agent-harness-model-catalog-cohort-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&harness_home).unwrap();
+        let config_file = harness_home.join(crate::HARNESS_CONFIG_FILE_NAME);
+
+        assert_eq!(
+            model_catalog_rollout_mode_for_agent(Some(&harness_home), Some("agent-a")),
+            ModelCatalogRolloutMode::Off
+        );
+
+        fs::write(
+            &config_file,
+            r#"{"orchestration":{"features":{"modelCatalogV2":{"mode":" authoritative "}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            model_catalog_rollout_mode_for_agent(Some(&harness_home), Some("agent-a")),
+            ModelCatalogRolloutMode::Off,
+            "runtime parsing must not enable a mode rejected by config validation"
+        );
+
+        fs::write(
+            &config_file,
+            r#"{"orchestration":{"features":{"modelCatalogV2":{"mode":"shadow"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            model_catalog_rollout_mode_for_agent(Some(&harness_home), Some("agent-b")),
+            ModelCatalogRolloutMode::Shadow
+        );
+        assert_eq!(
+            model_catalog_rollout_mode_for_agent(Some(&harness_home), None),
+            ModelCatalogRolloutMode::Shadow
+        );
+
+        fs::write(
+            &config_file,
+            r#"{"orchestration":{"features":{"modelCatalogV2":{"mode":"authoritative","enabledAgentIds":["agent-a"]}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            model_catalog_rollout_mode_for_agent(Some(&harness_home), Some("agent-a")),
+            ModelCatalogRolloutMode::Authoritative
+        );
+        assert_eq!(
+            model_catalog_rollout_mode_for_agent(Some(&harness_home), Some("agent-b")),
+            ModelCatalogRolloutMode::Off
+        );
+        assert_eq!(
+            model_catalog_rollout_mode_for_agent(Some(&harness_home), None),
+            ModelCatalogRolloutMode::Off
+        );
+
+        fs::write(
+            &config_file,
+            r#"{"orchestration":{"features":{"modelCatalogV2":{"mode":"authoritative","enabledAgentIds":[" Agent-A "]}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            model_catalog_rollout_mode_for_agent(Some(&harness_home), Some(" Agent-A ")),
+            ModelCatalogRolloutMode::Authoritative,
+            "outer whitespace is not part of the routing identity"
+        );
+        assert_eq!(
+            model_catalog_rollout_mode_for_agent(Some(&harness_home), Some("agent-a")),
+            ModelCatalogRolloutMode::Off,
+            "agent routing identities remain case-sensitive"
+        );
+
+        fs::write(
+            &config_file,
+            r#"{"orchestration":{"features":{"modelCatalogV2":{"mode":"authoritative","enabledAgentIds":["*"]}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            model_catalog_rollout_mode_for_agent(Some(&harness_home), Some("agent-b")),
+            ModelCatalogRolloutMode::Authoritative
+        );
+        assert_eq!(
+            model_catalog_rollout_mode_for_agent(Some(&harness_home), None),
+            ModelCatalogRolloutMode::Authoritative
+        );
+
+        for cohort in [
+            "[]",
+            "[\"agent-a\", 7]",
+            "\"agent-a\"",
+            "[\"agent-a\", \"   \"]",
+            "[\"*\", \"\"]",
+        ] {
+            let cohort = serde_json::from_str::<Value>(cohort).unwrap();
+            let config = serde_json::json!({
+                "orchestration": {
+                    "features": {
+                        "modelCatalogV2": {
+                            "mode": "authoritative",
+                            "enabledAgentIds": cohort,
+                        }
+                    }
+                }
+            });
+            fs::write(&config_file, serde_json::to_vec(&config).unwrap()).unwrap();
+            assert_eq!(
+                model_catalog_rollout_mode_for_agent(Some(&harness_home), Some("agent-a")),
+                ModelCatalogRolloutMode::Off,
+                "malformed or empty cohort must fail closed: {cohort}"
+            );
+        }
 
         let _ = fs::remove_dir_all(harness_home);
     }
