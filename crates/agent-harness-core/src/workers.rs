@@ -1872,6 +1872,8 @@ fn queue_llm_worker_turn(
         inbound_media_artifacts: Vec::new(),
         provider: string_path(&job.payload, "provider").map(ToString::to_string),
         model: string_path(&job.payload, "model").map(ToString::to_string),
+        reasoning_preference: None,
+        backend_reasoning_policy: None,
         prompt_files_present: 0,
         prompt_files_total: 0,
         selected_skill_ids: Vec::new(),

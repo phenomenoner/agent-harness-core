@@ -12,6 +12,7 @@ use serde_json::Value;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 
+use crate::backend_reasoning::{BackendReasoningPolicyV1, ReasoningPreference};
 use crate::loop_health::process_alive_for_pid;
 use crate::{
     AgentSource, HarnessLogEvent, HarnessLogLevel, InboundMediaArtifact, PromptAssemblyOptions,
@@ -137,6 +138,10 @@ pub struct RuntimeQueuePreparedItem {
     pub inbound_media_artifacts: Vec<InboundMediaArtifact>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_preference: Option<ReasoningPreference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_reasoning_policy: Option<BackendReasoningPolicyV1>,
     pub execution_dir: PathBuf,
     pub prompt_bundle_json: PathBuf,
     pub prompt_markdown: PathBuf,
@@ -282,6 +287,10 @@ struct PendingQueueItem {
     source_home: PathBuf,
     source_workspace: PathBuf,
     runtime_workspace: Option<PathBuf>,
+    provider: Option<String>,
+    model: Option<String>,
+    reasoning_preference: Option<ReasoningPreference>,
+    backend_reasoning_policy: Option<BackendReasoningPolicyV1>,
     planned_transcript_file: PathBuf,
     planned_trajectory_file: PathBuf,
     selected_skill_ids: Vec<String>,
@@ -1035,6 +1044,54 @@ pub fn prepare_runtime_queue_item(
             warnings,
         });
     };
+    if let Err(reason) = revalidate_pending_reasoning_snapshot(&options.harness_home, &pending) {
+        let reason = format!("runtime reasoning snapshot failed admission: {reason}");
+        write_runtime_queue_quarantine_marker(
+            &options.harness_home,
+            &pending.queue_id,
+            &reason,
+            now_ms,
+        )?;
+        warnings.push(format!(
+            "runtime queue item `{}` was quarantined before lease acquisition: {reason}",
+            pending.queue_id
+        ));
+        let control = QueueTerminalControlMatch {
+            source: TerminalControlSource::Quarantine,
+            reason,
+            suppression_recorded: false,
+        };
+        record_terminal_control_suppression(
+            &options.harness_home,
+            &pending.queue_id,
+            Some(&pending.runtime_class),
+            Some(&pending.origin),
+            pending.cron_run_id.as_deref(),
+            pending.scheduled_for_ms,
+            &pending.continuation,
+            &control,
+        )?;
+        write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+        let receipt = terminal_control_no_pending_receipt(
+            &pending.queue_id,
+            Some(pending.runtime_class.clone()),
+            Some(pending.origin.clone()),
+            pending.cron_run_id.clone(),
+            pending.scheduled_for_ms,
+            pending.continuation.clone(),
+            &control,
+        );
+        append_json_line(&execution_receipts_file, &receipt)?;
+        return Ok(RuntimeQueuePrepareReport {
+            schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
+            harness_home: options.harness_home,
+            queue_file,
+            execution_receipts_file,
+            item: None,
+            receipt,
+            warnings,
+        });
+    }
     let pending = maybe_apply_context_rollover_before_turn(
         &options.harness_home,
         &queue_file,
@@ -1063,7 +1120,7 @@ pub fn prepare_runtime_queue_item(
     let source = AgentSource::with_workspace(&pending.source_home, &prompt_workspace);
     let registry = load_agent_registry(&source)?;
     let skill_index = build_runtime_skill_index(&source, &options.harness_home)?;
-    let plan = build_turn_plan(
+    let mut plan = build_turn_plan(
         &source,
         &registry,
         &skill_index,
@@ -1080,6 +1137,12 @@ pub fn prepare_runtime_queue_item(
             skill_limit: pending.selected_skill_ids.len().max(5),
         },
     )?;
+    if let (Some(provider), Some(model)) = (&pending.provider, &pending.model) {
+        plan.model_policy.provider = Some(provider.clone());
+        plan.model_policy.model = Some(model.clone());
+        plan.reasoning_preference = pending.reasoning_preference.clone();
+        plan.backend_reasoning_policy = pending.backend_reasoning_policy.clone();
+    }
     let actual_skill_ids = plan
         .selected_skills
         .iter()
@@ -1124,6 +1187,8 @@ pub fn prepare_runtime_queue_item(
         inbound_media_artifacts: pending.inbound_media_artifacts.clone(),
         provider: bundle.provider.clone(),
         model: bundle.model.clone(),
+        reasoning_preference: bundle.reasoning_preference.clone(),
+        backend_reasoning_policy: bundle.backend_reasoning_policy.clone(),
         execution_dir: execution_dir.clone(),
         prompt_bundle_json: prompt_files.json.clone(),
         prompt_markdown: prompt_files.markdown.clone(),
@@ -3008,10 +3073,43 @@ fn read_pending_items(
             continue;
         }
         match parse_pending_item(&value) {
-            Some(item) => items.push(item),
-            None => warnings.push(format!(
-                "runtime queue item `{queue_id}` is missing required fields"
-            )),
+            Ok(item) => items.push(item),
+            Err(error) => {
+                let has_execution_snapshot = [
+                    "provider",
+                    "model",
+                    "reasoningPreference",
+                    "reasoning_preference",
+                    "backendReasoningPolicy",
+                    "backend_reasoning_policy",
+                ]
+                .iter()
+                .any(|key| value.get(*key).is_some_and(|value| !value.is_null()));
+                let reason = if has_execution_snapshot {
+                    format!(
+                        "runtime queue item `{queue_id}` has an invalid execution snapshot: {error}"
+                    )
+                } else {
+                    format!("runtime queue item `{queue_id}` is invalid: {error}")
+                };
+                if has_execution_snapshot
+                    && let Some(harness_home) = queue_file
+                        .parent()
+                        .and_then(Path::parent)
+                        .and_then(Path::parent)
+                    && let Err(marker_error) = write_runtime_queue_quarantine_marker(
+                        harness_home,
+                        queue_id,
+                        &reason,
+                        current_log_time_ms().unwrap_or_default(),
+                    )
+                {
+                    warnings.push(format!(
+                        "failed to quarantine malformed runtime queue item `{queue_id}`: {marker_error}"
+                    ));
+                }
+                warnings.push(reason);
+            }
         }
     }
 
@@ -3158,17 +3256,29 @@ fn is_terminal_run_once_status(status: &str) -> bool {
     )
 }
 
-fn parse_pending_item(value: &Value) -> Option<PendingQueueItem> {
-    let source = value.get("source")?;
-    let platform = string_field(value, &["platform"])?.to_string();
+fn parse_pending_item(value: &Value) -> Result<PendingQueueItem, String> {
+    let source = value
+        .get("source")
+        .ok_or_else(|| "missing source object".to_string())?;
+    let platform = string_field(value, &["platform"])
+        .ok_or_else(|| "missing platform".to_string())?
+        .to_string();
+    let (provider, model, reasoning_preference, backend_reasoning_policy) =
+        parse_pending_reasoning_snapshot(value)?;
     let runtime_class = string_field(value, &["runtimeClass", "runtime_class"])
         .map(ToString::to_string)
         .unwrap_or_else(|| default_runtime_class_for(&platform));
-    Some(PendingQueueItem {
-        queue_id: string_field(value, &["queueId", "queue_id"])?.to_string(),
+    Ok(PendingQueueItem {
+        queue_id: string_field(value, &["queueId", "queue_id"])
+            .ok_or_else(|| "missing queue id".to_string())?
+            .to_string(),
         created_at_ms: i64_field(value, &["createdAtMs", "created_at_ms"]).unwrap_or(0),
-        agent_id: string_field(value, &["agentId", "agent_id"])?.to_string(),
-        session_key: string_field(value, &["sessionKey", "session_key"])?.to_string(),
+        agent_id: string_field(value, &["agentId", "agent_id"])
+            .ok_or_else(|| "missing agent id".to_string())?
+            .to_string(),
+        session_key: string_field(value, &["sessionKey", "session_key"])
+            .ok_or_else(|| "missing session key".to_string())?
+            .to_string(),
         runtime_class,
         origin: string_field(value, &["origin"])
             .map(ToString::to_string)
@@ -3183,29 +3293,189 @@ fn parse_pending_item(value: &Value) -> Option<PendingQueueItem> {
         scheduled_for_ms: i64_field(value, &["scheduledForMs", "scheduled_for_ms"]),
         platform,
         account_id: string_field(value, &["accountId", "account_id"]).map(ToString::to_string),
-        channel_id: string_field(value, &["channelId", "channel_id"])?.to_string(),
-        user_id: string_field(value, &["userId", "user_id"])?.to_string(),
-        message_text: string_field(value, &["messageText", "message_text"])?.to_string(),
+        channel_id: string_field(value, &["channelId", "channel_id"])
+            .ok_or_else(|| "missing channel id".to_string())?
+            .to_string(),
+        user_id: string_field(value, &["userId", "user_id"])
+            .ok_or_else(|| "missing user id".to_string())?
+            .to_string(),
+        message_text: string_field(value, &["messageText", "message_text"])
+            .ok_or_else(|| "missing message text".to_string())?
+            .to_string(),
         inbound_context: string_field(value, &["inboundContext", "inbound_context"])
             .map(ToString::to_string),
         inbound_media_artifacts: inbound_media_artifacts_field(
             value,
             &["inboundMediaArtifacts", "inbound_media_artifacts"],
         ),
-        source_home: path_field(source, &["sourceHome", "source_home"])?,
-        source_workspace: path_field(source, &["sourceWorkspace", "source_workspace"])?,
+        source_home: path_field(source, &["sourceHome", "source_home"])
+            .ok_or_else(|| "missing source home".to_string())?,
+        source_workspace: path_field(source, &["sourceWorkspace", "source_workspace"])
+            .ok_or_else(|| "missing source workspace".to_string())?,
         runtime_workspace: path_field(source, &["runtimeWorkspace", "runtime_workspace"]),
+        provider,
+        model,
+        reasoning_preference,
+        backend_reasoning_policy,
         planned_transcript_file: path_field(
             value,
             &["plannedTranscriptFile", "planned_transcript_file"],
-        )?,
+        )
+        .ok_or_else(|| "missing planned transcript file".to_string())?,
         planned_trajectory_file: path_field(
             value,
             &["plannedTrajectoryFile", "planned_trajectory_file"],
-        )?,
+        )
+        .ok_or_else(|| "missing planned trajectory file".to_string())?,
         selected_skill_ids: string_array_field(value, &["selectedSkillIds", "selected_skill_ids"]),
         continuation: continuation_metadata_from_value(value),
     })
+}
+
+fn parse_pending_reasoning_snapshot(
+    value: &Value,
+) -> Result<
+    (
+        Option<String>,
+        Option<String>,
+        Option<ReasoningPreference>,
+        Option<BackendReasoningPolicyV1>,
+    ),
+    String,
+> {
+    let preference_value = value
+        .get("reasoningPreference")
+        .or_else(|| value.get("reasoning_preference"))
+        .filter(|value| !value.is_null());
+    let policy_value = value
+        .get("backendReasoningPolicy")
+        .or_else(|| value.get("backend_reasoning_policy"))
+        .filter(|value| !value.is_null());
+    if preference_value.is_none() && policy_value.is_none() {
+        return match (value.get("provider"), value.get("model")) {
+            (None | Some(Value::Null), None | Some(Value::Null)) => Ok((None, None, None, None)),
+            (Some(Value::String(provider)), Some(Value::String(model)))
+                if !provider.is_empty()
+                    && provider.trim() == provider
+                    && !model.is_empty()
+                    && model.trim() == model =>
+            {
+                Ok((Some(provider.clone()), Some(model.clone()), None, None))
+            }
+            _ => Err(
+                "provider and model must be absent together or form a canonical complete route"
+                    .to_string(),
+            ),
+        };
+    }
+    if preference_value.is_some() != policy_value.is_some() {
+        return Err("reasoning preference and backend policy must be present together".to_string());
+    }
+    let provider = match value.get("provider") {
+        Some(Value::String(value)) if !value.is_empty() && value.trim() == value => value.clone(),
+        _ => {
+            return Err("reasoning snapshot requires a canonical non-empty provider".to_string());
+        }
+    };
+    let model = match value.get("model") {
+        Some(Value::String(value)) if !value.is_empty() && value.trim() == value => value.clone(),
+        _ => {
+            return Err("reasoning snapshot requires a canonical non-empty model".to_string());
+        }
+    };
+    let reasoning_preference = preference_value
+        .map(|value| serde_json::from_value::<ReasoningPreference>(value.clone()))
+        .transpose()
+        .map_err(|error| format!("invalid reasoning preference: {error}"))?;
+    let backend_reasoning_policy = policy_value
+        .map(|value| serde_json::from_value::<BackendReasoningPolicyV1>(value.clone()))
+        .transpose()
+        .map_err(|error| format!("invalid backend reasoning policy: {error}"))?;
+    if let (Some(preference), Some(policy)) = (
+        reasoning_preference.as_ref(),
+        backend_reasoning_policy.as_ref(),
+    ) {
+        if let Err(error) = policy.validate_for_route(&provider, &model) {
+            return Err(format!("reasoning snapshot route mismatch: {error}"));
+        }
+        if preference
+            .explicit_effort()
+            .is_some_and(|effort| !effort.eq_ignore_ascii_case(policy.effective_effort()))
+        {
+            return Err(
+                "explicit reasoning preference does not match backend policy effort".to_string(),
+            );
+        }
+        if preference.validate().is_err()
+            || preference
+                .explicit_effort()
+                .is_some_and(|effort| effort.trim() != effort)
+        {
+            return Err("reasoning preference is not canonical".to_string());
+        }
+    }
+    Ok((
+        Some(provider),
+        Some(model),
+        reasoning_preference,
+        backend_reasoning_policy,
+    ))
+}
+
+fn revalidate_pending_reasoning_snapshot(
+    harness_home: &Path,
+    item: &PendingQueueItem,
+) -> Result<(), String> {
+    let (Some(preference), Some(policy)) = (
+        item.reasoning_preference.as_ref(),
+        item.backend_reasoning_policy.as_ref(),
+    ) else {
+        return Ok(());
+    };
+    let provider = item.provider.as_deref().ok_or("missing queued provider")?;
+    let model = item.model.as_deref().ok_or("missing queued model")?;
+    policy
+        .validate_for_execution_route(provider, model)
+        .map_err(|error| format!("queued backend reasoning route mismatch: {error}"))?;
+    if crate::model_catalog::model_catalog_rollout_mode_for_agent(
+        Some(harness_home),
+        Some(&item.agent_id),
+    ) != crate::model_catalog::ModelCatalogRolloutMode::Authoritative
+    {
+        return Err("catalog rollout is not authoritative for the queued agent".into());
+    }
+    let cache_file = harness_home.join("codex-home").join("models_cache.json");
+    let text = fs::read_to_string(&cache_file)
+        .map_err(|error| format!("model catalog cache unavailable: {error}"))?;
+    let catalog = crate::model_catalog::parse_codex_model_catalog(&text)?;
+    let route = catalog
+        .exact_route(provider, model)
+        .ok_or_else(|| format!("exact route {provider}/{model} is absent from catalog"))?;
+    let effort = match preference {
+        ReasoningPreference::Default => route
+            .default_reasoning_effort
+            .as_deref()
+            .ok_or("exact route has no default reasoning effort")?,
+        ReasoningPreference::Explicit { effort } => effort,
+    };
+    if effort.eq_ignore_ascii_case("ultra") {
+        return Err("ultra requires a matching delegation resource authorization receipt".into());
+    }
+    let current = crate::model_catalog::resolve_reasoning_effort(
+        Some(&catalog),
+        crate::model_catalog::ModelCatalogRolloutMode::Authoritative,
+        provider,
+        model,
+        effort,
+        crate::model_catalog::UnsupportedReasoningPolicy::Reject,
+    );
+    if !current.authoritative
+        || current.status != crate::model_catalog::ReasoningResolutionStatus::Accepted
+        || current.effective_effort.as_deref() != Some(policy.effective_effort())
+    {
+        return Err("queued reasoning policy is not valid for the current exact route".into());
+    }
+    Ok(())
 }
 
 fn continuation_metadata_from_value(value: &Value) -> RuntimeContinuationMetadata {
@@ -3423,6 +3693,214 @@ mod tests {
     };
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn queued_item_value(queue_id: &str) -> Value {
+        serde_json::json!({
+            "schema": "agent-harness.runtime-queue-item.v1",
+            "queueId": queue_id,
+            "status": "queued",
+            "createdAtMs": 10,
+            "agentId": "main",
+            "sessionKey": "telegram:dm:user:main",
+            "runtimeClass": "interactive",
+            "origin": "channel",
+            "platform": "telegram",
+            "channelId": "dm",
+            "userId": "user",
+            "messageText": "continue",
+            "source": {
+                "sourceHome": "source",
+                "sourceWorkspace": "workspace"
+            },
+            "plannedTranscriptFile": "transcript.jsonl",
+            "plannedTrajectoryFile": "trajectory.jsonl",
+            "selectedSkillIds": []
+        })
+    }
+
+    fn exact_reasoning_policy(effort: &str) -> BackendReasoningPolicyV1 {
+        BackendReasoningPolicyV1::new(
+            crate::backend_reasoning::BackendReasoningSource::ChannelCommand,
+            crate::model_catalog::ReasoningResolutionReceipt {
+                schema_version: crate::model_catalog::REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION,
+                requested_provider: "openai".to_string(),
+                requested_model: "gpt-5.6-sol".to_string(),
+                effective_provider: Some("openai".to_string()),
+                effective_model: Some("gpt-5.6-sol".to_string()),
+                requested_effort: effort.to_string(),
+                effective_effort: Some(effort.to_string()),
+                catalog_effective_effort: Some(effort.to_string()),
+                catalog_revision: Some("test-revision".to_string()),
+                status: crate::model_catalog::ReasoningResolutionStatus::Accepted,
+                authoritative: true,
+                reason: "test exact route".to_string(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn add_reasoning_snapshot(value: &mut Value, effort: &str) {
+        let object = value.as_object_mut().unwrap();
+        object.insert("provider".to_string(), Value::String("openai".to_string()));
+        object.insert(
+            "model".to_string(),
+            Value::String("gpt-5.6-sol".to_string()),
+        );
+        object.insert(
+            "reasoningPreference".to_string(),
+            serde_json::to_value(ReasoningPreference::explicit(effort).unwrap()).unwrap(),
+        );
+        object.insert(
+            "backendReasoningPolicy".to_string(),
+            serde_json::to_value(exact_reasoning_policy(effort)).unwrap(),
+        );
+    }
+
+    #[test]
+    fn pending_reasoning_snapshot_parser_is_strict_and_legacy_compatible() {
+        let legacy = parse_pending_item(&queued_item_value("legacy")).unwrap();
+        assert_eq!(legacy.reasoning_preference, None);
+        assert_eq!(legacy.backend_reasoning_policy, None);
+
+        let mut route_only = queued_item_value("route-only");
+        route_only
+            .as_object_mut()
+            .unwrap()
+            .insert("provider".to_string(), Value::String("openai".to_string()));
+        route_only.as_object_mut().unwrap().insert(
+            "model".to_string(),
+            Value::String("gpt-5.6-sol".to_string()),
+        );
+        let route_only = parse_pending_item(&route_only).unwrap();
+        assert_eq!(route_only.provider.as_deref(), Some("openai"));
+        assert_eq!(route_only.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(route_only.reasoning_preference, None);
+
+        let mut partial_route = queued_item_value("partial-route");
+        partial_route
+            .as_object_mut()
+            .unwrap()
+            .insert("provider".to_string(), Value::String("openai".to_string()));
+        assert!(parse_pending_item(&partial_route).is_err());
+
+        let mut exact = queued_item_value("exact");
+        add_reasoning_snapshot(&mut exact, "max");
+        let parsed = parse_pending_item(&exact).unwrap();
+        assert_eq!(
+            parsed
+                .reasoning_preference
+                .as_ref()
+                .and_then(ReasoningPreference::explicit_effort),
+            Some("max")
+        );
+        assert_eq!(
+            parsed
+                .backend_reasoning_policy
+                .as_ref()
+                .map(BackendReasoningPolicyV1::effective_effort),
+            Some("max")
+        );
+
+        let mut policy_only = exact.clone();
+        policy_only
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoningPreference");
+        assert!(parse_pending_item(&policy_only).is_err());
+
+        let mut wrong_route = exact;
+        wrong_route.as_object_mut().unwrap().insert(
+            "model".to_string(),
+            Value::String("gpt-5.6-luna".to_string()),
+        );
+        assert!(parse_pending_item(&wrong_route).is_err());
+    }
+
+    #[test]
+    fn malformed_reasoning_snapshot_is_quarantined_durably() {
+        let root = temp_root("malformed_reasoning_snapshot_is_quarantined");
+        let harness_home = root.join(".agent-harness");
+        let queue_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("pending.jsonl");
+        fs::create_dir_all(queue_file.parent().unwrap()).unwrap();
+        let mut malformed = queued_item_value("malformed-reasoning");
+        malformed.as_object_mut().unwrap().insert(
+            "reasoningPreference".to_string(),
+            serde_json::to_value(ReasoningPreference::explicit("max").unwrap()).unwrap(),
+        );
+        let mut partial_route = queued_item_value("partial-route");
+        partial_route
+            .as_object_mut()
+            .unwrap()
+            .insert("provider".to_string(), Value::String("openai".to_string()));
+        fs::write(
+            &queue_file,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&malformed).unwrap(),
+                serde_json::to_string(&partial_route).unwrap()
+            ),
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        assert!(
+            read_pending_items(&queue_file, &mut warnings)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("invalid execution snapshot")
+                && warning.contains("must be present together")
+        }));
+        assert!(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("quarantine")
+                .join("malformed-reasoning.json")
+                .is_file()
+        );
+        assert!(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("quarantine")
+                .join("partial-route.json")
+                .is_file()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_reasoning_admission_rechecks_catalog_and_rollout() {
+        let root = temp_root("pending_reasoning_admission_rechecks_catalog");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(harness_home.join("codex-home")).unwrap();
+        fs::write(
+            harness_home.join(crate::HARNESS_CONFIG_FILE_NAME),
+            r#"{"orchestration":{"features":{"modelCatalogV2":{"mode":"authoritative","enabledAgentIds":["main"]}}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join("codex-home").join("models_cache.json"),
+            r#"{"models":[{"slug":"gpt-5.6-sol","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"},{"effort":"max"}]}]}"#,
+        )
+        .unwrap();
+        let mut value = queued_item_value("admission");
+        add_reasoning_snapshot(&mut value, "max");
+        let pending = parse_pending_item(&value).unwrap();
+        revalidate_pending_reasoning_snapshot(&harness_home, &pending).unwrap();
+
+        fs::write(
+            harness_home.join(crate::HARNESS_CONFIG_FILE_NAME),
+            r#"{"orchestration":{"features":{"modelCatalogV2":{"mode":"off"}}}}"#,
+        )
+        .unwrap();
+        assert!(revalidate_pending_reasoning_snapshot(&harness_home, &pending).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn runtime_queue_lease_owner_envelope_serializes_generation_metadata() {
@@ -4564,6 +5042,8 @@ mod tests {
                 thinking_enabled: false,
                 thinking_level: None,
                 thinking_instruction: None,
+                reasoning_preference: None,
+                backend_reasoning_policy: None,
                 fast_mode: None,
                 stop_requested: false,
                 stop_reason: None,
@@ -4681,6 +5161,8 @@ mod tests {
                 thinking_enabled: false,
                 thinking_level: None,
                 thinking_instruction: None,
+                reasoning_preference: None,
+                backend_reasoning_policy: None,
                 fast_mode: None,
                 stop_requested: false,
                 stop_reason: None,
@@ -4738,6 +5220,10 @@ mod tests {
             message_text: "continue after compact".to_string(),
             inbound_context: None,
             inbound_media_artifacts: Vec::new(),
+            provider: None,
+            model: None,
+            reasoning_preference: None,
+            backend_reasoning_policy: None,
             source_home: root.join(".openclaw"),
             source_workspace: root.join(".openclaw").join("workspace"),
             runtime_workspace: None,
@@ -5686,6 +6172,10 @@ mod tests {
             source_home: PathBuf::from("source"),
             source_workspace: PathBuf::from("workspace"),
             runtime_workspace: None,
+            provider: None,
+            model: None,
+            reasoning_preference: None,
+            backend_reasoning_policy: None,
             planned_transcript_file: PathBuf::from(format!("{queue_id}.jsonl")),
             planned_trajectory_file: PathBuf::from(format!("{queue_id}.trajectory.jsonl")),
             selected_skill_ids: Vec::new(),

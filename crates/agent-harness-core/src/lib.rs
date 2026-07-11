@@ -671,6 +671,8 @@ mod virtual_session_context_tests {
                 thinking_enabled: false,
                 thinking_level: None,
                 thinking_instruction: None,
+                reasoning_preference: None,
+                backend_reasoning_policy: None,
                 fast_mode: None,
                 stop_requested: false,
                 stop_reason: None,

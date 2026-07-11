@@ -19,6 +19,87 @@ pub enum BackendReasoningSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
+pub enum ReasoningPreference {
+    Default,
+    Explicit { effort: String },
+}
+
+impl ReasoningPreference {
+    pub fn explicit(effort: impl Into<String>) -> Result<Self, ReasoningPreferenceError> {
+        let effort = effort.into();
+        if effort.trim().is_empty() {
+            return Err(ReasoningPreferenceError::MissingEffort);
+        }
+        if effort != effort.trim() {
+            return Err(ReasoningPreferenceError::NonCanonicalEffort);
+        }
+        Ok(Self::Explicit { effort })
+    }
+
+    pub fn explicit_effort(&self) -> Option<&str> {
+        match self {
+            Self::Default => None,
+            Self::Explicit { effort } => Some(effort.as_str()),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ReasoningPreferenceError> {
+        match self {
+            Self::Default => Ok(()),
+            Self::Explicit { effort } if effort.trim().is_empty() => {
+                Err(ReasoningPreferenceError::MissingEffort)
+            }
+            Self::Explicit { effort } if effort != effort.trim() => {
+                Err(ReasoningPreferenceError::NonCanonicalEffort)
+            }
+            Self::Explicit { .. } => Ok(()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReasoningPreference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match ReasoningPreferenceWire::deserialize(deserializer)? {
+            ReasoningPreferenceWire::Default => Ok(Self::Default),
+            ReasoningPreferenceWire::Explicit { effort } => {
+                Self::explicit(effort).map_err(D::Error::custom)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
+enum ReasoningPreferenceWire {
+    Default,
+    Explicit { effort: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningPreferenceError {
+    MissingEffort,
+    NonCanonicalEffort,
+}
+
+impl fmt::Display for ReasoningPreferenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingEffort => formatter
+                .write_str("explicit backend reasoning preference requires a non-empty effort"),
+            Self::NonCanonicalEffort => formatter.write_str(
+                "explicit backend reasoning preference effort must not have outer whitespace",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReasoningPreferenceError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendReasoningPolicyV1 {
     schema_version: u32,
@@ -132,6 +213,19 @@ impl BackendReasoningPolicyV1 {
             receipt_model: effective_model.to_string(),
         })
     }
+
+    pub fn validate_for_execution_route(
+        &self,
+        execution_provider: &str,
+        execution_model: &str,
+    ) -> Result<(), BackendReasoningPolicyError> {
+        if self.resolution.status != ReasoningResolutionStatus::Accepted
+            || !self.resolution.authoritative
+        {
+            return Err(BackendReasoningPolicyError::NonAuthoritativeResolution);
+        }
+        self.validate_for_route(execution_provider, execution_model)
+    }
 }
 
 impl<'de> Deserialize<'de> for BackendReasoningPolicyV1 {
@@ -165,6 +259,7 @@ pub enum BackendReasoningPolicyError {
     NonCanonicalEffectiveEffort,
     MissingEffectiveRoute(&'static str),
     NonCanonicalEffectiveRoute(&'static str),
+    NonAuthoritativeResolution,
     RouteMismatch {
         execution_provider: String,
         execution_model: String,
@@ -195,6 +290,9 @@ impl fmt::Display for BackendReasoningPolicyError {
             Self::NonCanonicalEffectiveRoute(field) => write!(
                 formatter,
                 "backend reasoning policy {field} must not have outer whitespace"
+            ),
+            Self::NonAuthoritativeResolution => formatter.write_str(
+                "backend reasoning execution requires an Accepted authoritative resolution",
             ),
             Self::RouteMismatch {
                 execution_provider,
@@ -439,6 +537,42 @@ mod tests {
         let mut blank = serde_json::to_value(policy).unwrap();
         blank["resolution"]["effectiveEffort"] = serde_json::json!("  ");
         assert!(serde_json::from_value::<BackendReasoningPolicyV1>(blank).is_err());
+    }
+
+    #[test]
+    fn reasoning_preference_v1_preserves_default_and_open_ended_explicit_efforts() {
+        let default = ReasoningPreference::Default;
+        assert_eq!(
+            serde_json::from_value::<ReasoningPreference>(serde_json::to_value(&default).unwrap())
+                .unwrap(),
+            default
+        );
+
+        for effort in ["xhigh", "max", "ultra", "future-effort"] {
+            let preference = ReasoningPreference::explicit(effort).unwrap();
+            assert_eq!(preference.explicit_effort(), Some(effort));
+            assert_eq!(
+                serde_json::from_value::<ReasoningPreference>(
+                    serde_json::to_value(&preference).unwrap()
+                )
+                .unwrap(),
+                preference
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_preference_v1_rejects_blank_or_padded_efforts() {
+        assert!(ReasoningPreference::explicit("").is_err());
+        assert!(ReasoningPreference::explicit("   ").is_err());
+        assert!(ReasoningPreference::explicit(" ultra ").is_err());
+        assert!(
+            serde_json::from_value::<ReasoningPreference>(serde_json::json!({
+                "kind": "explicit",
+                "effort": " max "
+            }))
+            .is_err()
+        );
     }
 
     fn receipt(

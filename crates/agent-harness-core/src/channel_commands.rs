@@ -156,8 +156,15 @@ pub fn parse_channel_command(input: &str) -> Option<ChannelCommand> {
             topic: optional_text(rest),
         }),
         "think" => {
-            let (level, global) = optional_text_with_global_flag(rest);
+            let (level, global) = optional_reasoning_effort(rest);
             Some(ChannelCommand::Think { level, global })
+        }
+        "reasoning" => {
+            let (effort, global) = optional_reasoning_effort(rest);
+            Some(ChannelCommand::Think {
+                level: effort,
+                global,
+            })
         }
         "stop" => Some(ChannelCommand::Stop {
             reason: optional_text(rest),
@@ -209,6 +216,17 @@ fn optional_text_with_global_flag(value: &str) -> (Option<String>, bool) {
     }
     let text = parts.join(" ");
     (required_text(&text), global)
+}
+
+fn optional_reasoning_effort(value: &str) -> (Option<String>, bool) {
+    let trimmed = value.trim();
+    if !trimmed.is_empty() {
+        let (first, rest) = split_command(trimmed);
+        if first.eq_ignore_ascii_case("global") {
+            return (optional_text(rest), true);
+        }
+    }
+    optional_text_with_global_flag(trimmed)
 }
 
 fn optional_restart_target(value: &str) -> (Option<String>, Option<String>) {
@@ -304,6 +322,36 @@ mod tests {
             Some(ChannelCommand::Think {
                 level: Some("超高".to_string()),
                 global: false
+            })
+        );
+        assert_eq!(
+            parse_channel_command("/reasoning"),
+            Some(ChannelCommand::Think {
+                level: None,
+                global: false
+            })
+        );
+        for effort in ["max", "ultra", "future-effort", "default"] {
+            assert_eq!(
+                parse_channel_command(&format!("/reasoning {effort}")),
+                Some(ChannelCommand::Think {
+                    level: Some(effort.to_string()),
+                    global: false
+                })
+            );
+        }
+        assert_eq!(
+            parse_channel_command("/reasoning global ultra"),
+            Some(ChannelCommand::Think {
+                level: Some("ultra".to_string()),
+                global: true
+            })
+        );
+        assert_eq!(
+            parse_channel_command("/think global max"),
+            Some(ChannelCommand::Think {
+                level: Some("max".to_string()),
+                global: true
             })
         );
         assert_eq!(
@@ -460,6 +508,13 @@ mod tests {
             Some(ChannelCommandIntent::Think {
                 level: None,
                 global: false
+            })
+        );
+        assert_eq!(
+            parse_channel_command_intent("/reasoning global max"),
+            Some(ChannelCommandIntent::Think {
+                level: Some("max".to_string()),
+                global: true
             })
         );
         assert_eq!(

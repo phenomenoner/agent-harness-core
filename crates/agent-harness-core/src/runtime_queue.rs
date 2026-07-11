@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::backend_reasoning::{BackendReasoningPolicyV1, ReasoningPreference};
 use crate::latency::{LatencyStage, latency_receipts_file, record_latency_stage};
 use crate::wake::signal_wake;
 use crate::{ChannelStep, ChannelStepAction, InboundMediaArtifact, RuntimeContinuationMetadata};
@@ -62,6 +63,10 @@ pub struct RuntimeQueueItem {
     pub inbound_media_artifacts: Vec<InboundMediaArtifact>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_preference: Option<ReasoningPreference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_reasoning_policy: Option<BackendReasoningPolicyV1>,
     pub prompt_files_present: usize,
     pub prompt_files_total: usize,
     pub selected_skill_ids: Vec<String>,
@@ -366,6 +371,8 @@ fn build_queue_item(
         inbound_media_artifacts: step.inbound_media_artifacts.clone(),
         provider: agent_turn.provider.clone(),
         model: agent_turn.model.clone(),
+        reasoning_preference: agent_turn.reasoning_preference.clone(),
+        backend_reasoning_policy: agent_turn.backend_reasoning_policy.clone(),
         prompt_files_present: agent_turn.prompt_files_present,
         prompt_files_total: agent_turn.prompt_files_total,
         selected_skill_ids: agent_turn.selected_skill_ids.clone(),
@@ -468,10 +475,15 @@ mod tests {
     use crate::{
         ChannelStepAction, InboundMediaArtifact, InboundMediaDownloadStatus,
         InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant, TurnPlanInput,
+        backend_reasoning::{BackendReasoningSource, ReasoningPreference},
         build_channel_step, build_source_skill_index, build_turn_plan,
         inbound_media_attachment_root,
         latency::{LatencyStage, latency_receipts_file, read_latest_queue_receipt},
         load_agent_registry,
+        model_catalog::{
+            REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION, ReasoningResolutionReceipt,
+            ReasoningResolutionStatus,
+        },
         wake::read_wake_sequence,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -500,7 +512,10 @@ mod tests {
             },
         )
         .unwrap();
-        let step = build_channel_step(&registry, &turn);
+        let mut step = build_channel_step(&registry, &turn);
+        let agent_turn = step.agent_turn.as_mut().unwrap();
+        agent_turn.reasoning_preference = None;
+        agent_turn.backend_reasoning_policy = None;
 
         let report = enqueue_channel_step(
             &step,
@@ -567,6 +582,8 @@ mod tests {
         .unwrap();
         assert_eq!(queue_json["status"], "queued");
         assert_eq!(queue_json["source"]["kind"], "channel");
+        assert!(queue_json.get("reasoningPreference").is_none());
+        assert!(queue_json.get("backendReasoningPolicy").is_none());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -662,6 +679,174 @@ mod tests {
         assert_eq!(artifact["sha256"], "abc123");
         assert_eq!(artifact["downloadStatus"], "downloaded");
         assert_eq!(artifact["modelAttachmentStatus"], "prompt-only");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn enqueue_channel_agent_turn_serializes_exact_max_reasoning_policy() {
+        let root = temp_root("enqueue_channel_agent_turn_serializes_exact_max_reasoning_policy");
+        let source = write_runtime_queue_source(&root);
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                text: "use max reasoning".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let mut step = build_channel_step(&registry, &turn);
+        let (preference, policy) = max_reasoning_snapshot();
+        let agent_turn = step.agent_turn.as_mut().unwrap();
+        agent_turn.reasoning_preference = Some(preference.clone());
+        agent_turn.backend_reasoning_policy = Some(policy.clone());
+
+        let report = enqueue_channel_step(
+            &step,
+            RuntimeQueueEnqueueOptions {
+                harness_home: root.join(".agent-harness"),
+                runtime_workspace: None,
+                inbound_canonical_id: None,
+                now_ms: 1234,
+            },
+        )
+        .unwrap();
+
+        let item = report.item.unwrap();
+        assert_eq!(item.reasoning_preference.as_ref(), Some(&preference));
+        assert_eq!(item.backend_reasoning_policy.as_ref(), Some(&policy));
+        let queue_json: Value = serde_json::from_str(
+            fs::read_to_string(&report.queue_file)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            queue_json["reasoningPreference"],
+            serde_json::json!({"kind": "explicit", "effort": "max"})
+        );
+        assert_eq!(
+            queue_json["backendReasoningPolicy"],
+            serde_json::json!({
+                "schemaVersion": 1,
+                "source": "channel-command",
+                "resolution": {
+                    "schemaVersion": REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION,
+                    "requestedProvider": "openai",
+                    "requestedModel": "gpt-5.6",
+                    "effectiveProvider": "openai",
+                    "effectiveModel": "gpt-5.6",
+                    "requestedEffort": "max",
+                    "effectiveEffort": "max",
+                    "catalogEffectiveEffort": "max",
+                    "catalogRevision": "test-revision",
+                    "status": "accepted",
+                    "authoritative": true,
+                    "reason": "test fixture"
+                }
+            })
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn queue_control_retry_preserves_reasoning_snapshot_unchanged() {
+        let root = temp_root("queue_control_retry_preserves_reasoning_snapshot_unchanged");
+        let source = write_runtime_queue_source(&root);
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                text: "retry max reasoning".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let mut step = build_channel_step(&registry, &turn);
+        let (preference, policy) = max_reasoning_snapshot();
+        let agent_turn = step.agent_turn.as_mut().unwrap();
+        agent_turn.reasoning_preference = Some(preference);
+        agent_turn.backend_reasoning_policy = Some(policy);
+        let harness_home = root.join(".agent-harness");
+        let enqueue = enqueue_channel_step(
+            &step,
+            RuntimeQueueEnqueueOptions {
+                harness_home: harness_home.clone(),
+                runtime_workspace: None,
+                inbound_canonical_id: None,
+                now_ms: 1234,
+            },
+        )
+        .unwrap();
+        let original_queue_id = enqueue.item.unwrap().queue_id;
+
+        let retry = control_runtime_queue_item(RuntimeQueueControlOptions {
+            harness_home,
+            queue_id: original_queue_id.clone(),
+            action: RuntimeQueueControlAction::Retry,
+            reason: "operator retry after timeout".to_string(),
+            now_ms: 2234,
+        })
+        .unwrap();
+
+        let new_queue_id = retry.new_queue_id.unwrap();
+        let queue_text = fs::read_to_string(&retry.queue_file).unwrap();
+        let queued_items = queue_text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let original_item = queued_items
+            .iter()
+            .find(|item| {
+                item.get("queueId").and_then(Value::as_str) == Some(original_queue_id.as_str())
+            })
+            .unwrap();
+        let retry_item = queued_items
+            .iter()
+            .find(|item| item.get("queueId").and_then(Value::as_str) == Some(new_queue_id.as_str()))
+            .unwrap();
+        let original_preference = original_item
+            .get("reasoningPreference")
+            .expect("original queue item must contain the reasoning preference snapshot");
+        let original_policy = original_item
+            .get("backendReasoningPolicy")
+            .expect("original queue item must contain the backend reasoning policy snapshot");
+        assert_eq!(original_preference["effort"], "max");
+        assert_eq!(original_policy["resolution"]["effectiveEffort"], "max");
+        assert_eq!(
+            retry_item.get("reasoningPreference"),
+            Some(original_preference)
+        );
+        assert_eq!(
+            retry_item.get("backendReasoningPolicy"),
+            Some(original_policy)
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -830,6 +1015,29 @@ mod tests {
         assert_eq!(receipt_json["status"], "skipped-not-agent-turn");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn max_reasoning_snapshot() -> (ReasoningPreference, BackendReasoningPolicyV1) {
+        let preference = ReasoningPreference::explicit("max").unwrap();
+        let policy = BackendReasoningPolicyV1::new(
+            BackendReasoningSource::ChannelCommand,
+            ReasoningResolutionReceipt {
+                schema_version: REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION,
+                requested_provider: "openai".to_string(),
+                requested_model: "gpt-5.6".to_string(),
+                effective_provider: Some("openai".to_string()),
+                effective_model: Some("gpt-5.6".to_string()),
+                requested_effort: "max".to_string(),
+                effective_effort: Some("max".to_string()),
+                catalog_effective_effort: Some("max".to_string()),
+                catalog_revision: Some("test-revision".to_string()),
+                status: ReasoningResolutionStatus::Accepted,
+                authoritative: true,
+                reason: "test fixture".to_string(),
+            },
+        )
+        .unwrap();
+        (preference, policy)
     }
 
     fn write_runtime_queue_source(root: &Path) -> crate::AgentSource {

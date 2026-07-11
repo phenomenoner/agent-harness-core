@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::backend_reasoning::{
+    BackendReasoningPolicyV1, BackendReasoningSource, ReasoningPreference,
+};
 use crate::{
     AgentOverride, AgentProfile, AgentRegistry, AgentSource, ChannelCommand, ChannelCommandIntent,
     ChannelSessionState, DEFAULT_THINKING_LEVEL, InboundMediaArtifact, PROMPT_FILE_NAMES,
@@ -50,6 +53,10 @@ pub struct TurnPlan {
     pub model_policy: TurnModelPolicy,
     pub provider_request_policy: TurnProviderRequestPolicy,
     pub thinking_policy: TurnThinkingPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_preference: Option<ReasoningPreference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_reasoning_policy: Option<BackendReasoningPolicyV1>,
     pub channel_state: Option<ChannelSessionState>,
     pub command: Option<ChannelCommand>,
     pub command_intent: Option<ChannelCommandIntent>,
@@ -139,6 +146,8 @@ pub fn build_turn_plan(
     let agent = selected_agent.map(turn_agent);
     let mut model_policy = selected_agent.map(turn_model_policy).unwrap_or_default();
     let mut thinking_policy = TurnThinkingPolicy::default();
+    let mut reasoning_preference = None;
+    let mut backend_reasoning_policy = None;
     let command = parse_channel_command(&input.text);
     let command_intent = command.clone().map(ChannelCommand::into_intent);
     let dispatch = if command.is_some() {
@@ -158,7 +167,13 @@ pub fn build_turn_plan(
         &mut warnings,
     );
     if let Some(agent_override) = &agent_override {
-        apply_agent_override(&mut model_policy, &mut thinking_policy, &agent_override);
+        apply_agent_override(
+            &mut model_policy,
+            &mut thinking_policy,
+            &mut reasoning_preference,
+            &mut backend_reasoning_policy,
+            agent_override,
+        );
     }
 
     let selected_agent_id = agent.as_ref().map(|agent| agent.id.as_str());
@@ -173,6 +188,35 @@ pub fn build_turn_plan(
     if let Some(state) = &channel_state {
         apply_model_override(&mut model_policy, state);
         apply_thinking_override(&mut thinking_policy, state);
+        apply_reasoning_override(
+            &mut reasoning_preference,
+            &mut backend_reasoning_policy,
+            state,
+        );
+    }
+    if crate::model_catalog::model_catalog_rollout_mode_for_agent(
+        input.harness_home.as_deref(),
+        selected_agent_id,
+    ) != crate::model_catalog::ModelCatalogRolloutMode::Authoritative
+    {
+        reasoning_preference = None;
+        backend_reasoning_policy = None;
+    } else if let Some(preference) = reasoning_preference.as_ref() {
+        backend_reasoning_policy = resolve_backend_reasoning_policy_for_turn(
+            input.harness_home.as_deref(),
+            &model_policy,
+            preference,
+            backend_reasoning_policy
+                .as_ref()
+                .map(|policy| policy.source()),
+            &mut warnings,
+        );
+    }
+    if reasoning_preference.is_some() && backend_reasoning_policy.is_none() {
+        warnings.push(
+            "backend reasoning preference is stored but has no route-valid resolved policy; execution must fail closed until it can be revalidated"
+                .to_string(),
+        );
     }
     let provider_request_policy = provider_request_policy_from_state(
         &model_policy,
@@ -264,6 +308,8 @@ pub fn build_turn_plan(
         model_policy,
         provider_request_policy,
         thinking_policy,
+        reasoning_preference,
+        backend_reasoning_policy,
         channel_state,
         command,
         command_intent,
@@ -271,6 +317,118 @@ pub fn build_turn_plan(
         selected_skills,
         warnings,
     })
+}
+
+fn resolve_backend_reasoning_policy_for_turn(
+    harness_home: Option<&Path>,
+    model_policy: &TurnModelPolicy,
+    preference: &ReasoningPreference,
+    prior_source: Option<BackendReasoningSource>,
+    warnings: &mut Vec<String>,
+) -> Option<BackendReasoningPolicyV1> {
+    if let Err(error) = preference.validate() {
+        warnings.push(format!(
+            "backend reasoning preference is invalid and was suspended: {error}"
+        ));
+        return None;
+    }
+    let provider = model_policy.provider.as_deref().unwrap_or_default();
+    let model = model_policy.model.as_deref().unwrap_or_default();
+    let catalog = load_cached_model_catalog(harness_home, warnings)?;
+    let requested_effort = match preference {
+        ReasoningPreference::Default => {
+            let Some(route) = catalog.exact_route(provider, model) else {
+                warnings.push(format!(
+                    "backend reasoning default cannot be resolved because the exact route {provider}/{model} is absent from the model catalog"
+                ));
+                return None;
+            };
+            let Some(default) = route.default_reasoning_effort.as_deref() else {
+                warnings.push(format!(
+                    "backend reasoning default cannot be resolved because {provider}/{model} advertises no default effort"
+                ));
+                return None;
+            };
+            if !route
+                .supported_reasoning_efforts
+                .iter()
+                .any(|effort| effort.eq_ignore_ascii_case(default))
+            {
+                warnings.push(format!(
+                    "backend reasoning default {default} is not present in the supported effort list for {provider}/{model}"
+                ));
+                return None;
+            }
+            default.to_string()
+        }
+        ReasoningPreference::Explicit { effort } => effort.clone(),
+    };
+
+    // Ultra is a separate resource/delegation mode. A persisted channel/default
+    // preference never authorizes it by itself; only a child-admission receipt may.
+    let source = prior_source.unwrap_or(BackendReasoningSource::AgentDefault);
+    if requested_effort.eq_ignore_ascii_case("ultra")
+        && source != BackendReasoningSource::ChildAdmission
+    {
+        warnings.push(
+            "backend reasoning ultra remains suspended until a child-admission authorization receipt is present"
+                .to_string(),
+        );
+        return None;
+    }
+
+    let resolution = crate::model_catalog::resolve_reasoning_effort(
+        Some(&catalog),
+        crate::model_catalog::ModelCatalogRolloutMode::Authoritative,
+        provider,
+        model,
+        &requested_effort,
+        crate::model_catalog::UnsupportedReasoningPolicy::Reject,
+    );
+    if !resolution.authoritative
+        || resolution.status != crate::model_catalog::ReasoningResolutionStatus::Accepted
+    {
+        warnings.push(format!(
+            "backend reasoning preference could not be resolved for {provider}/{model}: {}",
+            resolution.reason
+        ));
+        return None;
+    }
+    BackendReasoningPolicyV1::new(source, resolution)
+        .map_err(|error| {
+            warnings.push(format!(
+                "backend reasoning preference resolved but could not become an execution policy: {error}"
+            ));
+        })
+        .ok()
+}
+
+fn load_cached_model_catalog(
+    harness_home: Option<&Path>,
+    warnings: &mut Vec<String>,
+) -> Option<crate::model_catalog::ModelCapabilityCatalog> {
+    let harness_home = harness_home?;
+    let cache_file = harness_home.join("codex-home").join("models_cache.json");
+    let text = match fs::read_to_string(&cache_file) {
+        Ok(text) => text,
+        Err(error) => {
+            warnings.push(format!(
+                "Codex model catalog cache {} is unavailable: {error}",
+                cache_file.display()
+            ));
+            return None;
+        }
+    };
+    match crate::model_catalog::parse_codex_model_catalog(&text) {
+        Ok(catalog) => Some(catalog),
+        Err(error) => {
+            warnings.push(format!(
+                "Codex model catalog cache {} is invalid: {error}",
+                cache_file.display()
+            ));
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -492,6 +650,8 @@ fn apply_model_override(model_policy: &mut TurnModelPolicy, state: &ChannelSessi
 fn apply_agent_override(
     model_policy: &mut TurnModelPolicy,
     thinking_policy: &mut TurnThinkingPolicy,
+    reasoning_preference: &mut Option<ReasoningPreference>,
+    backend_reasoning_policy: &mut Option<BackendReasoningPolicyV1>,
     override_entry: &AgentOverride,
 ) {
     if let Some(provider) = &override_entry.provider {
@@ -503,6 +663,69 @@ fn apply_agent_override(
     if let Some(level) = &override_entry.thinking_level {
         thinking_policy.enabled = true;
         thinking_policy.level = Some(level.clone());
+    }
+    if let Some(preference) = &override_entry.reasoning_preference {
+        *reasoning_preference = Some(preference.clone());
+        *backend_reasoning_policy = override_entry.backend_reasoning_policy.clone();
+    }
+}
+
+fn apply_reasoning_override(
+    reasoning_preference: &mut Option<ReasoningPreference>,
+    backend_reasoning_policy: &mut Option<BackendReasoningPolicyV1>,
+    state: &ChannelSessionState,
+) {
+    if let Some(preference) = &state.reasoning_preference {
+        *reasoning_preference = Some(preference.clone());
+        *backend_reasoning_policy = state.backend_reasoning_policy.clone();
+    } else if state.thinking_enabled || state.thinking_level.is_some() {
+        // A session-scoped legacy /think write is newer and more specific than
+        // any agent-global backend preference. It masks the inherited backend
+        // state without ever promoting legacy thinkingLevel into wire effort.
+        *reasoning_preference = None;
+        *backend_reasoning_policy = None;
+    }
+}
+
+#[cfg(test)]
+mod reasoning_override_precedence_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_session_think_masks_inherited_backend_preference_without_migration() {
+        let mut preference = Some(ReasoningPreference::explicit("max").unwrap());
+        let mut policy = None;
+        let state = ChannelSessionState {
+            schema: "agent-harness.channel-session.v1".to_string(),
+            platform: "telegram".to_string(),
+            channel_id: "dm".to_string(),
+            user_id: "user".to_string(),
+            active_session_key: "telegram:dm:user:main".to_string(),
+            agent_id: Some("main".to_string()),
+            provider: None,
+            model: None,
+            session_topic: None,
+            model_override: None,
+            model_override_provider: None,
+            model_override_model: None,
+            thinking_enabled: true,
+            thinking_level: Some("low".to_string()),
+            thinking_instruction: None,
+            reasoning_preference: None,
+            backend_reasoning_policy: None,
+            fast_mode: None,
+            stop_requested: false,
+            stop_reason: None,
+            steering_notes: Vec::new(),
+            btw_notes: Vec::new(),
+            last_command: None,
+            updated_at_ms: 1,
+        };
+
+        apply_reasoning_override(&mut preference, &mut policy, &state);
+
+        assert_eq!(preference, None);
+        assert_eq!(policy, None);
     }
 }
 

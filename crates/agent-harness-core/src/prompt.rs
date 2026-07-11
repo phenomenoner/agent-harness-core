@@ -65,6 +65,10 @@ pub struct PromptBundle {
     pub provider_request_policy: crate::TurnProviderRequestPolicy,
     pub thinking_enabled: bool,
     pub thinking_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_preference: Option<crate::backend_reasoning::ReasoningPreference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_reasoning_policy: Option<crate::backend_reasoning::BackendReasoningPolicyV1>,
     pub summary: PromptBundleSummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_skills: Vec<SkillSelection>,
@@ -349,6 +353,8 @@ pub fn assemble_prompt_bundle(
         provider_request_policy: plan.provider_request_policy.clone(),
         thinking_enabled: plan.thinking_policy.enabled,
         thinking_level: plan.thinking_policy.level.clone(),
+        reasoning_preference: plan.reasoning_preference.clone(),
+        backend_reasoning_policy: plan.backend_reasoning_policy.clone(),
         summary,
         selected_skills: plan.selected_skills.clone(),
         sections,
@@ -1741,6 +1747,13 @@ fn truncate_utf8_to_bytes(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend_reasoning::{
+        BackendReasoningPolicyV1, BackendReasoningSource, ReasoningPreference,
+    };
+    use crate::model_catalog::{
+        REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION, ReasoningResolutionReceipt,
+        ReasoningResolutionStatus,
+    };
     use crate::{
         AgentSource, InboundMediaArtifact, InboundMediaDownloadStatus,
         InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant, PackAdmissionConfig,
@@ -3069,6 +3082,8 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_slice(&fs::read(files.json).unwrap()).unwrap();
         assert_eq!(json["schema"], PROMPT_BUNDLE_SCHEMA);
+        assert!(json.get("reasoningPreference").is_none());
+        assert!(json.get("backendReasoningPolicy").is_none());
         assert!(
             fs::read_to_string(files.markdown)
                 .unwrap()
@@ -3076,6 +3091,156 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prompt_bundle_json_contains_exact_max_backend_reasoning_policy() {
+        let root = temp_root("prompt_bundle_json_contains_exact_max_backend_reasoning_policy");
+        let source = write_prompt_source(&root);
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let mut plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "inspect the bundle artifact".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        apply_max_backend_reasoning_policy(&mut plan);
+        let bundle = assemble_prompt_bundle(&plan, PromptAssemblyOptions::default()).unwrap();
+
+        let files = write_prompt_bundle(&bundle, root.join("out")).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(files.json).unwrap()).unwrap();
+
+        assert_eq!(
+            json["reasoningPreference"],
+            serde_json::json!({
+                "kind": "explicit",
+                "effort": "max"
+            })
+        );
+        assert_eq!(
+            json["backendReasoningPolicy"],
+            serde_json::json!({
+                "schemaVersion": 1,
+                "source": "channel-command",
+                "resolution": {
+                    "schemaVersion": 1,
+                    "requestedProvider": "openai",
+                    "requestedModel": "gpt-5",
+                    "effectiveProvider": "openai",
+                    "effectiveModel": "gpt-5",
+                    "requestedEffort": "max",
+                    "effectiveEffort": "max",
+                    "catalogEffectiveEffort": "max",
+                    "catalogRevision": "test-catalog",
+                    "status": "accepted",
+                    "authoritative": true,
+                    "reason": "explicit max accepted"
+                }
+            })
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prompt_bundle_markdown_excludes_backend_reasoning_controls() {
+        let root = temp_root("prompt_bundle_markdown_excludes_backend_reasoning_controls");
+        let source = write_prompt_source(&root);
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let mut plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "inspect the rendered prompt".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        apply_max_backend_reasoning_policy(&mut plan);
+        let bundle = assemble_prompt_bundle(&plan, PromptAssemblyOptions::default()).unwrap();
+
+        let runtime_context = bundle
+            .sections
+            .iter()
+            .find(|section| section.kind == PromptSectionKind::RuntimeContext)
+            .expect("prompt bundle should contain runtime context");
+        let markdown = render_prompt_markdown(&bundle);
+        for forbidden in [
+            "reasoningPreference",
+            "backendReasoningPolicy",
+            "requestedEffort",
+            "effectiveEffort",
+            "catalogEffectiveEffort",
+            "reasoning_preference",
+            "backend_reasoning_policy",
+            "requested_effort",
+            "effective_effort",
+            "catalog_effective_effort",
+            "reasoning_effort",
+            "reasoning effort",
+            "effort: max",
+            "\"effort\": \"max\"",
+            "Backend reasoning",
+        ] {
+            assert!(
+                !runtime_context.content.contains(forbidden),
+                "runtime context leaked backend reasoning control {forbidden:?}"
+            );
+            assert!(
+                !markdown.contains(forbidden),
+                "rendered prompt leaked backend reasoning control {forbidden:?}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn apply_max_backend_reasoning_policy(plan: &mut TurnPlan) {
+        plan.reasoning_preference = Some(ReasoningPreference::explicit("max").unwrap());
+        plan.backend_reasoning_policy = Some(
+            BackendReasoningPolicyV1::new(
+                BackendReasoningSource::ChannelCommand,
+                ReasoningResolutionReceipt {
+                    schema_version: REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION,
+                    requested_provider: "openai".to_string(),
+                    requested_model: "gpt-5".to_string(),
+                    effective_provider: Some("openai".to_string()),
+                    effective_model: Some("gpt-5".to_string()),
+                    requested_effort: "max".to_string(),
+                    effective_effort: Some("max".to_string()),
+                    catalog_effective_effort: Some("max".to_string()),
+                    catalog_revision: Some("test-catalog".to_string()),
+                    status: ReasoningResolutionStatus::Accepted,
+                    authoritative: true,
+                    reason: "explicit max accepted".to_string(),
+                },
+            )
+            .unwrap(),
+        );
     }
 
     fn write_prompt_source(root: &Path) -> AgentSource {

@@ -23182,6 +23182,8 @@ mod tests {
                 thinking_enabled: false,
                 thinking_level: None,
                 thinking_instruction: None,
+                reasoning_preference: None,
+                backend_reasoning_policy: None,
                 fast_mode: None,
                 stop_requested: false,
                 stop_reason: None,
@@ -25751,6 +25753,10 @@ mod tests {
             ChannelAccessDecision::Allowed(ChannelPermission::Limited)
         );
         assert!(channel_permission_allows_text(ChannelPermission::Limited, "/status").is_ok());
+        assert!(channel_permission_allows_text(ChannelPermission::Limited, "/reasoning").is_ok());
+        assert!(
+            channel_permission_allows_text(ChannelPermission::Limited, "/reasoning max").is_err()
+        );
         assert!(
             channel_permission_allows_text(ChannelPermission::Limited, "/model openai/gpt-5")
                 .is_err()
@@ -26867,6 +26873,10 @@ mod tests {
         );
         assert!(channel_permission_allows_text(ChannelPermission::Limited, "/think").is_ok());
         assert!(channel_permission_allows_text(ChannelPermission::Limited, "/think high").is_err());
+        assert!(channel_permission_allows_text(ChannelPermission::Limited, "/reasoning").is_ok());
+        assert!(
+            channel_permission_allows_text(ChannelPermission::Limited, "/reasoning max").is_err()
+        );
     }
 
     #[test]

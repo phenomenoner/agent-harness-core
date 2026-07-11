@@ -364,6 +364,10 @@ pub struct CodexRuntimePlan {
     pub continuation: RuntimeContinuationMetadata,
     pub provider: Option<String>,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_preference: Option<crate::backend_reasoning::ReasoningPreference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_reasoning_policy: Option<crate::backend_reasoning::BackendReasoningPolicyV1>,
     pub provider_request_policy: crate::TurnProviderRequestPolicy,
     pub prompt_bundle_json: PathBuf,
     pub prompt_markdown: PathBuf,
@@ -875,6 +879,10 @@ struct CodexRuntimePlanFile {
     pub continuation: RuntimeContinuationMetadata,
     pub provider: Option<String>,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_preference: Option<crate::backend_reasoning::ReasoningPreference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_reasoning_policy: Option<crate::backend_reasoning::BackendReasoningPolicyV1>,
     #[serde(default)]
     pub provider_request_policy: crate::TurnProviderRequestPolicy,
     pub prompt_bundle_json: PathBuf,
@@ -932,6 +940,16 @@ struct CodexBindingRecord {
     trajectory_file: PathBuf,
     completion_file: PathBuf,
     completed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CodexReasoningThreadStateV1 {
+    schema: String,
+    thread_id: String,
+    effort: String,
+    disposition: String,
+    updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1059,6 +1077,8 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
     let agent_id = string_field(&bundle, &["agentId", "agent_id"]).map(ToString::to_string);
     let provider = string_field(&bundle, &["provider"]).map(ToString::to_string);
     let model = string_field(&bundle, &["model"]).map(ToString::to_string);
+    let (reasoning_preference, backend_reasoning_policy) =
+        parse_backend_reasoning_snapshot(&bundle, provider.as_deref(), model.as_deref())?;
     let provider_request_policy = bundle
         .get("providerRequestPolicy")
         .cloned()
@@ -1090,7 +1110,18 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
         &execution_dir,
         &mut warnings,
     );
-    let thread_id = read_existing_codex_thread_id(&codex_binding_file, &mut warnings)?;
+    let mut thread_id = read_existing_codex_thread_id(&codex_binding_file, &mut warnings)?;
+    if backend_reasoning_policy.is_none()
+        && thread_id.as_deref().is_some_and(|thread_id| {
+            codex_thread_may_have_managed_effort(&codex_binding_file, thread_id, &mut warnings)
+        })
+    {
+        warnings.push(
+            "existing Codex thread may retain a managed reasoning effort; forcing a fresh thread before an unmanaged/legacy turn"
+                .to_string(),
+        );
+        thread_id = None;
+    }
     let executable = resolve_runtime_plan_executable(
         options
             .codex_executable
@@ -1140,6 +1171,8 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
         continuation,
         provider,
         model,
+        reasoning_preference,
+        backend_reasoning_policy,
         provider_request_policy,
         prompt_bundle_json,
         prompt_markdown,
@@ -1171,6 +1204,76 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
         receipt,
         warnings,
     })
+}
+
+fn parse_backend_reasoning_snapshot(
+    bundle: &Value,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> io::Result<(
+    Option<crate::backend_reasoning::ReasoningPreference>,
+    Option<crate::backend_reasoning::BackendReasoningPolicyV1>,
+)> {
+    let preference = optional_typed_bundle_field::<crate::backend_reasoning::ReasoningPreference>(
+        bundle,
+        &["reasoningPreference", "reasoning_preference"],
+    )?;
+    let policy = optional_typed_bundle_field::<crate::backend_reasoning::BackendReasoningPolicyV1>(
+        bundle,
+        &["backendReasoningPolicy", "backend_reasoning_policy"],
+    )?;
+    match (&preference, &policy) {
+        (None, None) => Ok((None, None)),
+        (Some(_), None) | (None, Some(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "prompt bundle reasoning preference and backend policy must be present together",
+        )),
+        (Some(preference), Some(policy)) => {
+            preference.validate().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("prompt bundle reasoning preference is invalid: {error}"),
+                )
+            })?;
+            policy
+                .validate_for_route(provider.unwrap_or_default(), model.unwrap_or_default())
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("prompt bundle backend reasoning route is invalid: {error}"),
+                    )
+                })?;
+            if let crate::backend_reasoning::ReasoningPreference::Explicit { effort } = preference
+                && effort != policy.effective_effort()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "prompt bundle reasoning preference effort does not match backend policy",
+                ));
+            }
+            Ok((Some(preference.clone()), Some(policy.clone())))
+        }
+    }
+}
+
+fn optional_typed_bundle_field<T>(bundle: &Value, keys: &[&str]) -> io::Result<Option<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let Some(value) = keys.iter().find_map(|key| bundle.get(*key)) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid {} in prompt bundle: {error}", keys[0]),
+            )
+        })
 }
 
 pub fn preflight_codex_runtime(
@@ -3995,6 +4098,10 @@ fn drive_codex_app_server(
         "input": input_parts
     });
     attach_codex_app_server_service_tier(&mut turn_params, &plan.provider_request_policy);
+    let wire_effort = validated_codex_turn_effort(harness_home, plan)?;
+    if let Some(effort) = wire_effort.as_ref() {
+        turn_params["effort"] = Value::String(effort.clone());
+    }
     let turn_start_request_id = if compact_before_turn { 3 } else { 2 };
     let mut steer_bridge = CodexTurnSteerBridge::new(
         harness_home,
@@ -4003,6 +4110,9 @@ fn drive_codex_app_server(
         thread_id.clone(),
         turn_start_request_id,
     )?;
+    if let Some(effort) = wire_effort.as_deref() {
+        mark_codex_thread_reasoning_may_be_sticky(plan, &thread_id, effort)?;
+    }
     if let Err(error) = write_json_rpc(
         &mut stdin,
         &json!({
@@ -4308,6 +4418,413 @@ fn drive_codex_app_server(
         interrupted_tool_uses: Vec::new(),
         warnings: state.warnings,
     })
+}
+
+const CODEX_REASONING_THREAD_STATE_SCHEMA: &str = "agent-harness.codex-reasoning-thread-state.v1";
+
+fn codex_reasoning_thread_state_file(codex_binding_file: &Path) -> PathBuf {
+    codex_binding_file.with_extension("reasoning-state.json")
+}
+
+fn codex_thread_may_have_managed_effort(
+    codex_binding_file: &Path,
+    thread_id: &str,
+    warnings: &mut Vec<String>,
+) -> bool {
+    let state_file = codex_reasoning_thread_state_file(codex_binding_file);
+    let text = match fs::read_to_string(&state_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+        Err(error) => {
+            warnings.push(format!(
+                "Codex reasoning thread state {} could not be read; forcing conservative fresh-thread rollover: {error}",
+                state_file.display()
+            ));
+            return true;
+        }
+    };
+    let state = match serde_json::from_str::<CodexReasoningThreadStateV1>(&text) {
+        Ok(state) => state,
+        Err(error) => {
+            warnings.push(format!(
+                "Codex reasoning thread state {} is invalid; forcing conservative fresh-thread rollover: {error}",
+                state_file.display()
+            ));
+            return true;
+        }
+    };
+    if state.schema != CODEX_REASONING_THREAD_STATE_SCHEMA {
+        warnings.push(format!(
+            "Codex reasoning thread state {} has unsupported schema {}; forcing conservative fresh-thread rollover",
+            state_file.display(),
+            state.schema
+        ));
+        return true;
+    }
+    state.thread_id == thread_id
+        && !state.effort.trim().is_empty()
+        && state.effort.trim() == state.effort
+}
+
+fn mark_codex_thread_reasoning_may_be_sticky(
+    plan: &CodexRuntimePlanFile,
+    thread_id: &str,
+    effort: &str,
+) -> io::Result<PathBuf> {
+    let state_file = codex_reasoning_thread_state_file(&plan.outputs.codex_binding_file);
+    let state = CodexReasoningThreadStateV1 {
+        schema: CODEX_REASONING_THREAD_STATE_SCHEMA.to_string(),
+        thread_id: thread_id.to_string(),
+        effort: effort.to_string(),
+        disposition: "may-be-sticky".to_string(),
+        updated_at_ms: current_log_time_ms()?,
+    };
+    crate::write_json_atomic(&state_file, &state)?;
+    Ok(state_file)
+}
+
+fn validated_codex_turn_effort(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+) -> io::Result<Option<String>> {
+    validate_codex_turn_effort_fields(
+        harness_home,
+        plan.agent_id.as_deref(),
+        plan.provider.as_deref(),
+        plan.model.as_deref(),
+        plan.reasoning_preference.as_ref(),
+        plan.backend_reasoning_policy.as_ref(),
+    )
+}
+
+fn validate_codex_turn_effort_fields(
+    harness_home: &Path,
+    agent_id: Option<&str>,
+    provider: Option<&str>,
+    model: Option<&str>,
+    preference: Option<&crate::backend_reasoning::ReasoningPreference>,
+    policy: Option<&crate::backend_reasoning::BackendReasoningPolicyV1>,
+) -> io::Result<Option<String>> {
+    let (preference, policy) = match (preference, policy) {
+        (None, None) => return Ok(None),
+        (Some(preference), Some(policy)) => (preference, policy),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Codex runtime reasoning preference and backend policy must be present together",
+            ));
+        }
+    };
+    if crate::model_catalog::model_catalog_rollout_mode_for_agent(Some(harness_home), agent_id)
+        != crate::model_catalog::ModelCatalogRolloutMode::Authoritative
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "backend reasoning policy is no longer authorized for this agent rollout cohort",
+        ));
+    }
+    let provider = provider.unwrap_or_default();
+    let model = model.unwrap_or_default();
+    policy
+        .validate_for_execution_route(provider, model)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("backend reasoning policy route changed before turn/start: {error}"),
+            )
+        })?;
+    let effort = policy.effective_effort();
+    if effort.eq_ignore_ascii_case("ultra") {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "ultra reasoning requires a matching delegation resource authorization receipt",
+        ));
+    }
+    let cache_file = harness_home.join("codex-home").join("models_cache.json");
+    let catalog_text = fs::read_to_string(&cache_file).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "Codex model catalog cache {} is unavailable before turn/start: {error}",
+                cache_file.display()
+            ),
+        )
+    })?;
+    let catalog =
+        crate::model_catalog::parse_codex_model_catalog(&catalog_text).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Codex model catalog cache {} is invalid before turn/start: {error}",
+                    cache_file.display()
+                ),
+            )
+        })?;
+    let route = catalog.exact_route(provider, model).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("exact Codex route {provider}/{model} is no longer advertised"),
+        )
+    })?;
+    if !route
+        .supported_reasoning_efforts
+        .iter()
+        .any(|advertised| advertised == effort)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "backend reasoning effort {effort} is no longer advertised for {provider}/{model}"
+            ),
+        ));
+    }
+    match preference {
+        crate::backend_reasoning::ReasoningPreference::Default => {
+            if route.default_reasoning_effort.as_deref() != Some(effort) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "queued default reasoning effort {effort} no longer matches the current catalog default for {provider}/{model}"
+                    ),
+                ));
+            }
+        }
+        crate::backend_reasoning::ReasoningPreference::Explicit { effort: requested }
+            if requested != effort =>
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "queued explicit reasoning preference does not match its backend policy",
+            ));
+        }
+        crate::backend_reasoning::ReasoningPreference::Explicit { .. } => {}
+    }
+    Ok(Some(effort.to_string()))
+}
+
+#[cfg(test)]
+mod backend_reasoning_wire_tests {
+    use super::*;
+    use crate::backend_reasoning::{
+        BackendReasoningPolicyV1, BackendReasoningSource, ReasoningPreference,
+    };
+    use crate::model_catalog::{
+        REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION, ReasoningResolutionReceipt,
+        ReasoningResolutionStatus,
+    };
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_root(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "agent-harness-codex-reasoning-{name}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn reasoning_policy(effort: &str) -> BackendReasoningPolicyV1 {
+        reasoning_policy_with_authority(effort, ReasoningResolutionStatus::Accepted, true)
+    }
+
+    fn reasoning_policy_with_authority(
+        effort: &str,
+        status: ReasoningResolutionStatus,
+        authoritative: bool,
+    ) -> BackendReasoningPolicyV1 {
+        BackendReasoningPolicyV1::new(
+            BackendReasoningSource::ChannelCommand,
+            ReasoningResolutionReceipt {
+                schema_version: REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION,
+                requested_provider: "openai".to_string(),
+                requested_model: "gpt-5.6-sol".to_string(),
+                effective_provider: Some("openai".to_string()),
+                effective_model: Some("gpt-5.6-sol".to_string()),
+                requested_effort: effort.to_string(),
+                effective_effort: Some(effort.to_string()),
+                catalog_effective_effort: Some(effort.to_string()),
+                catalog_revision: Some("test-revision".to_string()),
+                status,
+                authoritative,
+                reason: "test exact route".to_string(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn write_authoritative_fixture(root: &Path) {
+        fs::create_dir_all(root.join("codex-home")).unwrap();
+        fs::write(
+            root.join(crate::HARNESS_CONFIG_FILE_NAME),
+            r#"{"orchestration":{"features":{"modelCatalogV2":{"mode":"authoritative","enabledAgentIds":["main"]}}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("codex-home").join("models_cache.json"),
+            r#"{"models":[{"slug":"gpt-5.6-sol","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"},{"effort":"max"},{"effort":"ultra"}]}]}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn prompt_bundle_reasoning_snapshot_is_strict_and_route_bound() {
+        let preference = ReasoningPreference::explicit("max").unwrap();
+        let policy = reasoning_policy("max");
+        let bundle = serde_json::json!({
+            "reasoningPreference": preference,
+            "backendReasoningPolicy": policy,
+        });
+        let parsed =
+            parse_backend_reasoning_snapshot(&bundle, Some("openai"), Some("gpt-5.6-sol")).unwrap();
+        assert_eq!(
+            parsed.0,
+            Some(ReasoningPreference::explicit("max").unwrap())
+        );
+        assert_eq!(
+            parsed.1.as_ref().map(|policy| policy.effective_effort()),
+            Some("max")
+        );
+
+        let policy_only = serde_json::json!({
+            "backendReasoningPolicy": reasoning_policy("max"),
+        });
+        assert!(
+            parse_backend_reasoning_snapshot(&policy_only, Some("openai"), Some("gpt-5.6-sol"))
+                .is_err()
+        );
+        assert!(
+            parse_backend_reasoning_snapshot(&bundle, Some("openai"), Some("gpt-5.6-luna"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn turn_start_effort_is_exact_and_runtime_kill_switch_is_fail_closed() {
+        let root = test_root("wire");
+        write_authoritative_fixture(&root);
+        let max_preference = ReasoningPreference::explicit("max").unwrap();
+        let max_policy = reasoning_policy("max");
+        assert_eq!(
+            validate_codex_turn_effort_fields(
+                &root,
+                Some("main"),
+                Some("openai"),
+                Some("gpt-5.6-sol"),
+                Some(&max_preference),
+                Some(&max_policy),
+            )
+            .unwrap(),
+            Some("max".to_string())
+        );
+        let shadow_policy =
+            reasoning_policy_with_authority("max", ReasoningResolutionStatus::Shadow, false);
+        assert!(
+            validate_codex_turn_effort_fields(
+                &root,
+                Some("main"),
+                Some("openai"),
+                Some("gpt-5.6-sol"),
+                Some(&max_preference),
+                Some(&shadow_policy),
+            )
+            .is_err()
+        );
+
+        fs::write(
+            root.join(crate::HARNESS_CONFIG_FILE_NAME),
+            r#"{"orchestration":{"features":{"modelCatalogV2":{"mode":"off"}}}}"#,
+        )
+        .unwrap();
+        assert!(
+            validate_codex_turn_effort_fields(
+                &root,
+                Some("main"),
+                Some("openai"),
+                Some("gpt-5.6-sol"),
+                Some(&max_preference),
+                Some(&max_policy),
+            )
+            .is_err()
+        );
+
+        write_authoritative_fixture(&root);
+        let default = ReasoningPreference::Default;
+        let default_policy = reasoning_policy("low");
+        assert_eq!(
+            validate_codex_turn_effort_fields(
+                &root,
+                Some("main"),
+                Some("openai"),
+                Some("gpt-5.6-sol"),
+                Some(&default),
+                Some(&default_policy),
+            )
+            .unwrap(),
+            Some("low".to_string())
+        );
+
+        let ultra = ReasoningPreference::explicit("ultra").unwrap();
+        let ultra_policy = reasoning_policy("ultra");
+        assert!(
+            validate_codex_turn_effort_fields(
+                &root,
+                Some("main"),
+                Some("openai"),
+                Some("gpt-5.6-sol"),
+                Some(&ultra),
+                Some(&ultra_policy),
+            )
+            .is_err()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_effort_thread_state_forces_conservative_fresh_thread_rollover() {
+        let root = test_root("sticky-thread-state");
+        fs::create_dir_all(&root).unwrap();
+        let binding_file = root.join("session.codex-binding.json");
+        let state_file = codex_reasoning_thread_state_file(&binding_file);
+        crate::write_json_atomic(
+            &state_file,
+            &CodexReasoningThreadStateV1 {
+                schema: CODEX_REASONING_THREAD_STATE_SCHEMA.to_string(),
+                thread_id: "thread-managed".to_string(),
+                effort: "max".to_string(),
+                disposition: "may-be-sticky".to_string(),
+                updated_at_ms: 1,
+            },
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        assert!(codex_thread_may_have_managed_effort(
+            &binding_file,
+            "thread-managed",
+            &mut warnings
+        ));
+        assert!(!codex_thread_may_have_managed_effort(
+            &binding_file,
+            "thread-fresh",
+            &mut warnings
+        ));
+
+        fs::write(&state_file, "{not-json").unwrap();
+        assert!(codex_thread_may_have_managed_effort(
+            &binding_file,
+            "thread-managed",
+            &mut warnings
+        ));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| { warning.contains("forcing conservative fresh-thread rollover") })
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 fn app_server_model_provider(plan: &CodexRuntimePlanFile) -> Option<String> {

@@ -9,6 +9,7 @@ use crate::{
     ChannelCommandEffect, ChannelOutboundMessage, ChannelStep,
     VirtualSessionTaskBoundaryCloseOptions,
     admission::{ScopedStopOptions, ScopedStopTarget, record_scoped_stop},
+    backend_reasoning::{BackendReasoningPolicyV1, BackendReasoningSource, ReasoningPreference},
     close_virtual_session_for_task_boundary,
     codex_runtime::{CodexTurnSteerRequestOptions, queue_codex_turn_steer_request},
     progress::{AgentProgressSessionSupersedeOptions, supersede_agent_progress_session_surfaces},
@@ -104,6 +105,10 @@ pub struct ChannelSessionState {
     pub thinking_level: Option<String>,
     #[serde(default)]
     pub thinking_instruction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_preference: Option<ReasoningPreference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_reasoning_policy: Option<BackendReasoningPolicyV1>,
     #[serde(default)]
     pub fast_mode: Option<String>,
     #[serde(default)]
@@ -131,6 +136,10 @@ pub struct AgentOverride {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub thinking_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_preference: Option<ReasoningPreference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_reasoning_policy: Option<BackendReasoningPolicyV1>,
     #[serde(default)]
     pub fast_mode: Option<String>,
     pub updated_at_ms: Option<i64>,
@@ -341,6 +350,8 @@ fn new_state(step: &ChannelStep) -> ChannelSessionState {
         thinking_enabled: false,
         thinking_level: None,
         thinking_instruction: None,
+        reasoning_preference: None,
+        backend_reasoning_policy: None,
         fast_mode: None,
         stop_requested: false,
         stop_reason: None,
@@ -414,6 +425,8 @@ fn apply_effect(
             state.thinking_enabled = false;
             state.thinking_level = None;
             state.thinking_instruction = None;
+            state.reasoning_preference = None;
+            state.backend_reasoning_policy = None;
             state.fast_mode = None;
             state.stop_requested = false;
             state.stop_reason = None;
@@ -442,8 +455,71 @@ fn apply_effect(
                 state.thinking_enabled = true;
                 state.thinking_level = Some(level.clone());
                 state.thinking_instruction = None;
+                state.reasoning_preference = None;
+                state.backend_reasoning_policy = None;
                 if *global {
                     write_agent_override_thinking(harness_home, agent_id, level, now_ms, warnings)?;
+                }
+            }
+        }
+        ChannelCommandEffect::ShowReasoning {
+            agent_id,
+            provider,
+            model,
+            ..
+        } => {
+            update_model_context(state, agent_id, provider, model);
+        }
+        ChannelCommandEffect::SwitchReasoning {
+            agent_id,
+            provider,
+            model,
+            preference,
+            global,
+            accepted,
+            resolved_policy,
+            resolution,
+            catalog_default,
+            ..
+        } => {
+            if *accepted {
+                if let Err(error) = validate_accepted_reasoning_effect(
+                    preference,
+                    resolved_policy.as_ref(),
+                    resolution.as_ref(),
+                    provider.as_deref(),
+                    model.as_deref(),
+                    catalog_default.as_deref(),
+                ) {
+                    warnings.push(format!(
+                        "rejected inconsistent backend reasoning effect: {error}"
+                    ));
+                    return Ok(stop_applied_queue_ids);
+                }
+                update_model_context(state, agent_id, provider, model);
+                state.reasoning_preference = Some(preference.clone());
+                state.backend_reasoning_policy = resolved_policy.clone();
+                match preference {
+                    ReasoningPreference::Default => {
+                        state.thinking_enabled = false;
+                        state.thinking_level = None;
+                        state.thinking_instruction = None;
+                    }
+                    ReasoningPreference::Explicit { effort } => {
+                        state.thinking_enabled = true;
+                        state.thinking_level = Some(effort.clone());
+                        state.thinking_instruction = None;
+                    }
+                }
+                if *global {
+                    write_agent_override_reasoning(
+                        harness_home,
+                        agent_id,
+                        preference,
+                        resolved_policy.as_ref(),
+                        now_ms,
+                        warnings,
+                    )?;
                 }
             }
         }
@@ -513,6 +589,7 @@ fn apply_effect(
             state.model_override = Some(format!("{provider}/{model}"));
             state.model_override_provider = Some(provider.clone());
             state.model_override_model = Some(model.clone());
+            state.backend_reasoning_policy = None;
             if *global {
                 write_agent_override_model(
                     harness_home,
@@ -650,12 +727,87 @@ fn active_session_sibling_queue_ids(
     Ok(queue_ids)
 }
 
+fn validate_accepted_reasoning_effect(
+    preference: &ReasoningPreference,
+    policy: Option<&BackendReasoningPolicyV1>,
+    resolution: Option<&crate::model_catalog::ReasoningResolutionReceipt>,
+    provider: Option<&str>,
+    model: Option<&str>,
+    catalog_default: Option<&str>,
+) -> Result<(), String> {
+    preference.validate().map_err(|error| error.to_string())?;
+    let provider = provider
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "execution provider is missing".to_string())?;
+    let model = model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "execution model is missing".to_string())?;
+
+    match preference {
+        ReasoningPreference::Default => {
+            if policy.is_some() {
+                return Err("default reset must not carry an explicit execution policy".to_string());
+            }
+            match (catalog_default, resolution) {
+                (None, None) => Ok(()),
+                (Some(default), Some(resolution))
+                    if resolution.status
+                        == crate::model_catalog::ReasoningResolutionStatus::Accepted
+                        && resolution.effective_effort.as_deref() == Some(default) =>
+                {
+                    Ok(())
+                }
+                _ => Err("default reset catalog evidence is inconsistent".to_string()),
+            }
+        }
+        ReasoningPreference::Explicit { effort } => {
+            let policy = policy
+                .ok_or_else(|| "explicit preference is missing its execution policy".to_string())?;
+            if policy.source() != BackendReasoningSource::ChannelCommand {
+                return Err("channel command policy has the wrong source".to_string());
+            }
+            policy
+                .validate_for_route(provider, model)
+                .map_err(|error| error.to_string())?;
+            if policy.effective_effort() != effort {
+                return Err(format!(
+                    "preference effort `{effort}` does not match policy effort `{}`",
+                    policy.effective_effort()
+                ));
+            }
+            if resolution != Some(policy.resolution()) {
+                return Err(
+                    "effect resolution does not match the execution policy receipt".to_string(),
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 fn update_model_context(
     state: &mut ChannelSessionState,
     agent_id: &Option<String>,
     provider: &Option<String>,
     model: &Option<String>,
 ) {
+    let agent_changed = agent_id
+        .as_ref()
+        .is_some_and(|agent_id| state.agent_id.as_ref() != Some(agent_id));
+    let route_changed = provider
+        .as_ref()
+        .is_some_and(|provider| state.provider.as_ref() != Some(provider))
+        || model
+            .as_ref()
+            .is_some_and(|model| state.model.as_ref() != Some(model));
+    if agent_changed {
+        state.reasoning_preference = None;
+        state.backend_reasoning_policy = None;
+    } else if route_changed {
+        state.backend_reasoning_policy = None;
+    }
     if agent_id.is_some() {
         state.agent_id = agent_id.clone();
     }
@@ -672,6 +824,8 @@ fn command_name(effect: &ChannelCommandEffect) -> &'static str {
         ChannelCommandEffect::StartNewSession { .. } => "new",
         ChannelCommandEffect::ShowThinking { .. } => "think",
         ChannelCommandEffect::SwitchThinking { .. } => "think",
+        ChannelCommandEffect::ShowReasoning { .. } => "think",
+        ChannelCommandEffect::SwitchReasoning { .. } => "think",
         ChannelCommandEffect::StopCurrentRun { .. } => "stop",
         ChannelCommandEffect::RestartChannel { .. } => "restart",
         ChannelCommandEffect::RestartGateway { .. } => "restart",
@@ -746,6 +900,7 @@ fn write_agent_override_model(
     let override_entry = store.agents.entry(agent_id.clone()).or_default();
     override_entry.provider = Some(provider.to_string());
     override_entry.model = Some(model.to_string());
+    override_entry.backend_reasoning_policy = None;
     override_entry.updated_at_ms = Some(now_ms);
     write_agent_overrides_store(harness_home, &store)
 }
@@ -764,6 +919,30 @@ fn write_agent_override_thinking(
     let mut store = read_agent_overrides_store(harness_home)?;
     let override_entry = store.agents.entry(agent_id.clone()).or_default();
     override_entry.thinking_level = Some(level.to_string());
+    override_entry.reasoning_preference = None;
+    override_entry.backend_reasoning_policy = None;
+    override_entry.updated_at_ms = Some(now_ms);
+    write_agent_overrides_store(harness_home, &store)
+}
+
+fn write_agent_override_reasoning(
+    harness_home: &Path,
+    agent_id: &Option<String>,
+    preference: &ReasoningPreference,
+    policy: Option<&BackendReasoningPolicyV1>,
+    now_ms: i64,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    let Some(agent_id) = agent_id else {
+        warnings
+            .push("reasoning global was requested but no current agent was selected".to_string());
+        return Ok(());
+    };
+    let mut store = read_agent_overrides_store(harness_home)?;
+    let override_entry = store.agents.entry(agent_id.clone()).or_default();
+    override_entry.reasoning_preference = Some(preference.clone());
+    override_entry.backend_reasoning_policy = policy.cloned();
+    override_entry.thinking_level = preference.explicit_effort().map(str::to_string);
     override_entry.updated_at_ms = Some(now_ms);
     write_agent_overrides_store(harness_home, &store)
 }
