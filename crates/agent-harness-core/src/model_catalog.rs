@@ -1,10 +1,13 @@
-use std::{fs, path::Path};
+use std::{collections::BTreeSet, fs, path::Path};
 
 use ring::digest::{SHA256, digest};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub const MODEL_CAPABILITY_CATALOG_SCHEMA_VERSION: u32 = 1;
+pub const REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ModelCatalogRolloutMode {
     #[default]
@@ -13,14 +16,14 @@ pub enum ModelCatalogRolloutMode {
     Authoritative,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UnsupportedReasoningPolicy {
     Reject,
     FallbackToDefault,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReasoningResolutionStatus {
     Legacy,
@@ -30,7 +33,7 @@ pub enum ReasoningResolutionStatus {
     Fallback,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCapability {
     pub provider: String,
@@ -41,9 +44,14 @@ pub struct ModelCapability {
     pub fast_service_tier: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCapabilityCatalog {
+    #[serde(
+        default = "model_catalog_schema_version",
+        deserialize_with = "deserialize_model_catalog_schema_version"
+    )]
+    pub schema_version: u32,
     pub revision: String,
     pub models: Vec<ModelCapability>,
 }
@@ -61,9 +69,22 @@ impl ModelCapabilityCatalog {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReasoningResolutionReceipt {
+    #[serde(
+        default = "reasoning_receipt_schema_version",
+        deserialize_with = "deserialize_reasoning_receipt_schema_version"
+    )]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub requested_provider: String,
+    #[serde(default)]
+    pub requested_model: String,
+    #[serde(default)]
+    pub effective_provider: Option<String>,
+    #[serde(default)]
+    pub effective_model: Option<String>,
     pub requested_effort: String,
     pub effective_effort: Option<String>,
     pub catalog_effective_effort: Option<String>,
@@ -74,20 +95,16 @@ pub struct ReasoningResolutionReceipt {
 }
 
 pub fn parse_codex_model_catalog(text: &str) -> Result<ModelCapabilityCatalog, String> {
-    let mut value = serde_json::from_str::<Value>(text)
+    let value = serde_json::from_str::<Value>(text)
         .map_err(|error| format!("invalid Codex model catalog JSON: {error}"))?;
-    let raw = serde_json::from_value::<RawCatalog>(value.clone())
-        .map_err(|error| format!("invalid Codex model catalog schema: {error}"))?;
-    if let Some(object) = value.as_object_mut() {
-        object.remove("fetched_at");
-        object.remove("fetchedAt");
-    }
-    let canonical = serde_json::to_vec(&value)
-        .map_err(|error| format!("failed to canonicalize Codex model catalog: {error}"))?;
-    let revision = format!("sha256:{}", hex_lower(digest(&SHA256, &canonical).as_ref()));
-    let models = raw
-        .models
-        .into_iter()
+    let entries = value
+        .as_object()
+        .and_then(|object| object.get("models"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "invalid Codex model catalog schema: models must be an array".to_string())?;
+    let models = entries
+        .iter()
+        .filter_map(|entry| serde_json::from_value::<RawModel>(entry.clone()).ok())
         .filter_map(|entry| {
             let model = entry.slug.trim().to_ascii_lowercase();
             if model.is_empty() {
@@ -96,6 +113,7 @@ pub fn parse_codex_model_catalog(text: &str) -> Result<ModelCapabilityCatalog, S
             let supported_reasoning_efforts = entry
                 .supported_reasoning_levels
                 .into_iter()
+                .filter_map(|value| serde_json::from_value::<RawReasoningLevel>(value).ok())
                 .filter_map(RawReasoningLevel::effort)
                 .map(|effort| effort.trim().to_ascii_lowercase())
                 .filter(|effort| !effort.is_empty())
@@ -118,8 +136,69 @@ pub fn parse_codex_model_catalog(text: &str) -> Result<ModelCapabilityCatalog, S
                 ),
             })
         })
-        .collect();
-    Ok(ModelCapabilityCatalog { revision, models })
+        .collect::<Vec<_>>();
+    if models.is_empty() {
+        return Err("invalid Codex model catalog schema: no usable model entries".to_string());
+    }
+    let mut exact_routes = BTreeSet::new();
+    for model in &models {
+        if !exact_routes.insert((model.provider.clone(), model.model.clone())) {
+            return Err(format!(
+                "invalid Codex model catalog schema: duplicate exact route {}/{}",
+                model.provider, model.model
+            ));
+        }
+    }
+    let mut revision_models = models
+        .iter()
+        .map(CatalogRevisionModelProjection::from)
+        .collect::<Vec<_>>();
+    revision_models.sort_by(|left, right| {
+        left.provider
+            .cmp(right.provider)
+            .then_with(|| left.model.cmp(right.model))
+    });
+    let projection = CatalogRevisionProjection {
+        schema_version: MODEL_CAPABILITY_CATALOG_SCHEMA_VERSION,
+        models: &revision_models,
+    };
+    let canonical = serde_json::to_vec(&projection)
+        .map_err(|error| format!("failed to canonicalize Codex model catalog: {error}"))?;
+    let revision = format!("sha256:{}", hex_lower(digest(&SHA256, &canonical).as_ref()));
+    Ok(ModelCapabilityCatalog {
+        schema_version: MODEL_CAPABILITY_CATALOG_SCHEMA_VERSION,
+        revision,
+        models,
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogRevisionProjection<'a> {
+    schema_version: u32,
+    models: &'a [CatalogRevisionModelProjection<'a>],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogRevisionModelProjection<'a> {
+    provider: &'a str,
+    model: &'a str,
+    default_reasoning_effort: Option<&'a str>,
+    supported_reasoning_efforts: &'a [String],
+    fast_service_tier: Option<&'a str>,
+}
+
+impl<'a> From<&'a ModelCapability> for CatalogRevisionModelProjection<'a> {
+    fn from(model: &'a ModelCapability) -> Self {
+        Self {
+            provider: model.provider.as_str(),
+            model: model.model.as_str(),
+            default_reasoning_effort: model.default_reasoning_effort.as_deref(),
+            supported_reasoning_efforts: &model.supported_reasoning_efforts,
+            fast_service_tier: model.fast_service_tier.as_deref(),
+        }
+    }
 }
 
 pub fn model_catalog_rollout_mode(harness_home: Option<&Path>) -> ModelCatalogRolloutMode {
@@ -158,11 +237,15 @@ pub fn resolve_reasoning_effort(
     policy: UnsupportedReasoningPolicy,
 ) -> ReasoningResolutionReceipt {
     let requested = requested_effort.to_string();
+    let requested_provider = provider.to_string();
+    let requested_model = model.to_string();
     let normalized = normalize_catalog_effort(requested_effort);
     let legacy_effective = crate::normalize_thinking_level(requested_effort).or_else(|| {
         let normalized = requested_effort.trim().to_ascii_lowercase();
         (!normalized.is_empty()).then_some(normalized)
     });
+    let legacy_provider = nonempty(Some(provider.to_string()));
+    let legacy_model = nonempty(Some(model.to_string()));
     let route = catalog.and_then(|catalog| catalog.exact_route(provider, model));
     let advertised = normalized.as_ref().and_then(|effort| {
         route.and_then(|route| {
@@ -176,6 +259,11 @@ pub fn resolve_reasoning_effort(
 
     match mode {
         ModelCatalogRolloutMode::Off => ReasoningResolutionReceipt {
+            schema_version: REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION,
+            requested_provider,
+            requested_model,
+            effective_provider: legacy_provider,
+            effective_model: legacy_model,
             requested_effort: requested,
             effective_effort: legacy_effective,
             catalog_effective_effort: None,
@@ -185,6 +273,11 @@ pub fn resolve_reasoning_effort(
             reason: "model catalog authority is disabled; legacy normalization applies".into(),
         },
         ModelCatalogRolloutMode::Shadow => ReasoningResolutionReceipt {
+            schema_version: REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION,
+            requested_provider,
+            requested_model,
+            effective_provider: legacy_provider,
+            effective_model: legacy_model,
             requested_effort: requested,
             effective_effort: legacy_effective,
             catalog_effective_effort: advertised,
@@ -197,21 +290,46 @@ pub fn resolve_reasoning_effort(
         },
         ModelCatalogRolloutMode::Authoritative => {
             let Some(catalog) = catalog else {
-                return rejected_receipt(
-                    requested,
-                    None,
-                    "authoritative model catalog is unavailable",
-                );
+                return ReasoningResolutionReceipt {
+                    schema_version: REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION,
+                    requested_provider,
+                    requested_model,
+                    effective_provider: legacy_provider,
+                    effective_model: legacy_model,
+                    requested_effort: requested,
+                    effective_effort: legacy_effective,
+                    catalog_effective_effort: None,
+                    catalog_revision: None,
+                    status: ReasoningResolutionStatus::Legacy,
+                    authoritative: false,
+                    reason: "catalog is unavailable; conservative legacy compatibility remains authoritative"
+                        .into(),
+                };
             };
             let Some(route) = route else {
-                return rejected_receipt(
-                    requested,
-                    Some(&catalog.revision),
-                    "provider/model route is absent from the authoritative catalog",
-                );
+                return ReasoningResolutionReceipt {
+                    schema_version: REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION,
+                    requested_provider,
+                    requested_model,
+                    effective_provider: legacy_provider,
+                    effective_model: legacy_model,
+                    requested_effort: requested,
+                    effective_effort: legacy_effective,
+                    catalog_effective_effort: None,
+                    catalog_revision: Some(catalog.revision.clone()),
+                    status: ReasoningResolutionStatus::Legacy,
+                    authoritative: false,
+                    reason: "exact provider/model route is unknown; conservative legacy compatibility remains authoritative"
+                        .into(),
+                };
             };
             if let Some(effective) = advertised {
                 return ReasoningResolutionReceipt {
+                    schema_version: REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION,
+                    requested_provider,
+                    requested_model,
+                    effective_provider: Some(route.provider.clone()),
+                    effective_model: Some(route.model.clone()),
                     requested_effort: requested,
                     effective_effort: Some(effective.clone()),
                     catalog_effective_effort: Some(effective),
@@ -229,6 +347,11 @@ pub fn resolve_reasoning_effort(
                     .any(|candidate| candidate.eq_ignore_ascii_case(default))
             {
                 return ReasoningResolutionReceipt {
+                    schema_version: REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION,
+                    requested_provider,
+                    requested_model,
+                    effective_provider: Some(route.provider.clone()),
+                    effective_model: Some(route.model.clone()),
                     requested_effort: requested,
                     effective_effort: Some(default.clone()),
                     catalog_effective_effort: Some(default.clone()),
@@ -238,19 +361,22 @@ pub fn resolve_reasoning_effort(
                     reason: "unsupported effort fell back to the advertised model default".into(),
                 };
             }
-            rejected_receipt(
-                requested,
-                Some(&catalog.revision),
-                "requested reasoning effort is not advertised for the exact route",
-            )
+            ReasoningResolutionReceipt {
+                schema_version: REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION,
+                requested_provider,
+                requested_model,
+                effective_provider: Some(route.provider.clone()),
+                effective_model: Some(route.model.clone()),
+                requested_effort: requested,
+                effective_effort: None,
+                catalog_effective_effort: None,
+                catalog_revision: Some(catalog.revision.clone()),
+                status: ReasoningResolutionStatus::Rejected,
+                authoritative: true,
+                reason: "requested reasoning effort is not advertised for the exact route".into(),
+            }
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct RawCatalog {
-    #[serde(default)]
-    models: Vec<RawModel>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -267,7 +393,7 @@ struct RawModel {
     )]
     default_reasoning_level: Option<String>,
     #[serde(default, alias = "supportedReasoningLevels")]
-    supported_reasoning_levels: Vec<RawReasoningLevel>,
+    supported_reasoning_levels: Vec<Value>,
     #[serde(default, alias = "serviceTiers")]
     service_tiers: Vec<RawServiceTier>,
     #[serde(default, alias = "additionalSpeedTiers")]
@@ -344,26 +470,44 @@ fn fast_service_tier(
         })
 }
 
-fn rejected_receipt(
-    requested_effort: String,
-    revision: Option<&str>,
-    reason: &str,
-) -> ReasoningResolutionReceipt {
-    ReasoningResolutionReceipt {
-        requested_effort,
-        effective_effort: None,
-        catalog_effective_effort: None,
-        catalog_revision: revision.map(str::to_string),
-        status: ReasoningResolutionStatus::Rejected,
-        authoritative: true,
-        reason: reason.to_string(),
-    }
-}
-
 fn nonempty(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+const fn model_catalog_schema_version() -> u32 {
+    MODEL_CAPABILITY_CATALOG_SCHEMA_VERSION
+}
+
+const fn reasoning_receipt_schema_version() -> u32 {
+    REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION
+}
+
+fn deserialize_model_catalog_schema_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let version = u32::deserialize(deserializer)?;
+    if version != MODEL_CAPABILITY_CATALOG_SCHEMA_VERSION {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported model capability catalog schema version {version}"
+        )));
+    }
+    Ok(version)
+}
+
+fn deserialize_reasoning_receipt_schema_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let version = u32::deserialize(deserializer)?;
+    if version != REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported reasoning resolution receipt schema version {version}"
+        )));
+    }
+    Ok(version)
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -493,6 +637,229 @@ mod tests {
             parse_codex_model_catalog(&fixture("one")).unwrap().revision,
             parse_codex_model_catalog(&fixture("two")).unwrap().revision
         );
+    }
+
+    #[test]
+    fn model_catalog_contract_v1_serializes_schema_and_route_evidence() {
+        let catalog = parse_codex_model_catalog(&fixture("one")).unwrap();
+        let catalog_json = serde_json::to_value(&catalog).unwrap();
+        assert_eq!(catalog_json["schemaVersion"], 1);
+        let catalog_round_trip =
+            serde_json::from_value::<ModelCapabilityCatalog>(catalog_json).unwrap();
+        assert_eq!(catalog_round_trip, catalog);
+
+        let receipt = resolve_reasoning_effort(
+            Some(&catalog),
+            ModelCatalogRolloutMode::Authoritative,
+            "codex",
+            "GPT-5.6-SOL",
+            "XHIGH",
+            UnsupportedReasoningPolicy::Reject,
+        );
+        let receipt_json = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(receipt_json["schemaVersion"], 1);
+        assert_eq!(receipt_json["requestedProvider"], "codex");
+        assert_eq!(receipt_json["requestedModel"], "GPT-5.6-SOL");
+        assert_eq!(receipt_json["effectiveProvider"], "openai");
+        assert_eq!(receipt_json["effectiveModel"], "gpt-5.6-sol");
+        assert_eq!(receipt_json["requestedEffort"], "XHIGH");
+        assert_eq!(receipt_json["effectiveEffort"], "xhigh");
+        assert_eq!(receipt_json["catalogRevision"], catalog.revision);
+        let receipt_round_trip =
+            serde_json::from_value::<ReasoningResolutionReceipt>(receipt_json).unwrap();
+        assert_eq!(receipt_round_trip, receipt);
+    }
+
+    #[test]
+    fn model_catalog_contract_v1_revision_is_capability_canonical() {
+        let first = r#"{
+          "fetched_at":"one","etag":"volatile-a","client_version":"0.1",
+          "models":[
+            {"slug":"gpt-5.6-sol","display_name":"Sol","default_reasoning_level":"low",
+             "supported_reasoning_levels":["low","xhigh","ultra"]},
+            {"slug":"gpt-5.6-terra","display_name":"Terra","default_reasoning_level":"deep",
+             "supported_reasoning_levels":["deep","frontier"]}
+          ]}"#;
+        let reordered = r#"{
+          "fetched_at":"two","etag":"volatile-b","client_version":"99.0",
+          "unrelated":{"cache":"metadata"},
+          "models":[
+            {"slug":"gpt-5.6-terra","display_name":"Terra presentation v2","default_reasoning_level":"deep",
+             "supported_reasoning_levels":["deep","frontier"]},
+            {"slug":"gpt-5.6-sol","display_name":"Sol presentation v2","default_reasoning_level":"low",
+             "supported_reasoning_levels":["low","xhigh","ultra"]}
+          ]}"#;
+        let first = parse_codex_model_catalog(first).unwrap();
+        let reordered = parse_codex_model_catalog(reordered).unwrap();
+        assert_eq!(first.revision, reordered.revision);
+        assert_eq!(first.models[0].model, "gpt-5.6-sol");
+        assert_eq!(reordered.models[0].model, "gpt-5.6-terra");
+    }
+
+    #[test]
+    fn model_catalog_contract_v1_shadow_keeps_legacy_effective_route() {
+        let catalog = parse_codex_model_catalog(&fixture("one")).unwrap();
+        let receipt = resolve_reasoning_effort(
+            Some(&catalog),
+            ModelCatalogRolloutMode::Shadow,
+            "codex",
+            "GPT-5.6-SOL",
+            "max",
+            UnsupportedReasoningPolicy::Reject,
+        );
+        assert_eq!(receipt.status, ReasoningResolutionStatus::Shadow);
+        assert!(!receipt.authoritative);
+        assert_eq!(receipt.requested_provider, "codex");
+        assert_eq!(receipt.requested_model, "GPT-5.6-SOL");
+        assert_eq!(receipt.effective_provider.as_deref(), Some("codex"));
+        assert_eq!(receipt.effective_model.as_deref(), Some("GPT-5.6-SOL"));
+        assert_eq!(receipt.effective_effort.as_deref(), Some("xhigh"));
+        assert_eq!(receipt.catalog_effective_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn model_catalog_contract_v1_rejects_unsupported_serialized_schema_versions() {
+        let catalog = parse_codex_model_catalog(&fixture("one")).unwrap();
+        let mut catalog_json = serde_json::to_value(catalog).unwrap();
+        catalog_json["schemaVersion"] = serde_json::json!(2);
+        assert!(serde_json::from_value::<ModelCapabilityCatalog>(catalog_json).is_err());
+
+        let catalog = parse_codex_model_catalog(&fixture("one")).unwrap();
+        let receipt = resolve_reasoning_effort(
+            Some(&catalog),
+            ModelCatalogRolloutMode::Authoritative,
+            "openai",
+            "gpt-5.6-sol",
+            "xhigh",
+            UnsupportedReasoningPolicy::Reject,
+        );
+        let mut receipt_json = serde_json::to_value(receipt).unwrap();
+        receipt_json["schemaVersion"] = serde_json::json!(2);
+        assert!(serde_json::from_value::<ReasoningResolutionReceipt>(receipt_json).is_err());
+    }
+
+    #[test]
+    fn model_catalog_contract_v1_rejects_duplicate_exact_routes() {
+        let duplicate = r#"{
+          "models":[
+            {"slug":"gpt-5.6-sol","supported_reasoning_levels":["low"]},
+            {"slug":"GPT-5.6-SOL","supported_reasoning_levels":["ultra"]}
+          ]}"#;
+        assert!(parse_codex_model_catalog(duplicate).is_err());
+    }
+
+    #[test]
+    fn model_catalog_contract_v1_skips_bad_entries_and_reasoning_elements() {
+        let text = r#"{
+          "models":[
+            42,
+            {"slug":false,"supported_reasoning_levels":["low"]},
+            {"slug":"gpt-5.6-terra","default_reasoning_level":"deep",
+             "supported_reasoning_levels":["deep",7,{"effort":"frontier"},{},null,"summit"]}
+          ]}"#;
+        let catalog = parse_codex_model_catalog(text).unwrap();
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(
+            catalog
+                .exact_route("openai", "gpt-5.6-terra")
+                .unwrap()
+                .supported_reasoning_efforts,
+            ["deep", "frontier", "summit"]
+        );
+    }
+
+    #[test]
+    fn model_catalog_contract_v1_rejects_wholly_unusable_catalog() {
+        assert!(parse_codex_model_catalog(r#"{"models":[]}"#).is_err());
+        assert!(parse_codex_model_catalog(r#"{"models":[42,null,{"slug":""}]}"#).is_err());
+        assert!(parse_codex_model_catalog(r#"[]"#).is_err());
+    }
+
+    #[test]
+    fn model_catalog_contract_v1_preserves_future_effort_names_and_order() {
+        let text = r#"{"models":[{"slug":"gpt-5.6-terra",
+          "default_reasoning_level":"deliberate",
+          "supported_reasoning_levels":["summit","deliberate","abyss","summit"]}]}"#;
+        let catalog = parse_codex_model_catalog(text).unwrap();
+        let terra = catalog.exact_route("openai", "gpt-5.6-terra").unwrap();
+        assert_eq!(
+            terra.supported_reasoning_efforts,
+            ["summit", "deliberate", "abyss"]
+        );
+        let receipt = resolve_reasoning_effort(
+            Some(&catalog),
+            ModelCatalogRolloutMode::Authoritative,
+            "openai",
+            "gpt-5.6-terra",
+            "abyss",
+            UnsupportedReasoningPolicy::Reject,
+        );
+        assert_eq!(receipt.effective_effort.as_deref(), Some("abyss"));
+        assert_eq!(receipt.status, ReasoningResolutionStatus::Accepted);
+    }
+
+    #[test]
+    fn model_catalog_contract_v1_codex_alias_is_explicit_and_receipted() {
+        let catalog = parse_codex_model_catalog(&fixture("one")).unwrap();
+        let openai = catalog.exact_route("openai", "gpt-5.6-sol").unwrap();
+        let codex = catalog.exact_route("codex", "gpt-5.6-sol").unwrap();
+        assert_eq!(openai, codex);
+
+        let receipt = resolve_reasoning_effort(
+            Some(&catalog),
+            ModelCatalogRolloutMode::Authoritative,
+            "codex",
+            "gpt-5.6-sol",
+            "xhigh",
+            UnsupportedReasoningPolicy::Reject,
+        );
+        let json = serde_json::to_value(receipt).unwrap();
+        assert_eq!(json["requestedProvider"], "codex");
+        assert_eq!(json["effectiveProvider"], "openai");
+    }
+
+    #[test]
+    fn model_catalog_contract_v1_missing_catalog_keeps_legacy_compatibility() {
+        let receipt = resolve_reasoning_effort(
+            None,
+            ModelCatalogRolloutMode::Authoritative,
+            "legacy-provider",
+            "legacy-model",
+            "custom-effort",
+            UnsupportedReasoningPolicy::Reject,
+        );
+        assert_eq!(receipt.status, ReasoningResolutionStatus::Legacy);
+        assert!(!receipt.authoritative);
+        assert_eq!(receipt.effective_effort.as_deref(), Some("custom-effort"));
+        let json = serde_json::to_value(receipt).unwrap();
+        assert_eq!(json["effectiveProvider"], "legacy-provider");
+        assert_eq!(json["effectiveModel"], "legacy-model");
+        assert!(json["reason"].as_str().unwrap().contains("compatibility"));
+    }
+
+    #[test]
+    fn model_catalog_contract_v1_unknown_route_keeps_legacy_compatibility() {
+        let catalog = parse_codex_model_catalog(&fixture("one")).unwrap();
+        let receipt = resolve_reasoning_effort(
+            Some(&catalog),
+            ModelCatalogRolloutMode::Authoritative,
+            "openrouter",
+            "future-model",
+            "future-effort",
+            UnsupportedReasoningPolicy::Reject,
+        );
+        assert_eq!(receipt.status, ReasoningResolutionStatus::Legacy);
+        assert!(!receipt.authoritative);
+        assert_eq!(receipt.effective_effort.as_deref(), Some("future-effort"));
+        assert_eq!(
+            receipt.catalog_revision.as_deref(),
+            Some(catalog.revision.as_str())
+        );
+        let json = serde_json::to_value(receipt).unwrap();
+        assert_eq!(json["requestedProvider"], "openrouter");
+        assert_eq!(json["requestedModel"], "future-model");
+        assert_eq!(json["effectiveProvider"], "openrouter");
+        assert_eq!(json["effectiveModel"], "future-model");
     }
 
     #[test]
