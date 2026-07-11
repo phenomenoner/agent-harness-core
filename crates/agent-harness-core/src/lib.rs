@@ -26,6 +26,7 @@ pub mod harness_registry;
 pub mod harness_skills;
 pub mod health;
 pub mod importer;
+pub mod lane;
 pub mod latency;
 pub mod live_control;
 pub mod logging;
