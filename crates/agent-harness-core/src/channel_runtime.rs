@@ -955,6 +955,243 @@ fn model_catalog_rollout_mode_for_turn(
     )
 }
 
+fn model_catalog_rollout_assessment_for_turn(
+    turn: &TurnPlan,
+) -> crate::model_catalog::ModelCatalogRolloutAssessment {
+    crate::model_catalog::model_catalog_rollout_assessment_for_agent(
+        turn.harness_home.as_deref(),
+        turn.agent.as_ref().map(|agent| agent.id.as_str()),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedReasoningStatus {
+    preference: Option<ReasoningPreference>,
+    preference_source: &'static str,
+    masked_agent_default: Option<ReasoningPreference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnifiedThinkStatusSnapshot {
+    agent_id: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    persisted: PersistedReasoningStatus,
+    rollout: String,
+    backend_policy: &'static str,
+    resolved_next_turn_effort: Option<String>,
+    legacy_enabled: bool,
+    legacy_level: Option<String>,
+    catalog_default: Option<String>,
+    catalog_efforts: Vec<String>,
+    catalog_revision: Option<String>,
+    authoritative: bool,
+    detail: String,
+}
+
+fn read_agent_default_reasoning_preference(turn: &TurnPlan) -> Option<ReasoningPreference> {
+    turn.harness_home
+        .as_deref()
+        .zip(turn.agent.as_ref())
+        .and_then(|(harness_home, agent)| {
+            crate::read_agent_override(harness_home, &agent.id)
+                .ok()
+                .flatten()
+        })
+        .and_then(|entry| entry.reasoning_preference)
+}
+
+fn persisted_reasoning_status(
+    turn: &TurnPlan,
+    agent_default: Option<ReasoningPreference>,
+) -> PersistedReasoningStatus {
+    if let Some(state) = turn.channel_state.as_ref() {
+        if let Some(preference) = state.reasoning_preference.as_ref() {
+            return PersistedReasoningStatus {
+                preference: Some(preference.clone()),
+                preference_source: "session",
+                masked_agent_default: None,
+            };
+        }
+        if state.thinking_enabled || state.thinking_level.is_some() {
+            return PersistedReasoningStatus {
+                preference: None,
+                preference_source: "none",
+                masked_agent_default: agent_default,
+            };
+        }
+    }
+
+    match agent_default {
+        Some(preference) => PersistedReasoningStatus {
+            preference: Some(preference),
+            preference_source: "agent-default",
+            masked_agent_default: None,
+        },
+        None => PersistedReasoningStatus {
+            preference: None,
+            preference_source: "none",
+            masked_agent_default: None,
+        },
+    }
+}
+
+fn rollout_status_label(assessment: crate::model_catalog::ModelCatalogRolloutAssessment) -> String {
+    let mode = |mode| match mode {
+        crate::model_catalog::ModelCatalogRolloutMode::Off => "off",
+        crate::model_catalog::ModelCatalogRolloutMode::Shadow => "shadow",
+        crate::model_catalog::ModelCatalogRolloutMode::Authoritative => "authoritative",
+    };
+    if assessment.excluded {
+        format!("excluded (configured={})", mode(assessment.configured_mode))
+    } else {
+        mode(assessment.effective_mode).to_string()
+    }
+}
+
+fn unified_think_status_snapshot(turn: &TurnPlan) -> UnifiedThinkStatusSnapshot {
+    let assessment = model_catalog_rollout_assessment_for_turn(turn);
+    let catalog = load_model_catalog_for_turn(turn);
+    let agent_default = read_agent_default_reasoning_preference(turn);
+    let persisted = persisted_reasoning_status(turn, agent_default);
+    let agent_id = turn.agent.as_ref().map(|agent| agent.id.clone());
+    let provider = turn.model_policy.provider.clone();
+    let model = turn.model_policy.model.clone();
+    let route = catalog.as_ref().and_then(|catalog| {
+        catalog.exact_route(
+            provider.as_deref().unwrap_or_default(),
+            model.as_deref().unwrap_or_default(),
+        )
+    });
+    let catalog_default = route.and_then(|route| route.default_reasoning_effort.clone());
+    let catalog_efforts = route
+        .map(|route| route.supported_reasoning_efforts.clone())
+        .unwrap_or_default();
+    let catalog_revision = catalog.as_ref().map(|catalog| catalog.revision.clone());
+    let authoritative =
+        assessment.effective_mode == crate::model_catalog::ModelCatalogRolloutMode::Authoritative;
+    let preference_matches_turn =
+        persisted.preference.as_ref() == turn.reasoning_preference.as_ref();
+    let policy = turn.backend_reasoning_policy.as_ref();
+    let policy_effort = policy.map(|policy| policy.effective_effort());
+    let policy_route_valid = policy.is_some_and(|policy| {
+        policy
+            .validate_for_execution_route(
+                provider.as_deref().unwrap_or_default(),
+                model.as_deref().unwrap_or_default(),
+            )
+            .is_ok()
+    });
+    let policy_effort_matches_preference = match persisted.preference.as_ref() {
+        Some(ReasoningPreference::Default) => policy_effort == catalog_default.as_deref(),
+        Some(ReasoningPreference::Explicit { effort }) => policy_effort == Some(effort.as_str()),
+        None => policy.is_none(),
+    };
+    let policy_effort_is_current = policy_effort.is_some_and(|effort| {
+        catalog_efforts
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(effort))
+    });
+    let ready = authoritative
+        && persisted.preference.is_some()
+        && preference_matches_turn
+        && policy_route_valid
+        && policy_effort_matches_preference
+        && policy_effort_is_current;
+    let has_backend_snapshot = persisted.preference.is_some()
+        || turn.reasoning_preference.is_some()
+        || turn.backend_reasoning_policy.is_some();
+    let backend_policy = if authoritative && has_backend_snapshot {
+        if ready { "ready" } else { "suspended" }
+    } else if persisted.preference.is_some() {
+        "dormant"
+    } else if turn.thinking_policy.enabled {
+        "legacy-only"
+    } else {
+        "unset"
+    };
+    let resolved_next_turn_effort = ready.then(|| {
+        policy
+            .expect("ready backend policy requires an execution policy")
+            .effective_effort()
+            .to_string()
+    });
+    let detail = match backend_policy {
+        "ready" => "policy snapshot is internally consistent for the next turn".to_string(),
+        "suspended" if !preference_matches_turn => {
+            "persisted preference and TurnPlan preference differ; policy is stale/suspended"
+                .to_string()
+        }
+        "suspended" if !policy_route_valid || !policy_effort_matches_preference => {
+            "policy route or effort is stale/inconsistent with the current snapshot".to_string()
+        }
+        "suspended" => turn
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("backend reasoning"))
+            .cloned()
+            .unwrap_or_else(|| {
+                "stored backend preference has no current route-valid execution policy".to_string()
+            }),
+        "dormant" => {
+            "stored backend preference is dormant while rollout is not authoritative".to_string()
+        }
+        "legacy-only" => {
+            "legacy prompt control is active; no backend effort is currently planned for the next turn"
+                .to_string()
+        }
+        _ => "no thinking or backend reasoning preference is set".to_string(),
+    };
+
+    UnifiedThinkStatusSnapshot {
+        agent_id,
+        provider,
+        model,
+        persisted,
+        rollout: rollout_status_label(assessment),
+        backend_policy,
+        resolved_next_turn_effort,
+        legacy_enabled: turn.thinking_policy.enabled,
+        legacy_level: turn
+            .thinking_policy
+            .enabled
+            .then(|| turn.thinking_policy.level.clone())
+            .flatten(),
+        catalog_default,
+        catalog_efforts,
+        catalog_revision,
+        authoritative,
+        detail,
+    }
+}
+
+fn unified_thinking_status_effect(turn: &TurnPlan) -> ChannelCommandEffect {
+    let snapshot = unified_think_status_snapshot(turn);
+    let reason = format!(
+        "Rollout: {}\nBackend policy: {}\nPreference source: {}\nMasked agent default: {}\nResolved next-turn effort: {}\nLegacy prompt enabled: {}\nLegacy prompt level: {}\nRuntime revalidation: required before turn/start; status is not wire execution evidence\nDetail: {}",
+        snapshot.rollout,
+        snapshot.backend_policy,
+        snapshot.persisted.preference_source,
+        display_reasoning_preference_or_dash(snapshot.persisted.masked_agent_default.as_ref()),
+        snapshot.resolved_next_turn_effort.as_deref().unwrap_or("-"),
+        yes_no(snapshot.legacy_enabled),
+        snapshot.legacy_level.as_deref().unwrap_or("-"),
+        snapshot.detail
+    );
+
+    ChannelCommandEffect::ShowReasoning {
+        agent_id: snapshot.agent_id,
+        provider: snapshot.provider,
+        model: snapshot.model,
+        current_preference: snapshot.persisted.preference,
+        available_efforts: snapshot.catalog_efforts,
+        catalog_default: snapshot.catalog_default,
+        catalog_revision: snapshot.catalog_revision,
+        authoritative: snapshot.authoritative,
+        reason,
+    }
+}
+
 fn reasoning_resolution_for_turn(
     turn: &TurnPlan,
     requested_effort: &str,
@@ -976,6 +1213,9 @@ fn unified_thinking_command_effect(
     effort: Option<String>,
     global: bool,
 ) -> ChannelCommandEffect {
+    let Some(effort) = effort else {
+        return unified_thinking_status_effect(turn);
+    };
     if model_catalog_rollout_mode_for_turn(turn)
         == crate::model_catalog::ModelCatalogRolloutMode::Authoritative
     {
@@ -985,11 +1225,7 @@ fn unified_thinking_command_effect(
     }
 }
 
-fn reasoning_command_effect(
-    turn: &TurnPlan,
-    effort: Option<String>,
-    global: bool,
-) -> ChannelCommandEffect {
+fn reasoning_command_effect(turn: &TurnPlan, effort: String, global: bool) -> ChannelCommandEffect {
     let agent_id = turn.agent.as_ref().map(|agent| agent.id.clone());
     let provider = turn.model_policy.provider.clone();
     let model = turn.model_policy.model.clone();
@@ -1021,20 +1257,6 @@ fn reasoning_command_effect(
         crate::model_catalog::ModelCatalogRolloutMode::Authoritative => {
             "catalog snapshot is authoritative for this agent"
         }
-    };
-
-    let Some(effort) = effort else {
-        return ChannelCommandEffect::ShowReasoning {
-            agent_id,
-            provider,
-            model,
-            current_preference: turn.reasoning_preference.clone(),
-            available_efforts,
-            catalog_default,
-            catalog_revision,
-            authoritative,
-            reason: rollout_reason.to_string(),
-        };
     };
 
     let normalized_requested = effort.trim().to_ascii_lowercase();
@@ -1161,44 +1383,28 @@ fn reasoning_command_effect(
     }
 }
 
-fn thinking_command_effect(
-    turn: &TurnPlan,
-    level: Option<String>,
-    global: bool,
-) -> ChannelCommandEffect {
+fn thinking_command_effect(turn: &TurnPlan, level: String, global: bool) -> ChannelCommandEffect {
     let available_levels = available_thinking_levels(turn);
     let agent_id = turn.agent.as_ref().map(|agent| agent.id.clone());
     let provider = turn.model_policy.provider.clone();
     let model = turn.model_policy.model.clone();
     let thinking_enabled = turn.thinking_policy.enabled;
     let current_level = current_thinking_level(turn);
-    match level {
-        Some(level) => {
-            let normalized = crate::normalize_thinking_level(&level)
-                .unwrap_or_else(|| level.trim().to_ascii_lowercase());
-            let valid = available_levels
-                .iter()
-                .any(|candidate| candidate == &normalized);
-            ChannelCommandEffect::SwitchThinking {
-                agent_id,
-                provider,
-                model,
-                thinking_enabled,
-                current_level,
-                level: normalized,
-                global,
-                valid,
-                available_levels,
-            }
-        }
-        None => ChannelCommandEffect::ShowThinking {
-            agent_id,
-            provider,
-            model,
-            thinking_enabled,
-            current_level,
-            available_levels,
-        },
+    let normalized = crate::normalize_thinking_level(&level)
+        .unwrap_or_else(|| level.trim().to_ascii_lowercase());
+    let valid = available_levels
+        .iter()
+        .any(|candidate| candidate == &normalized);
+    ChannelCommandEffect::SwitchThinking {
+        agent_id,
+        provider,
+        model,
+        thinking_enabled,
+        current_level,
+        level: normalized,
+        global,
+        valid,
+        available_levels,
     }
 }
 
@@ -1638,22 +1844,24 @@ fn command_reply_text(effect: &ChannelCommandEffect) -> String {
             text
         }
         ChannelCommandEffect::ShowReasoning {
+            agent_id,
             provider,
             model,
             current_preference,
             available_efforts,
             catalog_default,
-            authoritative,
+            catalog_revision,
             reason,
             ..
         } => format!(
-            "Backend reasoning preference: {}\nModel: {}\nCatalog default: {}\nAvailable backend efforts: {}\nAuthoritative: {}\n{}",
-            display_reasoning_preference(current_preference.as_ref()),
+            "Thinking control: /think (alias: /reasoning)\nAgent: {}\nModel: {}\nStored backend preference: {}\n{}\nCatalog default: {}\nCatalog efforts (observed): {}\nCatalog revision: {}",
+            display_opt(agent_id),
             display_model_route(provider, model),
+            display_reasoning_preference(current_preference.as_ref()),
+            reason,
             display_opt(catalog_default),
             display_list(available_efforts),
-            yes_no(*authoritative),
-            reason
+            display_opt(catalog_revision)
         ),
         ChannelCommandEffect::SwitchReasoning {
             agent_id,
@@ -2110,6 +2318,12 @@ fn display_reasoning_preference(preference: Option<&ReasoningPreference>) -> &st
         Some(ReasoningPreference::Default) => "default",
         Some(ReasoningPreference::Explicit { effort }) => effort.as_str(),
     }
+}
+
+fn display_reasoning_preference_or_dash(preference: Option<&ReasoningPreference>) -> &str {
+    preference
+        .map(|preference| display_reasoning_preference(Some(preference)))
+        .unwrap_or("-")
 }
 
 fn display_list(values: &[String]) -> String {
@@ -2926,16 +3140,12 @@ mod tests {
         )
         .unwrap();
         let show_step = build_channel_step(&registry, &show_turn);
-        assert!(
-            show_step.outbound_messages[0]
-                .text
-                .starts_with("Current session thinking level: medium")
-        );
-        assert!(
-            show_step.outbound_messages[0]
-                .text
-                .contains("minimal, low, medium, high")
-        );
+        let show_text = &show_step.outbound_messages[0].text;
+        assert!(show_text.contains("Thinking control: /think (alias: /reasoning)"));
+        assert!(show_text.contains("Rollout: off"));
+        assert!(show_text.contains("Backend policy: unset"));
+        assert!(show_text.contains("Legacy prompt enabled: no"));
+        assert!(show_text.contains("Legacy prompt level: -"));
 
         let switch_turn = build_turn_plan(
             &source,
@@ -3003,6 +3213,312 @@ mod tests {
                 ..
             }) if level == "xhigh" && valid
         ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unified_think_status_is_alias_identical_and_reports_authoritative_state() {
+        let root = temp_root("unified_think_status_authoritative");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_codex_models_cache_for_test(&harness_home);
+        write_model_catalog_mode_for_test(&harness_home, "authoritative");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let build = |text: &str| {
+            build_turn_plan(
+                &source,
+                &registry,
+                &skills,
+                TurnPlanInput {
+                    harness_home: Some(harness_home.clone()),
+                    platform: "telegram".to_string(),
+                    channel_id: "dm".to_string(),
+                    user_id: "user".to_string(),
+                    text: text.to_string(),
+                    inbound_context: None,
+                    inbound_media_artifacts: Vec::new(),
+                    requested_agent_id: Some("main56sol".to_string()),
+                    session_hint: None,
+                    skill_limit: 3,
+                },
+            )
+            .unwrap()
+        };
+        let apply = |text: &str, now_ms: i64| {
+            crate::apply_channel_command_step(
+                &build_channel_step(&registry, &build(text)),
+                crate::ChannelCommandApplyOptions {
+                    harness_home: harness_home.clone(),
+                    now_ms,
+                },
+            )
+            .unwrap()
+            .state
+            .unwrap()
+        };
+
+        let baseline = apply("/think max", 100);
+        let think_text = build_channel_step(&registry, &build("/think")).outbound_messages[0]
+            .text
+            .clone();
+        let reasoning_text = build_channel_step(&registry, &build("/reasoning")).outbound_messages
+            [0]
+        .text
+        .clone();
+        assert_eq!(think_text, reasoning_text);
+        for expected in [
+            "Thinking control: /think (alias: /reasoning)",
+            "Agent: main56sol",
+            "Model: openai/gpt-5.6-sol",
+            "Rollout: authoritative",
+            "Backend policy: ready",
+            "Stored backend preference: max",
+            "Preference source: session",
+            "Masked agent default: -",
+            "Resolved next-turn effort: max",
+            "Legacy prompt enabled: yes",
+            "Legacy prompt level: max",
+            "Runtime revalidation: required before turn/start; status is not wire execution evidence",
+            "Catalog default: low",
+            "Catalog efforts (observed): low, medium, high, xhigh, max, ultra",
+            "Catalog revision:",
+        ] {
+            assert!(
+                think_text.contains(expected),
+                "missing `{expected}` in {think_text}"
+            );
+        }
+
+        let after_status = apply("/think", 101);
+        assert_eq!(
+            after_status.reasoning_preference,
+            baseline.reasoning_preference
+        );
+        assert_eq!(
+            after_status.backend_reasoning_policy,
+            baseline.backend_reasoning_policy
+        );
+        assert_eq!(after_status.thinking_enabled, baseline.thinking_enabled);
+        assert_eq!(after_status.thinking_level, baseline.thinking_level);
+
+        let drift_turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "/reasoning".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main56luna".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let drift_step = build_channel_step(&registry, &drift_turn);
+        assert!(
+            drift_step.outbound_messages[0]
+                .text
+                .contains("openai/gpt-5.6-luna")
+        );
+        let drift_state = crate::apply_channel_command_step(
+            &drift_step,
+            crate::ChannelCommandApplyOptions {
+                harness_home: harness_home.clone(),
+                now_ms: 102,
+            },
+        )
+        .unwrap()
+        .state
+        .unwrap();
+        let mut expected_control_state = after_status;
+        expected_control_state.last_command = drift_state.last_command.clone();
+        expected_control_state.updated_at_ms = drift_state.updated_at_ms;
+        assert_eq!(drift_state, expected_control_state);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unified_think_status_reports_default_and_suspended_route_without_inference() {
+        let root = temp_root("unified_think_status_default_suspended");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_codex_models_cache_for_test(&harness_home);
+        write_model_catalog_mode_for_test(&harness_home, "authoritative");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let build = |text: &str| {
+            build_turn_plan(
+                &source,
+                &registry,
+                &skills,
+                TurnPlanInput {
+                    harness_home: Some(harness_home.clone()),
+                    platform: "telegram".to_string(),
+                    channel_id: "dm".to_string(),
+                    user_id: "user".to_string(),
+                    text: text.to_string(),
+                    inbound_context: None,
+                    inbound_media_artifacts: Vec::new(),
+                    requested_agent_id: Some("main56sol".to_string()),
+                    session_hint: None,
+                    skill_limit: 3,
+                },
+            )
+            .unwrap()
+        };
+        let apply = |text: &str, now_ms: i64| {
+            crate::apply_channel_command_step(
+                &build_channel_step(&registry, &build(text)),
+                crate::ChannelCommandApplyOptions {
+                    harness_home: harness_home.clone(),
+                    now_ms,
+                },
+            )
+            .unwrap();
+        };
+
+        apply("/think default", 110);
+        let default_text = build_channel_step(&registry, &build("/think")).outbound_messages[0]
+            .text
+            .clone();
+        for expected in [
+            "Backend policy: ready",
+            "Stored backend preference: default",
+            "Resolved next-turn effort: low",
+            "Legacy prompt enabled: no",
+            "Legacy prompt level: -",
+        ] {
+            assert!(
+                default_text.contains(expected),
+                "missing `{expected}` in {default_text}"
+            );
+        }
+
+        apply("/think max", 111);
+        apply("/model openai/gpt-5.5", 112);
+        let suspended_text = build_channel_step(&registry, &build("/reasoning")).outbound_messages
+            [0]
+        .text
+        .clone();
+        for expected in [
+            "Model: openai/gpt-5.5",
+            "Backend policy: suspended",
+            "Stored backend preference: max",
+            "Resolved next-turn effort: -",
+        ] {
+            assert!(
+                suspended_text.contains(expected),
+                "missing `{expected}` in {suspended_text}"
+            );
+        }
+        assert!(!suspended_text.contains("Resolved next-turn effort: max"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unified_think_status_reports_excluded_dormant_and_masked_legacy_state() {
+        let root = temp_root("unified_think_status_excluded_masked");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_codex_models_cache_for_test(&harness_home);
+        write_model_catalog_mode_for_test(&harness_home, "authoritative");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let build = |text: &str| {
+            build_turn_plan(
+                &source,
+                &registry,
+                &skills,
+                TurnPlanInput {
+                    harness_home: Some(harness_home.clone()),
+                    platform: "telegram".to_string(),
+                    channel_id: "dm".to_string(),
+                    user_id: "user".to_string(),
+                    text: text.to_string(),
+                    inbound_context: None,
+                    inbound_media_artifacts: Vec::new(),
+                    requested_agent_id: Some("main56sol".to_string()),
+                    session_hint: None,
+                    skill_limit: 3,
+                },
+            )
+            .unwrap()
+        };
+        let apply = |text: &str, now_ms: i64| {
+            crate::apply_channel_command_step(
+                &build_channel_step(&registry, &build(text)),
+                crate::ChannelCommandApplyOptions {
+                    harness_home: harness_home.clone(),
+                    now_ms,
+                },
+            )
+            .unwrap();
+        };
+
+        apply("/think global max", 120);
+        write_model_catalog_cohort_for_test(&harness_home, "authoritative", &["main56luna"]);
+        let dormant_text = build_channel_step(&registry, &build("/think")).outbound_messages[0]
+            .text
+            .clone();
+        for expected in [
+            "Rollout: excluded (configured=authoritative)",
+            "Backend policy: dormant",
+            "Stored backend preference: max",
+            "Preference source: session",
+            "Resolved next-turn effort: -",
+            "Catalog efforts (observed): low, medium, high, xhigh, max, ultra",
+        ] {
+            assert!(
+                dormant_text.contains(expected),
+                "missing `{expected}` in {dormant_text}"
+            );
+        }
+
+        apply("/reasoning low", 121);
+        let legacy_text = build_channel_step(&registry, &build("/reasoning")).outbound_messages[0]
+            .text
+            .clone();
+        for expected in [
+            "Rollout: excluded (configured=authoritative)",
+            "Backend policy: legacy-only",
+            "Stored backend preference: unset",
+            "Preference source: none",
+            "Masked agent default: max",
+            "Resolved next-turn effort: -",
+            "Legacy prompt enabled: yes",
+            "Legacy prompt level: low",
+        ] {
+            assert!(
+                legacy_text.contains(expected),
+                "missing `{expected}` in {legacy_text}"
+            );
+        }
+        assert!(!legacy_text.contains("Resolved next-turn effort: low"));
+
+        write_model_catalog_mode_for_test(&harness_home, "shadow");
+        let shadow_text = build_channel_step(&registry, &build("/think")).outbound_messages[0]
+            .text
+            .clone();
+        assert!(shadow_text.contains("Rollout: shadow"));
+        assert!(shadow_text.contains("Backend policy: legacy-only"));
+        assert!(shadow_text.contains("Resolved next-turn effort: -"));
+
+        write_model_catalog_mode_for_test(&harness_home, "off");
+        let off_text = build_channel_step(&registry, &build("/reasoning")).outbound_messages[0]
+            .text
+            .clone();
+        assert!(off_text.contains("Rollout: off"));
+        assert!(off_text.contains("Backend policy: legacy-only"));
+        assert!(off_text.contains("Resolved next-turn effort: -"));
 
         let _ = fs::remove_dir_all(root);
     }

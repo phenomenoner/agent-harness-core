@@ -16,6 +16,23 @@ pub enum ModelCatalogRolloutMode {
     Authoritative,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ModelCatalogRolloutAssessment {
+    pub configured_mode: ModelCatalogRolloutMode,
+    pub effective_mode: ModelCatalogRolloutMode,
+    pub excluded: bool,
+}
+
+impl ModelCatalogRolloutAssessment {
+    fn off() -> Self {
+        Self {
+            configured_mode: ModelCatalogRolloutMode::Off,
+            effective_mode: ModelCatalogRolloutMode::Off,
+            excluded: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UnsupportedReasoningPolicy {
@@ -212,26 +229,33 @@ pub fn model_catalog_rollout_mode_for_agent(
     harness_home: Option<&Path>,
     agent_id: Option<&str>,
 ) -> ModelCatalogRolloutMode {
+    model_catalog_rollout_assessment_for_agent(harness_home, agent_id).effective_mode
+}
+
+pub(crate) fn model_catalog_rollout_assessment_for_agent(
+    harness_home: Option<&Path>,
+    agent_id: Option<&str>,
+) -> ModelCatalogRolloutAssessment {
     let Some(harness_home) = harness_home else {
-        return ModelCatalogRolloutMode::Off;
+        return ModelCatalogRolloutAssessment::off();
     };
     let Some(config_file) = crate::harness_config_candidates(harness_home)
         .into_iter()
         .find(|path| path.is_file())
     else {
-        return ModelCatalogRolloutMode::Off;
+        return ModelCatalogRolloutAssessment::off();
     };
     let Ok(text) = fs::read_to_string(config_file) else {
-        return ModelCatalogRolloutMode::Off;
+        return ModelCatalogRolloutAssessment::off();
     };
     let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return ModelCatalogRolloutMode::Off;
+        return ModelCatalogRolloutAssessment::off();
     };
     let Some(feature) = value
         .pointer("/orchestration/features/modelCatalogV2")
         .and_then(Value::as_object)
     else {
-        return ModelCatalogRolloutMode::Off;
+        return ModelCatalogRolloutAssessment::off();
     };
     let mode = match feature.get("mode").and_then(Value::as_str) {
         Some("shadow") => ModelCatalogRolloutMode::Shadow,
@@ -239,32 +263,40 @@ pub fn model_catalog_rollout_mode_for_agent(
         _ => ModelCatalogRolloutMode::Off,
     };
     let Some(cohort) = feature.get("enabledAgentIds") else {
-        return mode;
+        return ModelCatalogRolloutAssessment {
+            configured_mode: mode,
+            effective_mode: mode,
+            excluded: false,
+        };
     };
     let Some(cohort) = cohort.as_array() else {
-        return ModelCatalogRolloutMode::Off;
+        return ModelCatalogRolloutAssessment::off();
     };
     if cohort.is_empty() {
-        return ModelCatalogRolloutMode::Off;
+        return ModelCatalogRolloutAssessment::off();
     }
 
     let requested_agent_id = agent_id.map(str::trim).filter(|value| !value.is_empty());
     let mut included = false;
     for member in cohort {
         let Some(member) = member.as_str() else {
-            return ModelCatalogRolloutMode::Off;
+            return ModelCatalogRolloutAssessment::off();
         };
         let member = member.trim();
         if member.is_empty() {
-            return ModelCatalogRolloutMode::Off;
+            return ModelCatalogRolloutAssessment::off();
         }
         if member == "*" || requested_agent_id.is_some_and(|agent_id| agent_id == member) {
             included = true;
         }
     }
-    included
-        .then_some(mode)
-        .unwrap_or(ModelCatalogRolloutMode::Off)
+    ModelCatalogRolloutAssessment {
+        configured_mode: mode,
+        effective_mode: included
+            .then_some(mode)
+            .unwrap_or(ModelCatalogRolloutMode::Off),
+        excluded: !included && mode != ModelCatalogRolloutMode::Off,
+    }
 }
 
 pub fn resolve_reasoning_effort(
@@ -1098,6 +1130,54 @@ mod tests {
                 "malformed or empty cohort must fail closed: {cohort}"
             );
         }
+
+        let _ = fs::remove_dir_all(harness_home);
+    }
+
+    #[test]
+    fn rollout_assessment_distinguishes_excluded_agent_without_changing_public_mode() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let harness_home = std::env::temp_dir().join(format!(
+            "agent-harness-model-catalog-assessment-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(crate::HARNESS_CONFIG_FILE_NAME),
+            r#"{"orchestration":{"features":{"modelCatalogV2":{"mode":"authoritative","enabledAgentIds":["agent-a"]}}}}"#,
+        )
+        .unwrap();
+
+        let included =
+            model_catalog_rollout_assessment_for_agent(Some(&harness_home), Some("agent-a"));
+        assert_eq!(
+            included.configured_mode,
+            ModelCatalogRolloutMode::Authoritative
+        );
+        assert_eq!(
+            included.effective_mode,
+            ModelCatalogRolloutMode::Authoritative
+        );
+        assert!(!included.excluded);
+
+        let excluded =
+            model_catalog_rollout_assessment_for_agent(Some(&harness_home), Some("agent-b"));
+        assert_eq!(
+            excluded.configured_mode,
+            ModelCatalogRolloutMode::Authoritative
+        );
+        assert_eq!(excluded.effective_mode, ModelCatalogRolloutMode::Off);
+        assert!(excluded.excluded);
+        assert_eq!(
+            model_catalog_rollout_mode_for_agent(Some(&harness_home), Some("agent-b")),
+            ModelCatalogRolloutMode::Off,
+            "the existing public API remains backward compatible"
+        );
 
         let _ = fs::remove_dir_all(harness_home);
     }

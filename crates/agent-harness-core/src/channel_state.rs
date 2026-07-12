@@ -462,14 +462,10 @@ fn apply_effect(
                 }
             }
         }
-        ChannelCommandEffect::ShowReasoning {
-            agent_id,
-            provider,
-            model,
-            ..
-        } => {
-            update_model_context(state, agent_id, provider, model);
-        }
+        // Unified `/think` status is observational. In particular, querying a
+        // different selected agent or route must not rewrite or invalidate any
+        // persisted channel control state.
+        ChannelCommandEffect::ShowReasoning { .. } => {}
         ChannelCommandEffect::SwitchReasoning {
             agent_id,
             provider,
