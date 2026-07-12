@@ -15,6 +15,7 @@ pub mod channel_ingress;
 pub mod channel_pipeline;
 pub mod channel_runtime;
 pub mod channel_state;
+pub mod child_execution_policy;
 pub(crate) mod codex_capability;
 pub mod codex_runtime;
 pub mod config;
