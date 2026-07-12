@@ -115,6 +115,15 @@ fn llm_runtime_queue_is_not_terminal_until_correlated_runtime_receipt() {
         worker_result(&harness_home, &child.job.job_id)["runtimeQueueId"],
         runtime_queue_id
     );
+    let mailbox = mailbox_result(&harness_home, &child.job.job_id);
+    assert_eq!(mailbox["rowCount"], 1);
+    assert_eq!(mailbox["autoResumable"], false);
+    assert_eq!(mailbox["state"], "unread");
+    assert_eq!(mailbox["outcome"], "succeeded");
+    assert_eq!(
+        mailbox["redactedSummary"],
+        "worker runtime terminal correlated as succeeded"
+    );
 
     let status = collect_worker_status(WorkerStatusOptions { harness_home }).unwrap();
     assert!(
@@ -220,6 +229,25 @@ fn worker_result(harness_home: &Path, job_id: &str) -> Value {
         )
         .unwrap();
     serde_json::from_str(&value).unwrap()
+}
+
+fn mailbox_result(harness_home: &Path, job_id: &str) -> Value {
+    let conn = Connection::open(worker_db_file(harness_home)).unwrap();
+    let (row_count, auto_resumable, state, envelope_json): (i64, i64, String, String) = conn
+        .query_row(
+            "SELECT COUNT(*), auto_resumable, state, envelope_json FROM worker_result_mailbox_v1 WHERE source_worker_job_id=?1",
+            params![job_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    let envelope: Value = serde_json::from_str(&envelope_json).unwrap();
+    json!({
+        "rowCount": row_count,
+        "autoResumable": auto_resumable == 1,
+        "state": state,
+        "outcome": envelope["outcome"],
+        "redactedSummary": envelope["redactedSummary"],
+    })
 }
 
 fn temp_root(test_name: &str) -> PathBuf {

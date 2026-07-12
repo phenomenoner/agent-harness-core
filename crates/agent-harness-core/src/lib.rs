@@ -88,6 +88,7 @@ pub mod vault;
 pub mod virtual_session_context;
 pub mod wake;
 pub mod worker_adapters;
+pub mod worker_result_mailbox;
 pub mod workers;
 
 pub use activation::{

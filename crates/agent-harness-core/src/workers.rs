@@ -37,6 +37,13 @@ use crate::{
         record_subagent_lifecycle, show_subagent_lifecycle,
     },
     synthesize_skill,
+    worker_result_mailbox::{
+        LEGACY_WORKER_RESULT_OWNER_SCHEMA, LegacyIncompleteWorkerResultOwnerV0,
+        LegacyOwnerMissingAxisV1, WorkerResultArtifactKindV1, WorkerResultArtifactPointerV1,
+        WorkerResultEnvelopeV1, WorkerResultMailboxInsertV1, WorkerResultOutcomeV1,
+        WorkerResultOwnerV1, initialize_worker_result_mailbox_schema,
+        insert_terminal_result_in_transaction,
+    },
 };
 
 const WORKER_STORE_SCHEMA: &str = "agent-harness.worker-store.v1";
@@ -415,6 +422,7 @@ pub fn init_worker_store(harness_home: impl AsRef<Path>) -> io::Result<PathBuf> 
     }
     let conn = Connection::open(&db_file).map_err(io::Error::other)?;
     create_schema(&conn).map_err(io::Error::other)?;
+    initialize_worker_result_mailbox_schema(&conn).map_err(io::Error::other)?;
     Ok(db_file)
 }
 
@@ -2568,24 +2576,109 @@ fn reconcile_runtime_queued_jobs(
         let Some(terminal) = terminals.get(runtime_queue_id) else {
             continue;
         };
-        set_job_status(
+        set_runtime_terminal_with_mailbox(
             conn,
-            &job.job_id,
-            terminal.worker_status,
+            &job,
+            runtime_queue_id,
+            terminal,
             now_ms,
-            Some(json!({
-                "runtimeQueueId": runtime_queue_id,
-                "runtimeStatus": terminal.runtime_status,
-                "reason": terminal.reason,
-                "terminalReceiptFile": receipts_file,
-                "correlation": "exact-runtime-queue-id"
-            })),
-            None,
-            Some(receipts_file.clone()),
+            &receipts_file,
         )?;
         reconciled += 1;
     }
     Ok(reconciled)
+}
+
+fn set_runtime_terminal_with_mailbox(
+    conn: &Connection,
+    job: &WorkerJob,
+    runtime_queue_id: &str,
+    terminal: &RuntimeWorkerTerminal,
+    now_ms: i64,
+    receipts_file: &Path,
+) -> io::Result<()> {
+    let transaction = conn.unchecked_transaction().map_err(io::Error::other)?;
+    let result = json!({
+        "runtimeQueueId": runtime_queue_id,
+        "runtimeStatus": terminal.runtime_status,
+        "reason": terminal.reason,
+        "terminalReceiptFile": receipts_file,
+        "correlation": "exact-runtime-queue-id"
+    });
+    let updated = transaction
+        .execute(
+            "UPDATE jobs SET status=?1, lease_owner=NULL, lease_expires_at_ms=NULL, result_json=?2, audit_path=?3, updated_at_ms=?4, finished_at_ms=?4 WHERE job_id=?5 AND status=?6",
+            params![
+                terminal.worker_status.as_str(),
+                result.to_string(),
+                receipts_file.to_string_lossy().to_string(),
+                now_ms,
+                job.job_id,
+                WorkerJobStatus::RuntimeQueued.as_str(),
+            ],
+        )
+        .map_err(io::Error::other)?;
+    if updated != 1 {
+        return Err(io::Error::other(format!(
+            "worker {} was not runtime-queued during terminal mailbox commit",
+            job.job_id
+        )));
+    }
+
+    let queue_digest = fnv1a_64_hex(runtime_queue_id);
+    let owner = WorkerResultOwnerV1::LegacyIncomplete(LegacyIncompleteWorkerResultOwnerV0 {
+        schema: LEGACY_WORKER_RESULT_OWNER_SCHEMA.to_string(),
+        legacy_owner_ref: format!("worker-job:{}", job.job_id),
+        lane: None,
+        virtual_session_id: None,
+        parent_worker_job_id: job.parent_job_id.clone(),
+        parent_queue_id: None,
+        source_queue_id: Some(runtime_queue_id.to_string()),
+        operation_plan_id: None,
+        operation_plan_item_id: None,
+        missing_identity_axes: vec![
+            LegacyOwnerMissingAxisV1::Platform,
+            LegacyOwnerMissingAxisV1::AccountId,
+            LegacyOwnerMissingAxisV1::ChannelId,
+            LegacyOwnerMissingAxisV1::UserId,
+            LegacyOwnerMissingAxisV1::AgentId,
+            LegacyOwnerMissingAxisV1::RuntimeClass,
+            LegacyOwnerMissingAxisV1::RootVirtualSession,
+            LegacyOwnerMissingAxisV1::ConcreteSession,
+            LegacyOwnerMissingAxisV1::VirtualSessionId,
+        ],
+    });
+    let outcome = match terminal.worker_status {
+        WorkerJobStatus::Succeeded => WorkerResultOutcomeV1::Succeeded,
+        WorkerJobStatus::Canceled => WorkerResultOutcomeV1::Canceled,
+        WorkerJobStatus::Expired => WorkerResultOutcomeV1::Expired,
+        _ => WorkerResultOutcomeV1::Failed,
+    };
+    let envelope = WorkerResultEnvelopeV1::new(
+        outcome,
+        format!(
+            "worker runtime terminal correlated as {}",
+            terminal.worker_status.as_str()
+        ),
+        vec![WorkerResultArtifactPointerV1 {
+            kind: WorkerResultArtifactKindV1::TerminalReceipt,
+            reference: format!("receipt:runtime-queue/{queue_digest}"),
+            sha256: None,
+        }],
+    )
+    .map_err(io::Error::other)?;
+    insert_terminal_result_in_transaction(
+        &transaction,
+        &WorkerResultMailboxInsertV1 {
+            terminal_event_key: format!("worker-runtime-terminal/{}/{queue_digest}", job.job_id),
+            owner,
+            envelope,
+            source_worker_job_id: Some(job.job_id.clone()),
+            terminal_at_ms: now_ms,
+        },
+    )
+    .map_err(io::Error::other)?;
+    transaction.commit().map_err(io::Error::other)
 }
 
 fn worker_status_from_runtime_terminal(status: &str) -> Option<WorkerJobStatus> {
