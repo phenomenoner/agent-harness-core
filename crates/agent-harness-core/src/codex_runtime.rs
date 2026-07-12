@@ -7,11 +7,21 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::backend_reasoning_execution::{
+    BackendReasoningCapabilitySourceV1, BackendReasoningExecutionEvidenceFieldsV1,
+    BackendReasoningExecutionEvidenceV1, BackendReasoningWireActionV1,
+};
+use crate::codex_capability::{
+    CacheCapabilitySnapshot, CacheLiveDriftDecision, CapabilityPreference, CodexConfigReadResponse,
+    CodexModelListCollector, CodexModelListPage, SameConnectionCapabilityProofV1,
+    SameConnectionProofContext, bind_effective_provider, build_same_connection_proof,
+    decide_cache_live_drift,
+};
 use crate::{
     AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
     HarnessLogEvent, HarnessLogLevel, InboundMediaArtifact, InboundMediaInputPlan,
@@ -82,6 +92,11 @@ const CODEX_THREAD_INLINE_IMAGE_TOTAL_BYTES_LIMIT: u64 = 3_000_000;
 const CODEX_THREAD_TOOL_OUTPUT_BYTES_LIMIT: u64 = 1_000_000;
 const CODEX_ROLLOUT_SCAN_MAX_FILES: usize = 256;
 const DEFAULT_HIGH_CONTEXT_USAGE_COMPACT_TOKEN_LIMIT: u64 = 120_000;
+const CODEX_CAPABILITY_CONFIG_READ_REQUEST_ID: i64 = 9_000;
+const CODEX_CAPABILITY_MODEL_LIST_FIRST_REQUEST_ID: i64 = 9_100;
+const CODEX_CAPABILITY_MODEL_LIST_PAGE_SIZE: usize = 256;
+const CODEX_CAPABILITY_MODEL_LIST_MAX_PAGES: usize = 16;
+const CODEX_CAPABILITY_HANDSHAKE_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum OwnedCodexEventsRolloutMode {
@@ -4068,7 +4083,244 @@ fn drive_codex_app_server(
             }
         }
     }
-    let prompt_input = fs::read_to_string(&plan.invocation.prompt_input_file)?;
+    let turn_start_request_id = if compact_before_turn { 3 } else { 2 };
+    let reasoning_snapshot_present =
+        plan.reasoning_preference.is_some() || plan.backend_reasoning_policy.is_some();
+    let validated_reasoning = match validated_codex_turn_effort(harness_home, plan) {
+        Ok(validated) => validated,
+        Err(error) => {
+            if reasoning_snapshot_present
+                && let Ok(attempt_id) = codex_reasoning_attempt_id(plan, child.id())
+            {
+                let evidence = build_backend_reasoning_execution_evidence(
+                    plan,
+                    &attempt_id,
+                    plan.reasoning_preference.is_some() && plan.backend_reasoning_policy.is_some(),
+                    BackendReasoningCapabilitySourceV1::NotObserved,
+                    BackendReasoningWireActionV1::Rejected,
+                    None,
+                    None,
+                    None,
+                    "reasoning-validation-rejected",
+                )
+                .or_else(|_| {
+                    build_backend_reasoning_execution_evidence(
+                        plan,
+                        &attempt_id,
+                        false,
+                        BackendReasoningCapabilitySourceV1::NotObserved,
+                        BackendReasoningWireActionV1::Rejected,
+                        None,
+                        None,
+                        None,
+                        "malformed-reasoning-snapshot-rejected",
+                    )
+                });
+                if let Ok(evidence) = evidence
+                    && let Err(receipt_error) = persist_backend_reasoning_execution_evidence(
+                        harness_home,
+                        &execution_dir,
+                        &evidence,
+                    )
+                {
+                    state.warnings.push(format!(
+                        "failed to persist rejected backend reasoning evidence: {receipt_error}"
+                    ));
+                }
+            }
+            return Ok(codex_app_server_terminal_failure_result(
+                &mut child,
+                &mut reader_handle,
+                &mut state,
+                &stdout_log,
+                &stderr_log,
+                CodexRuntimeRunStatus::ProtocolError,
+                format!("backend reasoning validation rejected turn/start: {error}"),
+                Some(thread_id.clone()),
+            ));
+        }
+    };
+    let managed_reasoning = validated_reasoning.is_some();
+    let reasoning_attempt_id = if managed_reasoning {
+        match codex_reasoning_attempt_id(plan, child.id()) {
+            Ok(attempt_id) => Some(attempt_id),
+            Err(error) => {
+                return Ok(codex_app_server_terminal_failure_result(
+                    &mut child,
+                    &mut reader_handle,
+                    &mut state,
+                    &stdout_log,
+                    &stderr_log,
+                    CodexRuntimeRunStatus::ProtocolError,
+                    format!("failed to allocate backend reasoning attempt id: {error}"),
+                    Some(thread_id.clone()),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let (wire_effort, wire_catalog_revision) = if let Some(validated) = validated_reasoning.as_ref()
+    {
+        let reasoning_attempt_id = reasoning_attempt_id
+            .as_deref()
+            .expect("managed reasoning allocated an attempt id");
+        let proof = match verify_codex_reasoning_capability_same_connection(
+            &line_rx,
+            &mut child,
+            &mut stdin,
+            &mut state,
+            &mut progress,
+            &mut timeouts,
+            plan.invocation.approval_policy,
+            Some(&cancel_check),
+            &runtime_workspace_root,
+            validated,
+        ) {
+            Ok(result) => match result {
+                Ok(proof) => proof,
+                Err(failure) => {
+                    if let Ok(evidence) = build_backend_reasoning_execution_evidence(
+                        plan,
+                        &reasoning_attempt_id,
+                        true,
+                        BackendReasoningCapabilitySourceV1::NotObserved,
+                        BackendReasoningWireActionV1::Rejected,
+                        None,
+                        None,
+                        None,
+                        "capability-handshake-rejected",
+                    ) && let Err(receipt_error) = persist_backend_reasoning_execution_evidence(
+                        harness_home,
+                        &execution_dir,
+                        &evidence,
+                    ) {
+                        state.warnings.push(format!(
+                            "failed to persist rejected backend reasoning evidence: {receipt_error}"
+                        ));
+                    }
+                    return Ok(codex_app_server_terminal_failure_result(
+                        &mut child,
+                        &mut reader_handle,
+                        &mut state,
+                        &stdout_log,
+                        &stderr_log,
+                        failure.status(),
+                        failure.reason().to_string(),
+                        Some(thread_id.clone()),
+                    ));
+                }
+            },
+            Err(error) => {
+                let failure = CodexCapabilityHandshakeFailure::Failed(format!(
+                    "Codex capability handshake I/O failed: {error}"
+                ));
+                if let Ok(evidence) = build_backend_reasoning_execution_evidence(
+                    plan,
+                    reasoning_attempt_id,
+                    true,
+                    BackendReasoningCapabilitySourceV1::NotObserved,
+                    BackendReasoningWireActionV1::Rejected,
+                    None,
+                    None,
+                    None,
+                    "capability-handshake-io-rejected",
+                ) && let Err(receipt_error) = persist_backend_reasoning_execution_evidence(
+                    harness_home,
+                    &execution_dir,
+                    &evidence,
+                ) {
+                    state.warnings.push(format!(
+                        "failed to persist rejected backend reasoning evidence: {receipt_error}"
+                    ));
+                }
+                return Ok(codex_app_server_terminal_failure_result(
+                    &mut child,
+                    &mut reader_handle,
+                    &mut state,
+                    &stdout_log,
+                    &stderr_log,
+                    failure.status(),
+                    failure.reason().to_string(),
+                    Some(thread_id.clone()),
+                ));
+            }
+        };
+        if let Err(error) = persist_codex_capability_proof(&execution_dir, &proof) {
+            if let Ok(evidence) = build_backend_reasoning_execution_evidence(
+                plan,
+                &reasoning_attempt_id,
+                true,
+                BackendReasoningCapabilitySourceV1::NotObserved,
+                BackendReasoningWireActionV1::Rejected,
+                None,
+                None,
+                None,
+                "capability-proof-persist-failed",
+            ) && let Err(receipt_error) = persist_backend_reasoning_execution_evidence(
+                harness_home,
+                &execution_dir,
+                &evidence,
+            ) {
+                state.warnings.push(format!(
+                    "failed to persist rejected backend reasoning evidence: {receipt_error}"
+                ));
+            }
+            return Ok(codex_app_server_terminal_failure_result(
+                &mut child,
+                &mut reader_handle,
+                &mut state,
+                &stdout_log,
+                &stderr_log,
+                CodexRuntimeRunStatus::ProtocolError,
+                format!("failed to persist same-connection capability proof: {error}"),
+                Some(thread_id.clone()),
+            ));
+        }
+        (
+            Some(proof.wire_effort.clone()),
+            Some(proof.proof_digest.clone()),
+        )
+    } else {
+        (None, None)
+    };
+    let prompt_input = match fs::read_to_string(&plan.invocation.prompt_input_file) {
+        Ok(prompt_input) => prompt_input,
+        Err(error) => {
+            if let Some(reasoning_attempt_id) = reasoning_attempt_id.as_deref()
+                && let Ok(evidence) = build_backend_reasoning_execution_evidence(
+                    plan,
+                    reasoning_attempt_id,
+                    true,
+                    BackendReasoningCapabilitySourceV1::AppServerModelList,
+                    BackendReasoningWireActionV1::Rejected,
+                    wire_catalog_revision.clone(),
+                    None,
+                    None,
+                    "prompt-input-read-rejected",
+                )
+                && let Err(receipt_error) = persist_backend_reasoning_execution_evidence(
+                    harness_home,
+                    &execution_dir,
+                    &evidence,
+                )
+            {
+                state.warnings.push(format!(
+                    "failed to persist rejected backend reasoning evidence: {receipt_error}"
+                ));
+            }
+            return Ok(codex_app_server_terminal_failure_result(
+                &mut child,
+                &mut reader_handle,
+                &mut state,
+                &stdout_log,
+                &stderr_log,
+                CodexRuntimeRunStatus::ProtocolError,
+                format!("failed to read Codex prompt input before turn/start: {error}"),
+                Some(thread_id.clone()),
+            ));
+        }
+    };
     let turn_sandbox_policy =
         app_server_sandbox_policy_value(&app_server_sandbox, &runtime_workspace_root);
     let mut input_parts = vec![json!({
@@ -4098,20 +4350,88 @@ fn drive_codex_app_server(
         "input": input_parts
     });
     attach_codex_app_server_service_tier(&mut turn_params, &plan.provider_request_policy);
-    let wire_effort = validated_codex_turn_effort(harness_home, plan)?;
     if let Some(effort) = wire_effort.as_ref() {
         turn_params["effort"] = Value::String(effort.clone());
     }
-    let turn_start_request_id = if compact_before_turn { 3 } else { 2 };
-    let mut steer_bridge = CodexTurnSteerBridge::new(
+    let mut steer_bridge = match CodexTurnSteerBridge::new(
         harness_home,
         plan,
         plan_file,
         thread_id.clone(),
         turn_start_request_id,
-    )?;
-    if let Some(effort) = wire_effort.as_deref() {
-        mark_codex_thread_reasoning_may_be_sticky(plan, &thread_id, effort)?;
+    ) {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            return Ok(codex_app_server_terminal_failure_result(
+                &mut child,
+                &mut reader_handle,
+                &mut state,
+                &stdout_log,
+                &stderr_log,
+                CodexRuntimeRunStatus::ProtocolError,
+                format!("failed to initialize Codex turn steer bridge: {error}"),
+                Some(thread_id.clone()),
+            ));
+        }
+    };
+    if let Some(reasoning_attempt_id) = reasoning_attempt_id.as_deref() {
+        let pending_evidence = match build_backend_reasoning_execution_evidence(
+            plan,
+            reasoning_attempt_id,
+            true,
+            BackendReasoningCapabilitySourceV1::AppServerModelList,
+            BackendReasoningWireActionV1::Pending,
+            wire_catalog_revision.clone(),
+            wire_effort.clone(),
+            Some(turn_start_request_id as u64),
+            "managed-turn-start-pending",
+        ) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Ok(codex_app_server_terminal_failure_result(
+                    &mut child,
+                    &mut reader_handle,
+                    &mut state,
+                    &stdout_log,
+                    &stderr_log,
+                    CodexRuntimeRunStatus::ProtocolError,
+                    format!("failed to build backend reasoning pending evidence: {error}"),
+                    Some(thread_id.clone()),
+                ));
+            }
+        };
+        if let Err(error) = persist_backend_reasoning_execution_evidence(
+            harness_home,
+            &execution_dir,
+            &pending_evidence,
+        ) {
+            return Ok(codex_app_server_terminal_failure_result(
+                &mut child,
+                &mut reader_handle,
+                &mut state,
+                &stdout_log,
+                &stderr_log,
+                CodexRuntimeRunStatus::ProtocolError,
+                format!("failed to persist backend reasoning pending evidence: {error}"),
+                Some(thread_id.clone()),
+            ));
+        }
+        if let Some(effort) = wire_effort.as_deref()
+            && let Err(error) = mark_codex_thread_reasoning_may_be_sticky(plan, &thread_id, effort)
+        {
+            return Ok(codex_app_server_terminal_failure_result(
+                &mut child,
+                &mut reader_handle,
+                &mut state,
+                &stdout_log,
+                &stderr_log,
+                CodexRuntimeRunStatus::ProtocolError,
+                format!(
+                    "failed to persist conservative Codex reasoning sticky marker before turn/start: {error}"
+                ),
+                Some(thread_id.clone()),
+            ));
+        }
     }
     if let Err(error) = write_json_rpc(
         &mut stdin,
@@ -4121,6 +4441,28 @@ fn drive_codex_app_server(
             "params": turn_params
         }),
     ) {
+        if let Some(reasoning_attempt_id) = reasoning_attempt_id.as_deref()
+            && let Ok(evidence) = build_backend_reasoning_execution_evidence(
+                plan,
+                reasoning_attempt_id,
+                true,
+                BackendReasoningCapabilitySourceV1::AppServerModelList,
+                BackendReasoningWireActionV1::Indeterminate,
+                wire_catalog_revision.clone(),
+                wire_effort.clone(),
+                Some(turn_start_request_id as u64),
+                "turn-start-write-indeterminate",
+            )
+            && let Err(receipt_error) = persist_backend_reasoning_execution_evidence(
+                harness_home,
+                &execution_dir,
+                &evidence,
+            )
+        {
+            state.warnings.push(format!(
+                "failed to persist indeterminate backend reasoning evidence: {receipt_error}"
+            ));
+        }
         return Ok(codex_app_server_write_failed_result(
             &mut child,
             &mut reader_handle,
@@ -4130,6 +4472,34 @@ fn drive_codex_app_server(
             "turn start request",
             error,
         ));
+    }
+    if let Some(reasoning_attempt_id) = reasoning_attempt_id.as_deref() {
+        match build_backend_reasoning_execution_evidence(
+            plan,
+            reasoning_attempt_id,
+            true,
+            BackendReasoningCapabilitySourceV1::AppServerModelList,
+            BackendReasoningWireActionV1::Sent,
+            wire_catalog_revision,
+            wire_effort.clone(),
+            Some(turn_start_request_id as u64),
+            "managed-turn-start-sent",
+        ) {
+            Ok(evidence) => {
+                if let Err(error) = persist_backend_reasoning_execution_evidence(
+                    harness_home,
+                    &execution_dir,
+                    &evidence,
+                ) {
+                    state.warnings.push(format!(
+                        "failed to persist sent backend reasoning evidence after turn/start write: {error}"
+                    ));
+                }
+            }
+            Err(error) => state.warnings.push(format!(
+                "failed to build sent backend reasoning evidence after turn/start write: {error}"
+            )),
+        }
     }
 
     let wait_result = wait_for_turn_completed(
@@ -4483,11 +4853,18 @@ fn mark_codex_thread_reasoning_may_be_sticky(
     Ok(state_file)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedCodexTurnEffort {
+    admission_effort: String,
+    cache: CacheCapabilitySnapshot,
+    preference: CapabilityPreference,
+}
+
 fn validated_codex_turn_effort(
     harness_home: &Path,
     plan: &CodexRuntimePlanFile,
-) -> io::Result<Option<String>> {
-    validate_codex_turn_effort_fields(
+) -> io::Result<Option<ValidatedCodexTurnEffort>> {
+    validate_codex_turn_effort_details_fields(
         harness_home,
         plan.agent_id.as_deref(),
         plan.provider.as_deref(),
@@ -4505,6 +4882,25 @@ fn validate_codex_turn_effort_fields(
     preference: Option<&crate::backend_reasoning::ReasoningPreference>,
     policy: Option<&crate::backend_reasoning::BackendReasoningPolicyV1>,
 ) -> io::Result<Option<String>> {
+    validate_codex_turn_effort_details_fields(
+        harness_home,
+        agent_id,
+        provider,
+        model,
+        preference,
+        policy,
+    )
+    .map(|validated| validated.map(|validated| validated.admission_effort))
+}
+
+fn validate_codex_turn_effort_details_fields(
+    harness_home: &Path,
+    agent_id: Option<&str>,
+    provider: Option<&str>,
+    model: Option<&str>,
+    preference: Option<&crate::backend_reasoning::ReasoningPreference>,
+    policy: Option<&crate::backend_reasoning::BackendReasoningPolicyV1>,
+) -> io::Result<Option<ValidatedCodexTurnEffort>> {
     let (preference, policy) = match (preference, policy) {
         (None, None) => return Ok(None),
         (Some(preference), Some(policy)) => (preference, policy),
@@ -4599,7 +4995,410 @@ fn validate_codex_turn_effort_fields(
         }
         crate::backend_reasoning::ReasoningPreference::Explicit { .. } => {}
     }
-    Ok(Some(effort.to_string()))
+    let capability_preference = match preference {
+        crate::backend_reasoning::ReasoningPreference::Default => CapabilityPreference::Default,
+        crate::backend_reasoning::ReasoningPreference::Explicit { effort } => {
+            CapabilityPreference::Explicit {
+                effort: effort.clone(),
+            }
+        }
+    };
+    Ok(Some(ValidatedCodexTurnEffort {
+        admission_effort: effort.to_string(),
+        cache: CacheCapabilitySnapshot {
+            provider: route.provider.clone(),
+            model: route.model.clone(),
+            default_reasoning_effort: route.default_reasoning_effort.clone(),
+            supported_reasoning_efforts: route.supported_reasoning_efforts.clone(),
+            revision: Some(catalog.revision.clone()),
+        },
+        preference: capability_preference,
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexCapabilityHandshakeFailure {
+    TimedOut(String),
+    Canceled(String),
+    Failed(String),
+}
+
+impl CodexCapabilityHandshakeFailure {
+    fn status(&self) -> CodexRuntimeRunStatus {
+        match self {
+            Self::TimedOut(_) => CodexRuntimeRunStatus::Timeout,
+            Self::Canceled(_) => CodexRuntimeRunStatus::Canceled,
+            Self::Failed(_) => CodexRuntimeRunStatus::ProtocolError,
+        }
+    }
+
+    fn reason(&self) -> &str {
+        match self {
+            Self::TimedOut(reason) | Self::Canceled(reason) | Self::Failed(reason) => reason,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_for_codex_capability_rpc_response(
+    line_rx: &mpsc::Receiver<Result<String, String>>,
+    child: &mut std::process::Child,
+    stdin: &mut impl Write,
+    state: &mut CodexProtocolState,
+    progress: &mut Option<CodexProgressEmitter>,
+    timeouts: &mut CodexProtocolTimeouts,
+    approval_policy: CodexApprovalPolicy,
+    cancel_check: Option<&RuntimeCancelCheck>,
+    request_id: i64,
+    method: &str,
+    handshake_deadline: Instant,
+) -> io::Result<Result<Value, CodexCapabilityHandshakeFailure>> {
+    loop {
+        let now = Instant::now();
+        if now >= handshake_deadline {
+            return Ok(Err(CodexCapabilityHandshakeFailure::TimedOut(format!(
+                "timed out waiting for Codex app-server {method} response after {CODEX_CAPABILITY_HANDSHAKE_TIMEOUT_MS}ms"
+            ))));
+        }
+        let poll_interval = handshake_deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(100));
+        match receive_protocol_event(
+            line_rx,
+            child,
+            state,
+            timeouts,
+            cancel_check,
+            Some(poll_interval),
+        )? {
+            ProtocolEvent::Json(value) => {
+                record_protocol_usage_event(&value, state);
+                emit_codex_progress(progress, &value, state);
+                if answer_unattended_server_request(&value, stdin, state, approval_policy)? {
+                    continue;
+                }
+                if json_id(&value) == Some(request_id) {
+                    if let Some(error) = protocol_error(&value) {
+                        return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
+                            "Codex app-server {method} request failed: {error}"
+                        ))));
+                    }
+                    let Some(result) = value.get("result") else {
+                        return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
+                            "Codex app-server {method} response did not include result"
+                        ))));
+                    };
+                    return Ok(Ok(result.clone()));
+                }
+                if json_id(&value).is_none()
+                    && let Some(error) = protocol_error(&value)
+                {
+                    return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
+                        "Codex app-server reported a connection-level error while waiting for {method}: {error}"
+                    ))));
+                }
+                if json_method(&value) == Some("model/rerouted") {
+                    return Ok(Err(CodexCapabilityHandshakeFailure::Failed(
+                        "Codex app-server rerouted the model before exact capability verification"
+                            .to_string(),
+                    )));
+                }
+                if is_turn_completed(&value) {
+                    return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
+                        "Codex app-server reported turn completion while waiting for {method}"
+                    ))));
+                }
+                if let Some(other_id) = json_id(&value) {
+                    state.warnings.push(format!(
+                        "ignored unrelated Codex app-server response id {other_id} while waiting for {method} id {request_id}"
+                    ));
+                }
+            }
+            ProtocolEvent::Poll => continue,
+            ProtocolEvent::TimedOut(reason) => {
+                return Ok(Err(CodexCapabilityHandshakeFailure::TimedOut(reason)));
+            }
+            ProtocolEvent::Failed(reason) => {
+                return Ok(Err(CodexCapabilityHandshakeFailure::Failed(reason)));
+            }
+            ProtocolEvent::Canceled(reason) => {
+                return Ok(Err(CodexCapabilityHandshakeFailure::Canceled(reason)));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_codex_reasoning_capability_same_connection(
+    line_rx: &mpsc::Receiver<Result<String, String>>,
+    child: &mut std::process::Child,
+    stdin: &mut impl Write,
+    state: &mut CodexProtocolState,
+    progress: &mut Option<CodexProgressEmitter>,
+    timeouts: &mut CodexProtocolTimeouts,
+    approval_policy: CodexApprovalPolicy,
+    cancel_check: Option<&RuntimeCancelCheck>,
+    runtime_workspace_root: &str,
+    validated: &ValidatedCodexTurnEffort,
+) -> io::Result<Result<SameConnectionCapabilityProofV1, CodexCapabilityHandshakeFailure>> {
+    if validated.cache.provider != "openai" {
+        return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
+            "same-connection capability verification does not authorize custom provider {}",
+            validated.cache.provider
+        ))));
+    }
+    let now = Instant::now();
+    let handshake_deadline = (now + Duration::from_millis(CODEX_CAPABILITY_HANDSHAKE_TIMEOUT_MS))
+        .min(timeouts.absolute_deadline);
+    if let Err(error) = write_json_rpc(
+        stdin,
+        &json!({
+            "id": CODEX_CAPABILITY_CONFIG_READ_REQUEST_ID,
+            "method": "config/read",
+            "params": {
+                "cwd": runtime_workspace_root,
+                "includeLayers": false
+            }
+        }),
+    ) {
+        return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
+            "failed to write Codex app-server config/read request: {error}"
+        ))));
+    }
+    let config_result = match wait_for_codex_capability_rpc_response(
+        line_rx,
+        child,
+        stdin,
+        state,
+        progress,
+        timeouts,
+        approval_policy,
+        cancel_check,
+        CODEX_CAPABILITY_CONFIG_READ_REQUEST_ID,
+        "config/read",
+        handshake_deadline,
+    )? {
+        Ok(result) => result,
+        Err(error) => return Ok(Err(error)),
+    };
+    let config_response: CodexConfigReadResponse = match serde_json::from_value(config_result) {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
+                "Codex app-server config/read response was malformed: {error}"
+            ))));
+        }
+    };
+    let effective_provider =
+        match bind_effective_provider(&validated.cache.provider, &config_response) {
+            Ok(provider) if provider == "openai" => provider,
+            Ok(provider) => {
+                return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
+                    "same-connection capability verification does not authorize provider {provider}"
+                ))));
+            }
+            Err(error) => {
+                return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
+                    "Codex app-server provider binding failed: {error}"
+                ))));
+            }
+        };
+
+    let mut collector = CodexModelListCollector::new(CODEX_CAPABILITY_MODEL_LIST_MAX_PAGES)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let mut cursor: Option<String> = None;
+    for page_index in 0..CODEX_CAPABILITY_MODEL_LIST_MAX_PAGES {
+        let request_id = CODEX_CAPABILITY_MODEL_LIST_FIRST_REQUEST_ID + page_index as i64;
+        let mut params = json!({
+            "limit": CODEX_CAPABILITY_MODEL_LIST_PAGE_SIZE,
+            "includeHidden": true
+        });
+        if let Some(cursor) = cursor.as_ref() {
+            params["cursor"] = Value::String(cursor.clone());
+        }
+        if let Err(error) = write_json_rpc(
+            stdin,
+            &json!({
+                "id": request_id,
+                "method": "model/list",
+                "params": params
+            }),
+        ) {
+            return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
+                "failed to write Codex app-server model/list request: {error}"
+            ))));
+        }
+        let page_result = match wait_for_codex_capability_rpc_response(
+            line_rx,
+            child,
+            stdin,
+            state,
+            progress,
+            timeouts,
+            approval_policy,
+            cancel_check,
+            request_id,
+            "model/list",
+            handshake_deadline,
+        )? {
+            Ok(result) => result,
+            Err(error) => return Ok(Err(error)),
+        };
+        let page: CodexModelListPage = match serde_json::from_value(page_result) {
+            Ok(page) => page,
+            Err(error) => {
+                return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
+                    "Codex app-server model/list response was malformed: {error}"
+                ))));
+            }
+        };
+        if page.data.len() > CODEX_CAPABILITY_MODEL_LIST_PAGE_SIZE {
+            return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
+                "Codex app-server model/list page exceeded the requested {}-model limit",
+                CODEX_CAPABILITY_MODEL_LIST_PAGE_SIZE
+            ))));
+        }
+        cursor = match collector.push_page(cursor.as_deref(), page) {
+            Ok(next_cursor) => next_cursor,
+            Err(error) => {
+                return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
+                    "Codex app-server model/list pagination was invalid: {error}"
+                ))));
+            }
+        };
+        if cursor.is_none() {
+            break;
+        }
+    }
+    let live = match collector.finish(&validated.cache.model) {
+        Ok(live) => live,
+        Err(error) => {
+            return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
+                "Codex app-server model/list capability was unusable: {error}"
+            ))));
+        }
+    };
+    let wire_effort = match decide_cache_live_drift(
+        &validated.cache,
+        &live,
+        &validated.preference,
+        &validated.admission_effort,
+    ) {
+        CacheLiveDriftDecision::Allow { wire_effort } => wire_effort,
+        CacheLiveDriftDecision::Deny { reason } => {
+            return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
+                "Codex cache/live capability drift denied turn/start: {reason:?}"
+            ))));
+        }
+    };
+    match build_same_connection_proof(
+        &SameConnectionProofContext {
+            runtime_pid: child.id(),
+            provider: effective_provider,
+            preference: validated.preference.clone(),
+            admission_effort: validated.admission_effort.clone(),
+            cache_revision: validated.cache.revision.clone(),
+        },
+        &live,
+        &wire_effort,
+    ) {
+        Ok(proof) => Ok(Ok(proof)),
+        Err(error) => Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
+            "failed to build same-connection Codex capability proof: {error}"
+        )))),
+    }
+}
+
+fn codex_reasoning_attempt_id(plan: &CodexRuntimePlanFile, runtime_pid: u32) -> io::Result<String> {
+    let queue = plan.queue_id.as_deref().unwrap_or("no-queue");
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    queue.hash(&mut hasher);
+    Ok(format!(
+        "reasoning-{}-{runtime_pid}-{now_ns}",
+        format_args!("{:016x}", hasher.finish()),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_backend_reasoning_execution_evidence(
+    plan: &CodexRuntimePlanFile,
+    attempt_id: &str,
+    include_managed_snapshot: bool,
+    capability_source: BackendReasoningCapabilitySourceV1,
+    wire_action: BackendReasoningWireActionV1,
+    wire_catalog_revision: Option<String>,
+    wire_effort: Option<String>,
+    turn_start_request_id: Option<u64>,
+    decision_code: &str,
+) -> io::Result<BackendReasoningExecutionEvidenceV1> {
+    let preference = include_managed_snapshot
+        .then(|| plan.reasoning_preference.clone())
+        .flatten();
+    let policy = include_managed_snapshot
+        .then(|| plan.backend_reasoning_policy.clone())
+        .flatten();
+    let policy_catalog_revision = policy
+        .as_ref()
+        .and_then(|policy| policy.resolution().catalog_revision.clone());
+    let (provider, model) = match (plan.provider.as_ref(), plan.model.as_ref()) {
+        (Some(provider), Some(model)) => (Some(provider.clone()), Some(model.clone())),
+        _ => (None, None),
+    };
+    BackendReasoningExecutionEvidenceV1::new(BackendReasoningExecutionEvidenceFieldsV1 {
+        attempt_id: attempt_id.to_string(),
+        queue_id: plan.queue_id.clone(),
+        agent_id: plan.agent_id.clone(),
+        provider,
+        model,
+        preference,
+        policy,
+        policy_catalog_revision,
+        wire_catalog_revision,
+        capability_source,
+        wire_action,
+        wire_effort,
+        turn_start_request_id,
+        decision_code: decision_code.to_string(),
+        recorded_at_ms: current_log_time_ms()?,
+    })
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+}
+
+fn persist_backend_reasoning_execution_evidence(
+    harness_home: &Path,
+    execution_dir: &Path,
+    evidence: &BackendReasoningExecutionEvidenceV1,
+) -> io::Result<PathBuf> {
+    evidence
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let attempt_file = execution_dir.join(format!(
+        "backend-reasoning-execution-{}.json",
+        safe_path_component(&evidence.attempt_id)
+    ));
+    let summary_file = execution_dir.join("backend-reasoning-execution.v1.json");
+    write_json_atomic(&attempt_file, evidence)?;
+    write_json_atomic(&summary_file, evidence)?;
+    let receipts_file = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("backend-reasoning-execution-receipts.jsonl");
+    fs::create_dir_all(parent_dir(&receipts_file)?)?;
+    append_json_line(&receipts_file, evidence)?;
+    Ok(attempt_file)
+}
+
+fn persist_codex_capability_proof(
+    execution_dir: &Path,
+    proof: &SameConnectionCapabilityProofV1,
+) -> io::Result<PathBuf> {
+    let proof_file = execution_dir.join("codex-capability-proof.v1.json");
+    write_json_atomic(&proof_file, proof)?;
+    Ok(proof_file)
 }
 
 #[cfg(test)]
@@ -7781,6 +8580,38 @@ fn codex_app_server_write_failed_result(
         assistant_raw_message: state.assistant_raw_message(),
         assistant_final_found: state.assistant_final_found(),
         thread_id: None,
+        event_count: state.event_count,
+        usage: state.usage.clone(),
+        stdout_log: Some(stdout_log.to_path_buf()),
+        stderr_log: Some(stderr_log.to_path_buf()),
+        context_recovery: None,
+        tool_use_timeout: None,
+        interruption_reason: None,
+        interrupted_tool_uses: Vec::new(),
+        warnings: std::mem::take(&mut state.warnings),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn codex_app_server_terminal_failure_result(
+    child: &mut std::process::Child,
+    reader_handle: &mut StdoutReaderHandle,
+    state: &mut CodexProtocolState,
+    stdout_log: &Path,
+    stderr_log: &Path,
+    status: CodexRuntimeRunStatus,
+    reason: String,
+    thread_id: Option<String>,
+) -> CodexAppServerRunResult {
+    finish_codex_child_and_stdout_reader(child, reader_handle, &mut state.warnings, &reason);
+    CodexAppServerRunResult {
+        status,
+        reason,
+        assistant_message: state.assistant_message_with_harness_notices(),
+        assistant_narration: state.assistant_narration_records(),
+        assistant_raw_message: state.assistant_raw_message(),
+        assistant_final_found: state.assistant_final_found(),
+        thread_id,
         event_count: state.event_count,
         usage: state.usage.clone(),
         stdout_log: Some(stdout_log.to_path_buf()),
@@ -12458,6 +13289,10 @@ mod tests {
         assert!(report.stderr_log.as_ref().unwrap().is_file());
         let stdout = fs::read_to_string(report.stdout_log.unwrap()).unwrap();
         assert!(stdout.contains("item/agentMessage/delta"));
+        let app_server_input =
+            fs::read_to_string(root.join("fake-app-server-input.jsonl")).unwrap();
+        assert!(!app_server_input.contains("config/read"));
+        assert!(!app_server_input.contains("model/list"));
         let completion = report.completion.unwrap();
         assert_eq!(
             completion.receipt.status,
@@ -12497,6 +13332,139 @@ mod tests {
             fs::read_to_string(transcript_file).unwrap().lines().count(),
             2
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_reasoning_uses_same_connection_capability_before_exact_turn_effort() {
+        let root =
+            temp_root("managed_reasoning_uses_same_connection_capability_before_exact_turn_effort");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, json!([]));
+        enable_managed_reasoning_fixture(&harness_home, plan_file, "max");
+        let (executable, arguments) = fake_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let input_values = fs::read_to_string(root.join("fake-app-server-input.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let method_index = |method: &str| {
+            input_values
+                .iter()
+                .position(|value| value.get("method").and_then(Value::as_str) == Some(method))
+                .unwrap()
+        };
+        let config_index = method_index("config/read");
+        let model_index = method_index("model/list");
+        let turn_index = method_index("turn/start");
+        assert!(config_index < model_index && model_index < turn_index);
+        assert_eq!(input_values[turn_index]["params"]["effort"], "max");
+        let thread_index = method_index("thread/start");
+        assert!(input_values[thread_index]["params"].get("effort").is_none());
+
+        let execution_dir = report.receipt.execution_dir.unwrap();
+        let proof: SameConnectionCapabilityProofV1 = serde_json::from_slice(
+            &fs::read(execution_dir.join("codex-capability-proof.v1.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(proof.model, "gpt-5.6-sol");
+        assert_eq!(proof.wire_effort, "max");
+        let evidence: BackendReasoningExecutionEvidenceV1 = serde_json::from_slice(
+            &fs::read(execution_dir.join("backend-reasoning-execution.v1.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(evidence.wire_action, BackendReasoningWireActionV1::Sent);
+        assert_eq!(evidence.wire_effort.as_deref(), Some("max"));
+        assert_eq!(
+            evidence.capability_source,
+            BackendReasoningCapabilitySourceV1::AppServerModelList
+        );
+        let evidence_journal = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("backend-reasoning-execution-receipts.jsonl");
+        assert_eq!(
+            fs::read_to_string(evidence_journal)
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_reasoning_live_catalog_denial_fails_before_turn_start() {
+        let root = temp_root("managed_reasoning_live_catalog_denial_fails_before_turn_start");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, json!([]));
+        enable_managed_reasoning_fixture(&harness_home, plan_file, "max");
+        fs::write(root.join("fake-app-server-live-deny-max"), "deny").unwrap();
+        let (executable, arguments) = fake_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+        assert!(report.receipt.reason.contains("LiveEffortMissing"));
+        let app_server_input =
+            fs::read_to_string(root.join("fake-app-server-input.jsonl")).unwrap();
+        assert!(app_server_input.contains("config/read"));
+        assert!(app_server_input.contains("model/list"));
+        assert!(!app_server_input.contains("turn/start"));
+        let execution_dir = report.receipt.execution_dir.unwrap();
+        assert!(
+            !execution_dir
+                .join("codex-capability-proof.v1.json")
+                .exists()
+        );
+        let evidence: BackendReasoningExecutionEvidenceV1 = serde_json::from_slice(
+            &fs::read(execution_dir.join("backend-reasoning-execution.v1.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(evidence.wire_action, BackendReasoningWireActionV1::Rejected);
+        assert!(evidence.turn_start_request_id.is_none());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -15093,6 +16061,45 @@ mod tests {
         fs::write(plan_file, serde_json::to_string_pretty(&value).unwrap()).unwrap();
     }
 
+    fn enable_managed_reasoning_fixture(harness_home: &Path, plan_file: &Path, effort: &str) {
+        fs::create_dir_all(harness_home.join("codex-home")).unwrap();
+        fs::write(
+            harness_home.join(crate::HARNESS_CONFIG_FILE_NAME),
+            r#"{"orchestration":{"features":{"modelCatalogV2":{"mode":"authoritative","enabledAgentIds":["main"]}}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join("codex-home").join("models_cache.json"),
+            r#"{"models":[{"slug":"gpt-5.6-sol","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"},{"effort":"xhigh"},{"effort":"max"},{"effort":"ultra"}]}]}"#,
+        )
+        .unwrap();
+        let policy = crate::backend_reasoning::BackendReasoningPolicyV1::new(
+            crate::backend_reasoning::BackendReasoningSource::ChannelCommand,
+            crate::model_catalog::ReasoningResolutionReceipt {
+                schema_version: crate::model_catalog::REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION,
+                requested_provider: "openai".to_string(),
+                requested_model: "gpt-5.6-sol".to_string(),
+                effective_provider: Some("openai".to_string()),
+                effective_model: Some("gpt-5.6-sol".to_string()),
+                requested_effort: effort.to_string(),
+                effective_effort: Some(effort.to_string()),
+                catalog_effective_effort: Some(effort.to_string()),
+                catalog_revision: Some("fixture-revision".to_string()),
+                status: crate::model_catalog::ReasoningResolutionStatus::Accepted,
+                authoritative: true,
+                reason: "managed runtime fixture".to_string(),
+            },
+        )
+        .unwrap();
+        let preference = crate::backend_reasoning::ReasoningPreference::explicit(effort).unwrap();
+        let mut value: Value = serde_json::from_slice(&fs::read(plan_file).unwrap()).unwrap();
+        value["provider"] = json!("openai");
+        value["model"] = json!("gpt-5.6-sol");
+        value["reasoningPreference"] = serde_json::to_value(preference).unwrap();
+        value["backendReasoningPolicy"] = serde_json::to_value(policy).unwrap();
+        fs::write(plan_file, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    }
+
     #[cfg(windows)]
     fn long_running_probe_command() -> (PathBuf, Vec<String>) {
         let system_cmd = PathBuf::from(r"C:\Windows\System32\cmd.exe");
@@ -15145,10 +16152,13 @@ mod tests {
         fs::write(
             &script,
             r#"
+$capture = Join-Path $PSScriptRoot 'fake-app-server-input.jsonl'
+$denyMax = Join-Path $PSScriptRoot 'fake-app-server-live-deny-max'
 while ($true) {
     if ($null -eq $threadMethod) { $threadMethod = 'unknown' }
     $line = [Console]::In.ReadLine()
     if ($null -eq $line) { break }
+    Add-Content -LiteralPath $capture -Value $line
     try {
         $msg = $line | ConvertFrom-Json
     } catch {
@@ -15164,6 +16174,16 @@ while ($true) {
     } elseif ($msg.method -eq 'thread/resume') {
         $threadMethod = 'thread/resume'
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'config/read') {
+        [Console]::Out.WriteLine('{"id":9000,"result":{"config":{"model_provider":"openai"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'model/list') {
+        if (Test-Path -LiteralPath $denyMax) {
+            [Console]::Out.WriteLine('{"id":9100,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-sol","defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"xhigh"}]}],"nextCursor":null}}')
+        } else {
+            [Console]::Out.WriteLine('{"id":9100,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-sol","defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"xhigh"},{"reasoningEffort":"max"},{"reasoningEffort":"ultra"}]}],"nextCursor":null}}')
+        }
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
         [Console]::Out.WriteLine(('{"method":"item/agentMessage/delta","params":{"delta":"Fake assistant reply. method=' + $threadMethod + '"}}'))
@@ -16227,7 +17247,10 @@ while ($true) {
         fs::write(
             &script,
             r#"
+capture="$(dirname "$0")/fake-app-server-input.jsonl"
+deny_max="$(dirname "$0")/fake-app-server-live-deny-max"
 while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$capture"
     case "$line" in
         *'"id":0'*)
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
@@ -16239,6 +17262,16 @@ while IFS= read -r line; do
         *'"method":"thread/resume"'*)
             thread_method='thread/resume'
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            ;;
+        *'"method":"config/read"'*)
+            printf '%s\n' '{"id":9000,"result":{"config":{"model_provider":"openai"}}}'
+            ;;
+        *'"method":"model/list"'*)
+            if [ -f "$deny_max" ]; then
+                printf '%s\n' '{"id":9100,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-sol","defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"xhigh"}]}],"nextCursor":null}}'
+            else
+                printf '%s\n' '{"id":9100,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-sol","defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"xhigh"},{"reasoningEffort":"max"},{"reasoningEffort":"ultra"}]}],"nextCursor":null}}'
+            fi
             ;;
         *'"method":"turn/start"'*)
             printf '%s\n' "{\"method\":\"item/agentMessage/delta\",\"params\":{\"delta\":\"Fake assistant reply. method=${thread_method:-unknown}\"}}"
