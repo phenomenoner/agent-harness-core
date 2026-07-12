@@ -2703,7 +2703,8 @@ fn defer_skill_curator_if_busy(
         || status.runtime.cron_queued_items > 0;
     let worker_busy = status.workers.totals.pending > 0
         || status.workers.totals.leased > 0
-        || status.workers.totals.running > 0;
+        || status.workers.totals.running > 0
+        || status.workers.totals.runtime_queued > 0;
     if !runtime_busy && !worker_busy {
         return Ok(None);
     }
@@ -2722,7 +2723,7 @@ fn defer_skill_curator_if_busy(
         proposals_created: 0,
         proposal_ids: Vec::new(),
         reason: format!(
-            "idle gate deferred: runtimeOpenItems={}, runtimeQueuedItems={}, runtimePreparedItems={}, cronOpenItems={}, cronQueuedItems={}, workerPending={}, workerLeased={}, workerRunning={}",
+            "idle gate deferred: runtimeOpenItems={}, runtimeQueuedItems={}, runtimePreparedItems={}, cronOpenItems={}, cronQueuedItems={}, workerPending={}, workerLeased={}, workerRunning={}, workerRuntimeQueued={}",
             status.runtime.open_items,
             status.runtime.queued_items,
             status.runtime.prepared_items,
@@ -2730,7 +2731,8 @@ fn defer_skill_curator_if_busy(
             status.runtime.cron_queued_items,
             status.workers.totals.pending,
             status.workers.totals.leased,
-            status.workers.totals.running
+            status.workers.totals.running,
+            status.workers.totals.runtime_queued
         ),
         clusters: Vec::new(),
         report_file: None,
@@ -7722,6 +7724,7 @@ fn run_worker_loop(args: &[String]) -> Result<(), String> {
                         break;
                     }
                 } else if report.status == WorkerRunOnceStatus::Completed
+                    || report.status == WorkerRunOnceStatus::Dispatched
                     || report.status == WorkerRunOnceStatus::Rescheduled
                 {
                     completed += 1;
@@ -22363,6 +22366,7 @@ fn runtime_run_once_status_label(status: RuntimeRunOnceStatus) -> &'static str {
 fn worker_run_once_status_label(status: WorkerRunOnceStatus) -> &'static str {
     match status {
         WorkerRunOnceStatus::Completed => "completed",
+        WorkerRunOnceStatus::Dispatched => "dispatched",
         WorkerRunOnceStatus::Rescheduled => "rescheduled",
         WorkerRunOnceStatus::NoWork => "no-work",
         WorkerRunOnceStatus::Failed => "failed",
@@ -23485,7 +23489,7 @@ mod tests {
         assert!(report.workspace_clean, "{:?}", report.workspace_diff);
         assert!(report.workspace_diff.is_empty());
         assert!(!report.harness_state_writes.is_empty());
-        assert_eq!(report.run.status, WorkerRunOnceStatus::Completed);
+        assert_eq!(report.run.status, WorkerRunOnceStatus::Dispatched);
         assert_eq!(
             report.runtime_execution_mode,
             "deterministic-terminal-receipt-no-model-execution"

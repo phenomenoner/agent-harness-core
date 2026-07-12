@@ -948,10 +948,11 @@ fn check_worker_dispatch(harness_home: &Path, checks: &mut Vec<ActivationReadine
                 checks.push(pass(
                     "worker-dispatch",
                     format!(
-                        "worker store ready at {}; pending={} running={} succeeded={}",
+                        "worker store ready at {}; pending={} running={} runtimeQueued={} succeeded={}",
                         report.database.display(),
                         report.totals.pending,
                         report.totals.running,
+                        report.totals.runtime_queued,
                         report.totals.succeeded
                     ),
                 ));

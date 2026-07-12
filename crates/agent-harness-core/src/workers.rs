@@ -107,6 +107,7 @@ pub struct WorkerRunOnceReport {
 #[serde(rename_all = "kebab-case")]
 pub enum WorkerRunOnceStatus {
     Completed,
+    Dispatched,
     Rescheduled,
     NoWork,
     Failed,
@@ -138,6 +139,7 @@ pub struct WorkerStatusTotals {
     pub pending: usize,
     pub leased: usize,
     pub running: usize,
+    pub runtime_queued: usize,
     pub succeeded: usize,
     pub failed_retryable: usize,
     pub failed_terminal: usize,
@@ -283,6 +285,7 @@ pub enum WorkerJobStatus {
     Pending,
     Leased,
     Running,
+    RuntimeQueued,
     Succeeded,
     FailedRetryable,
     FailedTerminal,
@@ -296,6 +299,7 @@ impl WorkerJobStatus {
             Self::Pending => "pending",
             Self::Leased => "leased",
             Self::Running => "running",
+            Self::RuntimeQueued => "runtime-queued",
             Self::Succeeded => "succeeded",
             Self::FailedRetryable => "failed-retryable",
             Self::FailedTerminal => "failed-terminal",
@@ -309,6 +313,7 @@ impl WorkerJobStatus {
             "pending" => Self::Pending,
             "leased" => Self::Leased,
             "running" => Self::Running,
+            "runtime-queued" => Self::RuntimeQueued,
             "succeeded" => Self::Succeeded,
             "failed-retryable" => Self::FailedRetryable,
             "failed-terminal" => Self::FailedTerminal,
@@ -509,6 +514,7 @@ pub fn enqueue_worker_job(options: WorkerEnqueueOptions) -> io::Result<WorkerEnq
 pub fn run_worker_once(options: WorkerRunOnceOptions) -> io::Result<WorkerRunOnceReport> {
     let db_file = init_worker_store(&options.harness_home)?;
     let conn = Connection::open(&db_file).map_err(io::Error::other)?;
+    reconcile_runtime_queued_jobs(&options.harness_home, &conn, options.now_ms)?;
     let config = load_worker_dispatch_config(&options.harness_home)?;
     let (job, blocked) = lease_next_job(
         &conn,
@@ -599,7 +605,11 @@ pub fn run_worker_once(options: WorkerRunOnceOptions) -> io::Result<WorkerRunOnc
         &options.harness_home,
         &HarnessLogEvent::new(
             current_log_time_ms().unwrap_or(options.now_ms),
-            if result.status == WorkerJobStatus::Succeeded || rescheduled {
+            if matches!(
+                result.status,
+                WorkerJobStatus::Succeeded | WorkerJobStatus::RuntimeQueued
+            ) || rescheduled
+            {
                 HarnessLogLevel::Info
             } else {
                 HarnessLogLevel::Warn
@@ -616,7 +626,9 @@ pub fn run_worker_once(options: WorkerRunOnceOptions) -> io::Result<WorkerRunOnc
         schema: WORKER_RUN_ONCE_SCHEMA,
         harness_home: options.harness_home,
         database: db_file,
-        status: if terminal {
+        status: if result.status == WorkerJobStatus::RuntimeQueued {
+            WorkerRunOnceStatus::Dispatched
+        } else if terminal {
             if result.status == WorkerJobStatus::Succeeded {
                 WorkerRunOnceStatus::Completed
             } else {
@@ -652,7 +664,10 @@ fn sync_cron_run_after_worker_result(
     let Some(cron_run_id) = string_path_any(&job.payload, &["cronRunId", "cron_run_id"]) else {
         return Ok(());
     };
-    if result.status == WorkerJobStatus::Succeeded && job.kind != WorkerJobKind::DeterministicShell
+    if matches!(
+        result.status,
+        WorkerJobStatus::Succeeded | WorkerJobStatus::RuntimeQueued
+    ) && job.kind != WorkerJobKind::DeterministicShell
     {
         return Ok(());
     }
@@ -1887,8 +1902,8 @@ fn queue_llm_worker_turn(
     }
     record_llm_subagent_lifecycle_running(harness_home, job, &queue_id, now_ms)?;
     Ok(WorkerJobExecutionResult {
-        status: WorkerJobStatus::Succeeded,
-        reason: "LLM worker job queued as durable runtime turn".to_string(),
+        status: WorkerJobStatus::RuntimeQueued,
+        reason: "LLM worker job durably queued; awaiting correlated runtime terminal".to_string(),
         audit_path: None,
         artifact_refs: Some(json!({
             "runtimeQueueFile": queue_file,
@@ -2301,6 +2316,7 @@ fn worker_totals(conn: &Connection, lane: Option<&str>) -> io::Result<WorkerStat
             WorkerJobStatus::Pending => totals.pending += 1,
             WorkerJobStatus::Leased => totals.leased += 1,
             WorkerJobStatus::Running => totals.running += 1,
+            WorkerJobStatus::RuntimeQueued => totals.runtime_queued += 1,
             WorkerJobStatus::Succeeded => totals.succeeded += 1,
             WorkerJobStatus::FailedRetryable => totals.failed_retryable += 1,
             WorkerJobStatus::FailedTerminal => totals.failed_terminal += 1,
@@ -2319,6 +2335,128 @@ fn worker_lanes(conn: &Connection) -> io::Result<Vec<String>> {
         .map_err(io::Error::other)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(io::Error::other)
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeWorkerTerminal {
+    worker_status: WorkerJobStatus,
+    runtime_status: String,
+    reason: String,
+}
+
+fn reconcile_runtime_queued_jobs(
+    harness_home: &Path,
+    conn: &Connection,
+    now_ms: i64,
+) -> io::Result<usize> {
+    let runtime_queued: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE status=?1",
+            params![WorkerJobStatus::RuntimeQueued.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(io::Error::other)?;
+    if runtime_queued == 0 {
+        return Ok(0);
+    }
+
+    let receipts_file = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("run-once-receipts.jsonl");
+    let receipts = match fs::read_to_string(&receipts_file) {
+        Ok(receipts) => receipts,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut terminals = BTreeMap::<String, RuntimeWorkerTerminal>::new();
+    for line in receipts.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(queue_id) = string_path_any(&value, &["queueId", "queue_id"]) else {
+            continue;
+        };
+        let Some(runtime_status) = string_path(&value, "status") else {
+            continue;
+        };
+        let Some(worker_status) = worker_status_from_runtime_terminal(runtime_status) else {
+            continue;
+        };
+        terminals.insert(
+            queue_id.to_string(),
+            RuntimeWorkerTerminal {
+                worker_status,
+                runtime_status: runtime_status.to_string(),
+                reason: string_path(&value, "reason")
+                    .unwrap_or("runtime terminal receipt recorded")
+                    .to_string(),
+            },
+        );
+    }
+    if terminals.is_empty() {
+        return Ok(0);
+    }
+
+    let jobs = {
+        let mut stmt = conn
+            .prepare("SELECT * FROM jobs WHERE status=?1 ORDER BY created_at_ms ASC")
+            .map_err(io::Error::other)?;
+        stmt.query_map(params![WorkerJobStatus::RuntimeQueued.as_str()], row_to_job)
+            .map_err(io::Error::other)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(io::Error::other)?
+    };
+
+    let mut reconciled = 0;
+    for job in jobs {
+        let Some(runtime_queue_id) = runtime_queue_id_from_worker_job(&job) else {
+            continue;
+        };
+        let Some(terminal) = terminals.get(runtime_queue_id) else {
+            continue;
+        };
+        set_job_status(
+            conn,
+            &job.job_id,
+            terminal.worker_status,
+            now_ms,
+            Some(json!({
+                "runtimeQueueId": runtime_queue_id,
+                "runtimeStatus": terminal.runtime_status,
+                "reason": terminal.reason,
+                "terminalReceiptFile": receipts_file,
+                "correlation": "exact-runtime-queue-id"
+            })),
+            None,
+            Some(receipts_file.clone()),
+        )?;
+        reconciled += 1;
+    }
+    Ok(reconciled)
+}
+
+fn worker_status_from_runtime_terminal(status: &str) -> Option<WorkerJobStatus> {
+    match status {
+        "completed" => Some(WorkerJobStatus::Succeeded),
+        "canceled" => Some(WorkerJobStatus::Canceled),
+        "dead-letter" | "failed-terminal" | "no-runtime-plan" | "preflight-blocked"
+        | "spawn-failed" | "protocol-error" | "context-exhausted" | "timeout" => {
+            Some(WorkerJobStatus::FailedTerminal)
+        }
+        _ => None,
+    }
+}
+
+fn runtime_queue_id_from_worker_job(job: &WorkerJob) -> Option<&str> {
+    job.artifact_refs
+        .as_ref()
+        .and_then(|value| string_path_any(value, &["runtimeQueueId", "runtime_queue_id"]))
+        .or_else(|| {
+            job.result
+                .as_ref()
+                .and_then(|value| string_path_any(value, &["runtimeQueueId", "runtime_queue_id"]))
+        })
 }
 
 fn jobs_with_expired_leases(conn: &Connection, now_ms: i64) -> io::Result<Vec<WorkerJob>> {
@@ -2876,7 +3014,7 @@ mod tests {
             now_ms: 1002,
         })
         .unwrap();
-        assert_eq!(first.status, WorkerRunOnceStatus::Completed);
+        assert_eq!(first.status, WorkerRunOnceStatus::Dispatched);
 
         let second = run_worker_once(WorkerRunOnceOptions {
             harness_home: harness_home.clone(),
@@ -2897,7 +3035,7 @@ mod tests {
             now_ms: 61_100,
         })
         .unwrap();
-        assert_eq!(later.status, WorkerRunOnceStatus::Completed);
+        assert_eq!(later.status, WorkerRunOnceStatus::Dispatched);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2957,7 +3095,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(run.status, WorkerRunOnceStatus::Completed);
+        assert_eq!(run.status, WorkerRunOnceStatus::Dispatched);
         let queue_file = harness_home
             .join("state")
             .join("runtime-queue")
@@ -3039,7 +3177,7 @@ mod tests {
             now_ms: 1003,
         })
         .unwrap();
-        assert_eq!(run.status, WorkerRunOnceStatus::Completed);
+        assert_eq!(run.status, WorkerRunOnceStatus::Dispatched);
 
         let running = crate::show_subagent_lifecycle(crate::SubagentLifecycleShowOptions {
             harness_home: harness_home.clone(),
@@ -3182,7 +3320,7 @@ mod tests {
             now_ms: 10_000,
         })
         .unwrap();
-        assert_eq!(second.status, WorkerRunOnceStatus::Completed);
+        assert_eq!(second.status, WorkerRunOnceStatus::Dispatched);
 
         let queue_file = harness_home
             .join("state")
