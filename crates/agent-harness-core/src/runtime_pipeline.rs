@@ -5692,6 +5692,7 @@ mod tests {
                 safe_to_rerun: true,
                 reason: "interrupted before exit code".to_string(),
             }],
+            backend_reasoning_execution: None,
         };
         let reason = runtime_failure_reply_reason(
             &receipt,
@@ -7421,6 +7422,7 @@ mod tests {
                 tool_use_timeout: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: None,
             },
             completion: None,
             stdout_log: None,
@@ -7477,6 +7479,7 @@ mod tests {
                 tool_use_timeout: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: None,
             },
             completion: None,
             stdout_log: None,
@@ -7543,6 +7546,7 @@ mod tests {
                 }),
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: None,
             },
             completion: None,
             stdout_log: None,

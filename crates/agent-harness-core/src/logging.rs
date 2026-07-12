@@ -262,6 +262,50 @@ pub fn append_jsonl_value(path: &Path, value: &impl Serialize) -> io::Result<()>
     Ok(())
 }
 
+pub fn append_jsonl_value_once_by_event_key(
+    path: &Path,
+    value: &impl Serialize,
+) -> io::Result<bool> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let serialized = serde_json::to_value(value).map_err(io::Error::other)?;
+    let event_key = serialized
+        .get("eventKey")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "eventKey is required"))?;
+    let _guard = JsonlAppendLock::acquire(path)?;
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let existing = serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid JSONL record at line {}: {error}", index + 1),
+            )
+        })?;
+        if existing.get("eventKey").and_then(serde_json::Value::as_str) == Some(event_key) {
+            return Ok(false);
+        }
+    }
+    let needs_leading_newline = jsonl_needs_leading_newline(path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    if needs_leading_newline {
+        file.write_all(b"\n")?;
+    }
+    serde_json::to_writer(&mut file, &serialized).map_err(io::Error::other)?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    Ok(true)
+}
+
 fn append_json_line(path: &Path, value: &impl Serialize) -> io::Result<()> {
     append_jsonl_value(path, value)
 }
@@ -616,6 +660,51 @@ mod tests {
             true
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn append_jsonl_value_once_deduplicates_stable_event_key() {
+        let root = temp_root("append_jsonl_value_once_deduplicates_stable_event_key");
+        let path = root.join("state").join("events.jsonl");
+        let first = json!({"eventKey":"attempt-1/1","action":"pending"});
+        let duplicate = json!({"eventKey":"attempt-1/1","action":"pending-replay"});
+        let second = json!({"eventKey":"attempt-1/2","action":"sent"});
+
+        assert!(append_jsonl_value_once_by_event_key(&path, &first).unwrap());
+        assert!(!append_jsonl_value_once_by_event_key(&path, &duplicate).unwrap());
+        assert!(append_jsonl_value_once_by_event_key(&path, &second).unwrap());
+
+        let lines = fs::read_to_string(&path).unwrap();
+        assert_eq!(lines.lines().count(), 2);
+        assert!(!lines.contains("pending-replay"));
+        assert!(!jsonl_append_lock_path(&path).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn append_jsonl_value_once_fails_closed_on_unreadable_or_malformed_journal() {
+        let root =
+            temp_root("append_jsonl_value_once_fails_closed_on_unreadable_or_malformed_journal");
+        let malformed = root.join("malformed.jsonl");
+        fs::create_dir_all(malformed.parent().unwrap()).unwrap();
+        fs::write(&malformed, b"{not-json}\n").unwrap();
+        let before = fs::read(&malformed).unwrap();
+        let error =
+            append_jsonl_value_once_by_event_key(&malformed, &json!({"eventKey":"attempt-1/1"}))
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&malformed).unwrap(), before);
+
+        let non_utf8 = root.join("non-utf8.jsonl");
+        fs::write(&non_utf8, [0xff]).unwrap();
+        let error =
+            append_jsonl_value_once_by_event_key(&non_utf8, &json!({"eventKey":"attempt-1/2"}))
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&non_utf8).unwrap(), vec![0xff]);
+        assert!(!jsonl_append_lock_path(&malformed).exists());
+        assert!(!jsonl_append_lock_path(&non_utf8).exists());
         let _ = fs::remove_dir_all(root);
     }
 

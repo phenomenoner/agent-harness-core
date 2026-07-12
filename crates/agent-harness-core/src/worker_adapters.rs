@@ -1,15 +1,18 @@
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::json;
 
+use crate::child_execution_policy::ChildExecutionPolicyV1;
 use crate::{
     AgentSource, DeterministicCronPlanAction, DeterministicCronPlanInput, NativeCronPlanAction,
     NativeCronPlanInput, SubagentPlanAction, SubagentPlanInput, WorkerEnqueueOptions,
-    WorkerEnqueueReport, WorkerJobKind, current_log_time_ms, enqueue_worker_job,
-    load_agent_registry, load_deterministic_cron_store, load_native_cron_store,
-    load_subagent_ledger, plan_deterministic_cron, plan_native_cron, plan_subagents,
+    WorkerEnqueueOptionsV2, WorkerEnqueueReport, WorkerJobKind, current_log_time_ms,
+    enqueue_worker_job, enqueue_worker_job_v2, load_agent_registry, load_deterministic_cron_store,
+    load_native_cron_store, load_subagent_ledger, plan_deterministic_cron, plan_native_cron,
+    plan_subagents,
 };
 
 const WORKER_ADAPTER_ENQUEUE_SCHEMA: &str = "agent-harness.worker-adapter-enqueue.v1";
@@ -49,6 +52,13 @@ pub struct SubagentWorkerEnqueueOptions {
     pub master_session_key: Option<String>,
     pub runtime_workspace: Option<PathBuf>,
     pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentWorkerEnqueueOptionsV2 {
+    pub options: SubagentWorkerEnqueueOptions,
+    /// Immutable child execution policies keyed by the imported subagent run id.
+    pub child_policies_by_run_id: BTreeMap<String, ChildExecutionPolicyV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -327,6 +337,19 @@ pub fn enqueue_native_cron_workers(
 pub fn enqueue_subagent_workers(
     options: SubagentWorkerEnqueueOptions,
 ) -> io::Result<WorkerAdapterEnqueueReport> {
+    enqueue_subagent_workers_v2(SubagentWorkerEnqueueOptionsV2 {
+        options,
+        child_policies_by_run_id: BTreeMap::new(),
+    })
+}
+
+pub fn enqueue_subagent_workers_v2(
+    options: SubagentWorkerEnqueueOptionsV2,
+) -> io::Result<WorkerAdapterEnqueueReport> {
+    let SubagentWorkerEnqueueOptionsV2 {
+        options,
+        child_policies_by_run_id,
+    } = options;
     let ledger = load_subagent_ledger(&options.source)?;
     let plan = plan_subagents(
         &ledger,
@@ -385,26 +408,29 @@ pub fn enqueue_subagent_workers(
             "messageText": message_text,
             "inboundContext": serde_json::to_string(entry).unwrap_or_default()
         });
-        let report = enqueue_worker_job(WorkerEnqueueOptions {
-            harness_home: options.harness_home.clone(),
-            kind: WorkerJobKind::LlmSubagent,
-            lane: Some("llm".to_string()),
-            payload,
-            idempotency_key: Some(format!("subagent-resume:{}", entry.run_id)),
-            parent_job_id: None,
-            job_group_id: Some(group_id.clone()),
-            master_agent_id: Some(master_agent.clone()),
-            master_session_key: Some(master_session.clone()),
-            wake_policy: None,
-            source: Some("subagent-ledger-adapter".to_string()),
-            priority: 0,
-            available_at_ms: Some(options.now_ms),
-            max_attempts: 3,
-            timeout_ms: Some(DEFAULT_WORKER_TIMEOUT_MS),
-            cascade_timeout_ms: Some(DEFAULT_WATCHDOG_TIMEOUT_MS),
-            rate_key: Some(format!("llm:{agent_id}")),
-            concurrency_group_key: Some(concurrency_group.clone()),
-            now_ms: options.now_ms,
+        let report = enqueue_worker_job_v2(WorkerEnqueueOptionsV2 {
+            options: WorkerEnqueueOptions {
+                harness_home: options.harness_home.clone(),
+                kind: WorkerJobKind::LlmSubagent,
+                lane: Some("llm".to_string()),
+                payload,
+                idempotency_key: Some(format!("subagent-resume:{}", entry.run_id)),
+                parent_job_id: None,
+                job_group_id: Some(group_id.clone()),
+                master_agent_id: Some(master_agent.clone()),
+                master_session_key: Some(master_session.clone()),
+                wake_policy: None,
+                source: Some("subagent-ledger-adapter".to_string()),
+                priority: 0,
+                available_at_ms: Some(options.now_ms),
+                max_attempts: 3,
+                timeout_ms: Some(DEFAULT_WORKER_TIMEOUT_MS),
+                cascade_timeout_ms: Some(DEFAULT_WATCHDOG_TIMEOUT_MS),
+                rate_key: Some(format!("llm:{agent_id}")),
+                concurrency_group_key: Some(concurrency_group.clone()),
+                now_ms: options.now_ms,
+            },
+            child_policy: child_policies_by_run_id.get(entry.run_id.as_str()).cloned(),
         })?;
         push_job_ref(&mut summary, &mut jobs, report, "resume-candidate");
     }
@@ -581,7 +607,18 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::{WorkerStatusOptions, collect_worker_status};
+    use crate::backend_reasoning::{
+        BackendReasoningPolicyV1, BackendReasoningSource, ReasoningPreference,
+    };
+    use crate::child_execution_policy::ChildExecutionPolicyV1Input;
+    use crate::model_catalog::{
+        REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION, ReasoningResolutionReceipt,
+        ReasoningResolutionStatus,
+    };
+    use crate::{
+        WorkerRunOnceOptions, WorkerRunOnceStatus, WorkerStatusOptions, collect_worker_status,
+        run_worker_once,
+    };
 
     #[test]
     fn deterministic_cron_adapter_enqueues_shell_job_and_watchdog() {
@@ -635,6 +672,114 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn subagent_adapter_applies_heterogeneous_policies_by_immutable_run_id() {
+        let root = temp_root("subagent_adapter_applies_heterogeneous_policies_by_run_id");
+        let source = write_heterogeneous_subagent_source(&root);
+        let harness_home = root.join("harness");
+        let sol_policy = managed_child_policy(1, "gpt-5.6-sol", "max");
+        let terra_policy = managed_child_policy(2, "gpt-5.6-terra", "ultra");
+
+        let report = enqueue_subagent_workers_v2(SubagentWorkerEnqueueOptionsV2 {
+            options: SubagentWorkerEnqueueOptions {
+                harness_home: harness_home.clone(),
+                source,
+                resume_subagents: true,
+                master_agent_id: Some("main".to_string()),
+                master_session_key: Some("master-session".to_string()),
+                runtime_workspace: None,
+                now_ms: 1000,
+            },
+            child_policies_by_run_id: BTreeMap::from([
+                ("queued-1".to_string(), sol_policy.clone()),
+                ("queued-2".to_string(), terra_policy.clone()),
+            ]),
+        })
+        .unwrap();
+        assert_eq!(report.summary.inserted_jobs, 2);
+
+        let mut observed_policies = Vec::new();
+        for now_ms in [1001, 1002] {
+            let run = run_worker_once(WorkerRunOnceOptions {
+                harness_home: harness_home.clone(),
+                lane: Some("llm".to_string()),
+                worker_id: format!("adapter-policy-worker-{now_ms}"),
+                lease_ms: 300_000,
+                now_ms,
+            })
+            .unwrap();
+            assert_eq!(run.status, WorkerRunOnceStatus::Dispatched);
+            observed_policies.push(run.job.unwrap().child_policy.unwrap());
+        }
+        assert!(observed_policies.contains(&sol_policy));
+        assert!(observed_policies.contains(&terra_policy));
+
+        let queue_text = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        let queued = queue_text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(queued.iter().any(|item| {
+            item["sessionKey"] == "subagent:queued-1:researcher"
+                && item["model"] == "gpt-5.6-sol"
+                && item["reasoningPreference"]["effort"] == "max"
+        }));
+        assert!(queued.iter().any(|item| {
+            item["sessionKey"] == "subagent:queued-2:coder"
+                && item["model"] == "gpt-5.6-terra"
+                && item["reasoningPreference"]["effort"] == "ultra"
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn managed_child_policy(
+        policy_revision: u64,
+        model: &str,
+        effort: &str,
+    ) -> ChildExecutionPolicyV1 {
+        let resolution = ReasoningResolutionReceipt {
+            schema_version: REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION,
+            requested_provider: "openai".to_string(),
+            requested_model: model.to_string(),
+            effective_provider: Some("openai".to_string()),
+            effective_model: Some(model.to_string()),
+            requested_effort: effort.to_string(),
+            effective_effort: Some(effort.to_string()),
+            catalog_effective_effort: Some(effort.to_string()),
+            catalog_revision: Some("catalog-test".to_string()),
+            status: ReasoningResolutionStatus::Accepted,
+            authoritative: true,
+            reason: "adapter child policy test".to_string(),
+        };
+        ChildExecutionPolicyV1::new(ChildExecutionPolicyV1Input {
+            policy_revision,
+            provider: Some("openai".to_string()),
+            model: Some(model.to_string()),
+            reasoning_preference: Some(ReasoningPreference::explicit(effort).unwrap()),
+            backend_reasoning_policy: Some(
+                BackendReasoningPolicyV1::new(BackendReasoningSource::ChildAdmission, resolution)
+                    .unwrap(),
+            ),
+            catalog_revision: Some("catalog-test".to_string()),
+            tools_profile: "default".to_string(),
+            sandbox_profile: "workspace-write".to_string(),
+            timeout_ms: 300_000,
+            heartbeat_timeout_ms: 60_000,
+            max_attempts: 3,
+            token_or_cost_budget: None,
+            delegation_limit: None,
+            result_contract: "child-result-envelope-v1".to_string(),
+        })
+        .unwrap()
+    }
+
     fn write_deterministic_source(root: &Path) -> AgentSource {
         let home = root.join(".openclaw");
         let workspace = root.join("workspace");
@@ -667,6 +812,36 @@ mod tests {
                   "parentAgentId": "main",
                   "status": "queued",
                   "task": "continue research"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        AgentSource::with_workspace(home, workspace)
+    }
+
+    fn write_heterogeneous_subagent_source(root: &Path) -> AgentSource {
+        let home = root.join(".openclaw");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(home.join("subagents")).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            home.join("subagents").join("runs.json"),
+            r#"{
+              "runs": [
+                {
+                  "id": "queued-1",
+                  "agentId": "researcher",
+                  "parentAgentId": "main",
+                  "status": "queued",
+                  "task": "continue research"
+                },
+                {
+                  "id": "queued-2",
+                  "agentId": "coder",
+                  "parentAgentId": "main",
+                  "status": "queued",
+                  "task": "continue implementation"
                 }
               ]
             }"#,

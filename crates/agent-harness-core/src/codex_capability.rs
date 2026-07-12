@@ -5,6 +5,7 @@ use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const CODEX_CAPABILITY_PROOF_SCHEMA_VERSION: u32 = 1;
+pub(crate) const CODEX_LIVE_MODEL_CATALOG_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,6 +53,7 @@ pub(crate) struct LiveModelCapability {
 }
 
 impl LiveModelCapability {
+    #[cfg(test)]
     pub(crate) fn supports(&self, effort: &str) -> bool {
         self.advertised_effort(effort).is_some()
     }
@@ -66,6 +68,59 @@ impl LiveModelCapability {
             .find(|advertised| advertised.eq_ignore_ascii_case(effort))
             .map(String::as_str)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LiveModelCatalogObservationV1 {
+    pub(crate) schema_version: u32,
+    pub(crate) model_id: String,
+    pub(crate) model: String,
+    pub(crate) advertised_default_effort: String,
+    pub(crate) advertised_efforts: Vec<String>,
+    pub(crate) page_count: usize,
+    pub(crate) catalog_digest: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveModelCatalogDigestProjection<'a> {
+    schema_version: u32,
+    model_id: &'a str,
+    model: &'a str,
+    advertised_default_effort: &'a str,
+    advertised_efforts: &'a [String],
+    page_count: usize,
+}
+
+pub(crate) fn build_live_model_catalog_observation(
+    live: &LiveModelCapability,
+) -> Result<LiveModelCatalogObservationV1, CodexCapabilityError> {
+    let mut advertised_efforts = live.supported_reasoning_efforts.clone();
+    advertised_efforts.sort_by_key(|effort| effort.to_ascii_lowercase());
+    let projection = LiveModelCatalogDigestProjection {
+        schema_version: CODEX_LIVE_MODEL_CATALOG_SCHEMA_VERSION,
+        model_id: &live.model_id,
+        model: &live.model,
+        advertised_default_effort: &live.default_reasoning_effort,
+        advertised_efforts: &advertised_efforts,
+        page_count: live.page_count,
+    };
+    let canonical = serde_json::to_vec(&projection).map_err(|error| {
+        CodexCapabilityError::CatalogSerialization {
+            reason: error.to_string(),
+        }
+    })?;
+    let catalog_digest = format!("sha256:{}", hex_lower(digest(&SHA256, &canonical).as_ref()));
+    Ok(LiveModelCatalogObservationV1 {
+        schema_version: CODEX_LIVE_MODEL_CATALOG_SCHEMA_VERSION,
+        model_id: live.model_id.clone(),
+        model: live.model.clone(),
+        advertised_default_effort: live.default_reasoning_effort.clone(),
+        advertised_efforts,
+        page_count: live.page_count,
+        catalog_digest,
+    })
 }
 
 #[derive(Debug)]
@@ -568,6 +623,9 @@ pub(crate) enum CodexCapabilityError {
     ProofSerialization {
         reason: String,
     },
+    CatalogSerialization {
+        reason: String,
+    },
 }
 
 impl fmt::Display for CodexCapabilityError {
@@ -635,6 +693,12 @@ impl fmt::Display for CodexCapabilityError {
             }
             Self::ProofSerialization { reason } => {
                 write!(formatter, "failed to serialize capability proof: {reason}")
+            }
+            Self::CatalogSerialization { reason } => {
+                write!(
+                    formatter,
+                    "failed to serialize live model catalog: {reason}"
+                )
             }
         }
     }
@@ -896,5 +960,81 @@ mod tests {
         let reordered_proof = build_same_connection_proof(&context, &reordered, "max").unwrap();
         assert_eq!(first_proof.proof_digest, reordered_proof.proof_digest);
         assert!(first_proof.proof_digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn live_model_catalog_digest_is_stable_across_advertised_effort_order() {
+        let first = LiveModelCapability {
+            model_id: "picker-sol".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            default_reasoning_effort: "max".to_string(),
+            supported_reasoning_efforts: vec![
+                "ultra".to_string(),
+                "xhigh".to_string(),
+                "max".to_string(),
+            ],
+            page_count: 2,
+        };
+        let mut reordered = first.clone();
+        reordered.supported_reasoning_efforts.reverse();
+
+        let first_observation = build_live_model_catalog_observation(&first).unwrap();
+        let reordered_observation = build_live_model_catalog_observation(&reordered).unwrap();
+
+        assert_eq!(first_observation, reordered_observation);
+        assert_eq!(
+            first_observation.advertised_efforts,
+            vec!["max", "ultra", "xhigh"]
+        );
+        assert!(first_observation.catalog_digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn live_model_catalog_digest_changes_for_each_catalog_capability_field() {
+        let live = LiveModelCapability {
+            model_id: "picker-sol".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            default_reasoning_effort: "max".to_string(),
+            supported_reasoning_efforts: vec!["max".to_string(), "ultra".to_string()],
+            page_count: 2,
+        };
+        let baseline = build_live_model_catalog_observation(&live)
+            .unwrap()
+            .catalog_digest;
+        let drifted = [
+            LiveModelCapability {
+                model_id: "picker-sol-v2".to_string(),
+                ..live.clone()
+            },
+            LiveModelCapability {
+                model: "gpt-5.6-sol-v2".to_string(),
+                ..live.clone()
+            },
+            LiveModelCapability {
+                default_reasoning_effort: "ultra".to_string(),
+                ..live.clone()
+            },
+            LiveModelCapability {
+                supported_reasoning_efforts: vec![
+                    "max".to_string(),
+                    "ultra".to_string(),
+                    "frontier".to_string(),
+                ],
+                ..live.clone()
+            },
+            LiveModelCapability {
+                page_count: 3,
+                ..live.clone()
+            },
+        ];
+
+        for capability in drifted {
+            assert_ne!(
+                baseline,
+                build_live_model_catalog_observation(&capability)
+                    .unwrap()
+                    .catalog_digest
+            );
+        }
     }
 }

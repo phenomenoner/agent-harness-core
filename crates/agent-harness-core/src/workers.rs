@@ -17,7 +17,9 @@ use crate::{
     SkillLearningProposalOperation, SkillLearningProposalStatus, SkillLearningSignal,
     SkillProposeOptions, SkillSynthesisOptions, append_harness_log,
     append_self_improvement_notification, apply_skill_proposal,
-    build_self_improvement_replacement_body, collect_cron_run_summary,
+    build_self_improvement_replacement_body,
+    child_execution_policy::ChildExecutionPolicyV1,
+    collect_cron_run_summary,
     config::{
         HarnessConfigValidationReport, HarnessConfigValidationStatus, validate_harness_config,
     },
@@ -45,6 +47,8 @@ const WORKER_REAP_SCHEMA: &str = "agent-harness.worker-reap-stale.v1";
 const WORKER_CANCEL_SCHEMA: &str = "agent-harness.worker-cancel.v1";
 const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const SHELL_OUTPUT_CAP_BYTES: usize = 16 * 1024;
+const INVALID_STORED_CHILD_POLICY_CODE: &str = "worker.invalid-stored-child-policy";
+const INVALID_STORED_CHILD_POLICY_REASON: &str = "stored child execution policy failed validation";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerEnqueueOptions {
@@ -67,6 +71,12 @@ pub struct WorkerEnqueueOptions {
     pub rate_key: Option<String>,
     pub concurrency_group_key: Option<String>,
     pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerEnqueueOptionsV2 {
+    pub options: WorkerEnqueueOptions,
+    pub child_policy: Option<ChildExecutionPolicyV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -346,6 +356,8 @@ pub struct WorkerJob {
     pub wake_policy: Option<Value>,
     pub source: Option<String>,
     pub payload: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_policy: Option<ChildExecutionPolicyV1>,
     pub idempotency_key: Option<String>,
     pub priority: i64,
     pub available_at_ms: i64,
@@ -407,21 +419,49 @@ pub fn init_worker_store(harness_home: impl AsRef<Path>) -> io::Result<PathBuf> 
 }
 
 pub fn enqueue_worker_job(options: WorkerEnqueueOptions) -> io::Result<WorkerEnqueueReport> {
+    enqueue_worker_job_v2(WorkerEnqueueOptionsV2 {
+        options,
+        child_policy: None,
+    })
+}
+
+pub fn enqueue_worker_job_v2(options: WorkerEnqueueOptionsV2) -> io::Result<WorkerEnqueueReport> {
+    let WorkerEnqueueOptionsV2 {
+        options,
+        child_policy,
+    } = options;
+    let child_policy_json = child_policy
+        .as_ref()
+        .map(|policy| {
+            policy.validate().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid child execution policy: {error}"),
+                )
+            })?;
+            serde_json::to_string(policy).map_err(io::Error::other)
+        })
+        .transpose()?;
     let db_file = init_worker_store(&options.harness_home)?;
     let conn = Connection::open(&db_file).map_err(io::Error::other)?;
+    quarantine_invalid_stored_child_policies(&conn, options.now_ms)?;
     let lane = options
         .lane
         .clone()
         .unwrap_or_else(|| options.kind.default_lane().to_string());
     let idempotency_key = options.idempotency_key.clone().unwrap_or_else(|| {
-        let stable = format!(
+        let legacy_stable = format!(
             "{}\n{}\n{}\n{}\n{}",
             options.kind.as_str(),
             lane,
             options.parent_job_id.as_deref().unwrap_or(""),
             options.source.as_deref().unwrap_or(""),
-            options.payload
+            options.payload,
         );
+        let stable = child_policy_json
+            .as_deref()
+            .map(|policy| format!("{legacy_stable}\n{policy}"))
+            .unwrap_or(legacy_stable);
         format!("auto:{}", fnv1a_64_hex(&stable))
     });
 
@@ -462,8 +502,8 @@ pub fn enqueue_worker_job(options: WorkerEnqueueOptions) -> io::Result<WorkerEnq
             lease_owner, lease_expires_at_ms, attempt, max_attempts,
             timeout_ms, cascade_timeout_ms, rate_key, concurrency_group_key,
             audit_path, result_json, artifact_refs_json, created_at_ms,
-            updated_at_ms, finished_at_ms
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, NULL, 0, ?15, ?16, ?17, ?18, ?19, NULL, NULL, NULL, ?20, ?20, NULL)",
+            updated_at_ms, finished_at_ms, child_policy_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, NULL, 0, ?15, ?16, ?17, ?18, ?19, NULL, NULL, NULL, ?20, ?20, NULL, ?21)",
         params![
             job_id,
             options.kind.as_str(),
@@ -487,6 +527,7 @@ pub fn enqueue_worker_job(options: WorkerEnqueueOptions) -> io::Result<WorkerEnq
             options.rate_key,
             options.concurrency_group_key,
             options.now_ms,
+            child_policy_json,
         ],
     )
     .map_err(io::Error::other)?;
@@ -514,6 +555,7 @@ pub fn enqueue_worker_job(options: WorkerEnqueueOptions) -> io::Result<WorkerEnq
 pub fn run_worker_once(options: WorkerRunOnceOptions) -> io::Result<WorkerRunOnceReport> {
     let db_file = init_worker_store(&options.harness_home)?;
     let conn = Connection::open(&db_file).map_err(io::Error::other)?;
+    quarantine_invalid_stored_child_policies(&conn, options.now_ms)?;
     reconcile_runtime_queued_jobs(&options.harness_home, &conn, options.now_ms)?;
     let config = load_worker_dispatch_config(&options.harness_home)?;
     let (job, blocked) = lease_next_job(
@@ -816,6 +858,7 @@ pub fn reap_stale_worker_jobs(
 ) -> io::Result<WorkerReapStaleReport> {
     let db_file = init_worker_store(&options.harness_home)?;
     let conn = Connection::open(&db_file).map_err(io::Error::other)?;
+    quarantine_invalid_stored_child_policies(&conn, options.now_ms)?;
     let mut expired_jobs = 0;
     let mut retryable_jobs = 0;
     let mut terminal_jobs = 0;
@@ -1024,6 +1067,7 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
             wake_policy_json TEXT,
             source TEXT,
             payload_json TEXT NOT NULL,
+            child_policy_json TEXT,
             idempotency_key TEXT NOT NULL UNIQUE,
             priority INTEGER NOT NULL DEFAULT 0,
             available_at_ms INTEGER NOT NULL,
@@ -1059,7 +1103,20 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
         );
         INSERT OR REPLACE INTO meta(key, value) VALUES ('schema', 'agent-harness.worker-store.v1');
         ",
-    )
+    )?;
+    ensure_child_policy_column(conn)
+}
+
+fn ensure_child_policy_column(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(jobs)")?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == "child_policy_json" {
+            return Ok(());
+        }
+    }
+    conn.execute("ALTER TABLE jobs ADD COLUMN child_policy_json TEXT", [])?;
+    Ok(())
 }
 
 fn find_job_by_idempotency(
@@ -1137,16 +1194,95 @@ fn pending_candidates(
         "SELECT * FROM jobs WHERE status IN ('pending','failed-retryable') AND available_at_ms <= ?1 ORDER BY priority DESC, available_at_ms ASC, created_at_ms ASC LIMIT 100"
     };
     let mut stmt = conn.prepare(sql).map_err(io::Error::other)?;
-    let rows = if let Some(lane) = lane_filter {
-        stmt.query_map(params![now_ms, lane], row_to_job)
-            .map_err(io::Error::other)?
-            .collect::<Result<Vec<_>, _>>()
+    let mut rows = if let Some(lane) = lane_filter {
+        stmt.query(params![now_ms, lane])
     } else {
-        stmt.query_map(params![now_ms], row_to_job)
-            .map_err(io::Error::other)?
-            .collect::<Result<Vec<_>, _>>()
+        stmt.query(params![now_ms])
+    }
+    .map_err(io::Error::other)?;
+    let mut candidates = Vec::new();
+    let mut invalid_child_policy_job_ids = Vec::new();
+    while let Some(row) = rows.next().map_err(io::Error::other)? {
+        let job_id: String = row.get("job_id").map_err(io::Error::other)?;
+        let child_policy_text: Option<String> =
+            row.get("child_policy_json").map_err(io::Error::other)?;
+        if stored_child_policy_is_invalid(child_policy_text.as_deref()) {
+            invalid_child_policy_job_ids.push(job_id);
+            continue;
+        }
+        candidates.push(row_to_job(row).map_err(io::Error::other)?);
+    }
+    drop(rows);
+    drop(stmt);
+
+    for job_id in invalid_child_policy_job_ids {
+        quarantine_invalid_stored_child_policy(conn, &job_id, now_ms)?;
+    }
+    Ok(candidates)
+}
+
+fn stored_child_policy_is_invalid(child_policy_text: Option<&str>) -> bool {
+    child_policy_text
+        .is_some_and(|text| serde_json::from_str::<ChildExecutionPolicyV1>(text).is_err())
+}
+
+fn quarantine_invalid_stored_child_policies(conn: &Connection, now_ms: i64) -> io::Result<usize> {
+    let invalid_job_ids = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT job_id, child_policy_json FROM jobs WHERE child_policy_json IS NOT NULL",
+            )
+            .map_err(io::Error::other)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(io::Error::other)?;
+        rows.filter_map(|row| match row {
+            Ok((job_id, policy)) if stored_child_policy_is_invalid(Some(&policy)) => {
+                Some(Ok(job_id))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(io::Error::other(error))),
+        })
+        .collect::<io::Result<Vec<_>>>()?
     };
-    rows.map_err(io::Error::other)
+    for job_id in &invalid_job_ids {
+        quarantine_invalid_stored_child_policy(conn, job_id, now_ms)?;
+    }
+    Ok(invalid_job_ids.len())
+}
+
+fn quarantine_invalid_stored_child_policy(
+    conn: &Connection,
+    job_id: &str,
+    now_ms: i64,
+) -> io::Result<()> {
+    let result = json!({
+        "status": WorkerJobStatus::FailedTerminal.as_str(),
+        "failureCode": INVALID_STORED_CHILD_POLICY_CODE,
+        "reason": INVALID_STORED_CHILD_POLICY_REASON,
+        "quarantined": true,
+    });
+    conn.execute(
+        "UPDATE jobs SET
+            child_policy_json=NULL,
+            status=CASE WHEN status IN ('succeeded','failed-terminal','canceled','expired') THEN status ELSE ?1 END,
+            lease_owner=NULL,
+            lease_expires_at_ms=NULL,
+            result_json=CASE WHEN status IN ('succeeded','failed-terminal','canceled','expired') THEN result_json ELSE ?2 END,
+            updated_at_ms=?3,
+            finished_at_ms=CASE WHEN status IN ('succeeded','failed-terminal','canceled','expired') THEN finished_at_ms ELSE ?3 END
+         WHERE job_id=?4 AND child_policy_json IS NOT NULL",
+        params![
+            WorkerJobStatus::FailedTerminal.as_str(),
+            result.to_string(),
+            now_ms,
+            job_id,
+        ],
+    )
+    .map_err(io::Error::other)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1184,7 +1320,7 @@ fn capacity_blocker(
         }
     }
     if let Some(channel_key) = worker_channel_key(job) {
-        let executing_channel = executing_channel_count(conn, &channel_key)?;
+        let executing_channel = executing_channel_count(conn, &channel_key, now_ms)?;
         if executing_channel >= config.channel_concurrency_limit {
             return Ok(Some(CapacityBlocker::Channel));
         }
@@ -1215,15 +1351,17 @@ fn blocked_summary(
     Ok(summary)
 }
 
-fn executing_channel_count(conn: &Connection, channel_key: &str) -> io::Result<usize> {
-    let mut stmt = conn
-        .prepare("SELECT * FROM jobs WHERE status IN ('leased','running')")
-        .map_err(io::Error::other)?;
-    let rows = stmt
-        .query_map([], row_to_job)
-        .map_err(io::Error::other)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(io::Error::other)?;
+fn executing_channel_count(conn: &Connection, channel_key: &str, now_ms: i64) -> io::Result<usize> {
+    let rows = {
+        let mut stmt = conn
+            .prepare("SELECT * FROM jobs WHERE status IN ('leased','running')")
+            .map_err(io::Error::other)?;
+        stmt.query_map([], row_to_job_tolerating_invalid_child_policy)
+            .map_err(io::Error::other)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(io::Error::other)?
+    };
+    let rows = resolve_tolerant_worker_rows(conn, rows, now_ms, false)?;
     Ok(rows
         .iter()
         .filter(|job| worker_channel_key(job).as_deref() == Some(channel_key))
@@ -1841,6 +1979,10 @@ fn queue_llm_worker_turn(
         .or_else(|| int_path(&job.payload, "scheduled_for_ms"));
     let channel_id = string_path(&job.payload, "channelId").unwrap_or("worker");
     let user_id = string_path(&job.payload, "userId").unwrap_or("worker-dispatch");
+    let managed_child_policy = job
+        .child_policy
+        .as_ref()
+        .filter(|policy| policy.is_managed_route());
     let queue_dir = harness_home.join("state").join("runtime-queue");
     fs::create_dir_all(&queue_dir)?;
     let queue_file = queue_dir.join("pending.jsonl");
@@ -1885,10 +2027,20 @@ fn queue_llm_worker_turn(
         inbound_context: string_path(&job.payload, "inboundContext").map(ToString::to_string),
         inbound_canonical_id: None,
         inbound_media_artifacts: Vec::new(),
-        provider: string_path(&job.payload, "provider").map(ToString::to_string),
-        model: string_path(&job.payload, "model").map(ToString::to_string),
-        reasoning_preference: None,
-        backend_reasoning_policy: None,
+        provider: managed_child_policy
+            .and_then(ChildExecutionPolicyV1::provider)
+            .map(ToString::to_string)
+            .or_else(|| string_path(&job.payload, "provider").map(ToString::to_string)),
+        model: managed_child_policy
+            .and_then(ChildExecutionPolicyV1::model)
+            .map(ToString::to_string)
+            .or_else(|| string_path(&job.payload, "model").map(ToString::to_string)),
+        reasoning_preference: managed_child_policy
+            .and_then(ChildExecutionPolicyV1::reasoning_preference)
+            .cloned(),
+        backend_reasoning_policy: managed_child_policy
+            .and_then(ChildExecutionPolicyV1::backend_reasoning_policy)
+            .cloned(),
         prompt_files_present: 0,
         prompt_files_total: 0,
         selected_skill_ids: Vec::new(),
@@ -2070,7 +2222,7 @@ fn run_watchdog_job(
                 "watchdog job requires jobGroupId or job_group_id",
             )
         })?;
-    let children = group_children(conn, group_id, &job.job_id)?;
+    let children = group_children(conn, group_id, &job.job_id, now_ms)?;
     let policy = job
         .wake_policy
         .clone()
@@ -2460,31 +2612,84 @@ fn runtime_queue_id_from_worker_job(job: &WorkerJob) -> Option<&str> {
 }
 
 fn jobs_with_expired_leases(conn: &Connection, now_ms: i64) -> io::Result<Vec<WorkerJob>> {
-    let mut stmt = conn
-        .prepare("SELECT * FROM jobs WHERE status IN ('leased','running') AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms < ?1")
-        .map_err(io::Error::other)?;
-    stmt.query_map(params![now_ms], row_to_job)
-        .map_err(io::Error::other)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(io::Error::other)
+    let rows = {
+        let mut stmt = conn
+            .prepare("SELECT * FROM jobs WHERE status IN ('leased','running') AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms < ?1")
+            .map_err(io::Error::other)?;
+        stmt.query_map(params![now_ms], row_to_job_tolerating_invalid_child_policy)
+            .map_err(io::Error::other)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(io::Error::other)?
+    };
+    resolve_tolerant_worker_rows(conn, rows, now_ms, false)
 }
 
-fn group_children(conn: &Connection, group_id: &str, self_id: &str) -> io::Result<Vec<WorkerJob>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT * FROM jobs WHERE job_group_id=?1 AND job_id<>?2 ORDER BY created_at_ms ASC",
+fn group_children(
+    conn: &Connection,
+    group_id: &str,
+    self_id: &str,
+    now_ms: i64,
+) -> io::Result<Vec<WorkerJob>> {
+    let rows = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT * FROM jobs WHERE job_group_id=?1 AND job_id<>?2 ORDER BY created_at_ms ASC",
+            )
+            .map_err(io::Error::other)?;
+        stmt.query_map(
+            params![group_id, self_id],
+            row_to_job_tolerating_invalid_child_policy,
         )
-        .map_err(io::Error::other)?;
-    stmt.query_map(params![group_id, self_id], row_to_job)
         .map_err(io::Error::other)?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(io::Error::other)
+        .map_err(io::Error::other)?
+    };
+    resolve_tolerant_worker_rows(conn, rows, now_ms, true)
+}
+
+enum TolerantWorkerRow {
+    Job(WorkerJob),
+    InvalidChildPolicy(String),
+}
+
+fn row_to_job_tolerating_invalid_child_policy(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<TolerantWorkerRow> {
+    let job_id: String = row.get("job_id")?;
+    let child_policy_text: Option<String> = row.get("child_policy_json")?;
+    if stored_child_policy_is_invalid(child_policy_text.as_deref()) {
+        Ok(TolerantWorkerRow::InvalidChildPolicy(job_id))
+    } else {
+        row_to_job(row).map(TolerantWorkerRow::Job)
+    }
+}
+
+fn resolve_tolerant_worker_rows(
+    conn: &Connection,
+    rows: Vec<TolerantWorkerRow>,
+    now_ms: i64,
+    include_quarantined: bool,
+) -> io::Result<Vec<WorkerJob>> {
+    let mut jobs = Vec::with_capacity(rows.len());
+    for row in rows {
+        match row {
+            TolerantWorkerRow::Job(job) => jobs.push(job),
+            TolerantWorkerRow::InvalidChildPolicy(job_id) => {
+                quarantine_invalid_stored_child_policy(conn, &job_id, now_ms)?;
+                if include_quarantined && let Some(job) = find_job_by_id(conn, &job_id)? {
+                    jobs.push(job);
+                }
+            }
+        }
+    }
+    Ok(jobs)
 }
 
 fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerJob> {
     let kind_text: String = row.get("kind")?;
     let status_text: String = row.get("status")?;
     let payload_text: String = row.get("payload_json")?;
+    let child_policy_text: Option<String> = row.get("child_policy_json")?;
     let wake_policy_text: Option<String> = row.get("wake_policy_json")?;
     let result_text: Option<String> = row.get("result_json")?;
     let artifact_refs_text: Option<String> = row.get("artifact_refs_json")?;
@@ -2506,6 +2711,17 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerJob> {
         wake_policy: wake_policy_text.and_then(|text| serde_json::from_str(&text).ok()),
         source: row.get("source")?,
         payload: serde_json::from_str(&payload_text).unwrap_or(Value::Null),
+        child_policy: child_policy_text
+            .map(|text| {
+                serde_json::from_str(&text).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })
+            .transpose()?,
         idempotency_key: row.get("idempotency_key")?,
         priority: row.get("priority")?,
         available_at_ms: row.get("available_at_ms")?,
@@ -2833,6 +3049,14 @@ fn epoch_ms() -> io::Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend_reasoning::{
+        BackendReasoningPolicyV1, BackendReasoningSource, ReasoningPreference,
+    };
+    use crate::child_execution_policy::{ChildExecutionPolicyV1, ChildExecutionPolicyV1Input};
+    use crate::model_catalog::{
+        REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION, ReasoningResolutionReceipt,
+        ReasoningResolutionStatus,
+    };
 
     const DEFAULT_LEASE_MS: i64 = 300_000;
 
@@ -2865,6 +3089,25 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn child_policy_column_migration_is_additive_and_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE jobs (job_id TEXT PRIMARY KEY)", [])
+            .unwrap();
+
+        ensure_child_policy_column(&conn).unwrap();
+        ensure_child_policy_column(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('jobs') WHERE name='child_policy_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -3119,6 +3362,244 @@ mod tests {
         let updated = runs.runs.first().unwrap();
         assert_eq!(updated.status, crate::CronRunStatus::RuntimeEnqueued);
         assert!(updated.runtime_queue_id.is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn child_policy_preserves_heterogeneous_sibling_routes_in_runtime_queue() {
+        let root = temp_root("child_policy_preserves_heterogeneous_sibling_routes");
+        let harness_home = root.join(".agent-harness");
+        let source = root.join("source");
+        let workspace = source.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let sol_policy = managed_child_policy(1, "openai", "gpt-5.6-sol", "max");
+        let terra_policy = managed_child_policy(2, "openai", "gpt-5.6-terra", "ultra");
+        let mut sol = llm_options(&harness_home, &source, &workspace, "sol-child", 1000);
+        sol.rate_key = None;
+        sol.payload["provider"] = json!("late-bound-provider");
+        sol.payload["model"] = json!("late-bound-model");
+        let mut terra = llm_options(&harness_home, &source, &workspace, "terra-child", 1001);
+        terra.rate_key = None;
+        terra.payload["provider"] = json!("late-bound-provider");
+        terra.payload["model"] = json!("late-bound-model");
+
+        let sol_job = enqueue_worker_job_with_policy(sol, sol_policy.clone()).job;
+        let terra_job = enqueue_worker_job_with_policy(terra, terra_policy.clone()).job;
+        assert_eq!(sol_job.child_policy.as_ref(), Some(&sol_policy));
+        assert_eq!(terra_job.child_policy.as_ref(), Some(&terra_policy));
+
+        for now_ms in [1002, 1003] {
+            let run = run_worker_once(WorkerRunOnceOptions {
+                harness_home: harness_home.clone(),
+                lane: Some("llm".to_string()),
+                worker_id: format!("test-worker-{now_ms}"),
+                lease_ms: DEFAULT_LEASE_MS,
+                now_ms,
+            })
+            .unwrap();
+            assert_eq!(run.status, WorkerRunOnceStatus::Dispatched);
+        }
+
+        let queued = runtime_queue_values(&harness_home);
+        assert_eq!(queued.len(), 2);
+        assert_runtime_route(&queued, "session-sol-child", "gpt-5.6-sol", "max");
+        assert_runtime_route(&queued, "session-terra-child", "gpt-5.6-terra", "ultra");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn child_policy_snapshot_overrides_later_payload_model_change() {
+        let root = temp_root("child_policy_snapshot_overrides_later_payload_model_change");
+        let harness_home = root.join(".agent-harness");
+        let source = root.join("source");
+        let workspace = source.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let policy = managed_child_policy(7, "openai", "gpt-5.6-sol", "max");
+        let mut options = llm_options(&harness_home, &source, &workspace, "immutable", 1000);
+        options.rate_key = None;
+        let report = enqueue_worker_job_with_policy(options, policy.clone());
+
+        let mut duplicate = llm_options(&harness_home, &source, &workspace, "immutable", 1001);
+        duplicate.payload["provider"] = json!("other-provider");
+        duplicate.payload["model"] = json!("other-model");
+        let duplicate = enqueue_worker_job_with_policy(
+            duplicate,
+            managed_child_policy(8, "openai", "gpt-5.6-terra", "ultra"),
+        );
+        assert!(!duplicate.inserted);
+        assert_eq!(duplicate.job.child_policy.as_ref(), Some(&policy));
+
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        let changed_payload = json!({
+            "sourceHome": source,
+            "sourceWorkspace": workspace,
+            "agentId": "main",
+            "sessionKey": "session-immutable",
+            "messageText": "run immutable",
+            "provider": "other-provider",
+            "model": "other-model"
+        });
+        conn.execute(
+            "UPDATE jobs SET payload_json=?1 WHERE job_id=?2",
+            params![changed_payload.to_string(), report.job.job_id],
+        )
+        .unwrap();
+
+        let run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("llm".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1001,
+        })
+        .unwrap();
+        assert_eq!(run.status, WorkerRunOnceStatus::Dispatched);
+        assert_eq!(run.job.unwrap().child_policy, Some(policy));
+        assert_runtime_route(
+            &runtime_queue_values(&harness_home),
+            "session-immutable",
+            "gpt-5.6-sol",
+            "max",
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn child_policy_snapshot_survives_retry_and_payload_repair() {
+        let root = temp_root("child_policy_snapshot_survives_retry_and_payload_repair");
+        let harness_home = root.join(".agent-harness");
+        let source = root.join("source");
+        let workspace = source.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let policy = managed_child_policy(11, "openai", "gpt-5.6-terra", "ultra");
+        let mut options = llm_options(&harness_home, &source, &workspace, "retry", 1000);
+        options.payload = json!({
+            "agentId": "main",
+            "sessionKey": "session-retry",
+            "messageText": "run retry"
+        });
+        options.rate_key = None;
+        let report = enqueue_worker_job_with_policy(options, policy.clone());
+
+        let failed = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("llm".to_string()),
+            worker_id: "test-worker-first".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1001,
+        })
+        .unwrap();
+        assert_eq!(failed.status, WorkerRunOnceStatus::Rescheduled);
+        assert_eq!(failed.job.unwrap().child_policy, Some(policy.clone()));
+
+        let repaired_payload = json!({
+            "sourceHome": source,
+            "sourceWorkspace": workspace,
+            "agentId": "main",
+            "sessionKey": "session-retry",
+            "messageText": "run retry",
+            "provider": "other-provider",
+            "model": "other-model"
+        });
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        conn.execute(
+            "UPDATE jobs SET payload_json=?1 WHERE job_id=?2",
+            params![repaired_payload.to_string(), report.job.job_id],
+        )
+        .unwrap();
+
+        let retried = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("llm".to_string()),
+            worker_id: "test-worker-second".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 3001,
+        })
+        .unwrap();
+        assert_eq!(retried.status, WorkerRunOnceStatus::Dispatched);
+        assert_eq!(retried.job.unwrap().child_policy, Some(policy));
+        assert_runtime_route(
+            &runtime_queue_values(&harness_home),
+            "session-retry",
+            "gpt-5.6-terra",
+            "ultra",
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_persisted_child_policy_is_terminalized_without_blocking_healthy_work() {
+        let root = temp_root(
+            "invalid_persisted_child_policy_is_terminalized_without_blocking_healthy_work",
+        );
+        let harness_home = root.join(".agent-harness");
+        let source = root.join("source");
+        let workspace = source.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let mut invalid = llm_options(&harness_home, &source, &workspace, "invalid-policy", 1000);
+        invalid.rate_key = None;
+        let invalid_report = enqueue_worker_job_with_policy(
+            invalid,
+            managed_child_policy(1, "openai", "gpt-5.6-sol", "max"),
+        );
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        conn.execute(
+            "UPDATE jobs SET child_policy_json=?1 WHERE job_id=?2",
+            params!["{not-json", invalid_report.job.job_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut healthy = llm_options(&harness_home, &source, &workspace, "healthy-policy", 1001);
+        healthy.rate_key = None;
+        let healthy_report = enqueue_worker_job_with_policy(
+            healthy,
+            managed_child_policy(2, "openai", "gpt-5.6-sol", "max"),
+        );
+
+        let run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("llm".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1002,
+        })
+        .unwrap();
+        assert_eq!(run.status, WorkerRunOnceStatus::Dispatched);
+        assert_eq!(
+            run.job.as_ref().map(|job| job.job_id.as_str()),
+            Some(healthy_report.job.job_id.as_str())
+        );
+        assert_runtime_route(
+            &runtime_queue_values(&harness_home),
+            "session-healthy-policy",
+            "gpt-5.6-sol",
+            "max",
+        );
+
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        let (status, result_text, child_policy_text): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT status, result_json, child_policy_json FROM jobs WHERE job_id=?1",
+                params![invalid_report.job.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, WorkerJobStatus::FailedTerminal.as_str());
+        assert!(child_policy_text.is_none());
+        let result: Value = serde_json::from_str(&result_text).unwrap();
+        assert_eq!(result["failureCode"], "worker.invalid-stored-child-policy");
+        assert_eq!(
+            result["reason"],
+            "stored child execution policy failed validation"
+        );
+        assert_eq!(result["quarantined"], true);
+        assert!(!result_text.contains("not-json"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4062,6 +4543,87 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn watchdog_quarantines_invalid_group_child_and_wakes_master() {
+        let root = temp_root("watchdog_quarantines_invalid_group_child_and_wakes_master");
+        let harness_home = root.join(".agent-harness");
+        let source = root.join("source");
+        let workspace = source.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let mut child = llm_options(&harness_home, &source, &workspace, "corrupt-child", 1000);
+        child.job_group_id = Some("group-corrupt".to_string());
+        child.rate_key = None;
+        let child_report = enqueue_worker_job_with_policy(
+            child,
+            managed_child_policy(21, "openai", "gpt-5.6-sol", "max"),
+        );
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        conn.execute(
+            "UPDATE jobs SET child_policy_json=?1 WHERE job_id=?2",
+            params!["{malformed", child_report.job.job_id],
+        )
+        .unwrap();
+        let grouped = group_children(&conn, "group-corrupt", "not-a-child", 1001).unwrap();
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].status, WorkerJobStatus::FailedTerminal);
+        assert!(grouped[0].child_policy.is_none());
+        drop(conn);
+
+        enqueue_worker_job(WorkerEnqueueOptions {
+            harness_home: harness_home.clone(),
+            kind: WorkerJobKind::Watchdog,
+            lane: Some("watchdog".to_string()),
+            payload: json!({
+                "sourceHome": source,
+                "sourceWorkspace": workspace,
+                "masterAgentId": "main",
+                "masterSessionKey": "master-session"
+            }),
+            idempotency_key: Some("watchdog-corrupt".to_string()),
+            parent_job_id: None,
+            job_group_id: Some("group-corrupt".to_string()),
+            master_agent_id: Some("main".to_string()),
+            master_session_key: Some("master-session".to_string()),
+            wake_policy: Some(json!({"mode":"all_completed"})),
+            source: Some("test".to_string()),
+            priority: 10,
+            available_at_ms: Some(1002),
+            max_attempts: 3,
+            timeout_ms: Some(DEFAULT_TIMEOUT_MS),
+            cascade_timeout_ms: None,
+            rate_key: None,
+            concurrency_group_key: Some("watchdog-group-corrupt".to_string()),
+            now_ms: 1002,
+        })
+        .unwrap();
+
+        let run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("watchdog".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1003,
+        })
+        .unwrap();
+        assert_eq!(run.status, WorkerRunOnceStatus::Completed);
+
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        let (status, policy): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, child_policy_json FROM jobs WHERE job_id=?1",
+                params![child_report.job.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, WorkerJobStatus::FailedTerminal.as_str());
+        assert!(policy.is_none());
+        let status = collect_worker_status(WorkerStatusOptions { harness_home }).unwrap();
+        assert_eq!(status.totals.pending, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn shell_options(harness_home: &Path, key: &str, now_ms: i64) -> WorkerEnqueueOptions {
         WorkerEnqueueOptions {
             harness_home: harness_home.to_path_buf(),
@@ -4120,6 +4682,93 @@ mod tests {
             concurrency_group_key: Some("master:main".to_string()),
             now_ms,
         }
+    }
+
+    fn managed_child_policy(
+        policy_revision: u64,
+        provider: &str,
+        model: &str,
+        effort: &str,
+    ) -> ChildExecutionPolicyV1 {
+        ChildExecutionPolicyV1::new(ChildExecutionPolicyV1Input {
+            policy_revision,
+            provider: Some(provider.to_string()),
+            model: Some(model.to_string()),
+            reasoning_preference: Some(ReasoningPreference::explicit(effort).unwrap()),
+            backend_reasoning_policy: Some(
+                BackendReasoningPolicyV1::new(
+                    BackendReasoningSource::ChildAdmission,
+                    ReasoningResolutionReceipt {
+                        schema_version: REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION,
+                        requested_provider: provider.to_string(),
+                        requested_model: model.to_string(),
+                        effective_provider: Some(provider.to_string()),
+                        effective_model: Some(model.to_string()),
+                        requested_effort: effort.to_string(),
+                        effective_effort: Some(effort.to_string()),
+                        catalog_effective_effort: Some(effort.to_string()),
+                        catalog_revision: Some("catalog-test".to_string()),
+                        status: ReasoningResolutionStatus::Accepted,
+                        authoritative: true,
+                        reason: "worker child policy test".to_string(),
+                    },
+                )
+                .unwrap(),
+            ),
+            catalog_revision: Some("catalog-test".to_string()),
+            tools_profile: "default".to_string(),
+            sandbox_profile: "workspace-write".to_string(),
+            timeout_ms: 300_000,
+            heartbeat_timeout_ms: 60_000,
+            max_attempts: 3,
+            token_or_cost_budget: None,
+            delegation_limit: None,
+            result_contract: "child-result-envelope-v1".to_string(),
+        })
+        .unwrap()
+    }
+
+    fn enqueue_worker_job_with_policy(
+        options: WorkerEnqueueOptions,
+        child_policy: ChildExecutionPolicyV1,
+    ) -> WorkerEnqueueReport {
+        enqueue_worker_job_v2(WorkerEnqueueOptionsV2 {
+            options,
+            child_policy: Some(child_policy),
+        })
+        .unwrap()
+    }
+
+    fn runtime_queue_values(harness_home: &Path) -> Vec<Value> {
+        fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+    }
+
+    fn assert_runtime_route(values: &[Value], session_key: &str, model: &str, effort: &str) {
+        let item = values
+            .iter()
+            .find(|item| item["sessionKey"] == session_key)
+            .unwrap();
+        assert_eq!(item["provider"], "openai");
+        assert_eq!(item["model"], model);
+        assert_eq!(item["reasoningPreference"]["kind"], "explicit");
+        assert_eq!(item["reasoningPreference"]["effort"], effort);
+        assert_eq!(
+            item["backendReasoningPolicy"]["resolution"]["effectiveModel"],
+            model
+        );
+        assert_eq!(
+            item["backendReasoningPolicy"]["resolution"]["effectiveEffort"],
+            effort
+        );
     }
     fn write_timeout_script(script_dir: &Path) -> PathBuf {
         #[cfg(windows)]

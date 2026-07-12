@@ -148,8 +148,9 @@ pub use channel_state::{
 };
 pub use codex_runtime::{
     AssistantNarrationConfig, AssistantNarrationMode, CodexApprovalPolicy,
-    CodexApprovalPolicyInspection, CodexAssistantNarration, CodexEnvRequirement,
-    CodexInvocationPlan, CodexOutputPlan, CodexProviderConfig, CodexRuntimeCompletionOptions,
+    CodexApprovalPolicyInspection, CodexAssistantNarration,
+    CodexBackendReasoningExecutionReference, CodexEnvRequirement, CodexInvocationPlan,
+    CodexOutputPlan, CodexProviderConfig, CodexRuntimeCompletionOptions,
     CodexRuntimeCompletionReceipt, CodexRuntimeCompletionReport, CodexRuntimeCompletionStatus,
     CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReceipt, CodexRuntimeLaunchProbeReport,
     CodexRuntimeLaunchProbeStatus, CodexRuntimeLaunchProcess, CodexRuntimePlan,
@@ -260,8 +261,8 @@ pub use live_control::{
 pub use logging::{
     HarnessLogEvent, HarnessLogLevel, HarnessLogRotationOptions, HarnessLogRotationReport,
     HarnessLogRotationStatus, HarnessLogWrite, append_harness_log, append_jsonl_value,
-    current_log_time_ms, harness_log_file, probe_harness_log_writable,
-    rotate_harness_log_if_needed, write_json_atomic,
+    append_jsonl_value_once_by_event_key, current_log_time_ms, harness_log_file,
+    probe_harness_log_writable, rotate_harness_log_if_needed, write_json_atomic,
 };
 pub use mcp::{McpRequestOptions, McpToolReceipt, handle_mcp_request};
 pub use media::{
@@ -612,18 +613,19 @@ pub use virtual_session_context::{
 };
 pub use worker_adapters::{
     DeterministicCronWorkerEnqueueOptions, NativeCronWorkerEnqueueOptions,
-    SubagentWorkerEnqueueOptions, WorkerAdapterEnqueueReport, WorkerAdapterEnqueueSummary,
-    WorkerAdapterJobRef, enqueue_deterministic_cron_workers, enqueue_native_cron_workers,
-    enqueue_subagent_workers,
+    SubagentWorkerEnqueueOptions, SubagentWorkerEnqueueOptionsV2, WorkerAdapterEnqueueReport,
+    WorkerAdapterEnqueueSummary, WorkerAdapterJobRef, enqueue_deterministic_cron_workers,
+    enqueue_native_cron_workers, enqueue_subagent_workers, enqueue_subagent_workers_v2,
 };
 pub use workers::{
     WorkerCancelOptions, WorkerCancelReport, WorkerCapacityBlockedSummary, WorkerDispatchConfig,
-    WorkerDownstreamRuntimeStatus, WorkerEnqueueOptions, WorkerEnqueueReport, WorkerJob,
-    WorkerJobExecutionResult, WorkerJobKind, WorkerJobStatus, WorkerLaneStatus,
-    WorkerReapStaleOptions, WorkerReapStaleReport, WorkerRunOnceOptions, WorkerRunOnceReport,
-    WorkerRunOnceStatus, WorkerStatusOptions, WorkerStatusReport, WorkerStatusTotals,
-    cancel_worker_job, collect_worker_status, enqueue_worker_job, init_worker_store,
-    load_worker_dispatch_config, reap_stale_worker_jobs, run_worker_once, worker_db_file,
+    WorkerDownstreamRuntimeStatus, WorkerEnqueueOptions, WorkerEnqueueOptionsV2,
+    WorkerEnqueueReport, WorkerJob, WorkerJobExecutionResult, WorkerJobKind, WorkerJobStatus,
+    WorkerLaneStatus, WorkerReapStaleOptions, WorkerReapStaleReport, WorkerRunOnceOptions,
+    WorkerRunOnceReport, WorkerRunOnceStatus, WorkerStatusOptions, WorkerStatusReport,
+    WorkerStatusTotals, cancel_worker_job, collect_worker_status, enqueue_worker_job,
+    enqueue_worker_job_v2, init_worker_store, load_worker_dispatch_config, reap_stale_worker_jobs,
+    run_worker_once, worker_db_file,
 };
 
 #[cfg(test)]

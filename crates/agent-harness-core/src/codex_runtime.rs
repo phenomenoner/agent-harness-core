@@ -13,14 +13,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::backend_reasoning_execution::{
-    BackendReasoningCapabilitySourceV1, BackendReasoningExecutionEvidenceFieldsV1,
-    BackendReasoningExecutionEvidenceV1, BackendReasoningWireActionV1,
+    BackendReasoningCapabilitySourceV1, BackendReasoningExecutionEvidenceFieldsV2,
+    BackendReasoningExecutionEvidenceV2, BackendReasoningWireActionV1,
 };
 use crate::codex_capability::{
     CacheCapabilitySnapshot, CacheLiveDriftDecision, CapabilityPreference, CodexConfigReadResponse,
     CodexModelListCollector, CodexModelListPage, SameConnectionCapabilityProofV1,
-    SameConnectionProofContext, bind_effective_provider, build_same_connection_proof,
-    decide_cache_live_drift,
+    SameConnectionProofContext, bind_effective_provider, build_live_model_catalog_observation,
+    build_same_connection_proof, decide_cache_live_drift,
 };
 use crate::{
     AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
@@ -608,6 +608,21 @@ pub struct CodexRuntimeRunReceipt {
     pub interruption_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interrupted_tool_uses: Vec<CodexInterruptedToolUse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_reasoning_execution: Option<CodexBackendReasoningExecutionReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexBackendReasoningExecutionReference {
+    pub attempt_id: String,
+    pub intended_wire_action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_wire_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_proof_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1599,6 +1614,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 tool_use_timeout: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: None,
             };
             append_codex_run_log(
                 &options.harness_home,
@@ -1645,6 +1661,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 tool_use_timeout: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: None,
             };
             append_codex_run_log(
                 &options.harness_home,
@@ -1695,6 +1712,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             tool_use_timeout: None,
             interruption_reason: None,
             interrupted_tool_uses: Vec::new(),
+            backend_reasoning_execution: None,
         };
         append_codex_run_log(
             &options.harness_home,
@@ -1749,6 +1767,9 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             tool_use_timeout: None,
             interruption_reason: None,
             interrupted_tool_uses: Vec::new(),
+            backend_reasoning_execution: run_file
+                .as_deref()
+                .and_then(read_prior_backend_reasoning_execution_reference),
         };
         append_codex_run_log(
             &options.harness_home,
@@ -1934,6 +1955,13 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
     )
 }
 
+fn read_prior_backend_reasoning_execution_reference(
+    run_file: &Path,
+) -> Option<CodexBackendReasoningExecutionReference> {
+    let value: Value = serde_json::from_slice(&fs::read(run_file).ok()?).ok()?;
+    serde_json::from_value(value.pointer("/receipt/backendReasoningExecution")?.clone()).ok()
+}
+
 fn finish_codex_runtime_run(
     harness_home: &Path,
     plan: &CodexRuntimePlanFile,
@@ -2035,6 +2063,7 @@ fn finish_codex_runtime_run(
         tool_use_timeout: run_result.tool_use_timeout,
         interruption_reason: run_result.interruption_reason,
         interrupted_tool_uses: run_result.interrupted_tool_uses,
+        backend_reasoning_execution: run_result.backend_reasoning_execution,
     };
     let log_level = match receipt.status {
         CodexRuntimeRunStatus::Completed => HarnessLogLevel::Info,
@@ -2195,6 +2224,7 @@ fn recover_completed_codex_run_from_stdout_log(
                 tool_use_timeout: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                 warnings: state.warnings,
             }));
         }
@@ -2217,6 +2247,7 @@ fn recover_completed_codex_run_from_stdout_log(
         tool_use_timeout: None,
         interruption_reason: None,
         interrupted_tool_uses: Vec::new(),
+        backend_reasoning_execution: state.backend_reasoning_execution.clone(),
         warnings: state.warnings,
     }))
 }
@@ -3334,6 +3365,7 @@ struct CodexAppServerRunResult {
     tool_use_timeout: Option<CodexToolUseTimeout>,
     interruption_reason: Option<String>,
     interrupted_tool_uses: Vec<CodexInterruptedToolUse>,
+    backend_reasoning_execution: Option<CodexBackendReasoningExecutionReference>,
     warnings: Vec<String>,
 }
 
@@ -3536,6 +3568,7 @@ fn drive_codex_app_server(
                 tool_use_timeout: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: None,
                 warnings: Vec::new(),
             });
         }
@@ -3558,6 +3591,7 @@ fn drive_codex_app_server(
             tool_use_timeout: None,
             interruption_reason: None,
             interrupted_tool_uses: Vec::new(),
+            backend_reasoning_execution: None,
             warnings: Vec::new(),
         });
     };
@@ -3579,6 +3613,7 @@ fn drive_codex_app_server(
             tool_use_timeout: None,
             interruption_reason: None,
             interrupted_tool_uses: Vec::new(),
+            backend_reasoning_execution: None,
             warnings: Vec::new(),
         });
     };
@@ -3720,6 +3755,7 @@ fn drive_codex_app_server(
                 tool_use_timeout: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                 warnings: state.warnings,
             });
         }
@@ -3746,6 +3782,7 @@ fn drive_codex_app_server(
                 tool_use_timeout: Some(tool),
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                 warnings: state.warnings,
             });
         }
@@ -3772,6 +3809,7 @@ fn drive_codex_app_server(
                 tool_use_timeout: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                 warnings: state.warnings,
             });
         }
@@ -3798,6 +3836,7 @@ fn drive_codex_app_server(
                 tool_use_timeout: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                 warnings: state.warnings,
             });
         }
@@ -3825,6 +3864,7 @@ fn drive_codex_app_server(
                 tool_use_timeout: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                 warnings: state.warnings,
             });
         }
@@ -3851,6 +3891,7 @@ fn drive_codex_app_server(
                 tool_use_timeout: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                 warnings: state.warnings,
             });
         }
@@ -3930,6 +3971,7 @@ fn drive_codex_app_server(
                     tool_use_timeout: None,
                     interruption_reason: None,
                     interrupted_tool_uses: Vec::new(),
+                    backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                     warnings: state.warnings,
                 });
             }
@@ -3966,6 +4008,7 @@ fn drive_codex_app_server(
                     tool_use_timeout: Some(tool),
                     interruption_reason: None,
                     interrupted_tool_uses: Vec::new(),
+                    backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                     warnings: state.warnings,
                 });
             }
@@ -4003,6 +4046,7 @@ fn drive_codex_app_server(
                     tool_use_timeout: None,
                     interruption_reason: None,
                     interrupted_tool_uses: Vec::new(),
+                    backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                     warnings: state.warnings,
                 });
             }
@@ -4039,6 +4083,7 @@ fn drive_codex_app_server(
                     tool_use_timeout: None,
                     interruption_reason: None,
                     interrupted_tool_uses: Vec::new(),
+                    backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                     warnings: state.warnings,
                 });
             }
@@ -4078,6 +4123,7 @@ fn drive_codex_app_server(
                     tool_use_timeout: None,
                     interruption_reason: None,
                     interrupted_tool_uses: Vec::new(),
+                    backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                     warnings: state.warnings,
                 });
             }
@@ -4101,6 +4147,8 @@ fn drive_codex_app_server(
                     None,
                     None,
                     None,
+                    None,
+                    None,
                     "reasoning-validation-rejected",
                 )
                 .or_else(|_| {
@@ -4113,19 +4161,37 @@ fn drive_codex_app_server(
                         None,
                         None,
                         None,
+                        None,
+                        None,
                         "malformed-reasoning-snapshot-rejected",
                     )
                 });
-                if let Ok(evidence) = evidence
-                    && let Err(receipt_error) = persist_backend_reasoning_execution_evidence(
+                if let Ok(evidence) = evidence {
+                    update_backend_reasoning_execution_reference(
+                        &mut state,
+                        &attempt_id,
+                        "rejected",
+                        None,
+                        None,
+                        None,
+                    );
+                    match persist_backend_reasoning_execution_evidence(
                         harness_home,
                         &execution_dir,
                         &evidence,
-                    )
-                {
-                    state.warnings.push(format!(
-                        "failed to persist rejected backend reasoning evidence: {receipt_error}"
-                    ));
+                    ) {
+                        Ok(evidence_file) => update_backend_reasoning_execution_reference(
+                            &mut state,
+                            &attempt_id,
+                            "rejected",
+                            Some("rejected"),
+                            Some(evidence_file),
+                            None,
+                        ),
+                        Err(receipt_error) => state.warnings.push(format!(
+                            "failed to persist rejected backend reasoning evidence: {receipt_error}"
+                        )),
+                    }
                 }
             }
             return Ok(codex_app_server_terminal_failure_result(
@@ -4160,7 +4226,8 @@ fn drive_codex_app_server(
     } else {
         None
     };
-    let (wire_effort, wire_catalog_revision) = if let Some(validated) = validated_reasoning.as_ref()
+    let (wire_effort, capability_proof_digest, capability_proof_file) = if let Some(validated) =
+        validated_reasoning.as_ref()
     {
         let reasoning_attempt_id = reasoning_attempt_id
             .as_deref()
@@ -4180,24 +4247,52 @@ fn drive_codex_app_server(
             Ok(result) => match result {
                 Ok(proof) => proof,
                 Err(failure) => {
+                    let observed_digest = failure
+                        .capability_observation_digest()
+                        .map(ToString::to_string);
+                    let capability_source = if observed_digest.is_some() {
+                        BackendReasoningCapabilitySourceV1::AppServerModelList
+                    } else {
+                        BackendReasoningCapabilitySourceV1::NotObserved
+                    };
                     if let Ok(evidence) = build_backend_reasoning_execution_evidence(
                         plan,
                         &reasoning_attempt_id,
                         true,
-                        BackendReasoningCapabilitySourceV1::NotObserved,
+                        capability_source,
                         BackendReasoningWireActionV1::Rejected,
                         None,
                         None,
+                        observed_digest,
+                        None,
                         None,
                         "capability-handshake-rejected",
-                    ) && let Err(receipt_error) = persist_backend_reasoning_execution_evidence(
-                        harness_home,
-                        &execution_dir,
-                        &evidence,
                     ) {
-                        state.warnings.push(format!(
-                            "failed to persist rejected backend reasoning evidence: {receipt_error}"
-                        ));
+                        update_backend_reasoning_execution_reference(
+                            &mut state,
+                            reasoning_attempt_id,
+                            "rejected",
+                            None,
+                            None,
+                            None,
+                        );
+                        match persist_backend_reasoning_execution_evidence(
+                            harness_home,
+                            &execution_dir,
+                            &evidence,
+                        ) {
+                            Ok(evidence_file) => update_backend_reasoning_execution_reference(
+                                &mut state,
+                                reasoning_attempt_id,
+                                "rejected",
+                                Some("rejected"),
+                                Some(evidence_file),
+                                None,
+                            ),
+                            Err(receipt_error) => state.warnings.push(format!(
+                                "failed to persist rejected backend reasoning evidence: {receipt_error}"
+                            )),
+                        }
                     }
                     return Ok(codex_app_server_terminal_failure_result(
                         &mut child,
@@ -4224,15 +4319,35 @@ fn drive_codex_app_server(
                     None,
                     None,
                     None,
+                    None,
+                    None,
                     "capability-handshake-io-rejected",
-                ) && let Err(receipt_error) = persist_backend_reasoning_execution_evidence(
-                    harness_home,
-                    &execution_dir,
-                    &evidence,
                 ) {
-                    state.warnings.push(format!(
-                        "failed to persist rejected backend reasoning evidence: {receipt_error}"
-                    ));
+                    update_backend_reasoning_execution_reference(
+                        &mut state,
+                        reasoning_attempt_id,
+                        "rejected",
+                        None,
+                        None,
+                        None,
+                    );
+                    match persist_backend_reasoning_execution_evidence(
+                        harness_home,
+                        &execution_dir,
+                        &evidence,
+                    ) {
+                        Ok(evidence_file) => update_backend_reasoning_execution_reference(
+                            &mut state,
+                            reasoning_attempt_id,
+                            "rejected",
+                            Some("rejected"),
+                            Some(evidence_file),
+                            None,
+                        ),
+                        Err(receipt_error) => state.warnings.push(format!(
+                            "failed to persist rejected backend reasoning evidence: {receipt_error}"
+                        )),
+                    }
                 }
                 return Ok(codex_app_server_terminal_failure_result(
                     &mut child,
@@ -4246,68 +4361,111 @@ fn drive_codex_app_server(
                 ));
             }
         };
-        if let Err(error) = persist_codex_capability_proof(&execution_dir, &proof) {
-            if let Ok(evidence) = build_backend_reasoning_execution_evidence(
-                plan,
-                &reasoning_attempt_id,
-                true,
-                BackendReasoningCapabilitySourceV1::NotObserved,
-                BackendReasoningWireActionV1::Rejected,
-                None,
-                None,
-                None,
-                "capability-proof-persist-failed",
-            ) && let Err(receipt_error) = persist_backend_reasoning_execution_evidence(
-                harness_home,
-                &execution_dir,
-                &evidence,
-            ) {
-                state.warnings.push(format!(
-                    "failed to persist rejected backend reasoning evidence: {receipt_error}"
+        let capability_proof_file = match persist_codex_capability_proof(&execution_dir, &proof) {
+            Ok(proof_file) => proof_file,
+            Err(error) => {
+                if let Ok(evidence) = build_backend_reasoning_execution_evidence(
+                    plan,
+                    &reasoning_attempt_id,
+                    true,
+                    BackendReasoningCapabilitySourceV1::AppServerModelList,
+                    BackendReasoningWireActionV1::Rejected,
+                    None,
+                    Some(proof.proof_digest.clone()),
+                    None,
+                    None,
+                    None,
+                    "capability-proof-persist-failed",
+                ) {
+                    update_backend_reasoning_execution_reference(
+                        &mut state,
+                        reasoning_attempt_id,
+                        "rejected",
+                        None,
+                        None,
+                        None,
+                    );
+                    match persist_backend_reasoning_execution_evidence(
+                        harness_home,
+                        &execution_dir,
+                        &evidence,
+                    ) {
+                        Ok(evidence_file) => update_backend_reasoning_execution_reference(
+                            &mut state,
+                            reasoning_attempt_id,
+                            "rejected",
+                            Some("rejected"),
+                            Some(evidence_file),
+                            None,
+                        ),
+                        Err(receipt_error) => state.warnings.push(format!(
+                            "failed to persist rejected backend reasoning evidence: {receipt_error}"
+                        )),
+                    }
+                }
+                return Ok(codex_app_server_terminal_failure_result(
+                    &mut child,
+                    &mut reader_handle,
+                    &mut state,
+                    &stdout_log,
+                    &stderr_log,
+                    CodexRuntimeRunStatus::ProtocolError,
+                    format!("failed to persist same-connection capability proof: {error}"),
+                    Some(thread_id.clone()),
                 ));
             }
-            return Ok(codex_app_server_terminal_failure_result(
-                &mut child,
-                &mut reader_handle,
-                &mut state,
-                &stdout_log,
-                &stderr_log,
-                CodexRuntimeRunStatus::ProtocolError,
-                format!("failed to persist same-connection capability proof: {error}"),
-                Some(thread_id.clone()),
-            ));
-        }
+        };
         (
             Some(proof.wire_effort.clone()),
             Some(proof.proof_digest.clone()),
+            Some(capability_proof_file),
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
     let prompt_input = match fs::read_to_string(&plan.invocation.prompt_input_file) {
         Ok(prompt_input) => prompt_input,
         Err(error) => {
-            if let Some(reasoning_attempt_id) = reasoning_attempt_id.as_deref()
-                && let Ok(evidence) = build_backend_reasoning_execution_evidence(
+            if let Some(reasoning_attempt_id) = reasoning_attempt_id.as_deref() {
+                update_backend_reasoning_execution_reference(
+                    &mut state,
+                    reasoning_attempt_id,
+                    "rejected",
+                    None,
+                    None,
+                    capability_proof_file.clone(),
+                );
+                if let Ok(evidence) = build_backend_reasoning_execution_evidence(
                     plan,
                     reasoning_attempt_id,
                     true,
                     BackendReasoningCapabilitySourceV1::AppServerModelList,
                     BackendReasoningWireActionV1::Rejected,
-                    wire_catalog_revision.clone(),
+                    None,
+                    capability_proof_digest.clone(),
+                    None,
                     None,
                     None,
                     "prompt-input-read-rejected",
-                )
-                && let Err(receipt_error) = persist_backend_reasoning_execution_evidence(
-                    harness_home,
-                    &execution_dir,
-                    &evidence,
-                )
-            {
-                state.warnings.push(format!(
-                    "failed to persist rejected backend reasoning evidence: {receipt_error}"
-                ));
+                ) {
+                    match persist_backend_reasoning_execution_evidence(
+                        harness_home,
+                        &execution_dir,
+                        &evidence,
+                    ) {
+                        Ok(evidence_file) => update_backend_reasoning_execution_reference(
+                            &mut state,
+                            reasoning_attempt_id,
+                            "rejected",
+                            Some("rejected"),
+                            Some(evidence_file),
+                            capability_proof_file.clone(),
+                        ),
+                        Err(receipt_error) => state.warnings.push(format!(
+                            "failed to persist rejected backend reasoning evidence: {receipt_error}"
+                        )),
+                    }
+                }
             }
             return Ok(codex_app_server_terminal_failure_result(
                 &mut child,
@@ -4362,6 +4520,47 @@ fn drive_codex_app_server(
     ) {
         Ok(bridge) => bridge,
         Err(error) => {
+            if let Some(reasoning_attempt_id) = reasoning_attempt_id.as_deref() {
+                update_backend_reasoning_execution_reference(
+                    &mut state,
+                    reasoning_attempt_id,
+                    "rejected",
+                    None,
+                    None,
+                    capability_proof_file.clone(),
+                );
+                if let Ok(evidence) = build_backend_reasoning_execution_evidence(
+                    plan,
+                    reasoning_attempt_id,
+                    true,
+                    BackendReasoningCapabilitySourceV1::AppServerModelList,
+                    BackendReasoningWireActionV1::Rejected,
+                    None,
+                    capability_proof_digest.clone(),
+                    None,
+                    None,
+                    None,
+                    "turn-steer-bridge-init-rejected",
+                ) {
+                    match persist_backend_reasoning_execution_evidence(
+                        harness_home,
+                        &execution_dir,
+                        &evidence,
+                    ) {
+                        Ok(evidence_file) => update_backend_reasoning_execution_reference(
+                            &mut state,
+                            reasoning_attempt_id,
+                            "rejected",
+                            Some("rejected"),
+                            Some(evidence_file),
+                            capability_proof_file.clone(),
+                        ),
+                        Err(receipt_error) => state.warnings.push(format!(
+                            "failed to persist rejected backend reasoning evidence: {receipt_error}"
+                        )),
+                    }
+                }
+            }
             return Ok(codex_app_server_terminal_failure_result(
                 &mut child,
                 &mut reader_handle,
@@ -4375,13 +4574,78 @@ fn drive_codex_app_server(
         }
     };
     if let Some(reasoning_attempt_id) = reasoning_attempt_id.as_deref() {
+        if let Some(effort) = wire_effort.as_deref()
+            && let Err(error) = mark_codex_thread_reasoning_may_be_sticky(plan, &thread_id, effort)
+        {
+            update_backend_reasoning_execution_reference(
+                &mut state,
+                reasoning_attempt_id,
+                "rejected",
+                None,
+                None,
+                capability_proof_file.clone(),
+            );
+            if let Ok(evidence) = build_backend_reasoning_execution_evidence(
+                plan,
+                reasoning_attempt_id,
+                true,
+                BackendReasoningCapabilitySourceV1::AppServerModelList,
+                BackendReasoningWireActionV1::Rejected,
+                None,
+                capability_proof_digest.clone(),
+                None,
+                None,
+                None,
+                "reasoning-sticky-marker-rejected",
+            ) {
+                match persist_backend_reasoning_execution_evidence(
+                    harness_home,
+                    &execution_dir,
+                    &evidence,
+                ) {
+                    Ok(evidence_file) => update_backend_reasoning_execution_reference(
+                        &mut state,
+                        reasoning_attempt_id,
+                        "rejected",
+                        Some("rejected"),
+                        Some(evidence_file),
+                        capability_proof_file.clone(),
+                    ),
+                    Err(receipt_error) => state.warnings.push(format!(
+                        "failed to persist rejected backend reasoning evidence: {receipt_error}"
+                    )),
+                }
+            }
+            return Ok(codex_app_server_terminal_failure_result(
+                &mut child,
+                &mut reader_handle,
+                &mut state,
+                &stdout_log,
+                &stderr_log,
+                CodexRuntimeRunStatus::ProtocolError,
+                format!(
+                    "failed to persist conservative Codex reasoning sticky marker before turn/start: {error}"
+                ),
+                Some(thread_id.clone()),
+            ));
+        }
+        update_backend_reasoning_execution_reference(
+            &mut state,
+            reasoning_attempt_id,
+            "pending",
+            None,
+            None,
+            capability_proof_file.clone(),
+        );
         let pending_evidence = match build_backend_reasoning_execution_evidence(
             plan,
             reasoning_attempt_id,
             true,
             BackendReasoningCapabilitySourceV1::AppServerModelList,
             BackendReasoningWireActionV1::Pending,
-            wire_catalog_revision.clone(),
+            None,
+            capability_proof_digest.clone(),
+            None,
             wire_effort.clone(),
             Some(turn_start_request_id as u64),
             "managed-turn-start-pending",
@@ -4400,38 +4664,33 @@ fn drive_codex_app_server(
                 ));
             }
         };
-        if let Err(error) = persist_backend_reasoning_execution_evidence(
+        let pending_evidence_file = match persist_backend_reasoning_execution_evidence(
             harness_home,
             &execution_dir,
             &pending_evidence,
         ) {
-            return Ok(codex_app_server_terminal_failure_result(
-                &mut child,
-                &mut reader_handle,
-                &mut state,
-                &stdout_log,
-                &stderr_log,
-                CodexRuntimeRunStatus::ProtocolError,
-                format!("failed to persist backend reasoning pending evidence: {error}"),
-                Some(thread_id.clone()),
-            ));
-        }
-        if let Some(effort) = wire_effort.as_deref()
-            && let Err(error) = mark_codex_thread_reasoning_may_be_sticky(plan, &thread_id, effort)
-        {
-            return Ok(codex_app_server_terminal_failure_result(
-                &mut child,
-                &mut reader_handle,
-                &mut state,
-                &stdout_log,
-                &stderr_log,
-                CodexRuntimeRunStatus::ProtocolError,
-                format!(
-                    "failed to persist conservative Codex reasoning sticky marker before turn/start: {error}"
-                ),
-                Some(thread_id.clone()),
-            ));
-        }
+            Ok(evidence_file) => evidence_file,
+            Err(error) => {
+                return Ok(codex_app_server_terminal_failure_result(
+                    &mut child,
+                    &mut reader_handle,
+                    &mut state,
+                    &stdout_log,
+                    &stderr_log,
+                    CodexRuntimeRunStatus::ProtocolError,
+                    format!("failed to persist backend reasoning pending evidence: {error}"),
+                    Some(thread_id.clone()),
+                ));
+            }
+        };
+        update_backend_reasoning_execution_reference(
+            &mut state,
+            reasoning_attempt_id,
+            "pending",
+            Some("pending"),
+            Some(pending_evidence_file),
+            capability_proof_file.clone(),
+        );
     }
     if let Err(error) = write_json_rpc(
         &mut stdin,
@@ -4441,27 +4700,46 @@ fn drive_codex_app_server(
             "params": turn_params
         }),
     ) {
-        if let Some(reasoning_attempt_id) = reasoning_attempt_id.as_deref()
-            && let Ok(evidence) = build_backend_reasoning_execution_evidence(
+        if let Some(reasoning_attempt_id) = reasoning_attempt_id.as_deref() {
+            update_backend_reasoning_execution_reference(
+                &mut state,
+                reasoning_attempt_id,
+                "indeterminate",
+                None,
+                None,
+                capability_proof_file.clone(),
+            );
+            if let Ok(evidence) = build_backend_reasoning_execution_evidence(
                 plan,
                 reasoning_attempt_id,
                 true,
                 BackendReasoningCapabilitySourceV1::AppServerModelList,
                 BackendReasoningWireActionV1::Indeterminate,
-                wire_catalog_revision.clone(),
+                None,
+                capability_proof_digest.clone(),
+                None,
                 wire_effort.clone(),
                 Some(turn_start_request_id as u64),
                 "turn-start-write-indeterminate",
-            )
-            && let Err(receipt_error) = persist_backend_reasoning_execution_evidence(
-                harness_home,
-                &execution_dir,
-                &evidence,
-            )
-        {
-            state.warnings.push(format!(
-                "failed to persist indeterminate backend reasoning evidence: {receipt_error}"
-            ));
+            ) {
+                match persist_backend_reasoning_execution_evidence(
+                    harness_home,
+                    &execution_dir,
+                    &evidence,
+                ) {
+                    Ok(evidence_file) => update_backend_reasoning_execution_reference(
+                        &mut state,
+                        reasoning_attempt_id,
+                        "indeterminate",
+                        Some("indeterminate"),
+                        Some(evidence_file),
+                        capability_proof_file.clone(),
+                    ),
+                    Err(receipt_error) => state.warnings.push(format!(
+                        "failed to persist indeterminate backend reasoning evidence: {receipt_error}"
+                    )),
+                }
+            }
         }
         return Ok(codex_app_server_write_failed_result(
             &mut child,
@@ -4474,26 +4752,44 @@ fn drive_codex_app_server(
         ));
     }
     if let Some(reasoning_attempt_id) = reasoning_attempt_id.as_deref() {
+        update_backend_reasoning_execution_reference(
+            &mut state,
+            reasoning_attempt_id,
+            "sent",
+            None,
+            None,
+            capability_proof_file.clone(),
+        );
         match build_backend_reasoning_execution_evidence(
             plan,
             reasoning_attempt_id,
             true,
             BackendReasoningCapabilitySourceV1::AppServerModelList,
             BackendReasoningWireActionV1::Sent,
-            wire_catalog_revision,
+            None,
+            capability_proof_digest.clone(),
+            None,
             wire_effort.clone(),
             Some(turn_start_request_id as u64),
             "managed-turn-start-sent",
         ) {
             Ok(evidence) => {
-                if let Err(error) = persist_backend_reasoning_execution_evidence(
+                match persist_backend_reasoning_execution_evidence(
                     harness_home,
                     &execution_dir,
                     &evidence,
                 ) {
-                    state.warnings.push(format!(
+                    Ok(evidence_file) => update_backend_reasoning_execution_reference(
+                        &mut state,
+                        reasoning_attempt_id,
+                        "sent",
+                        Some("sent"),
+                        Some(evidence_file),
+                        capability_proof_file.clone(),
+                    ),
+                    Err(error) => state.warnings.push(format!(
                         "failed to persist sent backend reasoning evidence after turn/start write: {error}"
-                    ));
+                    )),
                 }
             }
             Err(error) => state.warnings.push(format!(
@@ -4579,6 +4875,7 @@ fn drive_codex_app_server(
                 tool_use_timeout: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                 warnings: state.warnings,
             });
         }
@@ -4605,6 +4902,7 @@ fn drive_codex_app_server(
                 tool_use_timeout: Some(tool),
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                 warnings: state.warnings,
             });
         }
@@ -4631,6 +4929,7 @@ fn drive_codex_app_server(
                 tool_use_timeout: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                 warnings: state.warnings,
             });
         }
@@ -4658,6 +4957,7 @@ fn drive_codex_app_server(
                 tool_use_timeout: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                 warnings: state.warnings,
             });
         }
@@ -4685,6 +4985,7 @@ fn drive_codex_app_server(
                 tool_use_timeout: None,
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
+                backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                 warnings: state.warnings,
             });
         }
@@ -4729,6 +5030,7 @@ fn drive_codex_app_server(
                 tool_use_timeout: None,
                 interruption_reason,
                 interrupted_tool_uses,
+                backend_reasoning_execution: state.backend_reasoning_execution.clone(),
                 warnings: state.warnings,
             });
         }
@@ -4761,6 +5063,7 @@ fn drive_codex_app_server(
             tool_use_timeout: None,
             interruption_reason: None,
             interrupted_tool_uses: Vec::new(),
+            backend_reasoning_execution: state.backend_reasoning_execution.clone(),
             warnings: state.warnings,
         });
     }
@@ -4786,6 +5089,7 @@ fn drive_codex_app_server(
         tool_use_timeout: None,
         interruption_reason: None,
         interrupted_tool_uses: Vec::new(),
+        backend_reasoning_execution: state.backend_reasoning_execution.clone(),
         warnings: state.warnings,
     })
 }
@@ -4874,6 +5178,7 @@ fn validated_codex_turn_effort(
     )
 }
 
+#[cfg(test)]
 fn validate_codex_turn_effort_fields(
     harness_home: &Path,
     agent_id: Option<&str>,
@@ -5021,6 +5326,10 @@ enum CodexCapabilityHandshakeFailure {
     TimedOut(String),
     Canceled(String),
     Failed(String),
+    ObservedFailed {
+        reason: String,
+        observation_digest: String,
+    },
 }
 
 impl CodexCapabilityHandshakeFailure {
@@ -5028,13 +5337,23 @@ impl CodexCapabilityHandshakeFailure {
         match self {
             Self::TimedOut(_) => CodexRuntimeRunStatus::Timeout,
             Self::Canceled(_) => CodexRuntimeRunStatus::Canceled,
-            Self::Failed(_) => CodexRuntimeRunStatus::ProtocolError,
+            Self::Failed(_) | Self::ObservedFailed { .. } => CodexRuntimeRunStatus::ProtocolError,
         }
     }
 
     fn reason(&self) -> &str {
         match self {
             Self::TimedOut(reason) | Self::Canceled(reason) | Self::Failed(reason) => reason,
+            Self::ObservedFailed { reason, .. } => reason,
+        }
+    }
+
+    fn capability_observation_digest(&self) -> Option<&str> {
+        match self {
+            Self::ObservedFailed {
+                observation_digest, ..
+            } => Some(observation_digest),
+            _ => None,
         }
     }
 }
@@ -5278,6 +5597,14 @@ fn verify_codex_reasoning_capability_same_connection(
             ))));
         }
     };
+    let observation = match build_live_model_catalog_observation(&live) {
+        Ok(observation) => observation,
+        Err(error) => {
+            return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
+                "failed to build live Codex capability observation: {error}"
+            ))));
+        }
+    };
     let wire_effort = match decide_cache_live_drift(
         &validated.cache,
         &live,
@@ -5286,9 +5613,10 @@ fn verify_codex_reasoning_capability_same_connection(
     ) {
         CacheLiveDriftDecision::Allow { wire_effort } => wire_effort,
         CacheLiveDriftDecision::Deny { reason } => {
-            return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
-                "Codex cache/live capability drift denied turn/start: {reason:?}"
-            ))));
+            return Ok(Err(CodexCapabilityHandshakeFailure::ObservedFailed {
+                reason: format!("Codex cache/live capability drift denied turn/start: {reason:?}"),
+                observation_digest: observation.catalog_digest.clone(),
+            }));
         }
     };
     match build_same_connection_proof(
@@ -5303,9 +5631,10 @@ fn verify_codex_reasoning_capability_same_connection(
         &wire_effort,
     ) {
         Ok(proof) => Ok(Ok(proof)),
-        Err(error) => Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
-            "failed to build same-connection Codex capability proof: {error}"
-        )))),
+        Err(error) => Ok(Err(CodexCapabilityHandshakeFailure::ObservedFailed {
+            reason: format!("failed to build same-connection Codex capability proof: {error}"),
+            observation_digest: observation.catalog_digest,
+        })),
     }
 }
 
@@ -5331,10 +5660,12 @@ fn build_backend_reasoning_execution_evidence(
     capability_source: BackendReasoningCapabilitySourceV1,
     wire_action: BackendReasoningWireActionV1,
     wire_catalog_revision: Option<String>,
+    capability_proof_digest: Option<String>,
+    capability_observation_digest: Option<String>,
     wire_effort: Option<String>,
     turn_start_request_id: Option<u64>,
     decision_code: &str,
-) -> io::Result<BackendReasoningExecutionEvidenceV1> {
+) -> io::Result<BackendReasoningExecutionEvidenceV2> {
     let preference = include_managed_snapshot
         .then(|| plan.reasoning_preference.clone())
         .flatten();
@@ -5348,7 +5679,8 @@ fn build_backend_reasoning_execution_evidence(
         (Some(provider), Some(model)) => (Some(provider.clone()), Some(model.clone())),
         _ => (None, None),
     };
-    BackendReasoningExecutionEvidenceV1::new(BackendReasoningExecutionEvidenceFieldsV1 {
+    let transition_sequence = wire_action.transition_sequence();
+    BackendReasoningExecutionEvidenceV2::new(BackendReasoningExecutionEvidenceFieldsV2 {
         attempt_id: attempt_id.to_string(),
         queue_id: plan.queue_id.clone(),
         agent_id: plan.agent_id.clone(),
@@ -5358,8 +5690,11 @@ fn build_backend_reasoning_execution_evidence(
         policy,
         policy_catalog_revision,
         wire_catalog_revision,
+        capability_proof_digest,
+        capability_observation_digest,
         capability_source,
         wire_action,
+        transition_sequence,
         wire_effort,
         turn_start_request_id,
         decision_code: decision_code.to_string(),
@@ -5371,25 +5706,55 @@ fn build_backend_reasoning_execution_evidence(
 fn persist_backend_reasoning_execution_evidence(
     harness_home: &Path,
     execution_dir: &Path,
-    evidence: &BackendReasoningExecutionEvidenceV1,
+    evidence: &BackendReasoningExecutionEvidenceV2,
 ) -> io::Result<PathBuf> {
     evidence
         .validate()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     let attempt_file = execution_dir.join(format!(
-        "backend-reasoning-execution-{}.json",
+        "backend-reasoning-execution.v2-{}.json",
         safe_path_component(&evidence.attempt_id)
     ));
-    let summary_file = execution_dir.join("backend-reasoning-execution.v1.json");
-    write_json_atomic(&attempt_file, evidence)?;
-    write_json_atomic(&summary_file, evidence)?;
+    let summary_file = execution_dir.join("backend-reasoning-execution.v2.json");
     let receipts_file = harness_home
         .join("state")
         .join("runtime-queue")
         .join("backend-reasoning-execution-receipts.jsonl");
     fs::create_dir_all(parent_dir(&receipts_file)?)?;
-    append_json_line(&receipts_file, evidence)?;
+    crate::append_jsonl_value_once_by_event_key(&receipts_file, evidence)?;
+    write_json_atomic(&attempt_file, evidence)?;
+    write_json_atomic(&summary_file, evidence)?;
     Ok(attempt_file)
+}
+
+fn update_backend_reasoning_execution_reference(
+    state: &mut CodexProtocolState,
+    attempt_id: &str,
+    intended_wire_action: &str,
+    durable_wire_action: Option<&str>,
+    evidence_file: Option<PathBuf>,
+    capability_proof_file: Option<PathBuf>,
+) {
+    let prior = state
+        .backend_reasoning_execution
+        .clone()
+        .filter(|reference| reference.attempt_id == attempt_id);
+    state.backend_reasoning_execution = Some(CodexBackendReasoningExecutionReference {
+        attempt_id: attempt_id.to_string(),
+        intended_wire_action: intended_wire_action.to_string(),
+        durable_wire_action: durable_wire_action.map(ToString::to_string).or_else(|| {
+            prior
+                .as_ref()
+                .and_then(|reference| reference.durable_wire_action.clone())
+        }),
+        evidence_file: evidence_file.or_else(|| {
+            prior
+                .as_ref()
+                .and_then(|reference| reference.evidence_file.clone())
+        }),
+        capability_proof_file: capability_proof_file
+            .or_else(|| prior.and_then(|reference| reference.capability_proof_file)),
+    });
 }
 
 fn persist_codex_capability_proof(
@@ -6024,6 +6389,7 @@ fn recover_preflight_thread_health_pollution(
         tool_use_timeout: None,
         interruption_reason: None,
         interrupted_tool_uses: Vec::new(),
+        backend_reasoning_execution: None,
         warnings: Vec::new(),
     };
     let mut recovered = run_context_checkpoint_fallback(
@@ -6835,6 +7201,7 @@ struct CodexProtocolState {
     usage: Option<CodexRuntimeUsage>,
     warnings: Vec<String>,
     denied_approval_requests: Vec<String>,
+    backend_reasoning_execution: Option<CodexBackendReasoningExecutionReference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8588,6 +8955,7 @@ fn codex_app_server_write_failed_result(
         tool_use_timeout: None,
         interruption_reason: None,
         interrupted_tool_uses: Vec::new(),
+        backend_reasoning_execution: state.backend_reasoning_execution.clone(),
         warnings: std::mem::take(&mut state.warnings),
     }
 }
@@ -8620,6 +8988,7 @@ fn codex_app_server_terminal_failure_result(
         tool_use_timeout: None,
         interruption_reason: None,
         interrupted_tool_uses: Vec::new(),
+        backend_reasoning_execution: state.backend_reasoning_execution.clone(),
         warnings: std::mem::take(&mut state.warnings),
     }
 }
@@ -13385,15 +13754,37 @@ mod tests {
         let thread_index = method_index("thread/start");
         assert!(input_values[thread_index]["params"].get("effort").is_none());
 
-        let execution_dir = report.receipt.execution_dir.unwrap();
+        let terminal_reference = report
+            .receipt
+            .backend_reasoning_execution
+            .clone()
+            .expect("managed turn should bind terminal reasoning evidence");
+        assert_eq!(terminal_reference.intended_wire_action, "sent");
+        assert_eq!(
+            terminal_reference.durable_wire_action.as_deref(),
+            Some("sent")
+        );
+        assert!(
+            terminal_reference
+                .evidence_file
+                .as_ref()
+                .is_some_and(|path| path.is_file())
+        );
+        assert!(
+            terminal_reference
+                .capability_proof_file
+                .as_ref()
+                .is_some_and(|path| path.is_file())
+        );
+        let execution_dir = report.receipt.execution_dir.clone().unwrap();
         let proof: SameConnectionCapabilityProofV1 = serde_json::from_slice(
             &fs::read(execution_dir.join("codex-capability-proof.v1.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(proof.model, "gpt-5.6-sol");
         assert_eq!(proof.wire_effort, "max");
-        let evidence: BackendReasoningExecutionEvidenceV1 = serde_json::from_slice(
-            &fs::read(execution_dir.join("backend-reasoning-execution.v1.json")).unwrap(),
+        let evidence: BackendReasoningExecutionEvidenceV2 = serde_json::from_slice(
+            &fs::read(execution_dir.join("backend-reasoning-execution.v2.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(evidence.wire_action, BackendReasoningWireActionV1::Sent);
@@ -13412,6 +13803,19 @@ mod tests {
                 .lines()
                 .count(),
             2
+        );
+        let replay = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+        assert_eq!(
+            replay.receipt.backend_reasoning_execution,
+            Some(terminal_reference)
         );
 
         let _ = fs::remove_dir_all(root);
@@ -13453,21 +13857,171 @@ mod tests {
         assert!(app_server_input.contains("config/read"));
         assert!(app_server_input.contains("model/list"));
         assert!(!app_server_input.contains("turn/start"));
-        let execution_dir = report.receipt.execution_dir.unwrap();
+        let terminal_reference = report
+            .receipt
+            .backend_reasoning_execution
+            .as_ref()
+            .expect("observed denial should bind rejected evidence");
+        assert_eq!(terminal_reference.intended_wire_action, "rejected");
+        assert_eq!(
+            terminal_reference.durable_wire_action.as_deref(),
+            Some("rejected")
+        );
+        let execution_dir = report.receipt.execution_dir.clone().unwrap();
         assert!(
             !execution_dir
                 .join("codex-capability-proof.v1.json")
                 .exists()
         );
-        let evidence: BackendReasoningExecutionEvidenceV1 = serde_json::from_slice(
-            &fs::read(execution_dir.join("backend-reasoning-execution.v1.json")).unwrap(),
+        let evidence: BackendReasoningExecutionEvidenceV2 = serde_json::from_slice(
+            &fs::read(execution_dir.join("backend-reasoning-execution.v2.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(evidence.wire_action, BackendReasoningWireActionV1::Rejected);
         assert!(evidence.turn_start_request_id.is_none());
+        assert_eq!(
+            evidence.capability_source,
+            BackendReasoningCapabilitySourceV1::AppServerModelList
+        );
+        assert!(evidence.capability_proof_digest.is_none());
+        assert!(evidence.capability_observation_digest.is_some());
+        assert!(evidence.wire_catalog_revision.is_none());
 
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn managed_reasoning_steer_bridge_failure_persists_rejected_evidence() {
+        let root = temp_root("managed_reasoning_steer_bridge_failure_persists_rejected_evidence");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, json!([]));
+        enable_managed_reasoning_fixture(&harness_home, plan_file, "max");
+        let (executable, arguments) = fake_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let binding_dir = codex_active_turn_binding_dir(&harness_home);
+        if binding_dir.exists() {
+            fs::remove_dir_all(&binding_dir).unwrap();
+        }
+        fs::write(&binding_dir, "block active-turn binding directory").unwrap();
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+        assert!(report.receipt.reason.contains("turn steer bridge"));
+        let terminal_reference = report
+            .receipt
+            .backend_reasoning_execution
+            .as_ref()
+            .expect("steer bridge failure should bind rejected evidence");
+        assert_eq!(terminal_reference.intended_wire_action, "rejected");
+        assert_eq!(
+            terminal_reference.durable_wire_action.as_deref(),
+            Some("rejected")
+        );
+        assert!(terminal_reference.capability_proof_file.is_some());
+        let execution_dir = report.receipt.execution_dir.clone().unwrap();
+        let evidence: BackendReasoningExecutionEvidenceV2 = serde_json::from_slice(
+            &fs::read(execution_dir.join("backend-reasoning-execution.v2.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(evidence.wire_action, BackendReasoningWireActionV1::Rejected);
+        assert!(evidence.capability_proof_digest.is_some());
+        assert!(evidence.capability_observation_digest.is_none());
+        let app_server_input =
+            fs::read_to_string(root.join("fake-app-server-input.jsonl")).unwrap();
+        assert!(!app_server_input.contains("turn/start"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_reasoning_sticky_marker_failure_precedes_pending_evidence() {
+        let root = temp_root("managed_reasoning_sticky_marker_failure_precedes_pending_evidence");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, json!([]));
+        enable_managed_reasoning_fixture(&harness_home, plan_file, "max");
+        let (executable, arguments) = fake_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+        let plan: CodexRuntimePlanFile =
+            serde_json::from_slice(&fs::read(plan_file).unwrap()).unwrap();
+        let sticky_file = codex_reasoning_thread_state_file(&plan.outputs.codex_binding_file);
+        if sticky_file.exists() {
+            fs::remove_file(&sticky_file).unwrap();
+        }
+        fs::create_dir_all(&sticky_file).unwrap();
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::ProtocolError);
+        assert!(report.receipt.reason.contains("sticky marker"));
+        let terminal_reference = report
+            .receipt
+            .backend_reasoning_execution
+            .as_ref()
+            .expect("sticky marker failure should bind rejected evidence");
+        assert_eq!(terminal_reference.intended_wire_action, "rejected");
+        assert_eq!(
+            terminal_reference.durable_wire_action.as_deref(),
+            Some("rejected")
+        );
+        let execution_dir = report.receipt.execution_dir.clone().unwrap();
+        let evidence: BackendReasoningExecutionEvidenceV2 = serde_json::from_slice(
+            &fs::read(execution_dir.join("backend-reasoning-execution.v2.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(evidence.wire_action, BackendReasoningWireActionV1::Rejected);
+        assert_eq!(evidence.transition_sequence, 1);
+        let receipts = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("backend-reasoning-execution-receipts.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(receipts.lines().count(), 1);
+        assert!(!receipts.contains("\"wireAction\":\"pending\""));
+        let app_server_input =
+            fs::read_to_string(root.join("fake-app-server-input.jsonl")).unwrap();
+        assert!(!app_server_input.contains("turn/start"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn run_codex_runtime_codex_owned_turn_ignores_child_final_and_completion() {
         let root =
