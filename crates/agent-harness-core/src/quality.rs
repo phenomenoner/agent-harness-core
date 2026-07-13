@@ -69,13 +69,13 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I3",
-            statement: "terminal states are irreversible",
+            statement: "terminal states are irreversible, and pending or retryable worker jobs already at their attempt cap become terminal before selection or lease",
             owner: "runtime_pipeline/workers",
         },
         InvariantEntry {
             id: "I4",
-            statement: "cancel only affects the requested turn, queue item, job, or scope",
-            owner: "admission/channel_state",
+            statement: "cancel only affects the requested turn, queue item, job, declared scope, or the selected deterministic job's descendant process tree",
+            owner: "admission/channel_state/workers",
         },
         InvariantEntry {
             id: "I5",
@@ -139,8 +139,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I17",
-            statement: "durable control artifacts are authoritative before runtime execution, progress delivery, restart consumption, and sender-class cron notification",
-            owner: "runtime_worker/runtime_pipeline/runtime_queue/progress/channel_runtime/dream_director/cron_scheduler",
+            statement: "durable control artifacts are authoritative before runtime execution, progress delivery, restart consumption, and sender-class cron notification; deterministic cron uses one exact source, timezone/calendar evaluation, bounded per-entry execution policy, stable occurrence identity, and explicit catch-up authority",
+            owner: "runtime_worker/runtime_pipeline/runtime_queue/progress/channel_runtime/dream_director/cron_scheduler/deterministic_cron",
         },
         InvariantEntry {
             id: "I18",
@@ -924,6 +924,8 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "deterministic cron jobs produce cron-run evidence keyed by canonical cron id",
                 "late deterministic slots follow an explicit catch-up policy",
                 "sender-class jobs suppress stale sources unless an explicit force override is receipted",
+                "deterministic entries use exact crontab sources, timezone/calendar fields, and bounded per-entry execution policy",
+                "exhausted jobs terminalize before lease and timeout cancellation covers only the selected process tree",
             ],
             runnable_tests: vec![
                 "config::tests::validate_harness_config_accepts_cron_scheduler_run_caps",
@@ -937,8 +939,16 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "dream_director::tests::dream_director_sender_sends_fresh_source_with_freshness_metadata",
                 "dream_director::tests::dream_director_sender_accepts_absolute_source_path_from_relative_home",
                 "cron_scheduler::tests::e2e_5_cron_outage_replay_from_sanitized_fixture",
+                "cron_scheduler::tests::deterministic_cron_canon_execution_policy_flows_to_cron_run_and_worker",
+                "cron_scheduler::tests::lint_rejects_invalid_deterministic_cron_execution_policy",
+                "cron_scheduler::tests::backup_cron_restart_catch_up_can_be_suppressed_without_enqueue",
+                "cron_scheduler::tests::deterministic_crontab_cron_tz_controls_current_and_catch_up_slots",
+                "cron_scheduler::tests::cron_expression_supports_calendar_day_and_month_fields",
+                "deterministic_cron::tests::crontab_loader_ignores_backup_and_temporary_files",
+                "workers::tests::exhausted_pending_worker_is_terminalized_without_starting_process",
+                "workers::tests::deterministic_timeout_terminates_descendant_process_tree",
             ],
-            promotion_gate: "Before cutover, prove cron config validation, deterministic cron evidence, catch-up policy, health/status freshness warnings, and stale-source sender suppression with the Round16 E2E-5 cron freshness fixture pack.",
+            promotion_gate: "Before cutover, run the cron freshness fixture and prove cron config validation, exact source discovery, timezone/calendar scheduling, bounded execution policy, pre-lease attempt exhaustion, process-tree timeout, deterministic cron evidence, catch-up suppression, health/status freshness warnings, and stale-source sender suppression.",
         },
         ScenarioMatrixEntry {
             id: "multi-agent-memory-compartment",
@@ -1268,6 +1278,7 @@ pub fn release_checklist() -> ReleaseChecklist {
             "progress ordering changes passed queue-local preemption, first-surface send, orphan-claim recovery, and terminal-control ghost-close replay checks",
             "progress panel lane-cap heartbeat/current-step checks passed across channel platforms",
             "cron freshness changes passed config run-cap validation, cron-canon health/status warnings, deterministic catch-up, and stale-source sender suppression checks",
+            "cron/backup incident hardening passed exact-source, timezone/calendar, per-entry timeout/attempt, pre-lease exhaustion, process-tree timeout, occurrence-idempotency, verified-retention, and zero-stale-catch-up checks",
             "Codex tool-use timeout changes passed bounded recovery checks",
             "Round18 delivery/runtime interruption changes passed Telegram overlong final chunking, terminal receipt precedence, permanent provider rejection, structured interrupted command, safe-rerun, prompt/resolver, and runtime failure wording checks",
             "artifact/context hygiene changes passed generic artifact prompt/progress redaction and Discord attachment extraction checks",

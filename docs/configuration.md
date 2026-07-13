@@ -328,6 +328,14 @@ Native cron LLM turns use CronRunStore before worker enqueue:
 - `cron-run-control --action retry --run-id <id>` resets the run to retry-pending, clears stale worker/runtime refs, and lets the scheduler clear the matching watermark and enqueue a new worker job with an attempt-specific idempotency key.
 - `cron-run-control --action skip|quarantine|unquarantine` can stop or isolate bad cron work without blocking unrelated agents. Worker and runtime dispatch re-check CronRunStore controls and tombstone skipped runtime queue items instead of running stale work.
 
+### Deterministic Cron Execution Policy
+
+Deterministic entries may define `timeoutMs` and `maxAttempts` in `workspace/docs/ops/cron-canon.json`. Defaults remain `300000` milliseconds and `3` attempts for backward compatibility. Valid bounds are `1000..86400000` milliseconds and `1..10` attempts; invalid values fail scheduler lint and prevent enqueue.
+
+`TZ` or `CRON_TZ` lines in a crontab apply to current-slot and restart catch-up evaluation. Standard minute, hour, day-of-month, month, and day-of-week fields are evaluated in that timezone. Worker payloads receive `AGENT_HARNESS_CRON_ENTRY_ID`, `AGENT_HARNESS_CRON_SCHEDULED_FOR_MS`, and, when configured, `AGENT_HARNESS_CRON_TIMEZONE`, so a local command can make one scheduled occurrence idempotent.
+
+Only a file named exactly `crontab` or ending exactly in `.crontab` is loaded. Backup and temporary copies such as `.crontab.bak-*` and `.crontab.tmp` are ignored. Long-running or externally visible jobs should use an explicit catch-up policy that suppresses unsafe stale occurrences after restart.
+
 ## Response Formatting
 
 `harness-config.json` can configure how intermediate Codex assistant narration and final channel reply tone are surfaced:

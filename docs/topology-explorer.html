@@ -219,7 +219,7 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "9aeaaab58f0206dd72d5351912553ebb8d53410e658cb02b836c9b637495514e"
+      "sha256": "c19664340eb324699c75256bd92106f07c004c2667545274d5148b55efec4c57"
     },
     {
       "path": "docs/.private/agent-harness-operations-handbook.md",
@@ -266,7 +266,7 @@
       "label": "channel_state",
       "group": "component",
       "state": "implemented",
-      "summary": "slash-command state and active session metadata",
+      "summary": "slash-command state and active session metadata; /think and /reasoning are one control surface",
       "reads": "channel command input",
       "writes": "state/channels/\u003cplatform>/\u003cchannel>/\u003cuser>/state.json",
       "invariants": "I4, I8",
@@ -318,10 +318,49 @@
       "label": "prompt / turns",
       "group": "component",
       "state": "implemented",
-      "summary": "agent-scoped prompt bundle and selected skill context",
-      "reads": "registry, prompt files, memory, channel state, artifact summaries",
-      "writes": "prompt bundle and injection ledger",
+      "summary": "exact-full-lane, agent-scoped prompt bundle, eight-file OpenClaw-style per-agent config manifest, selected skill context, and backend-generation reinjection",
+      "reads": "registry, agent workspace/config files including static MEMORY.md, dynamic per-agent memory recall, channel state, artifact summaries, full lane, backend context generation",
+      "writes": "prompt bundle, prompt manifest, and lane-scoped injection ledger",
       "invariants": "I8, I11",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-workers-child-execution-policy",
+      "label": "workers / child execution policy",
+      "group": "component",
+      "state": "implemented",
+      "summary": "immutable per-child provider/model/reasoning/tool/sandbox/budget snapshot, pre-lease exhausted-job terminalization, and bounded execution/process-tree cancellation",
+      "reads": "parent operation plan, exact owner, child admission policy",
+      "writes": "worker job, immutable policy snapshot, lifecycle/terminal receipts",
+      "invariants": "I3, I4, I7, I8",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-cron-scheduler-deterministic-cron",
+      "label": "cron_scheduler / deterministic_cron",
+      "group": "component",
+      "state": "implemented",
+      "summary": "exact crontab source discovery, timezone/calendar evaluation, per-entry execution policy, occurrence identity, watermarks, and catch-up authority",
+      "reads": "canonical cron entries, exact .crontab sources, scheduler config, prior tick evidence",
+      "writes": "CronRun/worker admission, occurrence metadata, job decisions, watermarks, tick receipts",
+      "invariants": "I3, I5, I7, I17",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-worker-result-mailbox-coordinator-resume",
+      "label": "worker result mailbox / coordinator resume",
+      "group": "component",
+      "state": "implemented",
+      "summary": "exact-owner child result collection and master-only durable continuation",
+      "reads": "typed terminal child receipts, bounded/redacted result summaries or opaque artifact pointers, exact-lane activity",
+      "writes": "mailbox claims, explicit failed omissions, resume intent, coordinator wait/consume receipts, structural-only master continuation context",
+      "invariants": "I2, I3, I8, I9",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -331,10 +370,10 @@
       "label": "codex_runtime",
       "group": "component",
       "state": "implemented",
-      "summary": "app-server plan/executable resolution, preflight, startup/run, completion capture, tool-timeout recovery",
+      "summary": "app-server plan/executable resolution, preflight, startup/run, completion capture, tool-timeout recovery, and interrupted-command evidence",
       "reads": "prompt bundle, Codex config, provider request policy",
-      "writes": "execution receipts, terminal protocol-error receipts, transcripts, completions, toolUseTimeout summaries",
-      "invariants": "I2, I3, I7, I10",
+      "writes": "execution receipts, terminal protocol-error receipts, transcripts, completions, toolUseTimeout summaries, interruptedToolUses summaries",
+      "invariants": "I2, I3, I7, I10, I19",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -357,10 +396,10 @@
       "label": "runtime_pipeline",
       "group": "component",
       "state": "implemented",
-      "summary": "run-once orchestration, retry/dead-letter, final outbox repair, outbound media directive parsing and artifactRef resolution",
+      "summary": "run-once orchestration, retry/dead-letter, final outbox repair, interruption summary classification, outbound media directive parsing and artifactRef resolution",
       "reads": "queue item, Codex receipts, channel state, media policy config",
       "writes": "run-once receipt, dead-letter receipt, final outbox, media policy/lint receipts",
-      "invariants": "I2, I3, I7, I8, I9, I16",
+      "invariants": "I2, I3, I7, I8, I9, I16, I19",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -370,10 +409,10 @@
       "label": "channel_delivery",
       "group": "component",
       "state": "implemented",
-      "summary": "provider-native delivery, retry, outbound presentation rendering, and attachment-kind-aware media upload",
+      "summary": "provider-native delivery, retry, outbound presentation rendering, text chunking, terminal receipt precedence, and attachment-kind-aware media upload",
       "reads": "outbox JSONL, optional rich-message presentation payloads, policy-validated attachments",
-      "writes": "delivery receipts, per-provider rendered-unit receipts with attachment kind",
-      "invariants": "I2, I7, I9, I14, I16",
+      "writes": "delivery receipts, per-provider rendered-unit receipts with attachment kind and per-chunk text ids",
+      "invariants": "I2, I7, I9, I14, I16, I18",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -471,6 +510,17 @@
       ]
     },
     {
+      "id": "axis-virtualsessionid",
+      "label": "virtualSessionId",
+      "group": "identity",
+      "state": "required",
+      "summary": "Stable task-continuity owner across concrete-session rollover.",
+      "preservedThrough": "working-context resolver, prompt manifest, operation plan, child result owner, coordinator resume",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
       "id": "axis-runtimeclass",
       "label": "runtimeClass",
       "group": "identity",
@@ -493,100 +543,56 @@
       ]
     },
     {
-      "id": "impact-channel-identity-allow-list-or-bindings",
-      "label": "Channel identity, allow-list, or bindings",
-      "group": "gate",
-      "state": "release-gate",
-      "summary": "allowed vs blocked ingress; ambiguous binding fail-closed; non-main agent binding",
-      "reviewDocs": "docs/trust-boundaries.md, local docs/.private/agent-harness-channel-self-check.md, this file",
+      "id": "axis-backendcontextgeneration",
+      "label": "backendContextGeneration",
+      "group": "identity",
+      "state": "required",
+      "summary": "Opaque Codex/backend context generation, not a routing wildcard.",
+      "preservedThrough": "prompt manifest, injection ledger, reinjection decision, prepared execution receipt",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
     },
     {
-      "id": "impact-channel-commands-or-state",
-      "label": "Channel commands or state",
+      "id": "impact-channel-identity-commands-or-state",
+      "label": "Channel identity, commands, or state",
       "group": "gate",
       "state": "release-gate",
-      "summary": "/new, /model, /think, /stop; same agent stale-session suppression; different agent non-suppression; fresh /new prompt/memory task boundary",
-      "reviewDocs": "local docs/.private/agent-harness-dev-handoff.md, this file",
+      "summary": "allow/deny and ambiguous-binding gates; non-main routing; /new, /model, unified /think//reasoning, /stop; agent-scoped state and fresh-task boundaries",
+      "reviewDocs": "docs/trust-boundaries.md, docs/configuration.md, docs/invariants.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
     },
     {
-      "id": "impact-runtime-queue-or-leases",
-      "label": "Runtime queue or leases",
+      "id": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
+      "label": "Runtime queue, worker mailbox, coordinator, or leases",
       "group": "gate",
       "state": "release-gate",
-      "summary": "same-session FIFO; runtime class isolation; stale lease recovery; terminal state selection",
-      "reviewDocs": "docs/agent-worker-dispatch-strategy.md, docs/configuration.md, this file",
+      "summary": "FIFO/class isolation; WorkerJobKind-derived route; typed terminal provenance; immutable heterogeneous policies; exact-owner mailbox; failed omissions; structural-only context; exact-lane mutual exclusion; idempotent replay; master-only user output",
+      "reviewDocs": "docs/agent-worker-dispatch-strategy.md, docs/configuration.md, docs/invariants.md, docs/schema-registry.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
     },
     {
-      "id": "impact-codex-runtime-or-completion-recording",
-      "label": "Codex runtime or completion recording",
+      "id": "impact-codex-runtime-final-outbox-delivery-or-progress",
+      "label": "Codex runtime, final outbox, delivery, or progress",
       "group": "gate",
       "state": "release-gate",
-      "summary": "real final plus empty completion; already-recorded completion outbox repair; protocol error classification, including app-server startup/write failures; Windows shim/native executable resolution; active tool-use idle timeout recovery",
-      "reviewDocs": "local docs/.private/agent-harness-dev-handoff.md, local docs/.private/r9-2-completion-outbox-staging.md, this file",
+      "summary": "completion/protocol-error terminality; duplicate and stale-owner suppression; progress/final separation; provider delivery and terminal receipt precedence; bounded interruption evidence",
+      "reviewDocs": "docs/invariants.md, docs/schema-registry.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
     },
     {
-      "id": "impact-final-outbox-or-delivery",
-      "label": "Final outbox or delivery",
+      "id": "impact-presentation-media-or-artifact-hygiene",
+      "label": "Presentation, media, or artifact hygiene",
       "group": "gate",
       "state": "release-gate",
-      "summary": "completed turn has exactly one final outbox or terminal notification; duplicate suppression by source queue/completion; final agent-reply excludes progress/narration stream content and implementation-goal read-only review evidence; structured owner/session routing keeps mismatched-run output as internal evidence while allowing channel-ingress-routed non-main agents to own their own final outbox; invalid historical outbox rows are retired with skipped-permanent receipts instead of fake delivered receipts; Telegram and Discord delivery receipt trace",
-      "reviewDocs": "local docs/.private/agent-harness-channel-self-check.md, docs/invariants.md, local docs/.private/release-checklist.md, this file",
-      "refs": [
-        "docs/agent-harness-topology-contract.md"
-      ]
-    },
-    {
-      "id": "impact-outbound-presentation-or-rich-message-rendering",
-      "label": "Outbound presentation or rich-message rendering",
-      "group": "gate",
-      "state": "release-gate",
-      "summary": "semantic presentation renders deterministically to Telegram and Discord; plain-final Markdown subset is harness-parsed before provider rendering; Telegram HTML is escaped; Discord disables accidental mentions; text/media/action units and presentation render/fallback/full-text-preserved receipts are accounted; attachment-index and artifactRef media refs preserve generated or inbound attachments; rendered media units record attachment kind; partial rich-batch delivery is not marked complete; action re-entry is verified or explicitly deferred under normal channel identity/session routing",
-      "reviewDocs": "local docs/.private/rich-message-presentation-design-2026-06-30.md, docs/invariants.md, local docs/.private/release-checklist.md, this file",
-      "refs": [
-        "docs/agent-harness-topology-contract.md"
-      ]
-    },
-    {
-      "id": "impact-outbound-media-directive-or-delivery-policy",
-      "label": "Outbound media directive or delivery policy",
-      "group": "gate",
-      "state": "release-gate",
-      "summary": "MEDIA directives are parsed only outside protected spans; unknown or denied paths leave visible rejection text plus agent-harness.outbound-media-policy.v1 receipts; artifactRef resolution stays inside the harness artifact resolver; lint warning/fail-closed behavior is covered; Telegram image albums/caption overflow and Discord multipart batching record attachment-kind delivery receipts",
-      "reviewDocs": "docs/invariants.md, docs/schema-registry.md, local docs/.private/release-checklist.md, this file",
-      "refs": [
-        "docs/agent-harness-topology-contract.md"
-      ]
-    },
-    {
-      "id": "impact-progress-delivery-or-narration",
-      "label": "Progress delivery or narration",
-      "group": "gate",
-      "state": "release-gate",
-      "summary": "bounded body/status edit volume; repeated text-hash suppression; terminal progress convergence; progress/narration stays out of final agent-reply; compact-before-turn fallback or fresh-thread recovery path when completion recovery is touched",
-      "reviewDocs": "docs/agent-harness-assistant-narration-tech-note.md, local docs/.private/agent-harness-channel-self-check.md, docs/invariants.md, local docs/.private/release-checklist.md, this file",
-      "refs": [
-        "docs/agent-harness-topology-contract.md"
-      ]
-    },
-    {
-      "id": "impact-artifact-or-media-prompt-hygiene",
-      "label": "Artifact or media prompt hygiene",
-      "group": "gate",
-      "state": "release-gate",
-      "summary": "image, audio/transcript, generated speech/media, browser capture, document/download, long tool-log/review transcript, worker-report, provider-native attachment fixtures, Discord text/image/referenced attachments, and Telegram document/voice/audio/video/static-sticker/reply media render as artifact refs plus bounded extraction summaries with provenance; raw bytes/base64/provider URLs/tool blobs are absent from main-thread prompt/continuity and Codex progress previews",
-      "reviewDocs": "local private artifact-hygiene evidence, docs/invariants.md, local docs/.private/release-checklist.md, this file",
+      "summary": "protected parsing; policy-gated artifact refs; bounded extracted context; provider escaping/batching; no raw payloads, credentials, provider URLs, or local paths in durable model-facing context",
+      "reviewDocs": "docs/invariants.md, docs/schema-registry.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -596,41 +602,80 @@
       "label": "Prompt assembly or agent selection",
       "group": "gate",
       "state": "release-gate",
-      "summary": "main and non-main prompt isolation; provider/Codex home selection; prompt file role headers; fresh /new request does not inject previous-task memory context",
-      "reviewDocs": "local docs/.private/agent-harness-dev-handoff.md, this file",
+      "summary": "absent non-main directory isolation; safe worker agent ids and canonical session-path confinement; exact-lane/backend-generation manifest; eight static files and aliases; tombstones; dynamic-memory separation; /new isolation",
+      "reviewDocs": "docs/configuration.md, docs/invariants.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
     },
     {
-      "id": "impact-provider-model-request-override-commands",
-      "label": "Provider/model/request override commands",
+      "id": "impact-provider-model-request-overrides",
+      "label": "Provider/model/request overrides",
       "group": "gate",
       "state": "release-gate",
-      "summary": "/model, /think, and /fast command state remains agent/session-scoped; unsupported provider/model routes fail closed; Codex app-server fast mode is gated by model-catalog serviceTiers and uses camelCase serviceTier only for supported routes; command replies do not start model turns",
-      "reviewDocs": "docs/configuration.md, local docs/.private/agent-harness-dev-handoff.md, this file",
+      "summary": "exact-route max; exact ultra rejection; legacy alias canonicalization; unsupported routes fail closed; command replies remain model-turn-free",
+      "reviewDocs": "docs/configuration.md, docs/invariants.md, docs/migration-0.8.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
     },
     {
-      "id": "impact-memory-graph-recall-or-session-history-search",
-      "label": "Memory, graph recall, or session-history search",
+      "id": "impact-memory-or-session-history-search",
+      "label": "Memory or session-history search",
       "group": "gate",
       "state": "release-gate",
-      "summary": "per-agent memory namespace; source-scope/filter telemetry; graph freshness receipt; no canonical writes through read-index caches; concrete session-history candidates require same agent plus lane-qualified session key; project/global fallback is explicit",
-      "reviewDocs": "local docs/.private/ops/memory-importance-maintenance-contract.md, docs/invariants.md, this file",
+      "summary": "per-agent namespace; bounded provenance; no canonical writes through read caches; exact-lane session history; explicit project/global scope",
+      "reviewDocs": "docs/invariants.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
     },
     {
-      "id": "impact-supervisor-or-live-cutover",
-      "label": "Supervisor or live cutover",
+      "id": "impact-release-or-rollback-boundary",
+      "label": "Release or rollback boundary",
       "group": "gate",
       "state": "release-gate",
-      "summary": "staging build, idle gate, backup/rollback receipt, spawn-stable Node/Codex executable paths, post-cutover health/status/outbox checks",
-      "reviewDocs": "local docs/.private/agent-harness-operations-handbook.md, local docs/.private/release-checklist.md, this file",
+      "summary": "candidate gates, idle boundary, no ultra enablement, source/V2 compatibility review, safe state rollback, and post-change health checks",
+      "reviewDocs": "docs/configuration.md, docs/invariants.md, docs/migration-0.8.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "gpt56-max-prompt-coordinator-cutover-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "GPT-5.6 Max-only prompt/child/coordinator upgrade",
+      "designTarget": "GPT-5.6 routes accept catalog-supported efforts through exact max; exact ultra is unsupported and cannot be enabled through command, persisted state, child policy, or configuration. Prompt configuration is isolated per agent and exact full lane/backend generation. Heterogeneous child policies are immutable, child results carry bounded/redacted content or explicit failed omissions to the exact owner, and one exact-lane-safe master continuation owns user-facing output.",
+      "currentEvidence": "Implementation and staging evidence are still being assembled. This contract does not assert T4, live cutover, or post-cutover proof.",
+      "promotionGate": "Promote only after focused and broad staging gates prove command aliases/max propagation/Ultra rejection, prompt/path isolation, WorkerJobKind route binding, typed terminal provenance, complete mailbox batches, master-only progress/final/error ownership, exact-lane mutual exclusion, and restart/replay idempotency; then complete the guarded release gates.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "label": "telegram-final-chunking-terminal-receipt-live-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Telegram final text delivery and terminal receipt precedence",
+      "designTarget": "Overlong Telegram final text should deliver as ordered provider-safe chunks under one logical delivery id, every provider message id should be captured as rendered-unit receipts, Telegram provider-permanent message is too long responses should terminal-skip instead of retrying unchanged payloads, and any terminal receipt must outrank later retryable failures for the same delivery id.",
+      "currentEvidence": "Staging tests cover UTF-16 chunk budgeting with labels, paragraph/line boundary preference, plain and rich-fallback chunk delivery, post-chunk permanent message is too long classification, Discord chunk regression, and channel_delivery::tests::terminal_delivery_receipt_outranks_later_retryable_failed_receipt.",
+      "promotionGate": "Promote after live or candidate-home provider evidence shows a long Telegram final produces ordered (i/n) messages, one delivery receipt with per-chunk rendered units, no retryable backlog, and no resurrection after terminal receipt.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-interrupted-command-observability-live-gap",
+      "label": "interrupted-command-observability-live-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Interrupted validation command observability",
+      "designTarget": "A same-lane newer turn that interrupts an in-flight Codex command should record interrupted_by_new_turn, command preview/cwd/log pointers, safe-rerun classification, and bounded continuation context; it must not be reported as a failed test without an observed failing exit code or assertion output.",
+      "currentEvidence": "Staging tests cover active command cancel evidence in codex_runtime, safe-rerun classification, runtime failure text that avoids failed-test wording, and structured lastInterruption prompt context with legacy fallback.",
+      "promotionGate": "Promote after controlled live-lane or candidate-home smoke proves interruption affects only the current execution lane, gateway/supervisor loops remain live, receipts contain bounded command evidence, and the continuation prompt names the resume action without stdout/stderr dumps.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -706,9 +751,9 @@
       "group": "gap",
       "state": "open-gap",
       "summary": "Progress delivery and final-reply UX",
-      "designTarget": "A long-running channel turn should show bounded progress updates, then converge to one final reply or terminal notification without excessive provider edits, repeated body/status churn, non-terminal progress after completion, or raw internal worker final text leaking into the visible progress action stream. The body/action lane is an event-history stream and may be capped; the status/current-step lane is a heartbeat/current-summary surface and must remain editable after the body cap.",
-      "currentEvidence": "A 2026-06-28 Telegram DM audit after 02:57 Taipei found one completed turn with one final outbox but more than 100 progress edit receipts, and a later in-flight turn with dozens of progress edits before any final outbox. A Discord long-running turn then showed the inverse UX failure: body/status counters reached 6 while internal events and typing indicators continued, making the visible panel look frozen. Round10 adds response.progressDeliveryMaxNonterminalUpdatesPerLane / progressDeliveryMaxNonterminalBodyUpdatesPerQueue, tracks delivered non-terminal lane counters in agent-harness.progress-delivery-state.v1, exposes volume_limited, keeps terminal convergence outside the volume cap, and adds status heartbeat after body cap via progressDeliveryStatusHeartbeatAfterBodyCapMs. progress::tests::delivery_plan_status_heartbeat_after_body_cap_is_channel_agnostic proves the same behavior for Telegram and Discord fixtures. Follow-up staging adds progress::tests::delivery_plan_status_updates_immediately_for_new_current_step_after_body_cap, proving a newly appended assistant execution summary bypasses the post-body-cap heartbeat interval and edits the status/current-step lane immediately. Round12 scenario-matrix follow-up adds progress::tests::progress_surface_volume_replay_converges_without_post_terminal_churn, covering Telegram and Discord in one replay: delivered body/status, capped body/action lane, immediate status/current-step update, heartbeat after cap, terminal convergence, and no late provider-visible churn after terminal delivery. Package D staging adds progress::tests::action_stream_summarizes_internal_worker_results_instead_of_raw_final_text and progress::tests::action_stream_summarizes_structured_subagent_notifications_without_source_label, proving subagent/worker result tool events, including structured subagent notifications without source labels, render as a bounded summary instead of raw worker final prose.",
-      "promotionGate": "Promote only after a replay/scenario gate proves per-queue body/action edit caps, status/current-step heartbeat after body cap, immediate current-step updates for new assistant execution summaries, worker-result action summaries, repeated text-hash suppression, terminal progress convergence, final-outbox presence, and no post-terminal edit churn across Telegram and Discord.",
+      "designTarget": "A long-running channel turn should show bounded progress updates, then converge to one final reply or terminal notification without excessive provider edits, repeated body/status churn, non-terminal progress after completion, terminal progress closing before the source final provider delivery, or raw internal worker final text leaking into the visible progress action stream. The body/action lane is an event-history stream and may be capped; the status/current-step lane is a heartbeat/current-summary surface and must remain editable after the body cap.",
+      "currentEvidence": "A 2026-06-28 Telegram DM audit after 02:57 Taipei found one completed turn with one final outbox but more than 100 progress edit receipts, and a later in-flight turn with dozens of progress edits before any final outbox. A Discord long-running turn then showed the inverse UX failure: body/status counters reached 6 while internal events and typing indicators continued, making the visible panel look frozen. Round10 adds response.progressDeliveryMaxNonterminalUpdatesPerLane / progressDeliveryMaxNonterminalBodyUpdatesPerQueue, tracks delivered non-terminal lane counters in agent-harness.progress-delivery-state.v1, exposes volume_limited, keeps terminal convergence outside the volume cap, and adds status heartbeat after body cap via progressDeliveryStatusHeartbeatAfterBodyCapMs. progress::tests::delivery_plan_status_heartbeat_after_body_cap_is_channel_agnostic proves the same behavior for Telegram and Discord fixtures. Follow-up staging adds progress::tests::delivery_plan_status_updates_immediately_for_new_current_step_after_body_cap, proving a newly appended assistant execution summary bypasses the post-body-cap heartbeat interval and edits the status/current-step lane immediately. Round12 scenario-matrix follow-up adds progress::tests::progress_surface_volume_replay_converges_without_post_terminal_churn, covering Telegram and Discord in one replay: delivered body/status, capped body/action lane, immediate status/current-step update, heartbeat after cap, terminal convergence, and no late provider-visible churn after terminal delivery. Package D staging adds progress::tests::action_stream_summarizes_internal_worker_results_instead_of_raw_final_text and progress::tests::action_stream_summarizes_structured_subagent_notifications_without_source_label, proving subagent/worker result tool events, including structured subagent notifications without source labels, render as a bounded summary instead of raw worker final prose. Round17 final-order staging adds progress::tests::terminal_progress_waits_until_source_final_delivery_is_delivered, proving terminal progress waits when the same source queue has a final outbox row whose provider delivery receipt is not yet delivered.",
+      "promotionGate": "Promote only after a replay/scenario gate proves per-queue body/action edit caps, status/current-step heartbeat after body cap, immediate current-step updates for new assistant execution summaries, worker-result action summaries, repeated text-hash suppression, terminal progress convergence after source final provider delivery, final-outbox presence, and no post-terminal edit churn across Telegram and Discord.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -771,9 +816,9 @@
       "group": "gap",
       "state": "open-gap",
       "summary": "Deterministic cron freshness and catch-up",
-      "designTarget": "Cron canon freshness must be evaluated by status/health independently of the keeper job, deterministic cron executions must be answerable by canonical cron id, and restart catch-up behavior must be explicit and receipted per job class. Notification/sender jobs must not present stale source packets as fresh unless an operator forces that path and the receipt says so.",
-      "currentEvidence": "Round16 Slice B adds generic cron-canon monitor evaluation in status/healthz, deterministic worker evidence keyed by canon cron id, per-job catchUpPolicy decisions, and a tracked Dream Director sender freshness guard that suppresses stale source packets by default. Current local evidence covers K1-K6, health/status freshness warnings, deterministic CronRun evidence, catch-up policy receipts, the sender dry-run receipt surface, and checked-in cron_scheduler::tests::e2e_5_cron_outage_replay_from_sanitized_fixture; live Dream Lite freshness reset/current-state decision and live/candidate sender receipt remain cutover gates.",
-      "promotionGate": "Promote after K1-K6, checked-in E2E-5 replay, and live/candidate sender receipt evidence prove stale keeper/source warnings are visible, stale sender packets are suppressed or explicitly forced with receipts, deterministic cron success/failure is queryable by canon id, and restart catch-up policy decisions are audited for analysis, notification, and keeper-class jobs.",
+      "designTarget": "Cron canon freshness must be evaluated by status/health independently of the keeper job, deterministic cron executions must be answerable by canonical cron id, and restart catch-up behavior must be explicit and receipted per job class. Each occurrence must come from one exact crontab source, use the declared timezone/calendar fields, and apply bounded per-entry timeout/attempt policy before enqueue. Notification/sender and backup-class jobs must not execute stale work unless an operator forces that path and the receipt says so.",
+      "currentEvidence": "The scheduler now filters exact crontab filenames, validates canonical timeoutMs / maxAttempts, honors TZ / CRON_TZ for current and catch-up slots, supports calendar day/month fields, passes stable occurrence metadata to workers, and terminalizes exhausted jobs before lease. Incident-shaped replay covers attempt-cap bypass, process-tree timeout, invalid policy, source-copy filtering, timezone, and unsafe backup catch-up suppression in addition to existing health/status and E2E-5 evidence.",
+      "promotionGate": "Promote after focused incident replay plus a candidate/live dry-run prove zero unsafe stale backup enqueue, one intended source per entry, valid execution bounds, correct local schedule evaluation, and post-cutover worker/scheduler readback shows no retry growth or duplicate occurrence.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -813,6 +858,19 @@
       "designTarget": "User commands should be parsed as control-plane events before model dispatch, mutate scoped channel/session state deterministically, emit machine-readable command receipts, and skip LLM execution when the command is fully handled by the runtime. Commands should not depend on a chat-facing agent noticing and obeying command-shaped text.",
       "currentEvidence": "Agent Harness has a command path for /new, /think, /model, /stop, /status, /steer, /btw, and protected restart requests: channel_runtime builds CommandReply steps, channel_state writes scoped state plus command receipts, and command replies do not enqueue agent turns. Round16 Slice B hardens command parsing/receipt uniformity and adds a checked-in agent-harness-cli::tests::e2e_4_restart_gateway_staging_closed_loop_replay for the gateway restart request -> consumption -> heartbeat -> completion ack chain. Remaining live proof is provider/supervisor smoke: a real supervised child restart and Discord delivery evidence, plus any lifecycle commands still intentionally model-assisted.",
       "promotionGate": "Keep central command registry coverage for command-only, command-plus-reply, and command-plus-enqueue cases; emit stable command receipts for applied, unsupported, unknown, and skipped-not-command outcomes; prove handled commands do not create model turns; prove same platform/channel/user but different agentId state isolation; prove /stop cancellation is immediate and source-correlated; document which lifecycle commands are runtime-owned versus model-assisted; before live promotion, prove the E2E-4 restart loop with a real supervised child and provider-side ack delivery.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-skill-ecosystem-closed-loop-gap",
+      "label": "skill-ecosystem-closed-loop-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Skill ecosystem closed loop",
+      "designTarget": "Skills should behave as runtime state with deterministic discovery/selection, guarded prompt exposure, proposal-mediated mutation, first-class autonomous review/apply, reversible lifecycle curation, checksum-locked packs, and aggregate health evidence.",
+      "currentEvidence": "Staging adds matcher v3 with mixed CJK tokenizer, category/tag/usage scoring, catalog retrieval, skill-view, skill-lint, skill-guard, reversible curator archive/restore/pin, file-based skill packs, skill-synthesize with autonomous apply by default, skill-apply --autonomous, skill-doctor, schema entries, and invariant I20. Direct writes remain forbidden; autonomous apply still uses proposal ids, checksum validation, target locks, backups, lint/guard decisions, and receipts.",
+      "promotionGate": "Promote only after focused tests plus the staging closed-loop replay prove CJK selection, no-skill complex turn synthesis, autonomous review/apply, re-selection of the created skill, pack export/import/remove round-trip, curator dry-run, skill-doctor --json, public/private hygiene, and no live cutover until explicit operator approval.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -956,6 +1014,21 @@
     {
       "source": "canon-topology-contract",
       "target": "component-prompt-turns",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-workers-child-execution-policy",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-cron-scheduler-deterministic-cron",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-worker-result-mailbox-coordinator-resume",
       "label": "owns boundary"
     },
     {
@@ -1185,12 +1258,37 @@
     },
     {
       "source": "canon-topology-contract",
+      "target": "axis-virtualsessionid",
+      "label": "defines"
+    },
+    {
+      "source": "axis-virtualsessionid",
+      "target": "component-prompt-turns",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-virtualsessionid",
+      "target": "component-workers-child-execution-policy",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-virtualsessionid",
+      "target": "component-worker-result-mailbox-coordinator-resume",
+      "label": "must survive through"
+    },
+    {
+      "source": "canon-topology-contract",
       "target": "axis-runtimeclass",
       "label": "defines"
     },
     {
       "source": "axis-runtimeclass",
       "target": "component-runtime-queue-runtime-worker",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-runtimeclass",
+      "target": "component-workers-child-execution-policy",
       "label": "must survive through"
     },
     {
@@ -1214,168 +1312,118 @@
       "label": "must survive through"
     },
     {
-      "source": "impact-channel-identity-allow-list-or-bindings",
+      "source": "canon-topology-contract",
+      "target": "axis-backendcontextgeneration",
+      "label": "defines"
+    },
+    {
+      "source": "axis-backendcontextgeneration",
+      "target": "component-prompt-turns",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-backendcontextgeneration",
+      "target": "component-workers-child-execution-policy",
+      "label": "must survive through"
+    },
+    {
+      "source": "impact-channel-identity-commands-or-state",
       "target": "canon-topology-contract",
       "label": "reviewed by"
     },
     {
       "source": "component-channel-identity",
-      "target": "impact-channel-identity-allow-list-or-bindings",
+      "target": "impact-channel-identity-commands-or-state",
       "label": "changes trigger"
     },
     {
       "source": "component-channel-state",
-      "target": "impact-channel-identity-allow-list-or-bindings",
+      "target": "impact-channel-identity-commands-or-state",
       "label": "changes trigger"
     },
     {
       "source": "component-channel-ingress-channel-runtime",
-      "target": "impact-channel-identity-allow-list-or-bindings",
+      "target": "impact-channel-identity-commands-or-state",
       "label": "changes trigger"
     },
     {
       "source": "component-channel-delivery",
-      "target": "impact-channel-identity-allow-list-or-bindings",
+      "target": "impact-channel-identity-commands-or-state",
       "label": "changes trigger"
     },
     {
-      "source": "impact-channel-commands-or-state",
-      "target": "canon-topology-contract",
-      "label": "reviewed by"
-    },
-    {
-      "source": "component-channel-identity",
-      "target": "impact-channel-commands-or-state",
-      "label": "changes trigger"
-    },
-    {
-      "source": "component-channel-state",
-      "target": "impact-channel-commands-or-state",
-      "label": "changes trigger"
-    },
-    {
-      "source": "component-channel-ingress-channel-runtime",
-      "target": "impact-channel-commands-or-state",
-      "label": "changes trigger"
-    },
-    {
-      "source": "component-channel-delivery",
-      "target": "impact-channel-commands-or-state",
-      "label": "changes trigger"
-    },
-    {
-      "source": "impact-runtime-queue-or-leases",
+      "source": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
       "target": "canon-topology-contract",
       "label": "reviewed by"
     },
     {
       "source": "component-channel-ingress-channel-runtime",
-      "target": "impact-runtime-queue-or-leases",
+      "target": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
       "label": "changes trigger"
     },
     {
       "source": "component-runtime-queue-runtime-worker",
-      "target": "impact-runtime-queue-or-leases",
+      "target": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
       "label": "changes trigger"
     },
     {
       "source": "component-codex-runtime",
-      "target": "impact-runtime-queue-or-leases",
+      "target": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
       "label": "changes trigger"
     },
     {
       "source": "component-runtime-pipeline",
-      "target": "impact-runtime-queue-or-leases",
+      "target": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
       "label": "changes trigger"
     },
     {
-      "source": "impact-codex-runtime-or-completion-recording",
+      "source": "impact-codex-runtime-final-outbox-delivery-or-progress",
       "target": "canon-topology-contract",
       "label": "reviewed by"
     },
     {
       "source": "component-channel-ingress-channel-runtime",
-      "target": "impact-codex-runtime-or-completion-recording",
+      "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
       "label": "changes trigger"
     },
     {
       "source": "component-runtime-queue-runtime-worker",
-      "target": "impact-codex-runtime-or-completion-recording",
+      "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
       "label": "changes trigger"
     },
     {
       "source": "component-codex-runtime",
-      "target": "impact-codex-runtime-or-completion-recording",
+      "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
       "label": "changes trigger"
     },
     {
       "source": "component-runtime-pipeline",
-      "target": "impact-codex-runtime-or-completion-recording",
-      "label": "changes trigger"
-    },
-    {
-      "source": "impact-final-outbox-or-delivery",
-      "target": "canon-topology-contract",
-      "label": "reviewed by"
-    },
-    {
-      "source": "component-channel-delivery",
-      "target": "impact-final-outbox-or-delivery",
-      "label": "changes trigger"
-    },
-    {
-      "source": "impact-outbound-presentation-or-rich-message-rendering",
-      "target": "canon-topology-contract",
-      "label": "reviewed by"
-    },
-    {
-      "source": "impact-outbound-media-directive-or-delivery-policy",
-      "target": "canon-topology-contract",
-      "label": "reviewed by"
-    },
-    {
-      "source": "component-media-artifact-hygiene",
-      "target": "impact-outbound-media-directive-or-delivery-policy",
-      "label": "changes trigger"
-    },
-    {
-      "source": "component-provider-request-policy",
-      "target": "impact-outbound-media-directive-or-delivery-policy",
+      "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
       "label": "changes trigger"
     },
     {
       "source": "component-channel-delivery",
-      "target": "impact-outbound-media-directive-or-delivery-policy",
-      "label": "changes trigger"
-    },
-    {
-      "source": "impact-progress-delivery-or-narration",
-      "target": "canon-topology-contract",
-      "label": "reviewed by"
-    },
-    {
-      "source": "component-channel-delivery",
-      "target": "impact-progress-delivery-or-narration",
+      "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
       "label": "changes trigger"
     },
     {
       "source": "component-progress",
-      "target": "impact-progress-delivery-or-narration",
+      "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
       "label": "changes trigger"
     },
     {
-      "source": "impact-artifact-or-media-prompt-hygiene",
+      "source": "impact-presentation-media-or-artifact-hygiene",
       "target": "canon-topology-contract",
       "label": "reviewed by"
     },
     {
       "source": "component-media-artifact-hygiene",
-      "target": "impact-artifact-or-media-prompt-hygiene",
-      "label": "changes trigger"
-    },
-    {
-      "source": "component-prompt-turns",
-      "target": "impact-artifact-or-media-prompt-hygiene",
+      "target": "impact-presentation-media-or-artifact-hygiene",
       "label": "changes trigger"
     },
     {
@@ -1389,29 +1437,119 @@
       "label": "changes trigger"
     },
     {
-      "source": "impact-provider-model-request-override-commands",
+      "source": "impact-provider-model-request-overrides",
       "target": "canon-topology-contract",
       "label": "reviewed by"
     },
     {
       "source": "component-provider-request-policy",
-      "target": "impact-provider-model-request-override-commands",
+      "target": "impact-provider-model-request-overrides",
       "label": "changes trigger"
     },
     {
-      "source": "impact-memory-graph-recall-or-session-history-search",
+      "source": "impact-memory-or-session-history-search",
       "target": "canon-topology-contract",
       "label": "reviewed by"
     },
     {
       "source": "component-memory-session-history-retrieval",
-      "target": "impact-memory-graph-recall-or-session-history-search",
+      "target": "impact-memory-or-session-history-search",
       "label": "changes trigger"
     },
     {
-      "source": "impact-supervisor-or-live-cutover",
+      "source": "impact-release-or-rollback-boundary",
       "target": "canon-topology-contract",
       "label": "reviewed by"
+    },
+    {
+      "source": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime",
+      "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-telegram-final-chunking-terminal-receipt-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-interrupted-command-observability-live-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime",
+      "target": "gap-interrupted-command-observability-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-interrupted-command-observability-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-interrupted-command-observability-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime",
+      "target": "gap-interrupted-command-observability-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline",
+      "target": "gap-interrupted-command-observability-live-gap",
+      "label": "has gap"
     },
     {
       "source": "gap-openclaw-mem-full-parity-gap",
@@ -1474,6 +1612,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-provider-request-policy",
       "target": "gap-channel-session-history-classification-gap",
       "label": "has gap"
@@ -1515,6 +1658,11 @@
     },
     {
       "source": "component-prompt-turns",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
       "target": "gap-multi-agent-full-matrix-gap",
       "label": "has gap"
     },
@@ -1620,6 +1768,16 @@
     },
     {
       "source": "component-media-artifact-hygiene",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
       "target": "gap-progress-delivery-volume-gap",
       "label": "has gap"
     },
@@ -1744,6 +1902,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-codex-runtime",
       "target": "gap-codex-startup-executable-stability-gap",
       "label": "has gap"
@@ -1779,6 +1942,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-codex-runtime",
       "target": "gap-runtime-terminal-control-gap",
       "label": "has gap"
@@ -1804,12 +1972,22 @@
       "label": "tracked in"
     },
     {
-      "source": "component-channel-state",
+      "source": "component-runtime-queue-runtime-worker",
       "target": "gap-deterministic-cron-freshness-gap",
       "label": "has gap"
     },
     {
-      "source": "component-runtime-queue-runtime-worker",
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-deterministic-cron-freshness-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-cron-scheduler-deterministic-cron",
+      "target": "gap-deterministic-cron-freshness-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
       "target": "gap-deterministic-cron-freshness-gap",
       "label": "has gap"
     },
@@ -1840,6 +2018,11 @@
     },
     {
       "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
       "target": "gap-external-review-loop-resilience-gap",
       "label": "has gap"
     },
@@ -1924,6 +2107,16 @@
       "label": "has gap"
     },
     {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-cron-scheduler-deterministic-cron",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-codex-runtime",
       "target": "gap-first-class-command-plane-gap",
       "label": "has gap"
@@ -1946,6 +2139,56 @@
     {
       "source": "component-memory-session-history-retrieval",
       "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-skill-ecosystem-closed-loop-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-skill-ecosystem-closed-loop-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime",
+      "target": "gap-skill-ecosystem-closed-loop-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-skill-ecosystem-closed-loop-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-media-artifact-hygiene",
+      "target": "gap-skill-ecosystem-closed-loop-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-skill-ecosystem-closed-loop-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-cron-scheduler-deterministic-cron",
+      "target": "gap-skill-ecosystem-closed-loop-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime",
+      "target": "gap-skill-ecosystem-closed-loop-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline",
+      "target": "gap-skill-ecosystem-closed-loop-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-skill-ecosystem-closed-loop-gap",
       "label": "has gap"
     },
     {
@@ -2020,6 +2263,11 @@
     },
     {
       "source": "component-prompt-turns",
+      "target": "gap-channel-media-delivery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
       "target": "gap-channel-media-delivery-gap",
       "label": "has gap"
     },
@@ -2142,6 +2390,11 @@
       "source": "gap-repo-code-graph-support-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
+    },
+    {
+      "source": "component-cron-scheduler-deterministic-cron",
+      "target": "gap-repo-code-graph-support-gap",
+      "label": "has gap"
     },
     {
       "source": "gap-supervisor-service-health-precedence-gap",
@@ -2324,9 +2577,6 @@
       "nodes": [
         "canon-topology-contract",
         "ops-current-live-validation",
-        "impact-codex-runtime-or-completion-recording",
-        "impact-final-outbox-or-delivery",
-        "impact-supervisor-or-live-cutover",
         "gap-scenario-matrix-coverage-gap",
         "gap-supervisor-service-health-precedence-gap"
       ],

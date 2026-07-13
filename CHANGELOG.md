@@ -8,6 +8,11 @@
 - Added an exact-lane, backend-generation-scoped manifest for the eight per-agent static prompt files, including alias handling and deletion tombstones. Non-main agents no longer inherit main-agent prompt files when their own workspace is absent.
 - Added immutable heterogeneous child execution policies, exact-owner result mailboxes, lease-safe coordinator resume, explicit failed omissions for missing child evidence, and master-only user-facing progress/final/error ownership.
 
+### Fixed
+
+- Hardened deterministic cron with per-entry `timeoutMs` and `maxAttempts`, `TZ` / `CRON_TZ`-aware current and catch-up scheduling, calendar day/month fields, and exact crontab source filtering that ignores backup and temporary copies.
+- Exhausted worker jobs are terminalized before lease, and timed-out deterministic jobs terminate their Windows descendant process tree instead of leaving child processes running.
+
 ### Security
 
 - Bound worker runtime routing to `WorkerJobKind`, require typed terminal receipt schema plus matching runtime-class/origin provenance, and confine worker transcript lookup to a validated per-agent sessions directory.

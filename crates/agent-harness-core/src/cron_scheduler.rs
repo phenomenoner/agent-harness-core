@@ -27,6 +27,9 @@ const DEFAULT_MAX_CATCHUP_PER_TICK: usize = 10;
 const DEFAULT_MAX_ENQUEUE_PER_TICK: usize = 20;
 const DEFAULT_WORKER_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_WATCHDOG_TIMEOUT_MS: u64 = 900_000;
+const MIN_DETERMINISTIC_TIMEOUT_MS: u64 = 1_000;
+const MAX_DETERMINISTIC_TIMEOUT_MS: u64 = 86_400_000;
+const MAX_DETERMINISTIC_ATTEMPTS: i64 = 10;
 const SCHEDULER_LOCK_STALE_MS: i64 = 30_000;
 const CRON_RECEIPTS_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const CRON_RECEIPTS_MAX_ARCHIVES: usize = 5;
@@ -217,6 +220,21 @@ enum DeterministicCatchUpPlan {
         decision: String,
         missed_slots: Vec<i64>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeterministicExecutionPolicy {
+    timeout_ms: u64,
+    max_attempts: i64,
+}
+
+impl Default for DeterministicExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            timeout_ms: DEFAULT_WORKER_TIMEOUT_MS,
+            max_attempts: 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -619,6 +637,28 @@ pub fn lint_cron_scheduler(
             );
         }
         for entry in plan.entries {
+            let evidence_entry_id =
+                deterministic_cron_evidence_entry_id(&options.harness_home, &entry);
+            if let Err(error) = deterministic_cron_execution_policy(&options.harness_home, &entry) {
+                push_lint_finding(
+                    &mut findings,
+                    CronSchedulerLintSeverity::Error,
+                    "deterministic-invalid-execution-policy",
+                    error,
+                    Some("deterministic-cron"),
+                    Some(evidence_entry_id.clone()),
+                );
+            }
+            if let Err(error) = deterministic_crontab_timezone(&entry) {
+                push_lint_finding(
+                    &mut findings,
+                    CronSchedulerLintSeverity::Error,
+                    "deterministic-invalid-timezone",
+                    error,
+                    Some("deterministic-cron"),
+                    Some(evidence_entry_id),
+                );
+            }
             let (severity, code) = match entry.action {
                 DeterministicCronPlanAction::MissingScript => (
                     CronSchedulerLintSeverity::Error,
@@ -1147,14 +1187,48 @@ fn collect_deterministic_cron_decisions(
             continue;
         }
         let evidence_entry_id = deterministic_cron_evidence_entry_id(&options.harness_home, entry);
+        let execution_policy =
+            match deterministic_cron_execution_policy(&options.harness_home, entry) {
+                Ok(policy) => policy,
+                Err(error) => {
+                    push_decision(
+                        report,
+                        "deterministic-cron",
+                        &source_id,
+                        &evidence_entry_id,
+                        options.now_ms,
+                        CronSchedulerJobDecisionStatus::Error,
+                        &error,
+                        None,
+                    );
+                    continue;
+                }
+            };
+        let timezone = match deterministic_crontab_timezone(entry) {
+            Ok(timezone) => timezone,
+            Err(error) => {
+                push_decision(
+                    report,
+                    "deterministic-cron",
+                    &source_id,
+                    &evidence_entry_id,
+                    options.now_ms,
+                    CronSchedulerJobDecisionStatus::Error,
+                    &error,
+                    None,
+                );
+                continue;
+            }
+        };
         let catch_up_policy =
             deterministic_cron_canon_catch_up_policy(&options.harness_home, entry);
         let (scheduled_for_ms, catch_up) =
-            match deterministic_due_slot(&entry.schedule, options.now_ms) {
+            match deterministic_due_slot(&entry.schedule, timezone.as_deref(), options.now_ms) {
                 Ok(Some(value)) => (value, None),
                 Ok(None) => {
                     match deterministic_catch_up_decision(
                         &entry.schedule,
+                        timezone.as_deref(),
                         previous_tick_ms,
                         options.now_ms,
                         config.max_catchup_per_tick,
@@ -1332,7 +1406,7 @@ fn collect_deterministic_cron_decisions(
             runtime_class: "deterministic-shell".to_string(),
             session_key: session_key.clone(),
             session_policy: session_policy.to_string(),
-            max_attempts: 3,
+            max_attempts: execution_policy.max_attempts,
             now_ms: options.now_ms,
         })?;
         let idempotency_key = scheduler_idempotency_key(
@@ -1343,6 +1417,22 @@ fn collect_deterministic_cron_decisions(
             cron_run.attempt,
         );
         let cwd = script_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let mut occurrence_env = serde_json::Map::from_iter([
+            (
+                "AGENT_HARNESS_CRON_ENTRY_ID".to_string(),
+                Value::String(evidence_entry_id.clone()),
+            ),
+            (
+                "AGENT_HARNESS_CRON_SCHEDULED_FOR_MS".to_string(),
+                Value::String(scheduled_for_ms.to_string()),
+            ),
+        ]);
+        if let Some(timezone) = timezone.as_deref() {
+            occurrence_env.insert(
+                "AGENT_HARNESS_CRON_TIMEZONE".to_string(),
+                Value::String(timezone.to_string()),
+            );
+        }
         let payload = json!({
             "adapter": "cron-scheduler",
             "sourceKind": "deterministic-cron",
@@ -1360,6 +1450,7 @@ fn collect_deterministic_cron_decisions(
             "scriptPath": script_path,
             "cwd": cwd,
             "argv": [],
+            "env": occurrence_env,
             "dryRun": !config.deterministic_cron.execute_shell,
             "agentId": &agent_id,
             "sessionKey": &session_key,
@@ -1390,9 +1481,11 @@ fn collect_deterministic_cron_decisions(
             source: Some("cron-scheduler".to_string()),
             priority: 0,
             available_at_ms: Some(options.now_ms),
-            max_attempts: 3,
-            timeout_ms: Some(DEFAULT_WORKER_TIMEOUT_MS),
-            cascade_timeout_ms: Some(DEFAULT_WATCHDOG_TIMEOUT_MS),
+            max_attempts: execution_policy.max_attempts,
+            timeout_ms: Some(execution_policy.timeout_ms),
+            cascade_timeout_ms: Some(
+                DEFAULT_WATCHDOG_TIMEOUT_MS.max(execution_policy.timeout_ms.saturating_mul(3)),
+            ),
             rate_key: None,
             concurrency_group_key: Some(format!(
                 "{}:{}",
@@ -1996,13 +2089,16 @@ fn native_due_slot(schedule: &NativeCronSchedule, now_ms: i64) -> Result<Option<
 
 fn deterministic_due_slot(
     schedule: &DeterministicCronSchedule,
+    timezone: Option<&str>,
     now_ms: i64,
 ) -> Result<Option<i64>, String> {
     match schedule {
         DeterministicCronSchedule::Cron { expression } => {
-            cron_expression_due_slot(expression, now_ms)
+            cron_expression_due_slot_with_timezone(expression, timezone, now_ms)
         }
-        DeterministicCronSchedule::Macro { name } => macro_due_slot(name, now_ms),
+        DeterministicCronSchedule::Macro { name } => {
+            macro_due_slot_with_timezone(name, timezone, now_ms)
+        }
         DeterministicCronSchedule::Unsupported { summary } => Err(format!(
             "unsupported deterministic cron schedule: {summary}"
         )),
@@ -2035,6 +2131,16 @@ fn deterministic_cron_canon_field(
     entry: &DeterministicCronPlanEntry,
     field: &str,
 ) -> Option<String> {
+    deterministic_cron_canon_entry(harness_home, entry)?
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn deterministic_cron_canon_entry(
+    harness_home: &Path,
+    entry: &DeterministicCronPlanEntry,
+) -> Option<Value> {
     let canon_path = harness_home
         .join("workspace")
         .join("docs")
@@ -2056,10 +2162,83 @@ fn deterministic_cron_canon_field(
         if !deterministic_cron_canon_matches_entry(harness_home, cron, entry) {
             return None;
         }
-        cron.get(field)
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
+        Some(cron.clone())
     })
+}
+
+fn deterministic_cron_execution_policy(
+    harness_home: &Path,
+    entry: &DeterministicCronPlanEntry,
+) -> Result<DeterministicExecutionPolicy, String> {
+    let Some(canon) = deterministic_cron_canon_entry(harness_home, entry) else {
+        return Ok(DeterministicExecutionPolicy::default());
+    };
+    let mut policy = DeterministicExecutionPolicy::default();
+    if let Some(value) = canon.get("timeoutMs") {
+        let timeout_ms = value.as_u64().ok_or_else(|| {
+            format!(
+                "deterministic cron `{}` timeoutMs must be an integer",
+                entry.entry_id
+            )
+        })?;
+        if !(MIN_DETERMINISTIC_TIMEOUT_MS..=MAX_DETERMINISTIC_TIMEOUT_MS).contains(&timeout_ms) {
+            return Err(format!(
+                "deterministic cron `{}` timeoutMs must be between {} and {}",
+                entry.entry_id, MIN_DETERMINISTIC_TIMEOUT_MS, MAX_DETERMINISTIC_TIMEOUT_MS
+            ));
+        }
+        policy.timeout_ms = timeout_ms;
+    }
+    if let Some(value) = canon.get("maxAttempts") {
+        let max_attempts = value.as_i64().ok_or_else(|| {
+            format!(
+                "deterministic cron `{}` maxAttempts must be an integer",
+                entry.entry_id
+            )
+        })?;
+        if !(1..=MAX_DETERMINISTIC_ATTEMPTS).contains(&max_attempts) {
+            return Err(format!(
+                "deterministic cron `{}` maxAttempts must be between 1 and {}",
+                entry.entry_id, MAX_DETERMINISTIC_ATTEMPTS
+            ));
+        }
+        policy.max_attempts = max_attempts;
+    }
+    Ok(policy)
+}
+
+fn deterministic_crontab_timezone(
+    entry: &DeterministicCronPlanEntry,
+) -> Result<Option<String>, String> {
+    let text = fs::read_to_string(&entry.crontab_file).map_err(|error| {
+        format!(
+            "could not read deterministic crontab {}: {error}",
+            entry.crontab_file.display()
+        )
+    })?;
+    let mut timezone = None;
+    for line in text.lines().take(entry.line_number.saturating_sub(1)) {
+        let trimmed = line.trim();
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if matches!(key.trim(), "TZ" | "CRON_TZ") {
+            let value = value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
+            timezone_offset_minutes(Some(&value)).map_err(|error| {
+                format!(
+                    "deterministic crontab {}:{} has {error}",
+                    entry.crontab_file.display(),
+                    entry.line_number
+                )
+            })?;
+            timezone = Some(value);
+        }
+    }
+    Ok(timezone)
 }
 
 fn deterministic_cron_canon_matches_entry(
@@ -2123,6 +2302,7 @@ fn deterministic_cron_session_key(entry_id: &str, scheduled_for_ms: i64) -> Stri
 
 fn deterministic_catch_up_decision(
     schedule: &DeterministicCronSchedule,
+    timezone: Option<&str>,
     previous_tick_ms: Option<i64>,
     now_ms: i64,
     max_catchup_per_tick: usize,
@@ -2136,6 +2316,7 @@ fn deterministic_catch_up_decision(
     };
     let missed_slots = missed_deterministic_due_slots(
         schedule,
+        timezone,
         previous_tick_ms,
         now_ms,
         max_catchup_per_tick.max(1),
@@ -2167,6 +2348,7 @@ fn deterministic_catch_up_decision(
 
 fn missed_deterministic_due_slots(
     schedule: &DeterministicCronSchedule,
+    timezone: Option<&str>,
     previous_tick_ms: i64,
     now_ms: i64,
     max_slots: usize,
@@ -2175,7 +2357,7 @@ fn missed_deterministic_due_slots(
     let mut slot = floor_to_minute(previous_tick_ms) + 60_000;
     let end = floor_to_minute(now_ms).saturating_sub(60_000);
     while slot <= end && missed.len() < max_slots {
-        if deterministic_due_slot(schedule, slot)?.is_some() {
+        if deterministic_due_slot(schedule, timezone, slot)?.is_some() {
             missed.push(slot);
         }
         slot = slot.saturating_add(60_000);
@@ -2201,6 +2383,7 @@ fn last_scheduler_tick_ms(scheduler_dir: &Path) -> io::Result<Option<i64>> {
     Ok(None)
 }
 
+#[cfg(test)]
 fn cron_expression_due_slot(expression: &str, now_ms: i64) -> Result<Option<i64>, String> {
     cron_expression_due_slot_with_timezone(expression, None, now_ms)
 }
@@ -2219,9 +2402,10 @@ fn cron_expression_due_slot_with_timezone(
     let minute_slot = floor_to_minute(now_ms);
     let offset_minutes = timezone_offset_minutes(timezone)?;
     let local_slot = minute_slot + offset_minutes * 60_000;
-    let minute = ((local_slot / 60_000) % 60) as i64;
-    let hour = ((local_slot / 3_600_000) % 24) as i64;
-    let days = local_slot / 86_400_000;
+    let minute = local_slot.div_euclid(60_000).rem_euclid(60);
+    let hour = local_slot.div_euclid(3_600_000).rem_euclid(24);
+    let days = local_slot.div_euclid(86_400_000);
+    let (_, month, day_of_month) = civil_date_from_unix_days(days);
     let dow = (days + 4).rem_euclid(7);
     if !matches_cron_field(fields[0], minute, 0, 59)? {
         return Ok(None);
@@ -2229,13 +2413,21 @@ fn cron_expression_due_slot_with_timezone(
     if !matches_cron_field(fields[1], hour, 0, 23)? {
         return Ok(None);
     }
-    if !matches_restricted_day_field(fields[2], "day-of-month")? {
+    if !matches_cron_field(fields[3], month, 1, 12)? {
         return Ok(None);
     }
-    if !matches_restricted_day_field(fields[3], "month")? {
-        return Ok(None);
-    }
-    if !matches_cron_field(fields[4], dow, 0, 6)? {
+    let day_of_month_matches = matches_cron_field(fields[2], day_of_month, 1, 31)?;
+    let day_of_week_matches = matches_cron_field(fields[4], dow, 0, 6)?;
+    let day_matches = match (
+        matches!(fields[2], "*" | "?"),
+        matches!(fields[4], "*" | "?"),
+    ) {
+        (true, true) => true,
+        (true, false) => day_of_week_matches,
+        (false, true) => day_of_month_matches,
+        (false, false) => day_of_month_matches || day_of_week_matches,
+    };
+    if !day_matches {
         return Ok(None);
     }
     Ok(Some(minute_slot))
@@ -2280,26 +2472,46 @@ fn parse_numeric_timezone_offset(value: &str) -> Option<i64> {
     Some(sign * (hours * 60 + minutes))
 }
 
-fn macro_due_slot(name: &str, now_ms: i64) -> Result<Option<i64>, String> {
+fn civil_date_from_unix_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
+    // Proleptic Gregorian conversion adapted from Howard Hinnant's
+    // civil_from_days algorithm. The offset maps 1970-01-01 to its civil date.
+    let shifted = days_since_unix_epoch.saturating_add(719_468);
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month, day)
+}
+
+fn macro_due_slot_with_timezone(
+    name: &str,
+    timezone: Option<&str>,
+    now_ms: i64,
+) -> Result<Option<i64>, String> {
     let minute_slot = floor_to_minute(now_ms);
-    let minute = ((minute_slot / 60_000) % 60) as i64;
-    let hour = ((minute_slot / 3_600_000) % 24) as i64;
-    let days = minute_slot / 86_400_000;
+    let offset_minutes = timezone_offset_minutes(timezone)?;
+    let local_slot = minute_slot + offset_minutes * 60_000;
+    let minute = ((local_slot / 60_000) % 60) as i64;
+    let hour = ((local_slot / 3_600_000) % 24) as i64;
+    let days = local_slot / 86_400_000;
     let dow = (days + 4).rem_euclid(7);
     match name {
         "@hourly" => Ok((minute == 0).then_some(minute_slot)),
         "@daily" | "@midnight" => Ok((minute == 0 && hour == 0).then_some(minute_slot)),
         "@weekly" => Ok((minute == 0 && hour == 0 && dow == 0).then_some(minute_slot)),
         other => Err(format!("unsupported cron macro `{other}`")),
-    }
-}
-
-fn matches_restricted_day_field(field: &str, label: &str) -> Result<bool, String> {
-    match field {
-        "*" | "?" => Ok(true),
-        other => Err(format!(
-            "cron {label} field `{other}` is not yet supported by the scheduler"
-        )),
     }
 }
 
@@ -2442,6 +2654,23 @@ mod tests {
             cron_expression_due_slot("*/5 * * * *", 6 * 60_000)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn cron_expression_supports_calendar_day_and_month_fields() {
+        let february_first_1970_08_15 = 31 * 86_400_000 + 8 * 3_600_000 + 15 * 60_000;
+        assert_eq!(
+            cron_expression_due_slot("15 8 1 2 *", february_first_1970_08_15).unwrap(),
+            Some(february_first_1970_08_15)
+        );
+        assert_eq!(
+            cron_expression_due_slot("15 8 1 1 *", february_first_1970_08_15).unwrap(),
+            None
+        );
+        assert_eq!(
+            cron_expression_due_slot("15 8 2 2 *", february_first_1970_08_15).unwrap(),
+            None
         );
     }
 
@@ -2731,6 +2960,325 @@ mod tests {
     #[test]
     fn deterministic_cron_execution_reportable_by_canon_id() {
         run_once_enqueues_deterministic_cron_with_canon_cron_run_evidence();
+    }
+
+    #[test]
+    fn deterministic_cron_canon_execution_policy_flows_to_cron_run_and_worker() {
+        let root =
+            temp_root("deterministic_cron_canon_execution_policy_flows_to_cron_run_and_worker");
+        let harness_home = root.join(".agent-harness");
+        let source = write_deterministic_source_with_canon(&harness_home);
+        let canon_path = harness_home
+            .join("workspace")
+            .join("docs")
+            .join("ops")
+            .join("cron-canon.json");
+        let mut canon: Value = serde_json::from_slice(&fs::read(&canon_path).unwrap()).unwrap();
+        canon["activeCrons"][0]["timeoutMs"] = json!(3_600_000);
+        canon["activeCrons"][0]["maxAttempts"] = json!(1);
+        write_json_atomic(&canon_path, &canon).unwrap();
+
+        let report = run_cron_scheduler_once(CronSchedulerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            source,
+            runtime_workspace: None,
+            now_ms: 1_234,
+            dry_run: false,
+            enabled_override: Some(true),
+            native_enabled_override: Some(false),
+            deterministic_enabled_override: Some(true),
+            resume_cron_override: None,
+            include_registered_cron_override: None,
+            allow_deterministic_run_override: Some(true),
+            execute_shell_override: Some(false),
+            max_catchup_per_tick_override: None,
+            max_enqueue_per_tick_override: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.summary.enqueued, 1);
+        let cron_runs = crate::collect_cron_run_summary(&harness_home).unwrap();
+        assert_eq!(cron_runs.runs[0].max_attempts, 1);
+        let worker_conn = Connection::open(crate::worker_db_file(&harness_home)).unwrap();
+        let (max_attempts, timeout_ms, payload_json): (i64, i64, String) = worker_conn
+            .query_row(
+                "SELECT max_attempts, timeout_ms, payload_json FROM jobs LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(max_attempts, 1);
+        assert_eq!(timeout_ms, 3_600_000);
+        let payload: Value = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(
+            payload["env"]["AGENT_HARNESS_CRON_ENTRY_ID"],
+            "canon-deterministic-daily"
+        );
+        assert_eq!(payload["env"]["AGENT_HARNESS_CRON_SCHEDULED_FOR_MS"], "0");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lint_rejects_invalid_deterministic_cron_execution_policy() {
+        let root = temp_root("lint_rejects_invalid_deterministic_cron_execution_policy");
+        let harness_home = root.join(".agent-harness");
+        let source = write_deterministic_source_with_canon(&harness_home);
+        let canon_path = harness_home
+            .join("workspace")
+            .join("docs")
+            .join("ops")
+            .join("cron-canon.json");
+        let mut canon: Value = serde_json::from_slice(&fs::read(&canon_path).unwrap()).unwrap();
+        canon["activeCrons"][0]["timeoutMs"] = json!(0);
+        canon["activeCrons"][0]["maxAttempts"] = json!(0);
+        write_json_atomic(&canon_path, &canon).unwrap();
+
+        let report = lint_cron_scheduler(CronSchedulerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            source: source.clone(),
+            runtime_workspace: None,
+            now_ms: 1_234,
+            dry_run: true,
+            enabled_override: Some(true),
+            native_enabled_override: Some(false),
+            deterministic_enabled_override: Some(true),
+            resume_cron_override: None,
+            include_registered_cron_override: None,
+            allow_deterministic_run_override: Some(true),
+            execute_shell_override: Some(false),
+            max_catchup_per_tick_override: None,
+            max_enqueue_per_tick_override: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, CronSchedulerLintStatus::Error);
+        assert!(report.findings.iter().any(|finding| {
+            finding.code == "deterministic-invalid-execution-policy"
+                && finding.entry_id.as_deref() == Some("canon-deterministic-daily")
+        }));
+
+        canon["activeCrons"][0]["timeoutMs"] = json!(300_000);
+        write_json_atomic(&canon_path, &canon).unwrap();
+        let max_attempts_report = lint_cron_scheduler(CronSchedulerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            source,
+            runtime_workspace: None,
+            now_ms: 1_234,
+            dry_run: true,
+            enabled_override: Some(true),
+            native_enabled_override: Some(false),
+            deterministic_enabled_override: Some(true),
+            resume_cron_override: None,
+            include_registered_cron_override: None,
+            allow_deterministic_run_override: Some(true),
+            execute_shell_override: Some(false),
+            max_catchup_per_tick_override: None,
+            max_enqueue_per_tick_override: None,
+        })
+        .unwrap();
+        assert!(max_attempts_report.findings.iter().any(|finding| {
+            finding.code == "deterministic-invalid-execution-policy"
+                && finding.message.contains("maxAttempts")
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backup_cron_restart_catch_up_can_be_suppressed_without_enqueue() {
+        let root = temp_root("backup_cron_restart_catch_up_can_be_suppressed_without_enqueue");
+        let harness_home = root.join(".agent-harness");
+        let workspace = harness_home.join("workspace");
+        let runner = workspace.join("tools").join("backup-cron-runner");
+        let crontab = runner.join("crontab").join("backup.crontab");
+        let script = runner.join("jobs").join("backup.ps1");
+        fs::create_dir_all(crontab.parent().unwrap()).unwrap();
+        fs::create_dir_all(script.parent().unwrap()).unwrap();
+        fs::create_dir_all(workspace.join("docs").join("ops")).unwrap();
+        fs::write(&crontab, "0 0 * * * jobs/backup.ps1\n").unwrap();
+        fs::write(&script, "Write-Output 'backup'\n").unwrap();
+        fs::write(
+            workspace.join("docs").join("ops").join("cron-canon.json"),
+            r#"{
+              "schema": "openclaw.agent-harness.cron-canon.v1",
+              "activeCrons": [{
+                "id": "daily-snapshot-backup",
+                "kind": "deterministic-crontab",
+                "enabled": true,
+                "schedule": "0 0 * * *",
+                "sourcePath": "workspace/tools/backup-cron-runner/crontab/backup.crontab",
+                "script": "workspace/tools/backup-cron-runner/jobs/backup.ps1",
+                "catchUpPolicy": "guard-source-freshness",
+                "timeoutMs": 3600000,
+                "maxAttempts": 1
+              }]
+            }"#,
+        )
+        .unwrap();
+        let scheduler_dir = harness_home.join("state").join("cron-scheduler");
+        fs::create_dir_all(&scheduler_dir).unwrap();
+        fs::write(
+            scheduler_dir.join("receipts.jsonl"),
+            format!(
+                r#"{{"schema":"{CRON_SCHEDULER_TICK_SCHEMA}","status":"completed","nowMs":1000,"summary":{{}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let missed_slot = 86_400_000;
+        let report = run_cron_scheduler_once(CronSchedulerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            source: AgentSource::with_workspace(&harness_home, &workspace),
+            runtime_workspace: None,
+            now_ms: missed_slot + 61_234,
+            dry_run: false,
+            enabled_override: Some(true),
+            native_enabled_override: Some(false),
+            deterministic_enabled_override: Some(true),
+            resume_cron_override: None,
+            include_registered_cron_override: None,
+            allow_deterministic_run_override: Some(true),
+            execute_shell_override: Some(false),
+            max_catchup_per_tick_override: Some(3),
+            max_enqueue_per_tick_override: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.summary.enqueued, 0);
+        let decision = report
+            .decisions
+            .iter()
+            .find(|decision| decision.entry_id == "daily-snapshot-backup")
+            .unwrap();
+        assert_eq!(
+            decision.decision,
+            CronSchedulerJobDecisionStatus::SkippedPolicy
+        );
+        assert_eq!(
+            decision.catch_up_decision.as_deref(),
+            Some("guard-source-freshness")
+        );
+        assert_eq!(decision.missed_slots, vec![missed_slot]);
+        assert!(!crate::worker_db_file(&harness_home).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deterministic_crontab_cron_tz_controls_current_and_catch_up_slots() {
+        let root = temp_root("deterministic_crontab_cron_tz_controls_current_and_catch_up_slots");
+        let harness_home = root.join(".agent-harness");
+        let source = write_deterministic_source_with_canon(&harness_home);
+        let crontab = harness_home
+            .join("workspace")
+            .join("tools")
+            .join("cron-runner")
+            .join("crontab")
+            .join("openclaw-mem.crontab");
+        fs::write(&crontab, "CRON_TZ=Asia/Taipei\n30 1 * * * jobs/canon.ps1\n").unwrap();
+        let canon_path = harness_home
+            .join("workspace")
+            .join("docs")
+            .join("ops")
+            .join("cron-canon.json");
+        let mut canon: Value = serde_json::from_slice(&fs::read(&canon_path).unwrap()).unwrap();
+        canon["activeCrons"][0]["schedule"] = json!("30 1 * * *");
+        canon["activeCrons"][0]["catchUpPolicy"] = json!("run-late-once");
+        write_json_atomic(&canon_path, &canon).unwrap();
+
+        // 1970-01-02 01:30 Asia/Taipei == 1970-01-01 17:30 UTC. Treating the
+        // expression as UTC would instead run it at 09:30 Asia/Taipei.
+        let taipei_01_30_slot_utc = 17 * 3_600_000 + 30 * 60_000;
+        let current = run_cron_scheduler_once(CronSchedulerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            source: source.clone(),
+            runtime_workspace: None,
+            now_ms: taipei_01_30_slot_utc + 1_234,
+            dry_run: false,
+            enabled_override: Some(true),
+            native_enabled_override: Some(false),
+            deterministic_enabled_override: Some(true),
+            resume_cron_override: None,
+            include_registered_cron_override: None,
+            allow_deterministic_run_override: Some(true),
+            execute_shell_override: Some(false),
+            max_catchup_per_tick_override: None,
+            max_enqueue_per_tick_override: None,
+        })
+        .unwrap();
+        assert_eq!(current.summary.enqueued, 1);
+        assert_eq!(current.decisions[0].scheduled_for_ms, taipei_01_30_slot_utc);
+        let worker_conn = Connection::open(crate::worker_db_file(&harness_home)).unwrap();
+        let payload_json: String = worker_conn
+            .query_row("SELECT payload_json FROM jobs LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let payload: Value = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(payload["env"]["AGENT_HARNESS_CRON_TIMEZONE"], "Asia/Taipei");
+
+        let catch_up_home = root.join("catch-up").join(".agent-harness");
+        let catch_up_source = write_deterministic_source_with_canon(&catch_up_home);
+        let catch_up_crontab = catch_up_home
+            .join("workspace")
+            .join("tools")
+            .join("cron-runner")
+            .join("crontab")
+            .join("openclaw-mem.crontab");
+        fs::write(
+            &catch_up_crontab,
+            "TZ=Asia/Taipei\n30 1 * * * jobs/canon.ps1\n",
+        )
+        .unwrap();
+        let catch_up_canon_path = catch_up_home
+            .join("workspace")
+            .join("docs")
+            .join("ops")
+            .join("cron-canon.json");
+        let mut catch_up_canon: Value =
+            serde_json::from_slice(&fs::read(&catch_up_canon_path).unwrap()).unwrap();
+        catch_up_canon["activeCrons"][0]["schedule"] = json!("30 1 * * *");
+        catch_up_canon["activeCrons"][0]["catchUpPolicy"] = json!("run-late-once");
+        write_json_atomic(&catch_up_canon_path, &catch_up_canon).unwrap();
+        let scheduler_dir = catch_up_home.join("state").join("cron-scheduler");
+        fs::create_dir_all(&scheduler_dir).unwrap();
+        fs::write(
+            scheduler_dir.join("receipts.jsonl"),
+            format!(
+                r#"{{"schema":"{CRON_SCHEDULER_TICK_SCHEMA}","status":"completed","nowMs":{},"summary":{{}}}}"#,
+                taipei_01_30_slot_utc - 60_000
+            ),
+        )
+        .unwrap();
+        let catch_up = run_cron_scheduler_once(CronSchedulerRunOnceOptions {
+            harness_home: catch_up_home.clone(),
+            source: catch_up_source,
+            runtime_workspace: None,
+            now_ms: taipei_01_30_slot_utc + 61_234,
+            dry_run: false,
+            enabled_override: Some(true),
+            native_enabled_override: Some(false),
+            deterministic_enabled_override: Some(true),
+            resume_cron_override: None,
+            include_registered_cron_override: None,
+            allow_deterministic_run_override: Some(true),
+            execute_shell_override: Some(false),
+            max_catchup_per_tick_override: Some(3),
+            max_enqueue_per_tick_override: None,
+        })
+        .unwrap();
+        assert_eq!(catch_up.summary.enqueued, 1);
+        assert_eq!(
+            catch_up.decisions[0].scheduled_for_ms,
+            taipei_01_30_slot_utc
+        );
+        assert_eq!(
+            catch_up.decisions[0].missed_slots,
+            vec![taipei_01_30_slot_utc]
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

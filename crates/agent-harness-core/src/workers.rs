@@ -751,6 +751,7 @@ pub fn run_worker_once(options: WorkerRunOnceOptions) -> io::Result<WorkerRunOnc
     quarantine_invalid_stored_child_policies(&conn, options.now_ms)?;
     quarantine_invalid_stored_execution_modes(&conn, options.now_ms)?;
     reconcile_runtime_queued_jobs(&options.harness_home, &conn, options.now_ms)?;
+    terminalize_exhausted_pending_jobs(&options.harness_home, &conn, options.now_ms)?;
     let config = load_worker_dispatch_config(&options.harness_home)?;
     let (job, blocked) = lease_next_job(
         &conn,
@@ -1386,7 +1387,7 @@ fn lease_next_job(
                 let lease_expires = now_ms.saturating_add(lease_ms.max(1));
                 let rows = conn
                     .execute(
-                        "UPDATE jobs SET status=?1, lease_owner=?2, lease_expires_at_ms=?3, attempt=attempt+1, updated_at_ms=?4 WHERE job_id=?5 AND status IN ('pending','failed-retryable')",
+                        "UPDATE jobs SET status=?1, lease_owner=?2, lease_expires_at_ms=?3, attempt=attempt+1, updated_at_ms=?4 WHERE job_id=?5 AND status IN ('pending','failed-retryable') AND attempt < max_attempts",
                         params![
                             WorkerJobStatus::Leased.as_str(),
                             worker_id,
@@ -1412,9 +1413,9 @@ fn pending_candidates(
     now_ms: i64,
 ) -> io::Result<Vec<WorkerJob>> {
     let sql = if lane_filter.is_some() {
-        "SELECT * FROM jobs WHERE status IN ('pending','failed-retryable') AND available_at_ms <= ?1 AND lane=?2 ORDER BY priority DESC, available_at_ms ASC, created_at_ms ASC LIMIT 100"
+        "SELECT * FROM jobs WHERE status IN ('pending','failed-retryable') AND attempt < max_attempts AND available_at_ms <= ?1 AND lane=?2 ORDER BY priority DESC, available_at_ms ASC, created_at_ms ASC LIMIT 100"
     } else {
-        "SELECT * FROM jobs WHERE status IN ('pending','failed-retryable') AND available_at_ms <= ?1 ORDER BY priority DESC, available_at_ms ASC, created_at_ms ASC LIMIT 100"
+        "SELECT * FROM jobs WHERE status IN ('pending','failed-retryable') AND attempt < max_attempts AND available_at_ms <= ?1 ORDER BY priority DESC, available_at_ms ASC, created_at_ms ASC LIMIT 100"
     };
     let mut stmt = conn.prepare(sql).map_err(io::Error::other)?;
     let mut rows = if let Some(lane) = lane_filter {
@@ -2201,7 +2202,7 @@ fn run_deterministic_shell_job(
             break false;
         }
         if epoch_ms()?.saturating_sub(started) > i64::try_from(timeout_ms).unwrap_or(i64::MAX) {
-            let _ = child.kill();
+            terminate_worker_child_process_tree(&mut child);
             break true;
         }
         thread::sleep(Duration::from_millis(50));
@@ -2255,6 +2256,21 @@ fn run_deterministic_shell_job(
         artifact_refs: Some(json!({"auditPath": audit_path})),
         result: Some(audit),
     })
+}
+
+#[cfg(windows)]
+fn terminate_worker_child_process_tree(child: &mut std::process::Child) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+}
+
+#[cfg(not(windows))]
+fn terminate_worker_child_process_tree(child: &mut std::process::Child) {
+    let _ = child.kill();
 }
 
 fn queue_llm_worker_turn(
@@ -3169,6 +3185,46 @@ fn exhausted_retry_stop_reason(job: &WorkerJob) -> String {
         "retry attempts exhausted at attempt {} of {}",
         job.attempt, job.max_attempts
     )
+}
+
+fn terminalize_exhausted_pending_jobs(
+    harness_home: &Path,
+    conn: &Connection,
+    now_ms: i64,
+) -> io::Result<usize> {
+    let jobs = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT * FROM jobs
+                 WHERE status IN ('pending','failed-retryable')
+                   AND attempt >= max_attempts",
+            )
+            .map_err(io::Error::other)?;
+        let rows = stmt
+            .query_map([], |row| row_to_job(row))
+            .map_err(io::Error::other)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(io::Error::other)?
+    };
+
+    for job in &jobs {
+        let stop_reason = exhausted_retry_stop_reason(job);
+        let result = WorkerJobExecutionResult {
+            status: WorkerJobStatus::FailedTerminal,
+            reason: format!("worker job was not started; {stop_reason}"),
+            audit_path: job.audit_path.clone(),
+            artifact_refs: job.artifact_refs.clone(),
+            result: Some(json!({
+                "status": WorkerJobStatus::FailedTerminal.as_str(),
+                "reason": format!("worker job was not started; {stop_reason}"),
+                "stopReason": stop_reason,
+                "terminalizedBeforeLease": true,
+            })),
+        };
+        persist_execution_result(conn, job, &result, now_ms)?;
+        sync_cron_run_after_worker_result(harness_home, job, &result, now_ms)?;
+    }
+    Ok(jobs.len())
 }
 
 fn normalize_exhausted_retryable_result(
@@ -5770,6 +5826,127 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_pending_worker_is_terminalized_without_starting_process() {
+        let root = temp_root("exhausted_pending_worker_is_terminalized_without_starting_process");
+        let harness_home = root.join(".agent-harness");
+        let script_dir = harness_home.join("state").join("workers").join("scripts");
+        fs::create_dir_all(&script_dir).unwrap();
+        let marker = script_dir.join("unexpected-run.txt");
+        let script = write_marker_script(&script_dir, &marker);
+        let mut options = shell_options(&harness_home, "exhausted-before-lease", 1000);
+        options.payload = json!({"scriptPath": script, "cwd": script_dir});
+        options.max_attempts = 3;
+        let enqueued = enqueue_worker_job(options).unwrap();
+
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        conn.execute(
+            "UPDATE jobs SET status='pending', attempt=97, max_attempts=3 WHERE job_id=?1",
+            params![enqueued.job.job_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("shell".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1001,
+        })
+        .unwrap();
+
+        assert_eq!(run.status, WorkerRunOnceStatus::NoWork);
+        assert!(
+            !marker.exists(),
+            "exhausted worker unexpectedly ran its script"
+        );
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        let persisted = find_job_by_id(&conn, &enqueued.job.job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.status, WorkerJobStatus::FailedTerminal);
+        assert_eq!(persisted.attempt, 97);
+        assert_eq!(persisted.max_attempts, 3);
+        assert_eq!(persisted.finished_at_ms, Some(1001));
+        assert!(
+            persisted
+                .result
+                .as_ref()
+                .and_then(|value| value.get("reason"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("retry attempts exhausted")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deterministic_timeout_terminates_descendant_process_tree() {
+        let root = temp_root("deterministic_timeout_terminates_descendant_process_tree");
+        let harness_home = root.join(".agent-harness");
+        let script_dir = harness_home.join("state").join("workers").join("scripts");
+        fs::create_dir_all(&script_dir).unwrap();
+        let pid_file = script_dir.join("descendant.pid");
+        let script = script_dir.join("spawn-descendant.ps1");
+        fs::write(
+            &script,
+            format!(
+                "$child = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30' -PassThru\r\nSet-Content -LiteralPath '{}' -Value $child.Id\r\nWait-Process -Id $child.Id\r\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        let mut options = shell_options(&harness_home, "timeout-process-tree", 1000);
+        options.payload = json!({"scriptPath": script, "cwd": script_dir});
+        options.max_attempts = 1;
+        options.timeout_ms = Some(1500);
+        enqueue_worker_job(options).unwrap();
+
+        let run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("shell".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1001,
+        })
+        .unwrap();
+        assert_eq!(run.status, WorkerRunOnceStatus::Failed);
+        assert_eq!(
+            run.result.as_ref().unwrap().status,
+            WorkerJobStatus::FailedTerminal
+        );
+        assert!(pid_file.is_file(), "descendant pid was never recorded");
+        let descendant_pid: i64 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = SystemTime::now() + Duration::from_secs(5);
+        while crate::loop_health::process_alive_for_pid(descendant_pid) != Some(false)
+            && SystemTime::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let alive = crate::loop_health::process_alive_for_pid(descendant_pid);
+        if alive != Some(false) {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &descendant_pid.to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        assert_eq!(
+            alive,
+            Some(false),
+            "descendant process survived worker timeout"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn skill_synthesis_worker_autonomously_creates_agent_skill() {
         let root = temp_root("skill_synthesis_worker_autonomously_creates_agent_skill");
         let harness_home = root.join(".agent-harness");
@@ -6514,6 +6691,37 @@ mod tests {
 
             let script = script_dir.join("timeout.sh");
             fs::write(&script, "#!/bin/sh\nsleep 1\n").unwrap();
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+            script
+        }
+    }
+
+    fn write_marker_script(script_dir: &Path, marker: &Path) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let script = script_dir.join("write-marker.cmd");
+            fs::write(
+                &script,
+                format!("@echo unexpected-run> \"{}\"\r\n", marker.display()),
+            )
+            .unwrap();
+            script
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let script = script_dir.join("write-marker.sh");
+            fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nprintf unexpected-run > '{}'\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
             let mut permissions = fs::metadata(&script).unwrap().permissions();
             permissions.set_mode(0o755);
             fs::set_permissions(&script, permissions).unwrap();

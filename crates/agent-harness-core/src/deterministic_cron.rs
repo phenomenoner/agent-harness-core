@@ -437,22 +437,16 @@ fn resolve_script_path(runner_root: &Path, command: &str) -> Option<PathBuf> {
     None
 }
 
-fn is_crontab_file(root: &Path, path: &Path) -> bool {
+fn is_crontab_file(_root: &Path, path: &Path) -> bool {
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("");
-    if name.eq_ignore_ascii_case("crontab") || name.ends_with(".crontab") {
-        return true;
-    }
-    path.strip_prefix(root).ok().is_some_and(|relative| {
-        relative.components().any(|component| {
-            component
-                .as_os_str()
-                .to_str()
-                .is_some_and(|value| value.eq_ignore_ascii_case("crontab"))
-        })
-    })
+    name.eq_ignore_ascii_case("crontab")
+        || path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("crontab"))
 }
 
 fn files_under_named_dir(files: &[PathBuf], name: &str) -> Vec<PathBuf> {
@@ -648,6 +642,48 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("backup-cron-runner"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn crontab_loader_ignores_backup_and_temporary_files() {
+        let root = temp_root("crontab_loader_ignores_backup_and_temporary_files");
+        let home = root.join(".agent-harness");
+        let workspace = home.join("workspace");
+        let runner = workspace.join("tools").join("cron-runner");
+        let crontab_dir = runner.join("crontab");
+        let jobs_dir = runner.join("jobs");
+        fs::create_dir_all(&crontab_dir).unwrap();
+        fs::create_dir_all(&jobs_dir).unwrap();
+        fs::write(
+            crontab_dir.join("active.crontab"),
+            "0 1 * * * jobs/active.ps1\n",
+        )
+        .unwrap();
+        fs::write(
+            crontab_dir.join("active.crontab.bak-20260710"),
+            "0 2 * * * jobs/backup-copy.ps1\n",
+        )
+        .unwrap();
+        fs::write(
+            crontab_dir.join("active.crontab.tmp"),
+            "0 3 * * * jobs/temp-copy.ps1\n",
+        )
+        .unwrap();
+        fs::write(jobs_dir.join("active.ps1"), "Write-Output active\n").unwrap();
+        fs::write(jobs_dir.join("backup-copy.ps1"), "Write-Output backup\n").unwrap();
+        fs::write(jobs_dir.join("temp-copy.ps1"), "Write-Output temp\n").unwrap();
+
+        let source = AgentSource::with_workspace(&home, root.join("repo-root"));
+        let store = load_deterministic_cron_store(&source).unwrap();
+
+        assert_eq!(store.summary.crontab_files, 1);
+        assert_eq!(store.summary.entries, 1);
+        assert_eq!(
+            store.entries[0].crontab_file,
+            crontab_dir.join("active.crontab")
         );
 
         let _ = fs::remove_dir_all(root);
