@@ -6,12 +6,15 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::backend_reasoning::{BackendReasoningPolicyV1, ReasoningPreference};
+use crate::execution_mode::AuthorizedExecutionModeSnapshotV2;
 use crate::latency::{LatencyStage, latency_receipts_file, record_latency_stage};
 use crate::wake::signal_wake;
 use crate::{ChannelStep, ChannelStepAction, InboundMediaArtifact, RuntimeContinuationMetadata};
 
 const RUNTIME_QUEUE_REPORT_SCHEMA: &str = "agent-harness.runtime-queue-enqueue.v1";
 const RUNTIME_QUEUE_CONTROL_SCHEMA: &str = "agent-harness.runtime-queue-control.v1";
+const RUNTIME_QUEUE_ITEM_V1_SCHEMA: &str = "agent-harness.runtime-queue-item.v1";
+const RUNTIME_QUEUE_ITEM_V2_SCHEMA: &str = "agent-harness.runtime-queue-item.v2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeQueueEnqueueOptions {
@@ -19,6 +22,13 @@ pub struct RuntimeQueueEnqueueOptions {
     pub runtime_workspace: Option<PathBuf>,
     pub inbound_canonical_id: Option<String>,
     pub now_ms: i64,
+}
+
+/// Additive authoritative admission path. The legacy enqueue API deliberately
+/// remains V1 and never consults execution-mode sidecars.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeQueueEnqueueOptionsV2 {
+    pub options: RuntimeQueueEnqueueOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -38,6 +48,8 @@ pub struct RuntimeQueueEnqueueReport {
 pub struct RuntimeQueueItem {
     pub schema: &'static str,
     pub queue_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_queue_id: Option<String>,
     pub status: RuntimeQueueItemStatus,
     pub runtime_class: String,
     pub origin: String,
@@ -67,6 +79,8 @@ pub struct RuntimeQueueItem {
     pub reasoning_preference: Option<ReasoningPreference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_reasoning_policy: Option<BackendReasoningPolicyV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorized_execution_mode: Option<AuthorizedExecutionModeSnapshotV2>,
     pub prompt_files_present: usize,
     pub prompt_files_total: usize,
     pub selected_skill_ids: Vec<String>,
@@ -173,6 +187,21 @@ pub fn enqueue_channel_step(
     step: &ChannelStep,
     options: RuntimeQueueEnqueueOptions,
 ) -> io::Result<RuntimeQueueEnqueueReport> {
+    enqueue_channel_step_inner(step, options, false)
+}
+
+pub fn enqueue_channel_step_v2(
+    step: &ChannelStep,
+    options: RuntimeQueueEnqueueOptionsV2,
+) -> io::Result<RuntimeQueueEnqueueReport> {
+    enqueue_channel_step_inner(step, options.options, true)
+}
+
+fn enqueue_channel_step_inner(
+    step: &ChannelStep,
+    options: RuntimeQueueEnqueueOptions,
+    authorize_execution_mode: bool,
+) -> io::Result<RuntimeQueueEnqueueReport> {
     let queue_dir = options.harness_home.join("state").join("runtime-queue");
     let queue_file = queue_dir.join("pending.jsonl");
     let receipts_file = queue_dir.join("receipts.jsonl");
@@ -181,7 +210,18 @@ pub fn enqueue_channel_step(
     let mut warnings = step.warnings.clone();
     let item = if step.action == ChannelStepAction::EnqueueAgentTurn {
         match build_queue_item(step, &options)? {
-            Some(item) => Some(item),
+            Some(mut item) => {
+                item.authorized_execution_mode = if authorize_execution_mode {
+                    resolve_authorized_execution_mode_snapshot(step, &options, &item)?
+                } else {
+                    None
+                };
+                if item.authorized_execution_mode.is_some() {
+                    item.schema = RUNTIME_QUEUE_ITEM_V2_SCHEMA;
+                    item.admission_queue_id = Some(item.queue_id.clone());
+                }
+                Some(item)
+            }
             None => {
                 warnings.push(
                     "channel step requested enqueue but did not include agent turn dispatch"
@@ -345,8 +385,9 @@ fn build_queue_item(
     fs::create_dir_all(&sessions_dir)?;
 
     Ok(Some(RuntimeQueueItem {
-        schema: "agent-harness.runtime-queue-item.v1",
+        schema: RUNTIME_QUEUE_ITEM_V1_SCHEMA,
         queue_id: queue_id(step, &agent_turn.agent_id, options.now_ms),
+        admission_queue_id: None,
         status: RuntimeQueueItemStatus::Queued,
         runtime_class: "interactive".to_string(),
         origin: "channel".to_string(),
@@ -373,6 +414,7 @@ fn build_queue_item(
         model: agent_turn.model.clone(),
         reasoning_preference: agent_turn.reasoning_preference.clone(),
         backend_reasoning_policy: agent_turn.backend_reasoning_policy.clone(),
+        authorized_execution_mode: None,
         prompt_files_present: agent_turn.prompt_files_present,
         prompt_files_total: agent_turn.prompt_files_total,
         selected_skill_ids: agent_turn.selected_skill_ids.clone(),
@@ -380,6 +422,14 @@ fn build_queue_item(
         planned_trajectory_file,
         continuation: RuntimeContinuationMetadata::legacy(),
     }))
+}
+
+fn resolve_authorized_execution_mode_snapshot(
+    _step: &ChannelStep,
+    _options: &RuntimeQueueEnqueueOptions,
+    _item: &RuntimeQueueItem,
+) -> io::Result<Option<AuthorizedExecutionModeSnapshotV2>> {
+    Ok(None)
 }
 
 fn append_json_line(path: &Path, value: &impl Serialize) -> io::Result<()> {
@@ -477,6 +527,8 @@ mod tests {
         InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant, TurnPlanInput,
         backend_reasoning::{BackendReasoningSource, ReasoningPreference},
         build_channel_step, build_source_skill_index, build_turn_plan,
+        channel_state::ChannelExecutionModeStateV1,
+        execution_mode::{ExecutionModeSource, authorize_execution_mode_for_agent},
         inbound_media_attachment_root,
         latency::{LatencyStage, latency_receipts_file, read_latest_queue_receipt},
         load_agent_registry,
@@ -581,10 +633,203 @@ mod tests {
         )
         .unwrap();
         assert_eq!(queue_json["status"], "queued");
+        assert_eq!(queue_json["schema"], RUNTIME_QUEUE_ITEM_V1_SCHEMA);
         assert_eq!(queue_json["source"]["kind"], "channel");
+        assert!(queue_json.get("admissionQueueId").is_none());
+        assert!(queue_json.get("authorizedExecutionMode").is_none());
         assert!(queue_json.get("reasoningPreference").is_none());
         assert!(queue_json.get("backendReasoningPolicy").is_none());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn configured_ultra_state_is_inert_and_queue_stays_v1_across_retry() {
+        let root = temp_root("authoritative_ultra_admission_v2");
+        let source = write_runtime_queue_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"orchestration":{"features":{"executionModeV1":{"mode":"authoritative","enabledAgentIds":["main"],"authorizationRevision":"auth-v1","ultra":{"maxParallelChildren":2,"maxTotalChildren":6,"childTimeoutMs":300000}}}}}"#,
+        )
+        .unwrap();
+        let preference = crate::ExecutionModePreference::explicit("ultra").unwrap();
+        let assessment = authorize_execution_mode_for_agent(
+            Some(&harness_home),
+            Some("main"),
+            ExecutionModeSource::ChannelCommand,
+            &preference,
+        );
+        assert!(!assessment.authorized);
+        let state = ChannelExecutionModeStateV1 {
+            schema: "agent-harness.channel-execution-mode.v1".to_string(),
+            preference,
+            policy: assessment.policy,
+            migration_reason: None,
+            updated_at_ms: 1200,
+        };
+        let state_file = crate::channel_state::channel_execution_mode_state_file(
+            &harness_home,
+            "telegram",
+            "dm-42",
+            "user-7",
+        );
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        fs::write(&state_file, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "telegram".to_string(),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                text: "coordinate two independent checks".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let mut step = build_channel_step(&registry, &turn);
+        step.account_id = Some("primary".to_string());
+        let report = enqueue_channel_step_v2(
+            &step,
+            RuntimeQueueEnqueueOptionsV2 {
+                options: RuntimeQueueEnqueueOptions {
+                    harness_home: harness_home.clone(),
+                    runtime_workspace: None,
+                    inbound_canonical_id: Some("canonical-1".to_string()),
+                    now_ms: 1234,
+                },
+            },
+        )
+        .unwrap();
+        let item = report.item.as_ref().unwrap();
+        assert_eq!(item.schema, RUNTIME_QUEUE_ITEM_V1_SCHEMA);
+        assert!(item.admission_queue_id.is_none());
+        assert!(item.authorized_execution_mode.is_none());
+
+        let original: Value = serde_json::from_str(
+            fs::read_to_string(&report.queue_file)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(original["schema"], RUNTIME_QUEUE_ITEM_V1_SCHEMA);
+        assert!(original.get("admissionQueueId").is_none());
+        assert!(original.get("authorizedExecutionMode").is_none());
+        fs::remove_file(harness_home.join("harness-config.json")).unwrap();
+        let retry = control_runtime_queue_item(RuntimeQueueControlOptions {
+            harness_home: harness_home.clone(),
+            queue_id: item.queue_id.clone(),
+            action: RuntimeQueueControlAction::Retry,
+            reason: "transient backend retry".to_string(),
+            now_ms: 2234,
+        })
+        .unwrap();
+        let retry_id = retry.new_queue_id.unwrap();
+        let retried: Value = fs::read_to_string(&report.queue_file)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|value| value["queueId"] == retry_id)
+            .unwrap();
+        assert_eq!(retried["schema"], RUNTIME_QUEUE_ITEM_V1_SCHEMA);
+        assert!(retried.get("admissionQueueId").is_none());
+        assert!(retried.get("authorizedExecutionMode").is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn configured_ultra_state_without_account_is_inert_and_legacy_queue_appends() {
+        let root = temp_root("ultra_v2_missing_account");
+        let source = write_runtime_queue_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"orchestration":{"features":{"executionModeV1":{"mode":"authoritative","enabledAgentIds":["main"],"authorizationRevision":"auth-v1","ultra":{"maxParallelChildren":1,"maxTotalChildren":2,"childTimeoutMs":300000}}}}}"#,
+        )
+        .unwrap();
+        let preference = crate::ExecutionModePreference::explicit("ultra").unwrap();
+        let policy = authorize_execution_mode_for_agent(
+            Some(&harness_home),
+            Some("main"),
+            ExecutionModeSource::ChannelCommand,
+            &preference,
+        )
+        .policy;
+        let state_file = crate::channel_state::channel_execution_mode_state_file(
+            &harness_home,
+            "telegram",
+            "dm-42",
+            "user-7",
+        );
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        fs::write(
+            state_file,
+            serde_json::to_vec(&ChannelExecutionModeStateV1 {
+                schema: "agent-harness.channel-execution-mode.v1".to_string(),
+                preference,
+                policy,
+                migration_reason: None,
+                updated_at_ms: 1200,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "telegram".to_string(),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                text: "must fail closed".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        let step = build_channel_step(&registry, &turn);
+        let report = enqueue_channel_step_v2(
+            &step,
+            RuntimeQueueEnqueueOptionsV2 {
+                options: RuntimeQueueEnqueueOptions {
+                    harness_home: harness_home.clone(),
+                    runtime_workspace: None,
+                    inbound_canonical_id: None,
+                    now_ms: 1234,
+                },
+            },
+        )
+        .unwrap();
+        let item = report.item.unwrap();
+        assert_eq!(item.schema, RUNTIME_QUEUE_ITEM_V1_SCHEMA);
+        assert!(item.account_id.is_none());
+        assert!(item.authorized_execution_mode.is_none());
+        assert!(
+            harness_home
+                .join("state/runtime-queue/pending.jsonl")
+                .is_file()
+        );
         let _ = fs::remove_dir_all(root);
     }
 

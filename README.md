@@ -7,6 +7,7 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](rust-toolchain.toml)
 [![Edition 2024](https://img.shields.io/badge/edition-2024-red.svg)](Cargo.toml)
+[![Version 0.8.0](https://img.shields.io/badge/version-0.8.0-blue.svg)](crates/agent-harness-core/Cargo.toml)
 [![Platform: Windows-first](https://img.shields.io/badge/platform-Windows--first-0078d4.svg)](#faq)
 [![Status: Pre-release](https://img.shields.io/badge/status-pre--release-yellow.svg)](CHANGELOG.md)
 
@@ -39,11 +40,14 @@ Born as a ground-up Rust rebuild of a Docker-based legacy agent gateway ("OpenCl
 | | What you get |
 |---|---|
 | 🧾 **A receipt for everything** | Every ingress, queue write, model turn, delivery, and retry appends to JSONL ledgers. Reconstruct any incident after the fact — no black boxes. |
-| 📨 **Chat-native agents** | First-class Telegram Bot API and Discord (REST + Gateway) adapters: replies, policy-gated media attachments, referenced-media artifacts, message splitting, edit-in-place progress panels, default-off opt-in final-reply tone, and `/new` `/model` `/think` `/steer` `/stop` `/status` commands. |
+| 📨 **Chat-native agents** | First-class Telegram Bot API and Discord (REST + Gateway) adapters: replies, policy-gated media attachments, referenced-media artifacts, message splitting, edit-in-place progress panels, default-off opt-in final-reply tone, and `/new` `/model` `/think` `/reasoning` `/steer` `/stop` `/status` commands. |
 | 🔐 **Fail-closed by default** | DMs require explicit admin allow-lists, and ingress must resolve a platform/account/channel identity binding before dispatch. Unknown senders or ambiguous channel bindings never reach the model. |
 | ⚙️ **Durable, bounded work** | SQLite-backed worker dispatch with leases, retry/backoff, stale reaping, watchdogs, and concurrency limits per global / agent / channel / lane. Runtime dispatch classes isolate interactive, cron, worker, and maintenance turns so noisy cron work does not block channel agents. |
-| 🧵 **Long-task continuity** | A turn's session lives inside a stable **virtual session**. When the model context compacts past a threshold, the runtime rolls over into a *fresh* Codex session under the same virtual id, carrying a bounded **working set** (goal, plan refs, decisions, open files, validation, blockers) so long tasks survive repeated compaction instead of silently drifting — and `/new` is a hard task boundary that never inherits the previous task's context. The prompt now receives a bounded resolver-backed working-context section keyed by exact channel/session axes. *(Live-wired into every turn; real rollover and `/new` readback have passed, while broader live soak remains a release gate before full continuity-gap promotion.)* |
+| 🧵 **Long-task continuity** | A turn's session lives inside a stable **virtual session**. When the model context compacts past a threshold, the runtime rolls over into a *fresh* Codex session under the same virtual id, carrying a bounded **working set** (goal, plan refs, decisions, open files, validation, blockers) so long tasks survive repeated compaction instead of silently drifting — and `/new` is a hard task boundary that never inherits the previous task's context. The prompt receives a bounded resolver-backed working-context section keyed by exact channel/session axes. |
 | 🤖 **Model-agnostic routing** | Codex app-server executes turns; OpenRouter routing switches any conversation to e.g. `anthropic/claude-sonnet-4` with one `/model` command. Provider-specific Codex homes keep OpenRouter config out of the default Codex/OAuth path; secrets are checked at preflight, never written to disk. |
+| 🧭 **Capability-aware reasoning** | The v0.8.0 model catalog resolves the exact provider/model capability surface instead of assuming one global effort list. `/think` and `/reasoning` are aliases for one last-write-wins setting. Exact `max` is the highest currently known legal GPT-5.6 effort; unknown future names are accepted only when that exact route advertises them. Exact `ultra` is filtered and rejected, never advertised or configured as an effort. |
+| 🧩 **Per-agent runtime context** | Every configured agent can use its own OpenClaw-style model and eight-file static prompt inventory, with fallback aliases and deletion tombstones. Canonical prompt manifests are keyed by the exact virtual-session lane and Codex backend generation, while dynamic memory recall remains a separate per-turn context source. |
+| 🕸️ **Master-owned delegation** | A master agent can assign a different provider/model/effort policy to every child. Child terminals enter a bounded, actually redacted, exact-owner mailbox with opaque artifact pointers; child progress, final text, and errors stay internal, and only a lease-owning master continuation can acknowledge results and create user-facing output. |
 | 🧠 **Memory-aware** | OpenClaw-compatible memory hooks (recall, lifecycle capture, store proposals) with vector recall over imported SQLite embeddings — integrated via adapters, not forks. |
 | 📦 **Skills as runtime state** | Versioned, indexed `SKILL.md` runbooks are matched per turn and injected once per session via an injection ledger — no prompt bloat, no stale docs. Imported skill indexes cover both legacy and current OpenClaw namespace layouts. |
 | 🪶 **Minimal dependencies** | Six crates: `serde`, `serde_json`, `ureq`, `rusqlite`, `ring`, `base64`. No tokio, no async runtime, no clap. Synchronous Rust you can read in an afternoon and audit forever. |
@@ -71,6 +75,14 @@ flowchart LR
 ```
 
 The harness owns ingress, permissions, queuing, prompt assembly, delivery, long-task continuity, and audit. **Codex owns the model**: system prompt, tool schemas, MCP, sandbox, approvals, and session continuity. That split keeps the harness small, deterministic, and testable — 500+ tests run without any model call, using a bundled fake Codex app-server.
+
+### v0.8.0 capability boundary
+
+The v0.8.0 interfaces authorize reasoning against the exact effective provider/model route. Exact `max` is the highest currently known legal GPT-5.6 effort and is preserved without downgrading when that route advertises it. Cached model catalogs and Codex app-server capability observations both remove exact `ultra`; commands, persisted state, child policy, queue admission, and the runtime wire reject it as an effort. It is not advertised or configurable. The legacy spellings `ultra-high` and `ultra_high` canonicalize to `xhigh` before duplicate handling. Other future effort names remain open-ended only when the exact route advertises them.
+
+Multi-agent dispatch is heterogeneous by design: siblings need not share a model or effort. Each child receives an immutable dispatch-time policy and an exact master owner. Terminal output is reduced to a bounded, redacted summary plus opaque artifact references in a durable mailbox; a missing or invalid expected result becomes an explicit failed-omission envelope instead of disappearing from the batch. Runtime class and origin are derived from the trusted worker job kind and checked against typed terminal receipts. Any active work in the exact master lane suppresses resumption; after confirmed lane release, duplicate and restarted watchdog passes coalesce into exactly one logical resume intent and typed continuation. Child progress, final text, and errors are internal evidence and never become parent user-facing output directly.
+
+These are v0.8.0 source and compatibility contracts; release evidence is tracked separately from the public interface description. See [Configuration](docs/configuration.md), [0.7 to 0.8.0 Migration](docs/migration-0.8.md), [Invariants](docs/invariants.md), and [Schema Registry](docs/schema-registry.md) for the operator and compatibility details.
 
 ## Quick Start
 
@@ -120,7 +132,7 @@ One binary, `agent-harness`, grouped into clear families:
 
 ## Project Status
 
-Pre-release, under active development, and **live-validated daily**: the reference deployment runs a single supervised runtime loop (concurrency 12) plus worker, progress, Telegram, Discord, and scheduler loops, with tens of thousands of delivered messages and hundreds of completed model turns on record. Current staged work adds CronRunStore, dedicated cron worker/runtime lanes, one-shot and namespaced sticky cron sessions, and dispatch guards so cron LLM turns are observable, retryable, recoverable, and isolated from interactive channel turns.
+Version **0.8.0** is pre-release and under active development. Interfaces may still change before 1.0; the invariant catalog, schema registry, and scenario matrix define the public verification contracts for each release.
 
 See the [Changelog](CHANGELOG.md) and the [Roadmap & Backlog](docs/agent-harness-core-roadmap-backlog.md) for what's done, gated, and next.
 
@@ -131,6 +143,7 @@ See the [Changelog](CHANGELOG.md) and the [Roadmap & Backlog](docs/agent-harness
 | [Topology Contract](docs/agent-harness-topology-contract.md) | Identity axes, component ownership, impact matrix, and scenario packs for behavior-changing code reviews. |
 | [Topology Explorer](docs/topology-explorer.html) | Generated interactive browser view of the topology contract, ownership graph, release gates, and open implementation gaps. |
 | [Configuration](docs/configuration.md) | `harness-config.json` reference. |
+| [0.7 to 0.8.0 Migration](docs/migration-0.8.md) | Rust source incompatibilities, supported legacy artifact reads, upgrade sequence, and rollback boundary. |
 | [Worker Dispatch Strategy](docs/agent-worker-dispatch-strategy.md) | Durable workers, cron lanes, subagents, watchdog design. |
 | [Trust Boundaries](docs/trust-boundaries.md) | Where untrusted input enters and how it's bounded. |
 | [Invariants](docs/invariants.md) & [Schema Registry](docs/schema-registry.md) | The contracts the test suite enforces. |

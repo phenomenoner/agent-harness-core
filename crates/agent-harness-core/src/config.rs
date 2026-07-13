@@ -189,7 +189,32 @@ fn validate_orchestration_features_object(path: &str, value: &Value, errors: &mu
             "ownedCodexEventsV2" => {
                 validate_owned_codex_events_v2_object(&path_key(path, key), child, errors)
             }
+            "executionModeV1" => {
+                validate_execution_mode_v1_object(&path_key(path, key), child, errors)
+            }
             other => errors.push(format!("unknown orchestration feature `{other}` at {path}")),
+        }
+    }
+}
+
+fn validate_execution_mode_v1_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    if !object.contains_key("mode") {
+        errors.push(format!("{path}.mode is required"));
+    }
+    if object.get("mode").and_then(Value::as_str) != Some("off") {
+        errors.push(format!(
+            "{path} only supports mode `off` in this max-only release"
+        ));
+    }
+    for (key, child) in object {
+        match key.as_str() {
+            "mode" => expect_enum(path_key(path, key), child, &["off"], errors),
+            other => errors.push(format!(
+                "unsupported executionModeV1 config key `{other}` at {path}; Ultra is outside the max-only release"
+            )),
         }
     }
 }
@@ -2031,6 +2056,43 @@ mod tests {
             report.errors
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn execution_mode_v1_accepts_only_off_in_max_only_release() {
+        let root = temp_root("execution_mode_v1_validation");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(harness_home.join(HARNESS_CONFIG_FILE_NAME), r#"{}"#).unwrap();
+        assert_eq!(
+            validate_harness_config(&harness_home).unwrap().status,
+            HarnessConfigValidationStatus::Valid
+        );
+
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"orchestration":{"features":{"executionModeV1":{"mode":"off"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_harness_config(&harness_home).unwrap().status,
+            HarnessConfigValidationStatus::Valid
+        );
+
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"orchestration":{"features":{"executionModeV1":{"mode":"authoritative","enabledAgentIds":["main"],"authorizationRevision":"auth-v1","ultra":{"maxParallelChildren":2,"maxTotalChildren":6,"childTimeoutMs":300000}}}}}"#,
+        )
+        .unwrap();
+        let unsupported = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(unsupported.status, HarnessConfigValidationStatus::Invalid);
+        assert!(
+            unsupported
+                .errors
+                .iter()
+                .any(|error| error.contains("only supports mode `off`"))
+        );
         let _ = fs::remove_dir_all(root);
     }
 

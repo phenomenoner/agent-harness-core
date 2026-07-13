@@ -6189,21 +6189,189 @@ fn normalize_path_part(value: &str) -> String {
     }
 }
 
-fn redact_sensitive(text: &str) -> String {
-    text.split_whitespace()
-        .map(|token| {
-            if token.starts_with("sk-")
-                || token.starts_with("sk_proj")
-                || token.to_ascii_lowercase().contains("token=")
-                || token.to_ascii_lowercase().contains("password=")
+pub(crate) fn redact_sensitive(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut sensitive_ranges = Vec::new();
+
+    for (separator, byte) in bytes.iter().enumerate() {
+        if !matches!(byte, b'=' | b':') {
+            continue;
+        }
+        let Some(key) = assignment_key_before(text, separator) else {
+            continue;
+        };
+        if !is_sensitive_assignment_key(key) {
+            continue;
+        }
+        if let Some(range) = assignment_value_after(text, separator + 1) {
+            sensitive_ranges.push(range);
+        }
+    }
+
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if starts_ascii_case_insensitive(bytes, cursor, b"bearer")
+            && is_word_start_boundary(bytes, cursor)
+            && is_word_end_boundary(bytes, cursor + b"bearer".len())
+        {
+            let mut value_start = cursor + b"bearer".len();
+            let had_separator = bytes
+                .get(value_start)
+                .is_some_and(|byte| byte.is_ascii_whitespace());
+            while bytes
+                .get(value_start)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
             {
-                "[redacted]".to_string()
-            } else {
-                token.to_string()
+                value_start += 1;
             }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+            let value_end = credential_value_end(bytes, value_start);
+            if had_separator && looks_like_bearer_credential(&text[value_start..value_end]) {
+                sensitive_ranges.push((value_start, value_end));
+            }
+        }
+
+        if (bytes[cursor..].starts_with(b"sk-") || bytes[cursor..].starts_with(b"sk_proj"))
+            && is_word_start_boundary(bytes, cursor)
+        {
+            let value_end = credential_value_end(bytes, cursor);
+            sensitive_ranges.push((cursor, value_end));
+            cursor = value_end;
+        } else {
+            cursor += 1;
+        }
+    }
+
+    replace_sensitive_ranges(text, sensitive_ranges)
+}
+
+fn assignment_key_before(text: &str, separator: usize) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut key_end = separator;
+    while key_end > 0 && bytes[key_end - 1].is_ascii_whitespace() {
+        key_end -= 1;
+    }
+    if key_end == 0 {
+        return None;
+    }
+
+    if matches!(bytes[key_end - 1], b'\'' | b'"') {
+        let quote = bytes[key_end - 1];
+        let content_end = key_end - 1;
+        let content_start = bytes[..content_end]
+            .iter()
+            .rposition(|byte| *byte == quote)?
+            + 1;
+        return Some(&text[content_start..content_end]);
+    }
+
+    let mut key_start = key_end;
+    while key_start > 0
+        && (bytes[key_start - 1].is_ascii_alphanumeric()
+            || matches!(bytes[key_start - 1], b'_' | b'-'))
+    {
+        key_start -= 1;
+    }
+    (key_start < key_end).then(|| &text[key_start..key_end])
+}
+
+fn is_sensitive_assignment_key(key: &str) -> bool {
+    let normalized = key
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .map(|byte| byte.to_ascii_lowercase() as char)
+        .collect::<String>();
+    ["apikey", "password", "token", "secret"]
+        .iter()
+        .any(|suffix| normalized == *suffix || normalized.ends_with(suffix))
+}
+
+fn assignment_value_after(text: &str, mut value_start: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    while bytes
+        .get(value_start)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        value_start += 1;
+    }
+    let quote = bytes
+        .get(value_start)
+        .copied()
+        .filter(|byte| matches!(byte, b'\'' | b'"'));
+    if quote.is_some() {
+        value_start += 1;
+    }
+    let value_end = if let Some(quote) = quote {
+        bytes[value_start..]
+            .iter()
+            .position(|byte| *byte == quote)
+            .map(|offset| value_start + offset)
+            .unwrap_or(bytes.len())
+    } else {
+        credential_value_end(bytes, value_start)
+    };
+    (value_start < value_end).then_some((value_start, value_end))
+}
+
+fn credential_value_end(bytes: &[u8], value_start: usize) -> usize {
+    let mut value_end = value_start;
+    while bytes.get(value_end).is_some_and(|byte| {
+        !byte.is_ascii_whitespace()
+            && !matches!(byte, b',' | b';' | b'\'' | b'"' | b')' | b']' | b'}' | b'>')
+    }) {
+        value_end += 1;
+    }
+    value_end
+}
+
+fn starts_ascii_case_insensitive(bytes: &[u8], start: usize, needle: &[u8]) -> bool {
+    bytes
+        .get(start..start.saturating_add(needle.len()))
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
+}
+
+fn is_word_start_boundary(bytes: &[u8], index: usize) -> bool {
+    index == 0
+        || bytes
+            .get(index.wrapping_sub(1))
+            .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+}
+
+fn is_word_end_boundary(bytes: &[u8], index: usize) -> bool {
+    bytes
+        .get(index)
+        .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+}
+
+fn looks_like_bearer_credential(candidate: &str) -> bool {
+    candidate.len() >= 16
+        || candidate
+            .bytes()
+            .any(|byte| byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
+fn replace_sensitive_ranges(text: &str, mut ranges: Vec<(usize, usize)>) -> String {
+    ranges.retain(|(start, end)| start < end && *end <= text.len());
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some((_, previous_end)) = merged.last_mut() {
+            if start <= *previous_end {
+                *previous_end = (*previous_end).max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+
+    let mut output = String::with_capacity(text.len());
+    let mut copied_to = 0;
+    for (start, end) in merged {
+        output.push_str(&text[copied_to..start]);
+        output.push_str("[redacted]");
+        copied_to = end;
+    }
+    output.push_str(&text[copied_to..]);
+    output
 }
 
 fn write_memory_hook_report(report: &MemoryHookReport) -> io::Result<()> {
@@ -6394,6 +6562,53 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn redact_sensitive_covers_env_json_and_bearer_credentials() {
+        let input = concat!(
+            "Worker completed normally.\n",
+            "OPENAI_API_KEY=sk-env-secret keep=this\n",
+            r#"payload={"apiKey":"json-secret","status":"ok"}"#,
+            "\nAuthorization: Bearer eyJhbGciOi.secret.signature\n",
+            "Normal prose about API keys and bearer authentication stays readable."
+        );
+
+        let redacted = redact_sensitive(input);
+
+        assert!(redacted.contains("Worker completed normally.\n"));
+        assert!(redacted.contains("OPENAI_API_KEY=[redacted] keep=this"));
+        assert!(redacted.contains(r#"{"apiKey":"[redacted]","status":"ok"}"#));
+        assert!(redacted.contains("Authorization: Bearer [redacted]"));
+        assert!(
+            redacted
+                .contains("Normal prose about API keys and bearer authentication stays readable.")
+        );
+        for secret in [
+            "sk-env-secret",
+            "json-secret",
+            "eyJhbGciOi.secret.signature",
+        ] {
+            assert!(!redacted.contains(secret));
+        }
+    }
+
+    #[test]
+    fn redact_sensitive_preserves_labels_punctuation_and_non_secret_layout() {
+        let input = concat!(
+            "password = hunter2; token=abc123, api_key: 'quoted-secret'\n",
+            "status=ready token budget=1200\n",
+            "prefix sk-live-secret suffix"
+        );
+
+        assert_eq!(
+            redact_sensitive(input),
+            concat!(
+                "password = [redacted]; token=[redacted], api_key: '[redacted]'\n",
+                "status=ready token budget=1200\n",
+                "prefix [redacted] suffix"
+            )
+        );
+    }
 
     fn bridge_env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

@@ -3,12 +3,14 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use ring::digest;
 use serde::{Deserialize, Serialize};
 
 use crate::operation_plan::{
     OperationPlanItemStatus, OperationPlanShowOptions, OperationPlanShowReport,
     OperationPlanStatus, list_operation_plans, show_operation_plan,
 };
+use crate::virtual_session_context::resolve_virtual_session_working_context_for_lane;
 use crate::{
     InboundMediaInputPlanOptions, InboundMediaModelAttachmentStatus, MemoryPromptContextOptions,
     MemoryPromptContextStatus, MemoryRecallPlanOptions, PackArtifactMetadata, PackCandidateOptions,
@@ -22,6 +24,7 @@ use crate::{
 
 const PROMPT_BUNDLE_SCHEMA: &str = "agent-harness.prompt-bundle.v1";
 const PROMPT_INJECTION_LEDGER_SCHEMA: &str = "agent-harness.prompt-injection-ledger.v2";
+const AGENT_PROMPT_MANIFEST_SCHEMA: &str = "agent-harness.agent-prompt-manifest.v1";
 const INBOUND_CONTEXT_MAX_BYTES: usize = 16 * 1024;
 const VIRTUAL_SESSION_CONTEXT_MAX_BYTES: usize = 2 * 1024;
 
@@ -31,6 +34,12 @@ pub struct PromptAssemblyOptions {
     pub max_skill_file_bytes: usize,
     pub harness_home: Option<PathBuf>,
     pub memory_pack: PromptMemoryPackOptions,
+    /// Exact identity for new callers. `None` retains the bounded legacy
+    /// session/agent ledger behavior and is never treated as a wildcard.
+    pub full_lane: Option<crate::lane::FullLaneKeyV1>,
+    /// Opaque backend context generation. A new value forces static agent
+    /// configuration to be injected again even when file content is unchanged.
+    pub backend_context_generation: Option<String>,
 }
 
 impl Default for PromptAssemblyOptions {
@@ -40,6 +49,8 @@ impl Default for PromptAssemblyOptions {
             max_skill_file_bytes: 96 * 1024,
             harness_home: None,
             memory_pack: PromptMemoryPackOptions::default(),
+            full_lane: None,
+            backend_context_generation: None,
         }
     }
 }
@@ -69,11 +80,57 @@ pub struct PromptBundle {
     pub reasoning_preference: Option<crate::backend_reasoning::ReasoningPreference>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend_reasoning_policy: Option<crate::backend_reasoning::BackendReasoningPolicyV1>,
+    pub prompt_manifest: AgentPromptManifestV1,
     pub summary: PromptBundleSummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_skills: Vec<SkillSelection>,
     pub sections: Vec<PromptSection>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPromptManifestV1 {
+    pub schema: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_context_generation: Option<String>,
+    pub entries: Vec<AgentPromptManifestEntryV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPromptManifestEntryV1 {
+    pub canonical_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
+    pub path: PathBuf,
+    pub role: String,
+    pub status: AgentPromptManifestStatusV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<AgentPromptManifestChangeV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentPromptManifestStatusV1 {
+    Included,
+    Reused,
+    Removed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentPromptManifestChangeV1 {
+    Added,
+    Modified,
+    Removed,
+    BackendContextGenerationChanged,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -160,6 +217,19 @@ pub fn assemble_prompt_bundle(
     let mut reused_skills = 0usize;
     let mut continuity_notes = Vec::new();
     let agent_id = plan.agent.as_ref().map(|agent| agent.id.clone());
+    let lane_digest = options
+        .full_lane
+        .as_ref()
+        .map(crate::lane::FullLaneKeyV1::identity_hash)
+        .transpose()
+        .map_err(io::Error::other)?;
+    let backend_context_generation = options
+        .backend_context_generation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let mut manifest_entries = Vec::with_capacity(plan.prompt_files.len());
     let mut ledger_state = if plan.dispatch == TurnDispatch::AgentTurn {
         options
             .harness_home
@@ -169,6 +239,8 @@ pub fn assemble_prompt_bundle(
                     harness_home,
                     agent_id.as_deref(),
                     &plan.session_key,
+                    lane_digest.as_deref(),
+                    backend_context_generation.as_deref(),
                 )
             })
             .transpose()?
@@ -190,11 +262,20 @@ pub fn assemble_prompt_bundle(
         sections.push(agent_identity_section(plan));
         sections.push(channel_output_contract_section());
         if let Some(harness_home) = options.harness_home.as_ref() {
-            match operation_plan_context_section(harness_home, plan, agent_id.as_deref()) {
+            match operation_plan_context_section(
+                harness_home,
+                plan,
+                agent_id.as_deref(),
+                lane_digest.as_deref(),
+            ) {
                 Ok(section) => sections.push(section),
                 Err(error) => warnings.push(format!("operation plan context unavailable: {error}")),
             }
-            match virtual_session_working_context_section(harness_home, plan) {
+            match virtual_session_working_context_section(
+                harness_home,
+                plan,
+                options.full_lane.as_ref(),
+            ) {
                 Ok(Some(section)) => sections.push(section),
                 Ok(None) => {}
                 Err(error) => warnings.push(format!(
@@ -204,7 +285,18 @@ pub fn assemble_prompt_bundle(
         }
 
         for prompt_file in &plan.prompt_files {
+            let mut manifest_entry = prompt_manifest_entry(prompt_file);
             if !prompt_file.exists {
+                if let Some(ledger_state) = ledger_state.as_mut()
+                    && ledger_state.remove_prompt_file(&prompt_file.name, &prompt_file.path)
+                {
+                    manifest_entry.change = Some(AgentPromptManifestChangeV1::Removed);
+                    continuity_notes.push(format!(
+                        "prompt file `{}` was removed; prior injected content is tombstoned",
+                        prompt_file.name
+                    ));
+                }
+                manifest_entries.push(manifest_entry);
                 continue;
             }
             let section = read_limited_section_with_ledger(
@@ -212,15 +304,18 @@ pub fn assemble_prompt_bundle(
                 PromptSectionTier::StableRuntime,
                 prompt_file.name.clone(),
                 &prompt_file.path,
+                &prompt_file.name,
                 options.max_prompt_file_bytes,
                 ledger_state.as_mut(),
                 &mut continuity_notes,
                 &mut reused_prompt_files,
+                &mut manifest_entry,
             )?;
             if let Some(mut section) = section {
                 add_prompt_file_role_header(&mut section);
                 sections.push(section);
             }
+            manifest_entries.push(manifest_entry);
         }
 
         if !plan.selected_skills.is_empty() {
@@ -347,7 +442,7 @@ pub fn assemble_prompt_bundle(
         source_workspace: plan.source_workspace.clone(),
         dispatch: plan.dispatch,
         session_key: plan.session_key.clone(),
-        agent_id,
+        agent_id: agent_id.clone(),
         provider: plan.model_policy.provider.clone(),
         model: plan.model_policy.model.clone(),
         provider_request_policy: plan.provider_request_policy.clone(),
@@ -355,6 +450,13 @@ pub fn assemble_prompt_bundle(
         thinking_level: plan.thinking_policy.level.clone(),
         reasoning_preference: plan.reasoning_preference.clone(),
         backend_reasoning_policy: plan.backend_reasoning_policy.clone(),
+        prompt_manifest: AgentPromptManifestV1 {
+            schema: AGENT_PROMPT_MANIFEST_SCHEMA.to_string(),
+            agent_id: agent_id.clone(),
+            lane_digest,
+            backend_context_generation,
+            entries: manifest_entries,
+        },
         summary,
         selected_skills: plan.selected_skills.clone(),
         sections,
@@ -454,11 +556,13 @@ fn operation_plan_context_section(
     harness_home: &Path,
     turn: &TurnPlan,
     agent_id: Option<&str>,
+    exact_lane_digest: Option<&str>,
 ) -> io::Result<PromptSection> {
     let summaries = list_operation_plans(harness_home.to_path_buf())?;
     let mut matching = Vec::new();
     let mut fallback = Vec::new();
-    let allow_fallback = agent_id.map(|agent_id| agent_id == "main").unwrap_or(true);
+    let allow_fallback =
+        exact_lane_digest.is_none() && agent_id.map(|agent_id| agent_id == "main").unwrap_or(true);
 
     for summary in summaries
         .into_iter()
@@ -476,7 +580,13 @@ fn operation_plan_context_section(
         })?;
         let session_match = report.plan.session_key == turn.session_key;
         let agent_match = agent_id.is_some_and(|agent_id| report.plan.agent_id == agent_id);
-        if session_match || agent_match {
+        if if let Some(expected_digest) = exact_lane_digest {
+            session_match
+                && agent_match
+                && report.plan.lane_digest.as_deref() == Some(expected_digest)
+        } else {
+            session_match || agent_match
+        } {
             matching.push(report);
         } else if allow_fallback && fallback.len() < 3 {
             fallback.push(report);
@@ -683,6 +793,26 @@ fn add_prompt_file_role_header(section: &mut PromptSection) {
     section.bytes_included = section.bytes_included.saturating_add(header_len);
 }
 
+fn prompt_manifest_entry(prompt_file: &crate::TurnPromptFile) -> AgentPromptManifestEntryV1 {
+    AgentPromptManifestEntryV1 {
+        canonical_name: prompt_file.name.clone(),
+        source_name: prompt_file
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToString::to_string),
+        path: prompt_file.path.clone(),
+        role: prompt_file_role(&prompt_file.name).to_string(),
+        status: if prompt_file.exists {
+            AgentPromptManifestStatusV1::Included
+        } else {
+            AgentPromptManifestStatusV1::Removed
+        },
+        change: None,
+        content_sha256: None,
+    }
+}
+
 fn prompt_file_role(name: &str) -> &'static str {
     match name.to_ascii_uppercase().as_str() {
         "AGENTS.MD" => {
@@ -745,11 +875,12 @@ fn session_continuity_section(notes: Vec<String>) -> PromptSection {
 fn virtual_session_working_context_section(
     harness_home: &Path,
     plan: &TurnPlan,
+    full_lane: Option<&crate::lane::FullLaneKeyV1>,
 ) -> io::Result<Option<PromptSection>> {
     let Some(agent_id) = plan.agent.as_ref().map(|agent| agent.id.clone()) else {
         return Ok(None);
     };
-    let context = resolve_virtual_session_working_context(VirtualSessionContextQuery {
+    let query = VirtualSessionContextQuery {
         harness_home: harness_home.to_path_buf(),
         platform: plan.platform.clone(),
         channel_id: plan.channel_id.clone(),
@@ -757,7 +888,12 @@ fn virtual_session_working_context_section(
         agent_id,
         session_key: Some(plan.session_key.clone()),
         now_ms: current_log_time_ms().unwrap_or(0),
-    })?;
+    };
+    let context = if full_lane.is_some() {
+        resolve_virtual_session_working_context_for_lane(query, full_lane)?
+    } else {
+        resolve_virtual_session_working_context(query)?
+    };
     if !virtual_session_context_has_prompt_value(&context) {
         return Ok(None);
     }
@@ -842,6 +978,9 @@ fn render_virtual_session_working_context(context: &VirtualSessionWorkingContext
                 .unwrap_or_else(|| "(none)".to_string())
         ),
     ];
+    if let Some(lane_digest) = context.lane_digest.as_deref() {
+        lines.insert(2, format!("laneDigest: {lane_digest}"));
+    }
     if context.continuation_index > 0
         && let Some(interruption) = context.last_interruption.as_deref()
     {
@@ -1207,17 +1346,21 @@ fn read_limited_section_with_ledger(
     tier: PromptSectionTier,
     title: String,
     path: &Path,
+    canonical_name: &str,
     max_bytes: usize,
     ledger_state: Option<&mut PromptInjectionLedgerState>,
     continuity_notes: &mut Vec<String>,
     reused_count: &mut usize,
+    manifest_entry: &mut AgentPromptManifestEntryV1,
 ) -> io::Result<Option<PromptSection>> {
     let bytes = fs::read(path)?;
     let fingerprint = stable_fingerprint(&bytes);
-    let ledger_key = ledger_key(kind, path);
+    manifest_entry.content_sha256 = Some(sha256_hex(&bytes));
     if let Some(ledger_state) = ledger_state {
-        if ledger_state.has_unchanged(&ledger_key, &fingerprint) {
+        let prior_exists = ledger_state.prompt_file_prior_exists(canonical_name, path);
+        if ledger_state.prompt_file_unchanged_or_migrate(canonical_name, path, &fingerprint) {
             *reused_count += 1;
+            manifest_entry.status = AgentPromptManifestStatusV1::Reused;
             continuity_notes.push(format!(
                 "{} `{}` from `{}` ({})",
                 section_kind_label(kind),
@@ -1227,8 +1370,16 @@ fn read_limited_section_with_ledger(
             ));
             return Ok(None);
         }
-        ledger_state.upsert(
-            ledger_key,
+        manifest_entry.change = Some(if ledger_state.backend_generation_changed {
+            AgentPromptManifestChangeV1::BackendContextGenerationChanged
+        } else if prior_exists {
+            AgentPromptManifestChangeV1::Modified
+        } else {
+            AgentPromptManifestChangeV1::Added
+        });
+        ledger_state.upsert_prompt_file(
+            canonical_name,
+            path,
             PromptInjectionLedgerEntry {
                 kind,
                 title: title.clone(),
@@ -1240,6 +1391,8 @@ fn read_limited_section_with_ledger(
                 delivery_mode: None,
             },
         );
+    } else {
+        manifest_entry.change = Some(AgentPromptManifestChangeV1::Added);
     }
 
     Ok(Some(limited_section_from_bytes(
@@ -1374,6 +1527,10 @@ struct PromptInjectionLedger {
     schema: String,
     agent_id: Option<String>,
     session_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lane_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend_context_generation: Option<String>,
     entries: BTreeMap<String, PromptInjectionLedgerEntry>,
 }
 
@@ -1398,17 +1555,26 @@ struct PromptInjectionLedgerState {
     path: PathBuf,
     ledger: PromptInjectionLedger,
     dirty: bool,
+    backend_generation_changed: bool,
 }
 
 impl PromptInjectionLedgerState {
-    fn load(harness_home: &Path, agent_id: Option<&str>, session_key: &str) -> io::Result<Self> {
-        let path = prompt_injection_ledger_path(harness_home, agent_id, session_key);
+    fn load(
+        harness_home: &Path,
+        agent_id: Option<&str>,
+        session_key: &str,
+        lane_digest: Option<&str>,
+        backend_context_generation: Option<&str>,
+    ) -> io::Result<Self> {
+        let path = prompt_injection_ledger_path(harness_home, agent_id, session_key, lane_digest);
         let ledger = if path.is_file() {
             let bytes = fs::read(&path)?;
             serde_json::from_slice(&bytes).unwrap_or_else(|_| PromptInjectionLedger {
                 schema: PROMPT_INJECTION_LEDGER_SCHEMA.to_string(),
                 agent_id: agent_id.map(ToString::to_string),
                 session_key: session_key.to_string(),
+                lane_digest: lane_digest.map(ToString::to_string),
+                backend_context_generation: backend_context_generation.map(ToString::to_string),
                 entries: BTreeMap::new(),
             })
         } else {
@@ -1416,23 +1582,104 @@ impl PromptInjectionLedgerState {
                 schema: PROMPT_INJECTION_LEDGER_SCHEMA.to_string(),
                 agent_id: agent_id.map(ToString::to_string),
                 session_key: session_key.to_string(),
+                lane_digest: lane_digest.map(ToString::to_string),
+                backend_context_generation: backend_context_generation.map(ToString::to_string),
                 entries: BTreeMap::new(),
             }
         };
         let mut ledger = ledger;
+        let backend_generation_changed = !ledger.entries.is_empty()
+            && backend_context_generation.is_some()
+            && ledger.backend_context_generation.as_deref() != backend_context_generation;
+        let metadata_changed = ledger.lane_digest.as_deref() != lane_digest
+            || (backend_context_generation.is_some()
+                && ledger.backend_context_generation.as_deref() != backend_context_generation);
         ledger.schema = PROMPT_INJECTION_LEDGER_SCHEMA.to_string();
+        ledger.lane_digest = lane_digest.map(ToString::to_string);
+        if backend_context_generation.is_some() {
+            ledger.backend_context_generation = backend_context_generation.map(ToString::to_string);
+        }
         Ok(Self {
             path,
             ledger,
-            dirty: false,
+            dirty: metadata_changed,
+            backend_generation_changed,
         })
     }
 
-    fn has_unchanged(&self, key: &str, fingerprint: &str) -> bool {
+    fn prompt_file_key(canonical_name: &str) -> String {
+        format!("prompt-file:{canonical_name}")
+    }
+
+    fn prompt_file_prior_exists(&self, canonical_name: &str, path: &Path) -> bool {
         self.ledger
             .entries
-            .get(key)
+            .contains_key(&Self::prompt_file_key(canonical_name))
+            || self
+                .ledger
+                .entries
+                .contains_key(&ledger_key(PromptSectionKind::PromptFile, path))
+    }
+
+    fn prompt_file_unchanged_or_migrate(
+        &mut self,
+        canonical_name: &str,
+        path: &Path,
+        fingerprint: &str,
+    ) -> bool {
+        if self.backend_generation_changed {
+            return false;
+        }
+        let key = Self::prompt_file_key(canonical_name);
+        if self
+            .ledger
+            .entries
+            .get(&key)
             .is_some_and(|entry| entry.fingerprint == fingerprint)
+        {
+            return true;
+        }
+        let old_key = ledger_key(PromptSectionKind::PromptFile, path);
+        let Some(entry) = self
+            .ledger
+            .entries
+            .get(&old_key)
+            .filter(|entry| entry.fingerprint == fingerprint)
+            .cloned()
+        else {
+            return false;
+        };
+        self.ledger.entries.remove(&old_key);
+        self.ledger.entries.insert(key, entry);
+        self.dirty = true;
+        true
+    }
+
+    fn upsert_prompt_file(
+        &mut self,
+        canonical_name: &str,
+        path: &Path,
+        entry: PromptInjectionLedgerEntry,
+    ) {
+        self.ledger
+            .entries
+            .remove(&ledger_key(PromptSectionKind::PromptFile, path));
+        self.upsert(Self::prompt_file_key(canonical_name), entry);
+    }
+
+    fn remove_prompt_file(&mut self, canonical_name: &str, path: &Path) -> bool {
+        let removed = self
+            .ledger
+            .entries
+            .remove(&Self::prompt_file_key(canonical_name))
+            .is_some()
+            | self
+                .ledger
+                .entries
+                .remove(&ledger_key(PromptSectionKind::PromptFile, path))
+                .is_some();
+        self.dirty |= removed;
+        removed
     }
 
     fn upsert(&mut self, key: String, entry: PromptInjectionLedgerEntry) {
@@ -1542,12 +1789,21 @@ fn prompt_injection_ledger_path(
     harness_home: &Path,
     agent_id: Option<&str>,
     session_key: &str,
+    lane_digest: Option<&str>,
 ) -> PathBuf {
+    let file_stem = match lane_digest {
+        Some(digest) => format!(
+            "lane-{}--{}",
+            safe_path_segment(digest),
+            safe_path_segment(session_key)
+        ),
+        None => safe_path_segment(session_key),
+    };
     harness_home
         .join("state")
         .join("prompt-injection-ledgers")
         .join(safe_path_segment(agent_id.unwrap_or("default")))
-        .join(format!("{}.json", safe_path_segment(session_key)))
+        .join(format!("{file_stem}.json"))
 }
 
 fn ledger_key(kind: PromptSectionKind, path: &Path) -> String {
@@ -1577,6 +1833,17 @@ fn stable_fingerprint(bytes: &[u8]) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("fnv1a64:{hash:016x}")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let value = digest::digest(&digest::SHA256, bytes);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(value.as_ref().len() * 2);
+    for byte in value.as_ref() {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn safe_path_segment(value: &str) -> String {
@@ -2046,6 +2313,174 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn operation_plan_prompt_exact_lane_requires_matching_digest_without_legacy_fallback() {
+        let root = temp_root("operation_plan_prompt_exact_lane_requires_matching_digest");
+        let source = write_prompt_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "continue exact work".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: Some("session-root:cont-1".to_string()),
+                skill_limit: 0,
+            },
+        )
+        .unwrap();
+        let lane = crate::lane::FullLaneKeyV1::new(
+            "telegram",
+            "account-a",
+            "dm",
+            "user",
+            "main",
+            "interactive",
+            "session-root",
+            "session-root:cont-1",
+        )
+        .unwrap();
+        let base_options = crate::operation_plan::CreateOperationPlanOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "scoped-plan".to_string(),
+            origin_queue_id: None,
+            session_key: plan.session_key.clone(),
+            agent_id: "main".to_string(),
+            goal: "scoped exact work".to_string(),
+            acceptance_criteria: None,
+            constraints: None,
+            max_open_items: None,
+            max_fanout: None,
+            now_ms: 1000,
+        };
+        crate::operation_plan::create_operation_plan_v2(
+            crate::operation_plan::CreateOperationPlanOptionsV2 {
+                options: base_options,
+                lane_digest: lane.identity_hash().unwrap(),
+            },
+        )
+        .unwrap();
+        crate::operation_plan::create_operation_plan(
+            crate::operation_plan::CreateOperationPlanOptions {
+                harness_home: harness_home.clone(),
+                plan_id: "legacy-plan".to_string(),
+                origin_queue_id: None,
+                session_key: plan.session_key.clone(),
+                agent_id: "main".to_string(),
+                goal: "legacy unscoped work".to_string(),
+                acceptance_criteria: None,
+                constraints: None,
+                max_open_items: None,
+                max_fanout: None,
+                now_ms: 1001,
+            },
+        )
+        .unwrap();
+
+        let exact = assemble_prompt_bundle(
+            &plan,
+            PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                full_lane: Some(lane.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        )
+        .unwrap();
+        let exact_text = exact
+            .sections
+            .iter()
+            .find(|section| section.title == "OperationPlan task list")
+            .unwrap()
+            .content
+            .as_str();
+        assert!(exact_text.contains("planId=scoped-plan"));
+        assert!(!exact_text.contains("planId=legacy-plan"));
+
+        for mismatched in [
+            crate::lane::FullLaneKeyV1::new(
+                "telegram",
+                "account-b",
+                "dm",
+                "user",
+                "main",
+                "interactive",
+                "session-root",
+                "session-root:cont-1",
+            )
+            .unwrap(),
+            crate::lane::FullLaneKeyV1::new(
+                "telegram",
+                "account-a",
+                "dm",
+                "user",
+                "main",
+                "worker",
+                "session-root",
+                "session-root:cont-1",
+            )
+            .unwrap(),
+            crate::lane::FullLaneKeyV1::new(
+                "telegram",
+                "account-a",
+                "dm",
+                "user",
+                "main",
+                "interactive",
+                "other-root",
+                "session-root:cont-1",
+            )
+            .unwrap(),
+        ] {
+            let bundle = assemble_prompt_bundle(
+                &plan,
+                PromptAssemblyOptions {
+                    harness_home: Some(harness_home.clone()),
+                    full_lane: Some(mismatched),
+                    ..PromptAssemblyOptions::default()
+                },
+            )
+            .unwrap();
+            let text = &bundle
+                .sections
+                .iter()
+                .find(|section| section.title == "OperationPlan task list")
+                .unwrap()
+                .content;
+            assert!(text.contains("Active OperationPlans: none visible"));
+            assert!(!text.contains("planId=scoped-plan"));
+            assert!(!text.contains("planId=legacy-plan"));
+        }
+
+        let legacy = assemble_prompt_bundle(
+            &plan,
+            PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        )
+        .unwrap();
+        let legacy_text = &legacy
+            .sections
+            .iter()
+            .find(|section| section.title == "OperationPlan task list")
+            .unwrap()
+            .content;
+        assert!(legacy_text.contains("planId=scoped-plan"));
+        assert!(legacy_text.contains("planId=legacy-plan"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn prompt_tiers_emit_skill_index_and_invocation_envelope() {
         let root = temp_root("prompt_tiers_emit_skill_index_and_invocation_envelope");
@@ -3217,6 +3652,157 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prompt_manifest_tracks_generation_reinjection_and_delete_tombstone() {
+        let root = temp_root("prompt_manifest_tracks_generation_reinjection_and_delete_tombstone");
+        let source = write_prompt_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let input = TurnPlanInput {
+            harness_home: Some(harness_home.clone()),
+            platform: "telegram".to_string(),
+            channel_id: "dm".to_string(),
+            user_id: "user".to_string(),
+            text: "continue".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            requested_agent_id: Some("main".to_string()),
+            session_hint: Some("telegram:dm:user:main".to_string()),
+            skill_limit: 0,
+        };
+        let options = PromptAssemblyOptions {
+            harness_home: Some(harness_home.clone()),
+            backend_context_generation: Some("backend-generation-1".to_string()),
+            ..PromptAssemblyOptions::default()
+        };
+
+        let first_plan = build_turn_plan(&source, &registry, &skills, input.clone()).unwrap();
+        let first = assemble_prompt_bundle(&first_plan, options.clone()).unwrap();
+        assert_eq!(
+            first.prompt_manifest.entries.len(),
+            crate::PROMPT_FILE_NAMES.len()
+        );
+        assert!(first.prompt_manifest.entries.iter().any(|entry| {
+            entry.canonical_name == "AGENTS.md"
+                && entry.status == AgentPromptManifestStatusV1::Included
+                && entry.change == Some(AgentPromptManifestChangeV1::Added)
+                && entry
+                    .content_sha256
+                    .as_deref()
+                    .is_some_and(|hash| hash.len() == 64)
+        }));
+
+        let second_plan = build_turn_plan(&source, &registry, &skills, input.clone()).unwrap();
+        let second = assemble_prompt_bundle(&second_plan, options.clone()).unwrap();
+        assert!(second.prompt_manifest.entries.iter().any(|entry| {
+            entry.canonical_name == "SOUL.md"
+                && entry.status == AgentPromptManifestStatusV1::Reused
+                && entry.change.is_none()
+        }));
+
+        let third_plan = build_turn_plan(&source, &registry, &skills, input.clone()).unwrap();
+        let third = assemble_prompt_bundle(
+            &third_plan,
+            PromptAssemblyOptions {
+                backend_context_generation: Some("backend-generation-2".to_string()),
+                ..options.clone()
+            },
+        )
+        .unwrap();
+        assert!(third.prompt_manifest.entries.iter().any(|entry| {
+            entry.canonical_name == "AGENTS.md"
+                && entry.status == AgentPromptManifestStatusV1::Included
+                && entry.change
+                    == Some(AgentPromptManifestChangeV1::BackendContextGenerationChanged)
+        }));
+
+        fs::remove_file(source.workspace.join("SOUL.md")).unwrap();
+        let fourth_plan = build_turn_plan(&source, &registry, &skills, input).unwrap();
+        let fourth = assemble_prompt_bundle(
+            &fourth_plan,
+            PromptAssemblyOptions {
+                backend_context_generation: Some("backend-generation-2".to_string()),
+                ..options
+            },
+        )
+        .unwrap();
+        assert!(fourth.prompt_manifest.entries.iter().any(|entry| {
+            entry.canonical_name == "SOUL.md"
+                && entry.status == AgentPromptManifestStatusV1::Removed
+                && entry.change == Some(AgentPromptManifestChangeV1::Removed)
+                && entry.content_sha256.is_none()
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prompt_ledger_exact_lane_digest_separates_account_runtime_and_root_axes() {
+        let root = temp_root("prompt_ledger_exact_lane_digest_separates_axes");
+        let harness_home = root.join(".agent-harness");
+        let lane = crate::lane::FullLaneKeyV1::new(
+            "telegram",
+            "account-a",
+            "dm",
+            "user",
+            "main",
+            "interactive",
+            "telegram:dm:user:main",
+            "telegram:dm:user:main",
+        )
+        .unwrap();
+        let account_other = crate::lane::FullLaneKeyV1::new(
+            "telegram",
+            "account-b",
+            "dm",
+            "user",
+            "main",
+            "interactive",
+            "telegram:dm:user:main",
+            "telegram:dm:user:main",
+        )
+        .unwrap();
+        let runtime_other = crate::lane::FullLaneKeyV1::new(
+            "telegram",
+            "account-a",
+            "dm",
+            "user",
+            "main",
+            "worker",
+            "telegram:dm:user:main",
+            "telegram:dm:user:main",
+        )
+        .unwrap();
+        let root_other = crate::lane::FullLaneKeyV1::new(
+            "telegram",
+            "account-a",
+            "dm",
+            "user",
+            "main",
+            "interactive",
+            "other-root",
+            "telegram:dm:user:main",
+        )
+        .unwrap();
+        let paths = [lane, account_other, runtime_other, root_other]
+            .iter()
+            .map(|lane| {
+                prompt_injection_ledger_path(
+                    &harness_home,
+                    Some("main"),
+                    "telegram:dm:user:main",
+                    Some(&lane.identity_hash().unwrap()),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(paths.len(), 4);
+        assert_ne!(
+            prompt_injection_ledger_path(&harness_home, Some("main"), "shared-session", None,),
+            prompt_injection_ledger_path(&harness_home, Some("other"), "shared-session", None,)
+        );
     }
 
     fn apply_max_backend_reasoning_policy(plan: &mut TurnPlan) {

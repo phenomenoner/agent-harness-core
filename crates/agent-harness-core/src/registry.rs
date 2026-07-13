@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -116,7 +116,7 @@ pub fn load_agent_registry(source: &AgentSource) -> io::Result<AgentRegistry> {
     let mut agent_configs = BTreeMap::new();
     if let Some(config) = &config {
         registry.defaults = collect_agent_defaults(config);
-        collect_agent_configs(config, &mut agent_configs);
+        collect_agent_configs(config, &mut agent_configs)?;
         registry.providers = collect_providers(config);
         registry.plugins = collect_plugins(config);
         registry.channels = collect_channels(config, &registry.plugins);
@@ -163,10 +163,10 @@ fn collect_agent_defaults(config: &Value) -> AgentDefaults {
     }
 }
 
-fn collect_agent_configs(config: &Value, agents: &mut BTreeMap<String, Value>) {
+fn collect_agent_configs(config: &Value, agents: &mut BTreeMap<String, Value>) -> io::Result<()> {
     for path in ["/agents/list", "/agents/items", "/agent/list"] {
         if let Some(value) = config.pointer(path) {
-            collect_agent_collection(value, agents);
+            collect_agent_collection(value, agents)?;
         }
     }
 
@@ -174,25 +174,31 @@ fn collect_agent_configs(config: &Value, agents: &mut BTreeMap<String, Value>) {
         && value.get("list").is_none()
         && value.get("items").is_none()
     {
-        collect_agent_keyed_object(value, agents);
+        collect_agent_keyed_object(value, agents)?;
     }
+    Ok(())
 }
 
-fn collect_agent_collection(value: &Value, agents: &mut BTreeMap<String, Value>) {
+fn collect_agent_collection(value: &Value, agents: &mut BTreeMap<String, Value>) -> io::Result<()> {
     if let Some(array) = value.as_array() {
         for agent in array {
             if let Some(id) = agent_id(agent) {
+                validate_agent_id_path_component(id)?;
                 agents.insert(id.to_string(), agent.clone());
             }
         }
     } else if value.is_object() {
-        collect_agent_keyed_object(value, agents);
+        collect_agent_keyed_object(value, agents)?;
     }
+    Ok(())
 }
 
-fn collect_agent_keyed_object(value: &Value, agents: &mut BTreeMap<String, Value>) {
+fn collect_agent_keyed_object(
+    value: &Value,
+    agents: &mut BTreeMap<String, Value>,
+) -> io::Result<()> {
     let Some(object) = value.as_object() else {
-        return;
+        return Ok(());
     };
 
     for (key, value) in object {
@@ -200,8 +206,26 @@ fn collect_agent_keyed_object(value: &Value, agents: &mut BTreeMap<String, Value
             continue;
         }
         let id = agent_id(value).unwrap_or(key);
+        validate_agent_id_path_component(id)?;
         agents.insert(id.to_string(), value.clone());
     }
+    Ok(())
+}
+
+pub(crate) fn validate_agent_id_path_component(value: &str) -> io::Result<()> {
+    let mut components = Path::new(value).components();
+    let is_single_normal_component = matches!(components.next(), Some(Component::Normal(component)) if component == value)
+        && components.next().is_none();
+    let has_forbidden_character = value.chars().any(|character| {
+        character == '/' || character == '\\' || character == ':' || character.is_control()
+    });
+    if value.is_empty() || !is_single_normal_component || has_forbidden_character {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "agentId must be a single safe path component",
+        ));
+    }
+    Ok(())
 }
 
 fn build_agent_profile(
@@ -933,6 +957,70 @@ mod tests {
         assert_eq!(memory_plugin.source, "plugins.entries");
         assert!(memory_plugin.memory_related);
         assert!(registry.channels.telegram);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registry_rejects_unsafe_config_agent_ids_that_escape_the_agents_directory() {
+        let root = temp_root("registry_rejects_unsafe_config_agent_ids");
+        let home = root.join(".openclaw");
+        fs::create_dir_all(&home).unwrap();
+
+        for config in [
+            serde_json::json!({
+                "agents": {
+                    "list": [{ "id": root.join("outside-agent").display().to_string() }]
+                }
+            }),
+            serde_json::json!({
+                "agents": {
+                    "../outside-agent": { "enabled": true }
+                }
+            }),
+        ] {
+            fs::write(
+                home.join("openclaw.json"),
+                serde_json::to_vec_pretty(&config).unwrap(),
+            )
+            .unwrap();
+
+            let error = load_agent_registry(&AgentSource::new(&home)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .contains("agentId must be a single safe path component"),
+                "unexpected validation error: {error}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registry_accepts_unicode_agent_ids_that_are_single_path_components() {
+        let root = temp_root("registry_accepts_unicode_agent_id");
+        let home = root.join(".openclaw");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("openclaw.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agents": {
+                    "list": [{ "id": "小莉-研究員" }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let registry = load_agent_registry(&AgentSource::new(&home)).unwrap();
+        assert_eq!(registry.agents.len(), 1);
+        assert_eq!(registry.agents[0].id, "小莉-研究員");
+        assert_eq!(
+            registry.agents[0].directory,
+            home.join("agents").join("小莉-研究員")
+        );
 
         let _ = fs::remove_dir_all(root);
     }

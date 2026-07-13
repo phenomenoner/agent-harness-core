@@ -12,7 +12,7 @@ use crate::{
     ChannelStepAction, HarnessLogEvent, HarnessLogLevel, InboundMediaArtifact,
     RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, SkillIndex, TurnPlanInput,
     append_harness_log, apply_channel_command_step, build_channel_step, build_turn_plan,
-    enqueue_channel_step, load_agent_registry,
+    load_agent_registry,
 };
 
 const CHANNEL_RECEIVE_SCHEMA: &str = "agent-harness.channel-receive.v1";
@@ -274,13 +274,15 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
                 )
             }
             ChannelStepAction::EnqueueAgentTurn => {
-                let queue = enqueue_channel_step(
+                let queue = crate::enqueue_channel_step_v2(
                     &step,
-                    RuntimeQueueEnqueueOptions {
-                        harness_home: options.harness_home.clone(),
-                        runtime_workspace: options.runtime_workspace.clone(),
-                        inbound_canonical_id: inbound_canonical_id.clone(),
-                        now_ms: options.now_ms,
+                    crate::RuntimeQueueEnqueueOptionsV2 {
+                        options: RuntimeQueueEnqueueOptions {
+                            harness_home: options.harness_home.clone(),
+                            runtime_workspace: options.runtime_workspace.clone(),
+                            inbound_canonical_id: inbound_canonical_id.clone(),
+                            now_ms: options.now_ms,
+                        },
                     },
                 )?;
                 let queue_id = queue.receipt.queue_id.clone();
@@ -650,6 +652,7 @@ fn fnv1a_64_hex(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend_reasoning::ReasoningPreference;
     use crate::{build_source_skill_index, read_channel_session_state};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -747,6 +750,97 @@ mod tests {
         let item = queue.item.unwrap();
         assert_eq!(item.provider.as_deref(), Some("openrouter"));
         assert_eq!(item.model.as_deref(), Some("anthropic/claude-sonnet-4"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unified_think_alias_max_is_command_only_agent_scoped_and_propagates_to_next_turn() {
+        let root = temp_root(
+            "unified_think_alias_max_is_command_only_agent_scoped_and_propagates_to_next_turn",
+        );
+        let source = write_reasoning_receive_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_reasoning_catalog(&harness_home);
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = |agent_id: &str, session_key: &str, message: &str, now_ms: i64| {
+            receive_channel_message(ChannelReceiveOptions {
+                source: source.clone(),
+                runtime_workspace: None,
+                harness_home: harness_home.clone(),
+                skill_index: skills.clone(),
+                platform: "discord".to_string(),
+                account_id: Some("discord-main".to_string()),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                agent_id: Some(agent_id.to_string()),
+                session_key: Some(session_key.to_string()),
+                message: message.to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                inbound_event_kind: None,
+                inbound_event_id: None,
+                skill_limit: 3,
+                now_ms,
+            })
+            .unwrap()
+        };
+
+        let think_max = receive("main", "discord:dm-42:user-7:main", "/think max", 1000);
+        let reasoning_high = receive("main", "discord:dm-42:user-7:main", "/reasoning high", 1001);
+        let reasoning_max = receive("main", "discord:dm-42:user-7:main", "/reasoning max", 1002);
+
+        for report in [&think_max, &reasoning_high, &reasoning_max] {
+            assert_eq!(report.status, ChannelReceiveStatus::CommandApplied);
+            assert_eq!(report.step_action, ChannelStepAction::ReplyOnly);
+            assert_eq!(report.command_name.as_deref(), Some("think"));
+            assert!(report.queue_id.is_none());
+            assert!(report.queue_enqueue.is_none());
+        }
+        assert!(
+            !harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl")
+                .exists(),
+            "thinking commands must not enqueue model turns"
+        );
+        let state = read_channel_session_state(&harness_home, "discord", "dm-42", "user-7")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            state.reasoning_preference,
+            Some(ReasoningPreference::Explicit { ref effort }) if effort == "max"
+        ));
+
+        let sibling_turn = receive(
+            "side",
+            "discord:dm-42:user-7:side",
+            "inspect independently",
+            1003,
+        );
+        let main_turn = receive(
+            "main",
+            "discord:dm-42:user-7:main",
+            "continue parent work",
+            1004,
+        );
+
+        assert_eq!(sibling_turn.status, ChannelReceiveStatus::AgentTurnQueued);
+        assert_eq!(main_turn.status, ChannelReceiveStatus::AgentTurnQueued);
+        let sibling_item = sibling_turn.queue_enqueue.unwrap().item.unwrap();
+        let main_item = main_turn.queue_enqueue.unwrap().item.unwrap();
+        assert_eq!(sibling_item.agent_id, "side");
+        assert!(!matches!(
+            sibling_item.reasoning_preference,
+            Some(ReasoningPreference::Explicit { ref effort }) if effort == "max"
+        ));
+        assert_eq!(main_item.agent_id, "main");
+        assert!(matches!(
+            main_item.reasoning_preference,
+            Some(ReasoningPreference::Explicit { ref effort }) if effort == "max"
+        ));
+        assert_eq!(runtime_queue_line_count(&harness_home), 2);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1203,6 +1297,88 @@ mod tests {
         )
         .unwrap();
         AgentSource::with_workspace(home, workspace)
+    }
+
+    fn write_reasoning_receive_source(root: &Path) -> AgentSource {
+        let home = root.join(".openclaw");
+        let workspace = home.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        for agent_id in ["main", "side"] {
+            fs::create_dir_all(home.join("agents").join(agent_id).join("sessions")).unwrap();
+            fs::write(
+                home.join("agents")
+                    .join(agent_id)
+                    .join("sessions")
+                    .join("sessions.json"),
+                "{}",
+            )
+            .unwrap();
+        }
+        fs::write(workspace.join("AGENTS.md"), "# Agent").unwrap();
+        fs::write(
+            home.join("openclaw.json"),
+            r#"{
+              "agents": {
+                "defaults": { "provider": "openai", "model": "gpt-5.6-sol" },
+                "list": [
+                  { "id": "main", "model": "gpt-5.6-sol", "enabled": true },
+                  { "id": "side", "model": "gpt-5.6-sol", "enabled": true }
+                ]
+              },
+              "models": {
+                "providers": {
+                  "openai": { "apiKey": "${OPENAI_API_KEY}" }
+                }
+              },
+              "plugins": [
+                { "id": "discord", "enabled": true }
+              ]
+            }"#,
+        )
+        .unwrap();
+        AgentSource::with_workspace(home, workspace)
+    }
+
+    fn write_reasoning_catalog(harness_home: &Path) {
+        let codex_home = harness_home.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(
+            codex_home.join("models_cache.json"),
+            r#"{
+              "models": [
+                {
+                  "slug": "gpt-5.6-sol",
+                  "default_reasoning_level": "medium",
+                  "supported_reasoning_levels": [
+                    { "effort": "low" },
+                    { "effort": "medium" },
+                    { "effort": "high" },
+                    { "effort": "xhigh" },
+                    { "effort": "max" },
+                    { "effort": "ultra" }
+                  ],
+                  "service_tiers": [],
+                  "comp_hash": "ingress-test"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        fs::create_dir_all(harness_home).unwrap();
+        fs::write(
+            harness_home.join(crate::HARNESS_CONFIG_FILE_NAME),
+            r#"{
+              "orchestration": {
+                "features": {
+                  "modelCatalogV2": {
+                    "mode": "authoritative",
+                    "enabledAgentIds": ["main", "side"]
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
     }
 
     fn temp_root(test_name: &str) -> PathBuf {

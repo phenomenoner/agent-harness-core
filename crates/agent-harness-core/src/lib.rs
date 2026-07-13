@@ -20,12 +20,14 @@ pub(crate) mod codex_capability;
 pub mod codex_runtime;
 pub mod config;
 pub mod context_rollover;
+pub mod coordinator_resume;
 pub mod cron;
 pub mod cron_runs;
 pub mod cron_scheduler;
 pub mod deploy;
 pub mod deterministic_cron;
 pub mod dream_director;
+pub mod execution_mode;
 pub mod harness_registry;
 pub mod harness_skills;
 pub mod health;
@@ -88,7 +90,25 @@ pub mod vault;
 pub mod virtual_session_context;
 pub mod wake;
 pub mod worker_adapters;
+pub mod worker_coordination;
 pub mod worker_result_mailbox;
+pub mod worker_resume;
+
+pub use child_execution_policy::{
+    CHILD_EXECUTION_POLICY_SCHEMA, CHILD_EXECUTION_POLICY_V2_SCHEMA, ChildExecutionPolicyError,
+    ChildExecutionPolicyV1, ChildExecutionPolicyV1Input, ChildExecutionPolicyV2,
+};
+pub use coordinator_resume::{
+    COORDINATOR_RESUME_METADATA_SCHEMA, CoordinatorResumeMetadataError, CoordinatorResumeMetadataV1,
+};
+pub use execution_mode::{
+    AUTHORIZED_EXECUTION_MODE_SNAPSHOT_SCHEMA_VERSION, AuthorizedExecutionModeSnapshotV2,
+    EXECUTION_MODE_POLICY_SCHEMA_VERSION, ExecutionModeAuthorizationAssessmentV1,
+    ExecutionModeError, ExecutionModePolicyV1, ExecutionModePreference, ExecutionModeSource,
+    SAFE_RESUME_LEASE_CONTRACT, SAFE_RESUME_READINESS_RECEIPT_SCHEMA, STANDARD_EXECUTION_MODE,
+    SafeResumeReadinessReceiptV1, ULTRA_EXECUTION_MODE, authorize_execution_mode_for_agent,
+    is_reserved_execution_mode_effort,
+};
 pub mod workers;
 
 pub use activation::{
@@ -112,8 +132,8 @@ pub use background::{
 };
 pub use channel_commands::{
     ChannelCommand, ChannelCommandIntent, DEFAULT_THINKING_LEVEL, FastCommandMode, THINKING_LEVELS,
-    XHIGH_THINKING_LEVEL, normalize_thinking_level, parse_channel_command,
-    parse_channel_command_intent,
+    XHIGH_THINKING_LEVEL, normalize_execution_mode, normalize_thinking_level,
+    parse_channel_command, parse_channel_command_intent,
 };
 pub use channel_delivery::{
     ChannelDeliveryPending, ChannelDeliveryPresentationFallbackReason,
@@ -394,18 +414,19 @@ pub use nudge::{
     reset_session_nudge_state, should_trigger_nudge,
 };
 pub use operation_plan::{
-    CreateOperationPlanOptions, OperationPlan, OperationPlanAddItemOptions,
-    OperationPlanAddItemReport, OperationPlanBlockOptions, OperationPlanBlockReport,
-    OperationPlanComment, OperationPlanCommentOptions, OperationPlanCommentReport,
-    OperationPlanCompleteOptions, OperationPlanCompleteReport, OperationPlanCreateReport,
-    OperationPlanDelegateItemOptions, OperationPlanEvent, OperationPlanEventKind,
-    OperationPlanItem, OperationPlanItemStatus, OperationPlanPromoteDependenciesOptions,
-    OperationPlanPromoteDependenciesReport, OperationPlanReceipt, OperationPlanReceiptAction,
-    OperationPlanShowOptions, OperationPlanShowReport, OperationPlanStatus, OperationPlanSummary,
+    CreateOperationPlanOptions, CreateOperationPlanOptionsV2, OperationPlan,
+    OperationPlanAddItemOptions, OperationPlanAddItemReport, OperationPlanBlockOptions,
+    OperationPlanBlockReport, OperationPlanComment, OperationPlanCommentOptions,
+    OperationPlanCommentReport, OperationPlanCompleteOptions, OperationPlanCompleteReport,
+    OperationPlanCreateReport, OperationPlanDelegateItemOptions, OperationPlanEvent,
+    OperationPlanEventKind, OperationPlanItem, OperationPlanItemStatus,
+    OperationPlanPromoteDependenciesOptions, OperationPlanPromoteDependenciesReport,
+    OperationPlanReceipt, OperationPlanReceiptAction, OperationPlanShowOptions,
+    OperationPlanShowReport, OperationPlanStatus, OperationPlanSummary,
     OperationPlanUpdateItemOptions, OperationPlanUpdateItemReport, add_operation_plan_item,
     block_operation_plan, comment_on_operation_plan, complete_operation_plan,
-    create_operation_plan, delegate_operation_plan_item, list_operation_plans,
-    promote_operation_plan_items_from_dependencies, show_operation_plan,
+    create_operation_plan, create_operation_plan_v2, delegate_operation_plan_item,
+    list_operation_plans, promote_operation_plan_items_from_dependencies, show_operation_plan,
     update_operation_plan_item,
 };
 pub use ops::{
@@ -434,8 +455,10 @@ pub use progress::{
     supersede_agent_progress_session_surfaces,
 };
 pub use prompt::{
-    PromptAssemblyOptions, PromptBundle, PromptBundleFiles, PromptBundleSummary, PromptSection,
-    PromptSectionKind, PromptSectionTier, assemble_prompt_bundle, write_prompt_bundle,
+    AgentPromptManifestChangeV1, AgentPromptManifestEntryV1, AgentPromptManifestStatusV1,
+    AgentPromptManifestV1, PromptAssemblyOptions, PromptBundle, PromptBundleFiles,
+    PromptBundleSummary, PromptSection, PromptSectionKind, PromptSectionTier,
+    assemble_prompt_bundle, write_prompt_bundle,
 };
 pub use quality::{
     InvariantEntry, PublicHygieneOptions, PublicHygieneReport, ReleaseChecklist,
@@ -477,15 +500,18 @@ pub use runtime_policy::{
 };
 pub use runtime_queue::{
     RuntimeQueueControlAction, RuntimeQueueControlOptions, RuntimeQueueControlReport,
-    RuntimeQueueControlStatus, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
-    RuntimeQueueItem, RuntimeQueueItemStatus, RuntimeQueueReceipt, RuntimeQueueReceiptStatus,
-    RuntimeQueueSource, RuntimeQueueSourceKind, control_runtime_queue_item, enqueue_channel_step,
+    RuntimeQueueControlStatus, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueOptionsV2,
+    RuntimeQueueEnqueueReport, RuntimeQueueItem, RuntimeQueueItemStatus, RuntimeQueueReceipt,
+    RuntimeQueueReceiptStatus, RuntimeQueueSource, RuntimeQueueSourceKind,
+    control_runtime_queue_item, enqueue_channel_step, enqueue_channel_step_v2,
 };
 pub use runtime_worker::{
     RuntimeDispatchClassConfig, RuntimeDispatchConfig, RuntimeExecutionReceipt,
     RuntimeExecutionReceiptStatus, RuntimeQueueCapacityOptions, RuntimeQueueCapacityReport,
-    RuntimeQueueClassCapacity, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
-    RuntimeQueuePreparedItem, inspect_runtime_queue_capacity, load_runtime_dispatch_config,
+    RuntimeQueueClassCapacity, RuntimeQueueLeaseObservationOptions,
+    RuntimeQueueLeaseObservationReceipt, RuntimeQueueLeaseObservationStatus,
+    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeQueuePreparedItem,
+    inspect_runtime_queue_capacity, load_runtime_dispatch_config, observe_runtime_queue_lease,
     prepare_runtime_queue_item, release_runtime_queue_lease, write_runtime_queue_quarantine_marker,
 };
 pub use security::{SecurityScanOptions, SecurityScanReport, scan_security_boundaries};
@@ -610,23 +636,27 @@ pub use virtual_session_context::{
     VIRTUAL_SESSION_WORKING_CONTEXT_SCHEMA, VirtualSessionContextQuery,
     VirtualSessionEvidenceAnchor, VirtualSessionEvidenceAnchors, VirtualSessionLane,
     VirtualSessionScopeDecision, VirtualSessionWorkingContext,
-    resolve_virtual_session_working_context,
+    resolve_virtual_session_working_context, resolve_virtual_session_working_context_for_lane,
 };
 pub use worker_adapters::{
     DeterministicCronWorkerEnqueueOptions, NativeCronWorkerEnqueueOptions,
-    SubagentWorkerEnqueueOptions, SubagentWorkerEnqueueOptionsV2, WorkerAdapterEnqueueReport,
-    WorkerAdapterEnqueueSummary, WorkerAdapterJobRef, enqueue_deterministic_cron_workers,
-    enqueue_native_cron_workers, enqueue_subagent_workers, enqueue_subagent_workers_v2,
+    SubagentCoordinatorResumeOptionsV1, SubagentWorkerEnqueueOptions,
+    SubagentWorkerEnqueueOptionsV2, SubagentWorkerEnqueueOptionsV3, SubagentWorkerEnqueueOptionsV4,
+    SubagentWorkerEnqueueOptionsV5, WorkerAdapterEnqueueReport, WorkerAdapterEnqueueSummary,
+    WorkerAdapterJobRef, enqueue_deterministic_cron_workers, enqueue_native_cron_workers,
+    enqueue_subagent_workers, enqueue_subagent_workers_v2, enqueue_subagent_workers_v3,
+    enqueue_subagent_workers_v4, enqueue_subagent_workers_v5,
 };
 pub use workers::{
     WorkerCancelOptions, WorkerCancelReport, WorkerCapacityBlockedSummary, WorkerDispatchConfig,
     WorkerDownstreamRuntimeStatus, WorkerEnqueueOptions, WorkerEnqueueOptionsV2,
-    WorkerEnqueueReport, WorkerJob, WorkerJobExecutionResult, WorkerJobKind, WorkerJobStatus,
-    WorkerLaneStatus, WorkerReapStaleOptions, WorkerReapStaleReport, WorkerRunOnceOptions,
-    WorkerRunOnceReport, WorkerRunOnceStatus, WorkerStatusOptions, WorkerStatusReport,
-    WorkerStatusTotals, cancel_worker_job, collect_worker_status, enqueue_worker_job,
-    enqueue_worker_job_v2, init_worker_store, load_worker_dispatch_config, reap_stale_worker_jobs,
-    run_worker_once, worker_db_file,
+    WorkerEnqueueOptionsV3, WorkerEnqueueOptionsV4, WorkerEnqueueReport, WorkerJob,
+    WorkerJobExecutionResult, WorkerJobKind, WorkerJobStatus, WorkerLaneStatus,
+    WorkerReapStaleOptions, WorkerReapStaleReport, WorkerRunOnceOptions, WorkerRunOnceReport,
+    WorkerRunOnceStatus, WorkerStatusOptions, WorkerStatusReport, WorkerStatusTotals,
+    cancel_worker_job, collect_worker_status, enqueue_worker_job, enqueue_worker_job_v2,
+    enqueue_worker_job_v3, enqueue_worker_job_v4, init_worker_store, load_worker_dispatch_config,
+    reap_stale_worker_jobs, run_worker_once, worker_db_file,
 };
 
 #[cfg(test)]
@@ -929,6 +959,7 @@ pub const PROMPT_FILE_NAMES: &[&str] = &[
     "IDENTITY.md",
     "HEARTBEAT.md",
     "BOOTSTRAP.md",
+    "MEMORY.md",
 ];
 
 pub const SKILL_FILE_NAME: &str = "SKILL.md";

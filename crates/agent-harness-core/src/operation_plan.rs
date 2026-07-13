@@ -32,6 +32,14 @@ pub struct CreateOperationPlanOptions {
     pub now_ms: i64,
 }
 
+/// Additive exact-lane create surface. The legacy options remain unchanged so
+/// existing Rust callers and unscoped plan creation retain their behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateOperationPlanOptionsV2 {
+    pub options: CreateOperationPlanOptions,
+    pub lane_digest: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationPlanAddItemOptions {
     pub harness_home: PathBuf,
@@ -230,6 +238,8 @@ pub struct OperationPlan {
     pub origin_queue_id: Option<String>,
     pub session_key: String,
     pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_digest: Option<String>,
     pub goal: String,
     pub status: OperationPlanStatus,
     pub acceptance_criteria: Option<String>,
@@ -373,12 +383,36 @@ pub struct OperationPlanComment {
 pub fn create_operation_plan(
     options: CreateOperationPlanOptions,
 ) -> io::Result<OperationPlanCreateReport> {
+    create_operation_plan_internal(options, None, false)
+}
+
+pub fn create_operation_plan_v2(
+    options: CreateOperationPlanOptionsV2,
+) -> io::Result<OperationPlanCreateReport> {
+    validate_lane_digest(&options.lane_digest)?;
+    create_operation_plan_internal(options.options, Some(options.lane_digest), true)
+}
+
+fn create_operation_plan_internal(
+    options: CreateOperationPlanOptions,
+    lane_digest: Option<String>,
+    enforce_exact_lane: bool,
+) -> io::Result<OperationPlanCreateReport> {
     let plan_dir = operation_plan_dir(&options.harness_home, &options.plan_id);
     let plan_file = plan_dir.join(PLAN_FILE);
     let receipts_file = plan_dir.join(RECEIPTS_FILE);
     fs::create_dir_all(&plan_dir)?;
 
     if let Ok(plan) = read_json_plan(&plan_file) {
+        if enforce_exact_lane && plan.lane_digest.as_deref() != lane_digest.as_deref() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "operation plan `{}` is not owned by the requested exact lane digest",
+                    options.plan_id
+                ),
+            ));
+        }
         let receipt = OperationPlanReceipt {
             schema: OPERATION_PLAN_RECEIPT_SCHEMA,
             at_ms: options.now_ms,
@@ -408,6 +442,7 @@ pub fn create_operation_plan(
         origin_queue_id: options.origin_queue_id,
         session_key: options.session_key,
         agent_id: options.agent_id,
+        lane_digest,
         goal: options.goal,
         status: OperationPlanStatus::Open,
         acceptance_criteria: options.acceptance_criteria,
@@ -505,6 +540,21 @@ pub fn show_operation_plan(
         receipts_file: receipt_file,
         receipt,
     })
+}
+
+fn validate_lane_digest(value: &str) -> io::Result<()> {
+    if value.len() == 64
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "lane digest must be a canonical lowercase SHA-256 hex string",
+    ))
 }
 
 fn operation_plan_item_readback_summary<'a>(
@@ -1886,6 +1936,114 @@ mod tests {
         })
         .unwrap();
         assert_eq!(completed.plan.status, OperationPlanStatus::Completed);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn operation_plan_v2_persists_exact_lane_digest_and_rejects_mismatched_duplicate() {
+        let root = temp_root("operation_plan_v2_persists_exact_lane_digest");
+        let harness_home = root.join(".agent-harness");
+        let lane = crate::lane::FullLaneKeyV1::new(
+            "telegram",
+            "account-a",
+            "dm",
+            "user",
+            "main",
+            "interactive",
+            "session-root",
+            "session-root:cont-1",
+        )
+        .unwrap();
+        let lane_digest = lane.identity_hash().unwrap();
+        let options = CreateOperationPlanOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "exact-plan".to_string(),
+            origin_queue_id: Some("queue-1".to_string()),
+            session_key: "session-root:cont-1".to_string(),
+            agent_id: "main".to_string(),
+            goal: "keep exact lane context isolated".to_string(),
+            acceptance_criteria: None,
+            constraints: None,
+            max_open_items: None,
+            max_fanout: None,
+            now_ms: 1000,
+        };
+        let created = create_operation_plan_v2(CreateOperationPlanOptionsV2 {
+            options: options.clone(),
+            lane_digest: lane_digest.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            created.plan.lane_digest.as_deref(),
+            Some(lane_digest.as_str())
+        );
+
+        let duplicate = create_operation_plan_v2(CreateOperationPlanOptionsV2 {
+            options: options.clone(),
+            lane_digest: lane_digest.clone(),
+        })
+        .unwrap();
+        assert!(!duplicate.created);
+        assert!(duplicate.receipt.duplicated);
+
+        let other_lane = crate::lane::FullLaneKeyV1::new(
+            "telegram",
+            "account-b",
+            "dm",
+            "user",
+            "main",
+            "interactive",
+            "session-root",
+            "session-root:cont-1",
+        )
+        .unwrap();
+        let error = create_operation_plan_v2(CreateOperationPlanOptionsV2 {
+            options,
+            lane_digest: other_lane.identity_hash().unwrap(),
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_operation_plan_without_lane_digest_remains_readable_but_v2_claim_fails_closed() {
+        let root = temp_root("legacy_operation_plan_without_lane_digest_remains_readable");
+        let harness_home = root.join(".agent-harness");
+        let options = CreateOperationPlanOptions {
+            harness_home: harness_home.clone(),
+            plan_id: "legacy-plan".to_string(),
+            origin_queue_id: None,
+            session_key: "legacy-session".to_string(),
+            agent_id: "main".to_string(),
+            goal: "legacy compatible".to_string(),
+            acceptance_criteria: None,
+            constraints: None,
+            max_open_items: None,
+            max_fanout: None,
+            now_ms: 1000,
+        };
+        let legacy = create_operation_plan(options.clone()).unwrap();
+        assert_eq!(legacy.plan.lane_digest, None);
+        assert_eq!(
+            show_operation_plan(OperationPlanShowOptions {
+                harness_home: harness_home.clone(),
+                plan_id: "legacy-plan".to_string(),
+            })
+            .unwrap()
+            .plan
+            .lane_digest,
+            None
+        );
+
+        let error = create_operation_plan_v2(CreateOperationPlanOptionsV2 {
+            options,
+            lane_digest: "a".repeat(64),
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         let _ = fs::remove_dir_all(root);
     }

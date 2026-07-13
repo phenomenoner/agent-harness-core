@@ -12,6 +12,7 @@ use crate::context_rollover::{
     derive_virtual_session_id, read_working_set_memory_for_session, root_working_session_key,
     string_field, virtual_session_file,
 };
+use crate::lane::FullLaneKeyV1;
 
 pub const VIRTUAL_SESSION_WORKING_CONTEXT_SCHEMA: &str =
     "agent-harness.virtual-session-working-context.v1";
@@ -32,6 +33,8 @@ pub struct VirtualSessionContextQuery {
 pub struct VirtualSessionWorkingContext {
     pub schema: String,
     pub lane: VirtualSessionLane,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -247,6 +250,7 @@ pub fn resolve_virtual_session_working_context(
     Ok(VirtualSessionWorkingContext {
         schema: VIRTUAL_SESSION_WORKING_CONTEXT_SCHEMA.to_string(),
         lane,
+        lane_digest: None,
         virtual_session_id: Some(virtual_session_id),
         current_session_key: Some(current_session_key),
         continuation_index,
@@ -266,6 +270,79 @@ pub fn resolve_virtual_session_working_context(
     })
 }
 
+/// Resolves working context under an optional exact full-lane boundary.
+///
+/// Legacy callers retain the existing bounded four-axis behavior. New callers
+/// should provide a concrete `FullLaneKeyV1`; legacy-unknown axes are denied
+/// rather than interpreted as wildcards.
+pub fn resolve_virtual_session_working_context_for_lane(
+    query: VirtualSessionContextQuery,
+    full_lane: Option<&FullLaneKeyV1>,
+) -> io::Result<VirtualSessionWorkingContext> {
+    let Some(full_lane) = full_lane else {
+        return resolve_virtual_session_working_context(query);
+    };
+    let digest = full_lane.identity_hash().map_err(io::Error::other)?;
+    let lane = VirtualSessionLane {
+        platform: query.platform.clone(),
+        channel_id: query.channel_id.clone(),
+        user_id: query.user_id.clone(),
+        agent_id: query.agent_id.clone(),
+    };
+    let exact_axes_match = !full_lane.has_legacy_unknowns()
+        && full_lane.platform() == query.platform
+        && full_lane.channel_id() == query.channel_id
+        && full_lane.user_id() == query.user_id
+        && full_lane.agent_id() == query.agent_id
+        && query
+            .session_key
+            .as_deref()
+            .is_some_and(|session| session == full_lane.concrete_session());
+    if !exact_axes_match {
+        let mut context = empty_envelope(
+            lane,
+            query.session_key,
+            query.now_ms,
+            VirtualSessionScopeDecision {
+                status: "denied".to_string(),
+                reason:
+                    "full lane did not exactly match query axes; unknown axes never wildcard-match"
+                        .to_string(),
+                fallback_used: false,
+                denied_candidates: vec![digest.clone()],
+            },
+        );
+        context.lane_digest = Some(digest);
+        return Ok(context);
+    }
+
+    let mut context = resolve_virtual_session_working_context(query)?;
+    context.lane_digest = Some(digest.clone());
+    if context.scope_decision.status == "same-virtual-session"
+        && context
+            .current_session_key
+            .as_deref()
+            .is_some_and(|session| {
+                root_working_session_key(session) != full_lane.root_virtual_session()
+            })
+    {
+        context.virtual_session_id = None;
+        context.predecessor_session_key = None;
+        context.working_set_file = None;
+        context.last_interruption = None;
+        context.recent_queue_ids.clear();
+        context.evidence_anchors = VirtualSessionEvidenceAnchors::default();
+        context.operation_plans.clear();
+        context.scope_decision = VirtualSessionScopeDecision {
+            status: "denied".to_string(),
+            reason: "full lane root virtual session did not match resolved root".to_string(),
+            fallback_used: false,
+            denied_candidates: vec![digest],
+        };
+    }
+    Ok(context)
+}
+
 fn empty_envelope(
     lane: VirtualSessionLane,
     current_session_key: Option<String>,
@@ -275,6 +352,7 @@ fn empty_envelope(
     VirtualSessionWorkingContext {
         schema: VIRTUAL_SESSION_WORKING_CONTEXT_SCHEMA.to_string(),
         lane,
+        lane_digest: None,
         virtual_session_id: None,
         current_session_key,
         continuation_index: 0,
@@ -533,4 +611,105 @@ fn bounded_text(value: &str, max_chars: usize) -> String {
         .collect::<String>();
     out.push_str("...");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lane::LegacyLaneKeyV0;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn exact_lane_denies_legacy_unknown_axes_instead_of_wildcard_matching() {
+        let root = temp_root("exact_lane_denies_legacy_unknown_axes");
+        let lane = FullLaneKeyV1::from_legacy(LegacyLaneKeyV0 {
+            platform: Some("telegram".to_string()),
+            channel_id: Some("dm".to_string()),
+            user_id: Some("user".to_string()),
+            agent_id: Some("main".to_string()),
+            concrete_session: Some("session-1".to_string()),
+            ..LegacyLaneKeyV0::default()
+        })
+        .unwrap();
+        let context =
+            resolve_virtual_session_working_context_for_lane(query(root, "session-1"), Some(&lane))
+                .unwrap();
+
+        assert_eq!(context.scope_decision.status, "denied");
+        assert!(
+            context
+                .scope_decision
+                .reason
+                .contains("never wildcard-match")
+        );
+        assert_eq!(context.lane_digest, Some(lane.identity_hash().unwrap()));
+    }
+
+    #[test]
+    fn exact_lane_digest_changes_with_account_and_runtime_and_root_mismatch_is_denied() {
+        let root = temp_root("exact_lane_digest_changes");
+        let lane = exact_lane("account-a", "interactive", "session-1");
+        let account_other = exact_lane("account-b", "interactive", "session-1");
+        let runtime_other = exact_lane("account-a", "worker", "session-1");
+        assert_ne!(
+            lane.identity_hash().unwrap(),
+            account_other.identity_hash().unwrap()
+        );
+        assert_ne!(
+            lane.identity_hash().unwrap(),
+            runtime_other.identity_hash().unwrap()
+        );
+
+        let wrong_root = exact_lane("account-a", "interactive", "different-root");
+        let context = resolve_virtual_session_working_context_for_lane(
+            query(root, "session-1"),
+            Some(&wrong_root),
+        )
+        .unwrap();
+        assert_eq!(context.scope_decision.status, "denied");
+        assert!(
+            context
+                .scope_decision
+                .reason
+                .contains("root virtual session")
+        );
+        assert!(context.recent_queue_ids.is_empty());
+    }
+
+    fn exact_lane(account: &str, runtime: &str, root: &str) -> FullLaneKeyV1 {
+        FullLaneKeyV1::new(
+            "telegram",
+            account,
+            "dm",
+            "user",
+            "main",
+            runtime,
+            root,
+            "session-1",
+        )
+        .unwrap()
+    }
+
+    fn query(harness_home: PathBuf, session: &str) -> VirtualSessionContextQuery {
+        VirtualSessionContextQuery {
+            harness_home,
+            platform: "telegram".to_string(),
+            channel_id: "dm".to_string(),
+            user_id: "user".to_string(),
+            agent_id: "main".to_string(),
+            session_key: Some(session.to_string()),
+            now_ms: 1,
+        }
+    }
+
+    fn temp_root(test_name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "agent-harness-virtual-session-{test_name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
 }

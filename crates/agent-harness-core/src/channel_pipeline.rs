@@ -438,8 +438,14 @@ mod tests {
                 ExpectedCommandEffect::ShowThinking,
                 ChannelCommandEffect::ShowThinking { .. }
             ) | (
+                ExpectedCommandEffect::ShowThinking,
+                ChannelCommandEffect::ShowReasoning { .. }
+            ) | (
                 ExpectedCommandEffect::SwitchThinking,
                 ChannelCommandEffect::SwitchThinking { .. }
+            ) | (
+                ExpectedCommandEffect::SwitchThinking,
+                ChannelCommandEffect::SwitchReasoning { .. }
             ) | (
                 ExpectedCommandEffect::StopCurrentRun,
                 ChannelCommandEffect::StopCurrentRun { .. }

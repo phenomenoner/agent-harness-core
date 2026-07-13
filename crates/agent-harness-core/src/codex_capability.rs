@@ -59,13 +59,13 @@ impl LiveModelCapability {
     }
 
     pub(crate) fn advertised_effort(&self, effort: &str) -> Option<&str> {
-        let effort = effort.trim();
-        if effort.is_empty() {
-            return None;
-        }
+        let effort = normalize_live_reasoning_effort(effort)?;
         self.supported_reasoning_efforts
             .iter()
-            .find(|advertised| advertised.eq_ignore_ascii_case(effort))
+            .find(|advertised| {
+                normalize_live_reasoning_effort(advertised)
+                    .is_some_and(|advertised| advertised.eq_ignore_ascii_case(&effort))
+            })
             .map(String::as_str)
     }
 }
@@ -96,13 +96,17 @@ struct LiveModelCatalogDigestProjection<'a> {
 pub(crate) fn build_live_model_catalog_observation(
     live: &LiveModelCapability,
 ) -> Result<LiveModelCatalogObservationV1, CodexCapabilityError> {
-    let mut advertised_efforts = live.supported_reasoning_efforts.clone();
+    let (advertised_default_effort, mut advertised_efforts) = normalized_supported_efforts(
+        &live.model,
+        &live.default_reasoning_effort,
+        &live.supported_reasoning_efforts,
+    )?;
     advertised_efforts.sort_by_key(|effort| effort.to_ascii_lowercase());
     let projection = LiveModelCatalogDigestProjection {
         schema_version: CODEX_LIVE_MODEL_CATALOG_SCHEMA_VERSION,
         model_id: &live.model_id,
         model: &live.model,
-        advertised_default_effort: &live.default_reasoning_effort,
+        advertised_default_effort: &advertised_default_effort,
         advertised_efforts: &advertised_efforts,
         page_count: live.page_count,
     };
@@ -116,7 +120,7 @@ pub(crate) fn build_live_model_catalog_observation(
         schema_version: CODEX_LIVE_MODEL_CATALOG_SCHEMA_VERSION,
         model_id: live.model_id.clone(),
         model: live.model.clone(),
-        advertised_default_effort: live.default_reasoning_effort.clone(),
+        advertised_default_effort,
         advertised_efforts,
         page_count: live.page_count,
         catalog_digest,
@@ -241,33 +245,78 @@ fn validate_advertised_model(
         &model.default_reasoning_effort,
     )?;
 
-    let mut seen = BTreeSet::new();
-    for option in &model.supported_reasoning_efforts {
-        let effort = canonical_nonempty(
-            "model.supportedReasoningEfforts.reasoningEffort",
-            &option.reasoning_effort,
-        )?;
-        if !seen.insert(effort.to_ascii_lowercase()) {
-            return Err(CodexCapabilityError::DuplicateEffort {
-                model: model.model.clone(),
-                effort: effort.to_string(),
-            });
-        }
-    }
-    let Some(default) = model
+    let raw_efforts = model
         .supported_reasoning_efforts
         .iter()
-        .map(|option| option.reasoning_effort.as_str())
-        .find(|effort| effort.eq_ignore_ascii_case(&model.default_reasoning_effort))
-    else {
-        return Err(CodexCapabilityError::DefaultEffortNotSupported {
-            model: model.model,
-            effort: model.default_reasoning_effort,
-        });
-    };
-    model.default_reasoning_effort = default.to_string();
+        .map(|option| option.reasoning_effort.clone())
+        .collect::<Vec<_>>();
+    let (default, supported) =
+        normalized_supported_efforts(&model.model, &model.default_reasoning_effort, &raw_efforts)?;
+    model.default_reasoning_effort = default;
+    model.supported_reasoning_efforts = supported
+        .into_iter()
+        .map(|reasoning_effort| CodexReasoningEffortOption { reasoning_effort })
+        .collect();
     let key = model.model.to_ascii_lowercase();
     Ok((key, model))
+}
+
+fn normalized_supported_efforts(
+    model: &str,
+    default: &str,
+    efforts: &[String],
+) -> Result<(String, Vec<String>), CodexCapabilityError> {
+    let default = canonical_nonempty("model.defaultReasoningEffort", default)?;
+    let Some(default) = normalize_live_reasoning_effort(default) else {
+        return Err(CodexCapabilityError::DefaultEffortNotSupported {
+            model: model.to_string(),
+            effort: default.to_string(),
+        });
+    };
+    let mut seen = BTreeMap::new();
+    let mut supported = Vec::new();
+    for raw in efforts {
+        let raw = canonical_nonempty("model.supportedReasoningEfforts.reasoningEffort", raw)?;
+        let Some(effort) = normalize_live_reasoning_effort(raw) else {
+            continue;
+        };
+        let key = effort.to_ascii_lowercase();
+        let normalized_from_alias = !raw.eq_ignore_ascii_case(&effort);
+        if let Some(previous_was_alias) = seen.get(&key) {
+            if *previous_was_alias || normalized_from_alias {
+                continue;
+            }
+            return Err(CodexCapabilityError::DuplicateEffort {
+                model: model.to_string(),
+                effort,
+            });
+        }
+        seen.insert(key, normalized_from_alias);
+        supported.push(effort);
+    }
+    let Some(advertised_default) = supported
+        .iter()
+        .find(|effort| effort.eq_ignore_ascii_case(&default))
+        .cloned()
+    else {
+        return Err(CodexCapabilityError::DefaultEffortNotSupported {
+            model: model.to_string(),
+            effort: default,
+        });
+    };
+    Ok((advertised_default, supported))
+}
+
+fn normalize_live_reasoning_effort(effort: &str) -> Option<String> {
+    let effort = effort.trim();
+    if effort.is_empty() {
+        return None;
+    }
+    match effort.to_ascii_lowercase().as_str() {
+        "ultra" => None,
+        "ultra-high" | "ultra_high" => Some("xhigh".to_string()),
+        _ => Some(effort.to_string()),
+    }
 }
 
 pub(crate) fn bind_effective_provider(
@@ -773,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn paginated_catalog_matches_model_field_and_keeps_open_efforts_distinct() {
+    fn paginated_catalog_filters_reserved_ultra_and_keeps_future_efforts_distinct() {
         let mut collector = CodexModelListCollector::new(4).unwrap();
         let next = collector
             .push_page(
@@ -808,10 +857,44 @@ mod tests {
         assert_eq!(live.model, "gpt-5.6-sol");
         assert_eq!(live.default_reasoning_effort, "max");
         assert!(live.supports("max"));
-        assert!(live.supports("ultra"));
-        assert_ne!(
-            live.advertised_effort("max"),
-            live.advertised_effort("ultra")
+        assert!(!live.supports("ultra"));
+        assert!(live.supports("frontier"));
+        assert_eq!(
+            live.supported_reasoning_efforts,
+            ["xhigh", "max", "frontier"]
+        );
+    }
+
+    #[test]
+    fn collector_deduplicates_legacy_aliases_after_effort_normalization() {
+        let mut collector = CodexModelListCollector::new(1).unwrap();
+        collector
+            .push_page(
+                None,
+                page(
+                    vec![model(
+                        "picker-sol",
+                        "gpt-5.6-sol",
+                        "xhigh",
+                        &[
+                            "ultra-high",
+                            "xhigh",
+                            "ultra_high",
+                            "max",
+                            "ultra",
+                            "frontier",
+                        ],
+                    )],
+                    None,
+                ),
+            )
+            .unwrap();
+
+        let live = collector.finish("gpt-5.6-sol").unwrap();
+        assert_eq!(live.default_reasoning_effort, "xhigh");
+        assert_eq!(
+            live.supported_reasoning_efforts,
+            ["xhigh", "max", "frontier"]
         );
     }
 
@@ -982,10 +1065,7 @@ mod tests {
         let reordered_observation = build_live_model_catalog_observation(&reordered).unwrap();
 
         assert_eq!(first_observation, reordered_observation);
-        assert_eq!(
-            first_observation.advertised_efforts,
-            vec!["max", "ultra", "xhigh"]
-        );
+        assert_eq!(first_observation.advertised_efforts, vec!["max", "xhigh"]);
         assert!(first_observation.catalog_digest.starts_with("sha256:"));
     }
 
@@ -1001,6 +1081,13 @@ mod tests {
         let baseline = build_live_model_catalog_observation(&live)
             .unwrap()
             .catalog_digest;
+        assert!(matches!(
+            build_live_model_catalog_observation(&LiveModelCapability {
+                default_reasoning_effort: "ultra".to_string(),
+                ..live.clone()
+            }),
+            Err(CodexCapabilityError::DefaultEffortNotSupported { .. })
+        ));
         let drifted = [
             LiveModelCapability {
                 model_id: "picker-sol-v2".to_string(),
@@ -1011,7 +1098,8 @@ mod tests {
                 ..live.clone()
             },
             LiveModelCapability {
-                default_reasoning_effort: "ultra".to_string(),
+                default_reasoning_effort: "xhigh".to_string(),
+                supported_reasoning_efforts: vec!["max".to_string(), "xhigh".to_string()],
                 ..live.clone()
             },
             LiveModelCapability {

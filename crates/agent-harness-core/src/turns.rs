@@ -765,15 +765,38 @@ fn channel_state_query_text(message: &str, state: Option<&ChannelSessionState>) 
     text
 }
 
-fn prompt_files(workspace: &Path) -> io::Result<Vec<TurnPromptFile>> {
+fn prompt_files(workspace: &Path, warnings: &mut Vec<String>) -> io::Result<Vec<TurnPromptFile>> {
     let mut files = Vec::new();
     for name in PROMPT_FILE_NAMES {
-        let path = workspace.join(name);
-        let metadata = match fs::metadata(&path) {
-            Ok(metadata) if metadata.is_file() => Some(metadata),
-            Ok(_) => None,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
+        let canonical_path = workspace.join(name);
+        let canonical_metadata = prompt_file_metadata(&canonical_path)?;
+        let alias = match *name {
+            "AGENTS.md" => Some("AGENT.md"),
+            "BOOTSTRAP.md" => Some("BOOT.md"),
+            _ => None,
+        };
+        let alias_path = alias.map(|alias| workspace.join(alias));
+        let alias_metadata = alias_path
+            .as_deref()
+            .map(prompt_file_metadata)
+            .transpose()?
+            .flatten();
+        if canonical_metadata.is_some() && alias_metadata.is_some() {
+            warnings.push(format!(
+                "prompt alias conflict in {}: canonical `{name}` wins and `{}` is ignored",
+                workspace.display(),
+                alias.unwrap_or_default()
+            ));
+        }
+        let (path, metadata) = if canonical_metadata.is_some() {
+            (canonical_path, canonical_metadata)
+        } else if alias_metadata.is_some() {
+            (
+                alias_path.expect("alias path exists when alias metadata exists"),
+                alias_metadata,
+            )
+        } else {
+            (canonical_path, None)
         };
         files.push(TurnPromptFile {
             name: (*name).to_string(),
@@ -785,18 +808,27 @@ fn prompt_files(workspace: &Path) -> io::Result<Vec<TurnPromptFile>> {
     Ok(files)
 }
 
+fn prompt_file_metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn prompt_files_for_source(
     source: &AgentSource,
     warnings: &mut Vec<String>,
 ) -> io::Result<(PathBuf, Vec<TurnPromptFile>)> {
-    let files = prompt_files(&source.workspace)?;
+    let files = prompt_files(&source.workspace, warnings)?;
     if files.iter().any(|file| file.exists) {
         return Ok((source.workspace.clone(), files));
     }
 
     let imported_workspace = source.home.join("workspace");
     if imported_workspace != source.workspace && imported_workspace.is_dir() {
-        let imported_files = prompt_files(&imported_workspace)?;
+        let imported_files = prompt_files(&imported_workspace, warnings)?;
         if imported_files.iter().any(|file| file.exists) {
             warnings.push(format!(
                 "using imported source workspace {} for prompt files because queued workspace {} has no prompt files",
@@ -820,7 +852,7 @@ fn prompt_files_for_selected_agent(
     };
 
     let workspace = independent_agent_workspace(source, agent);
-    let files = prompt_files(&workspace)?;
+    let files = prompt_files(&workspace, warnings)?;
     if !files.iter().any(|file| file.exists) {
         warnings.push(format!(
             "independent agent `{}` has no prompt files in isolated workspace {}; shared source workspace {} was not used",
@@ -833,7 +865,7 @@ fn prompt_files_for_selected_agent(
 }
 
 fn is_independent_agent(agent: &AgentProfile) -> bool {
-    agent.id != "main" && agent.directory_exists
+    agent.id != "main"
 }
 
 fn independent_agent_workspace(source: &AgentSource, agent: &AgentProfile) -> PathBuf {
@@ -1149,6 +1181,100 @@ mod tests {
             plan.warnings
                 .iter()
                 .any(|warning| warning.contains("independent agent `xiaoxiaoli`"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn configured_non_main_agent_without_directory_never_inherits_main_prompt_files() {
+        let root = temp_root("configured_non_main_without_directory_prompt_isolation");
+        let source = write_turn_source(&root);
+        fs::write(
+            source.workspace.join("MEMORY.md"),
+            "MAIN-ONLY-MEMORY-MARKER",
+        )
+        .unwrap();
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+
+        let plan = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "hello".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("other".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+
+        let isolated_workspace = source.home.join("agents").join("other").join("workspace");
+        assert_eq!(plan.agent.as_ref().unwrap().id, "other");
+        assert_eq!(plan.source_workspace, isolated_workspace);
+        assert_eq!(prompt_files_present_for_test(&plan), 0);
+        assert!(
+            plan.prompt_files
+                .iter()
+                .all(|file| !file.exists && file.path.starts_with(&isolated_workspace))
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("independent agent `other`"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unsafe_config_agent_id_is_rejected_before_turn_can_read_outside_prompt_files() {
+        let root = temp_root("unsafe_config_agent_id_prompt_isolation");
+        let home = root.join(".openclaw");
+        let source_workspace = home.join("workspace");
+        let outside_agent = root.join("outside-agent");
+        let outside_workspace = outside_agent.join("workspace");
+        fs::create_dir_all(&source_workspace).unwrap();
+        fs::create_dir_all(&outside_workspace).unwrap();
+        fs::write(
+            outside_workspace.join("MEMORY.md"),
+            "OUTSIDE-AGENT-MEMORY-MUST-NOT-BE-READ",
+        )
+        .unwrap();
+        fs::write(
+            home.join("openclaw.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agents": {
+                    "list": [{
+                        "id": outside_agent.display().to_string(),
+                        "enabled": true
+                    }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let source = AgentSource::with_workspace(home, source_workspace);
+
+        let error = load_agent_registry(&source).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("agentId must be a single safe path component"),
+            "unexpected validation error: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(outside_workspace.join("MEMORY.md")).unwrap(),
+            "OUTSIDE-AGENT-MEMORY-MUST-NOT-BE-READ"
         );
 
         let _ = fs::remove_dir_all(root);
@@ -1603,6 +1729,54 @@ mod tests {
             Some("gpt-5.4-mini")
         );
         assert_eq!(other_plan.thinking_policy.level.as_deref(), Some("low"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prompt_file_aliases_are_fallback_only_and_conflicts_are_deterministic() {
+        let root = temp_root("prompt_file_aliases_are_fallback_only");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("AGENT.md"), "legacy singular").unwrap();
+        fs::write(workspace.join("BOOT.md"), "legacy bootstrap").unwrap();
+        let mut warnings = Vec::new();
+        let files = prompt_files(&workspace, &mut warnings).unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .find(|file| file.name == "AGENTS.md")
+                .unwrap()
+                .path,
+            workspace.join("AGENT.md")
+        );
+        assert_eq!(
+            files
+                .iter()
+                .find(|file| file.name == "BOOTSTRAP.md")
+                .unwrap()
+                .path,
+            workspace.join("BOOT.md")
+        );
+        assert!(warnings.is_empty());
+
+        fs::write(workspace.join("AGENTS.md"), "canonical plural").unwrap();
+        fs::write(workspace.join("BOOTSTRAP.md"), "canonical bootstrap").unwrap();
+        let mut warnings = Vec::new();
+        let files = prompt_files(&workspace, &mut warnings).unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .find(|file| file.name == "AGENTS.md")
+                .unwrap()
+                .path,
+            workspace.join("AGENTS.md")
+        );
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("AGENTS.md"));
+        assert!(warnings[0].contains("AGENT.md"));
+        assert!(warnings[1].contains("BOOTSTRAP.md"));
+        assert!(warnings[1].contains("BOOT.md"));
 
         let _ = fs::remove_dir_all(root);
     }

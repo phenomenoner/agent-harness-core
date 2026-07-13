@@ -132,8 +132,7 @@ pub fn parse_codex_model_catalog(text: &str) -> Result<ModelCapabilityCatalog, S
                 .into_iter()
                 .filter_map(|value| serde_json::from_value::<RawReasoningLevel>(value).ok())
                 .filter_map(RawReasoningLevel::effort)
-                .map(|effort| effort.trim().to_ascii_lowercase())
-                .filter(|effort| !effort.is_empty())
+                .filter_map(|effort| normalize_catalog_effort(&effort))
                 .fold(Vec::<String>::new(), |mut efforts, effort| {
                     if !efforts.iter().any(|current| current == &effort) {
                         efforts.push(effort);
@@ -145,7 +144,7 @@ pub fn parse_codex_model_catalog(text: &str) -> Result<ModelCapabilityCatalog, S
                 model,
                 display_name: nonempty(entry.display_name),
                 default_reasoning_effort: nonempty(entry.default_reasoning_level)
-                    .map(|effort| effort.to_ascii_lowercase()),
+                    .and_then(|effort| normalize_catalog_effort(&effort)),
                 supported_reasoning_efforts,
                 fast_service_tier: fast_service_tier(
                     &entry.service_tiers,
@@ -506,17 +505,20 @@ fn normalize_catalog_effort(effort: &str) -> Option<String> {
     if normalized.is_empty() {
         return None;
     }
-    Some(
-        match normalized.as_str() {
-            "x-high" | "x_high" | "extra-high" | "extra_high" | "very-high" | "very_high" => {
-                "xhigh"
+    match normalized.as_str() {
+        "ultra" => None,
+        _ => Some(
+            match normalized.as_str() {
+                "x-high" | "x_high" | "extra-high" | "extra_high" | "very-high" | "very_high" => {
+                    "xhigh"
+                }
+                "maximum" => "max",
+                "ultra-high" | "ultra_high" => "xhigh",
+                _ => normalized.as_str(),
             }
-            "maximum" => "max",
-            "ultra-high" | "ultra_high" => "ultra",
-            _ => normalized.as_str(),
-        }
-        .to_string(),
-    )
+            .to_string(),
+        ),
+    }
 }
 
 fn fast_service_tier(
@@ -644,14 +646,19 @@ mod tests {
     }
 
     #[test]
-    fn model_catalog_preserves_sol_effort_order_through_ultra() {
+    fn model_catalog_filters_reserved_ultra_and_keeps_legacy_ultra_high_as_xhigh() {
         let catalog = parse_codex_model_catalog(&fixture("one")).unwrap();
         assert_eq!(
             catalog
                 .exact_route("openai", "gpt-5.6-sol")
                 .unwrap()
                 .supported_reasoning_efforts,
-            ["low", "medium", "high", "xhigh", "max", "ultra"]
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(normalize_catalog_effort("ultra"), None);
+        assert_eq!(
+            normalize_catalog_effort("ultra-high").as_deref(),
+            Some("xhigh")
         );
     }
 

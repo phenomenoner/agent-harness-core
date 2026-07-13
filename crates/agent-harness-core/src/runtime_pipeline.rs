@@ -1053,34 +1053,58 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 rollover.requeued_queue_id
             ));
         } else if channel_session_is_current(&options.harness_home, &context, &mut warnings)? {
-            let decision = final_outbox_decision(FinalOutboxInputKind::TerminalError);
-            let message = ChannelOutboundMessage {
-                platform: context.platform.clone(),
-                account_id: context.account_id.clone(),
-                channel_id: context.channel_id.clone(),
-                user_id: context.user_id.clone(),
-                session_key: context.session_key.clone(),
-                kind: decision
-                    .outbound_kind
-                    .unwrap_or(ChannelOutboundMessageKind::ErrorReply),
-                source_queue_id: run.receipt.queue_id.clone(),
-                source_completion_file: run.receipt.completion_file.clone(),
-                text: runtime_failure_reply_text(
-                    status,
-                    &runtime_failure_reply_reason(&run.receipt, &receipt_reason),
-                    run.receipt.queue_id.as_deref(),
-                ),
-                presentation: None,
-                delivery_intent: delivery_intent_from_inbound_context(
-                    &context.platform,
-                    &context.channel_id,
-                    context.inbound_context.as_deref(),
-                ),
-                attachments: Vec::new(),
-            };
-            let file = append_outbound_message(&options.harness_home, &message)?;
-            outbox_file = Some(file);
-            outbound_message = Some(message);
+            let agent_id = prepare
+                .item
+                .as_ref()
+                .map(|item| item.agent_id.as_str())
+                .or_else(|| plan.plan.as_ref().and_then(|plan| plan.agent_id.as_deref()));
+            let run_session_key = prepare
+                .item
+                .as_ref()
+                .map(|item| item.session_key.as_str())
+                .or_else(|| plan.plan.as_ref().map(|plan| plan.session_key.as_str()));
+            let input_kind = final_outbox_input_kind_for_terminal_error(
+                prepare.receipt.runtime_class.as_deref(),
+                prepare.receipt.origin.as_deref(),
+                agent_id,
+                run_session_key,
+                &context.session_key,
+            );
+            let decision = final_outbox_decision(input_kind);
+            if !decision.may_write_final_outbox() {
+                warnings.push(format!(
+                    "failure outbox suppressed: terminal error classified as {:?} with disposition {:?}; runtime receipt remains authoritative evidence",
+                    input_kind, decision.disposition
+                ));
+            } else {
+                let message = ChannelOutboundMessage {
+                    platform: context.platform.clone(),
+                    account_id: context.account_id.clone(),
+                    channel_id: context.channel_id.clone(),
+                    user_id: context.user_id.clone(),
+                    session_key: context.session_key.clone(),
+                    kind: decision
+                        .outbound_kind
+                        .unwrap_or(ChannelOutboundMessageKind::ErrorReply),
+                    source_queue_id: run.receipt.queue_id.clone(),
+                    source_completion_file: run.receipt.completion_file.clone(),
+                    text: runtime_failure_reply_text(
+                        status,
+                        &runtime_failure_reply_reason(&run.receipt, &receipt_reason),
+                        run.receipt.queue_id.as_deref(),
+                    ),
+                    presentation: None,
+                    delivery_intent: delivery_intent_from_inbound_context(
+                        &context.platform,
+                        &context.channel_id,
+                        context.inbound_context.as_deref(),
+                    ),
+                    attachments: Vec::new(),
+                };
+                let file = append_outbound_message(&options.harness_home, &message)?;
+                outbox_file = Some(file);
+                outbound_message = Some(message);
+            }
         } else {
             let receipt = RuntimeRunOnceReceipt {
                 queue_id: run.receipt.queue_id.clone(),
@@ -1347,6 +1371,30 @@ fn progress_context_from(
         .as_ref()
         .map(|item| item.agent_id.clone())
         .or_else(|| plan.and_then(|plan| plan.agent_id.clone()));
+    let runtime_class = prepare
+        .item
+        .as_ref()
+        .map(|item| item.runtime_class.as_str())
+        .or(prepare.receipt.runtime_class.as_deref());
+    let origin = prepare
+        .item
+        .as_ref()
+        .map(|item| item.origin.as_str())
+        .or(prepare.receipt.origin.as_deref());
+    let run_session_key = prepare
+        .item
+        .as_ref()
+        .map(|item| item.session_key.as_str())
+        .or_else(|| plan.map(|plan| plan.session_key.as_str()));
+    if !final_outbox_run_owns_channel_parent(
+        runtime_class,
+        origin,
+        agent_id.as_deref(),
+        run_session_key,
+        &channel_context.session_key,
+    ) {
+        return None;
+    }
     Some(AgentProgressContext {
         queue_id,
         agent_id,
@@ -1362,8 +1410,19 @@ fn progress_context_from(
     })
 }
 
-fn progress_context_from_prepared_item(item: &RuntimeQueuePreparedItem) -> AgentProgressContext {
-    AgentProgressContext {
+fn progress_context_from_prepared_item(
+    item: &RuntimeQueuePreparedItem,
+) -> Option<AgentProgressContext> {
+    if !final_outbox_run_owns_channel_parent(
+        Some(&item.runtime_class),
+        Some(&item.origin),
+        Some(&item.agent_id),
+        Some(&item.session_key),
+        &item.session_key,
+    ) {
+        return None;
+    }
+    Some(AgentProgressContext {
         queue_id: item.queue_id.clone(),
         agent_id: Some(item.agent_id.clone()),
         account_id: item.account_id.clone(),
@@ -1375,7 +1434,7 @@ fn progress_context_from_prepared_item(item: &RuntimeQueuePreparedItem) -> Agent
         platform: item.platform.clone(),
         channel_id: item.channel_id.clone(),
         user_id: item.user_id.clone(),
-    }
+    })
 }
 
 fn append_suppressed_runtime_progress(
@@ -1387,7 +1446,7 @@ fn append_suppressed_runtime_progress(
     warnings: &mut Vec<String>,
 ) -> io::Result<()> {
     let progress_context = if let Some(item) = prepare.item.as_ref() {
-        Some(progress_context_from_prepared_item(item))
+        progress_context_from_prepared_item(item)
     } else {
         let channel_context = find_queue_channel_context(harness_home, queue_id, warnings)?;
         progress_context_from(prepare, plan, channel_context.as_ref())
@@ -1826,12 +1885,13 @@ fn final_outbox_input_kind_for_completed_response(
     user_message: Option<&str>,
     final_text: &str,
 ) -> FinalOutboxInputKind {
-    if runtime_class.is_some_and(|value| value != "interactive")
-        || origin.is_some_and(|value| value != "channel")
-    {
-        return FinalOutboxInputKind::InternalEvidence;
-    }
-    if !final_outbox_owner_is_channel_parent(agent_id, run_session_key, channel_session_key) {
+    if !final_outbox_run_owns_channel_parent(
+        runtime_class,
+        origin,
+        agent_id,
+        run_session_key,
+        channel_session_key,
+    ) {
         return FinalOutboxInputKind::InternalEvidence;
     }
     if implementation_request_requires_parent_completion(user_message)
@@ -1840,6 +1900,38 @@ fn final_outbox_input_kind_for_completed_response(
         return FinalOutboxInputKind::ReviewEvidence;
     }
     FinalOutboxInputKind::AgentReply
+}
+
+fn final_outbox_input_kind_for_terminal_error(
+    runtime_class: Option<&str>,
+    origin: Option<&str>,
+    agent_id: Option<&str>,
+    run_session_key: Option<&str>,
+    channel_session_key: &str,
+) -> FinalOutboxInputKind {
+    if final_outbox_run_owns_channel_parent(
+        runtime_class,
+        origin,
+        agent_id,
+        run_session_key,
+        channel_session_key,
+    ) {
+        FinalOutboxInputKind::TerminalError
+    } else {
+        FinalOutboxInputKind::InternalEvidence
+    }
+}
+
+fn final_outbox_run_owns_channel_parent(
+    runtime_class: Option<&str>,
+    origin: Option<&str>,
+    agent_id: Option<&str>,
+    run_session_key: Option<&str>,
+    channel_session_key: &str,
+) -> bool {
+    !runtime_class.is_some_and(|value| value != "interactive")
+        && !origin.is_some_and(|value| !runtime_origin_is_parent_channel(value))
+        && final_outbox_owner_is_channel_parent(agent_id, run_session_key, channel_session_key)
 }
 
 fn final_outbox_owner_is_channel_parent(
@@ -1863,6 +1955,10 @@ fn final_outbox_owner_is_channel_parent(
         return agent_id == "main";
     }
     true
+}
+
+fn runtime_origin_is_parent_channel(origin: &str) -> bool {
+    matches!(origin, "channel" | "coordinator-resume")
 }
 
 fn implementation_request_requires_parent_completion(user_message: Option<&str>) -> bool {
@@ -1971,7 +2067,7 @@ fn maybe_enqueue_tool_timeout_retry_continuation(
     else {
         return Ok(None);
     };
-    if item.runtime_class != "interactive" || item.origin != "channel" {
+    if item.runtime_class != "interactive" || !runtime_origin_is_parent_channel(&item.origin) {
         return Ok(None);
     }
     if !context_recovery_indicates_interrupted_long_task(&run.receipt) {
@@ -2046,7 +2142,7 @@ fn maybe_enqueue_polluted_thread_continuation(
     else {
         return Ok(None);
     };
-    if item.runtime_class != "interactive" || item.origin != "channel" {
+    if item.runtime_class != "interactive" || !runtime_origin_is_parent_channel(&item.origin) {
         return Ok(None);
     }
     let interrupted_long_task = context_recovery_indicates_interrupted_long_task(&run.receipt);
@@ -2274,7 +2370,7 @@ fn should_enqueue_stream_unstable_retry_continuation(
     min_attempts: usize,
     token_limit: u64,
 ) -> bool {
-    if item.runtime_class != "interactive" || item.origin != "channel" {
+    if item.runtime_class != "interactive" || !runtime_origin_is_parent_channel(&item.origin) {
         return false;
     }
     if run.receipt.status != CodexRuntimeRunStatus::ProtocolError {
@@ -2720,25 +2816,7 @@ fn latest_assistant_response(
     transcript_file: &Path,
     config: &AssistantNarrationConfig,
 ) -> io::Result<Option<LatestAssistantResponse>> {
-    let text = fs::read_to_string(transcript_file)?;
-    let mut entries = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let value: Value = match serde_json::from_str(trimmed) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let Some(role) = string_field(&value, &["role"]) else {
-            continue;
-        };
-        let Some(content) = string_field(&value, &["content"]) else {
-            continue;
-        };
-        entries.push((role.to_string(), content.to_string()));
-    }
+    let entries = transcript_entries(transcript_file)?;
     let Some(assistant_index) = entries
         .iter()
         .rposition(|(role, content)| role == "assistant" && !content.trim().is_empty())
@@ -2778,6 +2856,37 @@ fn latest_assistant_response(
         outbound_text,
         prior_user_text,
     }))
+}
+
+pub(crate) fn latest_assistant_final_text(transcript_file: &Path) -> io::Result<Option<String>> {
+    Ok(transcript_entries(transcript_file)?
+        .into_iter()
+        .rev()
+        .find(|(role, content)| role == "assistant" && !content.trim().is_empty())
+        .map(|(_, content)| content))
+}
+
+fn transcript_entries(transcript_file: &Path) -> io::Result<Vec<(String, String)>> {
+    let text = fs::read_to_string(transcript_file)?;
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let Some(role) = string_field(&value, &["role"]) else {
+            continue;
+        };
+        let Some(content) = string_field(&value, &["content"]) else {
+            continue;
+        };
+        entries.push((role.to_string(), content.to_string()));
+    }
+    Ok(entries)
 }
 
 fn compact_inline_narration(text: &str) -> String {
@@ -4432,7 +4541,7 @@ mod tests {
 
         let report = run_runtime_queue_once(RuntimeRunOnceOptions {
             harness_home: harness_home.clone(),
-            queue_id: Some(queue_id),
+            queue_id: Some(queue_id.clone()),
             codex_executable: Some(fake_codex_executable(&root)),
             timeout_ms: 30_000,
             idle_timeout_ms: 30_000,
@@ -5290,6 +5399,351 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn failed_worker_child_with_channel_context_does_not_write_parent_error_outbox() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("failed_worker_child_does_not_write_parent_error_outbox");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "delegate a bounded child task".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        let queue_id = receive.queue_id.unwrap();
+        rewrite_pending_queue_identity(
+            &harness_home,
+            &queue_id,
+            "worker",
+            "subagent-ledger",
+            "xiaoxiaoli",
+            "telegram:dm-42:user-7:xiaoxiaoli:child-1",
+        );
+        let fake_codex = fake_failing_codex_executable(&root);
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: Some(fake_codex),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::FailedTerminal);
+        assert!(report.outbound_message.is_none());
+        assert!(report.outbox_file.is_none());
+        assert!(
+            report.warnings.iter().any(|warning| {
+                warning.contains("runtime receipt remains authoritative evidence")
+            })
+        );
+        let receipts = fs::read_to_string(&report.receipts_file).unwrap();
+        assert!(receipts.contains(&queue_id));
+        assert!(receipts.contains(r#""status":"failed-terminal""#));
+        assert!(
+            !harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl")
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_external_agent_origin_with_channel_context_does_not_write_error_outbox() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("failed_external_agent_does_not_write_error_outbox");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "ask an external agent for evidence".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        let queue_id = receive.queue_id.unwrap();
+        rewrite_pending_queue_identity(
+            &harness_home,
+            &queue_id,
+            "interactive",
+            "external-agent",
+            "main",
+            "telegram:dm-42:user-7:main",
+        );
+        let fake_codex = fake_failing_codex_executable(&root);
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: Some(fake_codex),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::FailedTerminal);
+        assert!(report.outbound_message.is_none());
+        assert!(report.outbox_file.is_none());
+        assert!(
+            report.warnings.iter().any(|warning| {
+                warning.contains("runtime receipt remains authoritative evidence")
+            })
+        );
+        let receipts = fs::read_to_string(&report.receipts_file).unwrap();
+        assert!(receipts.contains(&queue_id));
+        assert!(receipts.contains(r#""status":"failed-terminal""#));
+        assert!(
+            !harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl")
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn external_agent_with_spoofed_parent_identity_emits_no_deliverable_progress() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("external_agent_with_spoofed_parent_identity_emits_no_progress");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "collect bounded external evidence".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        let queue_id = receive.queue_id.unwrap();
+        rewrite_pending_queue_identity(
+            &harness_home,
+            &queue_id,
+            "interactive",
+            "external-agent",
+            "main",
+            "telegram:dm-42:user-7:main",
+        );
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: Some(fake_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert!(report.outbound_message.is_none());
+        assert!(report.outbox_file.is_none());
+        let progress_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("progress-events.jsonl");
+        let progress = fs::read_to_string(&progress_file).unwrap_or_default();
+        assert!(
+            progress.lines().all(|line| !line.contains(&queue_id)),
+            "external child progress must remain internal even when agentId and sessionKey spoof the parent lane: {progress}"
+        );
+        let delivery = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 6_000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert!(
+            delivery
+                .pending
+                .iter()
+                .all(|pending| pending.queue_id != queue_id),
+            "external child progress must never become user-deliverable: {:#?}",
+            delivery.pending
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_stale_same_agent_channel_run_remains_suppressed() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("failed_stale_same_agent_channel_run_remains_suppressed");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "fail an obsolete same-agent turn".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        let queue_id = receive.queue_id.unwrap();
+        rewrite_pending_queue_identity(
+            &harness_home,
+            &queue_id,
+            "interactive",
+            "channel",
+            "main",
+            "telegram:dm-42:user-7:main:stale-child",
+        );
+        let state_file =
+            crate::channel_session_state_file(&harness_home, "telegram", "dm-42", "user-7");
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        write_json_atomic(
+            &state_file,
+            &crate::ChannelSessionState {
+                schema: "agent-harness.channel-session-state.v1".to_string(),
+                platform: "telegram".to_string(),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                active_session_key: "telegram:dm-42:user-7:main:live-parent".to_string(),
+                agent_id: Some("main".to_string()),
+                provider: None,
+                model: None,
+                session_topic: None,
+                model_override: None,
+                model_override_provider: None,
+                model_override_model: None,
+                thinking_enabled: false,
+                thinking_level: None,
+                thinking_instruction: None,
+                reasoning_preference: None,
+                backend_reasoning_policy: None,
+                fast_mode: None,
+                stop_requested: false,
+                stop_reason: None,
+                steering_notes: Vec::new(),
+                btw_notes: Vec::new(),
+                last_command: None,
+                updated_at_ms: 1234,
+            },
+        )
+        .unwrap();
+        let fake_codex = fake_failing_codex_executable(&root);
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id),
+            codex_executable: Some(fake_codex),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::FailedTerminal);
+        assert!(report.outbound_message.is_none());
+        assert!(report.outbox_file.is_none());
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("stale session telegram:dm-42:user-7:main:stale-child suppressed")
+        }));
+        assert!(
+            !harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl")
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(windows)]
     #[test]
     fn run_runtime_queue_once_interrupted_command_uses_structured_reason_outbox() {
@@ -5519,6 +5973,30 @@ mod tests {
                 review_text,
             ),
             FinalOutboxInputKind::AgentReply
+        );
+        assert_eq!(
+            final_outbox_input_kind_for_completed_response(
+                Some("interactive"),
+                Some("coordinator-resume"),
+                Some("main"),
+                Some("telegram:dm-42:user-7:main"),
+                "telegram:dm-42:user-7:main",
+                Some("complete the package"),
+                "Done.",
+            ),
+            FinalOutboxInputKind::AgentReply
+        );
+        assert_eq!(
+            final_outbox_input_kind_for_completed_response(
+                Some("worker"),
+                Some("subagent-ledger"),
+                Some("child"),
+                Some("subagent:child"),
+                "telegram:dm-42:user-7:main",
+                Some("child result"),
+                "child result",
+            ),
+            FinalOutboxInputKind::InternalEvidence
         );
         assert_eq!(
             final_outbox_input_kind_for_completed_response(
@@ -7347,6 +7825,7 @@ mod tests {
     ) -> RuntimeQueuePreparedItem {
         RuntimeQueuePreparedItem {
             queue_id: queue_id.to_string(),
+            admission_queue_id: None,
             agent_id: "main".to_string(),
             session_key: session_key.to_string(),
             runtime_class: "interactive".to_string(),
@@ -7364,6 +7843,7 @@ mod tests {
             model: Some("gpt-5.5".to_string()),
             reasoning_preference: None,
             backend_reasoning_policy: None,
+            authorized_execution_mode: None,
             execution_dir: PathBuf::from("execution"),
             prompt_bundle_json: PathBuf::from("prompt-bundle.json"),
             prompt_markdown: PathBuf::from("prompt.md"),
@@ -8482,6 +8962,40 @@ done
             "agent-harness-runtime-pipeline-{test_name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn rewrite_pending_queue_identity(
+        harness_home: &Path,
+        queue_id: &str,
+        runtime_class: &str,
+        origin: &str,
+        agent_id: &str,
+        session_key: &str,
+    ) {
+        let queue_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("pending.jsonl");
+        let text = fs::read_to_string(&queue_file).unwrap();
+        let mut found = false;
+        let rewritten = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let mut value: Value = serde_json::from_str(line).unwrap();
+                if string_field(&value, &["queueId", "queue_id"]) == Some(queue_id) {
+                    value["runtimeClass"] = Value::String(runtime_class.to_string());
+                    value["origin"] = Value::String(origin.to_string());
+                    value["agentId"] = Value::String(agent_id.to_string());
+                    value["sessionKey"] = Value::String(session_key.to_string());
+                    found = true;
+                }
+                serde_json::to_string(&value).unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(found, "queue item {queue_id} should exist before rewrite");
+        fs::write(queue_file, format!("{rewritten}\n")).unwrap();
     }
 
     fn hold_runtime_queue_lease_lock(queue_dir: &Path, runtime_class: &str) -> fs::File {

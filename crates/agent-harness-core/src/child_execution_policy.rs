@@ -4,8 +4,10 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::backend_reasoning::{BackendReasoningPolicyV1, ReasoningPreference};
+use crate::execution_mode::{AuthorizedExecutionModeSnapshotV2, is_reserved_execution_mode_effort};
 
 pub const CHILD_EXECUTION_POLICY_SCHEMA: &str = "agent-harness.child-execution-policy.v1";
+pub const CHILD_EXECUTION_POLICY_V2_SCHEMA: &str = "agent-harness.child-execution-policy.v2";
 pub const CHILD_EXECUTION_POLICY_MAX_STRING_BYTES: usize = 4_096;
 pub const CHILD_EXECUTION_POLICY_MAX_TIMEOUT_MS: u64 = 604_800_000;
 pub const CHILD_EXECUTION_POLICY_MAX_ATTEMPTS: u32 = 100;
@@ -54,6 +56,99 @@ pub struct ChildExecutionPolicyV1Input {
     pub token_or_cost_budget: Option<String>,
     pub delegation_limit: Option<u32>,
     pub result_contract: String,
+}
+
+/// Additive wrapper that keeps the public V1 policy/input source-compatible
+/// while carrying execution-mode authorization on an independent axis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChildExecutionPolicyV2 {
+    schema: String,
+    child_policy: ChildExecutionPolicyV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorized_execution_mode: Option<AuthorizedExecutionModeSnapshotV2>,
+}
+
+impl ChildExecutionPolicyV2 {
+    pub fn new(
+        child_policy: ChildExecutionPolicyV1,
+        authorized_execution_mode: Option<AuthorizedExecutionModeSnapshotV2>,
+    ) -> Result<Self, ChildExecutionPolicyError> {
+        let policy = Self {
+            schema: CHILD_EXECUTION_POLICY_V2_SCHEMA.to_string(),
+            child_policy,
+            authorized_execution_mode,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn validate(&self) -> Result<(), ChildExecutionPolicyError> {
+        if self.schema != CHILD_EXECUTION_POLICY_V2_SCHEMA {
+            return Err(ChildExecutionPolicyError::UnsupportedSchema(
+                self.schema.clone(),
+            ));
+        }
+        self.child_policy.validate()?;
+        if let Some(ReasoningPreference::Explicit { effort }) =
+            self.child_policy.reasoning_preference()
+            && is_reserved_execution_mode_effort(effort)
+        {
+            return Err(ChildExecutionPolicyError::ReservedExecutionModeEffort(
+                effort.clone(),
+            ));
+        }
+        if let Some(effort) = self.child_policy.effective_effort()
+            && is_reserved_execution_mode_effort(effort)
+        {
+            return Err(ChildExecutionPolicyError::ReservedExecutionModeEffort(
+                effort.to_string(),
+            ));
+        }
+        if let Some(snapshot) = &self.authorized_execution_mode {
+            snapshot.validate().map_err(|error| {
+                ChildExecutionPolicyError::ExecutionModeSnapshot(error.to_string())
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
+    pub const fn child_policy(&self) -> &ChildExecutionPolicyV1 {
+        &self.child_policy
+    }
+
+    pub const fn authorized_execution_mode(&self) -> Option<&AuthorizedExecutionModeSnapshotV2> {
+        self.authorized_execution_mode.as_ref()
+    }
+}
+
+impl<'de> Deserialize<'de> for ChildExecutionPolicyV2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            schema: String,
+            child_policy: ChildExecutionPolicyV1,
+            #[serde(default)]
+            authorized_execution_mode: Option<AuthorizedExecutionModeSnapshotV2>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let policy = Self {
+            schema: wire.schema,
+            child_policy: wire.child_policy,
+            authorized_execution_mode: wire.authorized_execution_mode,
+        };
+        policy.validate().map_err(D::Error::custom)?;
+        Ok(policy)
+    }
 }
 
 impl ChildExecutionPolicyV1 {
@@ -115,6 +210,11 @@ impl ChildExecutionPolicyV1 {
             })?;
             if let ReasoningPreference::Explicit { effort } = preference {
                 validate_string("reasoningPreference.effort", effort)?;
+                if is_reserved_execution_mode_effort(effort) {
+                    return Err(ChildExecutionPolicyError::ReservedExecutionModeEffort(
+                        effort.clone(),
+                    ));
+                }
             }
             policy
                 .validate_for_execution_route(provider, model)
@@ -123,6 +223,11 @@ impl ChildExecutionPolicyV1 {
                 "backendReasoningPolicy.effectiveEffort",
                 policy.effective_effort(),
             )?;
+            if is_reserved_execution_mode_effort(policy.effective_effort()) {
+                return Err(ChildExecutionPolicyError::ReservedExecutionModeEffort(
+                    policy.effective_effort().to_string(),
+                ));
+            }
             if let ReasoningPreference::Explicit { effort } = preference
                 && effort != policy.effective_effort()
             {
@@ -322,6 +427,8 @@ pub enum ChildExecutionPolicyError {
         snapshot: Option<String>,
         policy: Option<String>,
     },
+    ReservedExecutionModeEffort(String),
+    ExecutionModeSnapshot(String),
     InvalidTimeout {
         field: &'static str,
         value: u64,
@@ -377,6 +484,13 @@ impl fmt::Display for ChildExecutionPolicyError {
                 "catalog revision snapshot {:?} does not match backend policy revision {:?}",
                 snapshot, policy
             ),
+            Self::ReservedExecutionModeEffort(effort) => write!(
+                formatter,
+                "reasoning effort `{effort}` is reserved for execution-mode admission"
+            ),
+            Self::ExecutionModeSnapshot(error) => {
+                write!(formatter, "invalid authorized execution-mode snapshot: {error}")
+            }
             Self::InvalidTimeout { field, value } => write!(
                 formatter,
                 "{field} must be in 1..={CHILD_EXECUTION_POLICY_MAX_TIMEOUT_MS}, got {value}"
@@ -455,9 +569,104 @@ mod tests {
     };
 
     #[test]
+    fn v2_keeps_max_reasoning_separate_from_ultra_execution_mode() {
+        let child = ChildExecutionPolicyV2::new(
+            managed_policy(11, "openai", "gpt-5.6-sol", "max"),
+            Some(authorized_ultra_snapshot("main")),
+        )
+        .unwrap();
+
+        assert_eq!(child.child_policy().effective_effort(), Some("max"));
+        assert_eq!(
+            child.authorized_execution_mode().unwrap().effective_mode(),
+            crate::execution_mode::ULTRA_EXECUTION_MODE
+        );
+    }
+
+    #[test]
+    fn v2_rejects_ultra_from_either_reasoning_field() {
+        let legacy_ultra = ChildExecutionPolicyV1::new(ChildExecutionPolicyV1Input {
+            policy_revision: 12,
+            provider: Some("openai".to_string()),
+            model: Some("gpt-5.6-sol".to_string()),
+            reasoning_preference: Some(ReasoningPreference::explicit("ultra").unwrap()),
+            backend_reasoning_policy: Some(backend_policy("openai", "gpt-5.6-sol", "ultra")),
+            catalog_revision: Some("catalog-test".to_string()),
+            ..base_input()
+        })
+        .unwrap_err();
+        assert_eq!(
+            legacy_ultra,
+            ChildExecutionPolicyError::ReservedExecutionModeEffort("ultra".to_string())
+        );
+    }
+
+    #[test]
+    fn heterogeneous_v2_siblings_preserve_independent_execution_modes() {
+        let standard = ChildExecutionPolicyV2::new(
+            managed_policy(13, "openai", "gpt-5.6-sol", "max"),
+            Some(
+                crate::execution_mode::AuthorizedExecutionModeSnapshotV2::new(
+                    crate::execution_mode::ExecutionModePreference::Default,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let ultra = ChildExecutionPolicyV2::new(
+            managed_policy(14, "openai", "gpt-5.6-terra", "max"),
+            Some(authorized_ultra_snapshot("main")),
+        )
+        .unwrap();
+
+        assert_eq!(standard.child_policy().effective_effort(), Some("max"));
+        assert_eq!(ultra.child_policy().effective_effort(), Some("max"));
+        assert_eq!(
+            standard
+                .authorized_execution_mode()
+                .unwrap()
+                .effective_mode(),
+            crate::execution_mode::STANDARD_EXECUTION_MODE
+        );
+        assert_eq!(
+            ultra.authorized_execution_mode().unwrap().effective_mode(),
+            crate::execution_mode::ULTRA_EXECUTION_MODE
+        );
+        assert_ne!(standard, ultra);
+    }
+
+    #[test]
+    fn v2_serde_roundtrip_preserves_child_and_execution_snapshot() {
+        let original = ChildExecutionPolicyV2::new(
+            managed_policy(15, "openai", "gpt-5.6-sol", "max"),
+            Some(authorized_ultra_snapshot("main")),
+        )
+        .unwrap();
+        let encoded = serde_json::to_vec(&original).unwrap();
+        let decoded: ChildExecutionPolicyV2 = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded, original);
+        assert_eq!(
+            decoded
+                .authorized_execution_mode()
+                .unwrap()
+                .retry_identity()
+                .unwrap(),
+            original
+                .authorized_execution_mode()
+                .unwrap()
+                .retry_identity()
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn heterogeneous_siblings_preserve_independent_open_ended_routes_and_efforts() {
         let max = managed_policy(1, "openai", "gpt-5.6-sol", "max");
-        let ultra = managed_policy(2, "openai", "gpt-5.6-terra", "ultra");
+        let high = managed_policy(2, "openai", "gpt-5.6-terra", "high");
 
         assert_eq!(max.provider(), Some("openai"));
         assert_eq!(max.model(), Some("gpt-5.6-sol"));
@@ -465,12 +674,12 @@ mod tests {
             max.reasoning_preference().unwrap().explicit_effort(),
             Some("max")
         );
-        assert_eq!(ultra.model(), Some("gpt-5.6-terra"));
+        assert_eq!(high.model(), Some("gpt-5.6-terra"));
         assert_eq!(
-            ultra.reasoning_preference().unwrap().explicit_effort(),
-            Some("ultra")
+            high.reasoning_preference().unwrap().explicit_effort(),
+            Some("high")
         );
-        assert_ne!(max, ultra);
+        assert_ne!(max, high);
     }
 
     #[test]
@@ -503,16 +712,13 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             effort_error,
-            ChildExecutionPolicyError::ReasoningEffortMismatch {
-                preference: "ultra".to_string(),
-                policy: "max".to_string(),
-            }
+            ChildExecutionPolicyError::ReservedExecutionModeEffort("ultra".to_string())
         );
     }
 
     #[test]
     fn retry_clone_and_serde_roundtrip_preserve_exact_snapshot() {
-        let original = managed_policy(7, "openai", "gpt-5.6-sol", "ultra");
+        let original = managed_policy(7, "openai", "gpt-5.6-sol", "max");
         let retry = original.clone();
         let encoded = serde_json::to_vec(&retry).unwrap();
         let decoded: ChildExecutionPolicyV1 = serde_json::from_slice(&encoded).unwrap();
@@ -520,7 +726,7 @@ mod tests {
         assert_eq!(retry, original);
         assert_eq!(decoded, original);
         assert_eq!(decoded.policy_revision(), 7);
-        assert_eq!(decoded.effective_effort(), Some("ultra"));
+        assert_eq!(decoded.effective_effort(), Some("max"));
     }
 
     #[test]
@@ -599,5 +805,62 @@ mod tests {
             delegation_limit: None,
             result_contract: "child-result-envelope-v1".to_string(),
         }
+    }
+
+    fn authorized_ultra_snapshot(
+        agent_id: &str,
+    ) -> crate::execution_mode::AuthorizedExecutionModeSnapshotV2 {
+        use crate::execution_mode::{
+            ExecutionModePolicyV1, ExecutionModePreference, ExecutionModeSource,
+            SafeResumeReadinessReceiptV1, ULTRA_EXECUTION_MODE,
+        };
+        use crate::worker_result_mailbox::WorkerResultOwnerV1;
+
+        const DIGEST: &str =
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let preference = ExecutionModePreference::explicit(ULTRA_EXECUTION_MODE).unwrap();
+        let policy = ExecutionModePolicyV1::new(
+            ExecutionModeSource::ChildAdmission,
+            &preference,
+            ULTRA_EXECUTION_MODE,
+            agent_id,
+            "authorization-v1",
+            DIGEST,
+            2,
+            6,
+            300_000,
+        )
+        .unwrap();
+        let lane = crate::lane::FullLaneKeyV1::new(
+            "discord",
+            "primary",
+            "channel-1",
+            "user-1",
+            agent_id,
+            "subagent",
+            "root-session",
+            "concrete-session",
+        )
+        .unwrap();
+        let owner = crate::worker_result_mailbox::ExactWorkerResultOwnerV1::new(
+            lane,
+            "virtual-session-1",
+            None,
+            Some("parent-queue-1".to_string()),
+            "source-queue-1",
+            None,
+            None,
+        )
+        .unwrap();
+        let readiness =
+            SafeResumeReadinessReceiptV1::new(&owner, "durability-r1", true, true, true, true)
+                .unwrap();
+        crate::execution_mode::AuthorizedExecutionModeSnapshotV2::new(
+            preference,
+            Some(policy),
+            Some(WorkerResultOwnerV1::Exact(owner)),
+            Some(readiness),
+        )
+        .unwrap()
     }
 }

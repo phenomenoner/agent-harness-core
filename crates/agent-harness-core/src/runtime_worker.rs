@@ -13,6 +13,11 @@ use serde_json::Value;
 use std::os::windows::fs::OpenOptionsExt;
 
 use crate::backend_reasoning::{BackendReasoningPolicyV1, ReasoningPreference};
+use crate::context_rollover::{derive_virtual_session_id, root_working_session_key};
+use crate::execution_mode::{
+    AuthorizedExecutionModeSnapshotV2, STANDARD_EXECUTION_MODE, is_reserved_execution_mode_effort,
+};
+use crate::lane::FullLaneKeyV1;
 use crate::loop_health::process_alive_for_pid;
 use crate::{
     AgentSource, HarnessLogEvent, HarnessLogLevel, InboundMediaArtifact, PromptAssemblyOptions,
@@ -27,6 +32,8 @@ const RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA: &str = "agent-harness.runtime-queue-p
 const RUNTIME_QUEUE_LEASES_SCHEMA: &str = "agent-harness.runtime-queue-leases.v1";
 const RUNTIME_QUEUE_LEASE_RECONCILIATION_SCHEMA: &str =
     "agent-harness.runtime-queue-lease-reconciliation.v1";
+const RUNTIME_QUEUE_LEASE_OBSERVATION_SCHEMA: &str =
+    "agent-harness.runtime-queue-lease-observation.v1";
 const RUNTIME_QUEUE_STATE_INDEX_SCHEMA: &str = "agent-harness.runtime-queue-state-index.v1";
 const RUNTIME_QUEUE_QUARANTINE_SCHEMA: &str = "agent-harness.runtime-queue-quarantine.v1";
 const TERMINAL_CONTROL_SUPPRESSION_REASON: &str = "terminal-control-present";
@@ -118,6 +125,8 @@ pub struct RuntimeQueuePrepareReport {
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeQueuePreparedItem {
     pub queue_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_queue_id: Option<String>,
     pub agent_id: String,
     pub session_key: String,
     pub runtime_class: String,
@@ -142,6 +151,8 @@ pub struct RuntimeQueuePreparedItem {
     pub reasoning_preference: Option<ReasoningPreference>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend_reasoning_policy: Option<BackendReasoningPolicyV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorized_execution_mode: Option<AuthorizedExecutionModeSnapshotV2>,
     pub execution_dir: PathBuf,
     pub prompt_bundle_json: PathBuf,
     pub prompt_markdown: PathBuf,
@@ -270,6 +281,7 @@ struct RuntimeRunOnceSkipReceipt {
 #[derive(Debug, Clone)]
 struct PendingQueueItem {
     queue_id: String,
+    admission_queue_id: Option<String>,
     created_at_ms: i64,
     agent_id: String,
     session_key: String,
@@ -291,10 +303,12 @@ struct PendingQueueItem {
     model: Option<String>,
     reasoning_preference: Option<ReasoningPreference>,
     backend_reasoning_policy: Option<BackendReasoningPolicyV1>,
+    authorized_execution_mode: Option<AuthorizedExecutionModeSnapshotV2>,
     planned_transcript_file: PathBuf,
     planned_trajectory_file: PathBuf,
     selected_skill_ids: Vec<String>,
     continuation: RuntimeContinuationMetadata,
+    coordinator_resume: Option<crate::coordinator_resume::CoordinatorResumeMetadataV1>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -324,6 +338,8 @@ struct RuntimeQueueLease {
     #[serde(default)]
     user_id: Option<String>,
     session_key: String,
+    #[serde(default)]
+    virtual_session_id: Option<String>,
     #[serde(default)]
     session_lane_key: Option<String>,
     owner: RuntimeQueueLeaseOwner,
@@ -780,6 +796,13 @@ pub fn prepare_runtime_queue_item(
         }
         write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
         if let Some(pending) = acquired_prepared_lease.as_ref() {
+            if let Err(error) =
+                consume_coordinator_resume_after_lease(&options.harness_home, pending, now_ms)
+            {
+                lease_state.leases.remove(&pending.queue_id);
+                write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+                return Err(error);
+            }
             append_json_line(
                 &execution_receipts_file,
                 &lease_acquired_receipt(
@@ -887,6 +910,15 @@ pub fn prepare_runtime_queue_item(
                     }
                     lease_runtime_queue_item(&mut lease_state, pending, &lease_owner, now_ms);
                     write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+                    if let Err(error) = consume_coordinator_resume_after_lease(
+                        &options.harness_home,
+                        pending,
+                        now_ms,
+                    ) {
+                        lease_state.leases.remove(&pending.queue_id);
+                        write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+                        return Err(error);
+                    }
                     append_json_line(
                         &execution_receipts_file,
                         &lease_acquired_receipt(
@@ -1101,6 +1133,13 @@ pub fn prepare_runtime_queue_item(
     )?;
     lease_runtime_queue_item(&mut lease_state, &pending, &lease_owner, now_ms);
     write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+    if let Err(error) =
+        consume_coordinator_resume_after_lease(&options.harness_home, &pending, now_ms)
+    {
+        lease_state.leases.remove(&pending.queue_id);
+        write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+        return Err(error);
+    }
     append_json_line(
         &execution_receipts_file,
         &lease_acquired_receipt(
@@ -1154,13 +1193,15 @@ pub fn prepare_runtime_queue_item(
             pending.selected_skill_ids, actual_skill_ids
         ));
     }
-    let bundle = assemble_prompt_bundle(
-        &plan,
-        PromptAssemblyOptions {
-            harness_home: Some(options.harness_home.clone()),
-            ..options.prompt_options
-        },
-    )?;
+    let (full_lane, backend_context_generation) =
+        derive_prompt_runtime_context(&pending, &mut warnings)?;
+    let mut prompt_options = options.prompt_options;
+    prompt_options.harness_home = Some(options.harness_home.clone());
+    // The queued item is the authoritative post-routing identity. Never accept
+    // a caller-supplied lane or backend generation that can disagree with it.
+    prompt_options.full_lane = full_lane;
+    prompt_options.backend_context_generation = Some(backend_context_generation);
+    let bundle = assemble_prompt_bundle(&plan, prompt_options)?;
 
     let execution_dir = queue_execution_dir(&options.harness_home, &pending.queue_id);
     fs::create_dir_all(&execution_dir)?;
@@ -1172,6 +1213,7 @@ pub fn prepare_runtime_queue_item(
     let receipt_scheduled_for_ms = pending.scheduled_for_ms;
     let item = RuntimeQueuePreparedItem {
         queue_id: pending.queue_id.clone(),
+        admission_queue_id: pending.admission_queue_id.clone(),
         agent_id: pending.agent_id.clone(),
         session_key: pending.session_key.clone(),
         runtime_class: pending.runtime_class.clone(),
@@ -1189,6 +1231,7 @@ pub fn prepare_runtime_queue_item(
         model: bundle.model.clone(),
         reasoning_preference: bundle.reasoning_preference.clone(),
         backend_reasoning_policy: bundle.backend_reasoning_policy.clone(),
+        authorized_execution_mode: pending.authorized_execution_mode.clone(),
         execution_dir: execution_dir.clone(),
         prompt_bundle_json: prompt_files.json.clone(),
         prompt_markdown: prompt_files.markdown.clone(),
@@ -1242,6 +1285,117 @@ pub fn prepare_runtime_queue_item(
         receipt,
         warnings,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeQueueLeaseObservationOptions {
+    pub harness_home: PathBuf,
+    pub queue_id: String,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeQueueLaneActivityObservationOptions {
+    pub harness_home: PathBuf,
+    pub owner: crate::worker_result_mailbox::ExactWorkerResultOwnerV1,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeQueueLeaseObservationStatus {
+    Active,
+    Released,
+    Expired,
+    DeadOwner,
+    Unknown,
+}
+
+impl RuntimeQueueLeaseObservationStatus {
+    /// `Expired` and `DeadOwner` still require reconciliation; only physical
+    /// absence across every locked class is a confirmed release.
+    pub fn is_confirmed_released(self) -> bool {
+        self == Self::Released
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeQueueLeaseObservationReceipt {
+    pub schema: &'static str,
+    pub queue_id: String,
+    pub status: RuntimeQueueLeaseObservationStatus,
+    pub observed_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_class: Option<String>,
+    pub reason: String,
+}
+
+fn derive_prompt_runtime_context(
+    pending: &PendingQueueItem,
+    warnings: &mut Vec<String>,
+) -> io::Result<(Option<FullLaneKeyV1>, String)> {
+    let full_lane = pending
+        .account_id
+        .as_deref()
+        .map(|account_id| {
+            FullLaneKeyV1::new(
+                &pending.platform,
+                account_id,
+                &pending.channel_id,
+                &pending.user_id,
+                &pending.agent_id,
+                &pending.runtime_class,
+                root_working_session_key(&pending.session_key),
+                &pending.session_key,
+            )
+            .map_err(io::Error::other)
+        })
+        .transpose()?;
+
+    let policy_mode = if pending.backend_reasoning_policy.is_some() {
+        "managed"
+    } else {
+        "unmanaged"
+    };
+    let binding_file = prompt_codex_binding_file(&pending.planned_transcript_file);
+    let thread_id = if binding_file.is_file() {
+        match fs::read_to_string(&binding_file)
+            .and_then(|text| serde_json::from_str::<Value>(&text).map_err(io::Error::other))
+        {
+            Ok(value) => value
+                .get("threadId")
+                .or_else(|| value.get("thread_id"))
+                .or_else(|| value.get("codexThreadId"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+                .map(ToString::to_string),
+            Err(error) => {
+                warnings.push(format!(
+                    "could not read Codex binding for prompt generation at {}: {error}",
+                    binding_file.display()
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let backend_context_generation = match thread_id {
+        Some(thread_id) => format!("codex-thread:{thread_id}:policy={policy_mode}"),
+        None => format!("codex-unbound:{}:policy={policy_mode}", pending.queue_id),
+    };
+
+    Ok((full_lane, backend_context_generation))
+}
+
+fn prompt_codex_binding_file(transcript_file: &Path) -> PathBuf {
+    let file_name = transcript_file
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("session.jsonl");
+    transcript_file.with_file_name(format!("{file_name}.codex-app-server.json"))
 }
 
 pub fn inspect_runtime_queue_capacity(
@@ -1966,6 +2120,259 @@ pub fn release_runtime_queue_lease(
     Ok(())
 }
 
+/// Observes one exact runtime queue lease under every known runtime-class
+/// lease lock. This API never converts malformed, unreadable, or lock-busy
+/// state into `Released`; all such cases fail closed as `Unknown`.
+pub fn observe_runtime_queue_lease(
+    options: RuntimeQueueLeaseObservationOptions,
+) -> RuntimeQueueLeaseObservationReceipt {
+    let unknown =
+        |runtime_class: Option<String>, reason: String| RuntimeQueueLeaseObservationReceipt {
+            schema: RUNTIME_QUEUE_LEASE_OBSERVATION_SCHEMA,
+            queue_id: options.queue_id.clone(),
+            status: RuntimeQueueLeaseObservationStatus::Unknown,
+            observed_at_ms: options.observed_at_ms,
+            runtime_class,
+            reason,
+        };
+    if options.queue_id.trim().is_empty() || options.queue_id.chars().any(char::is_control) {
+        return unknown(
+            None,
+            "queueId is empty or contains a control character".to_string(),
+        );
+    }
+    if options.observed_at_ms < 0 {
+        return unknown(None, "observedAtMs cannot be negative".to_string());
+    }
+
+    let queue_dir = options.harness_home.join("state").join("runtime-queue");
+    let runtime_classes = match runtime_classes_for_observation(&queue_dir) {
+        Ok(classes) => classes,
+        Err(error) => {
+            return unknown(
+                None,
+                format!("runtime lease class discovery failed: {error}"),
+            );
+        }
+    };
+    let mut matches = Vec::new();
+    for runtime_class in runtime_classes {
+        let lease_lock = match acquire_runtime_queue_lease_lock(
+            &queue_dir,
+            &runtime_class,
+            options.observed_at_ms,
+        ) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                return unknown(
+                    Some(runtime_class.clone()),
+                    format!(
+                        "runtime queue lease lock is busy for class `{runtime_class}`; lease state was not observed"
+                    ),
+                );
+            }
+            Err(error) => {
+                return unknown(
+                    Some(runtime_class.clone()),
+                    format!("runtime queue lease lock failed for class `{runtime_class}`: {error}"),
+                );
+            }
+        };
+        let state = match read_runtime_queue_leases_strict(&queue_dir, &runtime_class) {
+            Ok(state) => state,
+            Err(error) => {
+                drop(lease_lock);
+                return unknown(
+                    Some(runtime_class.clone()),
+                    format!(
+                        "runtime queue lease state for class `{runtime_class}` is unknown: {error}"
+                    ),
+                );
+            }
+        };
+        if let Some(lease) = state.leases.get(&options.queue_id) {
+            matches.push((runtime_class.clone(), lease.clone()));
+        }
+        drop(lease_lock);
+    }
+
+    if matches.len() > 1 {
+        let classes = matches
+            .iter()
+            .map(|(runtime_class, _)| runtime_class.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return unknown(
+            None,
+            format!(
+                "queueId `{}` has duplicate runtime leases across classes: {classes}",
+                options.queue_id
+            ),
+        );
+    }
+    let Some((runtime_class, lease)) = matches.pop() else {
+        return RuntimeQueueLeaseObservationReceipt {
+            schema: RUNTIME_QUEUE_LEASE_OBSERVATION_SCHEMA,
+            queue_id: options.queue_id,
+            status: RuntimeQueueLeaseObservationStatus::Released,
+            observed_at_ms: options.observed_at_ms,
+            runtime_class: None,
+            reason: "no matching runtime queue lease exists in any known class".to_string(),
+        };
+    };
+    if lease.lease_expires_at_ms <= options.observed_at_ms {
+        return RuntimeQueueLeaseObservationReceipt {
+            schema: RUNTIME_QUEUE_LEASE_OBSERVATION_SCHEMA,
+            queue_id: options.queue_id,
+            status: RuntimeQueueLeaseObservationStatus::Expired,
+            observed_at_ms: options.observed_at_ms,
+            runtime_class: Some(runtime_class),
+            reason: format!(
+                "runtime queue lease expired at {}",
+                lease.lease_expires_at_ms
+            ),
+        };
+    }
+    if let Some(process_id) = dead_runtime_queue_lease_owner(&lease.owner) {
+        return RuntimeQueueLeaseObservationReceipt {
+            schema: RUNTIME_QUEUE_LEASE_OBSERVATION_SCHEMA,
+            queue_id: options.queue_id,
+            status: RuntimeQueueLeaseObservationStatus::DeadOwner,
+            observed_at_ms: options.observed_at_ms,
+            runtime_class: Some(runtime_class),
+            reason: format!(
+                "runtime queue lease owner {} references non-running processId={process_id}",
+                lease.owner.display_label()
+            ),
+        };
+    }
+    RuntimeQueueLeaseObservationReceipt {
+        schema: RUNTIME_QUEUE_LEASE_OBSERVATION_SCHEMA,
+        queue_id: options.queue_id,
+        status: RuntimeQueueLeaseObservationStatus::Active,
+        observed_at_ms: options.observed_at_ms,
+        runtime_class: Some(runtime_class),
+        reason: format!(
+            "runtime queue lease is active until {} for owner {}",
+            lease.lease_expires_at_ms,
+            lease.owner.display_label()
+        ),
+    }
+}
+
+/// Observes runtime leases for one exact coordinator owner lane. Any unreadable,
+/// malformed, or lock-busy lease state is reported as active so a coordinator
+/// resume cannot interrupt a turn whose absence was not actually observed.
+pub fn observe_runtime_queue_lane_activity(
+    options: RuntimeQueueLaneActivityObservationOptions,
+) -> crate::worker_resume::LaneActivityReceiptV1 {
+    let active = |reason: String| {
+        crate::worker_resume::LaneActivityReceiptV1::active(options.observed_at_ms.max(0), reason)
+            .expect("bounded runtime lane activity reason must be valid")
+    };
+    if options.observed_at_ms < 0 {
+        return active("runtime lane activity observation timestamp is invalid".to_string());
+    }
+    if let Err(error) = options.owner.validate() {
+        return active(format!("exact coordinator owner is invalid: {error}"));
+    }
+
+    let queue_dir = options.harness_home.join("state").join("runtime-queue");
+    let runtime_classes = match runtime_classes_for_observation(&queue_dir) {
+        Ok(classes) => classes,
+        Err(error) => {
+            return active(format!("runtime lease class discovery failed: {error}"));
+        }
+    };
+    for runtime_class in runtime_classes {
+        let lease_lock = match acquire_runtime_queue_lease_lock(
+            &queue_dir,
+            &runtime_class,
+            options.observed_at_ms,
+        ) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                return active(format!(
+                    "runtime queue lease lock is busy for class `{runtime_class}`; exact lane activity was not observed"
+                ));
+            }
+            Err(error) => {
+                return active(format!(
+                    "runtime queue lease lock failed for class `{runtime_class}`: {error}"
+                ));
+            }
+        };
+        let state = match read_runtime_queue_leases_strict(&queue_dir, &runtime_class) {
+            Ok(state) => state,
+            Err(error) => {
+                drop(lease_lock);
+                return active(format!(
+                    "runtime queue lease state for class `{runtime_class}` is unknown: {error}"
+                ));
+            }
+        };
+        if let Some(lease) = state
+            .leases
+            .values()
+            .find(|lease| runtime_queue_lease_matches_exact_owner(lease, &options.owner))
+        {
+            let reason = if lease.lease_expires_at_ms <= options.observed_at_ms {
+                format!(
+                    "exact lane runtime queue lease `{}` expired at {} but is not reconciled",
+                    lease.queue_id, lease.lease_expires_at_ms
+                )
+            } else if let Some(process_id) = dead_runtime_queue_lease_owner(&lease.owner) {
+                format!(
+                    "exact lane runtime queue lease `{}` references non-running processId={process_id} but is not reconciled",
+                    lease.queue_id
+                )
+            } else {
+                format!(
+                    "exact lane runtime queue lease `{}` is active until {}",
+                    lease.queue_id, lease.lease_expires_at_ms
+                )
+            };
+            drop(lease_lock);
+            return active(reason);
+        }
+        drop(lease_lock);
+    }
+
+    crate::worker_resume::LaneActivityReceiptV1::idle(options.observed_at_ms)
+        .expect("non-negative runtime lane activity timestamp must be valid")
+}
+
+fn runtime_queue_lease_matches_exact_owner(
+    lease: &RuntimeQueueLease,
+    owner: &crate::worker_result_mailbox::ExactWorkerResultOwnerV1,
+) -> bool {
+    let lane = &owner.lane;
+    lease.platform == lane.platform()
+        && lease.account_id.as_deref() == Some(lane.account_id())
+        && lease.channel_id == lane.channel_id()
+        && lease.user_id.as_deref() == Some(lane.user_id())
+        && lease.agent_id == lane.agent_id()
+        && lease.runtime_class == lane.runtime_class()
+        && root_working_session_key(&lease.session_key) == lane.root_virtual_session()
+        && lease.session_key == lane.concrete_session()
+        && runtime_queue_lease_virtual_session_id(lease).as_deref()
+            == Some(owner.virtual_session_id.as_str())
+}
+
+fn runtime_queue_lease_virtual_session_id(lease: &RuntimeQueueLease) -> Option<String> {
+    lease.virtual_session_id.clone().or_else(|| {
+        let user_id = lease.user_id.as_deref()?;
+        let root_session = root_working_session_key(&lease.session_key);
+        Some(derive_virtual_session_id(
+            &lease.platform,
+            &lease.channel_id,
+            user_id,
+            &lease.agent_id,
+            &root_session,
+        ))
+    })
+}
+
 pub fn reconcile_runtime_queue_leases_for_generation(
     harness_home: impl AsRef<Path>,
     service_id: &str,
@@ -2108,6 +2515,116 @@ fn runtime_classes_for_release(queue_dir: &Path) -> Vec<String> {
         }
     }
     classes
+}
+
+fn runtime_classes_for_observation(queue_dir: &Path) -> io::Result<Vec<String>> {
+    let mut classes = vec![
+        "interactive".to_string(),
+        "cron".to_string(),
+        "worker".to_string(),
+        "maintenance".to_string(),
+    ];
+    let legacy_file = runtime_queue_leases_file(queue_dir, "legacy");
+    match fs::metadata(&legacy_file) {
+        Ok(metadata) if metadata.is_file() => classes.push("legacy".to_string()),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "legacy runtime lease path is not a file: {}",
+                    legacy_file.display()
+                ),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let classes_dir = queue_dir.join("classes");
+    let entries = match fs::read_dir(&classes_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(classes),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "runtime class directory name is not valid UTF-8 under {}",
+                    classes_dir.display()
+                ),
+            )
+        })?;
+        if !classes.iter().any(|runtime_class| runtime_class == name) {
+            classes.push(name.to_string());
+        }
+    }
+    Ok(classes)
+}
+
+fn read_runtime_queue_leases_strict(
+    queue_dir: &Path,
+    runtime_class: &str,
+) -> io::Result<RuntimeQueueLeaseState> {
+    let leases_file = runtime_queue_leases_file(queue_dir, runtime_class);
+    match fs::metadata(&leases_file) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "runtime lease path is not a file: {}",
+                    leases_file.display()
+                ),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(RuntimeQueueLeaseState {
+                schema: runtime_queue_leases_schema(),
+                leases: BTreeMap::new(),
+            });
+        }
+        Err(error) => return Err(error),
+    }
+    let text = fs::read_to_string(&leases_file)?;
+    let state = serde_json::from_str::<RuntimeQueueLeaseState>(&text).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "runtime lease state {} is not valid JSON: {error}",
+                leases_file.display()
+            ),
+        )
+    })?;
+    if state.schema != runtime_queue_leases_schema() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "runtime lease state {} has unsupported schema `{}`",
+                leases_file.display(),
+                state.schema
+            ),
+        ));
+    }
+    for (queue_id, lease) in &state.leases {
+        if queue_id != &lease.queue_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "runtime lease state {} maps queueId `{queue_id}` to payload queueId `{}`",
+                    leases_file.display(),
+                    lease.queue_id
+                ),
+            ));
+        }
+    }
+    Ok(state)
 }
 
 pub fn resolve_queue_terminal_control(
@@ -2454,6 +2971,14 @@ fn runtime_capacity_blocker(
     let config = load_runtime_dispatch_config(harness_home)?;
     let all_leases =
         read_all_runtime_queue_leases_with_override(harness_home, state, &item.runtime_class)?;
+    if all_leases
+        .iter()
+        .any(|lease| exact_lane_coordinator_mutual_exclusion(item, lease))
+    {
+        return Ok(Some(
+            "exact-lane coordinator mutual exclusion with active runtime lease".to_string(),
+        ));
+    }
     let executing_global = all_leases.len();
     if executing_global >= config.global_concurrency_limit {
         return Ok(Some("global runtime limit".to_string()));
@@ -2721,12 +3246,60 @@ fn lease_runtime_queue_item(
             channel_id: item.channel_id.clone(),
             user_id: Some(item.user_id.clone()),
             session_key: item.session_key.clone(),
+            virtual_session_id: item
+                .coordinator_resume
+                .as_ref()
+                .map(|metadata| metadata.owner.virtual_session_id.clone())
+                .or_else(|| item.continuation.virtual_session_id.clone())
+                .or_else(|| {
+                    Some(derive_virtual_session_id(
+                        &item.platform,
+                        &item.channel_id,
+                        &item.user_id,
+                        &item.agent_id,
+                        &root_working_session_key(&item.session_key),
+                    ))
+                }),
             session_lane_key,
             owner: owner.clone(),
             started_at_ms: now_ms,
             lease_expires_at_ms: now_ms.saturating_add(DEFAULT_RUNTIME_LEASE_MS),
         },
     );
+}
+
+fn exact_lane_coordinator_mutual_exclusion(
+    item: &PendingQueueItem,
+    lease: &RuntimeQueueLease,
+) -> bool {
+    if item.origin != "coordinator-resume" && lease.origin != "coordinator-resume" {
+        return false;
+    }
+    let item_virtual_session_id = item
+        .coordinator_resume
+        .as_ref()
+        .map(|metadata| metadata.owner.virtual_session_id.clone())
+        .or_else(|| item.continuation.virtual_session_id.clone())
+        .unwrap_or_else(|| {
+            derive_virtual_session_id(
+                &item.platform,
+                &item.channel_id,
+                &item.user_id,
+                &item.agent_id,
+                &root_working_session_key(&item.session_key),
+            )
+        });
+    item.runtime_class == lease.runtime_class
+        && item.agent_id == lease.agent_id
+        && item.platform == lease.platform
+        && item.account_id == lease.account_id
+        && item.channel_id == lease.channel_id
+        && lease.user_id.as_deref() == Some(item.user_id.as_str())
+        && root_working_session_key(&item.session_key)
+            == root_working_session_key(&lease.session_key)
+        && item.session_key == lease.session_key
+        && runtime_queue_lease_virtual_session_id(lease).as_deref()
+            == Some(item_virtual_session_id.as_str())
 }
 
 fn runtime_channel_key(agent_id: &str, platform: &str, channel_id: &str) -> String {
@@ -2792,9 +3365,13 @@ fn is_interactive_channel_main_lane(
 ) -> bool {
     class_config.same_session_main_agent_serialization
         && runtime_class == "interactive"
-        && origin == "channel"
+        && runtime_origin_is_parent_channel(origin)
         && cron_run_id.is_none()
         && class_config.per_session_max_active > 0
+}
+
+fn runtime_origin_is_parent_channel(origin: &str) -> bool {
+    matches!(origin, "channel" | "coordinator-resume")
 }
 
 fn item_session_lane_key(
@@ -3268,10 +3845,61 @@ fn parse_pending_item(value: &Value) -> Result<PendingQueueItem, String> {
     let runtime_class = string_field(value, &["runtimeClass", "runtime_class"])
         .map(ToString::to_string)
         .unwrap_or_else(|| default_runtime_class_for(&platform));
-    Ok(PendingQueueItem {
-        queue_id: string_field(value, &["queueId", "queue_id"])
-            .ok_or_else(|| "missing queue id".to_string())?
-            .to_string(),
+    let queue_id = string_field(value, &["queueId", "queue_id"])
+        .ok_or_else(|| "missing queue id".to_string())?
+        .to_string();
+    let admission_queue_id =
+        string_field(value, &["admissionQueueId", "admission_queue_id"]).map(ToString::to_string);
+    let coordinator_resume = coordinator_resume_metadata_from_value(value, &queue_id)?;
+    let queue_schema = string_field(value, &["schema"]).unwrap_or_default();
+    if !queue_schema.is_empty()
+        && queue_schema != "agent-harness.runtime-queue-item.v1"
+        && queue_schema != "agent-harness.runtime-queue-item.v2"
+    {
+        return Err(format!("unsupported runtime queue schema `{queue_schema}`"));
+    }
+    let authorized_execution_mode = value
+        .get("authorizedExecutionMode")
+        .or_else(|| value.get("authorized_execution_mode"))
+        .map(|raw| {
+            serde_json::from_value::<AuthorizedExecutionModeSnapshotV2>(raw.clone())
+                .map_err(|error| format!("invalid authorized execution-mode snapshot: {error}"))
+        })
+        .transpose()?;
+    let is_v2 = queue_schema == "agent-harness.runtime-queue-item.v2";
+    let has_admission_queue_id = admission_queue_id.is_some();
+    let has_execution_snapshot = authorized_execution_mode.is_some();
+    if is_v2 && !has_admission_queue_id && (has_execution_snapshot || coordinator_resume.is_none())
+    {
+        return Err("runtime queue item v2 is missing admissionQueueId".to_string());
+    }
+    if is_v2 && !has_execution_snapshot && (has_admission_queue_id || coordinator_resume.is_none())
+    {
+        return Err("runtime queue item v2 is missing authorizedExecutionMode".to_string());
+    }
+    if queue_schema == "agent-harness.runtime-queue-item.v1"
+        && (has_admission_queue_id || has_execution_snapshot)
+    {
+        return Err("runtime queue item v1 must not carry V2 admission fields".to_string());
+    }
+    let origin = string_field(value, &["origin"])
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            if platform == "native-cron" {
+                "cron-scheduler".to_string()
+            } else {
+                "channel".to_string()
+            }
+        });
+    if (origin == "coordinator-resume") != coordinator_resume.is_some() {
+        return Err(
+            "coordinator-resume origin and typed coordinatorResume metadata must appear together"
+                .to_string(),
+        );
+    }
+    let pending = PendingQueueItem {
+        queue_id,
+        admission_queue_id,
         created_at_ms: i64_field(value, &["createdAtMs", "created_at_ms"]).unwrap_or(0),
         agent_id: string_field(value, &["agentId", "agent_id"])
             .ok_or_else(|| "missing agent id".to_string())?
@@ -3280,15 +3908,7 @@ fn parse_pending_item(value: &Value) -> Result<PendingQueueItem, String> {
             .ok_or_else(|| "missing session key".to_string())?
             .to_string(),
         runtime_class,
-        origin: string_field(value, &["origin"])
-            .map(ToString::to_string)
-            .unwrap_or_else(|| {
-                if platform == "native-cron" {
-                    "cron-scheduler".to_string()
-                } else {
-                    "channel".to_string()
-                }
-            }),
+        origin,
         cron_run_id: string_field(value, &["cronRunId", "cron_run_id"]).map(ToString::to_string),
         scheduled_for_ms: i64_field(value, &["scheduledForMs", "scheduled_for_ms"]),
         platform,
@@ -3317,6 +3937,7 @@ fn parse_pending_item(value: &Value) -> Result<PendingQueueItem, String> {
         model,
         reasoning_preference,
         backend_reasoning_policy,
+        authorized_execution_mode,
         planned_transcript_file: path_field(
             value,
             &["plannedTranscriptFile", "planned_transcript_file"],
@@ -3329,7 +3950,193 @@ fn parse_pending_item(value: &Value) -> Result<PendingQueueItem, String> {
         .ok_or_else(|| "missing planned trajectory file".to_string())?,
         selected_skill_ids: string_array_field(value, &["selectedSkillIds", "selected_skill_ids"]),
         continuation: continuation_metadata_from_value(value),
-    })
+        coordinator_resume,
+    };
+    revalidate_pending_execution_snapshot(&pending)?;
+    Ok(pending)
+}
+
+fn revalidate_pending_execution_snapshot(item: &PendingQueueItem) -> Result<(), String> {
+    let Some(snapshot) = &item.authorized_execution_mode else {
+        return Ok(());
+    };
+    snapshot
+        .validate()
+        .map_err(|error| format!("invalid authorized execution-mode snapshot: {error}"))?;
+    if snapshot.effective_mode() != STANDARD_EXECUTION_MODE {
+        return Err(format!(
+            "non-standard execution mode is not supported in this release: {}",
+            snapshot.effective_mode()
+        ));
+    }
+    if let Some(ReasoningPreference::Explicit { effort }) = &item.reasoning_preference
+        && is_reserved_execution_mode_effort(effort)
+    {
+        return Err(
+            "Ultra is reserved for execution mode and cannot be reasoning effort".to_string(),
+        );
+    }
+    if let Some(policy) = &item.backend_reasoning_policy
+        && is_reserved_execution_mode_effort(policy.effective_effort())
+    {
+        return Err("backend reasoning policy must not encode Ultra execution mode".to_string());
+    }
+    if let Some(execution_agent_id) = snapshot.execution_agent_id()
+        && execution_agent_id != item.agent_id
+    {
+        return Err(format!(
+            "execution snapshot agent mismatch: authorized `{execution_agent_id}`, queued `{}`",
+            item.agent_id
+        ));
+    }
+    if snapshot.effective_mode() == STANDARD_EXECUTION_MODE && snapshot.result_owner().is_none() {
+        return Ok(());
+    }
+    if snapshot.execution_agent_id().is_none() {
+        return Err("non-standard execution snapshot is missing execution agent".to_string());
+    }
+    let owner = snapshot.result_owner().ok_or_else(|| {
+        "non-standard execution snapshot is missing exact result owner".to_string()
+    })?;
+    let admission_queue_id = item.admission_queue_id.as_deref().ok_or_else(|| {
+        "authorized execution snapshot is missing immutable admissionQueueId".to_string()
+    })?;
+    if owner.source_queue_id != admission_queue_id {
+        return Err(
+            "execution snapshot owner is not bound to immutable admissionQueueId".to_string(),
+        );
+    }
+    if item.origin == "channel" {
+        let lane = &owner.lane;
+        let account_id = item
+            .account_id
+            .as_deref()
+            .ok_or_else(|| "execution snapshot requires exact queued accountId".to_string())?;
+        let root_session = root_working_session_key(&item.session_key);
+        let expected_virtual_session_id = derive_virtual_session_id(
+            &item.platform,
+            &item.channel_id,
+            &item.user_id,
+            &item.agent_id,
+            &root_session,
+        );
+        if owner.virtual_session_id != expected_virtual_session_id {
+            return Err("execution snapshot virtualSessionId mismatch".to_string());
+        }
+        let observed = [
+            ("platform", lane.platform(), item.platform.as_str()),
+            ("accountId", lane.account_id(), account_id),
+            ("channelId", lane.channel_id(), item.channel_id.as_str()),
+            ("userId", lane.user_id(), item.user_id.as_str()),
+            ("agentId", lane.agent_id(), item.agent_id.as_str()),
+            (
+                "runtimeClass",
+                lane.runtime_class(),
+                item.runtime_class.as_str(),
+            ),
+            (
+                "rootSession",
+                lane.root_virtual_session(),
+                root_session.as_str(),
+            ),
+            (
+                "concreteSession",
+                lane.concrete_session(),
+                item.session_key.as_str(),
+            ),
+        ];
+        if let Some((axis, expected, actual)) = observed
+            .into_iter()
+            .find(|(_, expected, actual)| expected != actual)
+        {
+            return Err(format!(
+                "execution snapshot {axis} mismatch: expected `{expected}`, queued `{actual}`"
+            ));
+        }
+        if owner.parent_queue_id.as_deref() != Some(admission_queue_id) {
+            return Err(
+                "channel execution snapshot parent is not bound to admissionQueueId".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn coordinator_resume_metadata_from_value(
+    value: &Value,
+    queue_id: &str,
+) -> Result<Option<crate::coordinator_resume::CoordinatorResumeMetadataV1>, String> {
+    let Some(raw) = value
+        .get("coordinatorResume")
+        .or_else(|| value.get("coordinator_resume"))
+    else {
+        return Ok(None);
+    };
+    let metadata =
+        serde_json::from_value::<crate::coordinator_resume::CoordinatorResumeMetadataV1>(
+            raw.clone(),
+        )
+        .map_err(|error| format!("invalid coordinator resume metadata: {error}"))?;
+    metadata
+        .validate()
+        .map_err(|error| format!("invalid coordinator resume metadata: {error}"))?;
+    if metadata.continuation_queue_id != queue_id {
+        return Err(format!(
+            "coordinator resume continuationQueueId {} does not match queueId {queue_id}",
+            metadata.continuation_queue_id
+        ));
+    }
+    Ok(Some(metadata))
+}
+
+fn consume_coordinator_resume_after_lease(
+    harness_home: &Path,
+    pending: &PendingQueueItem,
+    now_ms: i64,
+) -> io::Result<()> {
+    let Some(metadata) = &pending.coordinator_resume else {
+        return Ok(());
+    };
+    if pending.origin != "coordinator-resume" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "typed coordinator resume metadata requires coordinator-resume origin",
+        ));
+    }
+    metadata.validate().map_err(io::Error::other)?;
+    if metadata.continuation_queue_id != pending.queue_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "coordinator resume queue identity changed before lease acceptance",
+        ));
+    }
+    let db_file = crate::worker_db_file(harness_home);
+    let mut conn = rusqlite::Connection::open(&db_file).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "could not open worker DB for coordinator resume {}: {error}",
+                db_file.display()
+            ),
+        )
+    })?;
+    let transaction = conn.transaction().map_err(io::Error::other)?;
+    crate::worker_resume::consume_resume_intent_in_transaction(
+        &transaction,
+        &metadata.owner,
+        &metadata.intent_id,
+        &metadata.continuation_queue_id,
+        now_ms,
+    )
+    .map_err(io::Error::other)?;
+    crate::worker_coordination::mark_worker_coordinator_wait_consumed_in_transaction(
+        &transaction,
+        &metadata.wait_id,
+        &metadata.intent_id,
+        now_ms,
+    )
+    .map_err(io::Error::other)?;
+    transaction.commit().map_err(io::Error::other)
 }
 
 fn parse_pending_reasoning_snapshot(
@@ -3611,7 +4418,8 @@ fn maybe_apply_context_rollover_before_turn(
     now_ms: i64,
     warnings: &mut Vec<String>,
 ) -> io::Result<PendingQueueItem> {
-    if pending.runtime_class != "interactive" || pending.origin != "channel" {
+    if pending.runtime_class != "interactive" || !runtime_origin_is_parent_channel(&pending.origin)
+    {
         return Ok(pending);
     }
 
@@ -3718,6 +4526,94 @@ mod tests {
         })
     }
 
+    fn queued_ultra_v2_value(queue_id: &str, admission_queue_id: &str) -> Value {
+        let session_key = "telegram:dm:user:main";
+        let lane = crate::lane::FullLaneKeyV1::new(
+            "telegram",
+            "primary",
+            "dm",
+            "user",
+            "main",
+            "interactive",
+            session_key,
+            session_key,
+        )
+        .unwrap();
+        let owner = crate::worker_result_mailbox::ExactWorkerResultOwnerV1::new(
+            lane,
+            derive_virtual_session_id("telegram", "dm", "user", "main", session_key),
+            None,
+            Some(admission_queue_id.to_string()),
+            admission_queue_id,
+            None,
+            None,
+        )
+        .unwrap();
+        let preference = crate::execution_mode::ExecutionModePreference::explicit("ultra").unwrap();
+        let policy = crate::execution_mode::ExecutionModePolicyV1::new(
+            crate::execution_mode::ExecutionModeSource::ChildAdmission,
+            &preference,
+            "ultra",
+            "main",
+            "auth-v1",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            2,
+            6,
+            300_000,
+        )
+        .unwrap();
+        let readiness = crate::execution_mode::SafeResumeReadinessReceiptV1::new(
+            &owner,
+            "durability-v1",
+            true,
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+        let snapshot = crate::execution_mode::AuthorizedExecutionModeSnapshotV2::new(
+            preference,
+            Some(policy),
+            Some(crate::worker_result_mailbox::WorkerResultOwnerV1::Exact(
+                owner,
+            )),
+            Some(readiness),
+        )
+        .unwrap();
+        let mut value = queued_item_value(queue_id);
+        let object = value.as_object_mut().unwrap();
+        object.insert(
+            "schema".to_string(),
+            Value::String("agent-harness.runtime-queue-item.v2".to_string()),
+        );
+        object.insert(
+            "admissionQueueId".to_string(),
+            Value::String(admission_queue_id.to_string()),
+        );
+        object.insert(
+            "accountId".to_string(),
+            Value::String("primary".to_string()),
+        );
+        object.insert(
+            "authorizedExecutionMode".to_string(),
+            serde_json::to_value(snapshot).unwrap(),
+        );
+        value
+    }
+
+    #[test]
+    fn pending_v2_rejects_non_standard_execution_snapshot() {
+        let error = parse_pending_item(&queued_ultra_v2_value(
+            "retry:attempt-2",
+            "turn:admission-1",
+        ))
+        .unwrap_err();
+        assert!(
+            error.contains("non-standard execution mode is not supported"),
+            "{error}"
+        );
+    }
+
     fn exact_reasoning_policy(effort: &str) -> BackendReasoningPolicyV1 {
         BackendReasoningPolicyV1::new(
             crate::backend_reasoning::BackendReasoningSource::ChannelCommand,
@@ -3814,6 +4710,20 @@ mod tests {
             Value::String("gpt-5.6-luna".to_string()),
         );
         assert!(parse_pending_item(&wrong_route).is_err());
+    }
+
+    #[test]
+    fn pending_queue_parser_rejects_unknown_schema_version() {
+        let mut future = queued_item_value("future-schema");
+        future.as_object_mut().unwrap().insert(
+            "schema".to_string(),
+            Value::String("agent-harness.runtime-queue-item.v99".to_string()),
+        );
+        let error = parse_pending_item(&future).unwrap_err();
+        assert!(
+            error.contains("unsupported runtime queue schema"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -3930,6 +4840,274 @@ mod tests {
             serde_json::to_value(legacy).unwrap(),
             Value::String("pid:0".to_string())
         );
+    }
+
+    #[test]
+    fn runtime_queue_lease_observation_distinguishes_released_active_expired_and_dead_owner() {
+        let root = temp_root("runtime_queue_lease_observation_states");
+        let harness_home = root.join(".agent-harness");
+        let queue_id = "queue-observation";
+        let observed_at_ms = 10_000;
+
+        let released = observe_runtime_queue_lease(RuntimeQueueLeaseObservationOptions {
+            harness_home: harness_home.clone(),
+            queue_id: queue_id.to_string(),
+            observed_at_ms,
+        });
+        assert_eq!(released.queue_id, queue_id);
+        assert_eq!(
+            released.status,
+            RuntimeQueueLeaseObservationStatus::Released
+        );
+        assert_eq!(released.observed_at_ms, observed_at_ms);
+
+        write_observation_lease(
+            &harness_home,
+            "interactive",
+            queue_id,
+            observed_at_ms + 1_000,
+            RuntimeQueueLeaseOwner::Legacy(format!("pid:{}", std::process::id())),
+        );
+        let active = observe_runtime_queue_lease(RuntimeQueueLeaseObservationOptions {
+            harness_home: harness_home.clone(),
+            queue_id: queue_id.to_string(),
+            observed_at_ms,
+        });
+        assert_eq!(active.status, RuntimeQueueLeaseObservationStatus::Active);
+        assert_eq!(active.runtime_class.as_deref(), Some("interactive"));
+
+        write_observation_lease(
+            &harness_home,
+            "interactive",
+            queue_id,
+            observed_at_ms,
+            RuntimeQueueLeaseOwner::Legacy(format!("pid:{}", std::process::id())),
+        );
+        let expired = observe_runtime_queue_lease(RuntimeQueueLeaseObservationOptions {
+            harness_home: harness_home.clone(),
+            queue_id: queue_id.to_string(),
+            observed_at_ms,
+        });
+        assert_eq!(expired.status, RuntimeQueueLeaseObservationStatus::Expired);
+
+        write_observation_lease(
+            &harness_home,
+            "interactive",
+            queue_id,
+            observed_at_ms + 1_000,
+            RuntimeQueueLeaseOwner::Legacy("pid:0".to_string()),
+        );
+        let dead = observe_runtime_queue_lease(RuntimeQueueLeaseObservationOptions {
+            harness_home: harness_home.clone(),
+            queue_id: queue_id.to_string(),
+            observed_at_ms,
+        });
+        assert_eq!(dead.status, RuntimeQueueLeaseObservationStatus::DeadOwner);
+        assert!(dead.reason.contains("non-running"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_queue_lease_observation_fails_closed_for_malformed_and_unreadable_state() {
+        for (label, make_bad_state) in [("malformed", false), ("unreadable", true)] {
+            let root = temp_root(&format!("runtime_queue_lease_observation_{label}"));
+            let harness_home = root.join(".agent-harness");
+            let queue_dir = queue_dir(&harness_home);
+            let leases_file = runtime_queue_leases_file(&queue_dir, "interactive");
+            fs::create_dir_all(leases_file.parent().unwrap()).unwrap();
+            if make_bad_state {
+                fs::create_dir_all(&leases_file).unwrap();
+            } else {
+                fs::write(&leases_file, "{malformed").unwrap();
+            }
+
+            let receipt = observe_runtime_queue_lease(RuntimeQueueLeaseObservationOptions {
+                harness_home: harness_home.clone(),
+                queue_id: "queue-unknown".to_string(),
+                observed_at_ms: 10_000,
+            });
+            assert_eq!(receipt.status, RuntimeQueueLeaseObservationStatus::Unknown);
+            assert!(receipt.reason.contains("interactive"));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn runtime_queue_lease_observation_fails_closed_when_any_class_lock_is_busy() {
+        let root = temp_root("runtime_queue_lease_observation_lock_busy");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let _held_lock = create_runtime_queue_lease_lock(
+            &runtime_queue_lease_lock_file(&queue_dir, "interactive"),
+            10_000,
+        )
+        .unwrap();
+
+        let receipt = observe_runtime_queue_lease(RuntimeQueueLeaseObservationOptions {
+            harness_home: harness_home.clone(),
+            queue_id: "queue-lock-busy".to_string(),
+            observed_at_ms: 10_001,
+        });
+        assert_eq!(receipt.status, RuntimeQueueLeaseObservationStatus::Unknown);
+        assert!(receipt.reason.contains("lock is busy"));
+
+        drop(_held_lock);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exact_lane_activity_observation_is_virtual_session_scoped_and_fail_closed() {
+        let root = temp_root("exact_lane_activity_observation");
+        let harness_home = root.join(".agent-harness");
+        let session_key = "telegram:account-a:channel-a:user-a:main";
+        let virtual_session_id =
+            derive_virtual_session_id("telegram", "channel-a", "user-a", "main", session_key);
+        let owner = crate::worker_result_mailbox::ExactWorkerResultOwnerV1::new(
+            FullLaneKeyV1::new(
+                "telegram",
+                "account-a",
+                "channel-a",
+                "user-a",
+                "main",
+                "interactive",
+                session_key,
+                session_key,
+            )
+            .unwrap(),
+            virtual_session_id,
+            None,
+            Some("parent-queue".to_string()),
+            "child-queue",
+            None,
+            None,
+        )
+        .unwrap();
+
+        write_observation_lease(
+            &harness_home,
+            "interactive",
+            "newer-queue",
+            20_000,
+            RuntimeQueueLeaseOwner::Legacy(format!("pid:{}", std::process::id())),
+        );
+        let active =
+            observe_runtime_queue_lane_activity(RuntimeQueueLaneActivityObservationOptions {
+                harness_home: harness_home.clone(),
+                owner: owner.clone(),
+                observed_at_ms: 10_000,
+            });
+        assert!(active.lane_active);
+        assert!(active.blocker_reason.unwrap().contains("newer-queue"));
+
+        let mut other_virtual_session_owner = owner.clone();
+        other_virtual_session_owner.virtual_session_id = "different-virtual-session".to_string();
+        let other_virtual_session =
+            observe_runtime_queue_lane_activity(RuntimeQueueLaneActivityObservationOptions {
+                harness_home: harness_home.clone(),
+                owner: other_virtual_session_owner,
+                observed_at_ms: 10_000,
+            });
+        assert!(!other_virtual_session.lane_active);
+
+        let queue_dir = queue_dir(&harness_home);
+        fs::write(
+            runtime_queue_leases_file(&queue_dir, "interactive"),
+            "{malformed",
+        )
+        .unwrap();
+        let unknown =
+            observe_runtime_queue_lane_activity(RuntimeQueueLaneActivityObservationOptions {
+                harness_home: harness_home.clone(),
+                owner,
+                observed_at_ms: 10_001,
+            });
+        assert!(unknown.lane_active);
+        assert!(unknown.blocker_reason.unwrap().contains("unknown"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exact_lane_activity_observation_fails_closed_when_a_class_lock_is_busy() {
+        let root = temp_root("exact_lane_activity_observation_lock_busy");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let _held_lock = create_runtime_queue_lease_lock(
+            &runtime_queue_lease_lock_file(&queue_dir, "interactive"),
+            10_000,
+        )
+        .unwrap();
+        let session_key = "telegram:account-a:channel-a:user-a:main";
+        let owner = crate::worker_result_mailbox::ExactWorkerResultOwnerV1::new(
+            FullLaneKeyV1::new(
+                "telegram",
+                "account-a",
+                "channel-a",
+                "user-a",
+                "main",
+                "interactive",
+                session_key,
+                session_key,
+            )
+            .unwrap(),
+            derive_virtual_session_id("telegram", "channel-a", "user-a", "main", session_key),
+            None,
+            Some("parent-queue".to_string()),
+            "child-queue",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let receipt =
+            observe_runtime_queue_lane_activity(RuntimeQueueLaneActivityObservationOptions {
+                harness_home: harness_home.clone(),
+                owner,
+                observed_at_ms: 10_001,
+            });
+        assert!(receipt.lane_active);
+        assert!(receipt.blocker_reason.unwrap().contains("lock is busy"));
+
+        drop(_held_lock);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_observation_lease(
+        harness_home: &Path,
+        runtime_class: &str,
+        queue_id: &str,
+        lease_expires_at_ms: i64,
+        owner: RuntimeQueueLeaseOwner,
+    ) {
+        let queue_dir = queue_dir(harness_home);
+        let mut state = RuntimeQueueLeaseState {
+            schema: runtime_queue_leases_schema(),
+            leases: BTreeMap::new(),
+        };
+        state.leases.insert(
+            queue_id.to_string(),
+            RuntimeQueueLease {
+                queue_id: queue_id.to_string(),
+                agent_id: "main".to_string(),
+                runtime_class: runtime_class.to_string(),
+                origin: "channel".to_string(),
+                cron_run_id: None,
+                platform: "telegram".to_string(),
+                account_id: Some("account-a".to_string()),
+                channel_id: "channel-a".to_string(),
+                user_id: Some("user-a".to_string()),
+                session_key: "telegram:account-a:channel-a:user-a:main".to_string(),
+                virtual_session_id: None,
+                session_lane_key: None,
+                owner,
+                started_at_ms: 9_000,
+                lease_expires_at_ms,
+            },
+        );
+        write_runtime_queue_leases(&queue_dir, runtime_class, &state).unwrap();
     }
 
     #[test]
@@ -4889,6 +6067,7 @@ mod tests {
                 channel_id: "dm-42".to_string(),
                 user_id: Some("user-7".to_string()),
                 session_key: "telegram:dm-42:user-7:main".to_string(),
+                virtual_session_id: None,
                 session_lane_key: None,
                 owner: RuntimeQueueLeaseOwner::Envelope(RuntimeQueueLeaseOwnerEnvelope {
                     kind: "supervisor-child".to_string(),
@@ -5206,6 +6385,7 @@ mod tests {
         .unwrap();
         let pending = PendingQueueItem {
             queue_id: "queue-1".to_string(),
+            admission_queue_id: None,
             created_at_ms: 1234,
             agent_id: "main".to_string(),
             session_key: old_session.to_string(),
@@ -5224,6 +6404,7 @@ mod tests {
             model: None,
             reasoning_preference: None,
             backend_reasoning_policy: None,
+            authorized_execution_mode: None,
             source_home: root.join(".openclaw"),
             source_workspace: root.join(".openclaw").join("workspace"),
             runtime_workspace: None,
@@ -5231,6 +6412,7 @@ mod tests {
             planned_trajectory_file: PathBuf::from("old.trajectory.jsonl"),
             selected_skill_ids: Vec::new(),
             continuation: RuntimeContinuationMetadata::legacy(),
+            coordinator_resume: None,
         };
 
         let error = maybe_apply_context_rollover_before_turn(
@@ -5414,6 +6596,7 @@ mod tests {
                 channel_id: "tg-dm".to_string(),
                 user_id: Some("user-7".to_string()),
                 session_key: "main:telegram:tg-dm".to_string(),
+                virtual_session_id: None,
                 session_lane_key: None,
                 owner: RuntimeQueueLeaseOwner::Legacy("legacy-worker".to_string()),
                 started_at_ms: now_ms,
@@ -5484,6 +6667,7 @@ mod tests {
                 channel_id: "tg-dm".to_string(),
                 user_id: Some("user-7".to_string()),
                 session_key: "main:telegram:tg-dm".to_string(),
+                virtual_session_id: None,
                 session_lane_key: None,
                 owner: RuntimeQueueLeaseOwner::Legacy("pid:0".to_string()),
                 started_at_ms: now_ms,
@@ -5538,6 +6722,7 @@ mod tests {
                 channel_id: "tg-dm".to_string(),
                 user_id: Some("user-7".to_string()),
                 session_key: "main:telegram:tg-dm".to_string(),
+                virtual_session_id: None,
                 session_lane_key: None,
                 owner: RuntimeQueueLeaseOwner::Envelope(RuntimeQueueLeaseOwnerEnvelope {
                     kind: "supervisor-child".to_string(),
@@ -5564,6 +6749,7 @@ mod tests {
                 channel_id: "tg-dm".to_string(),
                 user_id: Some("user-7".to_string()),
                 session_key: "main:telegram:tg-dm".to_string(),
+                virtual_session_id: None,
                 session_lane_key: None,
                 owner: RuntimeQueueLeaseOwner::Envelope(RuntimeQueueLeaseOwnerEnvelope {
                     kind: "supervisor-child".to_string(),
@@ -6155,6 +7341,7 @@ mod tests {
     fn pending_cron_item(queue_id: &str, agent_id: &str, created_at_ms: i64) -> PendingQueueItem {
         PendingQueueItem {
             queue_id: queue_id.to_string(),
+            admission_queue_id: None,
             created_at_ms,
             agent_id: agent_id.to_string(),
             session_key: format!("cron:{agent_id}:{queue_id}:{created_at_ms}"),
@@ -6176,11 +7363,528 @@ mod tests {
             model: None,
             reasoning_preference: None,
             backend_reasoning_policy: None,
+            authorized_execution_mode: None,
             planned_transcript_file: PathBuf::from(format!("{queue_id}.jsonl")),
             planned_trajectory_file: PathBuf::from(format!("{queue_id}.trajectory.jsonl")),
             selected_skill_ids: Vec::new(),
             continuation: RuntimeContinuationMetadata::legacy(),
+            coordinator_resume: None,
         }
+    }
+
+    #[test]
+    fn prompt_runtime_context_uses_exact_lane_and_codex_thread_generation() {
+        let root = temp_root("prompt_runtime_context_exact_lane_generation");
+        fs::create_dir_all(&root).unwrap();
+        let transcript = root.join("session.jsonl");
+        let binding = root.join("session.jsonl.codex-app-server.json");
+        fs::write(&binding, r#"{"threadId":"thread-a"}"#).unwrap();
+
+        let mut pending = pending_cron_item("queue-a", "main", 1234);
+        pending.platform = "telegram".to_string();
+        pending.account_id = Some("account-a".to_string());
+        pending.channel_id = "channel-a".to_string();
+        pending.user_id = "user-a".to_string();
+        pending.runtime_class = "interactive".to_string();
+        pending.session_key = "telegram:dm:user-a:main".to_string();
+        pending.planned_transcript_file = transcript;
+
+        let mut warnings = Vec::new();
+        let (main_lane, main_generation) =
+            derive_prompt_runtime_context(&pending, &mut warnings).unwrap();
+        assert!(warnings.is_empty());
+        assert!(main_lane.is_some());
+        assert_eq!(main_generation, "codex-thread:thread-a:policy=unmanaged");
+
+        let mut sibling = pending.clone();
+        sibling.agent_id = "reviewer".to_string();
+        let (sibling_lane, _) = derive_prompt_runtime_context(&sibling, &mut warnings).unwrap();
+        assert_ne!(main_lane, sibling_lane);
+
+        fs::write(&binding, r#"{"threadId":"thread-b"}"#).unwrap();
+        let (_, rebound_generation) =
+            derive_prompt_runtime_context(&pending, &mut warnings).unwrap();
+        assert_eq!(rebound_generation, "codex-thread:thread-b:policy=unmanaged");
+
+        fs::remove_file(&binding).unwrap();
+        let (_, unbound_generation) =
+            derive_prompt_runtime_context(&pending, &mut warnings).unwrap();
+        assert_eq!(unbound_generation, "codex-unbound:queue-a:policy=unmanaged");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_prompt_manifest_isolated_by_full_lane_root_and_backend_generation() {
+        let root = temp_root("prepare_prompt_manifest_full_lane_root_generation");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::write(source.workspace.join("SOUL.md"), "# Soul prompt v1").unwrap();
+        fs::write(
+            source.workspace.join("MEMORY.md"),
+            "# Main agent persistent memory policy",
+        )
+        .unwrap();
+        let reviewer_home = source.home.join("agents").join("reviewer");
+        fs::create_dir_all(reviewer_home.join("sessions")).unwrap();
+        fs::create_dir_all(reviewer_home.join("workspace")).unwrap();
+        fs::write(
+            reviewer_home.join("workspace").join("AGENTS.md"),
+            "# Reviewer agent prompt",
+        )
+        .unwrap();
+        fs::write(
+            reviewer_home.join("workspace").join("MEMORY.md"),
+            "# Reviewer-only persistent memory policy",
+        )
+        .unwrap();
+        fs::write(reviewer_home.join("sessions").join("sessions.json"), "{}").unwrap();
+        fs::write(
+            source.home.join("openclaw.json"),
+            r#"{
+              "agents": {
+                "defaults": { "provider": "openai", "model": "codex" },
+                "list": [
+                  { "id": "main", "model": "gpt-5", "enabled": true },
+                  { "id": "reviewer", "model": "gpt-5", "enabled": true }
+                ]
+              },
+              "models": {
+                "providers": {
+                  "openai": { "apiKey": "${OPENAI_API_KEY}" }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let old_root_lane = FullLaneKeyV1::new(
+            "telegram",
+            "account-a",
+            "dm-a",
+            "user-a",
+            "main",
+            "interactive",
+            "session-root-a",
+            "session-root-a",
+        )
+        .unwrap();
+        crate::operation_plan::create_operation_plan_v2(
+            crate::operation_plan::CreateOperationPlanOptionsV2 {
+                options: crate::operation_plan::CreateOperationPlanOptions {
+                    harness_home: harness_home.clone(),
+                    plan_id: "old-root-plan".to_string(),
+                    origin_queue_id: None,
+                    session_key: "session-root-a".to_string(),
+                    agent_id: "main".to_string(),
+                    goal: "old root only".to_string(),
+                    acceptance_criteria: None,
+                    constraints: None,
+                    max_open_items: None,
+                    max_fanout: None,
+                    now_ms: 1_000,
+                },
+                lane_digest: old_root_lane.identity_hash().unwrap(),
+            },
+        )
+        .unwrap();
+
+        let first = enqueue_and_prepare_prompt_manifest(
+            &source,
+            &harness_home,
+            "telegram",
+            "account-a",
+            "dm-a",
+            "user-a",
+            "main",
+            "session-root-a",
+            "thread-a",
+            2_000,
+        );
+        let first_agents = prompt_manifest_entry(&first.manifest, "AGENTS.md");
+        assert_eq!(
+            first_agents.status,
+            crate::AgentPromptManifestStatusV1::Included
+        );
+        assert_eq!(
+            first_agents.change,
+            Some(crate::AgentPromptManifestChangeV1::Added)
+        );
+        let first_memory = prompt_manifest_entry(&first.manifest, "MEMORY.md");
+        assert_eq!(
+            first_memory.status,
+            crate::AgentPromptManifestStatusV1::Included
+        );
+        assert!(
+            first
+                .markdown
+                .contains("Main agent persistent memory policy")
+        );
+        assert!(first.markdown.contains("planId=old-root-plan"));
+        assert_eq!(
+            first.manifest.backend_context_generation.as_deref(),
+            Some("codex-thread:thread-a:policy=unmanaged")
+        );
+
+        let unchanged = enqueue_and_prepare_prompt_manifest(
+            &source,
+            &harness_home,
+            "telegram",
+            "account-a",
+            "dm-a",
+            "user-a",
+            "main",
+            "session-root-a",
+            "thread-a",
+            2_001,
+        );
+        assert_eq!(first.manifest.lane_digest, unchanged.manifest.lane_digest);
+        let unchanged_agents = prompt_manifest_entry(&unchanged.manifest, "AGENTS.md");
+        assert_eq!(
+            unchanged_agents.status,
+            crate::AgentPromptManifestStatusV1::Reused
+        );
+        assert_eq!(unchanged_agents.change, None);
+
+        fs::write(source.workspace.join("AGENTS.md"), "# Agent prompt v2").unwrap();
+        let modified = enqueue_and_prepare_prompt_manifest(
+            &source,
+            &harness_home,
+            "telegram",
+            "account-a",
+            "dm-a",
+            "user-a",
+            "main",
+            "session-root-a",
+            "thread-a",
+            2_002,
+        );
+        let modified_agents = prompt_manifest_entry(&modified.manifest, "AGENTS.md");
+        assert_eq!(
+            modified_agents.status,
+            crate::AgentPromptManifestStatusV1::Included
+        );
+        assert_eq!(
+            modified_agents.change,
+            Some(crate::AgentPromptManifestChangeV1::Modified)
+        );
+
+        let rebound = enqueue_and_prepare_prompt_manifest(
+            &source,
+            &harness_home,
+            "telegram",
+            "account-a",
+            "dm-a",
+            "user-a",
+            "main",
+            "session-root-a",
+            "thread-b",
+            2_003,
+        );
+        let rebound_agents = prompt_manifest_entry(&rebound.manifest, "AGENTS.md");
+        assert_eq!(
+            rebound_agents.status,
+            crate::AgentPromptManifestStatusV1::Included
+        );
+        assert_eq!(
+            rebound_agents.change,
+            Some(crate::AgentPromptManifestChangeV1::BackendContextGenerationChanged)
+        );
+        assert_eq!(
+            rebound.manifest.backend_context_generation.as_deref(),
+            Some("codex-thread:thread-b:policy=unmanaged")
+        );
+
+        fs::remove_file(source.workspace.join("SOUL.md")).unwrap();
+        let removed = enqueue_and_prepare_prompt_manifest(
+            &source,
+            &harness_home,
+            "telegram",
+            "account-a",
+            "dm-a",
+            "user-a",
+            "main",
+            "session-root-a",
+            "thread-b",
+            2_004,
+        );
+        let removed_soul = prompt_manifest_entry(&removed.manifest, "SOUL.md");
+        assert_eq!(
+            removed_soul.status,
+            crate::AgentPromptManifestStatusV1::Removed
+        );
+        assert_eq!(
+            removed_soul.change,
+            Some(crate::AgentPromptManifestChangeV1::Removed)
+        );
+
+        let baseline_digest = removed.manifest.lane_digest.clone().unwrap();
+        let variants = [
+            (
+                "platform",
+                "discord",
+                "account-a",
+                "dm-a",
+                "user-a",
+                "main",
+                "session-root-a",
+            ),
+            (
+                "account",
+                "telegram",
+                "account-b",
+                "dm-a",
+                "user-a",
+                "main",
+                "session-root-a",
+            ),
+            (
+                "channel",
+                "telegram",
+                "account-a",
+                "dm-b",
+                "user-a",
+                "main",
+                "session-root-a",
+            ),
+            (
+                "user",
+                "telegram",
+                "account-a",
+                "dm-a",
+                "user-b",
+                "main",
+                "session-root-a",
+            ),
+            (
+                "agent",
+                "telegram",
+                "account-a",
+                "dm-a",
+                "user-a",
+                "reviewer",
+                "session-root-a",
+            ),
+            (
+                "concrete-session",
+                "telegram",
+                "account-a",
+                "dm-a",
+                "user-a",
+                "main",
+                "session-root-a:cont-1",
+            ),
+            (
+                "new-root",
+                "telegram",
+                "account-a",
+                "dm-a",
+                "user-a",
+                "main",
+                "session-root-b",
+            ),
+        ];
+        let mut lane_digests = std::collections::BTreeSet::from([baseline_digest.clone()]);
+        for (index, (axis, platform, account, channel, user, agent, session)) in
+            variants.into_iter().enumerate()
+        {
+            let prepared = enqueue_and_prepare_prompt_manifest(
+                &source,
+                &harness_home,
+                platform,
+                account,
+                channel,
+                user,
+                agent,
+                session,
+                "thread-b",
+                2_100 + index as i64,
+            );
+            let digest = prepared.manifest.lane_digest.clone().unwrap();
+            assert!(
+                lane_digests.insert(digest),
+                "{axis} must select a distinct exact-lane prompt ledger"
+            );
+            let agents = prompt_manifest_entry(&prepared.manifest, "AGENTS.md");
+            assert_eq!(
+                agents.status,
+                crate::AgentPromptManifestStatusV1::Included,
+                "{axis} must not inherit the baseline prompt ledger"
+            );
+            assert_eq!(
+                agents.change,
+                Some(crate::AgentPromptManifestChangeV1::Added),
+                "{axis} must start with an independent manifest"
+            );
+            if axis == "new-root" {
+                assert!(!prepared.markdown.contains("planId=old-root-plan"));
+                assert!(
+                    prepared
+                        .markdown
+                        .contains("Active OperationPlans: none visible")
+                );
+            }
+            if axis == "agent" {
+                assert_eq!(
+                    prompt_manifest_entry(&prepared.manifest, "MEMORY.md").status,
+                    crate::AgentPromptManifestStatusV1::Included
+                );
+                assert!(
+                    prepared
+                        .markdown
+                        .contains("Reviewer-only persistent memory policy")
+                );
+                assert!(
+                    !prepared
+                        .markdown
+                        .contains("Main agent persistent memory policy")
+                );
+            }
+        }
+
+        let after_sibling = enqueue_and_prepare_prompt_manifest(
+            &source,
+            &harness_home,
+            "telegram",
+            "account-a",
+            "dm-a",
+            "user-a",
+            "main",
+            "session-root-a",
+            "thread-b",
+            2_200,
+        );
+        assert_eq!(
+            after_sibling.manifest.lane_digest.as_deref(),
+            Some(baseline_digest.as_str())
+        );
+        assert_eq!(
+            prompt_manifest_entry(&after_sibling.manifest, "AGENTS.md").status,
+            crate::AgentPromptManifestStatusV1::Reused
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    struct PreparedPromptManifestFixture {
+        manifest: crate::AgentPromptManifestV1,
+        markdown: String,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_and_prepare_prompt_manifest(
+        source: &AgentSource,
+        harness_home: &Path,
+        platform: &str,
+        account_id: &str,
+        channel_id: &str,
+        user_id: &str,
+        agent_id: &str,
+        session_key: &str,
+        codex_thread_id: &str,
+        now_ms: i64,
+    ) -> PreparedPromptManifestFixture {
+        let registry = load_agent_registry(source).unwrap();
+        let skills = build_source_skill_index(source).unwrap();
+        let turn = build_turn_plan(
+            source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: platform.to_string(),
+                channel_id: channel_id.to_string(),
+                user_id: user_id.to_string(),
+                text: "continue exact work".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some(agent_id.to_string()),
+                session_hint: Some(session_key.to_string()),
+                skill_limit: 0,
+            },
+        )
+        .unwrap();
+        let mut step = build_channel_step(&registry, &turn);
+        step.account_id = Some(account_id.to_string());
+        let queued = enqueue_channel_step(
+            &step,
+            RuntimeQueueEnqueueOptions {
+                harness_home: harness_home.to_path_buf(),
+                runtime_workspace: None,
+                inbound_canonical_id: None,
+                now_ms,
+            },
+        )
+        .unwrap();
+        let queued_item = queued.item.unwrap();
+        assert_eq!(queued_item.platform, platform);
+        assert_eq!(queued_item.account_id.as_deref(), Some(account_id));
+        assert_eq!(queued_item.channel_id, channel_id);
+        assert_eq!(queued_item.user_id, user_id);
+        assert_eq!(queued_item.agent_id, agent_id);
+        assert_eq!(queued_item.session_key, session_key);
+        fs::write(
+            prompt_codex_binding_file(&queued_item.planned_transcript_file),
+            serde_json::json!({ "threadId": codex_thread_id }).to_string(),
+        )
+        .unwrap();
+
+        let prepared = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.to_path_buf(),
+            queue_id: Some(queued_item.queue_id.clone()),
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert_eq!(
+            prepared.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+        let item = prepared.item.unwrap();
+        let bundle: Value =
+            serde_json::from_slice(&fs::read(&item.prompt_bundle_json).unwrap()).unwrap();
+        let manifest: crate::AgentPromptManifestV1 =
+            serde_json::from_value(bundle["promptManifest"].clone()).unwrap();
+        let expected_lane = FullLaneKeyV1::new(
+            platform,
+            account_id,
+            channel_id,
+            user_id,
+            agent_id,
+            "interactive",
+            root_working_session_key(session_key),
+            session_key,
+        )
+        .unwrap();
+        let expected_lane_digest = expected_lane.identity_hash().unwrap();
+        assert_eq!(
+            manifest.lane_digest.as_deref(),
+            Some(expected_lane_digest.as_str())
+        );
+        let markdown = fs::read_to_string(&item.prompt_markdown).unwrap();
+
+        append_json_line(
+            &queue_dir(harness_home).join("run-once-receipts.jsonl"),
+            &serde_json::json!({
+                "queueId": item.queue_id,
+                "status": "completed",
+                "reason": "prompt manifest scenario terminal receipt"
+            }),
+        )
+        .unwrap();
+        release_runtime_queue_lease(harness_home, &queued_item.queue_id).unwrap();
+
+        PreparedPromptManifestFixture { manifest, markdown }
+    }
+
+    fn prompt_manifest_entry<'a>(
+        manifest: &'a crate::AgentPromptManifestV1,
+        canonical_name: &str,
+    ) -> &'a crate::AgentPromptManifestEntryV1 {
+        manifest
+            .entries
+            .iter()
+            .find(|entry| entry.canonical_name == canonical_name)
+            .unwrap_or_else(|| panic!("missing manifest entry {canonical_name}"))
     }
 
     fn write_worker_source(root: &Path) -> AgentSource {

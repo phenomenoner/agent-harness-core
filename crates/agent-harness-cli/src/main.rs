@@ -38,26 +38,26 @@ use agent_harness_core::{
     CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimePreflightOptions,
     CodexRuntimePreflightReport, CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy,
     ContextPackParseOptions, ContextRolloverRequeuePreparedOptions, CreateOperationPlanOptions,
-    CronRunControlAction, CronRunControlOptions, CronRunListOptions, CronSchedulerLintStatus,
-    CronSchedulerRunOnceOptions, CronSchedulerTickStatus, DEFAULT_DREAM_DIRECTOR_MAX_CHARS,
-    DEFAULT_DREAM_DIRECTOR_SOURCE_MAX_AGE_HOURS, DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM,
-    DEFAULT_MEMORY_BACKFILL_BATCH_SIZE, DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS,
-    DEFAULT_MEMORY_BACKFILL_MAX_ITEMS, DEFAULT_MEMORY_BACKFILL_RATE_LIMIT_PER_MINUTE,
-    DEFAULT_MEMORY_BACKFILL_RETRY_CAP, DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION,
-    DEFAULT_MEMORY_OWNER_HEARTBEAT_MAX_AGE_MS, DeterministicCronPlan, DeterministicCronPlanInput,
-    DeterministicCronWorkerEnqueueOptions, DreamDirectorSendOptions, DriftCheckOptions,
-    DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel,
-    HarnessLogRotationOptions, HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport,
-    HealthzOptions, ImportPhaseStatus, ImportReport, InboundMediaArtifact,
-    InboundMediaDownloadStatus, InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant,
-    LearningProposalOptions, LiveControlAction, McpRequestOptions, MemoryCanvasWorkerOptions,
-    MemoryCanvasWorkerReport, MemoryCanvasWorkerStatus, MemoryCredentialsExportOptions,
-    MemoryCredentialsExportReport, MemoryEmbeddingBackfillLane, MemoryEmbeddingBackfillOptions,
-    MemoryEmbeddingBackfillReport, MemoryHookAdapterOptions, MemoryHookKind,
-    MemoryOwnerEndpointProbeOptions, MemoryOwnerEnsureOptions, MemoryOwnerHeartbeatOptions,
-    MemoryOwnerPromotionOptions, MemoryOwnerRecoveryOptions, MemoryOwnerShadowKind,
-    MemoryOwnerShadowOptions, MemoryOwnerTrustScopeOptions, MemorySearchOptions,
-    MemorySearchReport, MemoryVectorRecallOptions, MemoryVectorRecallReport,
+    CreateOperationPlanOptionsV2, CronRunControlAction, CronRunControlOptions, CronRunListOptions,
+    CronSchedulerLintStatus, CronSchedulerRunOnceOptions, CronSchedulerTickStatus,
+    DEFAULT_DREAM_DIRECTOR_MAX_CHARS, DEFAULT_DREAM_DIRECTOR_SOURCE_MAX_AGE_HOURS,
+    DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM, DEFAULT_MEMORY_BACKFILL_BATCH_SIZE,
+    DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS, DEFAULT_MEMORY_BACKFILL_MAX_ITEMS,
+    DEFAULT_MEMORY_BACKFILL_RATE_LIMIT_PER_MINUTE, DEFAULT_MEMORY_BACKFILL_RETRY_CAP,
+    DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION, DEFAULT_MEMORY_OWNER_HEARTBEAT_MAX_AGE_MS,
+    DeterministicCronPlan, DeterministicCronPlanInput, DeterministicCronWorkerEnqueueOptions,
+    DreamDirectorSendOptions, DriftCheckOptions, DryRunImportOptions, ExecuteImportOptions,
+    HarnessLogEvent, HarnessLogLevel, HarnessLogRotationOptions, HarnessMetricsOptions,
+    HarnessStatusOptions, HarnessStatusReport, HealthzOptions, ImportPhaseStatus, ImportReport,
+    InboundMediaArtifact, InboundMediaDownloadStatus, InboundMediaModelAttachmentStatus,
+    InboundMediaSelectedVariant, LearningProposalOptions, LiveControlAction, McpRequestOptions,
+    MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport, MemoryCanvasWorkerStatus,
+    MemoryCredentialsExportOptions, MemoryCredentialsExportReport, MemoryEmbeddingBackfillLane,
+    MemoryEmbeddingBackfillOptions, MemoryEmbeddingBackfillReport, MemoryHookAdapterOptions,
+    MemoryHookKind, MemoryOwnerEndpointProbeOptions, MemoryOwnerEnsureOptions,
+    MemoryOwnerHeartbeatOptions, MemoryOwnerPromotionOptions, MemoryOwnerRecoveryOptions,
+    MemoryOwnerShadowKind, MemoryOwnerShadowOptions, MemoryOwnerTrustScopeOptions,
+    MemorySearchOptions, MemorySearchReport, MemoryVectorRecallOptions, MemoryVectorRecallReport,
     MemoryVectorRecallStatus, NativeCronPlan, NativeCronPlanInput, NativeCronWorkerEnqueueOptions,
     OpenClawMemLocalOwnerPrepareOptions, OpenClawMemReadPathSmokeOptions,
     OpenClawMemServiceProposeOptions, OpenClawMemServiceRecallOptions, OpenClawMemServiceStatus,
@@ -101,7 +101,7 @@ use agent_harness_core::{
     collect_inbound_media_cache_report, collect_ops_cutover_status, collect_token_efficiency,
     collect_worker_status, comment_on_operation_plan, compare_channel_turn_shadow,
     complete_operation_plan, control_cron_run, control_runtime_queue_item,
-    create_learning_proposal, create_operation_plan, create_ops_backup,
+    create_learning_proposal, create_operation_plan, create_operation_plan_v2, create_ops_backup,
     create_skill_archive_proposal, create_skill_learning_proposal, current_log_time_ms,
     default_supervisor_child_specs, delegate_operation_plan_item, enqueue_channel_step,
     enqueue_deterministic_cron_workers, enqueue_native_cron_workers, enqueue_subagent_workers,
@@ -1098,6 +1098,7 @@ fn run_operation_plan(args: &[String]) -> Result<(), String> {
             "--plan-id",
             "--origin-queue-id",
             "--session-key",
+            "--lane-digest",
             "--agent",
             "--agent-id",
             "--goal",
@@ -1134,7 +1135,7 @@ fn run_operation_plan(args: &[String]) -> Result<(), String> {
             print_json(&plans)
         }
         "create" => {
-            let report = create_operation_plan(CreateOperationPlanOptions {
+            let create = CreateOperationPlanOptions {
                 harness_home: options.target_home.clone(),
                 plan_id: options.required("--plan-id")?,
                 origin_queue_id: options
@@ -1155,7 +1156,15 @@ fn run_operation_plan(args: &[String]) -> Result<(), String> {
                 max_open_items: options.optional_usize("--max-open-items")?,
                 max_fanout: options.optional_usize("--max-fanout")?,
                 now_ms,
-            })
+            };
+            let report = if let Some(lane_digest) = options.optional("--lane-digest") {
+                create_operation_plan_v2(CreateOperationPlanOptionsV2 {
+                    options: create,
+                    lane_digest: lane_digest.to_string(),
+                })
+            } else {
+                create_operation_plan(create)
+            }
             .map_err(|err| err.to_string())?;
             print_json(&report)
         }

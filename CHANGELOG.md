@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.8.0 - Unreleased
+
+### Changed
+
+- Added exact-route model capability discovery for GPT-5.6-family reasoning. `/think` and `/reasoning` now share one last-write-wins state; exact `max` is preserved when advertised, exact `ultra` is filtered and rejected, and legacy `ultra-high` / `ultra_high` canonicalize to `xhigh`.
+- Added an exact-lane, backend-generation-scoped manifest for the eight per-agent static prompt files, including alias handling and deletion tombstones. Non-main agents no longer inherit main-agent prompt files when their own workspace is absent.
+- Added immutable heterogeneous child execution policies, exact-owner result mailboxes, lease-safe coordinator resume, explicit failed omissions for missing child evidence, and master-only user-facing progress/final/error ownership.
+
+### Security
+
+- Bound worker runtime routing to `WorkerJobKind`, require typed terminal receipt schema plus matching runtime-class/origin provenance, and confine worker transcript lookup to a validated per-agent sessions directory.
+
+### Compatibility
+
+- This is a pre-1.0 Rust source boundary. The v0.8 reader retains documented legacy artifact readers, but older binaries must not be assumed to read V2 state written by v0.8. See `docs/migration-0.8.md`.
+
 ## v0.7.0 - 2026-07-09
 
 ### Changed

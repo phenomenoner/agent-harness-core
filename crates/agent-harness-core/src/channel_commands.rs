@@ -298,6 +298,13 @@ pub fn normalize_thinking_level(level: &str) -> Option<String> {
     }
 }
 
+pub fn normalize_execution_mode(level: &str) -> Option<String> {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "standard" => Some("standard".to_string()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +378,21 @@ mod tests {
                 target: Some("telegram".to_string()),
                 reason: Some("reconnect websocket".to_string())
             })
+        );
+    }
+
+    #[test]
+    fn exact_execution_modes_are_separate_from_legacy_thinking_aliases() {
+        assert_eq!(normalize_execution_mode("Ultra"), None);
+        assert_eq!(
+            normalize_execution_mode("standard").as_deref(),
+            Some("standard")
+        );
+        assert_eq!(normalize_execution_mode("max"), None);
+        assert_eq!(normalize_execution_mode("ultra-high"), None);
+        assert_eq!(
+            normalize_thinking_level("ultra-high").as_deref(),
+            Some("xhigh")
         );
     }
 

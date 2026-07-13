@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::execution_mode::{ExecutionModePolicyV1, ExecutionModePreference};
 use crate::{
     ChannelCommandEffect, ChannelOutboundMessage, ChannelStep,
     VirtualSessionTaskBoundaryCloseOptions,
@@ -20,6 +21,9 @@ const CHANNEL_COMMAND_APPLY_SCHEMA: &str = "agent-harness.channel-command-apply.
 const CHANNEL_STATE_SCHEMA: &str = "agent-harness.channel-session-state.v1";
 const CHANNEL_COMMAND_EVENT_SCHEMA: &str = "agent-harness.channel-command-event.v1";
 const AGENT_OVERRIDES_SCHEMA: &str = "agent-harness.agent-overrides.v1";
+const CHANNEL_EXECUTION_MODE_SCHEMA: &str = "agent-harness.channel-execution-mode.v1";
+const AGENT_EXECUTION_MODE_OVERRIDES_SCHEMA: &str =
+    "agent-harness.agent-execution-mode-overrides.v1";
 const RUNTIME_CANCEL_REQUEST_SCHEMA: &str = "agent-harness.runtime-cancel-request.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +156,26 @@ pub struct AgentOverridesStore {
     pub schema: String,
     #[serde(default)]
     pub agents: BTreeMap<String, AgentOverride>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelExecutionModeStateV1 {
+    pub schema: String,
+    pub preference: ExecutionModePreference,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<ExecutionModePolicyV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_reason: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentExecutionModeOverridesStoreV1 {
+    schema: String,
+    #[serde(default)]
+    agents: BTreeMap<String, ChannelExecutionModeStateV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -315,6 +339,39 @@ pub fn agent_overrides_file(harness_home: impl AsRef<Path>) -> PathBuf {
         .join("overrides.json")
 }
 
+pub fn channel_execution_mode_state_file(
+    harness_home: &Path,
+    platform: &str,
+    channel_id: &str,
+    user_id: &str,
+) -> PathBuf {
+    channel_session_state_dir(harness_home, platform, channel_id, user_id)
+        .join("execution-mode.json")
+}
+
+pub fn read_channel_execution_mode_state(
+    harness_home: &Path,
+    platform: &str,
+    channel_id: &str,
+    user_id: &str,
+) -> io::Result<Option<ChannelExecutionModeStateV1>> {
+    let path = channel_execution_mode_state_file(harness_home, platform, channel_id, user_id);
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(io::Error::other),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn agent_execution_mode_overrides_file(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("agents")
+        .join("execution-mode-overrides.json")
+}
+
 pub fn read_agent_override(
     harness_home: impl AsRef<Path>,
     agent_id: &str,
@@ -325,11 +382,167 @@ pub fn read_agent_override(
 
 fn read_channel_state(path: &Path) -> io::Result<Option<ChannelSessionState>> {
     match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(io::Error::other),
+        Ok(bytes) => {
+            let mut state =
+                serde_json::from_slice::<ChannelSessionState>(&bytes).map_err(io::Error::other)?;
+            if let Some(execution_state) = quarantine_legacy_ultra_state(
+                &mut state.reasoning_preference,
+                &mut state.backend_reasoning_policy,
+                &mut state.thinking_level,
+                state.updated_at_ms,
+            ) {
+                let execution_file = path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("execution-mode.json");
+                write_json_atomic(&execution_file, &execution_state)?;
+                write_json_atomic(path, &state)?;
+            }
+            Ok(Some(state))
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+fn quarantine_legacy_ultra_state(
+    reasoning_preference: &mut Option<ReasoningPreference>,
+    backend_reasoning_policy: &mut Option<BackendReasoningPolicyV1>,
+    thinking_level: &mut Option<String>,
+    updated_at_ms: i64,
+) -> Option<ChannelExecutionModeStateV1> {
+    let preference = reasoning_preference
+        .as_ref()
+        .and_then(ExecutionModePreference::quarantine_legacy_ultra_reasoning)?;
+    *reasoning_preference = None;
+    *backend_reasoning_policy = None;
+    if thinking_level
+        .as_deref()
+        .is_some_and(|level| level.eq_ignore_ascii_case("ultra"))
+    {
+        *thinking_level = None;
+    }
+    Some(ChannelExecutionModeStateV1 {
+        schema: CHANNEL_EXECUTION_MODE_SCHEMA.to_string(),
+        preference,
+        policy: None,
+        migration_reason: Some(
+            "legacy reasoning effort `ultra` quarantined; explicit reissue required".to_string(),
+        ),
+        updated_at_ms,
+    })
+}
+
+#[cfg(test)]
+mod execution_mode_state_tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+    use crate::backend_reasoning::{BackendReasoningSource, ReasoningPreference};
+    use crate::model_catalog::{
+        REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION, ReasoningResolutionReceipt,
+        ReasoningResolutionStatus,
+    };
+
+    #[test]
+    fn legacy_persisted_ultra_reasoning_is_quarantined_without_backend_policy() {
+        let mut preference = Some(ReasoningPreference::explicit("ultra").unwrap());
+        let mut policy = Some(
+            BackendReasoningPolicyV1::new(
+                BackendReasoningSource::ChannelCommand,
+                ReasoningResolutionReceipt {
+                    schema_version: REASONING_RESOLUTION_RECEIPT_SCHEMA_VERSION,
+                    requested_provider: "openai".to_string(),
+                    requested_model: "gpt-5.6-sol".to_string(),
+                    effective_provider: Some("openai".to_string()),
+                    effective_model: Some("gpt-5.6-sol".to_string()),
+                    requested_effort: "ultra".to_string(),
+                    effective_effort: Some("ultra".to_string()),
+                    catalog_effective_effort: Some("ultra".to_string()),
+                    catalog_revision: Some("legacy".to_string()),
+                    status: ReasoningResolutionStatus::Accepted,
+                    authoritative: true,
+                    reason: "legacy fixture".to_string(),
+                },
+            )
+            .unwrap(),
+        );
+        let mut thinking_level = Some("ultra".to_string());
+        let migrated =
+            quarantine_legacy_ultra_state(&mut preference, &mut policy, &mut thinking_level, 1000)
+                .unwrap();
+        assert!(preference.is_none());
+        assert!(policy.is_none());
+        assert!(thinking_level.is_none());
+        assert!(matches!(
+            migrated.preference,
+            ExecutionModePreference::LegacyQuarantined { ref mode } if mode == "ultra"
+        ));
+        assert!(migrated.policy.is_none());
+        assert!(!migrated.preference.is_authorizable());
+    }
+
+    #[test]
+    fn separate_execution_preference_persists_without_rewriting_reasoning() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let harness_home =
+            std::env::temp_dir().join(format!("agent-harness-execution-state-{nonce}"));
+        let state = ChannelSessionState {
+            schema: CHANNEL_STATE_SCHEMA.to_string(),
+            platform: "discord".to_string(),
+            channel_id: "channel-1".to_string(),
+            user_id: "user-1".to_string(),
+            active_session_key: "session-1".to_string(),
+            agent_id: Some("main".to_string()),
+            provider: Some("openai".to_string()),
+            model: Some("gpt-5.6-sol".to_string()),
+            session_topic: None,
+            model_override: None,
+            model_override_provider: None,
+            model_override_model: None,
+            thinking_enabled: true,
+            thinking_level: Some("max".to_string()),
+            thinking_instruction: None,
+            reasoning_preference: Some(ReasoningPreference::explicit("max").unwrap()),
+            backend_reasoning_policy: None,
+            fast_mode: None,
+            stop_requested: false,
+            stop_reason: None,
+            steering_notes: Vec::new(),
+            btw_notes: Vec::new(),
+            last_command: None,
+            updated_at_ms: 1000,
+        };
+        let execution = ChannelExecutionModeStateV1 {
+            schema: CHANNEL_EXECUTION_MODE_SCHEMA.to_string(),
+            preference: ExecutionModePreference::explicit("standard").unwrap(),
+            policy: None,
+            migration_reason: None,
+            updated_at_ms: 1001,
+        };
+        write_channel_execution_mode_state(&harness_home, &state, &execution).unwrap();
+        assert_eq!(
+            read_channel_execution_mode_state(
+                &harness_home,
+                &state.platform,
+                &state.channel_id,
+                &state.user_id,
+            )
+            .unwrap(),
+            Some(execution)
+        );
+        assert_eq!(
+            state
+                .reasoning_preference
+                .as_ref()
+                .and_then(ReasoningPreference::explicit_effort),
+            Some("max")
+        );
+        let _ = fs::remove_dir_all(harness_home);
     }
 }
 
@@ -514,6 +727,33 @@ fn apply_effect(
                         preference,
                         resolved_policy.as_ref(),
                         now_ms,
+                        warnings,
+                    )?;
+                }
+            }
+        }
+        ChannelCommandEffect::SwitchExecutionMode {
+            agent_id,
+            preference,
+            global,
+            accepted,
+            resolved_policy,
+            ..
+        } => {
+            if *accepted {
+                let execution_state = ChannelExecutionModeStateV1 {
+                    schema: CHANNEL_EXECUTION_MODE_SCHEMA.to_string(),
+                    preference: preference.clone(),
+                    policy: resolved_policy.clone(),
+                    migration_reason: None,
+                    updated_at_ms: now_ms,
+                };
+                write_channel_execution_mode_state(harness_home, state, &execution_state)?;
+                if *global {
+                    write_agent_execution_mode_override(
+                        harness_home,
+                        agent_id,
+                        &execution_state,
                         warnings,
                     )?;
                 }
@@ -822,6 +1062,7 @@ fn command_name(effect: &ChannelCommandEffect) -> &'static str {
         ChannelCommandEffect::SwitchThinking { .. } => "think",
         ChannelCommandEffect::ShowReasoning { .. } => "think",
         ChannelCommandEffect::SwitchReasoning { .. } => "think",
+        ChannelCommandEffect::SwitchExecutionMode { .. } => "think",
         ChannelCommandEffect::StopCurrentRun { .. } => "stop",
         ChannelCommandEffect::RestartChannel { .. } => "restart",
         ChannelCommandEffect::RestartGateway { .. } => "restart",
@@ -838,10 +1079,94 @@ fn command_name(effect: &ChannelCommandEffect) -> &'static str {
     }
 }
 
+fn write_channel_execution_mode_state(
+    harness_home: &Path,
+    state: &ChannelSessionState,
+    execution_state: &ChannelExecutionModeStateV1,
+) -> io::Result<()> {
+    write_json_atomic(
+        &channel_execution_mode_state_file(
+            harness_home,
+            &state.platform,
+            &state.channel_id,
+            &state.user_id,
+        ),
+        execution_state,
+    )
+}
+
+fn read_agent_execution_mode_overrides_store(
+    harness_home: &Path,
+) -> io::Result<AgentExecutionModeOverridesStoreV1> {
+    let path = agent_execution_mode_overrides_file(harness_home);
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(AgentExecutionModeOverridesStoreV1 {
+                schema: AGENT_EXECUTION_MODE_OVERRIDES_SCHEMA.to_string(),
+                agents: BTreeMap::new(),
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn read_agent_execution_mode_override(
+    harness_home: &Path,
+    agent_id: &str,
+) -> io::Result<Option<ChannelExecutionModeStateV1>> {
+    Ok(read_agent_execution_mode_overrides_store(harness_home)?
+        .agents
+        .get(agent_id)
+        .cloned())
+}
+
+fn write_agent_execution_mode_override(
+    harness_home: &Path,
+    agent_id: &Option<String>,
+    state: &ChannelExecutionModeStateV1,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    let Some(agent_id) = agent_id else {
+        warnings.push("execution mode --global requires a selected agent".to_string());
+        return Ok(());
+    };
+    let mut store = read_agent_execution_mode_overrides_store(harness_home)?;
+    store.agents.insert(agent_id.clone(), state.clone());
+    write_json_atomic(&agent_execution_mode_overrides_file(harness_home), &store)
+}
+
 fn read_agent_overrides_store(harness_home: impl AsRef<Path>) -> io::Result<AgentOverridesStore> {
+    let harness_home = harness_home.as_ref();
     let path = agent_overrides_file(harness_home);
     match fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other),
+        Ok(bytes) => {
+            let mut store =
+                serde_json::from_slice::<AgentOverridesStore>(&bytes).map_err(io::Error::other)?;
+            let mut execution_store = read_agent_execution_mode_overrides_store(harness_home)?;
+            let mut migrated = false;
+            for (agent_id, override_entry) in &mut store.agents {
+                if let Some(execution_state) = quarantine_legacy_ultra_state(
+                    &mut override_entry.reasoning_preference,
+                    &mut override_entry.backend_reasoning_policy,
+                    &mut override_entry.thinking_level,
+                    override_entry.updated_at_ms.unwrap_or(0),
+                ) {
+                    execution_store
+                        .agents
+                        .insert(agent_id.clone(), execution_state);
+                    migrated = true;
+                }
+            }
+            if migrated {
+                write_agent_overrides_store(harness_home, &store)?;
+                write_json_atomic(
+                    &agent_execution_mode_overrides_file(harness_home),
+                    &execution_store,
+                )?;
+            }
+            Ok(store)
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(AgentOverridesStore::default()),
         Err(error) => Err(error),
     }

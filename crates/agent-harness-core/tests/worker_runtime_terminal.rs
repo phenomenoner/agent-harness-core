@@ -45,6 +45,33 @@ fn llm_runtime_queue_is_not_terminal_until_correlated_runtime_receipt() {
         .and_then(Value::as_str)
         .unwrap()
         .to_string();
+    let transcript_file = PathBuf::from(
+        dispatch
+            .result
+            .as_ref()
+            .and_then(|result| result.artifact_refs.as_ref())
+            .and_then(|value| value.get("transcriptFile"))
+            .and_then(Value::as_str)
+            .unwrap(),
+    );
+    fs::create_dir_all(transcript_file.parent().unwrap()).unwrap();
+    fs::write(
+        &transcript_file,
+        format!(
+            "{}\n{}\n",
+            json!({
+                "schema": "agent-harness.transcript-message.v1",
+                "role": "user",
+                "content": "collect bounded evidence"
+            }),
+            json!({
+                "schema": "agent-harness.transcript-message.v1",
+                "role": "assistant",
+                "content": "Child finding: Sol max propagated and no child final. token=must-not-leak"
+            })
+        ),
+    )
+    .unwrap();
 
     let receipts_file = harness_home
         .join("state")
@@ -56,9 +83,12 @@ fn llm_runtime_queue_is_not_terminal_until_correlated_runtime_receipt() {
         format!(
             "{}\n",
             json!({
-                "queueId": "different-child-queue",
+                "schema": "unrelated.runtime-receipt.v1",
+                "queueId": runtime_queue_id,
                 "status": "completed",
-                "reason": "must not terminalize this worker"
+                "runtimeClass": "worker",
+                "origin": "worker",
+                "reason": "unknown receipt schema must not terminalize this worker"
             })
         ),
     )
@@ -93,9 +123,13 @@ fn llm_runtime_queue_is_not_terminal_until_correlated_runtime_receipt() {
         format!(
             "{}\n",
             json!({
+                "schema": "agent-harness.runtime-run-once.v1",
                 "queueId": runtime_queue_id,
                 "status": "completed",
-                "reason": "correlated child runtime completed"
+                "runtimeClass": "worker",
+                "origin": "worker",
+                "reason": "correlated child runtime completed",
+                "transcriptFile": transcript_file
             })
         ),
     )
@@ -122,7 +156,15 @@ fn llm_runtime_queue_is_not_terminal_until_correlated_runtime_receipt() {
     assert_eq!(mailbox["outcome"], "succeeded");
     assert_eq!(
         mailbox["redactedSummary"],
-        "worker runtime terminal correlated as succeeded"
+        "Child finding: Sol max propagated and no child final. token=[redacted]"
+    );
+    assert_eq!(mailbox["artifacts"][0]["kind"], "terminal-receipt");
+    assert_eq!(mailbox["artifacts"][1]["kind"], "transcript");
+    assert!(
+        mailbox["artifacts"][1]["reference"]
+            .as_str()
+            .unwrap()
+            .starts_with("artifact:runtime-queue/transcript/")
     );
 
     let status = collect_worker_status(WorkerStatusOptions { harness_home }).unwrap();
@@ -132,6 +174,175 @@ fn llm_runtime_queue_is_not_terminal_until_correlated_runtime_receipt() {
             .iter()
             .any(|lane| lane.lane == "llm" && lane.totals.pending == 1)
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn llm_subagent_rejects_spoofed_parent_runtime_route() {
+    let root = temp_root("llm_subagent_rejects_spoofed_parent_runtime_route");
+    let harness_home = root.join(".agent-harness");
+    let source = root.join("source");
+    let workspace = source.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let mut options = llm_child_options(&harness_home, &source, &workspace, 1_000);
+    options.payload["agentId"] = json!("main");
+    options.payload["sessionKey"] = json!("parent-session");
+    options.payload["runtimeClass"] = json!("interactive");
+    options.payload["origin"] = json!("channel");
+    enqueue_worker_job(options).unwrap();
+    let run = run_worker_once(WorkerRunOnceOptions {
+        harness_home: harness_home.clone(),
+        lane: Some("llm".to_string()),
+        worker_id: "spoofed-parent-worker".to_string(),
+        lease_ms: LEASE_MS,
+        now_ms: 1_001,
+    })
+    .unwrap();
+
+    assert_eq!(run.status, WorkerRunOnceStatus::Rescheduled);
+    assert!(run.result.as_ref().is_some_and(|result| {
+        result
+            .reason
+            .contains("conflicts with trusted worker route")
+    }));
+    assert!(
+        !harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("pending.jsonl")
+            .exists()
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn llm_worker_rejects_absolute_agent_id_before_any_outside_runtime_artifact() {
+    let root = temp_root("llm_worker_rejects_absolute_agent_id");
+    let harness_home = root.join(".agent-harness");
+    let source = root.join("source");
+    let workspace = source.join("workspace");
+    let outside_agent_dir = root.join("outside-agent");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let mut options = llm_child_options(&harness_home, &source, &workspace, 1_000);
+    options.payload["agentId"] = json!(outside_agent_dir);
+    enqueue_worker_job(options).unwrap();
+    let run = run_worker_once(WorkerRunOnceOptions {
+        harness_home: harness_home.clone(),
+        lane: Some("llm".to_string()),
+        worker_id: "unsafe-agent-worker".to_string(),
+        lease_ms: LEASE_MS,
+        now_ms: 1_001,
+    })
+    .unwrap();
+
+    assert_eq!(run.status, WorkerRunOnceStatus::Rescheduled);
+    assert!(!outside_agent_dir.exists());
+    assert!(
+        !harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("pending.jsonl")
+            .exists()
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn terminal_mailbox_ignores_jointly_tampered_transcript_paths_outside_agent_sessions() {
+    let root = temp_root("terminal_mailbox_ignores_tampered_transcript_path");
+    let harness_home = root.join(".agent-harness");
+    let source = root.join("source");
+    let workspace = source.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let child =
+        enqueue_worker_job(llm_child_options(&harness_home, &source, &workspace, 1_000)).unwrap();
+    let dispatch = run_worker_once(WorkerRunOnceOptions {
+        harness_home: harness_home.clone(),
+        lane: Some("llm".to_string()),
+        worker_id: "tampered-transcript-worker".to_string(),
+        lease_ms: LEASE_MS,
+        now_ms: 1_001,
+    })
+    .unwrap();
+    assert_eq!(dispatch.status, WorkerRunOnceStatus::Dispatched);
+    let runtime_queue_id = dispatch
+        .result
+        .as_ref()
+        .and_then(|result| result.result.as_ref())
+        .and_then(|value| value.get("runtimeQueueId"))
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let outside_transcript = root.join("outside-transcript.jsonl");
+    fs::write(
+        &outside_transcript,
+        format!(
+            "{}\n",
+            json!({
+                "role": "assistant",
+                "content": "OUTSIDE-TRANSCRIPT-MUST-NOT-REACH-MASTER"
+            })
+        ),
+    )
+    .unwrap();
+    let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+    conn.execute(
+        "UPDATE jobs SET artifact_refs_json=?1 WHERE job_id=?2",
+        params![
+            json!({
+                "runtimeQueueId": runtime_queue_id,
+                "transcriptFile": outside_transcript
+            })
+            .to_string(),
+            child.job.job_id
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let receipts_file = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("run-once-receipts.jsonl");
+    fs::write(
+        &receipts_file,
+        format!(
+            "{}\n",
+            json!({
+                "schema": "agent-harness.runtime-run-once.v1",
+                "queueId": runtime_queue_id,
+                "status": "completed",
+                "runtimeClass": "worker",
+                "origin": "worker",
+                "reason": "tampered terminal receipt",
+                "transcriptFile": outside_transcript
+            })
+        ),
+    )
+    .unwrap();
+    enqueue_worker_job(watchdog_options(&harness_home, &source, &workspace, 1_002)).unwrap();
+    run_worker_once(WorkerRunOnceOptions {
+        harness_home: harness_home.clone(),
+        lane: Some("watchdog".to_string()),
+        worker_id: "tampered-transcript-watchdog".to_string(),
+        lease_ms: LEASE_MS,
+        now_ms: 2_000,
+    })
+    .unwrap();
+
+    let mailbox = mailbox_result(&harness_home, &child.job.job_id);
+    assert_eq!(
+        mailbox["redactedSummary"],
+        "worker runtime terminal correlated as succeeded"
+    );
+    assert_eq!(mailbox["artifacts"].as_array().unwrap().len(), 1);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -247,6 +458,7 @@ fn mailbox_result(harness_home: &Path, job_id: &str) -> Value {
         "state": state,
         "outcome": envelope["outcome"],
         "redactedSummary": envelope["redactedSummary"],
+        "artifacts": envelope["artifacts"],
     })
 }
 

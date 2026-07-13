@@ -14,6 +14,60 @@ Agent Harness Core reads most operator state from a harness home directory suppl
 
 Use `--source-home` for imported prompt files, registry, skills, and legacy context. Use `--runtime-workspace` only for the Codex working directory. Prompt assembly falls back to the imported source workspace when the runtime workspace does not contain prompt files.
 
+## Model Capability and Reasoning Control
+
+v0.8.0 resolves reasoning against the exact effective provider/model route. Codex capability discovery supplies the model slug, default reasoning effort, and supported effort strings; the harness records a catalog revision and preserves the exact accepted effort through channel state, queue admission, and `turn/start`. Do not assume that two GPT-5.6 routes expose the same capabilities. For example, `gpt-5.6-sol` may use exact `max` only when the current exact route advertises `max`.
+
+Enable discovery gradually in `harness-config.json`:
+
+```json
+{
+  "orchestration": {
+    "features": {
+      "modelCatalogV2": {
+        "mode": "authoritative",
+        "enabledAgentIds": ["main", "reviewer"]
+      }
+    }
+  }
+}
+```
+
+`mode` accepts `off`, `shadow`, or `authoritative`. `enabledAgentIds` is optional; when present it is an exact per-agent rollout cohort. Shadow mode records the discovered result while legacy normalization remains authoritative. Authoritative mode accepts an effort only for a matching catalog route and fails closed when a stored route-valid policy cannot be revalidated.
+
+The v0.8.0 reasoning surface follows these rules:
+
+- `/think` and `/reasoning` are aliases for the same state and status output. They are not two independent knobs.
+- `/think max` followed by `/reasoning low` results in `low`; reversing the order results in `max`. The last valid write in the same scope wins.
+- `default` asks the exact route to use its advertised default.
+- `max` is the highest currently known legal GPT-5.6 reasoning effort. It stays distinct and is not normalized down when advertised by the exact route.
+- Exact `ultra` is removed from both cached model-catalog input and Codex app-server capability observations. It is rejected by commands, stored-policy recovery, child-policy validation, queue admission, and runtime wire validation; it is never advertised, configurable, or sent to Codex.
+- Legacy `ultra-high` and `ultra_high` normalize to `xhigh`; they are only compatibility spellings. Capability lists canonicalize these aliases before duplicate handling, so an alias next to canonical `xhigh` does not create a second effort.
+- Unknown future effort names remain open-ended only when the exact effective route advertises them. They are not inferred from another model or accepted from unverified configuration.
+
+There is no public `ultra` effort or resource-policy configuration in v0.8.0. Do not add one to `harness-config.json`.
+
+Agent model defaults remain OpenClaw-style source configuration in `openclaw.json`. Each configured agent may select a different model:
+
+```json
+{
+  "agents": {
+    "defaults": { "provider": "openai", "model": "gpt-5.6-sol" },
+    "list": [
+      { "id": "main", "model": "gpt-5.6-sol", "enabled": true },
+      {
+        "id": "reviewer",
+        "model": "gpt-5.6-terra",
+        "workspace": "agents/reviewer/workspace",
+        "enabled": true
+      }
+    ]
+  }
+}
+```
+
+This example selects models; it does not hard-code a reasoning capability. Use the catalog-backed command or a validated child policy to choose an effort that the exact route advertises.
+
 ## Skill Ecosystem
 
 `skills/` is indexed from operator-authored, imported, bundled, agent-created, and pack namespaces. Category subdirectories are supported one level below each root, and `.archive/` or other dot directories are excluded from discovery.
@@ -178,6 +232,24 @@ global limit >= per-agent limit >= per-agent-per-channel limit
 
 Invalid narrower-to-wider settings are capped at runtime with warnings.
 
+## Multi-Agent Child Coordination
+
+Child execution policy is a dispatch-time contract, not one global model setting. The master may assign every child an independent immutable provider, model, reasoning preference, resolved backend policy, catalog revision, tool/sandbox profile, timeout, attempt limit, budget, delegation limit, and result contract. Siblings can therefore use different GPT-5.6 family models and efforts without rewriting the master agent's defaults.
+
+Every child terminal result is bound to an exact master owner containing the full lane, virtual session, parent/source queue identity, and optional operation-plan identity. The durable mailbox stores the actual terminal outcome only as a redacted summary of at most 4 KiB plus up to 16 opaque artifact references; raw prompts, raw provider events, credentials, and absolute paths are forbidden. Coordinator prompt context is built only from these validated envelope fields and structural child metadata, never from an arbitrary worker payload or raw transcript. An incomplete legacy owner remains auditable but is excluded from automatic resume.
+
+Worker-to-runtime routing is not payload-authoritative. The harness derives `runtimeClass` and `origin` from `WorkerJobKind` (including the distinct coordinator-resume and native-cron paths), rejects a conflicting requested route, and reconciles terminal state only from `agent-harness.runtime-run-once.v1` receipts whose queue id, runtime class, and origin match that trusted route. Unknown schemas or mismatched provenance are ignored rather than terminalizing the worker.
+
+The master owns continuation and final delivery:
+
+1. Child success or failure is appended once to the exact-owner mailbox; child/external progress, final text, and errors do not create parent user-facing outbox rows.
+2. While any queue owns an active lease in the exact master lane, the watchdog leaves results unclaimed and does not wake or interrupt the master. This includes newer same-lane work, not only the original parent queue id.
+3. After confirmed lease release, sibling results coalesce into exactly one logical durable resume intent and one typed coordinator continuation; deterministic identities and idempotent admission provide the exactly-once resume effect across duplicate or restarted watchdog passes.
+4. The continuation acknowledges mailbox rows only after it acquires its runtime lease.
+5. Only the resumed master/coordinator may synthesize the user-facing final reply.
+
+Before continuation, every expected child id must have valid exact-owner terminal evidence. Missing or invalid evidence is replaced atomically with a deterministic failed-omission envelope, so a partial batch cannot silently look complete. Duplicate watchdog passes, process restart, and expired claim recovery must reuse the same intent rather than enqueueing another continuation. The in-code invariant describes the enqueue side as at-most-once; durability and reclaim close the corresponding lost-resume path. There is no legacy direct-child-final compatibility mode.
+
 ## Runtime Dispatch Classes
 
 Runtime queue items now carry `runtimeClass` and `origin` metadata. Channel ingress defaults to `interactive`, native LLM cron defaults to `cron`, worker-originated turns default to `worker`, and operational lanes may use `maintenance`.
@@ -315,7 +387,11 @@ Progress delivery modes:
 
 ## Prompt Files
 
-Prompt bundle generation adds explicit role headers for known prompt files. Examples:
+Prompt files are resolved per configured agent. The main agent uses the source workspace. A non-main agent uses its configured `workspace`, or `agents/<agent-id>/workspace` by default; if that isolated workspace or agent directory is absent or has no prompt files, the harness does not silently borrow the main agent's files.
+
+Agent ids used for worker session storage must be one safe path component: no absolute path, `.` / `..`, slash, backslash, colon, or control character. Worker transcript reconciliation also canonicalizes the expected `agents/<agent-id>/sessions` (or `cron-sessions`) directory and refuses symlink/path escapes. Use stable simple ids such as `main` or `reviewer`.
+
+The eight canonical files are:
 
 - `AGENTS.md`: workspace operating instructions.
 - `SOUL.md`: persona and voice guidance.
@@ -324,5 +400,14 @@ Prompt bundle generation adds explicit role headers for known prompt files. Exam
 - `IDENTITY.md`: agent identity.
 - `HEARTBEAT.md`: liveness or cadence guidance.
 - `BOOTSTRAP.md`: startup context.
+- `MEMORY.md`: agent-scoped durable memory guidance intended for prompt injection.
+
+These eight files are static agent context. Dynamic memory recall is planned and assembled separately on each eligible turn; recalled records are not a ninth manifest file and do not change the static-file ledger.
+
+`AGENT.md` is a fallback alias for `AGENTS.md`, and `BOOT.md` is a fallback alias for `BOOTSTRAP.md`. When canonical and alias files both exist, the canonical file wins and prompt assembly records a warning. Aliases are migration inputs, not additional prompt layers.
+
+Every agent turn emits `agent-harness.agent-prompt-manifest.v1`. The manifest inventories all canonical names, content hashes, source paths, roles, and one of `included`, `reused`, or `removed`. A file removed after prior injection produces a tombstone; it is not silently remembered. A changed file is injected again. A changed Codex backend/thread generation also forces reinjection even when file bytes are unchanged.
+
+Ledger reuse requires the exact `platform`, `accountId`, `channelId`, `userId`, `agentId`, `runtimeClass`, virtual-session root, and concrete `sessionKey`, plus the backend generation. Another agent, another exact lane, a `/new` root, or a new Codex backend generation cannot inherit the prior manifest entry. Exact-lane OperationPlan context also fails closed on a mismatched lane.
 
 Skills are selected dynamically. Command-only turns may legitimately select zero skills; ordinary agent turns can inject relevant `SKILL.md` bodies.

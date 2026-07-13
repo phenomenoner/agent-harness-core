@@ -9,6 +9,7 @@ use serde_json::Value;
 use crate::backend_reasoning::{
     BackendReasoningPolicyV1, BackendReasoningSource, ReasoningPreference,
 };
+use crate::execution_mode::{ExecutionModePolicyV1, ExecutionModePreference};
 use crate::{
     AgentRegistry, ChannelCommandIntent, DEFAULT_THINKING_LEVEL, FastCommandMode,
     GatewayRestartStatusReport, InboundMediaArtifact, RichMessagePresentation, THINKING_LEVELS,
@@ -133,6 +134,14 @@ pub enum ChannelCommandEffect {
         available_efforts: Vec<String>,
         catalog_default: Option<String>,
         catalog_revision: Option<String>,
+        reason: String,
+    },
+    SwitchExecutionMode {
+        agent_id: Option<String>,
+        preference: ExecutionModePreference,
+        global: bool,
+        accepted: bool,
+        resolved_policy: Option<ExecutionModePolicyV1>,
         reason: String,
     },
     ShowModel {
@@ -1184,7 +1193,11 @@ fn unified_thinking_status_effect(turn: &TurnPlan) -> ChannelCommandEffect {
         provider: snapshot.provider,
         model: snapshot.model,
         current_preference: snapshot.persisted.preference,
-        available_efforts: snapshot.catalog_efforts,
+        available_efforts: snapshot
+            .catalog_efforts
+            .into_iter()
+            .filter(|effort| !crate::is_reserved_execution_mode_effort(effort))
+            .collect(),
         catalog_default: snapshot.catalog_default,
         catalog_revision: snapshot.catalog_revision,
         authoritative: snapshot.authoritative,
@@ -1243,7 +1256,14 @@ fn reasoning_command_effect(turn: &TurnPlan, effort: String, global: bool) -> Ch
         Vec::new()
     } else {
         route
-            .map(|route| route.supported_reasoning_efforts.clone())
+            .map(|route| {
+                route
+                    .supported_reasoning_efforts
+                    .iter()
+                    .filter(|effort| !crate::is_reserved_execution_mode_effort(effort))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let authoritative = mode == crate::model_catalog::ModelCatalogRolloutMode::Authoritative;
@@ -1273,11 +1293,17 @@ fn reasoning_command_effect(turn: &TurnPlan, effort: String, global: bool) -> Ch
     } else {
         let exact_resolution = reasoning_resolution_for_turn(turn, &normalized_requested);
         if exact_resolution.status == crate::model_catalog::ReasoningResolutionStatus::Accepted {
+            let effective_effort = exact_resolution
+                .effective_effort
+                .clone()
+                .unwrap_or_else(|| normalized_requested.clone());
+            let legacy_alias_from =
+                (effective_effort != normalized_requested).then_some(normalized_requested);
             (
-                ReasoningPreference::explicit(normalized_requested.clone())
+                ReasoningPreference::explicit(effective_effort)
                     .expect("parsed /think effort must be non-empty"),
                 Some(exact_resolution),
-                None,
+                legacy_alias_from,
             )
         } else if let Some(alias) = crate::normalize_thinking_level(&normalized_requested)
             && alias != normalized_requested
@@ -1334,7 +1360,7 @@ fn reasoning_command_effect(turn: &TurnPlan, effort: String, global: bool) -> Ch
         resolved_policy.is_some()
     };
     let reason = if ultra_requires_separate_authorization {
-        "ultra requires an explicit agent allow-list and delegation/resource authorization receipt"
+        "`ultra` is not a reasoning effort; the highest supported GPT-5.6 effort is `max`"
             .to_string()
     } else if default_requested && accepted {
         if let Some(default) = catalog_default.as_deref() {
@@ -1717,6 +1743,33 @@ fn write_model_catalog_cohort_for_test(
     .unwrap();
 }
 
+#[cfg(test)]
+fn write_authorized_execution_mode_for_test(harness_home: &Path, agent_id: &str) {
+    fs::create_dir_all(harness_home).unwrap();
+    let config = serde_json::json!({
+        "orchestration": {
+            "features": {
+                "modelCatalogV2": { "mode": "authoritative" },
+                "executionModeV1": {
+                    "mode": "authoritative",
+                    "enabledAgentIds": [agent_id],
+                    "authorizationRevision": "test-auth-v1",
+                    "ultra": {
+                        "maxParallelChildren": 2,
+                        "maxTotalChildren": 6,
+                        "childTimeoutMs": 300000
+                    }
+                }
+            }
+        }
+    });
+    fs::write(
+        harness_home.join(crate::HARNESS_CONFIG_FILE_NAME),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+}
+
 fn new_session_key(turn: &TurnPlan) -> String {
     let agent_id = turn
         .agent
@@ -1893,6 +1946,40 @@ fn command_reply_text(effect: &ChannelCommandEffect) -> String {
                     display_model_route(provider, model),
                     display_reasoning_preference(Some(preference)),
                     display_list(available_efforts),
+                    reason
+                )
+            }
+        }
+        ChannelCommandEffect::SwitchExecutionMode {
+            agent_id,
+            preference,
+            global,
+            accepted,
+            resolved_policy,
+            reason,
+        } => {
+            if *accepted {
+                format!(
+                    "Execution mode requested{} for agent `{}`: {}\nAuthorization receipt: {}\n{}",
+                    if *global {
+                        " globally"
+                    } else {
+                        " for this session"
+                    },
+                    display_opt(agent_id),
+                    preference.requested_mode(),
+                    if resolved_policy.is_some() {
+                        "recorded"
+                    } else {
+                        "standard/default"
+                    },
+                    reason
+                )
+            } else {
+                format!(
+                    "Execution mode was not recorded for agent `{}`: {}\n{}",
+                    display_opt(agent_id),
+                    preference.requested_mode(),
                     reason
                 )
             }
@@ -3282,7 +3369,7 @@ mod tests {
             "Legacy prompt level: max",
             "Runtime revalidation: required before turn/start; status is not wire execution evidence",
             "Catalog default: low",
-            "Catalog efforts (observed): low, medium, high, xhigh, max, ultra",
+            "Catalog efforts (observed): low, medium, high, xhigh, max",
             "Catalog revision:",
         ] {
             assert!(
@@ -3475,7 +3562,7 @@ mod tests {
             "Stored backend preference: max",
             "Preference source: session",
             "Resolved next-turn effort: -",
-            "Catalog efforts (observed): low, medium, high, xhigh, max, ultra",
+            "Catalog efforts (observed): low, medium, high, xhigh, max",
         ] {
             assert!(
                 dormant_text.contains(expected),
@@ -3533,12 +3620,12 @@ mod tests {
         write_model_catalog_mode_for_test(&harness_home, "authoritative");
         let registry = load_agent_registry(&source).unwrap();
         let skills = build_source_skill_index(&source).unwrap();
-        let expected = vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        let expected = vec!["low", "medium", "high", "xhigh", "max"]
             .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>();
 
-        for effort in ["max", "ultra"] {
+        for effort in ["max"] {
             let turn = build_turn_plan(
                 &source,
                 &registry,
@@ -3582,6 +3669,85 @@ mod tests {
             assert_eq!(available_efforts, expected);
         }
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exact_ultra_is_rejected_as_non_effort_for_both_command_aliases() {
+        let root = temp_root("exact_ultra_rejected_as_non_effort");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_codex_models_cache_for_test(&harness_home);
+        write_model_catalog_mode_for_test(&harness_home, "authoritative");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let build = |text: &str| {
+            build_turn_plan(
+                &source,
+                &registry,
+                &skills,
+                TurnPlanInput {
+                    harness_home: Some(harness_home.clone()),
+                    platform: "telegram".to_string(),
+                    channel_id: "dm".to_string(),
+                    user_id: "user".to_string(),
+                    text: text.to_string(),
+                    inbound_context: None,
+                    inbound_media_artifacts: Vec::new(),
+                    requested_agent_id: Some("main56sol".to_string()),
+                    session_hint: None,
+                    skill_limit: 3,
+                },
+            )
+            .unwrap()
+        };
+
+        let denied = build_channel_step(&registry, &build("/reasoning ultra"));
+        assert!(matches!(
+            denied.command_effect,
+            Some(ChannelCommandEffect::SwitchReasoning {
+                preference: ReasoningPreference::Explicit { ref effort },
+                accepted: false,
+                resolved_policy: None,
+                ..
+            }) if effort == "ultra"
+        ));
+        assert!(
+            denied.outbound_messages[0]
+                .text
+                .contains("highest supported GPT-5.6 effort is `max`")
+        );
+
+        write_authorized_execution_mode_for_test(&harness_home, "main56sol");
+        let still_rejected = build_channel_step(&registry, &build("/think ultra"));
+        assert!(matches!(
+            still_rejected.command_effect,
+            Some(ChannelCommandEffect::SwitchReasoning {
+                preference: ReasoningPreference::Explicit { ref effort },
+                accepted: false,
+                resolved_policy: None,
+                ..
+            }) if effort == "ultra"
+        ));
+        let max = build_channel_step(&registry, &build("/reasoning max"));
+        assert!(matches!(
+            max.command_effect,
+            Some(ChannelCommandEffect::SwitchReasoning {
+                preference: ReasoningPreference::Explicit { ref effort },
+                accepted: true,
+                ..
+            }) if effort == "max"
+        ));
+        let standard = build_channel_step(&registry, &build("/reasoning standard"));
+        assert!(matches!(
+            standard.command_effect,
+            Some(ChannelCommandEffect::SwitchReasoning {
+                preference: ReasoningPreference::Explicit { ref effort },
+                accepted: false,
+                resolved_policy: None,
+                ..
+            }) if effort == "standard"
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3637,7 +3803,7 @@ mod tests {
         );
         assert_eq!(catalog_default, "low");
         assert!(available_efforts.iter().any(|value| value == "max"));
-        assert!(available_efforts.iter().any(|value| value == "ultra"));
+        assert!(!available_efforts.iter().any(|value| value == "ultra"));
         assert!(step.outbound_messages[0].text.contains("Backend reasoning"));
 
         let applied = crate::apply_channel_command_step(
@@ -3697,6 +3863,83 @@ mod tests {
             Some("max")
         );
         assert_eq!(followup.thinking_policy.level.as_deref(), Some("max"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn authoritative_reasoning_aliases_persist_canonical_effective_effort() {
+        let root = temp_root("authoritative_reasoning_aliases_persist_canonical_effort");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".agent-harness");
+        write_codex_models_cache_for_test(&harness_home);
+        write_model_catalog_mode_for_test(&harness_home, "authoritative");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+
+        for (index, requested_alias) in ["ultra-high", "ultra_high", "x-high"]
+            .into_iter()
+            .enumerate()
+        {
+            let turn = build_turn_plan(
+                &source,
+                &registry,
+                &skills,
+                TurnPlanInput {
+                    harness_home: Some(harness_home.clone()),
+                    platform: "telegram".to_string(),
+                    channel_id: "dm".to_string(),
+                    user_id: "user".to_string(),
+                    text: format!("/think {requested_alias}"),
+                    inbound_context: None,
+                    inbound_media_artifacts: Vec::new(),
+                    requested_agent_id: Some("main56sol".to_string()),
+                    session_hint: None,
+                    skill_limit: 3,
+                },
+            )
+            .unwrap();
+            let step = build_channel_step(&registry, &turn);
+            let applied = crate::apply_channel_command_step(
+                &step,
+                crate::ChannelCommandApplyOptions {
+                    harness_home: harness_home.clone(),
+                    now_ms: 50 + index as i64,
+                },
+            )
+            .unwrap();
+            let state = applied
+                .state
+                .expect("accepted reasoning alias must persist channel state");
+
+            assert_eq!(
+                state.reasoning_preference,
+                Some(ReasoningPreference::Explicit {
+                    effort: "xhigh".to_string(),
+                }),
+                "alias {requested_alias} must persist the canonical effective effort"
+            );
+            assert_eq!(
+                state
+                    .backend_reasoning_policy
+                    .as_ref()
+                    .map(|policy| policy.effective_effort()),
+                Some("xhigh")
+            );
+
+            let Some(ChannelCommandEffect::SwitchReasoning {
+                resolution: Some(resolution),
+                reason,
+                ..
+            }) = step.command_effect
+            else {
+                panic!("expected accepted reasoning effect for alias {requested_alias}");
+            };
+            assert_eq!(resolution.requested_effort, requested_alias);
+            assert_eq!(resolution.effective_effort.as_deref(), Some("xhigh"));
+            assert!(reason.contains(requested_alias));
+            assert!(reason.contains("xhigh"));
+        }
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4313,7 +4556,6 @@ mod tests {
         for (input, expected_level, expected_valid) in [
             ("/think max", "xhigh", true),
             ("/think ultra-high", "xhigh", true),
-            ("/think ultra", "ultra", false),
         ] {
             let turn = build_turn_plan(
                 &source,
@@ -4350,6 +4592,33 @@ mod tests {
                 step.command_effect
             );
         }
+
+        let ultra_turn = build_turn_plan(
+            &source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: Some(harness_home.clone()),
+                platform: "telegram".to_string(),
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                text: "/think ultra".to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main56sol".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            build_channel_step(&registry, &ultra_turn).command_effect,
+            Some(ChannelCommandEffect::SwitchThinking {
+                ref level,
+                valid: false,
+                ..
+            }) if level == "ultra"
+        ));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4397,7 +4666,7 @@ mod tests {
         };
         assert!(accepted, "included Sol cohort should accept max");
         assert!(available_efforts.iter().any(|level| level == "max"));
-        assert!(available_efforts.iter().any(|level| level == "ultra"));
+        assert!(!available_efforts.iter().any(|level| level == "ultra"));
 
         write_model_catalog_cohort_for_test(&harness_home, "authoritative", &["main56luna"]);
         let excluded = build_max_step();
@@ -4450,21 +4719,15 @@ mod tests {
         let Some(ChannelCommandEffect::SwitchReasoning {
             preference: ReasoningPreference::Explicit { ref effort },
             accepted,
-            ref available_efforts,
+            ref resolved_policy,
             ..
         }) = step.command_effect
         else {
-            panic!("expected SwitchReasoning for Luna ultra");
+            panic!("expected rejected SwitchReasoning for Luna ultra");
         };
         assert_eq!(effort, "ultra");
         assert!(!accepted);
-        assert_eq!(
-            available_efforts,
-            &["low", "medium", "high", "xhigh", "max"]
-                .into_iter()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        );
+        assert!(resolved_policy.is_none());
 
         let report = crate::apply_channel_command_step(
             &step,

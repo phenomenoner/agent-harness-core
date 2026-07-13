@@ -34,6 +34,7 @@ pub const MAX_MAILBOX_CLAIM_LEASE_MS: i64 = 24 * 60 * 60 * 1000;
 
 const MAILBOX_TABLE: &str = "worker_result_mailbox_v1";
 const OWNER_HASH_DOMAIN: &[u8] = b"agent-harness/worker-result-owner/v1";
+const COORDINATOR_HASH_DOMAIN: &[u8] = b"agent-harness/worker-result-coordinator/v1";
 const EVENT_HASH_DOMAIN: &[u8] = b"agent-harness/worker-result-terminal-event/v1";
 
 #[derive(Debug)]
@@ -191,6 +192,40 @@ impl ExactWorkerResultOwnerV1 {
             self.operation_plan_item_id.as_deref().unwrap_or(""),
         ));
         Ok(hash_named_components(OWNER_HASH_DOMAIN, &components))
+    }
+
+    /// Stable parent scope shared by sibling child results. Unlike
+    /// `owner_key`, this deliberately excludes `sourceQueueId`; it is suitable
+    /// for coalescing multiple child terminals into one coordinator resume.
+    pub fn coordinator_key(&self) -> Result<String, WorkerResultMailboxError> {
+        self.validate()?;
+        let parent_queue_id = self
+            .parent_queue_id
+            .as_deref()
+            .ok_or_else(|| invalid_input("exact coordinator owner requires parentQueueId"))?;
+        let lane_hash = self
+            .lane
+            .identity_hash()
+            .map_err(|error| invalid_input(format!("invalid full lane: {error}")))?;
+        let components = [
+            ("schema", self.schema.as_str()),
+            ("laneHash", lane_hash.as_str()),
+            ("virtualSessionId", self.virtual_session_id.as_str()),
+            (
+                "parentWorkerJobId",
+                self.parent_worker_job_id.as_deref().unwrap_or(""),
+            ),
+            ("parentQueueId", parent_queue_id),
+            (
+                "operationPlanId",
+                self.operation_plan_id.as_deref().unwrap_or(""),
+            ),
+            (
+                "operationPlanItemId",
+                self.operation_plan_item_id.as_deref().unwrap_or(""),
+            ),
+        ];
+        Ok(hash_named_components(COORDINATOR_HASH_DOMAIN, &components))
     }
 }
 
@@ -547,6 +582,7 @@ pub fn initialize_worker_result_mailbox_schema(
             terminal_event_key TEXT NOT NULL UNIQUE,
             owner_kind TEXT NOT NULL,
             owner_key TEXT,
+            coordinator_key TEXT,
             owner_json TEXT NOT NULL,
             auto_resumable INTEGER NOT NULL,
             envelope_json TEXT NOT NULL,
@@ -589,6 +625,59 @@ pub fn initialize_worker_result_mailbox_schema(
             VALUES ('schema', '{WORKER_RESULT_MAILBOX_SCHEMA}');
         "
     ))?;
+    ensure_coordinator_key_column(conn)?;
+    backfill_coordinator_keys(conn)?;
+    Ok(())
+}
+
+fn ensure_coordinator_key_column(conn: &Connection) -> Result<(), WorkerResultMailboxError> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({MAILBOX_TABLE})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "coordinator_key") {
+        conn.execute(
+            &format!("ALTER TABLE {MAILBOX_TABLE} ADD COLUMN coordinator_key TEXT"),
+            [],
+        )?;
+    }
+    conn.execute(
+        &format!(
+            "CREATE INDEX IF NOT EXISTS worker_result_mailbox_coordinator_unread_idx
+             ON {MAILBOX_TABLE}(coordinator_key, auto_resumable, state, terminal_at_ms, mailbox_id)"
+        ),
+        [],
+    )?;
+    Ok(())
+}
+
+fn backfill_coordinator_keys(conn: &Connection) -> Result<(), WorkerResultMailboxError> {
+    let rows = {
+        let mut statement = conn.prepare(&format!(
+            "SELECT mailbox_id, owner_json FROM {MAILBOX_TABLE}
+             WHERE owner_kind='exact' AND coordinator_key IS NULL"
+        ))?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (mailbox_id, owner_json) in rows {
+        let owner = serde_json::from_str::<WorkerResultOwnerV1>(&owner_json)?;
+        let WorkerResultOwnerV1::Exact(owner) = owner else {
+            continue;
+        };
+        let Ok(coordinator_key) = owner.coordinator_key() else {
+            continue;
+        };
+        conn.execute(
+            &format!(
+                "UPDATE {MAILBOX_TABLE} SET coordinator_key=?1 WHERE mailbox_id=?2 AND coordinator_key IS NULL"
+            ),
+            params![coordinator_key, mailbox_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -618,6 +707,10 @@ fn insert_terminal_result_on_connection(
     let owner_json = serde_json::to_string(&input.owner)?;
     let envelope_json = serde_json::to_string(&input.envelope)?;
     let owner_key = input.owner.owner_key()?;
+    let coordinator_key = match &input.owner {
+        WorkerResultOwnerV1::Exact(owner) => owner.coordinator_key().ok(),
+        WorkerResultOwnerV1::LegacyIncomplete(_) => None,
+    };
     let auto_resumable = input.owner.is_auto_resumable();
     let event_digest = terminal_event_digest(
         &input.terminal_event_key,
@@ -630,16 +723,17 @@ fn insert_terminal_result_on_connection(
     let inserted = conn.execute(
         &format!(
             "INSERT OR IGNORE INTO {MAILBOX_TABLE} (
-                schema, terminal_event_key, owner_kind, owner_key, owner_json,
+                schema, terminal_event_key, owner_kind, owner_key, coordinator_key, owner_json,
                 auto_resumable, envelope_json, event_digest, state,
                 source_worker_job_id, terminal_at_ms, created_at_ms, updated_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'unread', ?9, ?10, ?10, ?10)"
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'unread', ?10, ?11, ?11, ?11)"
         ),
         params![
             WORKER_RESULT_MAILBOX_SCHEMA,
             input.terminal_event_key,
             input.owner.owner_kind(),
             owner_key,
+            coordinator_key,
             owner_json,
             if auto_resumable { 1_i64 } else { 0_i64 },
             envelope_json,
@@ -813,6 +907,260 @@ pub fn claim_unread_for_exact_owner_in_transaction(
     })
 }
 
+/// Returns unread results from every sibling source owned by the same exact
+/// parent lane/session. The representative owner must include parentQueueId.
+pub fn coalesced_unread_for_coordinator(
+    conn: &Connection,
+    owner: &ExactWorkerResultOwnerV1,
+    limit: usize,
+) -> Result<WorkerResultMailboxBatchV1, WorkerResultMailboxError> {
+    validate_batch_limit(limit)?;
+    initialize_worker_result_mailbox_schema(conn)?;
+    let coordinator_key = owner.coordinator_key()?;
+    let records =
+        records_for_scope_state(conn, "coordinator_key", &coordinator_key, "unread", limit)?;
+    Ok(WorkerResultMailboxBatchV1 {
+        schema: WORKER_RESULT_MAILBOX_SCHEMA,
+        owner_key: coordinator_key,
+        records,
+    })
+}
+
+pub fn claim_unread_for_coordinator_in_transaction(
+    transaction: &Transaction<'_>,
+    owner: &ExactWorkerResultOwnerV1,
+    options: &WorkerResultMailboxClaimOptionsV1,
+) -> Result<WorkerResultMailboxClaimBatchV1, WorkerResultMailboxError> {
+    validate_claim_options(options)?;
+    initialize_worker_result_mailbox_schema(transaction)?;
+    let coordinator_key = owner.coordinator_key()?;
+    let lease_expires_at_ms = options.now_ms.saturating_add(options.lease_ms);
+
+    transaction.execute(
+        &format!(
+            "UPDATE {MAILBOX_TABLE}
+             SET state='unread', claim_token=NULL, claim_owner=NULL,
+                 claim_expires_at_ms=NULL, updated_at_ms=?1
+             WHERE coordinator_key=?2 AND auto_resumable=1 AND state='claimed'
+               AND claim_expires_at_ms <= ?1"
+        ),
+        params![options.now_ms, coordinator_key],
+    )?;
+
+    if let Some((bound_key, bound_claimant, bound_state, bound_expiry)) = transaction
+        .query_row(
+            &format!(
+                "SELECT coordinator_key, claim_owner, state, claim_expires_at_ms
+                 FROM {MAILBOX_TABLE} WHERE claim_token=?1
+                 ORDER BY mailbox_id ASC LIMIT 1"
+            ),
+            params![options.claim_token],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )
+        .optional()?
+    {
+        if bound_key.as_deref() != Some(coordinator_key.as_str())
+            || bound_claimant.as_deref() != Some(options.claimant_id.as_str())
+        {
+            return Err(WorkerResultMailboxError::ClaimTokenConflict {
+                claim_token: options.claim_token.clone(),
+            });
+        }
+        let records = if bound_state == "claimed" {
+            records_for_scope_claim(
+                transaction,
+                "coordinator_key",
+                &coordinator_key,
+                &options.claim_token,
+            )?
+        } else {
+            Vec::new()
+        };
+        return Ok(WorkerResultMailboxClaimBatchV1 {
+            schema: WORKER_RESULT_MAILBOX_SCHEMA,
+            owner_key: coordinator_key,
+            claim_token: options.claim_token.clone(),
+            claimant_id: options.claimant_id.clone(),
+            lease_expires_at_ms: bound_expiry.unwrap_or(options.now_ms),
+            replayed_existing_claim: true,
+            records,
+        });
+    }
+
+    let ids = unread_ids_for_scope(
+        transaction,
+        "coordinator_key",
+        &coordinator_key,
+        options.limit,
+    )?;
+    for mailbox_id in ids {
+        transaction.execute(
+            &format!(
+                "UPDATE {MAILBOX_TABLE}
+                 SET state='claimed', claim_token=?1, claim_owner=?2,
+                     claim_expires_at_ms=?3, updated_at_ms=?4
+                 WHERE mailbox_id=?5 AND coordinator_key=?6
+                   AND auto_resumable=1 AND state='unread'"
+            ),
+            params![
+                options.claim_token,
+                options.claimant_id,
+                lease_expires_at_ms,
+                options.now_ms,
+                mailbox_id,
+                coordinator_key,
+            ],
+        )?;
+    }
+    let records = records_for_scope_claim(
+        transaction,
+        "coordinator_key",
+        &coordinator_key,
+        &options.claim_token,
+    )?;
+    Ok(WorkerResultMailboxClaimBatchV1 {
+        schema: WORKER_RESULT_MAILBOX_SCHEMA,
+        owner_key: coordinator_key,
+        claim_token: options.claim_token.clone(),
+        claimant_id: options.claimant_id.clone(),
+        lease_expires_at_ms,
+        replayed_existing_claim: false,
+        records,
+    })
+}
+
+pub fn acknowledge_coordinator_claim_in_transaction(
+    transaction: &Transaction<'_>,
+    owner: &ExactWorkerResultOwnerV1,
+    claim_token: &str,
+    now_ms: i64,
+) -> Result<WorkerResultMailboxTransitionV1, WorkerResultMailboxError> {
+    validate_identifier("claimToken", claim_token, true)?;
+    validate_timestamp("nowMs", now_ms)?;
+    let coordinator_key = owner.coordinator_key()?;
+    let already_acknowledged = count_records_for_scope_claim_state(
+        transaction,
+        "coordinator_key",
+        &coordinator_key,
+        claim_token,
+        WorkerResultMailboxStateV1::Acknowledged,
+    )?;
+    let transitioned = transaction.execute(
+        &format!(
+            "UPDATE {MAILBOX_TABLE}
+             SET state='acknowledged', claim_expires_at_ms=NULL,
+                 acknowledged_at_ms=?1, updated_at_ms=?1
+             WHERE coordinator_key=?2 AND auto_resumable=1
+               AND claim_token=?3 AND state='claimed'"
+        ),
+        params![now_ms, coordinator_key, claim_token],
+    )?;
+    Ok(WorkerResultMailboxTransitionV1 {
+        matched_records: already_acknowledged.saturating_add(transitioned),
+        transitioned_records: transitioned,
+    })
+}
+
+pub fn release_coordinator_claim_in_transaction(
+    transaction: &Transaction<'_>,
+    owner: &ExactWorkerResultOwnerV1,
+    claim_token: &str,
+    now_ms: i64,
+) -> Result<WorkerResultMailboxTransitionV1, WorkerResultMailboxError> {
+    validate_identifier("claimToken", claim_token, true)?;
+    validate_timestamp("nowMs", now_ms)?;
+    let coordinator_key = owner.coordinator_key()?;
+    let matched = count_records_for_scope_claim_state(
+        transaction,
+        "coordinator_key",
+        &coordinator_key,
+        claim_token,
+        WorkerResultMailboxStateV1::Claimed,
+    )?;
+    let transitioned = transaction.execute(
+        &format!(
+            "UPDATE {MAILBOX_TABLE}
+             SET state='unread', claim_token=NULL, claim_owner=NULL,
+                 claim_expires_at_ms=NULL, updated_at_ms=?1
+             WHERE coordinator_key=?2 AND auto_resumable=1
+               AND claim_token=?3 AND state='claimed'"
+        ),
+        params![now_ms, coordinator_key, claim_token],
+    )?;
+    Ok(WorkerResultMailboxTransitionV1 {
+        matched_records: matched,
+        transitioned_records: transitioned,
+    })
+}
+
+pub fn claimed_records_for_coordinator_intent_in_transaction(
+    transaction: &Transaction<'_>,
+    owner: &ExactWorkerResultOwnerV1,
+    mailbox_ids: &[i64],
+    claim_tokens: &[String],
+) -> Result<Vec<WorkerResultMailboxRecordV1>, WorkerResultMailboxError> {
+    if mailbox_ids.is_empty() || mailbox_ids.len() > MAX_MAILBOX_BATCH_ITEMS {
+        return Err(invalid_input(
+            "mailboxIds must contain between 1 and 100 entries",
+        ));
+    }
+    if claim_tokens.is_empty() || claim_tokens.len() > MAX_MAILBOX_BATCH_ITEMS {
+        return Err(invalid_input(
+            "claimTokens must contain between 1 and 100 entries",
+        ));
+    }
+    let coordinator_key = owner.coordinator_key()?;
+    let mut unique_ids = mailbox_ids.to_vec();
+    unique_ids.sort_unstable();
+    unique_ids.dedup();
+    if unique_ids.len() != mailbox_ids.len() {
+        return Err(invalid_input("mailboxIds contains duplicates"));
+    }
+    let mut records = Vec::with_capacity(unique_ids.len());
+    for mailbox_id in unique_ids {
+        let scope: (Option<String>, String, Option<String>) = transaction.query_row(
+            &format!(
+                "SELECT coordinator_key, state, claim_token FROM {MAILBOX_TABLE}
+                 WHERE mailbox_id=?1"
+            ),
+            [mailbox_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if scope.0.as_deref() != Some(coordinator_key.as_str())
+            || scope.1 != "claimed"
+            || !scope
+                .2
+                .as_deref()
+                .is_some_and(|token| claim_tokens.iter().any(|expected| expected == token))
+        {
+            return Err(invalid_input(format!(
+                "mailboxId {mailbox_id} is not claimed by this coordinator intent"
+            )));
+        }
+        let raw = transaction.query_row(
+            &format!(
+                "SELECT mailbox_id, terminal_event_key, owner_kind, owner_key, owner_json,
+                        auto_resumable, envelope_json, state, claim_token, claim_owner,
+                        claim_expires_at_ms, source_worker_job_id, terminal_at_ms,
+                        created_at_ms, updated_at_ms, acknowledged_at_ms
+                 FROM {MAILBOX_TABLE} WHERE mailbox_id=?1"
+            ),
+            [mailbox_id],
+            RawMailboxRecord::from_row,
+        )?;
+        records.push(raw.decode()?);
+    }
+    records.sort_by_key(|record| (record.terminal_at_ms, record.mailbox_id));
+    Ok(records)
+}
+
 pub fn acknowledge_claim(
     conn: &mut Connection,
     owner: &ExactWorkerResultOwnerV1,
@@ -905,16 +1253,27 @@ fn records_for_owner_state(
     state: &str,
     limit: usize,
 ) -> Result<Vec<WorkerResultMailboxRecordV1>, WorkerResultMailboxError> {
+    records_for_scope_state(conn, "owner_key", owner_key, state, limit)
+}
+
+fn records_for_scope_state(
+    conn: &Connection,
+    key_column: &str,
+    key: &str,
+    state: &str,
+    limit: usize,
+) -> Result<Vec<WorkerResultMailboxRecordV1>, WorkerResultMailboxError> {
+    debug_assert!(matches!(key_column, "owner_key" | "coordinator_key"));
     let mut statement = conn.prepare(&format!(
         "SELECT mailbox_id, terminal_event_key, owner_kind, owner_key, owner_json,
                 auto_resumable, envelope_json, state, claim_token, claim_owner,
                 claim_expires_at_ms, source_worker_job_id, terminal_at_ms,
                 created_at_ms, updated_at_ms, acknowledged_at_ms
          FROM {MAILBOX_TABLE}
-         WHERE owner_key = ?1 AND auto_resumable = 1 AND state = ?2
+         WHERE {key_column} = ?1 AND auto_resumable = 1 AND state = ?2
          ORDER BY terminal_at_ms ASC, mailbox_id ASC LIMIT ?3"
     ))?;
-    let mut rows = statement.query(params![owner_key, state, limit as i64])?;
+    let mut rows = statement.query(params![key, state, limit as i64])?;
     decode_rows(&mut rows)
 }
 
@@ -923,13 +1282,23 @@ fn unread_ids_for_owner(
     owner_key: &str,
     limit: usize,
 ) -> Result<Vec<i64>, WorkerResultMailboxError> {
+    unread_ids_for_scope(conn, "owner_key", owner_key, limit)
+}
+
+fn unread_ids_for_scope(
+    conn: &Connection,
+    key_column: &str,
+    key: &str,
+    limit: usize,
+) -> Result<Vec<i64>, WorkerResultMailboxError> {
+    debug_assert!(matches!(key_column, "owner_key" | "coordinator_key"));
     let mut statement = conn.prepare(&format!(
         "SELECT mailbox_id FROM {MAILBOX_TABLE}
-         WHERE owner_key = ?1 AND auto_resumable = 1 AND state = 'unread'
+         WHERE {key_column} = ?1 AND auto_resumable = 1 AND state = 'unread'
          ORDER BY terminal_at_ms ASC, mailbox_id ASC LIMIT ?2"
     ))?;
     let ids = statement
-        .query_map(params![owner_key, limit as i64], |row| row.get(0))?
+        .query_map(params![key, limit as i64], |row| row.get(0))?
         .collect::<Result<Vec<i64>, _>>()?;
     Ok(ids)
 }
@@ -939,17 +1308,27 @@ fn records_for_claim(
     owner_key: &str,
     claim_token: &str,
 ) -> Result<Vec<WorkerResultMailboxRecordV1>, WorkerResultMailboxError> {
+    records_for_scope_claim(conn, "owner_key", owner_key, claim_token)
+}
+
+fn records_for_scope_claim(
+    conn: &Connection,
+    key_column: &str,
+    key: &str,
+    claim_token: &str,
+) -> Result<Vec<WorkerResultMailboxRecordV1>, WorkerResultMailboxError> {
+    debug_assert!(matches!(key_column, "owner_key" | "coordinator_key"));
     let mut statement = conn.prepare(&format!(
         "SELECT mailbox_id, terminal_event_key, owner_kind, owner_key, owner_json,
                 auto_resumable, envelope_json, state, claim_token, claim_owner,
                 claim_expires_at_ms, source_worker_job_id, terminal_at_ms,
                 created_at_ms, updated_at_ms, acknowledged_at_ms
          FROM {MAILBOX_TABLE}
-         WHERE owner_key = ?1 AND auto_resumable = 1 AND state = 'claimed'
+         WHERE {key_column} = ?1 AND auto_resumable = 1 AND state = 'claimed'
            AND claim_token = ?2
          ORDER BY terminal_at_ms ASC, mailbox_id ASC"
     ))?;
-    let mut rows = statement.query(params![owner_key, claim_token])?;
+    let mut rows = statement.query(params![key, claim_token])?;
     decode_rows(&mut rows)
 }
 
@@ -959,13 +1338,24 @@ fn count_records_for_claim_state(
     claim_token: &str,
     state: WorkerResultMailboxStateV1,
 ) -> Result<usize, WorkerResultMailboxError> {
+    count_records_for_scope_claim_state(conn, "owner_key", owner_key, claim_token, state)
+}
+
+fn count_records_for_scope_claim_state(
+    conn: &Connection,
+    key_column: &str,
+    key: &str,
+    claim_token: &str,
+    state: WorkerResultMailboxStateV1,
+) -> Result<usize, WorkerResultMailboxError> {
+    debug_assert!(matches!(key_column, "owner_key" | "coordinator_key"));
     let count: i64 = conn.query_row(
         &format!(
             "SELECT COUNT(*) FROM {MAILBOX_TABLE}
-             WHERE owner_key = ?1 AND auto_resumable = 1
+             WHERE {key_column} = ?1 AND auto_resumable = 1
                AND claim_token = ?2 AND state = ?3"
         ),
-        params![owner_key, claim_token, state.as_db()],
+        params![key, claim_token, state.as_db()],
         |row| row.get(0),
     )?;
     Ok(usize::try_from(count).unwrap_or(usize::MAX))
@@ -1290,6 +1680,20 @@ mod tests {
             Some("item-1".to_string()),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn sibling_sources_share_parent_coordinator_key_but_keep_distinct_owner_keys() {
+        let first = owner("main");
+        let mut second = first.clone();
+        second.source_queue_id = "source-queue-sibling".to_string();
+        second.validate().unwrap();
+
+        assert_ne!(first.owner_key().unwrap(), second.owner_key().unwrap());
+        assert_eq!(
+            first.coordinator_key().unwrap(),
+            second.coordinator_key().unwrap()
+        );
     }
 
     fn envelope(summary: &str) -> WorkerResultEnvelopeV1 {

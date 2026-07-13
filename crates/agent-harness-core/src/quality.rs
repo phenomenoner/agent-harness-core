@@ -157,6 +157,26 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
             statement: "skill ecosystem mutation is proposal-mediated but autonomous review/apply is a first-class path; lint/guard gates run before prompt exposure or apply, archive is reversible move-not-delete, and selection/view/apply decisions leave receipts",
             owner: "skills/skill_apply/skill_guard/skill_lint/skill_curator/prompt",
         },
+        InvariantEntry {
+            id: "I21",
+            statement: "reasoning effort is authorized against the effective provider/model route and preserved exactly through queue and runtime; /think and /reasoning are aliases of one last-write-wins state, GPT-5.6 max remains distinct, and ultra is rejected as a reasoning effort",
+            owner: "channel_commands/channel_state/channel_runtime/model_catalog/runtime_queue/codex_runtime",
+        },
+        InvariantEntry {
+            id: "I22",
+            statement: "each agent prompt is assembled from its own canonical manifest under an exact full-lane and backend-generation key; aliases are fallback-only, deletions create tombstones, and another agent or lane cannot reuse the ledger entry",
+            owner: "prompt/turns/virtual_session_context/operation_plan/runtime_worker",
+        },
+        InvariantEntry {
+            id: "I23",
+            statement: "each child has an immutable independent model/effort policy and exact master-owned result owner; child terminal results enter the durable mailbox and never directly create the parent final outbox",
+            owner: "child_execution_policy/worker_adapters/workers/worker_result_mailbox/runtime_pipeline",
+        },
+        InvariantEntry {
+            id: "I24",
+            statement: "coordinator resume is durable, exact-lane, coalesced, and at-most-once: an active parent lease suppresses wakeup, a confirmed released lease schedules one typed continuation, and mailbox acknowledgement follows continuation lease acquisition",
+            owner: "worker_coordination/worker_resume/coordinator_resume/workers/runtime_worker",
+        },
     ]
 }
 
@@ -603,6 +623,61 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             compatibility: "additive findings only in v1",
         },
         SchemaRegistryEntry {
+            schema: "agent-harness.runtime-queue-item.v2",
+            owner_module: "runtime_queue/runtime_worker/workers",
+            compatibility: "flat additive queue wire; coordinator-resume metadata is a typed V2 variant, while execution snapshots require immutable admissionQueueId and authorizedExecutionMode together; V1 readers remain supported",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.agent-prompt-manifest.v1",
+            owner_module: "prompt",
+            compatibility: "per-agent canonical source inventory; aliases, tombstones, backend generation, and exact-lane digest fields are additive in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.child-execution-policy.v1",
+            owner_module: "child_execution_policy/workers",
+            compatibility: "immutable per-child provider/model/reasoning snapshot; open-ended canonical effort strings are additive and validated against the resolved route",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.child-execution-policy.v2",
+            owner_module: "child_execution_policy/workers",
+            compatibility: "additive wrapper over V1 with an optional default-off execution snapshot; reasoning effort never accepts reserved execution-mode values",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.worker-result-owner.v1",
+            owner_module: "worker_result_mailbox",
+            compatibility: "exact full-lane, virtual-session, and source identity are immutable; legacy incomplete owners remain auditable but cannot auto-resume",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.worker-result-envelope.v1",
+            owner_module: "worker_result_mailbox",
+            compatibility: "bounded redacted summaries and opaque artifact pointers only; additive outcome metadata must preserve the content policy",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.worker-result-mailbox.v1",
+            owner_module: "worker_result_mailbox/workers",
+            compatibility: "SQLite append-once terminal events with additive columns only; owner rebinding conflicts fail closed and acknowledgement is monotonic",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.worker-coordinator-wait.v1",
+            owner_module: "worker_coordination/worker_adapters",
+            compatibility: "SQLite parent wait state with immutable exact owner and child set; state transitions are monotonic and duplicate admission is idempotent",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.worker-resume-intent.v1",
+            owner_module: "worker_resume",
+            compatibility: "SQLite exact-lane resume intent; sequence is monotonic, duplicate result sets coalesce, and expired claims are restart-reclaimable",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.coordinator-resume.v1",
+            owner_module: "coordinator_resume/workers/runtime_worker",
+            compatibility: "typed continuation metadata binds wait, intent, exact owner, and deterministic continuation queue id; additive fields only in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.safe-resume-readiness.v1",
+            owner_module: "execution_mode/runtime_queue",
+            compatibility: "readiness evidence is observational and fail-closed; additive probes may be added without treating caller booleans as authority",
+        },
+        SchemaRegistryEntry {
             schema: "agent-harness.quality-report.v1",
             owner_module: "quality",
             compatibility: "additive fields only in v1",
@@ -914,6 +989,98 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
             promotion_gate: "Create or reuse a configured-agent matrix covering main, xiaoxiaoli, and a future public/coach agent without rebuilding shared loops. For cross-session search, prove concrete session history is same-agent/session only, non-lane-qualified concrete keys fail closed, wrong-lane concrete candidates fail closed with denial receipts, and project/global fallback is explicit.",
         },
         ScenarioMatrixEntry {
+            id: "gpt56-reasoning-capability",
+            title: "GPT-5.6 model capability and unified reasoning control",
+            changed_areas: vec![
+                "channel commands/state",
+                "model capability catalog",
+                "runtime queue",
+                "Codex runtime",
+            ],
+            required_invariants: vec!["I3", "I8", "I21"],
+            required_evidence: vec![
+                "/think and /reasoning read and write one authoritative last-write-wins state",
+                "gpt-5.6-sol preserves exact max when the effective route advertises it",
+                "open-ended future catalog efforts are preserved without hard-coded downgrades",
+                "exact ultra is rejected as a reasoning effort and is not advertised or sent to Codex",
+                "legacy ultra-high remains the xhigh compatibility alias",
+                "turn-start wire evidence binds the resolved route and exact effort",
+            ],
+            runnable_tests: vec![
+                "codex_capability::tests::paginated_catalog_matches_model_field_and_keeps_open_efforts_distinct",
+                "channel_runtime::tests::model_catalog_authoritative_reasoning_preserves_exact_sol_max",
+                "channel_runtime::tests::think_and_reasoning_alias_share_one_last_write_wins_state",
+                "channel_runtime::tests::exact_ultra_is_rejected_as_non_effort_for_both_command_aliases",
+                "runtime_queue::tests::enqueue_channel_agent_turn_serializes_exact_max_reasoning_policy",
+                "codex_runtime::backend_reasoning_wire_tests::turn_start_effort_is_exact_and_runtime_kill_switch_is_fail_closed",
+            ],
+            promotion_gate: "Promote only after a current Codex capability probe authorizes the selected GPT-5.6 route, exact max survives command-to-wire verification, both aliases remain identical, and Ultra is absent from the supported effort surface and live configuration.",
+        },
+        ScenarioMatrixEntry {
+            id: "per-agent-prompt-manifest",
+            title: "Per-agent prompt manifest and exact-lane virtual-session injection",
+            changed_areas: vec![
+                "prompt assembly",
+                "agent workspace configuration",
+                "virtual-session context",
+                "operation plan",
+                "runtime worker",
+            ],
+            required_invariants: vec!["I8", "I15", "I22"],
+            required_evidence: vec![
+                "AGENTS, SOUL, IDENTITY, USER, TOOLS, MEMORY, BOOTSTRAP and other declared agent files are inventoried per agent",
+                "canonical names win and aliases are fallback-only",
+                "changed sources advance backend generation and deleted sources leave tombstones",
+                "prompt ledger reuse requires the exact platform/account/channel/user/agent/runtime/root/concrete lane digest",
+                "operation-plan context with a lane digest fails closed on a different lane while legacy plans stay readable",
+                "/new and backend-generation changes do not resurrect a prior task prompt context",
+            ],
+            runnable_tests: vec![
+                "turns::tests::prompt_file_aliases_are_fallback_only_and_conflicts_are_deterministic",
+                "prompt::tests::prompt_manifest_tracks_generation_reinjection_and_delete_tombstone",
+                "prompt::tests::prompt_ledger_exact_lane_digest_separates_account_runtime_and_root_axes",
+                "prompt::tests::operation_plan_prompt_exact_lane_requires_matching_digest_without_legacy_fallback",
+                "operation_plan::tests::operation_plan_v2_persists_exact_lane_digest_and_rejects_mismatched_duplicate",
+                "virtual_session_context::tests::exact_lane_denies_legacy_unknown_axes_instead_of_wildcard_matching",
+                "prompt::tests::prompt_bundle_new_command_boundary_skips_prior_task_memory_context",
+            ],
+            promotion_gate: "Promote after the exact-lane prompt matrix passes for two agents sharing platform/channel/user axes, source change/delete reinjection is deterministic, and a /new task plus backend rollover cannot reuse stale prompt or operation-plan context.",
+        },
+        ScenarioMatrixEntry {
+            id: "master-owned-subagent-coordination",
+            title: "Master-owned durable subagent result coordination",
+            changed_areas: vec![
+                "child execution policy",
+                "worker admission/store",
+                "result mailbox",
+                "coordinator wait/resume",
+                "runtime queue",
+                "final outbox",
+            ],
+            required_invariants: vec!["I2", "I3", "I5", "I8", "I23", "I24"],
+            required_evidence: vec![
+                "siblings retain independent provider/model/effort policies",
+                "child jobs, parent wait, and watchdog admission commit atomically",
+                "terminal child envelopes are append-once and owned by the exact master lane",
+                "active parent lease suppresses coordinator wakeup without claiming results",
+                "released parent creates one typed coordinator continuation and no legacy master wakeup",
+                "duplicate/restart attempts coalesce to one resume intent and acknowledge mailbox rows after lease acquisition",
+                "child or owner-mismatched terminal output never reaches the parent final outbox",
+            ],
+            runnable_tests: vec![
+                "child_execution_policy::tests::heterogeneous_siblings_preserve_independent_open_ended_routes_and_efforts",
+                "worker_adapters::tests::subagent_adapter_v5_atomically_preserves_heterogeneous_models_and_efforts",
+                "worker_adapters::tests::subagent_adapter_v5_rolls_back_children_wait_and_watchdog_together",
+                "worker_result_mailbox::tests::unread_lookup_and_claim_are_isolated_by_every_exact_owner_axis",
+                "worker_resume::tests::active_parent_quarantines_without_claiming_then_idle_schedules_once",
+                "worker_resume::tests::restart_replays_same_claim_and_intent_without_duplication",
+                "workers::tests::subagent_lifecycle_retry_does_not_duplicate_runtime_queue_item",
+                "runtime_pipeline::tests::run_runtime_queue_once_suppresses_owner_mismatched_agent_final_outbox",
+                "coordinator_resume::released_parent_schedules_one_durable_coordinator_resume_and_no_master_wakeup",
+            ],
+            promotion_gate: "Promote after heterogeneous siblings, atomic rollback, exact-owner isolation, active/released parent lease transitions, duplicate/restart recovery, mailbox acknowledgement, and child-final suppression pass in one staging candidate; live gateway control remains on the main lane.",
+        },
+        ScenarioMatrixEntry {
             id: "provider-request-acceleration",
             title: "Provider request acceleration command and service tier routing",
             changed_areas: vec![
@@ -1104,6 +1271,7 @@ pub fn release_checklist() -> ReleaseChecklist {
             "Codex tool-use timeout changes passed bounded recovery checks",
             "Round18 delivery/runtime interruption changes passed Telegram overlong final chunking, terminal receipt precedence, permanent provider rejection, structured interrupted command, safe-rerun, prompt/resolver, and runtime failure wording checks",
             "artifact/context hygiene changes passed generic artifact prompt/progress redaction and Discord attachment extraction checks",
+            "GPT-5.6 and multi-agent orchestration changes passed max-only reasoning, exact-lane prompt, heterogeneous-child, master-owned mailbox, lease-safe resume, and child-final suppression scenario gates",
             "public hygiene report passed",
             "rollback notes recorded",
             "staging healthz and trace samples captured",
@@ -1369,6 +1537,78 @@ mod tests {
                 .promotion_gate
                 .contains("real supervised child restart")
         );
+    }
+
+    #[test]
+    fn quality_catalogs_register_gpt56_prompt_and_coordination_contracts() {
+        let invariant_ids = invariant_catalog()
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect::<std::collections::HashSet<_>>();
+        for invariant in ["I21", "I22", "I23", "I24"] {
+            assert!(
+                invariant_ids.contains(invariant),
+                "missing orchestration invariant {invariant}"
+            );
+        }
+
+        let schemas = schema_registry_entries()
+            .into_iter()
+            .map(|entry| entry.schema)
+            .collect::<std::collections::HashSet<_>>();
+        for schema in [
+            "agent-harness.runtime-queue-item.v2",
+            "agent-harness.agent-prompt-manifest.v1",
+            "agent-harness.child-execution-policy.v1",
+            "agent-harness.worker-result-owner.v1",
+            "agent-harness.worker-result-envelope.v1",
+            "agent-harness.worker-result-mailbox.v1",
+            "agent-harness.worker-coordinator-wait.v1",
+            "agent-harness.worker-resume-intent.v1",
+            "agent-harness.coordinator-resume.v1",
+            "agent-harness.safe-resume-readiness.v1",
+        ] {
+            assert!(
+                schemas.contains(schema),
+                "missing schema registry entry {schema}"
+            );
+        }
+
+        let scenarios = scenario_matrix_catalog();
+        let reasoning = scenarios
+            .iter()
+            .find(|entry| entry.id == "gpt56-reasoning-capability")
+            .expect("GPT-5.6 reasoning scenario");
+        assert!(reasoning.required_invariants.contains(&"I21"));
+        assert!(reasoning.runnable_tests.contains(
+            &"channel_runtime::tests::think_and_reasoning_alias_share_one_last_write_wins_state"
+        ));
+        assert!(reasoning.runnable_tests.contains(
+            &"channel_runtime::tests::exact_ultra_is_rejected_as_non_effort_for_both_command_aliases"
+        ));
+
+        let prompt = scenarios
+            .iter()
+            .find(|entry| entry.id == "per-agent-prompt-manifest")
+            .expect("per-agent prompt manifest scenario");
+        assert!(prompt.required_invariants.contains(&"I22"));
+        assert!(prompt.runnable_tests.contains(
+            &"turns::tests::prompt_file_aliases_are_fallback_only_and_conflicts_are_deterministic"
+        ));
+
+        let coordination = scenarios
+            .iter()
+            .find(|entry| entry.id == "master-owned-subagent-coordination")
+            .expect("master-owned coordination scenario");
+        assert!(coordination.required_invariants.contains(&"I23"));
+        assert!(coordination.required_invariants.contains(&"I24"));
+        assert!(coordination
+            .runnable_tests
+            .contains(&"coordinator_resume::released_parent_schedules_one_durable_coordinator_resume_and_no_master_wakeup"));
+
+        assert!(release_checklist().required_items.contains(
+            &"GPT-5.6 and multi-agent orchestration changes passed max-only reasoning, exact-lane prompt, heterogeneous-child, master-owned mailbox, lease-safe resume, and child-final suppression scenario gates"
+        ));
     }
 
     fn temp_root(test_name: &str) -> PathBuf {
