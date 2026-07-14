@@ -3,6 +3,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::context_rollover::{derive_virtual_session_id, root_working_session_key};
 use crate::worker_result_mailbox::ExactWorkerResultOwnerV1;
 
 pub const COORDINATOR_RESUME_METADATA_SCHEMA: &str = "agent-harness.coordinator-resume.v1";
@@ -15,6 +16,20 @@ pub struct CoordinatorResumeMetadataV1 {
     pub wait_id: String,
     pub continuation_queue_id: String,
     pub owner: ExactWorkerResultOwnerV1,
+}
+
+/// Immutable queued lane fields that a coordinator continuation must match.
+/// The metadata owner is authoritative; queue payload values are untrusted at
+/// both the worker-dispatch and durable-runtime boundaries.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CoordinatorResumeQueuedLaneV1<'a> {
+    pub platform: &'a str,
+    pub account_id: &'a str,
+    pub channel_id: &'a str,
+    pub user_id: &'a str,
+    pub agent_id: &'a str,
+    pub runtime_class: &'a str,
+    pub session_key: &'a str,
 }
 
 impl CoordinatorResumeMetadataV1 {
@@ -54,6 +69,59 @@ impl CoordinatorResumeMetadataV1 {
         }
         Ok(())
     }
+
+    /// Rejects a continuation whose mutable queue representation differs from
+    /// its exact parent owner.  All eight full-lane axes, plus the derived
+    /// virtual session, are checked before the continuation can run.
+    pub(crate) fn validate_queued_lane(
+        &self,
+        queued: CoordinatorResumeQueuedLaneV1<'_>,
+    ) -> Result<(), CoordinatorResumeMetadataError> {
+        self.validate()?;
+        let root_session = root_working_session_key(queued.session_key);
+        let observed = [
+            ("platform", self.owner.lane.platform(), queued.platform),
+            ("accountId", self.owner.lane.account_id(), queued.account_id),
+            ("channelId", self.owner.lane.channel_id(), queued.channel_id),
+            ("userId", self.owner.lane.user_id(), queued.user_id),
+            ("agentId", self.owner.lane.agent_id(), queued.agent_id),
+            (
+                "runtimeClass",
+                self.owner.lane.runtime_class(),
+                queued.runtime_class,
+            ),
+            (
+                "rootVirtualSession",
+                self.owner.lane.root_virtual_session(),
+                root_session.as_str(),
+            ),
+            (
+                "concreteSession",
+                self.owner.lane.concrete_session(),
+                queued.session_key,
+            ),
+        ];
+        if let Some((axis, _, _)) = observed
+            .into_iter()
+            .find(|(_, expected, actual)| expected != actual)
+        {
+            return Err(CoordinatorResumeMetadataError::QueuedLaneMismatch(axis));
+        }
+
+        let expected_virtual_session_id = derive_virtual_session_id(
+            queued.platform,
+            queued.channel_id,
+            queued.user_id,
+            queued.agent_id,
+            &root_session,
+        );
+        if self.owner.virtual_session_id != expected_virtual_session_id {
+            return Err(CoordinatorResumeMetadataError::QueuedLaneMismatch(
+                "virtualSessionId",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +129,7 @@ pub enum CoordinatorResumeMetadataError {
     InvalidSchema(String),
     InvalidIdentifier(&'static str),
     InvalidOwner(String),
+    QueuedLaneMismatch(&'static str),
 }
 
 impl fmt::Display for CoordinatorResumeMetadataError {
@@ -74,6 +143,12 @@ impl fmt::Display for CoordinatorResumeMetadataError {
             }
             Self::InvalidOwner(reason) => {
                 write!(formatter, "coordinator resume owner is invalid: {reason}")
+            }
+            Self::QueuedLaneMismatch(axis) => {
+                write!(
+                    formatter,
+                    "coordinator resume owner does not match queued {axis}"
+                )
             }
         }
     }

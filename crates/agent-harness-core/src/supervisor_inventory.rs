@@ -287,6 +287,7 @@ fn expected_supervisor_service_kind(service_id: &str) -> Option<&'static str> {
         "worker-loop" => Some("worker"),
         "cron-scheduler-loop" => Some("cron"),
         "progress-delivery-loop" => Some("progress-delivery"),
+        "ledger-maintenance-loop" => Some("ledger-maintenance"),
         "telegram-loop" => Some("telegram-ingress"),
         "discord-outbox-loop" => Some("final-outbox"),
         "discord-gateway-loop" => Some("discord-gateway"),
@@ -763,6 +764,44 @@ mod tests {
         assert!(command.windows(2).any(|pair| {
             pair[0] == "--harness-home" && pair[1] == harness_home.to_string_lossy()
         }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inventory_accepts_isolated_ledger_maintenance_service_and_plans_owner() {
+        let root =
+            temp_root("inventory_accepts_isolated_ledger_maintenance_service_and_plans_owner");
+        let harness_home = root.join(".agent-harness");
+
+        let report = reconcile_supervisor_inventory(SupervisorInventoryOptions {
+            harness_home: harness_home.clone(),
+            desired_services: vec![SupervisorInventoryServiceConfig {
+                enabled: true,
+                service_id: "ledger-maintenance-loop".to_string(),
+                service_kind: "ledger-maintenance".to_string(),
+                args: vec!["--idle-ms".to_string(), "60000".to_string()],
+                priority: "maintenance".to_string(),
+                restart_delay_ms: 15_000,
+                heartbeat_timeout_ms: Some(5_000),
+            }],
+            now_ms: Some(1_000),
+            default_heartbeat_timeout_ms: Some(120_000),
+        })
+        .unwrap();
+
+        assert_eq!(report.missing.len(), 1);
+        assert_eq!(
+            report.missing.first().map(|item| item.service_id.as_str()),
+            Some("ledger-maintenance-loop")
+        );
+        assert_eq!(report.launch_commands.len(), 1);
+        assert!(
+            report.launch_commands[0]
+                .command
+                .windows(2)
+                .any(|pair| { pair[0] == "--service" && pair[1] == "ledger-maintenance-loop" })
+        );
 
         let _ = fs::remove_dir_all(root);
     }

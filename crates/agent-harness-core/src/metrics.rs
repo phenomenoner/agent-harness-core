@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
-use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Serialize;
-use serde_json::Value;
 
+use crate::runtime_receipt_history::read_runtime_queue_receipt_history_status_counts;
+use crate::runtime_worker::{
+    refresh_runtime_queue_state_index, runtime_queue_status_counts_from_index,
+};
 use crate::{HarnessStatusOptions, collect_harness_status};
 
 const HARNESS_METRICS_SCHEMA: &str = "agent-harness.metrics.v1";
@@ -70,7 +72,12 @@ pub fn collect_harness_metrics(options: HarnessMetricsOptions) -> io::Result<Har
             })
             .count() as i64,
     );
-    let runtime_status_counts = count_statuses(&queue_dir.join("run-once-receipts.jsonl"))?;
+    let mut runtime_status_counts = read_runtime_queue_receipt_history_status_counts(&queue_dir)?;
+    let hot_index = refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new())?;
+    merge_status_counts(
+        &mut runtime_status_counts,
+        runtime_queue_status_counts_from_index(&hot_index),
+    );
     Ok(HarnessMetricsReport {
         schema: HARNESS_METRICS_SCHEMA,
         harness_home: options.harness_home,
@@ -80,31 +87,18 @@ pub fn collect_harness_metrics(options: HarnessMetricsOptions) -> io::Result<Har
     })
 }
 
-fn count_statuses(path: &Path) -> io::Result<BTreeMap<String, usize>> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(error) => return Err(error),
-    };
-    let mut counts = BTreeMap::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        if let Some(status) = value.get("status").and_then(Value::as_str) {
-            *counts.entry(status.to_string()).or_insert(0) += 1;
-        }
+fn merge_status_counts(into: &mut BTreeMap<String, usize>, additional: BTreeMap<String, usize>) {
+    for (status, count) in additional {
+        let current = into.entry(status).or_default();
+        *current = current.saturating_add(count);
     }
-    Ok(counts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -129,6 +123,47 @@ mod tests {
         assert_eq!(report.counters["runtime.queue.queued"], 1);
         assert_eq!(report.runtime_status_counts["retry-pending"], 1);
         assert_eq!(report.runtime_status_counts["dead-letter"], 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn metrics_combines_committed_history_status_deltas_with_the_hot_ledger() {
+        let root =
+            temp_root("metrics_combines_committed_history_status_deltas_with_the_hot_ledger");
+        let harness_home = root.join(".agent-harness");
+        let queue = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue).unwrap();
+        let staged = crate::runtime_receipt_history::stage_runtime_queue_receipt_history(
+            &queue,
+            "metrics-history",
+            br#"{"queueId":"queue-history","status":"lease-busy"}
+{"queueId":"queue-history","status":"completed","reason":"historical completion"}
+"#,
+            b"",
+            &HashSet::new(),
+            100,
+        )
+        .unwrap();
+        crate::runtime_receipt_history::commit_runtime_queue_receipt_history(&staged, 101).unwrap();
+        fs::write(
+            queue.join("pending.jsonl"),
+            r#"{"queueId":"queue-live","status":"queued"}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            queue.join("run-once-receipts.jsonl"),
+            r#"{"queueId":"queue-live","status":"retry-pending"}
+"#,
+        )
+        .unwrap();
+
+        let report = collect_harness_metrics(HarnessMetricsOptions { harness_home }).unwrap();
+
+        assert_eq!(report.runtime_status_counts["lease-busy"], 1);
+        assert_eq!(report.runtime_status_counts["completed"], 1);
+        assert_eq!(report.runtime_status_counts["retry-pending"], 1);
 
         let _ = fs::remove_dir_all(root);
     }

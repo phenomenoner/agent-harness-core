@@ -209,7 +209,7 @@ fn released_parent_schedules_one_durable_coordinator_resume_and_no_master_wakeup
                     "channelId": "channel",
                     "userId": "user",
                     "sessionKey": "discord:channel:user:main",
-                    "virtualSessionId": "virtual-session",
+                    "virtualSessionId": "discord:channel:user:main:vsession-babfeafb4a118dbd",
                     "owner": format!("pid:{}", std::process::id()),
                     "startedAtMs": 2_000,
                     "leaseExpiresAtMs": 90_000
@@ -383,7 +383,7 @@ fn released_parent_schedules_one_durable_coordinator_resume_and_no_master_wakeup
                     "channelId": "channel",
                     "userId": "user",
                     "sessionKey": "discord:channel:user:main",
-                    "virtualSessionId": "virtual-session",
+                    "virtualSessionId": "discord:channel:user:main:vsession-babfeafb4a118dbd",
                     "owner": format!("pid:{}", std::process::id()),
                     "startedAtMs": 100_020,
                     "leaseExpiresAtMs": i64::MAX
@@ -492,7 +492,10 @@ fn exact_owner(source_queue_id: &str) -> ExactWorkerResultOwnerV1 {
             "discord:channel:user:main",
         )
         .unwrap(),
-        "virtual-session",
+        // The coordinator metadata validates the virtual-session derivation in
+        // addition to every full-lane axis. Keep this fixture on the same
+        // canonical V1 identity that a legacy-compatible runtime item carries.
+        "discord:channel:user:main:vsession-babfeafb4a118dbd",
         None,
         Some("parent-queue".to_string()),
         source_queue_id,

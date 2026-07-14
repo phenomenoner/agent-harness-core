@@ -1646,12 +1646,36 @@ fn rotate_cron_scheduler_receipts_if_needed(receipts_file: &Path, now_ms: i64) -
     if metadata.len() < CRON_RECEIPTS_MAX_BYTES {
         return Ok(());
     }
-    let archive = receipts_file.with_file_name(format!("receipts-{now_ms}.jsonl"));
-    fs::rename(receipts_file, archive)?;
-    prune_cron_receipt_archives(receipts_file.parent().unwrap_or(Path::new(".")))
+    let archive = next_cron_receipt_archive_path(receipts_file, now_ms)?;
+    fs::rename(receipts_file, &archive)?;
+    prune_cron_receipt_archives(
+        receipts_file.parent().unwrap_or(Path::new(".")),
+        Some(&archive),
+    )
 }
 
-fn prune_cron_receipt_archives(state_dir: &Path) -> io::Result<()> {
+fn next_cron_receipt_archive_path(receipts_file: &Path, now_ms: i64) -> io::Result<PathBuf> {
+    for sequence in 0..10_000_u32 {
+        let suffix = (sequence > 0)
+            .then(|| format!("-{sequence}"))
+            .unwrap_or_default();
+        let candidate = receipts_file.with_file_name(format!("receipts-{now_ms}{suffix}.jsonl"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "could not allocate a unique cron scheduler receipt archive for timestamp {now_ms}"
+        ),
+    ))
+}
+
+fn prune_cron_receipt_archives(
+    state_dir: &Path,
+    protected_archive: Option<&Path>,
+) -> io::Result<()> {
     let mut archives = Vec::new();
     for entry in fs::read_dir(state_dir)? {
         let entry = entry?;
@@ -1664,7 +1688,20 @@ fn prune_cron_receipt_archives(state_dir: &Path) -> io::Result<()> {
         }
     }
     archives.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0)));
-    for (path, _) in archives.into_iter().skip(CRON_RECEIPTS_MAX_ARCHIVES) {
+    let protected_count = usize::from(
+        protected_archive
+            .is_some_and(|protected| archives.iter().any(|(path, _)| path == protected)),
+    );
+    let keep_unprotected = CRON_RECEIPTS_MAX_ARCHIVES.saturating_sub(protected_count);
+    let mut retained_unprotected = 0;
+    for (path, _) in archives {
+        if protected_archive.is_some_and(|protected| path == protected) {
+            continue;
+        }
+        if retained_unprotected < keep_unprotected {
+            retained_unprotected += 1;
+            continue;
+        }
         fs::remove_file(path)?;
     }
     Ok(())
@@ -3081,6 +3118,89 @@ mod tests {
             finding.code == "deterministic-invalid-execution-policy"
                 && finding.message.contains("maxAttempts")
         }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scheduler_receipt_rotation_preserves_timestamp_collision_without_overwrite() {
+        let root = temp_root("scheduler_receipt_rotation_preserves_timestamp_collision");
+        let scheduler_dir = root.join("state").join("cron-scheduler");
+        fs::create_dir_all(&scheduler_dir).unwrap();
+        let receipts = scheduler_dir.join("receipts.jsonl");
+        fs::File::create(&receipts)
+            .unwrap()
+            .set_len(CRON_RECEIPTS_MAX_BYTES)
+            .unwrap();
+        let collision = scheduler_dir.join("receipts-1000.jsonl");
+        fs::write(&collision, "existing historical receipt").unwrap();
+        for index in 1..=3 {
+            fs::write(
+                scheduler_dir.join(format!("receipts-history-{index}.jsonl")),
+                format!("history-{index}"),
+            )
+            .unwrap();
+        }
+
+        rotate_cron_scheduler_receipts_if_needed(&receipts, 1000).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&collision).unwrap(),
+            "existing historical receipt"
+        );
+        assert!(scheduler_dir.join("receipts-1000-1.jsonl").is_file());
+        assert!(!receipts.exists());
+        let archives = fs::read_dir(&scheduler_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("receipts-") && name.ends_with(".jsonl"))
+            })
+            .count();
+        assert_eq!(archives, CRON_RECEIPTS_MAX_ARCHIVES);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scheduler_receipt_rotation_bounds_archives_and_keeps_current_archive() {
+        let root = temp_root("scheduler_receipt_rotation_bounds_archives");
+        let scheduler_dir = root.join("state").join("cron-scheduler");
+        fs::create_dir_all(&scheduler_dir).unwrap();
+        for index in 0..6 {
+            fs::write(
+                scheduler_dir.join(format!("receipts-history-{index}.jsonl")),
+                format!("history-{index}"),
+            )
+            .unwrap();
+        }
+        let unrelated = scheduler_dir.join("do-not-delete.txt");
+        fs::write(&unrelated, "unrelated state").unwrap();
+        let receipts = scheduler_dir.join("receipts.jsonl");
+        fs::File::create(&receipts)
+            .unwrap()
+            .set_len(CRON_RECEIPTS_MAX_BYTES)
+            .unwrap();
+
+        rotate_cron_scheduler_receipts_if_needed(&receipts, 2000).unwrap();
+
+        let archives = fs::read_dir(&scheduler_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("receipts-") && name.ends_with(".jsonl"))
+            })
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(archives.len(), CRON_RECEIPTS_MAX_ARCHIVES);
+        assert!(archives.iter().any(|name| name == "receipts-2000.jsonl"));
+        assert_eq!(fs::read_to_string(unrelated).unwrap(), "unrelated state");
 
         let _ = fs::remove_dir_all(root);
     }

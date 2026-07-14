@@ -2,14 +2,17 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json;
 
-use crate::logging::{append_jsonl_value, current_log_time_ms};
+use crate::logging::current_log_time_ms;
 
 const LATENCY_RECEIPT_SCHEMA: &str = "agent-harness.runtime-queue-latency.v1";
 const DEFAULT_LATENCY_RECEIPTS_FILE: &str = "latency-receipts.jsonl";
+const LATENCY_INDEX_FILE: &str = "latency-receipts-index.sqlite";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -29,13 +32,16 @@ pub enum LatencyStage {
     ThreadStartDone,
     FirstCodexEvent,
     FirstProgressEvent,
+    FirstProviderProgressSurface,
+    WorkingIndicator,
     FinalCodexEvent,
+    TerminalEvent,
     OutboxWrite,
     DeliveryAttempt,
     DeliveryDone,
 }
 
-pub const DEFAULT_LATENCY_STAGE_ORDER: [LatencyStage; 19] = [
+pub const DEFAULT_LATENCY_STAGE_ORDER: [LatencyStage; 22] = [
     LatencyStage::InboundReceived,
     LatencyStage::TurnPlanned,
     LatencyStage::RuntimeEnqueued,
@@ -51,7 +57,10 @@ pub const DEFAULT_LATENCY_STAGE_ORDER: [LatencyStage; 19] = [
     LatencyStage::ThreadStartDone,
     LatencyStage::FirstCodexEvent,
     LatencyStage::FirstProgressEvent,
+    LatencyStage::FirstProviderProgressSurface,
+    LatencyStage::WorkingIndicator,
     LatencyStage::FinalCodexEvent,
+    LatencyStage::TerminalEvent,
     LatencyStage::OutboxWrite,
     LatencyStage::DeliveryAttempt,
     LatencyStage::DeliveryDone,
@@ -102,31 +111,41 @@ pub fn record_latency_stage(
     at_ms: Option<i64>,
 ) -> io::Result<LatencyReceipt> {
     let receipts_file = receipts_file.as_ref();
-    if let Some(parent) = receipts_file.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
     let at_ms = at_ms.unwrap_or_else(|| current_log_time_ms().unwrap_or(0));
-    let mut receipt =
-        read_latest_queue_receipt(receipts_file, queue_id)?.unwrap_or_else(|| LatencyReceipt {
-            schema: LATENCY_RECEIPT_SCHEMA.to_string(),
-            queue_id: queue_id.to_string(),
-            lane: lane.to_string(),
-            updated_at_ms: at_ms,
-            stages: BTreeMap::new(),
-        });
-    receipt.lane = lane.to_string();
-    receipt.updated_at_ms = at_ms;
-
-    match receipt.stages.get(&stage) {
-        Some(existing) if *existing <= at_ms => {}
-        _ => {
-            receipt.stages.insert(stage, at_ms);
-        }
+    let mut connection = open_latency_index_for_write(receipts_file)?;
+    {
+        let transaction = connection.transaction().map_err(io::Error::other)?;
+        transaction
+            .execute(
+                "INSERT INTO latency_queue_receipts (queue_id, lane, updated_at_ms) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(queue_id) DO UPDATE SET \
+                   lane = CASE \
+                     WHEN latency_queue_receipts.lane = '' THEN excluded.lane \
+                     ELSE latency_queue_receipts.lane \
+                   END, \
+                   updated_at_ms = MAX(latency_queue_receipts.updated_at_ms, excluded.updated_at_ms)",
+                params![queue_id, lane, at_ms],
+            )
+            .map_err(io::Error::other)?;
+        transaction
+            .execute(
+                "INSERT INTO latency_stage_receipts (queue_id, stage, at_ms) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(queue_id, stage) DO UPDATE SET \
+                   at_ms = MIN(latency_stage_receipts.at_ms, excluded.at_ms)",
+                params![queue_id, latency_stage_key(stage), at_ms],
+            )
+            .map_err(io::Error::other)?;
+        transaction.commit().map_err(io::Error::other)?;
     }
 
-    append_jsonl_value(receipts_file, &receipt)?;
-    Ok(receipt)
+    read_latest_latency_receipt_from_connection(&connection, queue_id)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("latency receipt disappeared for queue `{queue_id}` after write"),
+        )
+    })
 }
 
 pub fn read_latest_queue_receipt(
@@ -134,6 +153,13 @@ pub fn read_latest_queue_receipt(
     queue_id: &str,
 ) -> io::Result<Option<LatencyReceipt>> {
     let receipts_file = receipts_file.as_ref();
+    if let Some(receipt) = read_latest_latency_receipt_from_index(receipts_file, queue_id)? {
+        return Ok(Some(receipt));
+    }
+
+    // Compatibility-only fallback for old diagnostic journals. Writers never
+    // take this branch: interactive timestamping is backed by the bounded
+    // SQLite projection above, so it cannot replay this historical JSONL.
     if !receipts_file.is_file() {
         return Ok(None);
     }
@@ -151,6 +177,127 @@ pub fn read_latest_queue_receipt(
         }
     }
     Ok(latest)
+}
+
+fn latency_index_file(receipts_file: &Path) -> PathBuf {
+    receipts_file.with_file_name(LATENCY_INDEX_FILE)
+}
+
+fn open_latency_index_for_write(receipts_file: &Path) -> io::Result<Connection> {
+    let index_file = latency_index_file(receipts_file);
+    if let Some(parent) = index_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let connection = Connection::open(&index_file).map_err(io::Error::other)?;
+    connection
+        .busy_timeout(Duration::ZERO)
+        .map_err(io::Error::other)?;
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS latency_queue_receipts (\
+                queue_id TEXT PRIMARY KEY NOT NULL,\
+                lane TEXT NOT NULL,\
+                updated_at_ms INTEGER NOT NULL\
+            );\
+            CREATE TABLE IF NOT EXISTS latency_stage_receipts (\
+                queue_id TEXT NOT NULL,\
+                stage TEXT NOT NULL,\
+                at_ms INTEGER NOT NULL,\
+                PRIMARY KEY(queue_id, stage)\
+            );\
+            CREATE INDEX IF NOT EXISTS latency_stage_receipts_by_queue \
+                ON latency_stage_receipts(queue_id, stage);",
+        )
+        .map_err(io::Error::other)?;
+    Ok(connection)
+}
+
+fn read_latest_latency_receipt_from_index(
+    receipts_file: &Path,
+    queue_id: &str,
+) -> io::Result<Option<LatencyReceipt>> {
+    let index_file = latency_index_file(receipts_file);
+    if !index_file.is_file() {
+        return Ok(None);
+    }
+    let connection = Connection::open_with_flags(&index_file, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(io::Error::other)?;
+    connection
+        .busy_timeout(Duration::ZERO)
+        .map_err(io::Error::other)?;
+    read_latest_latency_receipt_from_connection(&connection, queue_id)
+}
+
+fn read_latest_latency_receipt_from_connection(
+    connection: &Connection,
+    queue_id: &str,
+) -> io::Result<Option<LatencyReceipt>> {
+    let queue = connection
+        .query_row(
+            "SELECT lane, updated_at_ms FROM latency_queue_receipts WHERE queue_id = ?1",
+            params![queue_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(io::Error::other)?;
+    let Some((lane, updated_at_ms)) = queue else {
+        return Ok(None);
+    };
+
+    let mut stages = BTreeMap::new();
+    let mut statement = connection
+        .prepare(
+            "SELECT stage, at_ms FROM latency_stage_receipts \
+             WHERE queue_id = ?1 ORDER BY stage ASC",
+        )
+        .map_err(io::Error::other)?;
+    let rows = statement
+        .query_map(params![queue_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(io::Error::other)?;
+    for row in rows {
+        let (stage, at_ms) = row.map_err(io::Error::other)?;
+        if let Ok(stage) = serde_json::from_value::<LatencyStage>(serde_json::Value::String(stage))
+        {
+            stages.insert(stage, at_ms);
+        }
+    }
+
+    Ok(Some(LatencyReceipt {
+        schema: LATENCY_RECEIPT_SCHEMA.to_string(),
+        queue_id: queue_id.to_string(),
+        lane,
+        updated_at_ms,
+        stages,
+    }))
+}
+
+fn latency_stage_key(stage: LatencyStage) -> &'static str {
+    match stage {
+        LatencyStage::InboundReceived => "inbound-received",
+        LatencyStage::TurnPlanned => "turn-planned",
+        LatencyStage::RuntimeEnqueued => "runtime-enqueued",
+        LatencyStage::CapacityFirstSeen => "capacity-first-seen",
+        LatencyStage::LeaseAcquired => "lease-acquired",
+        LatencyStage::PromptBundleStart => "prompt-bundle-start",
+        LatencyStage::PromptBundleDone => "prompt-bundle-done",
+        LatencyStage::CodexPlanStart => "codex-plan-start",
+        LatencyStage::CodexPlanDone => "codex-plan-done",
+        LatencyStage::CodexSpawnStart => "codex-spawn-start",
+        LatencyStage::CodexSpawnDone => "codex-spawn-done",
+        LatencyStage::ThreadStartRequest => "thread-start-request",
+        LatencyStage::ThreadStartDone => "thread-start-done",
+        LatencyStage::FirstCodexEvent => "first-codex-event",
+        LatencyStage::FirstProgressEvent => "first-progress-event",
+        LatencyStage::FirstProviderProgressSurface => "first-provider-progress-surface",
+        LatencyStage::WorkingIndicator => "working-indicator",
+        LatencyStage::FinalCodexEvent => "final-codex-event",
+        LatencyStage::TerminalEvent => "terminal-event",
+        LatencyStage::OutboxWrite => "outbox-write",
+        LatencyStage::DeliveryAttempt => "delivery-attempt",
+        LatencyStage::DeliveryDone => "delivery-done",
+    }
 }
 
 pub fn latency_summary(
@@ -322,6 +469,34 @@ mod tests {
 
         assert_eq!(first.stages[&LatencyStage::InboundReceived], 1);
         assert_eq!(second.stages[&LatencyStage::InboundReceived], 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn latency_record_uses_bounded_projection_when_legacy_ledger_is_unreadable() {
+        let root =
+            temp_root("latency_record_uses_bounded_projection_when_legacy_ledger_is_unreadable");
+        let file = latency_receipts_file(root.join("harness"));
+        fs::create_dir_all(&file).unwrap();
+
+        let receipt = record_latency_stage(
+            &file,
+            "queue-projection",
+            "interactive",
+            LatencyStage::InboundReceived,
+            Some(42),
+        )
+        .unwrap();
+
+        assert_eq!(receipt.stages[&LatencyStage::InboundReceived], 42);
+        assert_eq!(
+            read_latest_queue_receipt(&file, "queue-projection")
+                .unwrap()
+                .unwrap()
+                .stages[&LatencyStage::InboundReceived],
+            42
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 

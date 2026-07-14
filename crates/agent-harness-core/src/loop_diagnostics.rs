@@ -1,10 +1,18 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::Value;
+
+use crate::runtime_receipt_history::{
+    find_runtime_queue_terminal_history, read_runtime_queue_terminal_history_summary,
+};
+use crate::runtime_worker::{
+    refresh_runtime_queue_state_index, runtime_queue_terminal_receipt_count_from_index,
+    terminal_run_once_ids_from_index,
+};
 
 const LOOP_ERROR_DIAGNOSTICS_SCHEMA: &str = "agent-harness.loop-error-diagnostics.v1";
 const RESOURCE_EXHAUSTION_READBACK_SCHEMA: &str = "agent-harness.resource-exhaustion-readback.v1";
@@ -40,7 +48,9 @@ pub struct RuntimeQueueActivitySnapshot {
     pub run_once_receipts_file: PathBuf,
     pub pending_items: usize,
     pub open_items: usize,
+    /// All-time terminal receipt events: committed cold history plus the hot ledger.
     pub terminal_receipts: usize,
+    /// All-time distinct terminal queue IDs: committed cold history plus the hot ledger.
     pub terminal_queue_ids: usize,
     pub active_leases: usize,
     pub warnings: Vec<String>,
@@ -220,11 +230,61 @@ fn collect_runtime_queue_activity(harness_home: &Path) -> RuntimeQueueActivitySn
     let run_once_receipts_file = queue_dir.join("run-once-receipts.jsonl");
     let mut warnings = Vec::new();
     let pending_queue_ids = read_queue_ids(&pending_file, "pending queue", &mut warnings);
-    let (terminal_receipts, terminal_queue_ids) =
-        read_terminal_receipts(&run_once_receipts_file, &mut warnings);
+    // Scheduling state is deliberately derived from the hot materialized index
+    // only. Historical terminal summaries are evidence/aggregate data and must
+    // never make an unrelated current queue look active or inactive.
+    let (hot_terminal_receipts, hot_terminal_queue_ids) = match refresh_runtime_queue_state_index(
+        &queue_dir,
+        &mut warnings,
+    ) {
+        Ok(index) => (
+            runtime_queue_terminal_receipt_count_from_index(&index),
+            terminal_run_once_ids_from_index(&index),
+        ),
+        Err(error) => {
+            warnings.push(format!(
+                "failed to refresh hot runtime terminal index for loop diagnostics: {error}; omitting hot terminal totals rather than replaying the receipt ledger"
+            ));
+            (0, HashSet::new())
+        }
+    };
+    let current_terminal_queue_ids = hot_terminal_queue_ids.clone();
+    let historical_terminal = match read_runtime_queue_terminal_history_summary(&queue_dir) {
+        Ok(summary) => summary,
+        Err(error) => {
+            warnings.push(format!(
+                "failed to read committed runtime receipt history summary for loop diagnostics: {error}"
+            ));
+            Default::default()
+        }
+    };
+    // The cold and hot stores are normally disjoint after a successful
+    // compaction. Query only the bounded hot-ID set anyway so diagnostics stay
+    // exact during recovery or a partially repeated turn, without loading the
+    // whole cold history.
+    let historical_hot_overlap = if hot_terminal_queue_ids.is_empty() {
+        0
+    } else {
+        let hot_identifiers = hot_terminal_queue_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        match find_runtime_queue_terminal_history(&queue_dir, &hot_identifiers) {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|record| hot_terminal_queue_ids.contains(&record.queue_id))
+                .count(),
+            Err(error) => {
+                warnings.push(format!(
+                    "failed to reconcile hot runtime terminal IDs against committed history: {error}"
+                ));
+                0
+            }
+        }
+    };
     let open_items = pending_queue_ids
         .iter()
-        .filter(|queue_id| !terminal_queue_ids.contains(*queue_id))
+        .filter(|queue_id| !current_terminal_queue_ids.contains(*queue_id))
         .count();
     let active_leases = count_runtime_leases(&queue_dir, &mut warnings);
     RuntimeQueueActivitySnapshot {
@@ -233,8 +293,13 @@ fn collect_runtime_queue_activity(harness_home: &Path) -> RuntimeQueueActivitySn
         run_once_receipts_file,
         pending_items: pending_queue_ids.len(),
         open_items,
-        terminal_receipts,
-        terminal_queue_ids: terminal_queue_ids.len(),
+        terminal_receipts: hot_terminal_receipts
+            .saturating_add(historical_terminal.terminal_records),
+        terminal_queue_ids: hot_terminal_queue_ids.len().saturating_add(
+            historical_terminal
+                .terminal_queue_ids
+                .saturating_sub(historical_hot_overlap),
+        ),
         active_leases,
         warnings,
     }
@@ -245,22 +310,6 @@ fn read_queue_ids(path: &Path, label: &str, warnings: &mut Vec<String>) -> Vec<S
         .into_iter()
         .filter_map(|value| string_field(&value, "queueId").map(ToString::to_string))
         .collect()
-}
-
-fn read_terminal_receipts(path: &Path, warnings: &mut Vec<String>) -> (usize, HashSet<String>) {
-    let mut receipts = 0usize;
-    let mut queue_ids = HashSet::new();
-    for value in read_jsonl_values(path, "run-once receipts", warnings) {
-        let status = string_field(&value, "status").unwrap_or_default();
-        if !is_terminal_status(status) {
-            continue;
-        }
-        receipts += 1;
-        if let Some(queue_id) = string_field(&value, "queueId") {
-            queue_ids.insert(queue_id.to_string());
-        }
-    }
-    (receipts, queue_ids)
 }
 
 fn count_runtime_leases(queue_dir: &Path, warnings: &mut Vec<String>) -> usize {
@@ -347,19 +396,6 @@ fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
 
-fn is_terminal_status(status: &str) -> bool {
-    matches!(
-        status,
-        "completed"
-            | "timeout"
-            | "failed-terminal"
-            | "canceled"
-            | "skipped"
-            | "dead-letter"
-            | "suppressed"
-    )
-}
-
 fn truncate_utf8(value: &str, max_bytes: usize) -> (bool, String) {
     if value.len() <= max_bytes {
         return (false, value.to_string());
@@ -374,6 +410,7 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -430,6 +467,51 @@ mod tests {
         assert_eq!(report.runtime_queue.terminal_receipts, 1);
         assert_eq!(report.runtime_queue.terminal_queue_ids, 1);
         assert_eq!(report.runtime_queue.active_leases, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loop_diagnostics_preserves_history_terminal_totals_and_uses_hot_terminal_state() {
+        let root = temp_root(
+            "loop_diagnostics_preserves_history_terminal_totals_and_uses_hot_terminal_state",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let staged = crate::runtime_receipt_history::stage_runtime_queue_receipt_history(
+            &queue_dir,
+            "loop-history",
+            br#"{"queueId":"queue-history","status":"completed","reason":"historical completion"}
+"#,
+            b"",
+            &HashSet::new(),
+            100,
+        )
+        .unwrap();
+        crate::runtime_receipt_history::commit_runtime_queue_receipt_history(&staged, 101).unwrap();
+        fs::write(
+            queue_dir.join("pending.jsonl"),
+            [
+                serde_json::json!({"queueId": "queue-open", "status": "queued"}).to_string(),
+                serde_json::json!({"queueId": "queue-hot-terminal", "status": "queued"})
+                    .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        fs::write(
+            queue_dir.join("run-once-receipts.jsonl"),
+            serde_json::json!({"queueId": "queue-hot-terminal", "status": "completed"}).to_string(),
+        )
+        .unwrap();
+
+        let report = collect_loop_error_diagnostics(&harness_home, "runtime", 12_345);
+
+        assert_eq!(report.runtime_queue.pending_items, 2);
+        assert_eq!(report.runtime_queue.open_items, 1, "{report:#?}");
+        assert_eq!(report.runtime_queue.terminal_receipts, 2, "{report:#?}");
+        assert_eq!(report.runtime_queue.terminal_queue_ids, 2, "{report:#?}");
 
         let _ = fs::remove_dir_all(root);
     }

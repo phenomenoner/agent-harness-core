@@ -3,6 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -20,6 +21,7 @@ use crate::{
 const CHANNEL_STEP_SCHEMA: &str = "agent-harness.channel-step.v1";
 const CHANNEL_RESTART_REQUEST_SCHEMA: &str = "agent-harness.channel-restart-request.v1";
 const CHANNEL_GATEWAY_RESTART_REQUEST_SCHEMA: &str = "agent-harness.gateway-restart-request.v1";
+pub(crate) const CHANNEL_OUTBOUND_DELIVERY_ID_V2_PREFIX: &str = "delivery:v2:";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -264,6 +266,11 @@ pub struct ChannelOutboundMessage {
     pub channel_id: String,
     pub user_id: String,
     pub session_key: String,
+    /// Stable logical identity assigned immediately before a canonical outbox
+    /// append. Legacy JSONL rows omit this field and continue to use the
+    /// historical line-and-bytes delivery identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_id: Option<String>,
     pub kind: ChannelOutboundMessageKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_queue_id: Option<String>,
@@ -276,6 +283,60 @@ pub struct ChannelOutboundMessage {
     pub delivery_intent: Option<ChannelDeliveryIntent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ChannelOutboundAttachment>,
+}
+
+/// Returns a well-formed durable v2 delivery identity when the outbound
+/// record carries one. Deliberately rejects blank or malformed values so only
+/// IDs emitted by the canonical append path are treated as authoritative.
+pub(crate) fn valid_channel_outbound_delivery_id(message: &ChannelOutboundMessage) -> Option<&str> {
+    message
+        .delivery_id
+        .as_deref()
+        .filter(|delivery_id| is_valid_channel_outbound_delivery_id(delivery_id))
+}
+
+/// Ensures the outbound record has a durable opaque v2 identity before its
+/// canonical JSONL append. Repeated calls preserve an existing valid ID;
+/// malformed values are deliberately replaced rather than becoming durable
+/// delivery identities.
+pub(crate) fn assign_channel_outbound_delivery_id(
+    message: &mut ChannelOutboundMessage,
+) -> io::Result<&str> {
+    if valid_channel_outbound_delivery_id(message).is_some() {
+        return Ok(message
+            .delivery_id
+            .as_deref()
+            .expect("validated outbound delivery ID is present"));
+    }
+
+    let mut random_bytes = [0_u8; 16];
+    SystemRandom::new().fill(&mut random_bytes).map_err(|_| {
+        io::Error::other("secure random generation failed for outbound delivery ID")
+    })?;
+    let mut delivery_id = String::with_capacity(
+        CHANNEL_OUTBOUND_DELIVERY_ID_V2_PREFIX.len() + random_bytes.len().saturating_mul(2),
+    );
+    delivery_id.push_str(CHANNEL_OUTBOUND_DELIVERY_ID_V2_PREFIX);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in random_bytes {
+        delivery_id.push(char::from(HEX[usize::from(byte >> 4)]));
+        delivery_id.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    message.delivery_id = Some(delivery_id);
+    Ok(message
+        .delivery_id
+        .as_deref()
+        .expect("assigned outbound delivery ID is present"))
+}
+
+fn is_valid_channel_outbound_delivery_id(delivery_id: &str) -> bool {
+    let Some(token) = delivery_id.strip_prefix(CHANNEL_OUTBOUND_DELIVERY_ID_V2_PREFIX) else {
+        return false;
+    };
+    token.len() == 32
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -385,7 +446,7 @@ fn build_command_step(
         source_home: turn.source_home.clone(),
         source_workspace: turn.source_workspace.clone(),
         platform: turn.platform.clone(),
-        account_id: None,
+        account_id: turn.account_id.clone(),
         channel_id: turn.channel_id.clone(),
         user_id: turn.user_id.clone(),
         message_text: turn.message_text.clone(),
@@ -425,7 +486,7 @@ fn build_agent_step(turn: &TurnPlan, warnings: Vec<String>) -> ChannelStep {
         source_home: turn.source_home.clone(),
         source_workspace: turn.source_workspace.clone(),
         platform: turn.platform.clone(),
-        account_id: None,
+        account_id: turn.account_id.clone(),
         channel_id: turn.channel_id.clone(),
         user_id: turn.user_id.clone(),
         message_text: turn.message_text.clone(),
@@ -446,7 +507,7 @@ fn error_step(turn: &TurnPlan, warnings: Vec<String>, text: &str) -> ChannelStep
         source_home: turn.source_home.clone(),
         source_workspace: turn.source_workspace.clone(),
         platform: turn.platform.clone(),
-        account_id: None,
+        account_id: turn.account_id.clone(),
         channel_id: turn.channel_id.clone(),
         user_id: turn.user_id.clone(),
         message_text: turn.message_text.clone(),
@@ -1238,6 +1299,22 @@ fn unified_thinking_command_effect(
     }
 }
 
+/// Maps only historical human-facing aliases that the model catalog cannot
+/// represent itself. Do not route capability-shaped names through the legacy
+/// thinking normalizer here: in authoritative mode an unadvertised effort
+/// (notably GPT-5.6 `max`) must be rejected rather than silently downgraded.
+fn authoritative_legacy_reasoning_alias(requested: &str) -> Option<String> {
+    match requested.trim().to_ascii_lowercase().as_str() {
+        "x-high" | "x_high" | "extra-high" | "extra_high" | "very-high" | "very_high"
+        | "ultra-high" | "ultra_high" | "超高" | "最高" => Some("xhigh".to_string()),
+        "最小" | "最低" => Some("minimal".to_string()),
+        "低" => Some("low".to_string()),
+        "中" | "中等" | "普通" | "標準" => Some("medium".to_string()),
+        "高" => Some("high".to_string()),
+        _ => None,
+    }
+}
+
 fn reasoning_command_effect(turn: &TurnPlan, effort: String, global: bool) -> ChannelCommandEffect {
     let agent_id = turn.agent.as_ref().map(|agent| agent.id.clone());
     let provider = turn.model_policy.provider.clone();
@@ -1305,9 +1382,7 @@ fn reasoning_command_effect(turn: &TurnPlan, effort: String, global: bool) -> Ch
                 Some(exact_resolution),
                 legacy_alias_from,
             )
-        } else if let Some(alias) = crate::normalize_thinking_level(&normalized_requested)
-            && alias != normalized_requested
-        {
+        } else if let Some(alias) = authoritative_legacy_reasoning_alias(&normalized_requested) {
             let alias_resolution = reasoning_resolution_for_turn(turn, &alias);
             if alias_resolution.status == crate::model_catalog::ReasoningResolutionStatus::Accepted
             {
@@ -1780,14 +1855,26 @@ fn new_session_key(turn: &TurnPlan) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
-    format!(
+    let base = format!(
         "{}:{}:{}:{}:session-{}",
         normalize_key_part(&turn.platform),
         normalize_key_part(&turn.channel_id),
         normalize_key_part(&turn.user_id),
         normalize_key_part(agent_id),
         millis
-    )
+    );
+    turn.account_id
+        .as_deref()
+        .map_or(base.clone(), |account_id| {
+            crate::turns::bind_session_key_to_account(
+                &base,
+                &turn.platform,
+                account_id,
+                &turn.channel_id,
+                &turn.user_id,
+                Some(agent_id),
+            )
+        })
 }
 
 fn current_time_ms() -> i64 {
@@ -2360,10 +2447,11 @@ fn outbound(
 ) -> ChannelOutboundMessage {
     ChannelOutboundMessage {
         platform: turn.platform.clone(),
-        account_id: None,
+        account_id: turn.account_id.clone(),
         channel_id: turn.channel_id.clone(),
         user_id: turn.user_id.clone(),
         session_key: turn.session_key.clone(),
+        delivery_id: None,
         kind,
         source_queue_id: None,
         source_completion_file: None,
@@ -2490,6 +2578,47 @@ mod tests {
     use super::*;
     use crate::{TurnPlanInput, build_source_skill_index, build_turn_plan, load_agent_registry};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn canonical_outbound_delivery_id_replaces_malformed_values_and_preserves_valid_v2() {
+        let mut outbound: ChannelOutboundMessage = serde_json::from_str(
+            r#"{
+                "platform":"discord",
+                "channelId":"dm-42",
+                "userId":"user-7",
+                "sessionKey":"session-1",
+                "deliveryId":" ",
+                "kind":"agent-reply",
+                "text":"hello"
+            }"#,
+        )
+        .unwrap();
+
+        assert!(valid_channel_outbound_delivery_id(&outbound).is_none());
+        let assigned = assign_channel_outbound_delivery_id(&mut outbound)
+            .unwrap()
+            .to_string();
+        assert!(assigned.starts_with(CHANNEL_OUTBOUND_DELIVERY_ID_V2_PREFIX));
+        assert_eq!(
+            assigned.len(),
+            CHANNEL_OUTBOUND_DELIVERY_ID_V2_PREFIX.len() + 32
+        );
+        assert_eq!(
+            valid_channel_outbound_delivery_id(&outbound),
+            Some(assigned.as_str())
+        );
+        assert_eq!(
+            assign_channel_outbound_delivery_id(&mut outbound).unwrap(),
+            assigned.as_str()
+        );
+
+        let existing = "delivery:v2:0123456789abcdef0123456789abcdef";
+        outbound.delivery_id = Some(existing.to_string());
+        assert_eq!(
+            assign_channel_outbound_delivery_id(&mut outbound).unwrap(),
+            existing
+        );
+    }
 
     #[test]
     fn channel_step_enqueues_plain_agent_turn() {
@@ -3868,6 +3997,140 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_stale_sol_catalog_rejects_exact_max_without_xhigh_fallback_for_both_command_aliases()
+     {
+        let root =
+            temp_root("authoritative_stale_sol_catalog_rejects_exact_max_without_xhigh_fallback");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let codex_home = harness_home.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(
+            codex_home.join("models_cache.json"),
+            r#"{
+              "models": [{
+                "slug": "gpt-5.6-sol",
+                "default_reasoning_level": "low",
+                "supported_reasoning_levels": [
+                  { "effort": "low" },
+                  { "effort": "high" },
+                  { "effort": "xhigh" }
+                ]
+              }]
+            }"#,
+        )
+        .unwrap();
+        write_model_catalog_mode_for_test(&harness_home, "authoritative");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let build = |text: &str| {
+            build_turn_plan(
+                &source,
+                &registry,
+                &skills,
+                TurnPlanInput {
+                    harness_home: Some(harness_home.clone()),
+                    platform: "telegram".to_string(),
+                    channel_id: "dm".to_string(),
+                    user_id: "user".to_string(),
+                    text: text.to_string(),
+                    inbound_context: None,
+                    inbound_media_artifacts: Vec::new(),
+                    requested_agent_id: Some("main56sol".to_string()),
+                    session_hint: None,
+                    skill_limit: 3,
+                },
+            )
+            .unwrap()
+        };
+        let apply = |step: &ChannelStep, now_ms: i64| {
+            crate::apply_channel_command_step(
+                step,
+                crate::ChannelCommandApplyOptions {
+                    harness_home: harness_home.clone(),
+                    now_ms,
+                },
+            )
+            .unwrap()
+        };
+
+        let baseline = apply(&build_channel_step(&registry, &build("/think high")), 40)
+            .state
+            .expect("accepted high command records state");
+        let assert_high = |state: &crate::ChannelSessionState| {
+            assert_eq!(state.thinking_level.as_deref(), Some("high"));
+            assert_eq!(
+                state.reasoning_preference,
+                Some(crate::backend_reasoning::ReasoningPreference::Explicit {
+                    effort: "high".to_string()
+                })
+            );
+            assert_eq!(
+                state
+                    .backend_reasoning_policy
+                    .as_ref()
+                    .map(|policy| policy.effective_effort()),
+                Some("high")
+            );
+        };
+        assert_high(&baseline);
+
+        for (index, command) in ["/think max", "/reasoning max"].into_iter().enumerate() {
+            let step = build_channel_step(&registry, &build(command));
+            assert_eq!(step.action, ChannelStepAction::ReplyOnly);
+            let Some(ChannelCommandEffect::SwitchReasoning {
+                preference: crate::backend_reasoning::ReasoningPreference::Explicit { effort },
+                accepted,
+                resolved_policy,
+                resolution: Some(resolution),
+                ..
+            }) = &step.command_effect
+            else {
+                panic!(
+                    "expected rejected exact max reasoning effect: {:?}",
+                    step.command_effect
+                );
+            };
+            assert_eq!(effort, "max");
+            assert!(!accepted);
+            assert!(resolved_policy.is_none());
+            assert_eq!(
+                resolution.status,
+                crate::model_catalog::ReasoningResolutionStatus::Rejected
+            );
+            assert!(resolution.authoritative);
+            assert_eq!(resolution.requested_effort, "max");
+            assert!(resolution.effective_effort.is_none());
+            assert!(
+                !step.outbound_messages[0]
+                    .text
+                    .contains("resolved to `xhigh`")
+            );
+            let state = apply(&step, 41 + index as i64)
+                .state
+                .expect("rejected command still reads persisted state");
+            assert_high(&state);
+        }
+
+        let followup = build("continue");
+        assert_eq!(
+            followup.reasoning_preference,
+            Some(crate::backend_reasoning::ReasoningPreference::Explicit {
+                effort: "high".to_string()
+            })
+        );
+        assert_eq!(
+            followup
+                .backend_reasoning_policy
+                .as_ref()
+                .map(|policy| policy.effective_effort()),
+            Some("high")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn authoritative_reasoning_aliases_persist_canonical_effective_effort() {
         let root = temp_root("authoritative_reasoning_aliases_persist_canonical_effort");
         let source = write_channel_source(&root);
@@ -4554,7 +4817,11 @@ mod tests {
         let skills = build_source_skill_index(&source).unwrap();
 
         for (input, expected_level, expected_valid) in [
-            ("/think max", "xhigh", true),
+            // A lane outside the catalog rollout must never silently turn a
+            // requested GPT-5.6 `max` effort into `xhigh`.  It remains
+            // visible and invalid until this lane has authoritative catalog
+            // capability, while historical xhigh aliases stay compatible.
+            ("/think max", "max", false),
             ("/think ultra-high", "xhigh", true),
         ] {
             let turn = build_turn_plan(
@@ -4679,8 +4946,8 @@ mod tests {
         else {
             panic!("expected excluded Sol cohort to retain legacy SwitchThinking");
         };
-        assert!(valid);
-        assert_eq!(level, "xhigh");
+        assert!(!valid, "excluded cohort must not silently downgrade max");
+        assert_eq!(level, "max");
         assert!(!available_levels.iter().any(|level| level == "max"));
         assert!(!available_levels.iter().any(|level| level == "ultra"));
 
@@ -4781,7 +5048,7 @@ mod tests {
             receipt.status,
             crate::model_catalog::ReasoningResolutionStatus::Shadow
         );
-        assert_eq!(receipt.effective_effort.as_deref(), Some("xhigh"));
+        assert_eq!(receipt.effective_effort.as_deref(), Some("max"));
         assert_eq!(receipt.catalog_effective_effort.as_deref(), Some("max"));
         assert!(!receipt.authoritative);
 
@@ -4791,8 +5058,11 @@ mod tests {
             Some(ChannelCommandEffect::SwitchThinking {
                 ref level,
                 valid,
+                ref available_levels,
                 ..
-            }) if level == "xhigh" && valid
+            }) if level == "max"
+                && !valid
+                && !available_levels.iter().any(|value| value == "max" || value == "ultra")
         ));
 
         let _ = fs::remove_dir_all(root);

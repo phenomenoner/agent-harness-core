@@ -1,12 +1,13 @@
 # Agent Harness Schema Registry
 
-Date: 2026-07-13
+Date: 2026-07-14
 
 The authoritative in-code registry is `agent_harness_core::quality::schema_registry_entries`, exposed by `agent-harness schema-registry`. This document records the current public compatibility contract for review and release checks.
 
 | Schema | Owner module | Compatibility rule | Current status |
 |---|---|---|---|
 | `agent-harness.runtime-run-once.v1` | `runtime_pipeline/workers` | Append-only JSONL; additive fields only in v1. Worker terminal reconciliation requires this exact schema plus queue-id and trusted route provenance. | Existing reader accepts legacy `timeout`; v1 adds `retry-pending`, `dead-letter`, `context-exhausted`, runtime metadata fields (`runtimeClass`, `origin`, `cronRunId`, `scheduledForMs`), and skipped cron tombstones. A worker is terminalized only when queue id, `runtimeClass`, and `origin` match the route derived from its `WorkerJobKind`; unknown schemas and mismatches are ignored. |
+| `agent-harness.ledger-maintenance.v1` | `ledger_maintenance` | Read-only maintenance report; per-ledger compaction fields are additive in v1. Normal passes remain source-aware and bounded; force remains operator-only. | Terminal append paths only signal a coalesced wake. Runtime, channel-delivery, and progress retention execute under the isolated maintenance owner rather than the interactive ingress/completion/delivery path. |
 | `agent-harness.codex-runtime-run.v1` | `codex_runtime` | Append-only JSONL plus per-execution JSON; additive fields only in v1. | Round10 adds optional `toolUseTimeout` metadata when an active Codex tool-use idle timeout is stopped and routed through bounded fresh-thread recovery. |
 | `agent-harness.external-review-evidence.v1` | `codex_runtime` | Per-execution recovery artifact; additive fields only in v1. | Local Round10 gap closure captures review-only recovery output as evidence instead of final parent workflow completion. |
 | `agent-harness.inbound-media-artifact.v1` | `media` | Artifact metadata is additive in v1; prompt-facing consumers must treat raw payload/provider fields as redaction candidates and use bounded extraction summaries for durable context. | Round10 adds optional `lifecycleStatus` and `extractionSummary` fields so images, audio/transcripts, generated media, browser captures, documents/downloads, large tool logs/review transcripts, worker reports, and provider-native attachments can be represented by refs plus summaries instead of raw blobs. Channel-media staging adds optional `provenance` so current-message and referenced-message media can be distinguished without exposing provider payloads. |
@@ -20,6 +21,7 @@ The authoritative in-code registry is `agent_harness_core::quality::schema_regis
 | `agent-harness.runtime-queue-latency.v1` | `latency` | Append-only per-stage queue latency receipts; additive stages and timestamps only in v1. | Implemented in staging. |
 | `agent-harness.latency-status.v1` | `agent-harness-cli` | Read-only CLI summary over latency receipts; additive summary fields only in v1. | Implemented in staging. |
 | `agent-harness.progress-delivery-state.v1` | `progress` | State JSON may add cursor/cache/counter fields in v1; existing lane cursors remain readable. | Round10 tracks body/status lane delivery counters; body/action lane non-terminal cap is finite while status/current-step heartbeat remains editable after body cap using `progressDeliveryStatusHeartbeatAfterBodyCapMs`. |
+| `agent-harness.progress-delivery-plan.v1` | `progress` | Plan summary counters and warnings are additive in v1. Non-fresh source snapshots produce no provider pending items, and historical providerless queues remain suppressed. | The plan distinguishes deferred cached events from stale fresh-send suppression so operators can diagnose a safe defer without treating it as successful provider delivery. |
 | `agent-harness.codex-context-preflight.v1` | `codex_runtime` | Append-only JSONL plus per-execution JSON; v1 adds thread-health scan details for inline image/tool-output bloat and compact-before-turn decisions. | Implemented in staging. |
 | `agent-harness.codex-context-checkpoint.v1` | `codex_runtime` | Per-execution recovery artifact; additive fields only in v1. | Implemented in staging. |
 | `agent-harness.codex-context-rollover.v1` | `codex_runtime` | Per-execution recovery artifact; binding backup path remains optional. | Implemented in staging. |

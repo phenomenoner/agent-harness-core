@@ -10,6 +10,8 @@ pub(crate) mod backend_reasoning_execution;
 pub mod background;
 pub mod channel_commands;
 pub mod channel_delivery;
+pub(crate) mod channel_delivery_history;
+pub(crate) mod channel_delivery_index;
 pub mod channel_identity;
 pub mod channel_ingress;
 pub mod channel_pipeline;
@@ -34,6 +36,7 @@ pub mod health;
 pub mod importer;
 pub mod lane;
 pub mod latency;
+pub mod ledger_maintenance;
 pub mod live_control;
 pub mod logging;
 pub mod loop_diagnostics;
@@ -52,15 +55,19 @@ pub mod nudge;
 pub mod operation_plan;
 pub mod ops;
 pub mod progress;
+pub(crate) mod progress_event_index;
 pub mod prompt;
 pub mod quality;
 pub mod queue_shadow;
 pub mod registry;
 pub mod response_tone;
 pub mod rich_presentation;
+pub(crate) mod runtime_execution_receipt_index;
+pub(crate) mod runtime_pending_index;
 pub mod runtime_pipeline;
 pub mod runtime_policy;
 pub mod runtime_queue;
+pub(crate) mod runtime_receipt_history;
 pub mod runtime_worker;
 pub mod security;
 pub mod self_improvement;
@@ -88,6 +95,7 @@ pub mod trace;
 pub mod turns;
 pub mod vault;
 pub mod virtual_session_context;
+pub(crate) mod virtual_session_runtime_index;
 pub mod wake;
 pub mod worker_adapters;
 pub mod worker_coordination;
@@ -131,16 +139,28 @@ pub use background::{
     upsert_background_task,
 };
 pub use channel_commands::{
-    ChannelCommand, ChannelCommandIntent, DEFAULT_THINKING_LEVEL, FastCommandMode, THINKING_LEVELS,
-    XHIGH_THINKING_LEVEL, normalize_execution_mode, normalize_thinking_level,
-    parse_channel_command, parse_channel_command_intent,
+    ChannelCommand, ChannelCommandIntent, DEFAULT_THINKING_LEVEL, FastCommandMode,
+    MAX_THINKING_LEVEL, THINKING_LEVELS, XHIGH_THINKING_LEVEL, normalize_execution_mode,
+    normalize_thinking_level, parse_channel_command, parse_channel_command_intent,
 };
 pub use channel_delivery::{
     ChannelDeliveryPending, ChannelDeliveryPresentationFallbackReason,
-    ChannelDeliveryPresentationReceipt, ChannelDeliveryReceipt, ChannelDeliveryRecordOptions,
+    ChannelDeliveryPresentationReceipt, ChannelDeliveryReceipt,
+    ChannelDeliveryReceiptCompactionOptions, ChannelDeliveryReceiptCompactionReport,
+    ChannelDeliveryReceiptCompactionStatus, ChannelDeliveryReceiptHistoryEntry,
+    ChannelDeliveryReceiptHistoryQueryOptions, ChannelDeliveryReceiptHistoryQueryReport,
+    ChannelDeliveryReceiptHistoryStorage, ChannelDeliveryRecordOptions,
     ChannelDeliveryRenderedUnitKind, ChannelDeliveryRenderedUnitReceipt, ChannelDeliveryStatus,
-    ChannelDeliveryUnitStatus, ChannelOutboxPlanOptions, ChannelOutboxPlanReport,
-    ChannelOutboxPlanSummary, plan_channel_outbox, record_channel_delivery,
+    ChannelDeliveryUnitStatus, ChannelOutboxAppendOutcome, ChannelOutboxAppendReport,
+    ChannelOutboxPlanOptions, ChannelOutboxPlanReport, ChannelOutboxPlanSummary,
+    DEFAULT_CHANNEL_DELIVERY_RECEIPT_MAX_COMPACTION_RECORDS,
+    DEFAULT_CHANNEL_DELIVERY_RECEIPT_MAX_HOT_BYTES,
+    DEFAULT_CHANNEL_DELIVERY_RECEIPT_MAX_HOT_RECORDS,
+    DEFAULT_CHANNEL_DELIVERY_RECEIPT_TARGET_HOT_BYTES,
+    DEFAULT_CHANNEL_DELIVERY_RECEIPT_TARGET_HOT_RECORDS, append_channel_outbox_message,
+    compact_channel_delivery_receipts_if_needed, plan_channel_outbox,
+    query_channel_delivery_receipt_history, record_channel_delivery,
+    record_channel_delivery_for_source_queue,
 };
 pub use channel_identity::{
     ChannelIdentityBinding, ChannelIdentityLookup, ChannelIdentityRegistry,
@@ -164,18 +184,21 @@ pub use channel_runtime::{
 pub use channel_state::{
     AgentOverride, AgentOverridesStore, ChannelCommandApplyOptions, ChannelCommandApplyReceipt,
     ChannelCommandApplyReceiptStatus, ChannelCommandApplyReport, ChannelCommandEvent,
-    ChannelSessionNote, ChannelSessionState, agent_overrides_file, apply_channel_command_step,
-    channel_session_state_file, read_agent_override, read_channel_session_state,
+    ChannelSessionNote, ChannelSessionState, ChannelSessionStateV2MigrationReport,
+    ChannelSessionStateV2MigrationStatus, ChannelStateLane, agent_overrides_file,
+    apply_channel_command_step, bind_channel_session_state_to_lane_v2, channel_session_state_file,
+    channel_session_state_v2_file, migrate_legacy_channel_session_state_to_v2, read_agent_override,
+    read_channel_session_state, read_channel_session_state_v2, write_channel_session_state_v2,
 };
 pub use codex_runtime::{
     AssistantNarrationConfig, AssistantNarrationMode, CodexApprovalPolicy,
     CodexApprovalPolicyInspection, CodexAssistantNarration,
     CodexBackendReasoningExecutionReference, CodexEnvRequirement, CodexInvocationPlan,
-    CodexOutputPlan, CodexProviderConfig, CodexRuntimeCompletionOptions,
-    CodexRuntimeCompletionReceipt, CodexRuntimeCompletionReport, CodexRuntimeCompletionStatus,
-    CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReceipt, CodexRuntimeLaunchProbeReport,
-    CodexRuntimeLaunchProbeStatus, CodexRuntimeLaunchProcess, CodexRuntimePlan,
-    CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimePreflightCheck,
+    CodexOutputPlan, CodexPromptAuthority, CodexPromptAuthorityRole, CodexProviderConfig,
+    CodexRuntimeCompletionOptions, CodexRuntimeCompletionReceipt, CodexRuntimeCompletionReport,
+    CodexRuntimeCompletionStatus, CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReceipt,
+    CodexRuntimeLaunchProbeReport, CodexRuntimeLaunchProbeStatus, CodexRuntimeLaunchProcess,
+    CodexRuntimePlan, CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimePreflightCheck,
     CodexRuntimePreflightCheckStatus, CodexRuntimePreflightOptions, CodexRuntimePreflightReceipt,
     CodexRuntimePreflightReport, CodexRuntimePreflightStatus, CodexRuntimeReceipt,
     CodexRuntimeReceiptStatus, CodexRuntimeRunOptions, CodexRuntimeRunReceipt,
@@ -198,13 +221,16 @@ pub use context_rollover::{
     ContextRolloverReceipt, ContextRolloverRequeuePreparedOptions, ContextRolloverStatus,
     ContextStaticRecordRefs, ContextVirtualSessionRecord, ContextWorkingSetGoal,
     ContextWorkingSetMemory, RuntimeContinuationMetadata, VirtualSessionTaskBoundaryCloseOptions,
-    VirtualSessionTerminalOptions, VirtualSessionThreadBackfillOptions,
-    apply_context_rollover_before_turn, backfill_virtual_session_codex_thread_id,
-    close_virtual_session_for_task_boundary, context_compact_counter_file,
-    context_rollover_episode_index_file, context_rollover_prepared_requeues_file,
-    context_rollover_receipts_file, continuation_session_key, is_rollover_completion_kind,
-    load_context_rollover_config, load_or_create_context_compact_counter,
-    load_working_set_continuity_section, mark_virtual_session_terminal, parse_rollover_mode,
+    VirtualSessionTaskBoundaryCloseV2Options, VirtualSessionTerminalOptions,
+    VirtualSessionTerminalV2Options, VirtualSessionThreadBackfillOptions,
+    VirtualSessionThreadBackfillV2Options, apply_context_rollover_before_turn,
+    backfill_virtual_session_codex_thread_id, backfill_virtual_session_codex_thread_id_for_lane,
+    close_virtual_session_for_task_boundary, close_virtual_session_for_task_boundary_for_lane,
+    context_compact_counter_file, context_rollover_episode_index_file,
+    context_rollover_prepared_requeues_file, context_rollover_receipts_file,
+    continuation_session_key, is_rollover_completion_kind, load_context_rollover_config,
+    load_or_create_context_compact_counter, load_working_set_continuity_section,
+    mark_virtual_session_terminal, mark_virtual_session_terminal_for_lane, parse_rollover_mode,
     planned_session_files, record_completed_turn_working_set_snapshot,
     record_context_compact_attempt, requeue_prepared_context_rollover,
     requeue_prepared_context_rollover_if_no_parent_siblings, root_working_session_key,
@@ -272,6 +298,10 @@ pub use importer::{
     ImportItem, ImportItemKind, ImportItemStatus, ImportReport, ImportReportSummary,
     ImportSemantics, NativeCronSemantics, ReportFiles, SessionSemantics, build_dry_run_report,
     execute_import, write_report_files,
+};
+pub use ledger_maintenance::{
+    LEDGER_MAINTENANCE_WAKE_LANE, LedgerMaintenanceRunOptions, LedgerMaintenanceRunReport,
+    ledger_maintenance_wake_file, request_ledger_maintenance, run_ledger_maintenance_once,
 };
 pub use live_control::{
     LiveControlAction, LiveControlIntent, LiveControlTokenRecord, LiveControlTokenStatus,
@@ -444,12 +474,19 @@ pub use progress::{
     AgentProgressDeliveryPlanOptions, AgentProgressDeliveryPlanReport,
     AgentProgressDeliveryPlanSummary, AgentProgressDeliveryReceipt,
     AgentProgressDeliveryRecordContext, AgentProgressDeliveryRecordOptions,
-    AgentProgressDeliveryStatus, AgentProgressEvent, AgentProgressKind,
-    AgentProgressSessionSupersedeOptions, AgentProgressSessionSupersedeReport, AgentProgressStatus,
-    agent_progress_delivery_receipts_file, agent_progress_delivery_state_file,
-    agent_progress_events_file, agent_progress_session_supersede_receipts_file,
-    append_agent_progress_event, latest_agent_progress_event_line_for_queue,
-    plan_agent_progress_delivery, record_agent_progress_delivery,
+    AgentProgressDeliveryStatus, AgentProgressEvent, AgentProgressEventIdentity,
+    AgentProgressHistoryCompactionOptions, AgentProgressHistoryCompactionReport,
+    AgentProgressHistoryLookupReport, AgentProgressHistoryRecord, AgentProgressHistoryStorage,
+    AgentProgressKind, AgentProgressSessionSupersedeOptions, AgentProgressSessionSupersedeReport,
+    AgentProgressStatus, DEFAULT_AGENT_PROGRESS_HOT_MAX_BYTES,
+    DEFAULT_AGENT_PROGRESS_HOT_RETAINED_TERMINAL_QUEUES, agent_progress_delivery_receipts_file,
+    agent_progress_delivery_state_file, agent_progress_events_file, agent_progress_history_file,
+    agent_progress_history_maintenance_state_file, agent_progress_history_marker_file,
+    agent_progress_session_supersede_receipts_file, append_agent_progress_event,
+    compact_agent_progress_history, compact_agent_progress_history_if_needed,
+    latest_agent_progress_event_id_for_queue, latest_agent_progress_event_identity_for_queue,
+    latest_agent_progress_event_line_for_queue, plan_agent_progress_delivery,
+    read_agent_progress_history_for_queue_ids, record_agent_progress_delivery,
     record_agent_progress_delivery_with_context, release_agent_progress_surface_claim,
     render_agent_progress_panel, sanitize_progress_preview,
     supersede_agent_progress_session_surfaces,
@@ -458,7 +495,7 @@ pub use prompt::{
     AgentPromptManifestChangeV1, AgentPromptManifestEntryV1, AgentPromptManifestStatusV1,
     AgentPromptManifestV1, PromptAssemblyOptions, PromptBundle, PromptBundleFiles,
     PromptBundleSummary, PromptSection, PromptSectionKind, PromptSectionTier,
-    assemble_prompt_bundle, write_prompt_bundle,
+    acknowledge_fresh_backend_thread, assemble_prompt_bundle, write_prompt_bundle,
 };
 pub use quality::{
     InvariantEntry, PublicHygieneOptions, PublicHygieneReport, ReleaseChecklist,
@@ -511,8 +548,13 @@ pub use runtime_worker::{
     RuntimeQueueClassCapacity, RuntimeQueueLeaseObservationOptions,
     RuntimeQueueLeaseObservationReceipt, RuntimeQueueLeaseObservationStatus,
     RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeQueuePreparedItem,
-    inspect_runtime_queue_capacity, load_runtime_dispatch_config, observe_runtime_queue_lease,
-    prepare_runtime_queue_item, release_runtime_queue_lease, write_runtime_queue_quarantine_marker,
+    RuntimeQueueReceiptCompactionOptions, RuntimeQueueReceiptCompactionReport,
+    RuntimeQueueReceiptCompactionStatus, RuntimeQueueTypingContext,
+    compact_runtime_queue_receipts_if_needed, inspect_runtime_queue_capacity,
+    load_runtime_dispatch_config, observe_runtime_queue_lease, prepare_runtime_queue_item,
+    release_runtime_queue_lease, resolve_runtime_queue_terminal_ids,
+    resolve_runtime_queue_terminal_ids_nonblocking,
+    resolve_runtime_queue_typing_context_nonblocking, write_runtime_queue_quarantine_marker,
 };
 pub use security::{SecurityScanOptions, SecurityScanReport, scan_security_boundaries};
 pub use self_improvement::{
@@ -626,7 +668,7 @@ pub use trace::{TraceOptions, TraceRecord, TraceReport, trace_harness_event};
 pub use turns::{
     TurnAgent, TurnDispatch, TurnModelPolicy, TurnPlan, TurnPlanFile, TurnPlanInput,
     TurnPromptFile, TurnProviderRequestPolicy, TurnThinkingPolicy, build_turn_plan,
-    write_turn_plan,
+    build_turn_plan_for_account, write_turn_plan,
 };
 pub use vault::{
     EncryptedVaultFile, EncryptedVaultRecord, VaultGetOptions, VaultPutOptions, get_vault_secret,
@@ -639,13 +681,15 @@ pub use virtual_session_context::{
     resolve_virtual_session_working_context, resolve_virtual_session_working_context_for_lane,
 };
 pub use worker_adapters::{
-    DeterministicCronWorkerEnqueueOptions, NativeCronWorkerEnqueueOptions,
-    SubagentCoordinatorResumeOptionsV1, SubagentWorkerEnqueueOptions,
-    SubagentWorkerEnqueueOptionsV2, SubagentWorkerEnqueueOptionsV3, SubagentWorkerEnqueueOptionsV4,
-    SubagentWorkerEnqueueOptionsV5, WorkerAdapterEnqueueReport, WorkerAdapterEnqueueSummary,
-    WorkerAdapterJobRef, enqueue_deterministic_cron_workers, enqueue_native_cron_workers,
-    enqueue_subagent_workers, enqueue_subagent_workers_v2, enqueue_subagent_workers_v3,
-    enqueue_subagent_workers_v4, enqueue_subagent_workers_v5,
+    ControlledCoordinatorSmokeChildV1, ControlledCoordinatorSmokeLaneV1,
+    ControlledCoordinatorSmokeOptionsV1, DeterministicCronWorkerEnqueueOptions,
+    NativeCronWorkerEnqueueOptions, SubagentCoordinatorResumeOptionsV1,
+    SubagentWorkerEnqueueOptions, SubagentWorkerEnqueueOptionsV2, SubagentWorkerEnqueueOptionsV3,
+    SubagentWorkerEnqueueOptionsV4, SubagentWorkerEnqueueOptionsV5, WorkerAdapterEnqueueReport,
+    WorkerAdapterEnqueueSummary, WorkerAdapterJobRef, enqueue_controlled_coordinator_smoke,
+    enqueue_deterministic_cron_workers, enqueue_native_cron_workers, enqueue_subagent_workers,
+    enqueue_subagent_workers_v2, enqueue_subagent_workers_v3, enqueue_subagent_workers_v4,
+    enqueue_subagent_workers_v5,
 };
 pub use workers::{
     WorkerCancelOptions, WorkerCancelReport, WorkerCapacityBlockedSummary, WorkerDispatchConfig,
@@ -694,10 +738,12 @@ mod virtual_session_context_tests {
             &ChannelSessionState {
                 schema: "agent-harness.channel-session-state.v1".to_string(),
                 platform: platform.to_string(),
+                account_id: None,
                 channel_id: channel_id.to_string(),
                 user_id: user_id.to_string(),
                 active_session_key: session_key.to_string(),
                 agent_id: Some(agent_id.to_string()),
+                config_revision: None,
                 provider: None,
                 model: None,
                 session_topic: None,
@@ -764,6 +810,7 @@ mod virtual_session_context_tests {
         let envelope = resolve_virtual_session_working_context(VirtualSessionContextQuery {
             harness_home: harness_home.clone(),
             platform: "telegram".to_string(),
+            account_id: None,
             channel_id: "dm".to_string(),
             user_id: "user".to_string(),
             agent_id: "main".to_string(),
@@ -828,6 +875,7 @@ mod virtual_session_context_tests {
         let envelope = resolve_virtual_session_working_context(VirtualSessionContextQuery {
             harness_home: harness_home.clone(),
             platform: "telegram".to_string(),
+            account_id: None,
             channel_id: "dm".to_string(),
             user_id: "user".to_string(),
             agent_id: "main".to_string(),
@@ -880,6 +928,7 @@ mod virtual_session_context_tests {
         let discord = resolve_virtual_session_working_context(VirtualSessionContextQuery {
             harness_home: harness_home.clone(),
             platform: "discord".to_string(),
+            account_id: None,
             channel_id: "same-channel".to_string(),
             user_id: "same-user".to_string(),
             agent_id: "main".to_string(),
@@ -935,6 +984,7 @@ mod virtual_session_context_tests {
         let non_main = resolve_virtual_session_working_context(VirtualSessionContextQuery {
             harness_home: harness_home.clone(),
             platform: "telegram".to_string(),
+            account_id: None,
             channel_id: "dm".to_string(),
             user_id: "user".to_string(),
             agent_id: "xiaoxiaoli".to_string(),

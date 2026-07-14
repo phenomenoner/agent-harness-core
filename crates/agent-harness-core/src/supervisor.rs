@@ -1,8 +1,10 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use serde_json::Value;
 
 const WINDOWS_SUPERVISOR_PLAN_SCHEMA: &str = "agent-harness.windows-supervisor-plan.v1";
 const LEGACY_RUNTIME_WORKSPACE_ROOTS: &[&str] = &["D:\\Warehouse\\Research\\OpenClaw_WSL"];
@@ -25,6 +27,7 @@ pub struct WindowsSupervisorPlanOptions {
     pub include_worker: bool,
     pub include_cron_scheduler: bool,
     pub include_progress: bool,
+    pub include_ledger_maintenance: bool,
     pub include_telegram: bool,
     pub include_discord: bool,
     pub idle_ms: u64,
@@ -304,44 +307,29 @@ pub fn write_windows_supervisor_plan(
         );
     }
 
-    if options.include_telegram {
-        let component = "telegram-loop";
+    if options.include_ledger_maintenance {
+        let component = "ledger-maintenance-loop";
         let runner_script = scripts_dir.join(format!("{component}.ps1"));
         let stop_file = stop_dir.join(format!("{component}.stop"));
-        let mut args = vec![
-            "telegram-loop".to_string(),
-            "--source-home".to_string(),
-            path_arg(&source_home),
+        let args = vec![
+            "supervisor-run".to_string(),
+            "--service".to_string(),
+            component.to_string(),
             "--harness-home".to_string(),
             path_arg(&harness_home),
-            "--iterations".to_string(),
+            "--harness-cli".to_string(),
+            path_arg(&harness_cli),
+            "--child-iterations".to_string(),
             "0".to_string(),
             "--idle-ms".to_string(),
-            options.idle_ms.to_string(),
+            options.idle_ms.max(60_000).to_string(),
             "--max-consecutive-errors".to_string(),
             options.max_consecutive_errors.to_string(),
-            "--poll-timeout-seconds".to_string(),
-            options.telegram_poll_timeout_seconds.to_string(),
-            "--max-updates".to_string(),
-            options.telegram_max_updates.to_string(),
-            "--outbox-limit".to_string(),
-            options.telegram_outbox_limit.to_string(),
+            "--restart-delay-ms".to_string(),
+            "60000".to_string(),
             "--stop-file".to_string(),
             path_arg(&stop_file),
         ];
-        if let Some(workspace) = &workspace {
-            args.extend(["--workspace".to_string(), path_arg(workspace)]);
-        }
-        args.extend([
-            "--runtime-workspace".to_string(),
-            path_arg(&runtime_workspace),
-        ]);
-        if let Some(agent_id) = &options.agent_id {
-            args.extend(["--agent".to_string(), agent_id.clone()]);
-        }
-        if let Some(codex) = &codex_executable {
-            args.extend(["--codex-exe".to_string(), path_arg(codex)]);
-        }
         write_runner_script(
             &runner_script,
             &harness_cli,
@@ -360,6 +348,78 @@ pub fn write_windows_supervisor_plan(
             stop_file,
             true,
         );
+    }
+
+    if options.include_telegram {
+        let component = "telegram-loop";
+        let runner_script = scripts_dir.join(format!("{component}.ps1"));
+        let stop_file = stop_dir.join(format!("{component}.stop"));
+        let args = telegram_loop_runner_args(
+            &options,
+            component,
+            &source_home,
+            &harness_home,
+            workspace.as_deref(),
+            &runtime_workspace,
+            &stop_file,
+            None,
+            options.agent_id.as_deref(),
+            codex_executable.as_deref(),
+        );
+        write_runner_script(
+            &runner_script,
+            &harness_cli,
+            &args,
+            &log_dir,
+            component,
+            &harness_home,
+            &stop_file,
+        )?;
+        push_task(
+            &mut scripts,
+            &mut tasks,
+            &options.task_prefix,
+            component,
+            runner_script,
+            stop_file,
+            true,
+        );
+
+        for configured in configured_telegram_plan_loops(&harness_home)? {
+            let component = configured.service_id;
+            let runner_script = scripts_dir.join(format!("{component}.ps1"));
+            let stop_file = stop_dir.join(format!("{component}.stop"));
+            let args = telegram_loop_runner_args(
+                &options,
+                &component,
+                &source_home,
+                &harness_home,
+                workspace.as_deref(),
+                &runtime_workspace,
+                &stop_file,
+                Some(&configured.account),
+                configured.agent_id.as_deref(),
+                codex_executable.as_deref(),
+            );
+            write_runner_script(
+                &runner_script,
+                &harness_cli,
+                &args,
+                &log_dir,
+                &component,
+                &harness_home,
+                &stop_file,
+            )?;
+            push_task(
+                &mut scripts,
+                &mut tasks,
+                &options.task_prefix,
+                &component,
+                runner_script,
+                stop_file,
+                true,
+            );
+        }
     }
 
     if options.include_discord {
@@ -543,6 +603,217 @@ fn push_task(
         stop_file,
         graceful_stop,
     });
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfiguredTelegramPlanLoop {
+    service_id: String,
+    account: String,
+    agent_id: Option<String>,
+}
+
+fn configured_telegram_plan_loops(
+    harness_home: &Path,
+) -> io::Result<Vec<ConfiguredTelegramPlanLoop>> {
+    let config_path = harness_home.join("harness-config.json");
+    let config_text = match fs::read_to_string(&config_path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let config: Value = serde_json::from_str(&config_text).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not valid JSON: {error}", config_path.display()),
+        )
+    })?;
+    let Some(supervisor) = config.get("supervisor") else {
+        return Ok(Vec::new());
+    };
+    let supervisor = supervisor.as_object().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "harness-config.json supervisor must be an object",
+        )
+    })?;
+    let Some(raw_loops) = supervisor.get("telegramLoops") else {
+        return Ok(Vec::new());
+    };
+    let raw_loops = raw_loops.as_array().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "harness-config.json supervisor.telegramLoops must be an array",
+        )
+    })?;
+
+    let mut seen_service_ids = BTreeSet::new();
+    let mut loops = Vec::new();
+    for (index, entry) in raw_loops.iter().enumerate() {
+        let enabled = optional_config_bool(entry, "enabled", true, index)?;
+        if !enabled {
+            continue;
+        }
+        let account = optional_config_string(entry, &["account", "telegramAccount"], index)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "harness-config.json supervisor.telegramLoops[{index}] requires account"
+                    ),
+                )
+            })?;
+        let service_id = optional_config_string(entry, &["serviceId"], index)?
+            .unwrap_or_else(|| format!("telegram-loop-{}", telegram_service_suffix(&account)));
+        if !service_id.starts_with("telegram-loop-") || !is_safe_supervisor_component(&service_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "harness-config.json supervisor.telegramLoops[{index}] serviceId must be a safe telegram-loop-* component"
+                ),
+            ));
+        }
+        if !seen_service_ids.insert(service_id.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "harness-config.json supervisor.telegramLoops contains duplicate serviceId {service_id}"
+                ),
+            ));
+        }
+        loops.push(ConfiguredTelegramPlanLoop {
+            service_id,
+            account,
+            agent_id: optional_config_string(entry, &["agent", "agentId"], index)?,
+        });
+    }
+    Ok(loops)
+}
+
+fn optional_config_bool(entry: &Value, key: &str, default: bool, index: usize) -> io::Result<bool> {
+    match entry.get(key) {
+        Some(value) => value.as_bool().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "harness-config.json supervisor.telegramLoops[{index}].{key} must be a boolean"
+                ),
+            )
+        }),
+        None => Ok(default),
+    }
+}
+
+fn optional_config_string(
+    entry: &Value,
+    keys: &[&str],
+    index: usize,
+) -> io::Result<Option<String>> {
+    for key in keys {
+        let Some(value) = entry.get(*key) else {
+            continue;
+        };
+        let value = value.as_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "harness-config.json supervisor.telegramLoops[{index}].{key} must be a string"
+                ),
+            )
+        })?;
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "harness-config.json supervisor.telegramLoops[{index}].{key} must not be empty"
+                ),
+            ));
+        }
+        return Ok(Some(value.to_string()));
+    }
+    Ok(None)
+}
+
+fn is_safe_supervisor_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn telegram_service_suffix(value: &str) -> String {
+    let mut suffix = String::new();
+    let mut previous_separator = true;
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            suffix.push(character.to_ascii_lowercase());
+            previous_separator = false;
+        } else if !previous_separator {
+            suffix.push('-');
+            previous_separator = true;
+        }
+    }
+    let suffix = suffix.trim_matches('-');
+    if suffix.is_empty() {
+        "account".to_string()
+    } else {
+        suffix.to_string()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn telegram_loop_runner_args(
+    options: &WindowsSupervisorPlanOptions,
+    component: &str,
+    source_home: &Path,
+    harness_home: &Path,
+    workspace: Option<&Path>,
+    runtime_workspace: &Path,
+    stop_file: &Path,
+    account: Option<&str>,
+    agent_id: Option<&str>,
+    codex_executable: Option<&Path>,
+) -> Vec<String> {
+    let mut args = vec![
+        "telegram-loop".to_string(),
+        "--source-home".to_string(),
+        path_arg(source_home),
+        "--harness-home".to_string(),
+        path_arg(harness_home),
+        "--loop-name".to_string(),
+        component.to_string(),
+        "--iterations".to_string(),
+        "0".to_string(),
+        "--idle-ms".to_string(),
+        options.idle_ms.to_string(),
+        "--max-consecutive-errors".to_string(),
+        options.max_consecutive_errors.to_string(),
+        "--poll-timeout-seconds".to_string(),
+        options.telegram_poll_timeout_seconds.to_string(),
+        "--max-updates".to_string(),
+        options.telegram_max_updates.to_string(),
+        "--outbox-limit".to_string(),
+        options.telegram_outbox_limit.to_string(),
+        "--stop-file".to_string(),
+        path_arg(stop_file),
+    ];
+    if let Some(workspace) = workspace {
+        args.extend(["--workspace".to_string(), path_arg(workspace)]);
+    }
+    args.extend([
+        "--runtime-workspace".to_string(),
+        path_arg(runtime_workspace),
+    ]);
+    if let Some(agent_id) = agent_id {
+        args.extend(["--agent".to_string(), agent_id.to_string()]);
+    }
+    if let Some(account) = account {
+        args.extend(["--telegram-account".to_string(), account.to_string()]);
+    }
+    if let Some(codex) = codex_executable {
+        args.extend(["--codex-exe".to_string(), path_arg(codex)]);
+    }
+    args
 }
 
 fn write_runner_script(
@@ -982,6 +1253,7 @@ mod tests {
             include_worker: true,
             include_cron_scheduler: false,
             include_progress: true,
+            include_ledger_maintenance: true,
             include_telegram: true,
             include_discord: true,
             idle_ms: 1000,
@@ -994,7 +1266,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(report.tasks.len(), 6);
+        assert_eq!(report.tasks.len(), 7);
         assert!(report.receipt_file.is_file());
         assert!(
             report
@@ -1048,6 +1320,20 @@ mod tests {
         assert!(progress_script.contains("--restart-delay-ms"));
         assert!(!progress_script.contains("Tee-Object"));
         assert!(progress_script.contains("*> $LogFile"));
+        let ledger_script = fs::read_to_string(
+            output_dir
+                .join("scripts")
+                .join("ledger-maintenance-loop.ps1"),
+        )
+        .unwrap();
+        assert!(ledger_script.contains("ledger-maintenance-loop"));
+        assert!(ledger_script.contains("supervisor-run"));
+        assert!(ledger_script.contains("--service"));
+        assert!(ledger_script.contains("--child-iterations"));
+        assert!(ledger_script.contains("--idle-ms"));
+        assert!(ledger_script.contains("'60000'"));
+        assert!(ledger_script.contains("ledger-maintenance-loop.stop"));
+        assert!(!ledger_script.contains("Tee-Object"));
         let discord_outbox_script =
             fs::read_to_string(output_dir.join("scripts").join("discord-outbox-loop.ps1")).unwrap();
         assert!(discord_outbox_script.contains("discord-outbox-loop"));
@@ -1098,6 +1384,92 @@ mod tests {
     }
 
     #[test]
+    fn plan_includes_enabled_configured_telegram_loop_with_ledger_maintenance() {
+        let root =
+            temp_root("plan_includes_enabled_configured_telegram_loop_with_ledger_maintenance");
+        let harness_home = root.join(".agent-harness");
+        let output_dir = root.join("supervisor");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{
+  "supervisor": {
+    "telegramLoops": [
+      {
+        "enabled": true,
+        "serviceId": "telegram-loop-secondary",
+        "account": "secondary",
+        "agent": "secondary"
+      }
+    ]
+  }
+}"#,
+        )
+        .unwrap();
+
+        let report = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
+            harness_home: harness_home.clone(),
+            source_home: harness_home.clone(),
+            workspace: Some(harness_home.join("workspace")),
+            runtime_workspace: Some(harness_home.clone()),
+            harness_cli: root.join("agent-harness.exe"),
+            codex_executable: Some(root.join("codex.exe")),
+            node_executable: PathBuf::from("node"),
+            discord_gateway_script: root.join("tools").join("discord").join("index.mjs"),
+            agent_id: Some("main".to_string()),
+            output_dir: Some(output_dir.clone()),
+            task_prefix: "AgentHarness".to_string(),
+            include_runtime: true,
+            runtime_workers: 12,
+            include_worker: true,
+            include_cron_scheduler: true,
+            include_progress: true,
+            include_ledger_maintenance: true,
+            include_telegram: true,
+            include_discord: true,
+            idle_ms: 1_000,
+            runtime_timeout_ms: 1_800_000,
+            runtime_idle_timeout_ms: 300_000,
+            max_consecutive_errors: 5,
+            telegram_poll_timeout_seconds: 1,
+            telegram_max_updates: 10,
+            telegram_outbox_limit: 20,
+        })
+        .unwrap();
+
+        assert_eq!(report.tasks.len(), 9);
+        assert!(
+            report
+                .tasks
+                .iter()
+                .any(|task| task.component == "ledger-maintenance-loop")
+        );
+        assert!(
+            report
+                .tasks
+                .iter()
+                .any(|task| task.component == "telegram-loop-secondary")
+        );
+
+        let custom_telegram = fs::read_to_string(
+            output_dir
+                .join("scripts")
+                .join("telegram-loop-secondary.ps1"),
+        )
+        .unwrap();
+        assert!(custom_telegram.contains("--telegram-account"));
+        assert!(custom_telegram.contains("'secondary'"));
+        assert!(custom_telegram.contains("--agent"));
+
+        let start_script =
+            fs::read_to_string(output_dir.join("scripts").join("start-scheduled-tasks.ps1"))
+                .unwrap();
+        assert!(start_script.contains("AgentHarness-telegram-loop-secondary"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     #[cfg(windows)]
     fn defaults_unpinned_codex_to_repo_local_windows_executable() {
         let root = temp_root("defaults_unpinned_codex_to_repo_local_windows_executable");
@@ -1134,6 +1506,7 @@ mod tests {
             include_worker: false,
             include_cron_scheduler: false,
             include_progress: false,
+            include_ledger_maintenance: false,
             include_telegram: true,
             include_discord: true,
             idle_ms: 1000,
@@ -1191,6 +1564,7 @@ mod tests {
             include_worker: false,
             include_cron_scheduler: true,
             include_progress: false,
+            include_ledger_maintenance: false,
             include_telegram: false,
             include_discord: false,
             idle_ms: 1000,
@@ -1234,6 +1608,7 @@ mod tests {
             include_worker: false,
             include_cron_scheduler: true,
             include_progress: false,
+            include_ledger_maintenance: false,
             include_telegram: false,
             include_discord: false,
             idle_ms: 1000,
@@ -1278,6 +1653,7 @@ mod tests {
             include_worker: false,
             include_cron_scheduler: true,
             include_progress: false,
+            include_ledger_maintenance: false,
             include_telegram: true,
             include_discord: true,
             idle_ms: 1000,
@@ -1343,6 +1719,7 @@ mod tests {
             include_worker: false,
             include_cron_scheduler: false,
             include_progress: false,
+            include_ledger_maintenance: false,
             include_telegram: true,
             include_discord: false,
             idle_ms: 1000,

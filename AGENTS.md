@@ -1,92 +1,53 @@
 # Project Agent Instructions
 
-## Start Here
+## Scope And Authority
 
-- For a new local working session, read `docs/.private/agent-harness-operations-handbook.md` first when it exists: it holds the live topology, current live validation, the full command walkthrough, and the private documentation map. The root `README.md` is the public-facing overview, not the operational source of truth.
-- Treat the handbook as task-scoped repo-development orientation, not ambient prompt material. Read only the sections needed for the current repo task, keep excerpts bounded, and do not keep the handbook resident for ordinary channel/chat turns or active harness-home operations that do not need repo-development context.
-- For programming, project-understanding, design, implementation, verification, completion, documentation cleanup, and handoff/cutover work, use `docs/.private/openspec-superpowers-agency-agents-workflow-guide.md` as the default SOP. It is the private canonical workflow for OpenSpec/Superpowers planning, automated review, completion gates, test synthesis, public/private hygiene, cleanup, self-improvement capture, project-understanding context packs, and battle-set operations.
+- These instructions govern the source/development repository. `.agent-harness/` is excluded from ordinary source work.
+- `.agent-harness/` is the deployed live `agent-harness-core` instance and runtime home. It is operationally related to this source repository, but it is not the source-editing tree or default working directory.
+- Do not read, search, modify, execute, validate, or control anything under `.agent-harness/` unless the user explicitly scopes a deployment, live-operations, cutover, repair, or post-cutover verification task to it.
+- Use the user request, this file, current code/tests, and the relevant public contracts as active authority. `README.md` is a public overview, not an operations runbook.
+- Read private documents only when a specific task needs them. A document marked `RETIRED` is historical context only and must not be invoked as a workflow or rule source.
+- Write technical documents in English unless the user asks for another language.
 
-## Documentation Language
+## Deployment Boundary
 
-- Write technical documents in English by default, including design notes, implementation plans, technical proposals, runbooks, backlog documents, and review artifacts, unless the user explicitly asks for another language.
+- Develop and verify changes in the source repository and staging locations. Mutate the live `.agent-harness/` deployment only during an explicitly authorized cutover or live-operations task, using the applicable current runbook and rollback evidence.
+- Treat the deployed path as a compatibility boundary. Moving `.agent-harness/` is a separate migration project, not routine cleanup; it requires a path-consumer inventory, compatibility or redirect plan, staged validation, intentional cutover, and rollback plan.
 
-## Default Development SOP
+## Development Gates
 
-- Treat `docs/.private/openspec-superpowers-agency-agents-workflow-guide.md` as the default programming and software-development workflow for this repository. Use it before falling back to ad hoc planning or implementation.
-- For unfamiliar code, stale docs, unclear topology, or cross-module changes, start with the SOP's project-understanding intake: build or refresh the private codebase map, docs inventory, impact map, and context pack before proposing or implementing.
-- For behavior-changing work, use the SOP's OpenSpec/Superpowers path: proposal or impact context, design review, task plan, TDD implementation, automated spec/code review, verification gates, archive/handoff, and learning capture as applicable.
-- For small local changes, scale the SOP down rather than skipping it: still classify blast radius, run fresh verification, respect public/private hygiene, and report cleanup.
-- If a workflow rule is duplicated between this `AGENTS.md` and the private SOP, this file states the high-priority project constraint and the SOP supplies the detailed procedure. If they conflict, follow the stricter safety, privacy, verification, or live-ops rule and record the mismatch as a self-improvement learning.
+- Use the smallest workflow that safely fits the change. No planning framework, reviewer loop, TDD ceremony, or delegation pattern is automatic.
+- Preserve unrelated user changes in the working tree. Do not rewrite or revert files outside the task.
+- Before behavior-changing work, review `docs/agent-harness-topology-contract.md` and the relevant rows in `docs/invariants.md`. Update those documents, the applicable tests, and `docs/.private/release-checklist.md` when the change alters their contracts or expectations.
+- Treat `agentId` and the exact `platform`, `accountId`, `channelId`, `userId`, and `sessionKey` tuple as routing and continuity boundaries. Do not substitute evidence from another agent or channel.
+- For software changes, apply `completeness-and-test-synthesis` before a completion claim: classify blast radius, map touched invariants, run fresh verification at the required tier, and report gaps. Cross-cutting identity, routing, shared-state, memory, delivery, supervisor, or security changes normally require scenario/replay evidence (T3) unless the user accepts a lower-tier gap.
 
-## Topology And Change Gates
+## Public And Private Surfaces
 
-- Before behavior-changing edits, review [docs/agent-harness-topology-contract.md](docs/agent-harness-topology-contract.md) for identity axes, component ownership, and the required impact matrix. Treat `agentId` as a routing boundary across channel state, session freshness, prompt assembly, runtime, outbox, delivery, and memory.
-- If a change touches channel identity/state/ingress, runtime queue/pipeline, prompt assembly, final outbox/delivery, memory, or supervisor/cutover behavior, update the topology contract, [docs/invariants.md](docs/invariants.md), the local release checklist at `docs/.private/release-checklist.md` when present, and the relevant local operator/self-check doc when their expectations change.
-- For channel/runtime/session changes, include the agent-boundary scenario pack: same-agent stale-session suppression still works, and a non-main agent sharing the same platform/channel/user is not suppressed by another agent's active session state.
-- Treat platform/channel as a task-continuity boundary when reconnecting prior work. Before claiming a "previous session" state, verify receipts by exact `platform`, `accountId`, `channelId`, `userId`, `agentId`, and `sessionKey`; do not substitute Telegram DM evidence for Discord DM work, or vice versa, even when artifacts, topics, or user intent look related.
-- First-citizen ops rule: when CK says "previous session" / "last session" / `上個 session` without narrowing it, interpret that as the whole active virtual session for the current platform/channel/user/agent lane, not an arbitrary concrete child session or unrelated repo session. Only narrow to a child/continuation session when CK explicitly names a child session, queue id, continuation index, or artifact. Discord and Telegram remain separate first-class lanes; never inspect or rely on the other channel's session unless CK explicitly asks for cross-channel evidence.
-- For gaps where design intent is broader than current implementation, use the topology contract's Expected Vs Actual Gaps table and Promotion Gate column as the source of missing regressions to add before claiming parity. Current examples include progress delivery volume, progress/final-surface separation, openclaw-mem full parity, multi-agent full matrix, virtual-session continuity, repo code graph support, and scenario-matrix coverage.
-- For implementation-completeness and test-case synthesis, use the completion gate in `docs/.private/openspec-superpowers-agency-agents-workflow-guide.md` as the promoted default. The older `.debug/test-synthesis-and-completeness-sop-2026-06-28.md` is historical/local reference material only when needed for details not yet moved into the SOP.
-- Keep the private canonical feature/module topology described by the SOP up to date when changes affect module relationships, invariants, design-vs-implementation gaps, or test coverage expectations.
+- Treat root policy/project files and public `docs/` and `tools/` entries as GitHub-facing. Keep secrets, local receipts, channel/user identifiers, machine-specific runbooks, private handoffs, graph/session caches, and debug evidence out of them.
+- Keep operator-only documents under ignored `docs/.private/`, local-only tools under `tools/.private/`, and scratch evidence under `.debug/`.
+- Before a public push or PR, inspect the actual public diff for private paths, identifiers, secrets, receipts, and accidental local artifacts. Private material must not be pushed to a public remote.
 
-## Public / Private Repo Surface
+## Delegation And External Review
 
-- Treat `README.md`, `CHANGELOG.md`, `SECURITY.md`, `DOC-GUIDELINES.md`, root `AGENTS.md`, and public `docs/` / `tools/` entries as GitHub-facing. They must explain architecture, configuration, usage, or public project status without exposing local ops receipts, private handoffs, debug evidence, channel/user identifiers, machine-specific runbooks, generated local graph/session caches, or private topology evidence.
-- Keep non-public documents under ignored `docs/.private/`. This includes live operations handbooks, release/checkpoint handoffs, cutover evidence, validation scratch notes, Superpowers/OpenSpec plans, project-understanding artifacts, self-improvement learnings, private topology maps, and owner/operator-only runbooks.
-- Keep non-public tools under ignored `tools/.private/`. This includes local environment wrappers, one-off maintenance scripts, private evidence collectors, and tools that only make sense for the owner machine.
-- Keep `.debug/` local-only. If a file under `.debug/` was ever tracked, remove it from the index while preserving the local copy when it is still useful.
-- When adding new docs or tools, choose the public location only if a new user or contributor benefits from reading or running it from GitHub. Otherwise put it directly in the matching `.private` folder.
-- Before public remote push or PR creation, run the SOP's public/private hygiene gate. Private docs may be committed only locally or to a private destination; do not push them to a public remote.
+- Follow the global dispatch policy. Direct execution is the default for small or coupled work; delegate only bounded, genuinely independent work with exclusive artifact ownership. Final synthesis and repository-wide verification stay with the main agent.
+- Worker briefs must name this repository root and must explicitly forbid `.agent-harness/` unless the user placed it in scope.
+- Use `claude -p` only when the user explicitly requests Claude review. Send only the scoped artifact and never secrets, credentials, raw `.env` data, or unrelated workspace content.
 
-## Default Superpowers For Development
+## Cleanup
 
-- For programming or software-development tasks, default to enabling and following [$superpowers](C:\Users\user\.agents\skills\superpowers\SKILL.md) through the private SOP before implementation unless the user explicitly says not to use it.
-- Treat this repo-level AGENTS section, or a user `[$superpowers]` mention, as the explicit project invocation for this repository if the standalone Superpowers skill text says it should only be used when explicitly invoked.
-- Treat Superpowers as the baseline development workflow for planning, implementation discipline, verification, and completion checks, with OpenSpec/project-understanding/self-improvement steps supplied by the private SOP. If the skill file is unavailable in a session, state that briefly and continue with the closest matching local process.
+- Remove only task-created temporary outputs that are no longer needed. Preserve user artifacts, rollback/candidate material, and evidence still required for review or reproduction.
+- Report material cleanup, archives, and intentional retention in the final handoff. Do not manufacture cleanup work when the task created no temporary artifacts.
 
-## Command Approval Discipline
+## Retired Rules And Skills
 
-- Prefer an already reviewed external PowerShell command path with `sandbox_permissions: "require_escalated"` for shell work in this repository. Treat the local sandbox Windows logon/session failure (`CreateProcessAsUserW failed: 1312`) as a confirmed local limitation, not an intermittent issue to repeatedly retry.
-- Do not submit three or more parallel escalated shell commands for automatic review.
-<!-- Temporarily disabled by operator experiment:
-- When a command needs `sandbox_permissions: "require_escalated"`, run one escalated command at a time unless the user explicitly asks for parallel execution.
--->
-- Prefer a single focused command that gathers the needed context over several simultaneous reviewed commands.
-- If an automatic approval review times out, retry at most once as a single command, then continue with a safer local alternative or ask the user for direction.
-- Always set a reasonable shell `timeout_ms` for commands that need automatic approval review when the tool supports it; this limits command runtime, not the reviewer's wait time.
+`RETIRED` means: do not auto-load, invoke, cite as authority, or let the item control execution. Retain it only for historical lookup unless the user explicitly reactivates it.
 
-## External Review Tools
-
-- CK authorizes `claude -p` as a whitelisted external review mechanism in this repository when the user explicitly requests Claude review, review loops, or `claude -p`. It may receive the scoped technical document, plan, diff, or code excerpt needed for that requested review.
-- Do not include secrets, credentials, private tokens, raw `.env` contents, or unrelated workspace data in `claude -p` prompts. Keep prompts scoped to the review target and record the review outcome in the relevant debug/review artifact when applicable.
-
-## Live Harness Safety
-
-- Do not stop, restart, or replace the live `.agent-harness` gateway unless the task explicitly calls for cutover or live operation.
-- Use staging target directories for tests and builds until the cutover step is intentionally reached.
-- For post-cutover or repair verification that needs provider-visible evidence (progress ordering, working indicator, final delivery on a real model turn), use the external controlled long-turn smoke procedure in `docs/.private/live-lane-smoke-verification-runbook.md` when it exists: it injects one turn through real channel ingress without stopping any live loop, and documents the required `channel-receive` form, pollution pitfalls, monitoring receipts, and pass criteria. It requires explicit operator approval because the smoke delivers real messages to the live lane.
-
-## Post-Task Cleanup
-
-- Before finishing a repo task, follow the cleanup gate in `docs/.private/openspec-superpowers-agency-agents-workflow-guide.md`: remove intermediate validation artifacts that are no longer needed, especially task-scoped `target\staging-*`, `target\staging-test-*`, `target\staging-check-*`, `target\staging-build-*`, `target\tmp`, local graph/index scratch files, and throwaway debug outputs created for the current task.
-- Do not automatically remove live or rollback material: keep `target\debug\agent-harness.exe`, documented `target\debug\agent-harness.pre-*.exe` rollback binaries, current cutover candidate builds, artifacts referenced by the operations handbook, and evidence that is still needed for audit, review, or reproduction.
-- If an artifact might still be useful but is not needed in the active workspace, archive it outside the repo with a manifest/checksum before deleting the workspace copy; prefer `E:\Warehouse_Rust-OpenClaw-Core_target\` for archived `target` material.
-- Include cleanup in the final verification checklist: report what was removed, what was archived, and what was intentionally retained.
-
-## Ops Keyword
-
-- When the user says `戰定` or asks to run the `戰定流程`, run the private SOP's Battle-Set Mode: carry the approved plan through implementation, tests, completion gate, test synthesis, docs/topology/self-improvement updates, public/private hygiene, cleanup, public-safe push when authorized, and the selected cutover path.
-- During this workflow, "update and clean up documentation and skills" means correcting or removing stale, contradictory, or no-longer-applicable guidance instead of only appending new notes.
-- If the `戰定` request does not explicitly say handoff-only or no-cutover, treat it as authorization to perform the intentional live cutover after all required gates pass. If the user asks for handoff-only/manual cutover, generate the private handoff document and stop before live-control actions. Until the cutover step is reached, continue to use staging target directories and avoid disturbing the live `.agent-harness` gateway.
-
-## Sub-Agent Delegation Preference
-
-- When sub-agent tooling is available, use sub-agents by default for repo-development work unless CK explicitly says not to use sub-agents for the current task. Treat this as an opt-out default, not an opt-in feature.
-- The default sub-agent scope includes bounded sidecar work such as read-only codebase inspection, plan/diff review, documentation gap checks, test matrix review, smoke-check design, long-running ops inspection, and separable implementation tasks with disjoint file ownership. It still excludes tiny single-answer replies, destructive/live-control operations, auth or permission changes, external posts/messages, purchases/trades/spend, and any task where CK explicitly says not to delegate.
-- Choose the sub-agent model freely according to task fit, required reasoning depth, latency, and availability. Prefer an appropriate GPT-5.6 family model by default; use another model when it is materially better suited or the preferred GPT-5.6 model is unavailable. Use Codex-authenticated worker lanes only; if provider/auth routing is not visible in the sub-agent receipt, record Codex-auth status as unverified rather than assuming it.
-- Every sub-agent assignment must have a bounded scope and an expected output. When waiting for a sub-agent, always use an explicit `timeout_ms` instead of an unbounded wait.
-- If a sub-agent wait times out, inspect whether the result is needed on the critical path. If it is not critical, continue locally; if it is critical, retry at most once with a shorter, clearer prompt and timeout.
-- Close completed, timed-out, irrelevant, or invalid-dispatch sub-agents promptly so stalled side work does not consume worker capacity or hide the actual blocker.
-- Keep live gateway control, destructive shell actions, final cutover, and any operation that can interrupt the active communication channel on the main agent path.
-- For sub-agents that edit code, assign disjoint file ownership, tell them they are not alone in the codebase, and require them to work with existing changes instead of reverting unrelated edits.
-- Always include the intended root path in sub-agent prompts. For this repo use `D:\Warehouse\Rust-OpenClaw-Core`; for active harness-home operations use `D:\Warehouse\Rust-OpenClaw-Core\.agent-harness`. Do not rely on inherited cwd, which may still be the legacy compatibility root `D:\Warehouse\Research\OpenClaw_WSL`.
+- `docs/.private/openspec-superpowers-agency-agents-workflow-guide.md` as a default or binding SOP.
+- Automatic OpenSpec, Superpowers, Agency Agents, TDD, multi-reviewer, or archive/self-improvement workflow chains.
+- All `superpowers:*` skills and the Superpowers bootstrap/plugin workflow. The Codex-global plugin is disabled separately.
+- Automatic loading of the operations handbook for ordinary source work. It remains applicable only when an explicitly scoped deployment, live-operations, cutover, repair, or post-cutover task needs it.
+- Treating `.agent-harness/` as the source-editing tree or default workspace; it is the live deployment/runtime target.
+- `戰定` / Battle-Set as implicit authorization for full workflow execution, public push, live control, or cutover. Those actions now require explicit task-level authorization.
+- The `CreateProcessAsUserW failed: 1312` sandbox-escalation workaround and its automatic approval/retry rules; use the active tool permission policy instead.
+- Default sub-agent fan-out, fixed worker-model prescriptions, and duplicated repo-level dispatch templates.

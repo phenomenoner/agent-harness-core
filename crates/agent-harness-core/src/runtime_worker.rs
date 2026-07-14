@@ -1,11 +1,9 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-#[cfg(not(windows))]
-use std::time::SystemTime;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,16 +11,30 @@ use serde_json::Value;
 use std::os::windows::fs::OpenOptionsExt;
 
 use crate::backend_reasoning::{BackendReasoningPolicyV1, ReasoningPreference};
+use crate::channel_state::ChannelStateLane;
 use crate::context_rollover::{derive_virtual_session_id, root_working_session_key};
 use crate::execution_mode::{
     AuthorizedExecutionModeSnapshotV2, STANDARD_EXECUTION_MODE, is_reserved_execution_mode_effort,
 };
 use crate::lane::FullLaneKeyV1;
+use crate::logging::{try_with_jsonl_append_lock, with_jsonl_append_lock};
 use crate::loop_health::process_alive_for_pid;
+use crate::runtime_execution_receipt_index::prepared_execution_receipts_from_index;
+use crate::runtime_pending_index::{
+    prune_terminal_queue_ids_from_pending_index, read_queued_pending_values_from_index,
+    read_queued_pending_values_from_index_nonblocking,
+};
+use crate::runtime_receipt_history::{
+    RuntimeQueueReceiptHistoryStaging, cleanup_staged_runtime_queue_receipt_history,
+    commit_runtime_queue_receipt_history, discard_runtime_queue_receipt_history,
+    find_runtime_queue_terminal_history, find_runtime_queue_terminal_history_nonblocking,
+    is_trusted_runtime_run_once_receipt, runtime_queue_receipt_history_file,
+    stage_runtime_queue_receipt_history,
+};
 use crate::{
     AgentSource, HarnessLogEvent, HarnessLogLevel, InboundMediaArtifact, PromptAssemblyOptions,
     RuntimeContinuationMetadata, append_harness_log, apply_context_rollover_before_turn,
-    assemble_prompt_bundle, build_runtime_skill_index, build_turn_plan,
+    assemble_prompt_bundle, build_runtime_skill_index, build_turn_plan_for_account,
     cron_run_runtime_dispatch_blocker, current_log_time_ms, load_agent_registry,
     load_worker_dispatch_config, write_json_atomic, write_prompt_bundle,
 };
@@ -35,6 +47,19 @@ const RUNTIME_QUEUE_LEASE_RECONCILIATION_SCHEMA: &str =
 const RUNTIME_QUEUE_LEASE_OBSERVATION_SCHEMA: &str =
     "agent-harness.runtime-queue-lease-observation.v1";
 const RUNTIME_QUEUE_STATE_INDEX_SCHEMA: &str = "agent-harness.runtime-queue-state-index.v1";
+const RUNTIME_QUEUE_STATE_INDEX_REVISION: u32 = 3;
+const RUNTIME_QUEUE_RECEIPT_COMPACTION_SCHEMA: &str =
+    "agent-harness.runtime-queue-receipt-compaction.v1";
+const RUNTIME_QUEUE_RECEIPT_COMPACTION_PENDING_SCHEMA: &str =
+    "agent-harness.runtime-queue-receipt-compaction-pending.v3";
+const RUNTIME_QUEUE_RECEIPT_COMPACTION_PENDING_SCHEMA_V2: &str =
+    "agent-harness.runtime-queue-receipt-compaction-pending.v2";
+const RUNTIME_QUEUE_RECEIPT_COMPACTION_STATE_SCHEMA: &str =
+    "agent-harness.runtime-queue-receipt-compaction-state.v1";
+const RUNTIME_QUEUE_RECEIPT_COMPACTION_DEFAULT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const RUNTIME_QUEUE_RECEIPT_COMPACTION_DEFAULT_MAX_ARCHIVES: usize = 3;
+const RUNTIME_QUEUE_RECEIPT_COMPACTION_RETRY_GROWTH_BYTES: u64 = 1024 * 1024;
+const RUNTIME_QUEUE_RECEIPT_COMPACTION_RETRY_INTERVAL_MS: i64 = 5 * 60 * 1000;
 const RUNTIME_QUEUE_QUARANTINE_SCHEMA: &str = "agent-harness.runtime-queue-quarantine.v1";
 const TERMINAL_CONTROL_SUPPRESSION_REASON: &str = "terminal-control-present";
 const RUNTIME_LOOP_SERVICE_ID: &str = "runtime-loop";
@@ -55,6 +80,62 @@ pub struct RuntimeQueuePrepareOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeQueueCapacityOptions {
     pub harness_home: PathBuf,
+}
+
+/// Minimal routing information required to emit a provider typing/working
+/// indicator for one still-runnable queue item.  This deliberately excludes
+/// user text, prompt content, and filesystem paths so the CLI can obtain it
+/// from bounded runtime projections instead of replaying `pending.jsonl`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeQueueTypingContext {
+    pub agent_id: String,
+    pub platform: String,
+    pub channel_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeQueueReceiptCompactionOptions {
+    pub harness_home: PathBuf,
+    pub max_bytes: u64,
+    pub max_archives: usize,
+    pub now_ms: i64,
+}
+
+impl RuntimeQueueReceiptCompactionOptions {
+    pub fn with_defaults(harness_home: PathBuf, now_ms: i64) -> Self {
+        Self {
+            harness_home,
+            max_bytes: RUNTIME_QUEUE_RECEIPT_COMPACTION_DEFAULT_MAX_BYTES,
+            max_archives: RUNTIME_QUEUE_RECEIPT_COMPACTION_DEFAULT_MAX_ARCHIVES,
+            now_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeQueueReceiptCompactionStatus {
+    Missing,
+    Unchanged,
+    Busy,
+    Compacted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeQueueReceiptCompactionReport {
+    pub schema: &'static str,
+    pub harness_home: PathBuf,
+    pub receipts_file: PathBuf,
+    pub pending_file: PathBuf,
+    pub status: RuntimeQueueReceiptCompactionStatus,
+    pub original_bytes: u64,
+    pub compacted_bytes: u64,
+    pub archive_file: Option<PathBuf>,
+    pub removed_archives: Vec<PathBuf>,
+    pub removed_pending_items: usize,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -169,6 +250,11 @@ pub struct RuntimeQueuePreparedItem {
 pub struct RuntimeExecutionReceipt {
     pub queue_id: Option<String>,
     pub status: RuntimeExecutionReceiptStatus,
+    /// Exact channel/account/agent lane for prepared interactive work.  This
+    /// is emitted from the durable queued item so downstream adapters never
+    /// reconstruct a virtual-session lane from a lossy session key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_lane: Option<crate::ChannelStateLane>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,7 +330,24 @@ pub(crate) struct RuntimeQueueStateIndex {
     #[serde(default = "runtime_queue_state_index_schema")]
     schema: String,
     #[serde(default)]
+    revision: u32,
+    #[serde(default)]
+    receipt_ledger: RuntimeQueueReceiptLedgerCursor,
+    #[serde(default)]
     pub(crate) queues: BTreeMap<String, RuntimeQueueStateIndexEntry>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeQueueReceiptLedgerCursor {
+    #[serde(default)]
+    offset_bytes: u64,
+    #[serde(default)]
+    line_number: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_modified_at_unix_nanos: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prefix_tail_fingerprint: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -253,13 +356,80 @@ pub(crate) struct RuntimeQueueStateIndexEntry {
     #[serde(default)]
     terminal_ever: bool,
     #[serde(default)]
+    terminal_run_once_ever: bool,
+    #[serde(default)]
     suppression_recorded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_occurred_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_runtime_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_transcript_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    run_once_status_counts: BTreeMap<String, usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal_control_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_runtime_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_transcript_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_occurred_at_ms: Option<i64>,
+}
+
+/// One exact queue record materialized from the append-only hot receipt index.
+///
+/// This intentionally contains only the latest receipt metadata required by
+/// normal runtime readers. Historical terminal evidence lives in the compact
+/// SQLite store once it leaves the hot ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeQueueHotReceiptRecord {
+    pub(crate) queue_id: String,
+    pub(crate) status: String,
+    pub(crate) reason: Option<String>,
+    pub(crate) runtime_class: Option<String>,
+    pub(crate) origin: Option<String>,
+    pub(crate) transcript_file: Option<PathBuf>,
+    pub(crate) occurred_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeQueueLedgerCompactionPending {
+    schema: String,
+    ledger_file: PathBuf,
+    archive_file: PathBuf,
+    temp_file: PathBuf,
+    expected_bytes: u64,
+    expected_digest: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    archive_expected_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    archive_expected_digest: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    history_store_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    history_transaction_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeQueueReceiptCompactionState {
+    schema: String,
+    last_attempt_at_ms: i64,
+    last_attempt_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -412,16 +582,38 @@ pub fn prepare_runtime_queue_item(
     let mut warnings = Vec::new();
     let now_ms = current_log_time_ms()?;
     let preliminary_pending_items = read_pending_items(&queue_file, &mut warnings)?;
-    let prepared_receipts = read_prepared_receipts(&execution_receipts_file, &mut warnings)?;
-    let run_once_receipts_file = queue_dir.join("run-once-receipts.jsonl");
-    let mut terminal_run_ids = read_terminal_run_once_ids(&run_once_receipts_file, &mut warnings)?;
+    // A terminal-control marker may cause the derived active index to prune a
+    // row before this invocation reaches its requested-item branch. Keep the
+    // bounded, source-authoritative snapshot from immediately before that
+    // cleanup so the terminal path can still emit one fully attributed
+    // suppression receipt. This snapshot is never used to select runnable
+    // work after the index has been refreshed.
+    let preliminary_pending_by_id = preliminary_pending_items
+        .iter()
+        .cloned()
+        .map(|item| (item.queue_id.clone(), item))
+        .collect::<HashMap<_, _>>();
+    let prepared_receipts = prepared_execution_receipts_from_index(&queue_dir, &mut warnings)?;
+    let run_once_index = refresh_runtime_queue_state_index(&queue_dir, &mut warnings)?;
+    let mut terminal_run_ids = terminal_run_once_ids_from_index(&run_once_index);
     terminal_run_ids.extend(pending_terminal_control_ids(
-        &options.harness_home,
+        &queue_dir,
         &preliminary_pending_items,
+        &run_once_index,
         &mut warnings,
     )?);
-    let retry_pending_run_ids =
-        read_retry_pending_run_once_ids(&run_once_receipts_file, &mut warnings)?;
+    let terminal_queue_ids = terminal_run_ids.iter().cloned().collect::<BTreeSet<_>>();
+    if let Err(error) =
+        prune_terminal_queue_ids_from_pending_index(&queue_dir, &terminal_queue_ids, &mut warnings)
+    {
+        // The pending JSONL remains authoritative, and selection below still
+        // filters terminal IDs.  A failed derived-index cleanup must not
+        // prevent a runnable queue item from being prepared.
+        warnings.push(format!(
+            "could not prune caller-proven terminal pending rows from the active index: {error}"
+        ));
+    }
+    let retry_pending_run_ids = retry_pending_run_once_ids_from_index(&run_once_index);
     let lock_runtime_class = select_lock_runtime_class(
         options.queue_id.as_deref(),
         &preliminary_pending_items,
@@ -439,6 +631,7 @@ pub fn prepare_runtime_queue_item(
             let receipt = RuntimeExecutionReceipt {
                 queue_id: options.queue_id,
                 status: RuntimeExecutionReceiptStatus::LeaseBusy,
+                channel_lane: None,
                 runtime_class: Some(lock_runtime_class.clone()),
                 origin: None,
                 cron_run_id: None,
@@ -491,7 +684,10 @@ pub fn prepare_runtime_queue_item(
         if let QueueTerminalControl::Terminal(control) =
             resolve_queue_terminal_control(&options.harness_home, requested_queue_id, session_key)?
         {
-            if let Some(pending) = pending_by_id.get(requested_queue_id) {
+            if let Some(pending) = pending_by_id
+                .get(requested_queue_id)
+                .or_else(|| preliminary_pending_by_id.get(requested_queue_id))
+            {
                 record_terminal_control_suppression(
                     &options.harness_home,
                     requested_queue_id,
@@ -561,28 +757,23 @@ pub fn prepare_runtime_queue_item(
         && terminal_run_ids.contains(requested_queue_id)
     {
         write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+        let pending = pending_by_id
+            .get(requested_queue_id)
+            .or_else(|| preliminary_pending_by_id.get(requested_queue_id));
         let receipt = RuntimeExecutionReceipt {
             queue_id: Some(requested_queue_id.to_string()),
             status: RuntimeExecutionReceiptStatus::NoPendingItem,
-            runtime_class: pending_by_id
-                .get(requested_queue_id)
-                .map(|item| item.runtime_class.clone()),
-            origin: pending_by_id
-                .get(requested_queue_id)
-                .map(|item| item.origin.clone()),
-            cron_run_id: pending_by_id
-                .get(requested_queue_id)
-                .and_then(|item| item.cron_run_id.clone()),
-            scheduled_for_ms: pending_by_id
-                .get(requested_queue_id)
-                .and_then(|item| item.scheduled_for_ms),
+            channel_lane: None,
+            runtime_class: pending.map(|item| item.runtime_class.clone()),
+            origin: pending.map(|item| item.origin.clone()),
+            cron_run_id: pending.and_then(|item| item.cron_run_id.clone()),
+            scheduled_for_ms: pending.and_then(|item| item.scheduled_for_ms),
             execution_dir: None,
             prompt_bundle_json: None,
             prompt_markdown: None,
             runtime_workspace: None,
             inbound_media_artifacts: Vec::new(),
-            continuation: pending_by_id
-                .get(requested_queue_id)
+            continuation: pending
                 .map(|item| item.continuation.clone())
                 .unwrap_or_else(RuntimeContinuationMetadata::legacy),
             terminal_control_matched: None,
@@ -659,6 +850,7 @@ pub fn prepare_runtime_queue_item(
             let receipt = RuntimeExecutionReceipt {
                 queue_id: Some(requested_queue_id.to_string()),
                 status: RuntimeExecutionReceiptStatus::NoPendingItem,
+                channel_lane: None,
                 runtime_class: prepared.runtime_class.clone(),
                 origin: prepared.origin.clone(),
                 cron_run_id: prepared.cron_run_id.clone(),
@@ -695,6 +887,7 @@ pub fn prepare_runtime_queue_item(
                 let receipt = RuntimeExecutionReceipt {
                     queue_id: Some(requested_queue_id.to_string()),
                     status: RuntimeExecutionReceiptStatus::NoPendingItem,
+                    channel_lane: None,
                     runtime_class: Some(pending.runtime_class.clone()),
                     origin: Some(pending.origin.clone()),
                     cron_run_id: pending.cron_run_id.clone(),
@@ -728,6 +921,7 @@ pub fn prepare_runtime_queue_item(
                 let receipt = RuntimeExecutionReceipt {
                     queue_id: Some(requested_queue_id.to_string()),
                     status: RuntimeExecutionReceiptStatus::NoPendingItem,
+                    channel_lane: None,
                     runtime_class: Some(pending.runtime_class.clone()),
                     origin: Some(pending.origin.clone()),
                     cron_run_id: pending.cron_run_id.clone(),
@@ -764,6 +958,7 @@ pub fn prepare_runtime_queue_item(
                 let receipt = RuntimeExecutionReceipt {
                     queue_id: Some(requested_queue_id.to_string()),
                     status: RuntimeExecutionReceiptStatus::NoPendingItem,
+                    channel_lane: None,
                     runtime_class: Some(pending.runtime_class.clone()),
                     origin: Some(pending.origin.clone()),
                     cron_run_id: pending.cron_run_id.clone(),
@@ -814,6 +1009,7 @@ pub fn prepare_runtime_queue_item(
         let receipt = RuntimeExecutionReceipt {
             queue_id: Some(requested_queue_id.to_string()),
             status: RuntimeExecutionReceiptStatus::AlreadyPrepared,
+            channel_lane: None,
             runtime_class: prepared.runtime_class.clone(),
             origin: prepared.origin.clone(),
             cron_run_id: prepared.cron_run_id.clone(),
@@ -929,6 +1125,7 @@ pub fn prepare_runtime_queue_item(
                     let receipt = RuntimeExecutionReceipt {
                     queue_id: Some(queue_id.clone()),
                     status: RuntimeExecutionReceiptStatus::AlreadyPrepared,
+                    channel_lane: None,
                     runtime_class: prepared.runtime_class.clone(),
                     origin: prepared.origin.clone(),
                     cron_run_id: prepared.cron_run_id.clone(),
@@ -992,7 +1189,7 @@ pub fn prepare_runtime_queue_item(
     else {
         write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
         if options.queue_id.is_none() {
-            let mut terminal_candidates = pending_by_id.values().collect::<Vec<_>>();
+            let mut terminal_candidates = preliminary_pending_by_id.values().collect::<Vec<_>>();
             terminal_candidates.sort_by(|left, right| {
                 runtime_selection_key(left)
                     .cmp(&runtime_selection_key(right))
@@ -1039,6 +1236,7 @@ pub fn prepare_runtime_queue_item(
         let receipt = RuntimeExecutionReceipt {
             queue_id: options.queue_id,
             status: RuntimeExecutionReceiptStatus::NoPendingItem,
+            channel_lane: None,
             runtime_class: None,
             origin: None,
             cron_run_id: None,
@@ -1159,7 +1357,7 @@ pub fn prepare_runtime_queue_item(
     let source = AgentSource::with_workspace(&pending.source_home, &prompt_workspace);
     let registry = load_agent_registry(&source)?;
     let skill_index = build_runtime_skill_index(&source, &options.harness_home)?;
-    let mut plan = build_turn_plan(
+    let mut plan = build_turn_plan_for_account(
         &source,
         &registry,
         &skill_index,
@@ -1175,6 +1373,7 @@ pub fn prepare_runtime_queue_item(
             session_hint: Some(pending.session_key.clone()),
             skill_limit: pending.selected_skill_ids.len().max(5),
         },
+        pending.account_id.clone(),
     )?;
     if let (Some(provider), Some(model)) = (&pending.provider, &pending.model) {
         plan.model_policy.provider = Some(provider.clone());
@@ -1195,6 +1394,7 @@ pub fn prepare_runtime_queue_item(
     }
     let (full_lane, backend_context_generation) =
         derive_prompt_runtime_context(&pending, &mut warnings)?;
+    let channel_lane = channel_state_lane_for_pending(&pending)?;
     let mut prompt_options = options.prompt_options;
     prompt_options.harness_home = Some(options.harness_home.clone());
     // The queued item is the authoritative post-routing identity. Never accept
@@ -1244,6 +1444,7 @@ pub fn prepare_runtime_queue_item(
     let receipt = RuntimeExecutionReceipt {
         queue_id: Some(pending.queue_id),
         status: RuntimeExecutionReceiptStatus::Prepared,
+        channel_lane,
         runtime_class: Some(receipt_runtime_class),
         origin: Some(receipt_origin),
         cron_run_id: receipt_cron_run_id,
@@ -1390,6 +1591,22 @@ fn derive_prompt_runtime_context(
     Ok((full_lane, backend_context_generation))
 }
 
+fn channel_state_lane_for_pending(
+    pending: &PendingQueueItem,
+) -> io::Result<Option<ChannelStateLane>> {
+    let Some(account_id) = pending.account_id.as_deref() else {
+        return Ok(None);
+    };
+    ChannelStateLane::new(
+        &pending.platform,
+        Some(account_id),
+        &pending.channel_id,
+        &pending.user_id,
+        &pending.agent_id,
+    )
+    .map(Some)
+}
+
 fn prompt_codex_binding_file(transcript_file: &Path) -> PathBuf {
     let file_name = transcript_file
         .file_name()
@@ -1409,11 +1626,18 @@ pub fn inspect_runtime_queue_capacity(
     let config = load_runtime_dispatch_config(&options.harness_home)?;
     let mut warnings = Vec::new();
     let now_ms = current_log_time_ms()?;
-    let prepared_receipts = read_prepared_receipts(&execution_receipts_file, &mut warnings)?;
-    let run_once_receipts_file = queue_dir.join("run-once-receipts.jsonl");
-    let terminal_run_ids = read_terminal_run_once_ids(&run_once_receipts_file, &mut warnings)?;
-    let retry_pending_run_ids =
-        read_retry_pending_run_once_ids(&run_once_receipts_file, &mut warnings)?;
+    let prepared_receipts = prepared_execution_receipts_from_index(&queue_dir, &mut warnings)?;
+    let run_once_index = refresh_runtime_queue_state_index(&queue_dir, &mut warnings)?;
+    let terminal_run_ids = terminal_run_once_ids_from_index(&run_once_index);
+    let terminal_queue_ids = terminal_run_ids.iter().cloned().collect::<BTreeSet<_>>();
+    if let Err(error) =
+        prune_terminal_queue_ids_from_pending_index(&queue_dir, &terminal_queue_ids, &mut warnings)
+    {
+        warnings.push(format!(
+            "could not prune caller-proven terminal pending rows from the active index during capacity inspection: {error}"
+        ));
+    }
+    let retry_pending_run_ids = retry_pending_run_once_ids_from_index(&run_once_index);
     let pending_items = read_pending_items(&queue_file, &mut warnings)?;
     let pending_by_id = pending_items
         .iter()
@@ -2634,13 +2858,48 @@ pub fn resolve_queue_terminal_control(
 ) -> io::Result<QueueTerminalControl> {
     let queue_dir = harness_home.as_ref().join("state").join("runtime-queue");
     let mut warnings = Vec::new();
-    let index = rebuild_runtime_queue_state_index(&queue_dir, &mut warnings)?;
-    resolve_queue_terminal_control_from_index(
+    let index = refresh_runtime_queue_state_index(&queue_dir, &mut warnings)?;
+    let control = resolve_queue_terminal_control_from_index(
         &queue_dir,
         queue_id,
         session_key,
         index.queues.get(queue_id),
-    )
+    )?;
+    if !matches!(&control, QueueTerminalControl::Runnable) {
+        return Ok(control);
+    }
+    let requested_queue_ids = std::iter::once(queue_id.to_string()).collect::<BTreeSet<_>>();
+    let cold_reasons = cold_terminal_history_reasons(&queue_dir, &requested_queue_ids)?;
+    let Some(reason) = cold_reasons.get(queue_id) else {
+        return Ok(QueueTerminalControl::Runnable);
+    };
+    Ok(QueueTerminalControl::Terminal(QueueTerminalControlMatch {
+        source: TerminalControlSource::RunOnceTerminal,
+        reason: reason.clone(),
+        suppression_recorded: index
+            .queues
+            .get(queue_id)
+            .is_some_and(|entry| entry.suppression_recorded),
+    }))
+}
+
+fn cold_terminal_history_reasons(
+    queue_dir: &Path,
+    queue_ids: &BTreeSet<String>,
+) -> io::Result<BTreeMap<String, String>> {
+    if queue_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    Ok(find_runtime_queue_terminal_history(queue_dir, queue_ids)?
+        .into_iter()
+        .filter(|record| queue_ids.contains(&record.queue_id))
+        .map(|record| {
+            let reason = record.reason.unwrap_or_else(|| {
+                format!("historical terminal run-once status `{}`", record.status)
+            });
+            (record.queue_id, reason)
+        })
+        .collect())
 }
 
 pub(crate) fn resolve_queue_terminal_control_from_index(
@@ -2728,7 +2987,7 @@ pub(crate) fn record_terminal_control_suppression(
     let queue_dir = harness_home.join("state").join("runtime-queue");
     fs::create_dir_all(&queue_dir)?;
     let mut warnings = Vec::new();
-    let mut index = rebuild_runtime_queue_state_index(&queue_dir, &mut warnings)?;
+    let mut index = refresh_runtime_queue_state_index(&queue_dir, &mut warnings)?;
     let entry = index.queues.entry(queue_id.to_string()).or_default();
     if entry.suppression_recorded {
         return Ok(false);
@@ -2754,6 +3013,8 @@ pub(crate) fn record_terminal_control_suppression(
     });
     append_json_line(&receipts_file, &receipt)?;
     entry.suppression_recorded = true;
+    entry.terminal_run_once_ever = true;
+    entry.latest_status = Some("suppressed".to_string());
     entry.terminal_control_source = Some(control.source.as_str().to_string());
     write_runtime_queue_state_index(&queue_dir, &index)?;
     Ok(true)
@@ -2771,6 +3032,7 @@ fn terminal_control_no_pending_receipt(
     RuntimeExecutionReceipt {
         queue_id: Some(queue_id.to_string()),
         status: RuntimeExecutionReceiptStatus::NoPendingItem,
+        channel_lane: None,
         runtime_class,
         origin,
         cron_run_id,
@@ -2793,22 +3055,43 @@ fn terminal_control_no_pending_receipt(
 }
 
 fn pending_terminal_control_ids(
-    harness_home: &Path,
+    queue_dir: &Path,
     pending_items: &[PendingQueueItem],
+    index: &RuntimeQueueStateIndex,
     warnings: &mut Vec<String>,
 ) -> io::Result<HashSet<String>> {
-    let queue_dir = harness_home.join("state").join("runtime-queue");
-    let index = rebuild_runtime_queue_state_index(&queue_dir, warnings)?;
     let mut ids = HashSet::new();
+    let pending_queue_ids = pending_items
+        .iter()
+        .map(|item| item.queue_id.clone())
+        .collect::<BTreeSet<_>>();
+    let cold_reasons = cold_terminal_history_reasons(queue_dir, &pending_queue_ids)?;
     for item in pending_items {
-        match resolve_queue_terminal_control_from_index(
-            &queue_dir,
+        let control = resolve_queue_terminal_control_from_index(
+            queue_dir,
             &item.queue_id,
             Some(&item.session_key),
             index.queues.get(&item.queue_id),
-        )? {
-            QueueTerminalControl::Runnable => {}
+        )?;
+        let control = match control {
+            QueueTerminalControl::Runnable => cold_reasons.get(&item.queue_id).map(|reason| {
+                QueueTerminalControl::Terminal(QueueTerminalControlMatch {
+                    source: TerminalControlSource::RunOnceTerminal,
+                    reason: reason.clone(),
+                    suppression_recorded: index
+                        .queues
+                        .get(&item.queue_id)
+                        .is_some_and(|entry| entry.suppression_recorded),
+                })
+            }),
             QueueTerminalControl::Terminal(control) => {
+                Some(QueueTerminalControl::Terminal(control))
+            }
+        };
+        match control {
+            None => {}
+            Some(QueueTerminalControl::Runnable) => {}
+            Some(QueueTerminalControl::Terminal(control)) => {
                 warnings.push(format!(
                     "runtime queue item `{}` has terminal control {}; excluding from selection",
                     item.queue_id,
@@ -2821,66 +3104,1389 @@ fn pending_terminal_control_ids(
     Ok(ids)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeQueueStateIndexRefreshMode {
+    Blocking,
+    NonBlocking,
+}
+
 pub(crate) fn rebuild_runtime_queue_state_index(
+    queue_dir: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<RuntimeQueueStateIndex> {
+    let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+    with_jsonl_append_lock(&receipts_file, || {
+        // Recovery must be rechecked after ownership is acquired. A failed
+        // compactor can publish its marker while this caller is waiting for the
+        // append lock; rebuilding a ledger before that recovery would accept an
+        // incomplete replacement as authoritative state.
+        recover_runtime_queue_ledger_compaction_if_needed_locked(&receipts_file, warnings)?;
+        rebuild_runtime_queue_state_index_locked(queue_dir, warnings)
+    })
+}
+
+fn rebuild_runtime_queue_state_index_for_refresh(
+    mode: RuntimeQueueStateIndexRefreshMode,
+    queue_dir: &Path,
+    cached_index: Option<RuntimeQueueStateIndex>,
+    warnings: &mut Vec<String>,
+) -> io::Result<RuntimeQueueStateIndex> {
+    match mode {
+        RuntimeQueueStateIndexRefreshMode::Blocking => {
+            rebuild_runtime_queue_state_index(queue_dir, warnings)
+        }
+        RuntimeQueueStateIndexRefreshMode::NonBlocking => {
+            let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+            match try_with_jsonl_append_lock(&receipts_file, || {
+                recover_runtime_queue_ledger_compaction_if_needed_locked(
+                    &receipts_file,
+                    warnings,
+                )?;
+                rebuild_runtime_queue_state_index_locked(queue_dir, warnings)
+            })? {
+                Some(index) => Ok(index),
+                None => cached_index.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!(
+                            "runtime queue-state refresh is waiting for live receipt compaction at {}",
+                            receipts_file.display()
+                        ),
+                    )
+                }),
+            }
+        }
+    }
+}
+
+/// Rebuilds the receipt index while the caller owns the receipt-ledger append
+/// lock. This deliberately skips marker recovery so compaction never tries to
+/// reacquire its own non-reentrant lock.
+fn rebuild_runtime_queue_state_index_locked(
     queue_dir: &Path,
     warnings: &mut Vec<String>,
 ) -> io::Result<RuntimeQueueStateIndex> {
     let mut index = RuntimeQueueStateIndex {
         schema: runtime_queue_state_index_schema(),
+        revision: RUNTIME_QUEUE_STATE_INDEX_REVISION,
+        receipt_ledger: RuntimeQueueReceiptLedgerCursor::default(),
         queues: BTreeMap::new(),
     };
     let receipts_file = queue_dir.join("run-once-receipts.jsonl");
     if receipts_file.is_file() {
-        let text = fs::read_to_string(&receipts_file)?;
-        for (line_index, line) in text.lines().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let value: Value = match serde_json::from_str(trimmed) {
-                Ok(value) => value,
-                Err(error) => {
-                    warnings.push(format!(
-                        "runtime run-once receipt line {} is not valid JSON while rebuilding queue-state index: {}",
-                        line_index + 1,
-                        error
-                    ));
-                    continue;
-                }
-            };
-            let Some(queue_id) = string_field(&value, &["queueId", "queue_id"]) else {
-                continue;
-            };
-            let Some(status) = string_field(&value, &["status"]) else {
-                continue;
-            };
-            let entry = index.queues.entry(queue_id.to_string()).or_default();
-            if status == "suppressed" {
-                entry.suppression_recorded = true;
-                if let Some(source) = string_field(&value, &["terminalControlSource"]) {
-                    entry.terminal_control_source = Some(source.to_string());
-                }
-                continue;
-            }
-            if is_terminal_run_once_status(status) {
-                entry.terminal_ever = true;
-                entry.terminal_status = Some(status.to_string());
-                entry.terminal_reason = string_field(&value, &["reason"]).map(ToString::to_string);
-                entry.terminal_control_source.get_or_insert_with(|| {
-                    TerminalControlSource::RunOnceTerminal.as_str().to_string()
-                });
-            }
-        }
+        index.receipt_ledger = read_runtime_queue_receipts_from_cursor(
+            &receipts_file,
+            &mut index,
+            RuntimeQueueReceiptLedgerCursor::default(),
+            warnings,
+            "rebuilding",
+        )?;
     }
     write_runtime_queue_state_index(queue_dir, &index)?;
     Ok(index)
+}
+
+/// Refreshes the terminal-control index without replaying a stable historical
+/// run-once ledger. The index remains compatible with old state files: a
+/// missing cursor is treated as stale and rebuilt once from the ledger.
+pub(crate) fn refresh_runtime_queue_state_index(
+    queue_dir: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<RuntimeQueueStateIndex> {
+    refresh_runtime_queue_state_index_with_mode(
+        queue_dir,
+        warnings,
+        RuntimeQueueStateIndexRefreshMode::Blocking,
+    )
+}
+
+/// Progress delivery is allowed to use the last materialized terminal-control
+/// index during a live compaction window. It still tails normal appends, but it
+/// never waits behind a ledger replacement just to plan a user-visible update.
+pub(crate) fn refresh_runtime_queue_state_index_nonblocking(
+    queue_dir: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<RuntimeQueueStateIndex> {
+    refresh_runtime_queue_state_index_with_mode(
+        queue_dir,
+        warnings,
+        RuntimeQueueStateIndexRefreshMode::NonBlocking,
+    )
+}
+
+fn refresh_runtime_queue_state_index_with_mode(
+    queue_dir: &Path,
+    warnings: &mut Vec<String>,
+    mode: RuntimeQueueStateIndexRefreshMode,
+) -> io::Result<RuntimeQueueStateIndex> {
+    let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+    if mode == RuntimeQueueStateIndexRefreshMode::Blocking {
+        recover_runtime_queue_ledger_compaction_if_needed(&receipts_file, warnings)?;
+    }
+    let mut index = match read_runtime_queue_state_index(queue_dir) {
+        Ok(Some(index))
+            if index.schema == runtime_queue_state_index_schema()
+                && index.revision == RUNTIME_QUEUE_STATE_INDEX_REVISION =>
+        {
+            index
+        }
+        Ok(Some(index)) => {
+            warnings.push(format!(
+                "runtime queue-state index has unsupported schema/revision `{}`/{}, rebuilding",
+                index.schema, index.revision
+            ));
+            return rebuild_runtime_queue_state_index_for_refresh(mode, queue_dir, None, warnings);
+        }
+        Ok(None) => {
+            return rebuild_runtime_queue_state_index_for_refresh(mode, queue_dir, None, warnings);
+        }
+        Err(error) => {
+            warnings.push(format!(
+                "runtime queue-state index could not be read; rebuilding: {error}"
+            ));
+            return rebuild_runtime_queue_state_index_for_refresh(mode, queue_dir, None, warnings);
+        }
+    };
+
+    // A compactor writes this marker before replacing the ledger. Returning the
+    // previously materialized index for this short maintenance window keeps the
+    // progress path non-blocking and prevents a reader from observing the
+    // Windows remove/rename gap.
+    if runtime_queue_ledger_compaction_marker_file(&receipts_file).is_file() {
+        return refresh_runtime_queue_state_index_after_marker(
+            mode,
+            queue_dir,
+            &receipts_file,
+            Some(index),
+            warnings,
+        );
+    }
+
+    let metadata = match fs::metadata(&receipts_file) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => {
+            warnings.push(format!(
+                "runtime run-once receipt path is not a file; rebuilding queue-state index: {}",
+                receipts_file.display()
+            ));
+            return rebuild_runtime_queue_state_index_for_refresh(
+                mode,
+                queue_dir,
+                Some(index),
+                warnings,
+            );
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if runtime_queue_ledger_compaction_marker_file(&receipts_file).is_file() {
+                return refresh_runtime_queue_state_index_after_marker(
+                    mode,
+                    queue_dir,
+                    &receipts_file,
+                    Some(index),
+                    warnings,
+                );
+            }
+            if index.receipt_ledger.offset_bytes > 0
+                || index.receipt_ledger.line_number > 0
+                || index.receipt_ledger.source_modified_at_unix_nanos.is_some()
+                || !index.queues.is_empty()
+            {
+                warnings.push(
+                    "runtime run-once receipt ledger disappeared; rebuilding queue-state index"
+                        .to_string(),
+                );
+                return rebuild_runtime_queue_state_index_for_refresh(
+                    mode,
+                    queue_dir,
+                    Some(index),
+                    warnings,
+                );
+            }
+            return Ok(index);
+        }
+        Err(error) => return Err(error),
+    };
+    let source_modified_at_unix_nanos = file_modified_at_unix_nanos(&metadata);
+    if index.receipt_ledger.source_modified_at_unix_nanos.is_none()
+        || (index.receipt_ledger.offset_bytes > 0
+            && index.receipt_ledger.prefix_tail_fingerprint.is_none())
+    {
+        warnings
+            .push("runtime queue-state index has no receipt ledger cursor; rebuilding".to_string());
+        return rebuild_runtime_queue_state_index_for_refresh(
+            mode,
+            queue_dir,
+            Some(index),
+            warnings,
+        );
+    }
+    if metadata.len() < index.receipt_ledger.offset_bytes {
+        warnings.push(
+            "runtime run-once receipt ledger was truncated; rebuilding queue-state index"
+                .to_string(),
+        );
+        return rebuild_runtime_queue_state_index_for_refresh(
+            mode,
+            queue_dir,
+            Some(index),
+            warnings,
+        );
+    }
+    if metadata.len() == index.receipt_ledger.offset_bytes {
+        if source_modified_at_unix_nanos == index.receipt_ledger.source_modified_at_unix_nanos
+            && runtime_queue_receipt_prefix_tail_matches(&receipts_file, &index.receipt_ledger)?
+        {
+            return Ok(index);
+        }
+        warnings.push(
+            "runtime run-once receipt ledger changed without an append; rebuilding queue-state index"
+                .to_string(),
+        );
+        return rebuild_runtime_queue_state_index_for_refresh(
+            mode,
+            queue_dir,
+            Some(index),
+            warnings,
+        );
+    }
+    let prefix_tail_matches =
+        match runtime_queue_receipt_prefix_tail_matches(&receipts_file, &index.receipt_ledger) {
+            Ok(matches) => matches,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    && runtime_queue_ledger_compaction_marker_file(&receipts_file).is_file() =>
+            {
+                return refresh_runtime_queue_state_index_after_marker(
+                    mode,
+                    queue_dir,
+                    &receipts_file,
+                    Some(index),
+                    warnings,
+                );
+            }
+            Err(error) => return Err(error),
+        };
+    if !prefix_tail_matches {
+        warnings.push(
+            "runtime run-once receipt ledger prefix no longer matches the index cursor; rebuilding queue-state index"
+                .to_string(),
+        );
+        return rebuild_runtime_queue_state_index_for_refresh(
+            mode,
+            queue_dir,
+            Some(index),
+            warnings,
+        );
+    }
+
+    let previous_cursor = index.receipt_ledger.clone();
+    let refreshed_cursor = match read_runtime_queue_receipts_from_cursor(
+        &receipts_file,
+        &mut index,
+        previous_cursor.clone(),
+        warnings,
+        "refreshing",
+    ) {
+        Ok(cursor) => cursor,
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                && runtime_queue_ledger_compaction_marker_file(&receipts_file).is_file() =>
+        {
+            return refresh_runtime_queue_state_index_after_marker(
+                mode,
+                queue_dir,
+                &receipts_file,
+                Some(index),
+                warnings,
+            );
+        }
+        Err(error) => return Err(error),
+    };
+    if refreshed_cursor != previous_cursor {
+        index.receipt_ledger = refreshed_cursor;
+        write_runtime_queue_state_index(queue_dir, &index)?;
+    }
+    Ok(index)
+}
+
+fn refresh_runtime_queue_state_index_after_marker(
+    mode: RuntimeQueueStateIndexRefreshMode,
+    queue_dir: &Path,
+    receipts_file: &Path,
+    cached_index: Option<RuntimeQueueStateIndex>,
+    warnings: &mut Vec<String>,
+) -> io::Result<RuntimeQueueStateIndex> {
+    match mode {
+        RuntimeQueueStateIndexRefreshMode::Blocking => {
+            recover_runtime_queue_ledger_compaction_if_needed(receipts_file, warnings)?;
+            refresh_runtime_queue_state_index_with_mode(queue_dir, warnings, mode)
+        }
+        RuntimeQueueStateIndexRefreshMode::NonBlocking => {
+            match try_recover_runtime_queue_ledger_compaction_if_needed(receipts_file, warnings)? {
+                RuntimeQueueLedgerCompactionRecovery::Busy => cached_index.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!(
+                            "runtime queue-state refresh has no cached index while compaction owns {}",
+                            receipts_file.display()
+                        ),
+                    )
+                }),
+                RuntimeQueueLedgerCompactionRecovery::NoMarker
+                | RuntimeQueueLedgerCompactionRecovery::Recovered => {
+                    refresh_runtime_queue_state_index_with_mode(queue_dir, warnings, mode)
+                }
+            }
+        }
+    }
+}
+
+fn read_runtime_queue_state_index(queue_dir: &Path) -> io::Result<Option<RuntimeQueueStateIndex>> {
+    let path = runtime_queue_state_index_file(queue_dir);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
+fn read_runtime_queue_receipts_from_cursor(
+    receipts_file: &Path,
+    index: &mut RuntimeQueueStateIndex,
+    cursor: RuntimeQueueReceiptLedgerCursor,
+    warnings: &mut Vec<String>,
+    phase: &str,
+) -> io::Result<RuntimeQueueReceiptLedgerCursor> {
+    let file = File::open(receipts_file)?;
+    let file_len = file.metadata()?.len();
+    let start_offset = cursor.offset_bytes.min(file_len);
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(start_offset))?;
+    let mut offset_bytes = start_offset;
+    let mut line_number = if cursor.offset_bytes > file_len {
+        0
+    } else {
+        cursor.line_number
+    };
+    loop {
+        let mut line = String::new();
+        let bytes_read = reader.read_line(&mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+        let complete_line = line.ends_with('\n');
+        let trimmed = line.trim();
+        if !complete_line && !trimmed.is_empty() && serde_json::from_str::<Value>(trimmed).is_err()
+        {
+            // A writer may have appended only part of a JSONL record. Keep the
+            // cursor before that tail so the next wake can parse the completed
+            // record instead of permanently skipping it as corruption.
+            break;
+        }
+        line_number = line_number.saturating_add(1);
+        offset_bytes = offset_bytes.saturating_add(bytes_read as u64);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(error) => {
+                warnings.push(format!(
+                    "runtime run-once receipt line {line_number} is not valid JSON while {phase} queue-state index: {error}"
+                ));
+                continue;
+            }
+        };
+        apply_runtime_queue_receipt_to_index(index, &value);
+    }
+    let metadata = reader.get_ref().metadata()?;
+    Ok(RuntimeQueueReceiptLedgerCursor {
+        offset_bytes,
+        line_number,
+        source_modified_at_unix_nanos: file_modified_at_unix_nanos(&metadata),
+        prefix_tail_fingerprint: runtime_queue_receipt_prefix_tail_fingerprint(
+            receipts_file,
+            offset_bytes,
+        )?,
+    })
+}
+
+fn apply_runtime_queue_receipt_to_index(index: &mut RuntimeQueueStateIndex, value: &Value) {
+    if !is_trusted_runtime_run_once_receipt(value) {
+        return;
+    }
+    let Some(queue_id) = string_field(value, &["queueId", "queue_id"]) else {
+        return;
+    };
+    let Some(status) = string_field(value, &["status"]) else {
+        return;
+    };
+    let entry = index.queues.entry(queue_id.to_string()).or_default();
+    entry.latest_status = Some(status.to_string());
+    entry.latest_reason = string_field(value, &["reason"]).map(ToString::to_string);
+    entry.latest_occurred_at_ms = i64_field(
+        value,
+        &[
+            "completedAtMs",
+            "completed_at_ms",
+            "occurredAtMs",
+            "occurred_at_ms",
+            "finishedAtMs",
+            "finished_at_ms",
+            "atMs",
+            "at_ms",
+        ],
+    );
+    entry.latest_runtime_class =
+        string_field(value, &["runtimeClass", "runtime_class"]).map(ToString::to_string);
+    entry.latest_origin = string_field(value, &["origin"]).map(ToString::to_string);
+    entry.latest_transcript_file = path_field(
+        value,
+        &[
+            "transcriptFile",
+            "transcript_file",
+            "plannedTranscriptFile",
+            "planned_transcript_file",
+        ],
+    );
+    let status_count = entry
+        .run_once_status_counts
+        .entry(status.to_string())
+        .or_default();
+    *status_count = status_count.saturating_add(1);
+    if is_terminal_run_once_status(status) {
+        entry.terminal_run_once_ever = true;
+    }
+    if status == "suppressed" {
+        entry.suppression_recorded = true;
+        if let Some(source) = string_field(value, &["terminalControlSource"]) {
+            entry.terminal_control_source = Some(source.to_string());
+        }
+        return;
+    }
+    if is_terminal_run_once_status(status) {
+        entry.terminal_ever = true;
+        entry.terminal_status = Some(status.to_string());
+        entry.terminal_reason = string_field(value, &["reason"]).map(ToString::to_string);
+        entry.terminal_runtime_class =
+            string_field(value, &["runtimeClass", "runtime_class"]).map(ToString::to_string);
+        entry.terminal_origin = string_field(value, &["origin"]).map(ToString::to_string);
+        entry.terminal_transcript_file = path_field(
+            value,
+            &[
+                "transcriptFile",
+                "transcript_file",
+                "plannedTranscriptFile",
+                "planned_transcript_file",
+            ],
+        );
+        entry.terminal_occurred_at_ms = i64_field(
+            value,
+            &[
+                "completedAtMs",
+                "completed_at_ms",
+                "occurredAtMs",
+                "occurred_at_ms",
+                "finishedAtMs",
+                "finished_at_ms",
+                "atMs",
+                "at_ms",
+            ],
+        );
+        entry
+            .terminal_control_source
+            .get_or_insert_with(|| TerminalControlSource::RunOnceTerminal.as_str().to_string());
+    }
+}
+
+fn file_modified_at_unix_nanos(metadata: &fs::Metadata) -> Option<u128> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+}
+
+fn runtime_queue_receipt_prefix_tail_matches(
+    receipts_file: &Path,
+    cursor: &RuntimeQueueReceiptLedgerCursor,
+) -> io::Result<bool> {
+    Ok(
+        runtime_queue_receipt_prefix_tail_fingerprint(receipts_file, cursor.offset_bytes)?
+            == cursor.prefix_tail_fingerprint,
+    )
+}
+
+fn runtime_queue_receipt_prefix_tail_fingerprint(
+    receipts_file: &Path,
+    offset_bytes: u64,
+) -> io::Result<Option<u64>> {
+    const FINGERPRINT_BYTES: u64 = 4 * 1024;
+    if offset_bytes == 0 {
+        return Ok(None);
+    }
+    let mut file = File::open(receipts_file)?;
+    let start = offset_bytes.saturating_sub(FINGERPRINT_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut remaining = offset_bytes.saturating_sub(start);
+    let mut buffer = [0_u8; FINGERPRINT_BYTES as usize];
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    while remaining > 0 {
+        let chunk_len = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..chunk_len])?;
+        for byte in &buffer[..chunk_len] {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        remaining = remaining.saturating_sub(chunk_len as u64);
+    }
+    Ok(Some(hash))
 }
 
 fn write_runtime_queue_state_index(
     queue_dir: &Path,
     index: &RuntimeQueueStateIndex,
 ) -> io::Result<()> {
-    write_json_atomic(&queue_dir.join("queue-state-index.json"), index)
+    write_json_atomic(&runtime_queue_state_index_file(queue_dir), index)
+}
+
+pub(crate) fn runtime_queue_state_index_file(queue_dir: &Path) -> PathBuf {
+    queue_dir.join("queue-state-index.json")
+}
+
+fn runtime_queue_receipt_compaction_lock_file(queue_dir: &Path) -> PathBuf {
+    queue_dir.join("runtime-queue-receipt-compaction.transaction")
+}
+
+/// Compacts runtime queue state only after a completed turn, never on the
+/// progress-delivery hot path. The active ledgers retain the queue states that
+/// can still affect runnable work; bounded archives retain recent diagnostics.
+pub fn compact_runtime_queue_receipts_if_needed(
+    options: RuntimeQueueReceiptCompactionOptions,
+) -> io::Result<RuntimeQueueReceiptCompactionReport> {
+    let queue_dir = options.harness_home.join("state").join("runtime-queue");
+    fs::create_dir_all(&queue_dir)?;
+    let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+    let pending_file = queue_dir.join("pending.jsonl");
+    let max_bytes = options.max_bytes.max(1);
+    let mut report = RuntimeQueueReceiptCompactionReport {
+        schema: RUNTIME_QUEUE_RECEIPT_COMPACTION_SCHEMA,
+        harness_home: options.harness_home.clone(),
+        receipts_file: receipts_file.clone(),
+        pending_file: pending_file.clone(),
+        status: RuntimeQueueReceiptCompactionStatus::Missing,
+        original_bytes: 0,
+        compacted_bytes: 0,
+        archive_file: None,
+        removed_archives: Vec::new(),
+        removed_pending_items: 0,
+        warnings: Vec::new(),
+    };
+
+    let transaction_lock = runtime_queue_receipt_compaction_lock_file(&queue_dir);
+    let acquired = try_with_jsonl_append_lock(&transaction_lock, || {
+        // The receipt and pending append locks form the cross-ledger snapshot
+        // boundary. Recovery is deliberately repeated only after both locks
+        // are owned so no writer can race a recovered file into the snapshot.
+        with_jsonl_append_lock(&receipts_file, || {
+            with_jsonl_append_lock(&pending_file, || {
+                recover_runtime_queue_ledger_compaction_if_needed_locked(
+                    &receipts_file,
+                    &mut report.warnings,
+                )?;
+                recover_runtime_queue_ledger_compaction_if_needed_locked(
+                    &pending_file,
+                    &mut report.warnings,
+                )?;
+                // Both ledger markers are resolved while their append locks
+                // are held, so any remaining staged batch is orphaned from a
+                // pre-marker crash and can no longer be made visible.
+                let removed_staged_history =
+                    cleanup_staged_runtime_queue_receipt_history(&queue_dir)?;
+                if removed_staged_history > 0 {
+                    report.warnings.push(format!(
+                        "discarded {removed_staged_history} orphaned runtime receipt history staging transaction(s)"
+                    ));
+                }
+
+                let metadata = match fs::metadata(&receipts_file) {
+                    Ok(metadata) if metadata.is_file() => metadata,
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "runtime run-once receipt path is not a file: {}",
+                                receipts_file.display()
+                            ),
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => return Err(error),
+                };
+                report.original_bytes = metadata.len();
+                if metadata.len() <= max_bytes {
+                    report.status = RuntimeQueueReceiptCompactionStatus::Unchanged;
+                    report.compacted_bytes = metadata.len();
+                    return Ok(());
+                }
+
+                let index =
+                    rebuild_runtime_queue_state_index_locked(&queue_dir, &mut report.warnings)?;
+                let mut removed_archives = Vec::new();
+                let (pending_snapshot, retained_queue_ids, removed_pending_items) =
+                    runtime_queue_pending_snapshot(&pending_file, &index, &mut report.warnings)?;
+                if let Some(outcome) = replace_runtime_queue_ledger_with_snapshot_locked(
+                    &pending_file,
+                    &queue_dir.join("pending-archive"),
+                    &pending_snapshot,
+                    options.max_archives.max(1),
+                    options.now_ms,
+                    None,
+                )? {
+                    removed_archives.extend(outcome.removed_archives);
+                }
+
+                let receipt_original = fs::read(&receipts_file)?;
+                let receipt_snapshot = runtime_queue_receipt_snapshot(
+                    &receipts_file,
+                    &retained_queue_ids,
+                    &mut report.warnings,
+                )?;
+                let receipt_history = if receipt_original == receipt_snapshot {
+                    None
+                } else {
+                    Some(stage_runtime_queue_receipt_history(
+                        &queue_dir,
+                        &runtime_queue_receipt_history_transaction_id(
+                            &receipt_original,
+                            options.now_ms,
+                        ),
+                        &receipt_original,
+                        &receipt_snapshot,
+                        &retained_queue_ids,
+                        options.now_ms,
+                    )?)
+                };
+                let receipt_marker = runtime_queue_ledger_compaction_marker_file(&receipts_file);
+                let receipt_outcome = replace_runtime_queue_ledger_with_snapshot_locked(
+                    &receipts_file,
+                    &queue_dir.join("run-once-receipts-archive"),
+                    &receipt_snapshot,
+                    options.max_archives.max(1),
+                    options.now_ms,
+                    receipt_history.as_ref(),
+                );
+                let outcome = match receipt_outcome {
+                    Ok(Some(outcome)) => outcome,
+                    Ok(None) => {
+                        if let Some(staging) = receipt_history.as_ref() {
+                            discard_runtime_queue_receipt_history(staging)?;
+                        }
+                        report.status = RuntimeQueueReceiptCompactionStatus::Unchanged;
+                        report.compacted_bytes = metadata.len();
+                        report.removed_archives = removed_archives;
+                        report.removed_pending_items = removed_pending_items;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        // A published marker owns recovery. Without one, the
+                        // hot-ledger swap never became durable and the staged
+                        // cold rows are safe to remove immediately.
+                        if !receipt_marker.is_file()
+                            && let Some(staging) = receipt_history.as_ref()
+                        {
+                            discard_runtime_queue_receipt_history(staging)?;
+                        }
+                        return Err(error);
+                    }
+                };
+
+                // Rebuild only from the new compact snapshot while both append
+                // locks remain held. This makes the materialized index and both
+                // active ledgers one recoverable maintenance transaction.
+                let _ = rebuild_runtime_queue_state_index_locked(&queue_dir, &mut report.warnings)?;
+                report.status = RuntimeQueueReceiptCompactionStatus::Compacted;
+                report.compacted_bytes = outcome.compacted_bytes;
+                report.archive_file = Some(outcome.archive_file);
+                removed_archives.extend(outcome.removed_archives);
+                report.removed_archives = removed_archives;
+                report.removed_pending_items = removed_pending_items;
+                Ok(())
+            })
+        })
+    })?;
+    if acquired.is_none() {
+        report.status = RuntimeQueueReceiptCompactionStatus::Busy;
+    }
+
+    Ok(report)
+}
+
+pub(crate) fn default_runtime_queue_receipt_compaction_options(
+    harness_home: PathBuf,
+    now_ms: i64,
+) -> RuntimeQueueReceiptCompactionOptions {
+    RuntimeQueueReceiptCompactionOptions::with_defaults(harness_home, now_ms)
+}
+
+/// Performs bounded receipt maintenance after a terminal turn.  A manual
+/// compact command intentionally bypasses this cadence; the automatic path
+/// avoids repeatedly reparsing a large all-active queue that cannot yet shrink.
+pub(crate) fn maybe_compact_runtime_queue_receipts_after_terminal(
+    harness_home: PathBuf,
+    now_ms: i64,
+) -> io::Result<Option<RuntimeQueueReceiptCompactionReport>> {
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+    let metadata = match fs::metadata(&receipts_file) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "runtime run-once receipt path is not a file: {}",
+                    receipts_file.display()
+                ),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.len() <= RUNTIME_QUEUE_RECEIPT_COMPACTION_DEFAULT_MAX_BYTES {
+        return Ok(None);
+    }
+
+    let state_file = runtime_queue_receipt_compaction_state_file(&queue_dir);
+    let previous_state = read_runtime_queue_receipt_compaction_state(&state_file)?;
+    if runtime_queue_receipt_compaction_retry_is_deferred(
+        now_ms,
+        metadata.len(),
+        previous_state.as_ref(),
+    ) {
+        return Ok(None);
+    }
+
+    let report = compact_runtime_queue_receipts_if_needed(
+        default_runtime_queue_receipt_compaction_options(harness_home, now_ms),
+    )?;
+    if report.status == RuntimeQueueReceiptCompactionStatus::Busy {
+        return Ok(Some(report));
+    }
+    let observed_bytes = fs::metadata(&receipts_file)
+        .map(|metadata| metadata.len())
+        .unwrap_or(report.compacted_bytes);
+    write_json_atomic(
+        &state_file,
+        &RuntimeQueueReceiptCompactionState {
+            schema: RUNTIME_QUEUE_RECEIPT_COMPACTION_STATE_SCHEMA.to_string(),
+            last_attempt_at_ms: now_ms,
+            last_attempt_bytes: observed_bytes,
+        },
+    )?;
+    Ok(Some(report))
+}
+
+fn runtime_queue_receipt_compaction_state_file(queue_dir: &Path) -> PathBuf {
+    queue_dir.join("run-once-receipt-compaction-state.json")
+}
+
+fn read_runtime_queue_receipt_compaction_state(
+    state_file: &Path,
+) -> io::Result<Option<RuntimeQueueReceiptCompactionState>> {
+    let bytes = match fs::read(state_file) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let state: RuntimeQueueReceiptCompactionState =
+        serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if state.schema != RUNTIME_QUEUE_RECEIPT_COMPACTION_STATE_SCHEMA {
+        return Ok(None);
+    }
+    Ok(Some(state))
+}
+
+fn runtime_queue_receipt_compaction_retry_is_deferred(
+    now_ms: i64,
+    observed_bytes: u64,
+    previous_state: Option<&RuntimeQueueReceiptCompactionState>,
+) -> bool {
+    let Some(state) = previous_state else {
+        return false;
+    };
+    if now_ms <= 0 {
+        return false;
+    }
+    let retry_at_ms = state
+        .last_attempt_at_ms
+        .saturating_add(RUNTIME_QUEUE_RECEIPT_COMPACTION_RETRY_INTERVAL_MS);
+    let grew_enough = observed_bytes.saturating_sub(state.last_attempt_bytes)
+        >= RUNTIME_QUEUE_RECEIPT_COMPACTION_RETRY_GROWTH_BYTES;
+    now_ms < retry_at_ms && !grew_enough
+}
+
+#[derive(Debug)]
+struct RuntimeQueueLedgerCompactionOutcome {
+    archive_file: PathBuf,
+    compacted_bytes: u64,
+    removed_archives: Vec<PathBuf>,
+}
+
+fn runtime_queue_pending_snapshot(
+    pending_file: &Path,
+    index: &RuntimeQueueStateIndex,
+    warnings: &mut Vec<String>,
+) -> io::Result<(Vec<u8>, HashSet<String>, usize)> {
+    let text = match fs::read_to_string(pending_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), HashSet::new(), 0));
+        }
+        Err(error) => return Err(error),
+    };
+    let mut snapshot = Vec::new();
+    let mut retained_queue_ids = HashSet::new();
+    let mut removed_terminal_items = 0usize;
+    for (line_index, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(error) => {
+                warnings.push(format!(
+                    "runtime pending queue line {} is not valid JSON during compaction; retaining it: {}",
+                    line_index + 1,
+                    error
+                ));
+                snapshot.extend_from_slice(trimmed.as_bytes());
+                snapshot.push(b'\n');
+                continue;
+            }
+        };
+        let Some(queue_id) = string_field(&value, &["queueId", "queue_id"]) else {
+            warnings.push(format!(
+                "runtime pending queue line {} has no queue id during compaction; retaining it",
+                line_index + 1
+            ));
+            snapshot.extend_from_slice(trimmed.as_bytes());
+            snapshot.push(b'\n');
+            continue;
+        };
+        if string_field(&value, &["status"]) != Some("queued") {
+            continue;
+        }
+        if index
+            .queues
+            .get(queue_id)
+            .is_some_and(|entry| entry.terminal_run_once_ever)
+        {
+            removed_terminal_items = removed_terminal_items.saturating_add(1);
+            continue;
+        }
+        retained_queue_ids.insert(queue_id.to_string());
+        snapshot.extend(serde_json::to_vec(&value).map_err(io::Error::other)?);
+        snapshot.push(b'\n');
+    }
+    Ok((snapshot, retained_queue_ids, removed_terminal_items))
+}
+
+fn runtime_queue_receipt_snapshot(
+    receipts_file: &Path,
+    retained_queue_ids: &HashSet<String>,
+    warnings: &mut Vec<String>,
+) -> io::Result<Vec<u8>> {
+    let text = fs::read_to_string(receipts_file)?;
+    let mut snapshot = Vec::new();
+    for (line_index, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => value,
+            Err(error) => {
+                // A malformed record has no safe queue identity. Preserve it
+                // verbatim rather than silently deleting operator evidence.
+                warnings.push(format!(
+                    "runtime run-once receipt line {} is not valid JSON during compaction; retaining it: {}",
+                    line_index + 1,
+                    error
+                ));
+                snapshot.extend_from_slice(trimmed.as_bytes());
+                snapshot.push(b'\n');
+                continue;
+            }
+        };
+        match string_field(&value, &["queueId", "queue_id"]) {
+            Some(queue_id) if retained_queue_ids.contains(queue_id) => {
+                // Retain the complete ordered history for runnable/retryable
+                // work. Retry accounting consumes prior failure records, so a
+                // latest-status-only snapshot would change execution behavior.
+                snapshot.extend(serde_json::to_vec(&value).map_err(io::Error::other)?);
+                snapshot.push(b'\n');
+            }
+            Some(_) => {}
+            None => {
+                // Keep unscoped records until an operator can classify them;
+                // they may carry an implementation-specific control fact.
+                warnings.push(format!(
+                    "runtime run-once receipt line {} has no queue id during compaction; retaining it",
+                    line_index + 1
+                ));
+                snapshot.extend(serde_json::to_vec(&value).map_err(io::Error::other)?);
+                snapshot.push(b'\n');
+            }
+        }
+    }
+    Ok(snapshot)
+}
+
+fn replace_runtime_queue_ledger_with_snapshot_locked(
+    ledger_file: &Path,
+    archive_dir: &Path,
+    snapshot: &[u8],
+    max_archives: usize,
+    now_ms: i64,
+    history_staging: Option<&RuntimeQueueReceiptHistoryStaging>,
+) -> io::Result<Option<RuntimeQueueLedgerCompactionOutcome>> {
+    let original = match fs::read(ledger_file) {
+        Ok(original) => original,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if original == snapshot {
+        return Ok(None);
+    }
+    fs::create_dir_all(archive_dir)?;
+    let archive_file = next_runtime_queue_ledger_archive_file(archive_dir, ledger_file, now_ms);
+    let archive_temp = runtime_queue_ledger_temp_file(&archive_file, now_ms, "archive");
+    write_runtime_queue_ledger_file(&archive_temp, &original)?;
+    fs::rename(&archive_temp, &archive_file)?;
+
+    let compact_temp = runtime_queue_ledger_temp_file(ledger_file, now_ms, "compact");
+    write_runtime_queue_ledger_file(&compact_temp, snapshot)?;
+    let pending = RuntimeQueueLedgerCompactionPending {
+        schema: RUNTIME_QUEUE_RECEIPT_COMPACTION_PENDING_SCHEMA.to_string(),
+        ledger_file: ledger_file.to_path_buf(),
+        archive_file: archive_file.clone(),
+        temp_file: compact_temp.clone(),
+        expected_bytes: snapshot.len() as u64,
+        expected_digest: runtime_queue_ledger_digest(&compact_temp)?,
+        archive_expected_bytes: Some(original.len() as u64),
+        archive_expected_digest: Some(runtime_queue_ledger_digest(&archive_file)?),
+        history_store_file: history_staging.map(|staging| staging.store_file.clone()),
+        history_transaction_id: history_staging.map(|staging| staging.transaction_id.clone()),
+    };
+    let marker_file = runtime_queue_ledger_compaction_marker_file(ledger_file);
+    write_json_atomic(&marker_file, &pending)?;
+    replace_runtime_queue_ledger_file(&compact_temp, ledger_file)?;
+    if !runtime_queue_ledger_matches(ledger_file, pending.expected_bytes, pending.expected_digest)?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "runtime queue ledger replacement did not match its compact snapshot: {}",
+                ledger_file.display()
+            ),
+        ));
+    }
+    if let Some(staging) = history_staging {
+        commit_runtime_queue_receipt_history(staging, now_ms)?;
+    }
+    let removed_archives =
+        prune_runtime_queue_ledger_archives(archive_dir, ledger_file, max_archives.max(1))?;
+    let _ = fs::remove_file(&marker_file);
+    Ok(Some(RuntimeQueueLedgerCompactionOutcome {
+        archive_file,
+        compacted_bytes: snapshot.len() as u64,
+        removed_archives,
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeQueueLedgerCompactionRecovery {
+    NoMarker,
+    Busy,
+    Recovered,
+}
+
+fn recover_runtime_queue_ledger_compaction_if_needed(
+    ledger_file: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    let marker_file = runtime_queue_ledger_compaction_marker_file(ledger_file);
+    if !marker_file.is_file() {
+        return Ok(());
+    }
+    with_jsonl_append_lock(ledger_file, || {
+        recover_runtime_queue_ledger_compaction_if_needed_locked(ledger_file, warnings).map(|_| ())
+    })
+}
+
+fn try_recover_runtime_queue_ledger_compaction_if_needed(
+    ledger_file: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<RuntimeQueueLedgerCompactionRecovery> {
+    if !runtime_queue_ledger_compaction_marker_file(ledger_file).is_file() {
+        return Ok(RuntimeQueueLedgerCompactionRecovery::NoMarker);
+    }
+    match try_with_jsonl_append_lock(ledger_file, || {
+        recover_runtime_queue_ledger_compaction_if_needed_locked(ledger_file, warnings)
+    })? {
+        Some(outcome) => Ok(outcome),
+        None => Ok(RuntimeQueueLedgerCompactionRecovery::Busy),
+    }
+}
+
+fn recover_runtime_queue_ledger_compaction_if_needed_locked(
+    ledger_file: &Path,
+    warnings: &mut Vec<String>,
+) -> io::Result<RuntimeQueueLedgerCompactionRecovery> {
+    let marker_file = runtime_queue_ledger_compaction_marker_file(ledger_file);
+    if !marker_file.is_file() {
+        return Ok(RuntimeQueueLedgerCompactionRecovery::NoMarker);
+    }
+    let pending: RuntimeQueueLedgerCompactionPending =
+        serde_json::from_slice(&fs::read(&marker_file)?).map_err(io::Error::other)?;
+    let is_v3 = pending.schema == RUNTIME_QUEUE_RECEIPT_COMPACTION_PENDING_SCHEMA;
+    let is_v2 = pending.schema == RUNTIME_QUEUE_RECEIPT_COMPACTION_PENDING_SCHEMA_V2;
+    if (!is_v3 && !is_v2) || pending.ledger_file.as_path() != ledger_file {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "runtime queue ledger compaction marker is invalid for {}",
+                ledger_file.display()
+            ),
+        ));
+    }
+    let history_staging = runtime_queue_receipt_history_staging_from_marker(ledger_file, &pending)?;
+    if runtime_queue_ledger_matches(ledger_file, pending.expected_bytes, pending.expected_digest)? {
+        if let Some(staging) = history_staging.as_ref() {
+            commit_runtime_queue_receipt_history(staging, current_log_time_ms()?)?;
+        }
+        let _ = fs::remove_file(&pending.temp_file);
+        let _ = fs::remove_file(&marker_file);
+        warnings.push(format!(
+            "recovered completed runtime queue ledger compaction for {}",
+            ledger_file.display()
+        ));
+        return Ok(RuntimeQueueLedgerCompactionRecovery::Recovered);
+    }
+    if runtime_queue_ledger_matches(
+        &pending.temp_file,
+        pending.expected_bytes,
+        pending.expected_digest,
+    )? {
+        replace_runtime_queue_ledger_file(&pending.temp_file, ledger_file)?;
+        if let Some(staging) = history_staging.as_ref() {
+            commit_runtime_queue_receipt_history(staging, current_log_time_ms()?)?;
+        }
+        let _ = fs::remove_file(&marker_file);
+        warnings.push(format!(
+            "recovered interrupted runtime queue ledger compaction from its snapshot for {}",
+            ledger_file.display()
+        ));
+        return Ok(RuntimeQueueLedgerCompactionRecovery::Recovered);
+    }
+    if pending.archive_file.is_file() {
+        let archive_is_valid = if is_v3 {
+            match (
+                pending.archive_expected_bytes,
+                pending.archive_expected_digest,
+            ) {
+                (Some(expected_bytes), Some(expected_digest)) => runtime_queue_ledger_matches(
+                    &pending.archive_file,
+                    expected_bytes,
+                    expected_digest,
+                )?,
+                _ => false,
+            }
+        } else {
+            runtime_queue_ledger_is_valid_jsonl(&pending.archive_file)?
+        };
+        if !archive_is_valid {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "runtime queue ledger compaction archive failed integrity validation for {}",
+                    ledger_file.display()
+                ),
+            ));
+        }
+        let restore_temp = runtime_queue_ledger_temp_file(ledger_file, 0, "restore");
+        let archived = fs::read(&pending.archive_file)?;
+        write_runtime_queue_ledger_file(&restore_temp, &archived)?;
+        replace_runtime_queue_ledger_file(&restore_temp, ledger_file)?;
+        if let Some(staging) = history_staging.as_ref() {
+            discard_runtime_queue_receipt_history(staging)?;
+        }
+        let _ = fs::remove_file(&pending.temp_file);
+        let _ = fs::remove_file(&marker_file);
+        if is_v2 {
+            warnings.push(format!(
+                "accepted legacy v2 runtime queue compaction marker with structural archive validation for {}",
+                ledger_file.display()
+            ));
+        }
+        warnings.push(format!(
+            "restored runtime queue ledger from archive after interrupted compaction: {}",
+            ledger_file.display()
+        ));
+        return Ok(RuntimeQueueLedgerCompactionRecovery::Recovered);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "runtime queue ledger compaction cannot recover {}; both snapshot and archive are missing",
+            ledger_file.display()
+        ),
+    ))
+}
+
+fn runtime_queue_receipt_history_staging_from_marker(
+    ledger_file: &Path,
+    pending: &RuntimeQueueLedgerCompactionPending,
+) -> io::Result<Option<RuntimeQueueReceiptHistoryStaging>> {
+    match (&pending.history_store_file, &pending.history_transaction_id) {
+        (None, None) => Ok(None),
+        (Some(store_file), Some(transaction_id)) if !transaction_id.trim().is_empty() => {
+            let queue_dir = ledger_file.parent().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "runtime queue ledger has no parent directory for history recovery: {}",
+                        ledger_file.display()
+                    ),
+                )
+            })?;
+            let expected_store = runtime_queue_receipt_history_file(queue_dir);
+            if store_file != &expected_store {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "runtime queue ledger compaction marker points at an unexpected history store for {}",
+                        ledger_file.display()
+                    ),
+                ));
+            }
+            Ok(Some(RuntimeQueueReceiptHistoryStaging {
+                store_file: store_file.clone(),
+                transaction_id: transaction_id.clone(),
+            }))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "runtime queue ledger compaction marker has incomplete history staging metadata for {}",
+                ledger_file.display()
+            ),
+        )),
+    }
+}
+
+fn runtime_queue_ledger_is_valid_jsonl(path: &Path) -> io::Result<bool> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut records = 0usize;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if serde_json::from_str::<Value>(&line).is_err() {
+            return Ok(false);
+        }
+        records = records.saturating_add(1);
+    }
+    Ok(records > 0)
+}
+
+fn runtime_queue_ledger_compaction_marker_file(ledger_file: &Path) -> PathBuf {
+    let file_name = ledger_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("ledger.jsonl");
+    ledger_file.with_file_name(format!(".{file_name}.compaction-pending.json"))
+}
+
+fn runtime_queue_ledger_temp_file(ledger_file: &Path, now_ms: i64, kind: &str) -> PathBuf {
+    let file_name = ledger_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("ledger.jsonl");
+    let mut attempt = 0_u32;
+    loop {
+        let candidate = ledger_file.with_file_name(format!(
+            ".{file_name}.{}.{}.{}.{}.tmp",
+            std::process::id(),
+            now_ms,
+            kind,
+            attempt
+        ));
+        if !candidate.exists() {
+            return candidate;
+        }
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+fn next_runtime_queue_ledger_archive_file(
+    archive_dir: &Path,
+    ledger_file: &Path,
+    now_ms: i64,
+) -> PathBuf {
+    let stem = ledger_file
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("ledger");
+    let mut attempt = 0_u32;
+    loop {
+        let suffix = if attempt == 0 {
+            String::new()
+        } else {
+            format!("-{attempt}")
+        };
+        let candidate = archive_dir.join(format!("{stem}-{now_ms}{suffix}.jsonl"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+fn write_runtime_queue_ledger_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+fn replace_runtime_queue_ledger_file(temp_file: &Path, ledger_file: &Path) -> io::Result<()> {
+    let started = Instant::now();
+    loop {
+        match fs::remove_file(ledger_file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::AlreadyExists
+                ) && started.elapsed() < Duration::from_secs(10) =>
+            {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+        match fs::rename(temp_file, ledger_file) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::AlreadyExists
+                ) && started.elapsed() < Duration::from_secs(10) =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn runtime_queue_ledger_matches(
+    ledger_file: &Path,
+    expected_bytes: u64,
+    expected_digest: u64,
+) -> io::Result<bool> {
+    let metadata = match fs::metadata(ledger_file) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if metadata.len() != expected_bytes {
+        return Ok(false);
+    }
+    Ok(runtime_queue_ledger_digest(ledger_file)? == expected_digest)
+}
+
+/// Full-stream FNV-1a checksum for compaction markers. This is not a security
+/// primitive; it is a durable accidental-corruption detector used only on the
+/// rare recovery path, where reading the complete compact snapshot is safe.
+fn runtime_queue_ledger_digest(path: &Path) -> io::Result<u64> {
+    let mut file = File::open(path)?;
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            return Ok(hash);
+        }
+        for byte in &buffer[..bytes_read] {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+}
+
+fn runtime_queue_receipt_history_transaction_id(original: &[u8], now_ms: i64) -> String {
+    format!(
+        "receipt-{}-{now_ms}-{:016x}",
+        std::process::id(),
+        runtime_queue_bytes_digest(original)
+    )
+}
+
+fn runtime_queue_bytes_digest(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn prune_runtime_queue_ledger_archives(
+    archive_dir: &Path,
+    ledger_file: &Path,
+    max_archives: usize,
+) -> io::Result<Vec<PathBuf>> {
+    let stem = ledger_file
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("ledger");
+    let expected_prefix = format!("{stem}-");
+    let mut archives = fs::read_dir(archive_dir)?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            if !entry.file_type().ok()?.is_file()
+                || !name.starts_with(&expected_prefix)
+                || !name.ends_with(".jsonl")
+            {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok());
+            Some((path, modified))
+        })
+        .collect::<Vec<_>>();
+    archives.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0)));
+    let mut removed = Vec::new();
+    for (path, _) in archives.into_iter().skip(max_archives.max(1)) {
+        fs::remove_file(&path)?;
+        removed.push(path);
+    }
+    Ok(removed)
 }
 
 fn queue_skip_control_reason(queue_dir: &Path, queue_id: &str) -> io::Result<Option<String>> {
@@ -3208,6 +4814,7 @@ fn lease_acquired_receipt(item: &PendingQueueItem, reason: &str) -> RuntimeExecu
     RuntimeExecutionReceipt {
         queue_id: Some(item.queue_id.clone()),
         status: RuntimeExecutionReceiptStatus::LeaseAcquired,
+        channel_lane: None,
         runtime_class: Some(item.runtime_class.clone()),
         origin: Some(item.origin.clone()),
         cron_run_id: item.cron_run_id.clone(),
@@ -3614,6 +5221,7 @@ fn read_pending_items(
     queue_file: &Path,
     warnings: &mut Vec<String>,
 ) -> io::Result<Vec<PendingQueueItem>> {
+    recover_runtime_queue_ledger_compaction_if_needed(queue_file, warnings)?;
     if !queue_file.is_file() {
         warnings.push(format!(
             "runtime queue file not found at {}",
@@ -3622,33 +5230,25 @@ fn read_pending_items(
         return Ok(Vec::new());
     }
 
-    let text = fs::read_to_string(queue_file)?;
+    let queue_dir = queue_file.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "runtime pending queue file has no parent directory: {}",
+                queue_file.display()
+            ),
+        )
+    })?;
+    let pending_values = read_queued_pending_values_from_index(queue_dir, warnings)?;
     let mut items = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        let line_number = index + 1;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let value: Value = match serde_json::from_str(trimmed) {
-            Ok(value) => value,
-            Err(error) => {
-                warnings.push(format!(
-                    "runtime queue line {line_number} is not valid JSON: {error}"
-                ));
-                continue;
-            }
-        };
+    for value in pending_values {
         let Some(queue_id) = string_field(&value, &["queueId", "queue_id"]) else {
-            warnings.push(format!("runtime queue line {line_number} has no queue id"));
+            // The source-authoritative pending projection excludes rows with
+            // no queue id.  Keep this defensive guard in case an older or
+            // manually repaired sidecar is encountered.
+            warnings.push("runtime pending index row has no queue id; skipping".to_string());
             continue;
         };
-        if string_field(&value, &["status"]) != Some("queued") {
-            warnings.push(format!(
-                "runtime queue item `{queue_id}` is not queued; skipping"
-            ));
-            continue;
-        }
         match parse_pending_item(&value) {
             Ok(item) => items.push(item),
             Err(error) => {
@@ -3693,131 +5293,272 @@ fn read_pending_items(
     Ok(items)
 }
 
-fn read_prepared_receipts(
-    receipts_file: &Path,
-    warnings: &mut Vec<String>,
-) -> io::Result<HashMap<String, RuntimeExecutionReceipt>> {
-    let mut receipts = HashMap::new();
-    if !receipts_file.is_file() {
-        return Ok(receipts);
-    }
+pub(crate) fn terminal_run_once_ids_from_index(index: &RuntimeQueueStateIndex) -> HashSet<String> {
+    index
+        .queues
+        .iter()
+        .filter_map(|(queue_id, entry)| entry.terminal_run_once_ever.then_some(queue_id.clone()))
+        .collect()
+}
 
-    let text = fs::read_to_string(receipts_file)?;
-    for (index, line) in text.lines().enumerate() {
-        let line_number = index + 1;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+/// Resolves terminal state only for the caller's exact current queue IDs.
+///
+/// The hot materialized index is authoritative for live receipts, while the
+/// committed cold history supplies compacted terminal tombstones. This avoids
+/// replaying the append-only JSONL ledger in latency-sensitive callers such as
+/// typing/working-indicator setup.
+pub fn resolve_runtime_queue_terminal_ids(
+    harness_home: &Path,
+    candidate_queue_ids: &BTreeSet<String>,
+) -> io::Result<BTreeSet<String>> {
+    if candidate_queue_ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let hot_index = refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new())?;
+    let mut terminal_ids = candidate_queue_ids
+        .iter()
+        .filter(|queue_id| {
+            hot_index
+                .queues
+                .get(queue_id.as_str())
+                .is_some_and(|entry| entry.terminal_run_once_ever)
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for record in find_runtime_queue_terminal_history(&queue_dir, candidate_queue_ids)? {
+        if candidate_queue_ids.contains(&record.queue_id) {
+            terminal_ids.insert(record.queue_id);
         }
-        let receipt: RuntimeExecutionReceipt = match serde_json::from_str(trimmed) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                warnings.push(format!(
-                    "runtime execution receipt line {line_number} is not valid JSON: {error}"
-                ));
-                continue;
+    }
+    Ok(terminal_ids)
+}
+
+/// Resolves terminal state for exact queue IDs without waiting behind an
+/// active receipt append or compaction.  A committed hot index is preferred;
+/// if that index is momentarily unavailable, an empty terminal set is a
+/// deliberate best-effort fallback for provider-visible activity indicators.
+/// The normal scheduler continues to use the blocking authoritative variant.
+pub fn resolve_runtime_queue_terminal_ids_nonblocking(
+    harness_home: &Path,
+    candidate_queue_ids: &BTreeSet<String>,
+) -> io::Result<BTreeSet<String>> {
+    if candidate_queue_ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let hot_index = match refresh_runtime_queue_state_index_nonblocking(&queue_dir, &mut Vec::new())
+    {
+        Ok(index) => index,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(BTreeSet::new()),
+        Err(error) => return Err(error),
+    };
+    let mut terminal_ids = candidate_queue_ids
+        .iter()
+        .filter(|queue_id| {
+            hot_index
+                .queues
+                .get(queue_id.as_str())
+                .is_some_and(|entry| entry.terminal_run_once_ever)
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    match find_runtime_queue_terminal_history_nonblocking(&queue_dir, candidate_queue_ids) {
+        Ok(records) => {
+            for record in records {
+                if candidate_queue_ids.contains(&record.queue_id) {
+                    terminal_ids.insert(record.queue_id);
+                }
             }
-        };
-        if receipt.status == RuntimeExecutionReceiptStatus::Prepared && receipt.queue_id.is_some() {
-            let queue_id = receipt.queue_id.clone().unwrap();
-            receipts.insert(queue_id, receipt);
         }
+        // A cold-history maintenance transaction must not hold up a typing
+        // update.  The committed hot index above is still safe evidence.
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+        Err(error) => return Err(error),
     }
-    Ok(receipts)
+    Ok(terminal_ids)
 }
 
-fn read_terminal_run_once_ids(
-    receipts_file: &Path,
-    warnings: &mut Vec<String>,
-) -> io::Result<HashSet<String>> {
-    read_run_once_ids_by_any_status(receipts_file, warnings, is_terminal_run_once_status)
-}
-
-fn read_retry_pending_run_once_ids(
-    receipts_file: &Path,
-    warnings: &mut Vec<String>,
-) -> io::Result<HashSet<String>> {
-    read_run_once_ids_by_latest_status(receipts_file, warnings, |status| status == "retry-pending")
-}
-
-fn read_run_once_ids_by_latest_status<F>(
-    receipts_file: &Path,
-    warnings: &mut Vec<String>,
-    predicate: F,
-) -> io::Result<HashSet<String>>
-where
-    F: Fn(&str) -> bool,
-{
-    let mut latest_status_by_id = HashMap::new();
-    if !receipts_file.is_file() {
-        return Ok(HashSet::new());
-    }
-
-    let text = fs::read_to_string(receipts_file)?;
-    for (index, line) in text.lines().enumerate() {
-        let line_number = index + 1;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let value: Value = match serde_json::from_str(trimmed) {
-            Ok(value) => value,
-            Err(error) => {
-                warnings.push(format!(
-                    "runtime run-once receipt line {line_number} is not valid JSON: {error}"
-                ));
-                continue;
+/// Returns the first still-runnable queue's provider routing context through
+/// lock-first materialized projections.  This is the only supported hot path
+/// for typing/working indicators; it never replays the pending JSONL ledger.
+pub fn resolve_runtime_queue_typing_context_nonblocking(
+    harness_home: &Path,
+    requested_queue_id: Option<&str>,
+) -> io::Result<Option<RuntimeQueueTypingContext>> {
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let pending_values =
+        read_queued_pending_values_from_index_nonblocking(&queue_dir, &mut Vec::new())?;
+    let candidate_queue_ids = pending_values
+        .iter()
+        .filter_map(|value| {
+            let queue_id = string_field(value, &["queueId", "queue_id"])?;
+            if requested_queue_id.is_some_and(|requested| requested != queue_id)
+                || string_field(value, &["status"]) != Some("queued")
+            {
+                return None;
             }
-        };
-        if let Some(queue_id) = string_field(&value, &["queueId", "queue_id"])
-            && let Some(status) = string_field(&value, &["status"])
+            Some(queue_id.to_string())
+        })
+        .collect::<BTreeSet<_>>();
+    let terminal_ids =
+        resolve_runtime_queue_terminal_ids_nonblocking(harness_home, &candidate_queue_ids)?;
+    for value in pending_values {
+        let queue_id = string_field(&value, &["queueId", "queue_id"]);
+        if let Some(requested_queue_id) = requested_queue_id
+            && queue_id != Some(requested_queue_id)
         {
-            latest_status_by_id.insert(queue_id.to_string(), status.to_string());
-        }
-    }
-    Ok(latest_status_by_id
-        .into_iter()
-        .filter_map(|(queue_id, status)| predicate(&status).then_some(queue_id))
-        .collect())
-}
-
-fn read_run_once_ids_by_any_status<F>(
-    receipts_file: &Path,
-    warnings: &mut Vec<String>,
-    predicate: F,
-) -> io::Result<HashSet<String>>
-where
-    F: Fn(&str) -> bool,
-{
-    let mut ids = HashSet::new();
-    if !receipts_file.is_file() {
-        return Ok(ids);
-    }
-
-    let text = fs::read_to_string(receipts_file)?;
-    for (index, line) in text.lines().enumerate() {
-        let line_number = index + 1;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
             continue;
         }
-        let value: Value = match serde_json::from_str(trimmed) {
-            Ok(value) => value,
-            Err(error) => {
-                warnings.push(format!(
-                    "runtime run-once receipt line {line_number} is not valid JSON: {error}"
-                ));
-                continue;
-            }
-        };
-        if let Some(queue_id) = string_field(&value, &["queueId", "queue_id"])
-            && let Some(status) = string_field(&value, &["status"])
-            && predicate(status)
+        if string_field(&value, &["status"]) != Some("queued")
+            || queue_id.is_some_and(|queue_id| terminal_ids.contains(queue_id))
         {
-            ids.insert(queue_id.to_string());
+            continue;
+        }
+        let Some(agent_id) = string_field(&value, &["agentId", "agent_id"]) else {
+            continue;
+        };
+        let Some(platform) = string_field(&value, &["platform"]) else {
+            continue;
+        };
+        let Some(channel_id) = string_field(&value, &["channelId", "channel_id"]) else {
+            continue;
+        };
+        return Ok(Some(RuntimeQueueTypingContext {
+            agent_id: agent_id.to_string(),
+            platform: platform.to_string(),
+            channel_id: channel_id.to_string(),
+        }));
+    }
+    Ok(None)
+}
+
+/// Returns the latest hot-ledger receipt materialized for one exact queue ID.
+/// This is the normal reader path for current runtime and virtual-session
+/// state; it never replays the JSONL ledger.
+pub(crate) fn latest_runtime_queue_hot_receipt_from_index(
+    index: &RuntimeQueueStateIndex,
+    queue_id: &str,
+) -> Option<RuntimeQueueHotReceiptRecord> {
+    let entry = index.queues.get(queue_id)?;
+    let status = entry.latest_status.clone()?;
+    Some(RuntimeQueueHotReceiptRecord {
+        queue_id: queue_id.to_string(),
+        status,
+        reason: entry.latest_reason.clone(),
+        runtime_class: entry.latest_runtime_class.clone(),
+        origin: entry.latest_origin.clone(),
+        transcript_file: entry.latest_transcript_file.clone(),
+        occurred_at_ms: entry.latest_occurred_at_ms,
+    })
+}
+
+/// Returns the latest actual terminal receipt materialized for one exact queue
+/// ID. Suppression receipts retain their existing terminal-control semantics
+/// and are not promoted into worker completion records here.
+pub(crate) fn terminal_runtime_queue_hot_receipt_from_index(
+    index: &RuntimeQueueStateIndex,
+    queue_id: &str,
+) -> Option<RuntimeQueueHotReceiptRecord> {
+    let entry = index.queues.get(queue_id)?;
+    let status = entry.terminal_status.clone()?;
+    Some(RuntimeQueueHotReceiptRecord {
+        queue_id: queue_id.to_string(),
+        status,
+        reason: entry.terminal_reason.clone(),
+        runtime_class: entry.terminal_runtime_class.clone(),
+        origin: entry.terminal_origin.clone(),
+        transcript_file: entry.terminal_transcript_file.clone(),
+        occurred_at_ms: entry.terminal_occurred_at_ms,
+    })
+}
+
+/// Returns the latest materialized hot receipt for each requested queue ID.
+/// The requested set makes this an exact bounded lookup even when the hot
+/// ledger itself is large.
+pub(crate) fn latest_runtime_queue_hot_receipts_from_index(
+    index: &RuntimeQueueStateIndex,
+    queue_ids: &BTreeSet<String>,
+) -> Vec<RuntimeQueueHotReceiptRecord> {
+    queue_ids
+        .iter()
+        .filter_map(|queue_id| latest_runtime_queue_hot_receipt_from_index(index, queue_id))
+        .collect()
+}
+
+pub(crate) fn runtime_queue_status_count_from_index(
+    index: &RuntimeQueueStateIndex,
+    queue_id: &str,
+    expected_status: &str,
+) -> usize {
+    index
+        .queues
+        .get(queue_id)
+        .and_then(|entry| entry.run_once_status_counts.get(expected_status))
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Aggregates hot-ledger status counts from the incrementally maintained
+/// index. Metrics and diagnostics use this instead of reparsing the ledger.
+pub(crate) fn runtime_queue_status_counts_from_index(
+    index: &RuntimeQueueStateIndex,
+) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for entry in index.queues.values() {
+        for (status, status_count) in &entry.run_once_status_counts {
+            let current = counts.entry(status.clone()).or_default();
+            *current = current.saturating_add(*status_count);
         }
     }
-    Ok(ids)
+    counts
+}
+
+pub(crate) fn runtime_queue_terminal_receipt_count_from_index(
+    index: &RuntimeQueueStateIndex,
+) -> usize {
+    index
+        .queues
+        .values()
+        .flat_map(|entry| entry.run_once_status_counts.iter())
+        .filter(|(status, _)| is_terminal_run_once_status(status.as_str()))
+        .fold(0usize, |count, (_, status_count)| {
+            count.saturating_add(*status_count)
+        })
+}
+
+pub(crate) fn runtime_queue_prior_failure_count_from_index(
+    index: &RuntimeQueueStateIndex,
+    queue_id: &str,
+) -> usize {
+    index
+        .queues
+        .get(queue_id)
+        .map(|entry| {
+            entry
+                .run_once_status_counts
+                .iter()
+                .filter(|(status, _)| {
+                    let status = status.as_str();
+                    !is_terminal_run_once_status(status)
+                        && status != "completed"
+                        && status != "no-work"
+                })
+                .fold(0usize, |count, (_, status_count)| {
+                    count.saturating_add(*status_count)
+                })
+        })
+        .unwrap_or_default()
+}
+
+fn retry_pending_run_once_ids_from_index(index: &RuntimeQueueStateIndex) -> HashSet<String> {
+    index
+        .queues
+        .iter()
+        .filter_map(|(queue_id, entry)| {
+            (entry.latest_status.as_deref() == Some("retry-pending")).then_some(queue_id.clone())
+        })
+        .collect()
 }
 
 fn is_terminal_run_once_status(status: &str) -> bool {
@@ -3952,6 +5693,22 @@ fn parse_pending_item(value: &Value) -> Result<PendingQueueItem, String> {
         continuation: continuation_metadata_from_value(value),
         coordinator_resume,
     };
+    if let Some(metadata) = pending.coordinator_resume.as_ref() {
+        let account_id = pending.account_id.as_deref().ok_or_else(|| {
+            "coordinator resume queue item is missing exact accountId".to_string()
+        })?;
+        metadata
+            .validate_queued_lane(crate::coordinator_resume::CoordinatorResumeQueuedLaneV1 {
+                platform: &pending.platform,
+                account_id,
+                channel_id: &pending.channel_id,
+                user_id: &pending.user_id,
+                agent_id: &pending.agent_id,
+                runtime_class: &pending.runtime_class,
+                session_key: &pending.session_key,
+            })
+            .map_err(|error| format!("invalid coordinator resume queued lane: {error}"))?;
+    }
     revalidate_pending_execution_snapshot(&pending)?;
     Ok(pending)
 }
@@ -4500,7 +6257,997 @@ mod tests {
         record_context_compact_attempt, record_scoped_stop,
     };
     use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::mpsc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn refresh_runtime_queue_state_index_reuses_persisted_cursor_across_restart_and_observes_appends()
+     {
+        let root = temp_root(
+            "refresh_runtime_queue_state_index_reuses_persisted_cursor_across_restart_and_observes_appends",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+        append_json_line(
+            &receipts_file,
+            &serde_json::json!({
+                "queueId": "turn:historical",
+                "status": "completed",
+                "reason": "historical terminal receipt"
+            }),
+        )
+        .unwrap();
+
+        let initial = rebuild_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+        assert!(initial.queues["turn:historical"].terminal_ever);
+        let index_file = queue_dir.join("queue-state-index.json");
+        let index_modified_before_restart = fs::metadata(&index_file).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+
+        // This call intentionally reconstructs no in-memory state. It must use
+        // the persisted cursor and avoid replaying or rewriting an unchanged
+        // historical receipt ledger.
+        let restarted = refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+        assert!(restarted.queues["turn:historical"].terminal_ever);
+        assert_eq!(
+            fs::metadata(&index_file).unwrap().modified().unwrap(),
+            index_modified_before_restart,
+            "an unchanged receipt ledger must not rewrite the persisted index"
+        );
+
+        append_json_line(
+            &receipts_file,
+            &serde_json::json!({
+                "queueId": "turn:appended",
+                "status": "completed",
+                "reason": "appended terminal receipt"
+            }),
+        )
+        .unwrap();
+        let appended = refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+        assert!(appended.queues["turn:historical"].terminal_ever);
+        assert!(appended.queues["turn:appended"].terminal_ever);
+        assert_eq!(
+            appended.receipt_ledger.offset_bytes,
+            fs::metadata(&receipts_file).unwrap().len()
+        );
+
+        // Terminal admission is sticky even if the latest receipt changes to a
+        // retryable state, while lease retry handling follows the latest state.
+        append_json_line(
+            &receipts_file,
+            &serde_json::json!({
+                "queueId": "turn:historical",
+                "status": "retry-pending",
+                "reason": "transient retry"
+            }),
+        )
+        .unwrap();
+        let retry_pending = refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+        assert!(terminal_run_once_ids_from_index(&retry_pending).contains("turn:historical"));
+        assert!(retry_pending_run_once_ids_from_index(&retry_pending).contains("turn:historical"));
+
+        append_json_line(
+            &receipts_file,
+            &serde_json::json!({
+                "queueId": "turn:historical",
+                "status": "timeout",
+                "reason": "terminal after retry"
+            }),
+        )
+        .unwrap();
+        let terminal_after_retry =
+            refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+        assert!(
+            terminal_run_once_ids_from_index(&terminal_after_retry).contains("turn:historical")
+        );
+        assert!(
+            !retry_pending_run_once_ids_from_index(&terminal_after_retry)
+                .contains("turn:historical")
+        );
+
+        let restarted_after_append =
+            refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+        assert!(restarted_after_append.queues["turn:appended"].terminal_ever);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refresh_runtime_queue_state_index_recovers_from_receipt_truncate_and_index_corruption() {
+        let root = temp_root(
+            "refresh_runtime_queue_state_index_recovers_from_receipt_truncate_and_index_corruption",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+        append_json_line(
+            &receipts_file,
+            &serde_json::json!({
+                "queueId": "turn:old-terminal",
+                "status": "completed",
+                "reason": "a deliberately long historical terminal receipt for truncate detection"
+            }),
+        )
+        .unwrap();
+        let _ = rebuild_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+
+        // A malformed complete record is consumed once with a warning, rather
+        // than forcing every progress wake to retry the same corruption.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&receipts_file)
+            .unwrap()
+            .write_all(b"{not-json}\n")
+            .unwrap();
+        let mut corruption_warnings = Vec::new();
+        let after_corruption =
+            refresh_runtime_queue_state_index(&queue_dir, &mut corruption_warnings).unwrap();
+        assert!(after_corruption.queues["turn:old-terminal"].terminal_ever);
+        assert!(corruption_warnings.iter().any(|warning| {
+            warning.contains("runtime run-once receipt line")
+                && warning.contains("not valid JSON while refreshing")
+        }));
+        let mut no_repeat_warnings = Vec::new();
+        let _ = refresh_runtime_queue_state_index(&queue_dir, &mut no_repeat_warnings).unwrap();
+        assert!(
+            !no_repeat_warnings
+                .iter()
+                .any(|warning| warning.contains("not valid JSON while refreshing"))
+        );
+
+        // Simulate a truncate/rotation replacement with a shorter current
+        // ledger. The old terminal control must be discarded, not leaked.
+        fs::write(
+            &receipts_file,
+            b"{\"queueId\":\"turn:new\",\"status\":\"queued\"}\n",
+        )
+        .unwrap();
+        let mut truncate_warnings = Vec::new();
+        let truncated =
+            refresh_runtime_queue_state_index(&queue_dir, &mut truncate_warnings).unwrap();
+        assert!(!truncated.queues.contains_key("turn:old-terminal"));
+        assert!(!truncated.queues["turn:new"].terminal_ever);
+        assert!(
+            truncate_warnings
+                .iter()
+                .any(|warning| warning.contains("receipt ledger was truncated"))
+        );
+
+        // If the materialized cursor/index itself is corrupt, rebuild from the
+        // current ledger and preserve the current terminal semantics.
+        fs::write(queue_dir.join("queue-state-index.json"), b"{not-json").unwrap();
+        append_json_line(
+            &receipts_file,
+            &serde_json::json!({
+                "queueId": "turn:new",
+                "status": "completed",
+                "reason": "current terminal receipt after index corruption"
+            }),
+        )
+        .unwrap();
+        let mut index_warnings = Vec::new();
+        let repaired = refresh_runtime_queue_state_index(&queue_dir, &mut index_warnings).unwrap();
+        assert!(repaired.queues["turn:new"].terminal_ever);
+        assert!(
+            index_warnings
+                .iter()
+                .any(|warning| warning.contains("queue-state index could not be read"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refresh_runtime_queue_state_index_rebuilds_legacy_revision_zero_from_receipt_ledger() {
+        let root = temp_root(
+            "refresh_runtime_queue_state_index_rebuilds_legacy_revision_zero_from_receipt_ledger",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+        append_json_line(
+            &receipts_file,
+            &serde_json::json!({
+                "schema": "agent-harness.runtime-run-once.v1",
+                "queueId": "turn:ledger-terminal",
+                "status": "completed",
+                "reason": "authoritative terminal receipt"
+            }),
+        )
+        .unwrap();
+
+        // A pre-revision state file is a derived cache, not lifecycle evidence.
+        // It may contain an old terminal entry that no longer appears in the
+        // authoritative receipt ledger, so upgrade must rebuild rather than
+        // retain that stale terminal control.
+        fs::write(
+            queue_dir.join("queue-state-index.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": RUNTIME_QUEUE_STATE_INDEX_SCHEMA,
+                "queues": {
+                    "turn:stale-index-only": {
+                        "terminalEver": true,
+                        "terminalRunOnceEver": true,
+                        "terminalStatus": "completed"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let rebuilt = refresh_runtime_queue_state_index(&queue_dir, &mut warnings).unwrap();
+
+        assert_eq!(rebuilt.revision, RUNTIME_QUEUE_STATE_INDEX_REVISION);
+        assert!(rebuilt.queues["turn:ledger-terminal"].terminal_ever);
+        assert!(!rebuilt.queues.contains_key("turn:stale-index-only"));
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("unsupported schema/revision") && warning.contains("/0")
+        }));
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(queue_dir.join("queue-state-index.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            persisted
+                .get("revision")
+                .and_then(serde_json::Value::as_u64),
+            Some(RUNTIME_QUEUE_STATE_INDEX_REVISION.into())
+        );
+        assert!(persisted.get("receiptLedger").is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_queue_receipt_compaction_bounds_archives_and_preserves_terminal_and_retry_state() {
+        let root = temp_root(
+            "runtime_queue_receipt_compaction_bounds_archives_and_preserves_terminal_and_retry_state",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+
+        for (queue_id, status, reason) in [
+            (
+                "turn:terminal",
+                "completed",
+                "terminal state must survive compaction",
+            ),
+            (
+                "turn:suppressed",
+                "suppressed",
+                "suppression must survive compaction",
+            ),
+            (
+                "turn:retry",
+                "retry-pending",
+                "latest retry state must survive compaction",
+            ),
+        ] {
+            append_json_line(
+                &receipts_file,
+                &serde_json::json!({
+                    "queueId": queue_id,
+                    "status": status,
+                    "reason": reason,
+                    "terminalControlSource": "run-once-terminal",
+                    "padding": "receipt-compaction-regression-padding".repeat(32)
+                }),
+            )
+            .unwrap();
+        }
+        let pending_file = queue_dir.join("pending.jsonl");
+        fs::write(
+            &pending_file,
+            [
+                queued_item_value("turn:terminal").to_string(),
+                queued_item_value("turn:suppressed").to_string(),
+                queued_item_value("turn:retry").to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let _ = rebuild_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+
+        let first =
+            compact_runtime_queue_receipts_if_needed(RuntimeQueueReceiptCompactionOptions {
+                harness_home: harness_home.clone(),
+                max_bytes: 1,
+                max_archives: 1,
+                now_ms: 10,
+            })
+            .unwrap();
+        assert_eq!(first.status, RuntimeQueueReceiptCompactionStatus::Compacted);
+        assert!(
+            first
+                .archive_file
+                .as_ref()
+                .is_some_and(|path| path.is_file())
+        );
+        assert!(
+            fs::metadata(&receipts_file).unwrap().len() < first.original_bytes,
+            "the active journal must be a bounded snapshot rather than the old full receipt stream"
+        );
+
+        // A lost index must rebuild from the compacted active journals without
+        // reviving terminal work. The terminal receipts are retained in the
+        // bounded archive; only still-queued retry work remains active.
+        fs::remove_file(queue_dir.join("queue-state-index.json")).unwrap();
+        let rebuilt = refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+        assert!(!rebuilt.queues.contains_key("turn:terminal"));
+        assert!(!rebuilt.queues.contains_key("turn:suppressed"));
+        assert!(retry_pending_run_once_ids_from_index(&rebuilt).contains("turn:retry"));
+        let compacted_pending = fs::read_to_string(&pending_file).unwrap();
+        assert!(compacted_pending.contains("turn:retry"));
+        assert!(!compacted_pending.contains("turn:terminal"));
+        assert!(!compacted_pending.contains("turn:suppressed"));
+        let archived_receipts = fs::read_to_string(first.archive_file.as_ref().unwrap()).unwrap();
+        assert!(archived_receipts.contains("turn:terminal"));
+        assert!(archived_receipts.contains("turn:suppressed"));
+
+        append_json_line(
+            &receipts_file,
+            &serde_json::json!({
+                "queueId": "turn:next",
+                "status": "completed",
+                "reason": "second archive bounds the first",
+                "padding": "receipt-compaction-regression-padding".repeat(32)
+            }),
+        )
+        .unwrap();
+        let second =
+            compact_runtime_queue_receipts_if_needed(RuntimeQueueReceiptCompactionOptions {
+                harness_home: harness_home.clone(),
+                max_bytes: 1,
+                max_archives: 1,
+                now_ms: 11,
+            })
+            .unwrap();
+        assert_eq!(
+            second.status,
+            RuntimeQueueReceiptCompactionStatus::Compacted
+        );
+        assert_eq!(
+            fs::read_dir(queue_dir.join("run-once-receipts-archive"))
+                .unwrap()
+                .count(),
+            1,
+            "archive retention must remain bounded"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_queue_receipt_compaction_recovers_interrupted_snapshot_with_full_digest_check() {
+        let root = temp_root(
+            "runtime_queue_receipt_compaction_recovers_interrupted_snapshot_with_full_digest_check",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+        let archive_dir = queue_dir.join("run-once-receipts-archive");
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        let archived = serde_json::json!({
+            "queueId": "turn:terminal",
+            "status": "completed",
+            "reason": "historical terminal record"
+        })
+        .to_string()
+            + "\n";
+        let snapshot = serde_json::json!({
+            "queueId": "turn:retry",
+            "status": "retry-pending",
+            "reason": "active retry record",
+            "compacted": true
+        })
+        .to_string()
+            + "\n";
+        let archive_file = archive_dir.join("run-once-receipts-10.jsonl");
+        fs::write(&archive_file, &archived).unwrap();
+        let compact_temp = runtime_queue_ledger_temp_file(&receipts_file, 11, "compact");
+        fs::write(&compact_temp, &snapshot).unwrap();
+        let expected_digest = runtime_queue_ledger_digest(&compact_temp).unwrap();
+
+        // This is the crash window after the destination was replaced but
+        // before the marker was removed. It has the same length and tail as
+        // the intended snapshot, so recovery must use the full digest rather
+        // than accepting a prefix-corrupted destination.
+        let mut corrupted = snapshot.as_bytes().to_vec();
+        corrupted[0] = b'[';
+        fs::write(&receipts_file, corrupted).unwrap();
+        let marker = RuntimeQueueLedgerCompactionPending {
+            schema: RUNTIME_QUEUE_RECEIPT_COMPACTION_PENDING_SCHEMA.to_string(),
+            ledger_file: receipts_file.clone(),
+            archive_file: archive_file.clone(),
+            temp_file: compact_temp,
+            expected_bytes: snapshot.len() as u64,
+            expected_digest,
+            archive_expected_bytes: Some(archived.len() as u64),
+            archive_expected_digest: Some(runtime_queue_ledger_digest(&archive_file).unwrap()),
+            history_store_file: None,
+            history_transaction_id: None,
+        };
+        write_json_atomic(
+            &runtime_queue_ledger_compaction_marker_file(&receipts_file),
+            &marker,
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let index = refresh_runtime_queue_state_index(&queue_dir, &mut warnings).unwrap();
+        assert_eq!(fs::read_to_string(&receipts_file).unwrap(), snapshot);
+        assert!(retry_pending_run_once_ids_from_index(&index).contains("turn:retry"));
+        assert!(!index.queues.contains_key("turn:terminal"));
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("recovered interrupted runtime queue ledger compaction")
+        }));
+        assert!(!runtime_queue_ledger_compaction_marker_file(&receipts_file).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_compaction_recovery_commits_staged_history_after_snapshot_is_durable() {
+        let root = temp_root(
+            "receipt_compaction_recovery_commits_staged_history_after_snapshot_is_durable",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+        let archive_dir = queue_dir.join("run-once-receipts-archive");
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        let archived = b"{\"queueId\":\"turn:historical\",\"traceId\":\"trace:historical\",\"status\":\"completed\",\"reason\":\"durable history recovery\"}\n{\"queueId\":\"turn:retry\",\"status\":\"retry-pending\"}\n";
+        let snapshot = b"{\"queueId\":\"turn:retry\",\"status\":\"retry-pending\"}\n";
+        let archive_file = archive_dir.join("run-once-receipts-history-recovery.jsonl");
+        fs::write(&archive_file, archived).unwrap();
+        fs::write(&receipts_file, snapshot).unwrap();
+        let staging = crate::runtime_receipt_history::stage_runtime_queue_receipt_history(
+            &queue_dir,
+            "history-recovery-commit",
+            archived,
+            snapshot,
+            &std::collections::HashSet::from(["turn:retry".to_string()]),
+            100,
+        )
+        .unwrap();
+        let temp_file = runtime_queue_ledger_temp_file(&receipts_file, 101, "compact");
+        fs::write(&temp_file, snapshot).unwrap();
+        let marker = RuntimeQueueLedgerCompactionPending {
+            schema: RUNTIME_QUEUE_RECEIPT_COMPACTION_PENDING_SCHEMA.to_string(),
+            ledger_file: receipts_file.clone(),
+            archive_file: archive_file.clone(),
+            temp_file,
+            expected_bytes: snapshot.len() as u64,
+            expected_digest: runtime_queue_ledger_digest(&receipts_file).unwrap(),
+            archive_expected_bytes: Some(archived.len() as u64),
+            archive_expected_digest: Some(runtime_queue_ledger_digest(&archive_file).unwrap()),
+            history_store_file: Some(staging.store_file.clone()),
+            history_transaction_id: Some(staging.transaction_id.clone()),
+        };
+        let marker_file = runtime_queue_ledger_compaction_marker_file(&receipts_file);
+        write_json_atomic(&marker_file, &marker).unwrap();
+
+        recover_runtime_queue_ledger_compaction_if_needed(&receipts_file, &mut Vec::new()).unwrap();
+
+        let history = crate::runtime_receipt_history::find_runtime_queue_terminal_history(
+            &queue_dir,
+            &std::collections::BTreeSet::from(["trace:historical".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "the durable hot snapshot must expose staged history"
+        );
+        assert_eq!(history[0].queue_id, "turn:historical");
+        assert!(!marker_file.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_compaction_recovery_discards_staged_history_when_archive_is_restored() {
+        let root = temp_root(
+            "receipt_compaction_recovery_discards_staged_history_when_archive_is_restored",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+        let archive_dir = queue_dir.join("run-once-receipts-archive");
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        let archived = b"{\"queueId\":\"turn:historical\",\"traceId\":\"trace:historical\",\"status\":\"completed\"}\n{\"queueId\":\"turn:retry\",\"status\":\"retry-pending\"}\n";
+        let snapshot = b"{\"queueId\":\"turn:retry\",\"status\":\"retry-pending\"}\n";
+        let archive_file = archive_dir.join("run-once-receipts-history-restore.jsonl");
+        fs::write(&archive_file, archived).unwrap();
+        let staging = crate::runtime_receipt_history::stage_runtime_queue_receipt_history(
+            &queue_dir,
+            "history-recovery-discard",
+            archived,
+            snapshot,
+            &std::collections::HashSet::from(["turn:retry".to_string()]),
+            100,
+        )
+        .unwrap();
+        let temp_file = runtime_queue_ledger_temp_file(&receipts_file, 101, "compact");
+        fs::write(&temp_file, b"broken snapshot\n").unwrap();
+        fs::write(&receipts_file, b"broken destination\n").unwrap();
+        let marker = RuntimeQueueLedgerCompactionPending {
+            schema: RUNTIME_QUEUE_RECEIPT_COMPACTION_PENDING_SCHEMA.to_string(),
+            ledger_file: receipts_file.clone(),
+            archive_file: archive_file.clone(),
+            temp_file,
+            expected_bytes: snapshot.len() as u64,
+            expected_digest: runtime_queue_bytes_digest(snapshot),
+            archive_expected_bytes: Some(archived.len() as u64),
+            archive_expected_digest: Some(runtime_queue_ledger_digest(&archive_file).unwrap()),
+            history_store_file: Some(staging.store_file.clone()),
+            history_transaction_id: Some(staging.transaction_id.clone()),
+        };
+        let marker_file = runtime_queue_ledger_compaction_marker_file(&receipts_file);
+        write_json_atomic(&marker_file, &marker).unwrap();
+
+        recover_runtime_queue_ledger_compaction_if_needed(&receipts_file, &mut Vec::new()).unwrap();
+
+        assert_eq!(fs::read(&receipts_file).unwrap(), archived);
+        assert!(
+            crate::runtime_receipt_history::find_runtime_queue_terminal_history(
+                &queue_dir,
+                &std::collections::BTreeSet::from(["trace:historical".to_string()]),
+            )
+            .unwrap()
+            .is_empty(),
+            "restoring the pre-compaction hot ledger must keep staged history invisible"
+        );
+        assert!(!marker_file.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_queue_receipt_compaction_recovery_accepts_legacy_v2_marker_with_valid_jsonl_archive()
+    {
+        let root = temp_root(
+            "runtime_queue_receipt_compaction_recovery_accepts_legacy_v2_marker_with_valid_jsonl_archive",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+        let archive_dir = queue_dir.join("run-once-receipts-archive");
+        fs::create_dir_all(&archive_dir).unwrap();
+        let archive_file = archive_dir.join("run-once-receipts-legacy.jsonl");
+        let archive = b"{\"queueId\":\"turn:legacy\",\"status\":\"completed\"}\n";
+        fs::write(&archive_file, archive).unwrap();
+        fs::write(&receipts_file, b"corrupted destination\n").unwrap();
+        let compact_temp = runtime_queue_ledger_temp_file(&receipts_file, 11, "compact");
+        fs::write(&compact_temp, b"corrupted snapshot\n").unwrap();
+        let marker = RuntimeQueueLedgerCompactionPending {
+            schema: RUNTIME_QUEUE_RECEIPT_COMPACTION_PENDING_SCHEMA_V2.to_string(),
+            ledger_file: receipts_file.clone(),
+            archive_file,
+            temp_file: compact_temp,
+            expected_bytes: 1,
+            expected_digest: 1,
+            archive_expected_bytes: None,
+            archive_expected_digest: None,
+            history_store_file: None,
+            history_transaction_id: None,
+        };
+        let marker_file = runtime_queue_ledger_compaction_marker_file(&receipts_file);
+        write_json_atomic(&marker_file, &marker).unwrap();
+
+        let mut warnings = Vec::new();
+        recover_runtime_queue_ledger_compaction_if_needed(&receipts_file, &mut warnings).unwrap();
+
+        assert_eq!(fs::read(&receipts_file).unwrap(), archive);
+        assert!(!marker_file.exists());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("accepted legacy v2"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refresh_runtime_queue_state_index_detects_same_size_prefix_rewrite() {
+        let root = temp_root("refresh_runtime_queue_state_index_detects_same_size_prefix_rewrite");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+        let first = serde_json::json!({
+            "queueId": "turn:first",
+            "status": "completed",
+            "reason": "same-size rewrite regression"
+        })
+        .to_string()
+            + "\n";
+        let second = serde_json::json!({
+            "queueId": "turn:other",
+            "status": "completed",
+            "reason": "same-size rewrite regression"
+        })
+        .to_string()
+            + "\n";
+        assert_eq!(first.len(), second.len());
+        fs::write(&receipts_file, &first).unwrap();
+        let mut original = rebuild_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+
+        fs::write(&receipts_file, &second).unwrap();
+        // Simulate a filesystem with coarse timestamps by preserving the new
+        // timestamp in the persisted cursor. The tail fingerprint must still
+        // force a rebuild instead of retaining the old terminal state.
+        original.receipt_ledger.source_modified_at_unix_nanos =
+            file_modified_at_unix_nanos(&fs::metadata(&receipts_file).unwrap());
+        write_runtime_queue_state_index(&queue_dir, &original).unwrap();
+
+        let mut warnings = Vec::new();
+        let refreshed = refresh_runtime_queue_state_index(&queue_dir, &mut warnings).unwrap();
+        assert!(!refreshed.queues.contains_key("turn:first"));
+        assert!(refreshed.queues["turn:other"].terminal_run_once_ever);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("changed without an append"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn queue_state_index_materializes_terminal_metadata_and_per_queue_status_counts() {
+        let root = temp_root(
+            "queue_state_index_materializes_terminal_metadata_and_per_queue_status_counts",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        fs::write(
+            queue_dir.join("run-once-receipts.jsonl"),
+            [
+                serde_json::json!({
+                    "queueId":"turn:indexed",
+                    "status":"failed-retryable"
+                })
+                .to_string(),
+                serde_json::json!({
+                    "queueId":"turn:indexed",
+                    "status":"no-prepared-execution"
+                })
+                .to_string(),
+                serde_json::json!({
+                    "queueId":"turn:indexed",
+                    "status":"completed",
+                    "reason":"terminal metadata must survive cursor refresh",
+                    "runtimeClass":"worker",
+                    "origin":"worker",
+                    "transcriptFile":"worker-transcript.jsonl",
+                    "completedAtMs":42
+                })
+                .to_string(),
+                serde_json::json!({
+                    "queueId":"turn:other",
+                    "status":"no-prepared-execution"
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let index = rebuild_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+        assert_eq!(runtime_queue_terminal_receipt_count_from_index(&index), 1);
+        let value = serde_json::to_value(index).unwrap();
+        let entry = &value["queues"]["turn:indexed"];
+        assert_eq!(entry["runOnceStatusCounts"]["failed-retryable"], 1);
+        assert_eq!(entry["runOnceStatusCounts"]["no-prepared-execution"], 1);
+        assert_eq!(entry["terminalRuntimeClass"], "worker");
+        assert_eq!(entry["terminalOrigin"], "worker");
+        assert_eq!(entry["terminalTranscriptFile"], "worker-transcript.jsonl");
+        assert_eq!(entry["terminalOccurredAtMs"], 42);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_queue_lookup_joins_hot_index_with_exact_cold_history() {
+        let root = temp_root("terminal_queue_lookup_joins_hot_index_with_exact_cold_history");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        fs::write(
+            queue_dir.join("run-once-receipts.jsonl"),
+            r#"{"queueId":"queue-hot","status":"completed"}
+"#,
+        )
+        .unwrap();
+        rebuild_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+        let staged = stage_runtime_queue_receipt_history(
+            &queue_dir,
+            "terminal-lookup-cold-history",
+            br#"{"queueId":"queue-cold","status":"failed-terminal"}
+"#,
+            b"",
+            &HashSet::new(),
+            100,
+        )
+        .unwrap();
+        commit_runtime_queue_receipt_history(&staged, 101).unwrap();
+        let requested = ["queue-hot", "queue-cold", "queue-open"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
+
+        let terminals = resolve_runtime_queue_terminal_ids(&harness_home, &requested).unwrap();
+
+        assert!(terminals.contains("queue-hot"));
+        assert!(terminals.contains("queue-cold"));
+        assert!(!terminals.contains("queue-open"));
+        assert!(matches!(
+            resolve_queue_terminal_control(&harness_home, "queue-cold", None).unwrap(),
+            QueueTerminalControl::Terminal(QueueTerminalControlMatch {
+                source: TerminalControlSource::RunOnceTerminal,
+                ..
+            })
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_queue_receipt_compaction_cadence_defers_only_unchanged_large_active_ledgers() {
+        let state = RuntimeQueueReceiptCompactionState {
+            schema: RUNTIME_QUEUE_RECEIPT_COMPACTION_STATE_SCHEMA.to_string(),
+            last_attempt_at_ms: 10_000,
+            last_attempt_bytes: 20 * 1024 * 1024,
+        };
+        assert!(runtime_queue_receipt_compaction_retry_is_deferred(
+            10_001,
+            state.last_attempt_bytes + 512 * 1024,
+            Some(&state)
+        ));
+        assert!(!runtime_queue_receipt_compaction_retry_is_deferred(
+            10_001,
+            state.last_attempt_bytes + RUNTIME_QUEUE_RECEIPT_COMPACTION_RETRY_GROWTH_BYTES,
+            Some(&state)
+        ));
+        assert!(!runtime_queue_receipt_compaction_retry_is_deferred(
+            state.last_attempt_at_ms + RUNTIME_QUEUE_RECEIPT_COMPACTION_RETRY_INTERVAL_MS,
+            state.last_attempt_bytes,
+            Some(&state)
+        ));
+    }
+
+    #[test]
+    fn runtime_queue_receipt_compaction_returns_busy_without_touching_ledgers_when_transaction_is_owned()
+     {
+        let root = temp_root(
+            "runtime_queue_receipt_compaction_returns_busy_without_touching_ledgers_when_transaction_is_owned",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+        append_json_line(
+            &receipts_file,
+            &serde_json::json!({
+                "queueId": "turn:transaction-owner",
+                "status": "completed",
+                "padding": "transaction-gate-regression-padding".repeat(32)
+            }),
+        )
+        .unwrap();
+        let original = fs::read(&receipts_file).unwrap();
+        let transaction_lock = runtime_queue_receipt_compaction_lock_file(&queue_dir);
+
+        crate::logging::with_jsonl_append_lock(&transaction_lock, || {
+            let report =
+                compact_runtime_queue_receipts_if_needed(RuntimeQueueReceiptCompactionOptions {
+                    harness_home: harness_home.clone(),
+                    max_bytes: 1,
+                    max_archives: 1,
+                    now_ms: 10,
+                })
+                .unwrap();
+            assert_eq!(
+                report.status,
+                RuntimeQueueReceiptCompactionStatus::Busy,
+                "a second compactor must not enter the cross-ledger transaction"
+            );
+            assert_eq!(
+                fs::read(&receipts_file).unwrap(),
+                original,
+                "a busy compactor must not mutate the ledger owned by another transaction"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn automatic_receipt_compaction_busy_does_not_defer_the_next_terminal_retry() {
+        let root =
+            temp_root("automatic_receipt_compaction_busy_does_not_defer_the_next_terminal_retry");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+        fs::write(
+            &receipts_file,
+            vec![b'x'; RUNTIME_QUEUE_RECEIPT_COMPACTION_DEFAULT_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+        let transaction_lock = runtime_queue_receipt_compaction_lock_file(&queue_dir);
+
+        crate::logging::with_jsonl_append_lock(&transaction_lock, || {
+            let report =
+                maybe_compact_runtime_queue_receipts_after_terminal(harness_home.clone(), 10_000)?
+                    .expect("an oversized ledger must attempt compaction");
+            assert_eq!(report.status, RuntimeQueueReceiptCompactionStatus::Busy);
+            assert!(
+                !runtime_queue_receipt_compaction_state_file(&queue_dir).exists(),
+                "lock contention must not consume the automatic retry cadence"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn progress_refresh_returns_cached_index_while_live_compaction_owns_receipt_lock() {
+        let root = temp_root(
+            "progress_refresh_returns_cached_index_while_live_compaction_owns_receipt_lock",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+        append_json_line(
+            &receipts_file,
+            &serde_json::json!({
+                "queueId": "turn:cached-terminal",
+                "status": "completed",
+                "reason": "the materialized index must remain available to progress"
+            }),
+        )
+        .unwrap();
+        let cached = rebuild_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+        assert!(cached.queues["turn:cached-terminal"].terminal_ever);
+
+        let archive_dir = queue_dir.join("run-once-receipts-archive");
+        fs::create_dir_all(&archive_dir).unwrap();
+        let archive_file = archive_dir.join("run-once-receipts-10.jsonl");
+        let archive_contents = fs::read(&receipts_file).unwrap();
+        fs::write(&archive_file, &archive_contents).unwrap();
+        let compact_temp = runtime_queue_ledger_temp_file(&receipts_file, 11, "compact");
+        let compact_snapshot = b"{\"queueId\":\"turn:active\",\"status\":\"retry-pending\"}\n";
+        fs::write(&compact_temp, compact_snapshot).unwrap();
+        let marker = RuntimeQueueLedgerCompactionPending {
+            schema: RUNTIME_QUEUE_RECEIPT_COMPACTION_PENDING_SCHEMA.to_string(),
+            ledger_file: receipts_file.clone(),
+            archive_file: archive_file.clone(),
+            temp_file: compact_temp.clone(),
+            expected_bytes: compact_snapshot.len() as u64,
+            expected_digest: runtime_queue_ledger_digest(&compact_temp).unwrap(),
+            archive_expected_bytes: Some(archive_contents.len() as u64),
+            archive_expected_digest: Some(runtime_queue_ledger_digest(&archive_file).unwrap()),
+            history_store_file: None,
+            history_transaction_id: None,
+        };
+        let marker_file = runtime_queue_ledger_compaction_marker_file(&receipts_file);
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let receipt_lock_file = receipts_file.clone();
+        let marker_for_thread = marker.clone();
+        let marker_file_for_thread = marker_file.clone();
+        let holder = std::thread::spawn(move || {
+            crate::logging::with_jsonl_append_lock(&receipt_lock_file, || {
+                write_json_atomic(&marker_file_for_thread, &marker_for_thread)?;
+                ready_sender
+                    .send(())
+                    .expect("test must observe the live compaction marker");
+                release_receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("test must release the live compaction lock");
+                Ok(())
+            })
+        });
+        ready_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("test compaction lock holder must start");
+
+        let started = std::time::Instant::now();
+        let refreshed =
+            refresh_runtime_queue_state_index_nonblocking(&queue_dir, &mut Vec::new()).unwrap();
+        let elapsed = started.elapsed();
+
+        release_sender.send(()).unwrap();
+        holder.join().unwrap().unwrap();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "progress refresh must return its cached index instead of waiting for compaction; elapsed={elapsed:?}"
+        );
+        assert!(
+            refreshed.queues["turn:cached-terminal"].terminal_ever,
+            "the safe cached index must remain usable while the ledger is being replaced"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_queue_receipt_compaction_recovery_refuses_corrupted_archive_without_valid_snapshot()
+    {
+        let root = temp_root(
+            "runtime_queue_receipt_compaction_recovery_refuses_corrupted_archive_without_valid_snapshot",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+        let archive_dir = queue_dir.join("run-once-receipts-archive");
+        fs::create_dir_all(&archive_dir).unwrap();
+        let archive_file = archive_dir.join("run-once-receipts-10.jsonl");
+        let original_archive = b"{\"queueId\":\"turn:historical\",\"status\":\"completed\"}\n";
+        fs::write(&archive_file, original_archive).unwrap();
+        let archive_expected_digest = runtime_queue_ledger_digest(&archive_file).unwrap();
+
+        let compact_temp = runtime_queue_ledger_temp_file(&receipts_file, 11, "compact");
+        let expected_snapshot = b"{\"queueId\":\"turn:retry\",\"status\":\"retry-pending\"}\n";
+        fs::write(&compact_temp, expected_snapshot).unwrap();
+        let expected_digest = runtime_queue_ledger_digest(&compact_temp).unwrap();
+        fs::write(&compact_temp, b"not-a-valid-snapshot\n").unwrap();
+        let corrupted_destination = b"not-a-valid-destination\n";
+        fs::write(&receipts_file, corrupted_destination).unwrap();
+        fs::write(&archive_file, b"corrupted-archive\n").unwrap();
+
+        let marker = RuntimeQueueLedgerCompactionPending {
+            schema: RUNTIME_QUEUE_RECEIPT_COMPACTION_PENDING_SCHEMA.to_string(),
+            ledger_file: receipts_file.clone(),
+            archive_file,
+            temp_file: compact_temp,
+            expected_bytes: expected_snapshot.len() as u64,
+            expected_digest,
+            archive_expected_bytes: Some(original_archive.len() as u64),
+            archive_expected_digest: Some(archive_expected_digest),
+            history_store_file: None,
+            history_transaction_id: None,
+        };
+        let marker_file = runtime_queue_ledger_compaction_marker_file(&receipts_file);
+        write_json_atomic(&marker_file, &marker).unwrap();
+
+        let error =
+            recover_runtime_queue_ledger_compaction_if_needed(&receipts_file, &mut Vec::new())
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&receipts_file).unwrap(), corrupted_destination);
+        assert!(
+            marker_file.is_file(),
+            "an unverifiable archive must remain marked for explicit recovery instead of becoming active state"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     fn queued_item_value(queue_id: &str) -> Value {
         serde_json::json!({
@@ -4599,6 +7346,107 @@ mod tests {
             serde_json::to_value(snapshot).unwrap(),
         );
         value
+    }
+
+    fn coordinator_resume_item_value() -> Value {
+        let queue_id = "coordinator-resume:intent-exact";
+        let session_key = "telegram:dm:user:main:root-session:cont-1";
+        let root_session = root_working_session_key(session_key);
+        let lane = crate::lane::FullLaneKeyV1::new(
+            "telegram",
+            "account-a",
+            "dm",
+            "user",
+            "main",
+            "interactive",
+            &root_session,
+            session_key,
+        )
+        .unwrap();
+        let owner = crate::worker_result_mailbox::ExactWorkerResultOwnerV1::new(
+            lane,
+            derive_virtual_session_id("telegram", "dm", "user", "main", &root_session),
+            None,
+            Some("turn:parent-exact".to_string()),
+            "turn:parent-exact",
+            None,
+            None,
+        )
+        .unwrap();
+        let metadata = crate::coordinator_resume::CoordinatorResumeMetadataV1::new(
+            "intent-exact",
+            "wait-exact",
+            queue_id,
+            owner,
+        )
+        .unwrap();
+        let mut value = queued_item_value(queue_id);
+        let object = value.as_object_mut().unwrap();
+        object.insert(
+            "schema".to_string(),
+            Value::String("agent-harness.runtime-queue-item.v2".to_string()),
+        );
+        object.insert(
+            "sessionKey".to_string(),
+            Value::String(session_key.to_string()),
+        );
+        object.insert(
+            "accountId".to_string(),
+            Value::String("account-a".to_string()),
+        );
+        object.insert(
+            "origin".to_string(),
+            Value::String("coordinator-resume".to_string()),
+        );
+        object.insert(
+            "coordinatorResume".to_string(),
+            serde_json::to_value(metadata).unwrap(),
+        );
+        value
+    }
+
+    #[test]
+    fn coordinator_resume_pending_item_rejects_each_owner_lane_axis_mismatch() {
+        let valid = coordinator_resume_item_value();
+        assert!(parse_pending_item(&valid).is_ok());
+
+        let mutations = [
+            ("platform", "discord", "platform"),
+            ("accountId", "account-b", "accountId"),
+            ("channelId", "dm-other", "channelId"),
+            ("userId", "user-other", "userId"),
+            ("agentId", "audit-worker", "agentId"),
+            ("runtimeClass", "worker", "runtimeClass"),
+            (
+                "sessionKey",
+                "telegram:dm:user:main:other-root:cont-1",
+                "rootVirtualSession",
+            ),
+            (
+                "sessionKey",
+                "telegram:dm:user:main:root-session:cont-2",
+                "concreteSession",
+            ),
+        ];
+
+        for (field, replacement, expected_axis) in mutations {
+            let mut mutated = valid.clone();
+            mutated
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), Value::String(replacement.to_string()));
+            let error = parse_pending_item(&mutated).unwrap_err();
+            assert!(
+                error.contains(expected_axis),
+                "mutation {field}={replacement} should reject {expected_axis}, got: {error}"
+            );
+        }
+
+        let mut mismatched_virtual_session = valid;
+        mismatched_virtual_session["coordinatorResume"]["owner"]["virtualSessionId"] =
+            Value::String("telegram:dm:user:main:vsession-other".to_string());
+        let error = parse_pending_item(&mismatched_virtual_session).unwrap_err();
+        assert!(error.contains("virtualSessionId"), "{error}");
     }
 
     #[test]
@@ -5747,6 +8595,141 @@ mod tests {
     }
 
     #[test]
+    fn read_pending_items_materializes_the_bounded_active_pending_index() {
+        let root = temp_root("read_pending_items_materializes_active_pending_index");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        append_worker_pending_runtime_item(&source, &harness_home, "turn:pending:indexed", 1234);
+
+        let mut warnings = Vec::new();
+        let items = read_pending_items(&queue_dir.join("pending.jsonl"), &mut warnings).unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].queue_id, "turn:pending:indexed");
+        assert!(
+            crate::runtime_pending_index::runtime_pending_index_file(&queue_dir).is_file(),
+            "normal worker selection must use the bounded active pending sidecar rather than replaying pending.jsonl"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn typing_context_uses_the_nonblocking_pending_projection() {
+        let root = temp_root("typing_context_uses_nonblocking_pending_projection");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        append_worker_pending_runtime_item(&source, &harness_home, "turn:typing:indexed", 1234);
+
+        let context = resolve_runtime_queue_typing_context_nonblocking(
+            &harness_home,
+            Some("turn:typing:indexed"),
+        )
+        .unwrap()
+        .expect("queued item should provide typing routing");
+
+        assert!(!context.agent_id.is_empty());
+        assert!(!context.platform.is_empty());
+        assert!(!context.channel_id.is_empty());
+        assert!(
+            crate::runtime_pending_index::runtime_pending_index_file(&queue_dir).is_file(),
+            "typing must materialize/read the bounded pending projection rather than replaying pending.jsonl"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_lookup_uses_committed_index_after_one_hundred_thousand_runtime_receipts() {
+        let root = temp_root(
+            "terminal_lookup_uses_committed_index_after_one_hundred_thousand_runtime_receipts",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let historical =
+            "{\"queueId\":\"turn:historic\",\"status\":\"completed\",\"reason\":\"historic\"}\n";
+        let mut receipts = historical.repeat(100_000);
+        receipts.push_str(
+            "{\"queueId\":\"turn:target\",\"status\":\"completed\",\"reason\":\"target\"}\n",
+        );
+        fs::write(queue_dir.join("run-once-receipts.jsonl"), receipts).unwrap();
+
+        refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+        let candidates = std::collections::BTreeSet::from(["turn:target".to_string()]);
+        let started = Instant::now();
+        let terminal =
+            resolve_runtime_queue_terminal_ids_nonblocking(&harness_home, &candidates).unwrap();
+
+        assert_eq!(terminal, candidates);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the current runtime receipt index must answer an exact terminal lookup without replaying 100k historical rows"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_lookup_uses_last_committed_index_while_runtime_receipt_append_is_locked() {
+        let root = temp_root(
+            "terminal_lookup_uses_last_committed_index_while_runtime_receipt_append_is_locked",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+        append_json_line(
+            &receipts_file,
+            &serde_json::json!({
+                "queueId": "turn:committed",
+                "status": "completed",
+                "reason": "committed before lock"
+            }),
+        )
+        .unwrap();
+        refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+        let committed = std::collections::BTreeSet::from(["turn:committed".to_string()]);
+
+        crate::logging::with_jsonl_append_lock(&receipts_file, || {
+            let mut file = OpenOptions::new().append(true).open(&receipts_file)?;
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "queueId": "turn:locked",
+                    "status": "completed",
+                    "reason": "not committed to the sidecar yet"
+                })
+            )?;
+            file.flush()?;
+
+            let started = Instant::now();
+            let observed =
+                resolve_runtime_queue_terminal_ids_nonblocking(&harness_home, &committed)?;
+            assert_eq!(observed, committed);
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "a live runtime receipt append must return the committed snapshot rather than wait"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let locked = std::collections::BTreeSet::from(["turn:locked".to_string()]);
+        assert_eq!(
+            resolve_runtime_queue_terminal_ids_nonblocking(&harness_home, &locked).unwrap(),
+            locked
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn prepare_runtime_queue_item_selects_cron_when_old_interactive_is_terminal() {
         let root =
             temp_root("prepare_runtime_queue_item_selects_cron_when_old_interactive_is_terminal");
@@ -6208,10 +9191,12 @@ mod tests {
             &ChannelSessionState {
                 schema: "agent-harness.channel-session-state.v1".to_string(),
                 platform: "telegram".to_string(),
+                account_id: None,
                 channel_id: "dm-42".to_string(),
                 user_id: "user-7".to_string(),
                 active_session_key: old_session.to_string(),
                 agent_id: Some("main".to_string()),
+                config_revision: None,
                 provider: None,
                 model: None,
                 session_topic: None,
@@ -6327,10 +9312,12 @@ mod tests {
             &ChannelSessionState {
                 schema: "agent-harness.channel-session-state.v1".to_string(),
                 platform: "telegram".to_string(),
+                account_id: None,
                 channel_id: "dm-42".to_string(),
                 user_id: "user-7".to_string(),
                 active_session_key: old_session.to_string(),
                 agent_id: Some("main".to_string()),
+                config_revision: None,
                 provider: None,
                 model: None,
                 session_topic: None,
@@ -7617,6 +10604,29 @@ mod tests {
             removed_soul.change,
             Some(crate::AgentPromptManifestChangeV1::Removed)
         );
+        assert!(removed.manifest.requires_fresh_backend_thread);
+        let account_bound_baseline_session = crate::turns::bind_session_key_to_account(
+            "session-root-a",
+            "telegram",
+            "account-a",
+            "dm-a",
+            "user-a",
+            Some("main"),
+        );
+        assert!(
+            crate::prompt::acknowledge_fresh_backend_thread(
+                &harness_home,
+                Some("main"),
+                &account_bound_baseline_session,
+                &old_root_lane,
+                removed
+                    .manifest
+                    .static_config_revision
+                    .as_deref()
+                    .expect("removed bundle static-config revision"),
+            )
+            .unwrap()
+        );
 
         let baseline_digest = removed.manifest.lane_digest.clone().unwrap();
         let variants = [
@@ -7926,6 +10936,97 @@ mod tests {
         )
         .unwrap();
         AgentSource::with_workspace(home, workspace)
+    }
+
+    #[test]
+    fn receipt_compaction_commits_cold_history_and_preserves_retry_receipt_sequence() {
+        let root = temp_root(
+            "receipt_compaction_commits_cold_history_and_preserves_retry_receipt_sequence",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        fs::write(
+            queue_dir.join("pending.jsonl"),
+            serde_json::json!({"queueId":"turn:retry","status":"queued"}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            queue_dir.join("run-once-receipts.jsonl"),
+            [
+                serde_json::json!({
+                    "schema":"agent-harness.runtime-run-once.v1",
+                    "queueId":"turn:historical",
+                    "traceId":"trace:historical",
+                    "sessionKey":"session:historical",
+                    "status":"completed",
+                    "reason":"old terminal",
+                    "runtimeClass":"interactive",
+                    "origin":"channel",
+                    "completedAtMs":10
+                })
+                .to_string(),
+                serde_json::json!({
+                    "schema":"agent-harness.runtime-run-once.v1",
+                    "queueId":"turn:retry",
+                    "status":"failed-retryable",
+                    "reason":"first retry failure"
+                })
+                .to_string(),
+                serde_json::json!({
+                    "schema":"agent-harness.runtime-run-once.v1",
+                    "queueId":"turn:retry",
+                    "status":"retry-pending",
+                    "reason":"retry remains runnable"
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let report =
+            compact_runtime_queue_receipts_if_needed(RuntimeQueueReceiptCompactionOptions {
+                harness_home: harness_home.clone(),
+                max_bytes: 1,
+                max_archives: 1,
+                now_ms: 100,
+            })
+            .unwrap();
+        assert_eq!(
+            report.status,
+            RuntimeQueueReceiptCompactionStatus::Compacted
+        );
+
+        let hot = fs::read_to_string(queue_dir.join("run-once-receipts.jsonl")).unwrap();
+        assert_eq!(
+            count_run_once_status(&hot, "turn:retry", "failed-retryable"),
+            1,
+            "retry accounting must retain prior failure events for a runnable queue"
+        );
+        assert_eq!(
+            count_run_once_status(&hot, "turn:retry", "retry-pending"),
+            1
+        );
+        assert!(!hot.contains("turn:historical"));
+
+        let history = crate::runtime_receipt_history::find_runtime_queue_terminal_history(
+            &queue_dir,
+            &std::collections::BTreeSet::from(["trace:historical".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].queue_id, "turn:historical");
+        assert_eq!(history[0].status, "completed");
+        let status_counts =
+            crate::runtime_receipt_history::read_runtime_queue_receipt_history_status_counts(
+                &queue_dir,
+            )
+            .unwrap();
+        assert_eq!(status_counts.get("completed"), Some(&1));
+        assert!(status_counts.get("failed-retryable").is_none());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     fn temp_root(test_name: &str) -> PathBuf {

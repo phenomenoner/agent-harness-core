@@ -9,14 +9,14 @@ use crate::{HARNESS_BUILTIN_SKILL_NAMESPACE, SKILL_FILE_NAME};
 const BUILTIN_HARNESS_SKILL_SYNC_SCHEMA: &str = "agent-harness.builtin-skill-sync.v1";
 const BUILTIN_HARNESS_SKILL_MANIFEST_SCHEMA: &str = "agent-harness.builtin-skill-manifest.v1";
 const AGENT_WINDOWS_HARNESS_SKILL_ID: &str = "agent-windows-harness";
-const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.22";
+const AGENT_WINDOWS_HARNESS_SKILL_VERSION: &str = "0.1.23";
 const SKILL_AUTHORING_STANDARD_SKILL_ID: &str = "skill-authoring-standard";
 const SKILL_AUTHORING_STANDARD_SKILL_VERSION: &str = "0.1.0";
 
 const AGENT_WINDOWS_HARNESS_SKILL: &str = r#"---
 name: agent-windows-harness
 description: Operate the Rust Windows Agent Harness, channel commands, activation handoff, provider isolation, response tone, Codex prompt continuity policy, OperationPlan tracking, all-loop supervisor reconciliation, and self-improvement review.
-version: 0.1.22
+version: 0.1.23
 platforms: [windows]
 metadata:
   agent_harness:
@@ -276,9 +276,9 @@ Use status for operator-facing health checks before and after handoff:
 - Use `--expected-version <item-version>` for `update-item` and `delegate`; read the current item version from the active plan snapshot before mutating it.
 - Advance item status through `todo -> ready -> running -> review -> done`; use `blocked` for real blockers from active states and `canceled` when work is intentionally abandoned.
 - Progress `todo` events are telemetry/rendering hints only; they are not durable planning state and must not replace OperationPlan items for multi-step work.
-- When sub-agent tooling is available and the task is inside CK's authorized delegation envelope, use sub-agents by default for bounded sidecar inspection, plan/diff review, documentation gap checks, test matrix review, and disjoint implementation slices unless CK explicitly says not to delegate.
+- Delegation guidance is advisory reference, not a mandatory dispatch requirement. The executing main agent decides whether and how to delegate from task complexity, risk, latency, available capacity, and the need to keep the main lane responsive. When sub-agent tooling is available and the task is inside CK's authorized delegation envelope, bounded sidecar inspection, plan/diff review, documentation gap checks, test matrix review, and disjoint implementation slices are good delegation candidates.
 - CK's authorized delegation envelope includes explicit requests for sub-agents, delegation, parallel work, reviewer loops, smoke checks, long-running ops work, or naturally split sidecar inspection/verification tasks. It excludes tiny single-answer replies, destructive/live-control operations, auth or permission changes, external posts/messages, purchases/trades/spend, and any task where CK explicitly says not to delegate.
-- For implementation work that can be split into disjoint code ownership, prefer `gpt-5.3-codex-spark` worker sub-agents, with `gpt-5.4-mini` fallback when Spark is unavailable, spawn is rejected, or a narrower retry is appropriate. Use Codex-authenticated worker lanes only; if provider/auth routing is not visible in the sub-agent receipt, record Codex-auth status as unverified rather than assuming it.
+- For delegated work, prefer an enabled, task-appropriate Codex-authenticated GPT-5.6 family model. The main agent chooses the exact model and a catalog-supported effort level dynamically per task; do not invent an unsupported level or treat `ultra` as an ordinary effort level. Use Codex-authenticated worker lanes only; if provider/auth routing is not visible in the sub-agent receipt, record Codex-auth status as unverified rather than assuming it.
 - Every sub-agent assignment must include the intended root path, bounded scope, expected output, owned files/modules, do-not-edit scope, safe verification, timeout expectation, and the note that workers are not alone in the codebase.
 - When waiting for a sub-agent, always use an explicit `timeout_ms`; if it times out, decide whether the result is critical-path. Continue locally if non-critical; retry at most once with a shorter, clearer prompt if critical.
 - Close completed, timed-out, irrelevant, or invalid-dispatch sub-agents promptly. Keep live gateway control, destructive shell actions, final cutover, auth/permission changes, and anything that can interrupt the active communication channel on the main-agent path.
@@ -625,6 +625,16 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn builtin_harness_skill_keeps_delegated_model_and_effort_selection_dynamic() {
+        assert!(AGENT_WINDOWS_HARNESS_SKILL.contains("catalog-supported effort level"));
+        assert!(
+            AGENT_WINDOWS_HARNESS_SKILL
+                .contains("task-appropriate Codex-authenticated GPT-5.6 family model")
+        );
+        assert!(!AGENT_WINDOWS_HARNESS_SKILL.contains("gpt-5.6-luna with effort `max`"));
+    }
 
     #[test]
     fn sync_builtin_harness_skills_writes_skill_and_manifest() {

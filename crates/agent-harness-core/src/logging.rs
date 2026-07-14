@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::loop_health::process_alive_for_pid;
+
 const HARNESS_LOG_SCHEMA: &str = "agent-harness.log-event.v1";
 const HARNESS_LOG_ROTATION_SCHEMA: &str = "agent-harness.log-rotation.v1";
 const JSONL_APPEND_LOCK_STALE_MS: u128 = 30_000;
@@ -262,6 +264,36 @@ pub fn append_jsonl_value(path: &Path, value: &impl Serialize) -> io::Result<()>
     Ok(())
 }
 
+/// Runs a transaction that changes a JSONL ledger while holding the same lock
+/// used by normal appenders. Callers that compact or replace a ledger must use
+/// this helper instead of racing a concurrent append.
+pub fn with_jsonl_append_lock<T>(
+    path: &Path,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _guard = JsonlAppendLock::acquire(path)?;
+    operation()
+}
+
+/// Runs a JSONL-ledger operation only when the append lock is immediately
+/// available.  Hot paths use this to prefer a safe materialized snapshot over
+/// waiting behind bounded maintenance such as receipt compaction.
+pub(crate) fn try_with_jsonl_append_lock<T>(
+    path: &Path,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<Option<T>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let Some(_guard) = JsonlAppendLock::try_acquire(path)? else {
+        return Ok(None);
+    };
+    operation().map(Some)
+}
+
 pub fn append_jsonl_value_once_by_event_key(
     path: &Path,
     value: &impl Serialize,
@@ -319,15 +351,8 @@ impl JsonlAppendLock {
         let lock_path = jsonl_append_lock_path(jsonl_path);
         let start = SystemTime::now();
         loop {
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                Ok(mut file) => {
-                    let _ = writeln!(file, "pid={}", std::process::id());
-                    return Ok(Self { path: lock_path });
-                }
+            match Self::try_create(&lock_path) {
+                Ok(lock) => return Ok(lock),
                 Err(error) if lock_acquire_error_is_busy(&error) => {
                     remove_stale_jsonl_lock(&lock_path)?;
                     let elapsed = start.elapsed().map_err(io::Error::other)?.as_millis();
@@ -345,6 +370,33 @@ impl JsonlAppendLock {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    fn try_acquire(jsonl_path: &Path) -> io::Result<Option<Self>> {
+        let lock_path = jsonl_append_lock_path(jsonl_path);
+        match Self::try_create(&lock_path) {
+            Ok(lock) => Ok(Some(lock)),
+            Err(error) if lock_acquire_error_is_busy(&error) => {
+                remove_stale_jsonl_lock(&lock_path)?;
+                match Self::try_create(&lock_path) {
+                    Ok(lock) => Ok(Some(lock)),
+                    Err(error) if lock_acquire_error_is_busy(&error) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn try_create(lock_path: &Path) -> io::Result<Self> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)?;
+        let _ = writeln!(file, "pid={}", std::process::id());
+        Ok(Self {
+            path: lock_path.to_path_buf(),
+        })
     }
 }
 
@@ -502,7 +554,37 @@ fn jsonl_needs_leading_newline(path: &Path) -> io::Result<bool> {
 }
 
 fn remove_stale_jsonl_lock(lock_path: &Path) -> io::Result<()> {
+    // A JSONL append lock can now protect a bounded but comparatively expensive
+    // receipt compaction.  Age alone is not a safe ownership signal: stealing
+    // a live writer's lock can allow an append to race a snapshot replacement.
+    // The owner PID is written when the lock is acquired, so retain a lock held
+    // by a process we can still prove is alive.  If the owner is dead, recover
+    // the orphan immediately; malformed/unknown lock files retain the legacy
+    // age-based fallback.
+    if let Some(owner_pid) = jsonl_append_lock_owner_pid(lock_path) {
+        match process_alive_for_pid(owner_pid) {
+            Some(true) => return Ok(()),
+            Some(false) => {
+                match fs::remove_file(lock_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) if lock_acquire_error_is_busy(&error) => {}
+                    Err(error) => return Err(error),
+                }
+                return Ok(());
+            }
+            None => {}
+        }
+    }
     remove_stale_lock(lock_path, JSONL_APPEND_LOCK_STALE_MS)
+}
+
+fn jsonl_append_lock_owner_pid(lock_path: &Path) -> Option<i64> {
+    let text = fs::read_to_string(lock_path).ok()?;
+    text.lines().find_map(|line| {
+        line.strip_prefix("pid=")
+            .and_then(|value| value.trim().parse::<i64>().ok())
+    })
 }
 
 fn remove_stale_lock(lock_path: &Path, stale_ms: u128) -> io::Result<()> {
@@ -562,7 +644,11 @@ pub fn current_log_time_ms() -> io::Result<i64> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(windows)]
+    use std::fs::FileTimes;
     use std::thread;
+    #[cfg(windows)]
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -633,6 +719,53 @@ mod tests {
         }
         assert!(!jsonl_append_lock_path(&path).exists());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn jsonl_append_lock_recovers_dead_owner_without_waiting_for_stale_deadline() {
+        let root =
+            temp_root("jsonl_append_lock_recovers_dead_owner_without_waiting_for_stale_deadline");
+        let path = root.join("state").join("receipts.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lock = jsonl_append_lock_path(&path);
+        fs::write(&lock, "pid=0\n").unwrap();
+
+        remove_stale_jsonl_lock(&lock).unwrap();
+
+        assert!(
+            !lock.exists(),
+            "a lock owned by a definitively dead process must be recovered promptly"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn jsonl_append_lock_never_steals_a_live_owner_after_the_legacy_stale_deadline() {
+        let root = temp_root(
+            "jsonl_append_lock_never_steals_a_live_owner_after_the_legacy_stale_deadline",
+        );
+        let path = root.join("state").join("receipts.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lock = jsonl_append_lock_path(&path);
+        fs::write(&lock, format!("pid={}\n", std::process::id())).unwrap();
+        let old = SystemTime::now()
+            .checked_sub(Duration::from_millis(JSONL_APPEND_LOCK_STALE_MS as u64 + 1))
+            .unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(old))
+            .unwrap();
+
+        remove_stale_jsonl_lock(&lock).unwrap();
+
+        assert!(
+            lock.exists(),
+            "a long-running compaction owner must retain its append lock while alive"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

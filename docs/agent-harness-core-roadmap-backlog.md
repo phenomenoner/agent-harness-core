@@ -2,8 +2,7 @@
 
 Date: 2026-06-12
 
-Source roadmap: `D:\Warehouse\Research\Claude_Discuss\ai-agent-harness-review\agent-harness-core-roadmap-2026-06-12.md`
-Review baseline: `D:\Warehouse\Research\Claude_Discuss\ai-agent-harness-review\agent-harness-comparative-review-2026-06-12.md`
+Source inputs: architecture roadmap and comparative review completed on 2026-06-12. The private review notes are not part of the public distribution.
 
 This is the canonical follow-up development backlog for `agent-harness-core` after the 2026-06-12 review. It incorporates the roadmap recommendations and intentionally ignores the roadmap time estimates. As of the 2026-06-12 staging pass, this document also tracks implementation status, review evidence, and remaining live/soak gates.
 

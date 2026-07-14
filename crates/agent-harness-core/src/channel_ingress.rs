@@ -1,32 +1,27 @@
-use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
+use crate::latency::{LatencyStage, latency_receipts_file, record_latency_stage};
+use crate::runtime_pending_index::pending_queue_id_exists_from_index;
+use crate::runtime_receipt_history::find_runtime_queue_terminal_history;
+use crate::runtime_worker::{refresh_runtime_queue_state_index, terminal_run_once_ids_from_index};
 use crate::{
-    AgentSource, ChannelCommandApplyOptions, ChannelCommandApplyReport, ChannelOutboundMessage,
+    AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus, AgentSource,
+    ChannelCommandApplyOptions, ChannelCommandApplyReport, ChannelOutboundMessage,
     ChannelStepAction, HarnessLogEvent, HarnessLogLevel, InboundMediaArtifact,
     RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport, SkillIndex, TurnPlanInput,
-    append_harness_log, apply_channel_command_step, build_channel_step, build_turn_plan,
+    append_agent_progress_event, append_channel_outbox_message, append_harness_log,
+    apply_channel_command_step, build_channel_step, build_turn_plan_for_account,
     load_agent_registry,
 };
 
 const CHANNEL_RECEIVE_SCHEMA: &str = "agent-harness.channel-receive.v1";
 const INGRESS_CLAIM_SCHEMA: &str = "agent-harness.ingress-claim.v1";
 const INGRESS_CLAIM_TTL_MS: i64 = 24 * 60 * 60 * 1000;
-const RUNTIME_TERMINAL_STATUSES: &[&str] = &[
-    "completed",
-    "timeout",
-    "failed-terminal",
-    "canceled",
-    "skipped",
-    "dead-letter",
-    "suppressed",
-];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelReceiveOptions {
@@ -131,7 +126,17 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
     fs::create_dir_all(&channel_state_dir)?;
 
     let registry = load_agent_registry(&options.source)?;
-    let turn = build_turn_plan(
+    // Every provider ingress receives an explicit account axis.  Legacy
+    // callers without an account are deterministically placed in `default`,
+    // never in a wildcard/shared lane.
+    let account_id = options
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("default")
+        .to_string();
+    let turn = build_turn_plan_for_account(
         &options.source,
         &registry,
         &options.skill_index,
@@ -147,9 +152,10 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
             session_hint: options.session_key,
             skill_limit: options.skill_limit,
         },
+        Some(account_id.clone()),
     )?;
     let mut step = build_channel_step(&registry, &turn);
-    step.account_id = options.account_id.clone();
+    step.account_id = turn.account_id.clone().or_else(|| Some(account_id.clone()));
     let command_name = turn
         .command
         .as_ref()
@@ -157,7 +163,7 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
     let mut warnings = step.warnings.clone();
     let inbound_canonical_id = inbound_canonical_id(
         &options.platform,
-        options.account_id.as_deref(),
+        Some(account_id.as_str()),
         &options.channel_id,
         &options.user_id,
         options.agent_id.as_deref(),
@@ -181,7 +187,7 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
             &path,
             canonical_id,
             &options.platform,
-            options.account_id.clone(),
+            Some(account_id.clone()),
             &options.channel_id,
             &options.user_id,
             options.agent_id.clone(),
@@ -195,7 +201,7 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
                 let receipt = ChannelReceiveReceipt {
                     status: ChannelReceiveStatus::DuplicateSuppressed,
                     platform: options.platform,
-                    account_id: options.account_id.clone(),
+                    account_id: Some(account_id.clone()),
                     channel_id: options.channel_id,
                     user_id: options.user_id,
                     session_key: step.session_key.clone(),
@@ -261,9 +267,12 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
                         now_ms: options.now_ms,
                     },
                 )?;
-                let outbound =
-                    with_account_id(apply.outbound_messages.clone(), options.account_id.clone());
-                append_outbound_messages(&options.harness_home, &outbox_file, &outbound)?;
+                let mut outbound =
+                    with_account_id(apply.outbound_messages.clone(), Some(account_id.clone()));
+                warnings.extend(append_outbound_messages(
+                    &options.harness_home,
+                    &mut outbound,
+                )?);
                 (
                     ChannelReceiveStatus::CommandApplied,
                     Some(apply.clone()),
@@ -289,6 +298,51 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
                 if let (Some(path), Some(queue_id)) = (claim_file.as_ref(), queue_id.as_deref()) {
                     update_ingress_claim_queue_id(path, queue_id)?;
                 }
+                if let (Some(queue_id), Some(item)) = (queue_id.as_deref(), queue.item.as_ref()) {
+                    if let Err(error) = record_latency_stage(
+                        latency_receipts_file(&options.harness_home),
+                        queue_id,
+                        &item.runtime_class,
+                        LatencyStage::InboundReceived,
+                        Some(options.now_ms),
+                    ) {
+                        warnings.push(format!(
+                            "failed to record inbound latency stage for `{queue_id}`: {error}"
+                        ));
+                    }
+                }
+                // The queue write is durable before this event is appended.  Emit a
+                // user-visible root-lane status here rather than waiting for prompt
+                // assembly, virtual-session evidence, or the backend process to
+                // start.  A progress failure must not invalidate a successfully
+                // accepted provider message, so preserve the turn and surface the
+                // observability failure as a warning instead.
+                if let Some(queue_id) = queue_id.as_deref() {
+                    let progress_context = AgentProgressContext {
+                        queue_id: queue_id.to_string(),
+                        agent_id: turn.agent.as_ref().map(|agent| agent.id.clone()),
+                        account_id: Some(account_id.clone()),
+                        thread_id: None,
+                        session_key: step.session_key.clone(),
+                        platform: options.platform.clone(),
+                        channel_id: options.channel_id.clone(),
+                        user_id: options.user_id.clone(),
+                    };
+                    let event = AgentProgressEvent::new(
+                        &progress_context,
+                        AgentProgressKind::Runtime,
+                        "queued",
+                        "Queued; preparing your request.",
+                        AgentProgressStatus::Started,
+                        options.now_ms,
+                    )
+                    .source("channel-ingress");
+                    if let Err(error) = append_agent_progress_event(&options.harness_home, &event) {
+                        warnings.push(format!(
+                        "failed to append immediate queued progress event for `{queue_id}`: {error}"
+                    ));
+                    }
+                }
                 warnings.extend(queue.warnings.clone());
                 (
                     ChannelReceiveStatus::AgentTurnQueued,
@@ -300,9 +354,12 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
                 )
             }
             ChannelStepAction::NoAgentAvailable => {
-                let outbound =
-                    with_account_id(step.outbound_messages.clone(), options.account_id.clone());
-                append_outbound_messages(&options.harness_home, &outbox_file, &outbound)?;
+                let mut outbound =
+                    with_account_id(step.outbound_messages.clone(), Some(account_id.clone()));
+                warnings.extend(append_outbound_messages(
+                    &options.harness_home,
+                    &mut outbound,
+                )?);
                 (
                     ChannelReceiveStatus::ErrorReplied,
                     None,
@@ -317,7 +374,7 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
     let receipt = ChannelReceiveReceipt {
         status,
         platform: options.platform,
-        account_id: options.account_id.clone(),
+        account_id: Some(account_id.clone()),
         channel_id: options.channel_id,
         user_id: options.user_id,
         session_key: step.session_key.clone(),
@@ -380,11 +437,14 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
 
 fn append_outbound_messages(
     harness_home: &Path,
-    path: &Path,
-    messages: &[ChannelOutboundMessage],
-) -> io::Result<()> {
-    for message in messages {
-        append_json_line(path, message)?;
+    messages: &mut [ChannelOutboundMessage],
+) -> io::Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    for message in messages.iter_mut() {
+        let report = append_channel_outbox_message(harness_home, message)?;
+        if let Some(warning) = report.index_warning {
+            warnings.push(warning);
+        }
     }
     if !messages.is_empty() {
         let wake_file = harness_home
@@ -398,7 +458,7 @@ fn append_outbound_messages(
             "channel ingress outbound messages appended",
         );
     }
-    Ok(())
+    Ok(warnings)
 }
 
 fn with_account_id(
@@ -560,68 +620,16 @@ fn cleanup_expired_ingress_claims(
 
 fn runtime_queue_id_active(harness_home: &Path, queue_id: &str) -> io::Result<bool> {
     let queue_dir = harness_home.join("state").join("runtime-queue");
-    if !runtime_queue_pending_contains(&queue_dir.join("pending.jsonl"), queue_id)? {
+    let mut warnings = Vec::new();
+    if !pending_queue_id_exists_from_index(&queue_dir, queue_id, &mut warnings)? {
         return Ok(false);
     }
-    let terminal_ids = read_runtime_receipt_queue_ids(
-        &queue_dir.join("run-once-receipts.jsonl"),
-        RUNTIME_TERMINAL_STATUSES,
-    )?;
-    Ok(!terminal_ids.contains(queue_id))
-}
-
-fn runtime_queue_pending_contains(path: &Path, queue_id: &str) -> io::Result<bool> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        if queue_id_from_value(&value).as_deref() == Some(queue_id) {
-            return Ok(true);
-        }
+    let hot_index = refresh_runtime_queue_state_index(&queue_dir, &mut warnings)?;
+    if terminal_run_once_ids_from_index(&hot_index).contains(queue_id) {
+        return Ok(false);
     }
-    Ok(false)
-}
-
-fn read_runtime_receipt_queue_ids(path: &Path, statuses: &[&str]) -> io::Result<BTreeSet<String>> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(error) => return Err(error),
-    };
-    let mut queue_ids = BTreeSet::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        let status = value.get("status").and_then(Value::as_str);
-        if status.is_some_and(|status| statuses.contains(&status))
-            && let Some(queue_id) = queue_id_from_value(&value)
-        {
-            queue_ids.insert(queue_id);
-        }
-    }
-    Ok(queue_ids)
-}
-
-fn queue_id_from_value(value: &Value) -> Option<String> {
-    value
-        .get("queueId")
-        .or_else(|| value.get("queue_id"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
+    let identifiers = std::collections::BTreeSet::from([queue_id.to_string()]);
+    Ok(find_runtime_queue_terminal_history(&queue_dir, &identifiers)?.is_empty())
 }
 
 fn normalize_key_part(value: &str) -> String {
@@ -653,7 +661,12 @@ fn fnv1a_64_hex(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::backend_reasoning::ReasoningPreference;
-    use crate::{build_source_skill_index, read_channel_session_state};
+    use crate::{
+        ChannelStateLane, build_source_skill_index,
+        latency::{LatencyStage, latency_receipts_file, read_latest_queue_receipt},
+        read_channel_session_state_v2,
+    };
+    use serde_json::Value;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -688,7 +701,9 @@ mod tests {
         assert_eq!(report.command_name.as_deref(), Some("model"));
         assert_eq!(report.outbound_messages.len(), 1);
         assert!(report.outbox_file.is_file());
-        let state = read_channel_session_state(&harness_home, "telegram", "dm", "user")
+        let lane =
+            ChannelStateLane::new("telegram", Some("default"), "dm", "user", "main").unwrap();
+        let state = read_channel_session_state_v2(&harness_home, &lane)
             .unwrap()
             .unwrap();
         assert_eq!(state.model_override_provider.as_deref(), Some("openrouter"));
@@ -726,7 +741,7 @@ mod tests {
         let report = receive_channel_message(ChannelReceiveOptions {
             source,
             runtime_workspace: None,
-            harness_home,
+            harness_home: harness_home.clone(),
             skill_index: skills,
             platform: "telegram".to_string(),
             account_id: None,
@@ -750,6 +765,26 @@ mod tests {
         let item = queue.item.unwrap();
         assert_eq!(item.provider.as_deref(), Some("openrouter"));
         assert_eq!(item.model.as_deref(), Some("anthropic/claude-sonnet-4"));
+        let events = fs::read_to_string(crate::agent_progress_events_file(&harness_home)).unwrap();
+        let queued = events
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|event| event["queueId"] == report.queue_id.as_deref().unwrap())
+            .expect("an enqueued human turn emits an immediate queued progress event");
+        assert_eq!(queued["status"], "started");
+        assert_eq!(queued["kind"], "runtime");
+        assert_eq!(queued["label"], "queued");
+        assert_eq!(queued["agentId"], "main");
+        let latency = read_latest_queue_receipt(
+            latency_receipts_file(&harness_home),
+            report.queue_id.as_deref().unwrap(),
+        )
+        .unwrap()
+        .expect("an accepted inbound turn records its ingress timestamp");
+        assert_eq!(
+            latency.stages.get(&LatencyStage::InboundReceived).copied(),
+            Some(1001)
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -805,7 +840,10 @@ mod tests {
                 .exists(),
             "thinking commands must not enqueue model turns"
         );
-        let state = read_channel_session_state(&harness_home, "discord", "dm-42", "user-7")
+        let lane =
+            ChannelStateLane::new("discord", Some("discord-main"), "dm-42", "user-7", "main")
+                .unwrap();
+        let state = read_channel_session_state_v2(&harness_home, &lane)
             .unwrap()
             .unwrap();
         assert!(matches!(
@@ -1048,7 +1086,10 @@ mod tests {
             duplicate.inbound_canonical_id.as_deref(),
             first.inbound_canonical_id.as_deref()
         );
-        let state = read_channel_session_state(&harness_home, "discord", "dm-42", "user-7")
+        let lane =
+            ChannelStateLane::new("discord", Some("discord-main"), "dm-42", "user-7", "main")
+                .unwrap();
+        let state = read_channel_session_state_v2(&harness_home, &lane)
             .unwrap()
             .unwrap();
         assert_eq!(state.model_override_provider.as_deref(), Some("openrouter"));
@@ -1379,6 +1420,44 @@ mod tests {
             }"#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn historical_terminal_queue_is_not_kept_active_by_a_stale_pending_claim() {
+        let root = temp_root("historical_terminal_queue_is_not_kept_active");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let staged = crate::runtime_receipt_history::stage_runtime_queue_receipt_history(
+            &queue_dir,
+            "ingress-history",
+            br#"{"queueId":"queue-terminal","status":"completed","reason":"terminal"}
+"#,
+            b"",
+            &std::collections::HashSet::new(),
+            100,
+        )
+        .unwrap();
+        crate::runtime_receipt_history::commit_runtime_queue_receipt_history(&staged, 101).unwrap();
+        fs::write(
+            queue_dir.join("pending.jsonl"),
+            [
+                serde_json::json!({"queueId":"queue-terminal","status":"queued"}).to_string(),
+                serde_json::json!({"queueId":"other-queue","status":"queued"}).to_string(),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        fs::write(queue_dir.join("run-once-receipts.jsonl"), "").unwrap();
+
+        assert!(!runtime_queue_id_active(&harness_home, "queue-terminal").unwrap());
+        assert!(
+            runtime_queue_id_active(&harness_home, "other-queue").unwrap(),
+            "an unrelated current pending queue must remain active"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     fn temp_root(test_name: &str) -> PathBuf {

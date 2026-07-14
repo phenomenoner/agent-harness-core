@@ -37,20 +37,22 @@ use agent_harness_core::{
     CodexRuntimeCompletionReport, CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReport,
     CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimePreflightOptions,
     CodexRuntimePreflightReport, CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy,
-    ContextPackParseOptions, ContextRolloverRequeuePreparedOptions, CreateOperationPlanOptions,
-    CreateOperationPlanOptionsV2, CronRunControlAction, CronRunControlOptions, CronRunListOptions,
-    CronSchedulerLintStatus, CronSchedulerRunOnceOptions, CronSchedulerTickStatus,
-    DEFAULT_DREAM_DIRECTOR_MAX_CHARS, DEFAULT_DREAM_DIRECTOR_SOURCE_MAX_AGE_HOURS,
-    DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM, DEFAULT_MEMORY_BACKFILL_BATCH_SIZE,
-    DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS, DEFAULT_MEMORY_BACKFILL_MAX_ITEMS,
-    DEFAULT_MEMORY_BACKFILL_RATE_LIMIT_PER_MINUTE, DEFAULT_MEMORY_BACKFILL_RETRY_CAP,
-    DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION, DEFAULT_MEMORY_OWNER_HEARTBEAT_MAX_AGE_MS,
-    DeterministicCronPlan, DeterministicCronPlanInput, DeterministicCronWorkerEnqueueOptions,
-    DreamDirectorSendOptions, DriftCheckOptions, DryRunImportOptions, ExecuteImportOptions,
-    HarnessLogEvent, HarnessLogLevel, HarnessLogRotationOptions, HarnessMetricsOptions,
-    HarnessStatusOptions, HarnessStatusReport, HealthzOptions, ImportPhaseStatus, ImportReport,
-    InboundMediaArtifact, InboundMediaDownloadStatus, InboundMediaModelAttachmentStatus,
-    InboundMediaSelectedVariant, LearningProposalOptions, LiveControlAction, McpRequestOptions,
+    ContextPackParseOptions, ContextRolloverRequeuePreparedOptions,
+    ControlledCoordinatorSmokeChildV1, ControlledCoordinatorSmokeLaneV1,
+    ControlledCoordinatorSmokeOptionsV1, CreateOperationPlanOptions, CreateOperationPlanOptionsV2,
+    CronRunControlAction, CronRunControlOptions, CronRunListOptions, CronSchedulerLintStatus,
+    CronSchedulerRunOnceOptions, CronSchedulerTickStatus, DEFAULT_DREAM_DIRECTOR_MAX_CHARS,
+    DEFAULT_DREAM_DIRECTOR_SOURCE_MAX_AGE_HOURS, DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM,
+    DEFAULT_MEMORY_BACKFILL_BATCH_SIZE, DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS,
+    DEFAULT_MEMORY_BACKFILL_MAX_ITEMS, DEFAULT_MEMORY_BACKFILL_RATE_LIMIT_PER_MINUTE,
+    DEFAULT_MEMORY_BACKFILL_RETRY_CAP, DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION,
+    DEFAULT_MEMORY_OWNER_HEARTBEAT_MAX_AGE_MS, DeterministicCronPlan, DeterministicCronPlanInput,
+    DeterministicCronWorkerEnqueueOptions, DreamDirectorSendOptions, DriftCheckOptions,
+    DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel,
+    HarnessLogRotationOptions, HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport,
+    HealthzOptions, ImportPhaseStatus, ImportReport, InboundMediaArtifact,
+    InboundMediaDownloadStatus, InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant,
+    LearningProposalOptions, LedgerMaintenanceRunOptions, LiveControlAction, McpRequestOptions,
     MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport, MemoryCanvasWorkerStatus,
     MemoryCredentialsExportOptions, MemoryCredentialsExportReport, MemoryEmbeddingBackfillLane,
     MemoryEmbeddingBackfillOptions, MemoryEmbeddingBackfillReport, MemoryHookAdapterOptions,
@@ -72,11 +74,11 @@ use agent_harness_core::{
     QueueShadowRecordOptions, RenderedRichUnit, RenderedRichUnitKind,
     RichPresentationValidationOptions, RuntimeQueueCapacityOptions, RuntimeQueueControlAction,
     RuntimeQueueControlOptions, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
-    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeRunOnceOptions,
-    RuntimeRunOnceReport, RuntimeRunOnceStatus, ScopedStopOptions, ScopedStopTarget,
-    SecurityScanOptions, SkillApplyOptions, SkillArchiveOptions, SkillAutonomousApplyOptions,
-    SkillDoctorOptions, SkillDoctorStatus, SkillGuardOptions, SkillIndex,
-    SkillLearningProposalOperation, SkillLearningProposalStatus, SkillLearningSignal,
+    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeQueueReceiptCompactionOptions,
+    RuntimeRunOnceOptions, RuntimeRunOnceReport, RuntimeRunOnceStatus, ScopedStopOptions,
+    ScopedStopTarget, SecurityScanOptions, SkillApplyOptions, SkillArchiveOptions,
+    SkillAutonomousApplyOptions, SkillDoctorOptions, SkillDoctorStatus, SkillGuardOptions,
+    SkillIndex, SkillLearningProposalOperation, SkillLearningProposalStatus, SkillLearningSignal,
     SkillLifecycleCuratorOptions, SkillLifecycleCuratorReport, SkillLintOptions,
     SkillPackConflictPolicy, SkillPackExportOptions, SkillPackImportOptions,
     SkillPackRemoveOptions, SkillPinOptions, SkillProposalActionOptions, SkillProposalListOptions,
@@ -91,27 +93,28 @@ use agent_harness_core::{
     WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport, WorkerCancelOptions,
     WorkerEnqueueOptions, WorkerEnqueueReport, WorkerJobKind, WorkerReapStaleOptions,
     WorkerRunOnceOptions, WorkerRunOnceReport, WorkerRunOnceStatus, WorkerStatusOptions,
-    acquire_budget, add_operation_plan_item, append_harness_log, append_jsonl_value,
-    apply_channel_command_step, apply_skill_proposal, assemble_prompt_bundle,
+    acquire_budget, add_operation_plan_item, append_channel_outbox_message, append_harness_log,
+    append_jsonl_value, apply_channel_command_step, apply_skill_proposal, assemble_prompt_bundle,
     autonomous_apply_skill_proposal, block_operation_plan, build_channel_step,
     build_dry_run_report, build_harness_skill_index, build_import_plan, build_runtime_skill_index,
     build_source_skill_index, build_turn_plan, cancel_worker_job, check_activation_readiness,
     check_config_drift, check_tool_description_pin, collect_gateway_restart_status,
     collect_harness_metrics, collect_harness_status, collect_healthz,
     collect_inbound_media_cache_report, collect_ops_cutover_status, collect_token_efficiency,
-    collect_worker_status, comment_on_operation_plan, compare_channel_turn_shadow,
-    complete_operation_plan, control_cron_run, control_runtime_queue_item,
-    create_learning_proposal, create_operation_plan, create_operation_plan_v2, create_ops_backup,
-    create_skill_archive_proposal, create_skill_learning_proposal, current_log_time_ms,
-    default_supervisor_child_specs, delegate_operation_plan_item, enqueue_channel_step,
+    collect_worker_status, comment_on_operation_plan, compact_runtime_queue_receipts_if_needed,
+    compare_channel_turn_shadow, complete_operation_plan, control_cron_run,
+    control_runtime_queue_item, create_learning_proposal, create_operation_plan,
+    create_operation_plan_v2, create_ops_backup, create_skill_archive_proposal,
+    create_skill_learning_proposal, current_log_time_ms, default_supervisor_child_specs,
+    delegate_operation_plan_item, enqueue_channel_step, enqueue_controlled_coordinator_smoke,
     enqueue_deterministic_cron_workers, enqueue_native_cron_workers, enqueue_subagent_workers,
     enqueue_worker_job, ensure_memory_owner_state, evaluate_admission, evaluate_prompt_reduction,
     evaluate_supervisor_children, execute_import, export_harness_registry_files,
     export_memory_credentials, export_skill_pack, get_vault_secret, handle_mcp_request,
     import_skill_pack, inspect_openclaw_mem_service, inspect_runtime_queue_capacity,
-    invariant_catalog, inventory, latest_agent_progress_event_line_for_queue, lint_cron_scheduler,
-    lint_skill_file, list_background_tasks, list_cron_runs, list_operation_plans,
-    list_skill_proposals, load_agent_registry, load_deterministic_cron_store,
+    invariant_catalog, inventory, latest_agent_progress_event_identity_for_queue,
+    lint_cron_scheduler, lint_skill_file, list_background_tasks, list_cron_runs,
+    list_operation_plans, list_skill_proposals, load_agent_registry, load_deterministic_cron_store,
     load_native_cron_store, load_subagent_ledger, parse_channel_command, parse_context_pack,
     plan_agent_progress_delivery, plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron,
     plan_native_cron, plan_subagents, preflight_codex_runtime, prepare_openclaw_mem_local_owner,
@@ -119,32 +122,34 @@ use agent_harness_core::{
     promote_operation_plan_items_from_dependencies, propose_openclaw_mem_service_memory,
     put_vault_secret, reap_stale_worker_jobs, recall_openclaw_mem_service, receive_channel_message,
     reconcile_supervisor_inventory, record_agent_progress_delivery_with_context,
-    record_channel_delivery, record_channel_turn_shadow, record_codex_runtime_completion,
-    record_memory_owner_endpoint_probe, record_memory_owner_heartbeat,
-    record_memory_owner_shadow_receipt, record_memory_owner_trust_scope_receipt,
-    record_ops_control, record_ops_cutover_apply, record_ops_cutover_approval,
-    record_ops_cutover_receipt, record_ops_cutover_request, record_scoped_stop,
-    record_subagent_lifecycle, record_supervise_deploy_canary, recover_memory_owner_state,
-    reject_skill_proposal, release_agent_progress_surface_claim, release_checklist,
-    remove_skill_pack, render_rich_presentation_batch_for_discord,
+    record_channel_delivery, record_channel_delivery_for_source_queue, record_channel_turn_shadow,
+    record_codex_runtime_completion, record_memory_owner_endpoint_probe,
+    record_memory_owner_heartbeat, record_memory_owner_shadow_receipt,
+    record_memory_owner_trust_scope_receipt, record_ops_control, record_ops_cutover_apply,
+    record_ops_cutover_approval, record_ops_cutover_receipt, record_ops_cutover_request,
+    record_scoped_stop, record_subagent_lifecycle, record_supervise_deploy_canary,
+    recover_memory_owner_state, reject_skill_proposal, release_agent_progress_surface_claim,
+    release_checklist, remove_skill_pack, render_rich_presentation_batch_for_discord,
     render_rich_presentation_batch_for_telegram, request_memory_owner_promotion,
     requeue_prepared_context_rollover, resolve_channel_identity,
-    resolve_virtual_session_working_context, restore_skill_from_archive,
-    rotate_harness_log_if_needed, run_channel_once, run_codex_runtime, run_cron_scheduler_once,
-    run_dream_director_send, run_memory_canvas_worker, run_memory_embedding_backfill,
-    run_memory_hook_adapter, run_openclaw_mem_read_path_smoke, run_public_hygiene,
-    run_runtime_queue_once, run_skill_doctor, run_skill_guard, run_skill_lifecycle_curator,
-    run_worker_once, runtime_worker::reconcile_runtime_queue_leases_for_generation,
-    scan_security_boundaries, scenario_matrix_catalog, schema_registry_entries,
-    search_imported_memory, search_imported_vector_memory, select_skills, set_skill_pin,
-    show_operation_plan, show_subagent_lifecycle, skill_curator_receipts_dir,
-    store_openclaw_mem_service_memory, subagent_lifecycle_receipts_file,
-    subagent_lifecycle_snapshot_file, sync_builtin_harness_skills, synthesize_skill,
-    tool_description_hash, trace_harness_event, update_operation_plan_item, upsert_background_task,
-    validate_harness_config, view_skill, write_channel_step, write_deterministic_cron_plan,
-    write_json_atomic, write_memory_search_receipt, write_memory_vector_recall_receipt,
-    write_native_cron_plan, write_prompt_bundle, write_report_files, write_skill_index,
-    write_subagent_plan, write_task_entity, write_turn_plan, write_windows_supervisor_plan,
+    resolve_runtime_queue_typing_context_nonblocking, resolve_virtual_session_working_context,
+    restore_skill_from_archive, rotate_harness_log_if_needed, run_channel_once, run_codex_runtime,
+    run_cron_scheduler_once, run_dream_director_send,
+    run_ledger_maintenance_once as run_ledger_maintenance_once_core, run_memory_canvas_worker,
+    run_memory_embedding_backfill, run_memory_hook_adapter, run_openclaw_mem_read_path_smoke,
+    run_public_hygiene, run_runtime_queue_once, run_skill_doctor, run_skill_guard,
+    run_skill_lifecycle_curator, run_worker_once,
+    runtime_worker::reconcile_runtime_queue_leases_for_generation, scan_security_boundaries,
+    scenario_matrix_catalog, schema_registry_entries, search_imported_memory,
+    search_imported_vector_memory, select_skills, set_skill_pin, show_operation_plan,
+    show_subagent_lifecycle, skill_curator_receipts_dir, store_openclaw_mem_service_memory,
+    subagent_lifecycle_receipts_file, subagent_lifecycle_snapshot_file,
+    sync_builtin_harness_skills, synthesize_skill, tool_description_hash, trace_harness_event,
+    update_operation_plan_item, upsert_background_task, validate_harness_config, view_skill,
+    write_channel_step, write_deterministic_cron_plan, write_json_atomic,
+    write_memory_search_receipt, write_memory_vector_recall_receipt, write_native_cron_plan,
+    write_prompt_bundle, write_report_files, write_skill_index, write_subagent_plan,
+    write_task_entity, write_turn_plan, write_windows_supervisor_plan,
 };
 
 const DEFAULT_CODEX_TIMEOUT_MS: u64 = 30 * 60 * 1000;
@@ -174,6 +179,8 @@ fn main() {
         "cron-run-control" => run_cron_run_control(&rest),
         "config-validate" => run_config_validate(&rest),
         "log-rotate" => run_log_rotate(&rest),
+        "runtime-receipt-compact" => run_runtime_receipt_compact(&rest),
+        "ledger-maintenance-once" => run_ledger_maintenance_once_cmd(&rest),
         "queue-retry" => run_runtime_queue_control(&rest, RuntimeQueueControlAction::Retry),
         "queue-skip" => run_runtime_queue_control(&rest, RuntimeQueueControlAction::Skip),
         "healthz" => run_healthz(&rest),
@@ -268,6 +275,7 @@ fn main() {
         "media-cache-status" => run_media_cache_status(&rest),
         "progress-delivery-once" => run_progress_delivery_once(&rest),
         "progress-delivery-loop" => run_progress_delivery_loop(&rest),
+        "ledger-maintenance-loop" => run_ledger_maintenance_loop(&rest),
         "telegram-probe" => run_telegram_probe(&rest),
         "telegram-poll-once" => run_telegram_poll_once(&rest),
         "telegram-loop" => run_telegram_loop(&rest),
@@ -309,6 +317,7 @@ fn main() {
         "virtual-session-context" => run_virtual_session_context(&rest),
         "subagent-plan" => run_subagent_plan(&rest),
         "subagent-enqueue" => run_subagent_enqueue(&rest),
+        "subagent-coordinator-smoke" => run_subagent_coordinator_smoke(&rest),
         "subagent-lifecycle" => run_subagent_lifecycle(&rest),
         "help" | "-h" | "--help" => {
             print_help();
@@ -778,6 +787,42 @@ fn run_log_rotate(args: &[String]) -> Result<(), String> {
         max_bytes,
         max_archives,
         now_ms: current_time_ms()?,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
+}
+
+fn run_runtime_receipt_compact(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(
+        args,
+        "runtime-receipt-compact",
+        &["--max-bytes", "--max-archives"],
+        &[],
+    )?;
+    let max_bytes = options
+        .optional_u64("--max-bytes")?
+        .unwrap_or(16 * 1024 * 1024);
+    let max_archives = options.optional_usize("--max-archives")?.unwrap_or(3);
+    let report = compact_runtime_queue_receipts_if_needed(RuntimeQueueReceiptCompactionOptions {
+        harness_home: options.target_home,
+        max_bytes,
+        max_archives,
+        now_ms: current_time_ms()?,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
+}
+
+/// Runs receipt/history retention once outside latency-sensitive ingress and
+/// delivery paths. `--force` is operator-only: normal background execution
+/// relies on source-aware gates and never performs an unconditional scan.
+fn run_ledger_maintenance_once_cmd(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(args, "ledger-maintenance-once", &[], &["--force"])?;
+    let force = options.has_flag("--force");
+    let report = run_ledger_maintenance_once_core(LedgerMaintenanceRunOptions {
+        harness_home: options.target_home,
+        now_ms: current_time_ms()?,
+        force,
     })
     .map_err(|err| err.to_string())?;
     print_json(&report)
@@ -2269,6 +2314,7 @@ fn run_supervisor_plan(args: &[String]) -> Result<(), String> {
         include_worker: args.include_worker,
         include_cron_scheduler: args.include_cron_scheduler,
         include_progress: args.include_progress,
+        include_ledger_maintenance: args.include_ledger_maintenance,
         include_telegram: args.include_telegram,
         include_discord: args.include_discord,
         idle_ms: args.idle_ms,
@@ -3701,7 +3747,7 @@ fn run_memory_owner_recover(args: &[String]) -> Result<(), String> {
 
 fn run_progress_delivery_once(args: &[String]) -> Result<(), String> {
     let args = progress_delivery_once_args_from_args(args)?;
-    let report = execute_progress_delivery_once(&args)?;
+    let report = execute_progress_delivery_once(&args, None)?;
     print_progress_delivery_once_report(&report);
     Ok(())
 }
@@ -3742,9 +3788,30 @@ fn run_progress_delivery_loop(args: &[String]) -> Result<(), String> {
         )?;
         let mut send_args = args.send.clone();
         send_args.preempt_after_wake_sequence = Some(progress_wake_sequence);
-        match execute_progress_delivery_once(&send_args) {
+        match execute_progress_delivery_once(&send_args, args.stop_file.as_deref()) {
             Ok(report) => {
                 consecutive_errors = 0;
+                if stop_file_requested(args.stop_file.as_deref()) {
+                    append_loop_stop_log(
+                        &args.send.target_home,
+                        "progress",
+                        "progress.delivery-loop-stopped",
+                        iterations,
+                        "stop file requested during progress delivery",
+                    )?;
+                    write_loop_heartbeat(
+                        &args.send.target_home,
+                        "progress-delivery-loop",
+                        "stopped",
+                        iterations,
+                        "stop file requested during progress delivery",
+                    )?;
+                    print_progress_delivery_once_report(&report);
+                    println!(
+                        "Progress delivery loop stop requested after {iterations} iteration(s)"
+                    );
+                    break;
+                }
                 write_loop_heartbeat(
                     &args.send.target_home,
                     "progress-delivery-loop",
@@ -3810,6 +3877,111 @@ fn run_progress_delivery_loop(args: &[String]) -> Result<(), String> {
             &args.send.target_home,
             "progress-delivery",
             progress_wake_sequence,
+            args.idle_ms,
+        );
+    }
+    Ok(())
+}
+
+fn run_ledger_maintenance_loop(args: &[String]) -> Result<(), String> {
+    let args = ledger_maintenance_loop_args_from_args(args)?;
+    let mut iterations = 0usize;
+    let mut consecutive_errors = 0usize;
+
+    loop {
+        let wake_sequence = read_loop_wake_sequence(&args.target_home, "ledger-maintenance");
+        if stop_file_requested(args.stop_file.as_deref()) {
+            append_loop_stop_log(
+                &args.target_home,
+                "ledger-maintenance",
+                "ledger.maintenance-loop-stopped",
+                iterations,
+                "stop file requested",
+            )?;
+            write_loop_heartbeat(
+                &args.target_home,
+                "ledger-maintenance-loop",
+                "stopped",
+                iterations,
+                "stop file requested",
+            )?;
+            break;
+        }
+
+        iterations += 1;
+        write_loop_heartbeat(
+            &args.target_home,
+            "ledger-maintenance-loop",
+            "running",
+            iterations,
+            "checking source-authoritative retention gates",
+        )?;
+        match run_ledger_maintenance_once_core(LedgerMaintenanceRunOptions {
+            harness_home: args.target_home.clone(),
+            now_ms: current_time_ms()?,
+            force: false,
+        }) {
+            Ok(report) => {
+                consecutive_errors = 0;
+                write_loop_heartbeat(
+                    &args.target_home,
+                    "ledger-maintenance-loop",
+                    "ok",
+                    iterations,
+                    &format!(
+                        "runtimeAttempted={} channelAttempted={} progressAttempted={} warnings={}",
+                        report.runtime_queue_receipts.is_some(),
+                        report.channel_delivery_receipts.is_some(),
+                        report.progress_history.is_some(),
+                        report.warnings.len(),
+                    ),
+                )?;
+            }
+            Err(error) => {
+                consecutive_errors += 1;
+                write_loop_heartbeat(
+                    &args.target_home,
+                    "ledger-maintenance-loop",
+                    "error",
+                    iterations,
+                    &format!("consecutiveErrors={consecutive_errors} error={error}"),
+                )?;
+                let log_time_ms = current_log_time_ms().map_err(|err| err.to_string())?;
+                let diagnostics = loop_error_diagnostics_suffix(
+                    &args.target_home,
+                    "ledger-maintenance-loop",
+                    log_time_ms,
+                );
+                append_harness_log(
+                    &args.target_home,
+                    &HarnessLogEvent::new(
+                        log_time_ms,
+                        HarnessLogLevel::Warn,
+                        "ledger-maintenance",
+                        "ledger.maintenance-loop-error",
+                        format!(
+                            "iteration={iterations} consecutiveErrors={consecutive_errors}/{} error={error}{diagnostics}",
+                            args.max_consecutive_errors
+                        ),
+                    ),
+                )
+                .map_err(|err| err.to_string())?;
+                if consecutive_errors >= args.max_consecutive_errors {
+                    return Err(format!(
+                        "ledger-maintenance-loop exceeded {} consecutive errors; last error: {error}",
+                        args.max_consecutive_errors
+                    ));
+                }
+            }
+        }
+
+        if args.iterations > 0 && iterations >= args.iterations {
+            break;
+        }
+        wait_for_loop_wake_since(
+            &args.target_home,
+            "ledger-maintenance",
+            wake_sequence,
             args.idle_ms,
         );
     }
@@ -4188,6 +4360,21 @@ fn supervisor_child_args(args: &SupervisorRunArgs) -> Vec<String> {
             }
             child_args
         }
+        "ledger-maintenance-loop" => {
+            let mut child_args = vec![
+                "ledger-maintenance-loop".to_string(),
+                "--harness-home".to_string(),
+                args.target_home.display().to_string(),
+                "--iterations".to_string(),
+                args.child_iterations.to_string(),
+                "--idle-ms".to_string(),
+                args.idle_ms.max(60_000).to_string(),
+                "--max-consecutive-errors".to_string(),
+                args.max_consecutive_errors.to_string(),
+            ];
+            push_optional_path_arg(&mut child_args, "--stop-file", args.stop_file.as_ref());
+            child_args
+        }
         service if service == "telegram-loop" || service.starts_with("telegram-loop-") => {
             let mut child_args = vec![
                 "telegram-loop".to_string(),
@@ -4295,6 +4482,7 @@ fn supervisor_run_supported_service(service: &str) -> bool {
             | "worker-loop"
             | "cron-scheduler-loop"
             | "progress-delivery-loop"
+            | "ledger-maintenance-loop"
             | "discord-outbox-loop"
             | "discord-gateway-loop"
             | "telegram-loop"
@@ -4387,6 +4575,7 @@ fn supervisor_service_priority(service: &str) -> &'static str {
     match service {
         "discord-outbox-loop" => "final-delivery",
         "progress-delivery-loop" => "telemetry",
+        "ledger-maintenance-loop" => "maintenance",
         _ => "standard",
     }
 }
@@ -4401,6 +4590,7 @@ fn supervisor_delivery_lane(service: &str) -> Option<&'static str> {
 
 fn execute_progress_delivery_once(
     args: &ProgressDeliveryOnceArgs,
+    stop_file: Option<&Path>,
 ) -> Result<ProgressDeliveryOnceReport, String> {
     let plan = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
         harness_home: args.target_home.clone(),
@@ -4416,8 +4606,15 @@ fn execute_progress_delivery_once(
         current_step_max_chars: args.current_step_max_chars,
     })
     .map_err(|err| err.to_string())?;
+    execute_progress_delivery_plan(args, plan, stop_file)
+}
+
+fn execute_progress_delivery_plan(
+    args: &ProgressDeliveryOnceArgs,
+    plan: agent_harness_core::AgentProgressDeliveryPlanReport,
+    stop_file: Option<&Path>,
+) -> Result<ProgressDeliveryOnceReport, String> {
     let mut warnings = plan.warnings.clone();
-    let policy = channel_access_policy(&args.target_home)?;
     let pending_count = plan.pending.len();
     let skipped_muted = plan.summary.skipped_muted;
     let volume_limited = plan.summary.volume_limited;
@@ -4429,17 +4626,46 @@ fn execute_progress_delivery_once(
 
     let mut pending_items = plan.pending;
     pending_items.sort_by_key(progress_delivery_pending_priority);
-    for pending in pending_items {
+    if stop_file_requested(stop_file) {
+        let released = release_unattempted_progress_surface_claims(args, &pending_items)?;
+        warnings.push(format!(
+            "progress delivery stop requested before provider delivery; released {released} unattempted fresh-send surface claim(s) and deferred {} pending item(s)",
+            pending_items.len()
+        ));
+        return Ok(ProgressDeliveryOnceReport {
+            pending_count,
+            skipped_muted,
+            volume_limited,
+            sent_messages,
+            edited_messages,
+            skipped_denied,
+            skipped_permanent,
+            failed_deliveries,
+            warnings,
+        });
+    }
+    let policy = channel_access_policy(&args.target_home)?;
+    let mut pending_items = pending_items.into_iter();
+    while let Some(pending) = pending_items.next() {
+        if stop_file_requested(stop_file) {
+            let mut unattempted = vec![pending];
+            unattempted.extend(pending_items);
+            let released = release_unattempted_progress_surface_claims(args, &unattempted)?;
+            warnings.push(format!(
+                "progress delivery stop requested before provider delivery; released {released} unattempted fresh-send surface claim(s) and deferred {} pending item(s)",
+                unattempted.len()
+            ));
+            break;
+        }
         if let Some(sequence) = args.preempt_after_wake_sequence {
             let current_sequence = read_loop_wake_sequence(&args.target_home, "progress-delivery");
             if current_sequence > sequence {
-                let latest_queue_event_line = latest_agent_progress_event_line_for_queue(
+                let latest_queue_event = latest_agent_progress_event_identity_for_queue(
                     &args.target_home,
                     &pending.queue_id,
                 )
                 .map_err(|err| err.to_string())?;
-                if progress_delivery_should_preempt_stale_pending(&pending, latest_queue_event_line)
-                {
+                if progress_delivery_should_preempt_stale_pending(&pending, latest_queue_event) {
                     let warning = format!(
                         "progress delivery plan for {} was preempted by newer events for the same queue; skipping stale non-terminal pending",
                         pending.queue_id
@@ -4489,6 +4715,20 @@ fn execute_progress_delivery_once(
                 continue;
             }
         };
+
+        // Access-policy evaluation may read local configuration. Recheck the
+        // watched stop file immediately before the external provider call so
+        // a requested shutdown cannot wait for the next pending item.
+        if stop_file_requested(stop_file) {
+            let mut unattempted = vec![pending];
+            unattempted.extend(pending_items);
+            let released = release_unattempted_progress_surface_claims(args, &unattempted)?;
+            warnings.push(format!(
+                "progress delivery stop requested before provider delivery; released {released} unattempted fresh-send surface claim(s) and deferred {} pending item(s)",
+                unattempted.len()
+            ));
+            break;
+        }
 
         match deliver_progress_pending(args, &pending) {
             Ok((actual_action, provider_message_id)) => {
@@ -4566,20 +4806,52 @@ fn execute_progress_delivery_once(
     Ok(report)
 }
 
+fn release_unattempted_progress_surface_claims(
+    args: &ProgressDeliveryOnceArgs,
+    pending_items: &[AgentProgressDeliveryPending],
+) -> Result<usize, String> {
+    let mut released = 0usize;
+    for pending in pending_items {
+        if pending.fresh_send_reason.is_some() && pending.provider_message_id.is_none() {
+            if release_agent_progress_surface_claim(
+                &args.target_home,
+                &pending.status_surface_key,
+                &pending.queue_id,
+            )
+            .map_err(|err| err.to_string())?
+            {
+                released += 1;
+            }
+        }
+    }
+    Ok(released)
+}
+
 fn progress_delivery_pending_priority(pending: &AgentProgressDeliveryPending) -> (u8, u8, usize) {
     let terminal_rank = if pending.terminal { 0 } else { 1 };
     let lane_rank = match (pending.terminal, pending.message_kind) {
         (true, agent_harness_core::AgentProgressDeliveryMessageKind::Status) => 0,
         (true, agent_harness_core::AgentProgressDeliveryMessageKind::Body) => 1,
-        (false, agent_harness_core::AgentProgressDeliveryMessageKind::Body) => 0,
-        (false, agent_harness_core::AgentProgressDeliveryMessageKind::Status) => 1,
+        (false, agent_harness_core::AgentProgressDeliveryMessageKind::Status) => 0,
+        (false, agent_harness_core::AgentProgressDeliveryMessageKind::Body) => 1,
     };
-    (terminal_rank, lane_rank, pending.event_line)
+    // Terminal delivery retains source order after its status/body precedence:
+    // a final surface must not be overtaken by arbitrary newer activity.  For
+    // active work, however, the latest status is the useful one; sending an
+    // older tool update first can make a fresh Working indicator appear stuck
+    // behind serial provider I/O. `usize::MAX - line` gives newer nonterminal
+    // events precedence without changing the terminal ordering contract.
+    let sequence_rank = if pending.terminal {
+        pending.event_line
+    } else {
+        usize::MAX.saturating_sub(pending.event_line)
+    };
+    (terminal_rank, lane_rank, sequence_rank)
 }
 
 fn progress_delivery_should_preempt_stale_pending(
     pending: &AgentProgressDeliveryPending,
-    latest_queue_event_line: Option<usize>,
+    latest_queue_event: Option<agent_harness_core::AgentProgressEventIdentity>,
 ) -> bool {
     if pending.terminal {
         return false;
@@ -4588,7 +4860,20 @@ fn progress_delivery_should_preempt_stale_pending(
     {
         return false;
     }
-    latest_queue_event_line.is_some_and(|line| line > pending.event_line)
+    let Some(latest_queue_event) = latest_queue_event else {
+        return false;
+    };
+    match (
+        pending.event_id.as_deref(),
+        latest_queue_event.event_id.as_deref(),
+    ) {
+        // v2 IDs remain stable across source compaction, so line relocation
+        // cannot make a current pending surface look stale.
+        (Some(pending_id), Some(latest_id)) => pending_id != latest_id,
+        // Mixed/legacy journals retain the old physical-line ordering only as
+        // a compatibility fallback until every writer supplies eventId.
+        _ => latest_queue_event.event_line > pending.event_line,
+    }
 }
 
 fn progress_delivery_account_id<'a>(
@@ -4759,6 +5044,7 @@ fn record_progress_delivery(
         },
         AgentProgressDeliveryRecordContext {
             status_surface_key: pending.status_surface_key.clone(),
+            event_id: pending.event_id.clone(),
             existing_provider_message_id,
             decision,
             fresh_send_reason,
@@ -5383,21 +5669,24 @@ where
         }
         match send_outbound(harness_home, token, &pending.message) {
             Ok(send) => {
-                record_channel_delivery(ChannelDeliveryRecordOptions {
-                    harness_home: harness_home.to_path_buf(),
-                    delivery_id: pending.delivery_id,
-                    status: ChannelDeliveryStatus::Delivered,
-                    platform: pending.message.platform.clone(),
-                    account_id: pending.message.account_id.clone(),
-                    channel_id: pending.message.channel_id.clone(),
-                    user_id: pending.message.user_id.clone(),
-                    session_key: pending.message.session_key.clone(),
-                    provider_message_id: send.provider_message_id,
-                    error: None,
-                    now_ms: current_time_ms()?,
-                    rendered_units: send.rendered_units,
-                    presentation: send.presentation,
-                })
+                record_channel_delivery_for_source_queue(
+                    ChannelDeliveryRecordOptions {
+                        harness_home: harness_home.to_path_buf(),
+                        delivery_id: pending.delivery_id,
+                        status: ChannelDeliveryStatus::Delivered,
+                        platform: pending.message.platform.clone(),
+                        account_id: pending.message.account_id.clone(),
+                        channel_id: pending.message.channel_id.clone(),
+                        user_id: pending.message.user_id.clone(),
+                        session_key: pending.message.session_key.clone(),
+                        provider_message_id: send.provider_message_id,
+                        error: None,
+                        now_ms: current_time_ms()?,
+                        rendered_units: send.rendered_units,
+                        presentation: send.presentation,
+                    },
+                    pending.message.source_queue_id.as_deref(),
+                )
                 .map_err(|err| err.to_string())?;
                 delivered_messages += 1;
             }
@@ -5407,21 +5696,24 @@ where
                 } else {
                     ChannelDeliveryStatus::Failed
                 };
-                record_channel_delivery(ChannelDeliveryRecordOptions {
-                    harness_home: harness_home.to_path_buf(),
-                    delivery_id: pending.delivery_id,
-                    status,
-                    platform: pending.message.platform.clone(),
-                    account_id: pending.message.account_id.clone(),
-                    channel_id: pending.message.channel_id.clone(),
-                    user_id: pending.message.user_id.clone(),
-                    session_key: pending.message.session_key.clone(),
-                    provider_message_id: error.provider_message_id,
-                    error: Some(error.message.clone()),
-                    now_ms: current_time_ms()?,
-                    rendered_units: error.rendered_units,
-                    presentation: error.presentation,
-                })
+                record_channel_delivery_for_source_queue(
+                    ChannelDeliveryRecordOptions {
+                        harness_home: harness_home.to_path_buf(),
+                        delivery_id: pending.delivery_id,
+                        status,
+                        platform: pending.message.platform.clone(),
+                        account_id: pending.message.account_id.clone(),
+                        channel_id: pending.message.channel_id.clone(),
+                        user_id: pending.message.user_id.clone(),
+                        session_key: pending.message.session_key.clone(),
+                        provider_message_id: error.provider_message_id,
+                        error: Some(error.message.clone()),
+                        now_ms: current_time_ms()?,
+                        rendered_units: error.rendered_units,
+                        presentation: error.presentation,
+                    },
+                    pending.message.source_queue_id.as_deref(),
+                )
                 .map_err(|err| err.to_string())?;
                 warnings.push(error.message);
                 failed_deliveries += 1;
@@ -6203,40 +6495,46 @@ fn execute_discord_outbox_send_once(
         }
         match discord_send_outbound_message(&token, &pending.message) {
             Ok(send) => {
-                record_channel_delivery(ChannelDeliveryRecordOptions {
-                    harness_home: args.target_home.clone(),
-                    delivery_id: pending.delivery_id,
-                    status: ChannelDeliveryStatus::Delivered,
-                    platform: pending.message.platform.clone(),
-                    account_id: pending.message.account_id.clone(),
-                    channel_id: pending.message.channel_id.clone(),
-                    user_id: pending.message.user_id.clone(),
-                    session_key: pending.message.session_key.clone(),
-                    provider_message_id: send.provider_message_id,
-                    error: None,
-                    now_ms: current_time_ms()?,
-                    rendered_units: send.rendered_units,
-                    presentation: send.presentation,
-                })
+                record_channel_delivery_for_source_queue(
+                    ChannelDeliveryRecordOptions {
+                        harness_home: args.target_home.clone(),
+                        delivery_id: pending.delivery_id,
+                        status: ChannelDeliveryStatus::Delivered,
+                        platform: pending.message.platform.clone(),
+                        account_id: pending.message.account_id.clone(),
+                        channel_id: pending.message.channel_id.clone(),
+                        user_id: pending.message.user_id.clone(),
+                        session_key: pending.message.session_key.clone(),
+                        provider_message_id: send.provider_message_id,
+                        error: None,
+                        now_ms: current_time_ms()?,
+                        rendered_units: send.rendered_units,
+                        presentation: send.presentation,
+                    },
+                    pending.message.source_queue_id.as_deref(),
+                )
                 .map_err(|err| err.to_string())?;
                 delivered_messages += 1;
             }
             Err(error) => {
-                record_channel_delivery(ChannelDeliveryRecordOptions {
-                    harness_home: args.target_home.clone(),
-                    delivery_id: pending.delivery_id,
-                    status: ChannelDeliveryStatus::Failed,
-                    platform: pending.message.platform.clone(),
-                    account_id: pending.message.account_id.clone(),
-                    channel_id: pending.message.channel_id.clone(),
-                    user_id: pending.message.user_id.clone(),
-                    session_key: pending.message.session_key.clone(),
-                    provider_message_id: error.provider_message_id,
-                    error: Some(error.message.clone()),
-                    now_ms: current_time_ms()?,
-                    rendered_units: error.rendered_units,
-                    presentation: error.presentation,
-                })
+                record_channel_delivery_for_source_queue(
+                    ChannelDeliveryRecordOptions {
+                        harness_home: args.target_home.clone(),
+                        delivery_id: pending.delivery_id,
+                        status: ChannelDeliveryStatus::Failed,
+                        platform: pending.message.platform.clone(),
+                        account_id: pending.message.account_id.clone(),
+                        channel_id: pending.message.channel_id.clone(),
+                        user_id: pending.message.user_id.clone(),
+                        session_key: pending.message.session_key.clone(),
+                        provider_message_id: error.provider_message_id,
+                        error: Some(error.message.clone()),
+                        now_ms: current_time_ms()?,
+                        rendered_units: error.rendered_units,
+                        presentation: error.presentation,
+                    },
+                    pending.message.source_queue_id.as_deref(),
+                )
                 .map_err(|err| err.to_string())?;
                 warnings.push(error.message);
                 failed_deliveries += 1;
@@ -8310,6 +8608,7 @@ fn virtual_session_context_envelope_from_args(
     resolve_virtual_session_working_context(VirtualSessionContextQuery {
         harness_home: args.target_home,
         platform: args.platform,
+        account_id: args.account_id,
         channel_id: args.channel_id,
         user_id: args.user_id,
         agent_id: args.agent_id,
@@ -8348,6 +8647,24 @@ fn run_subagent_enqueue(args: &[String]) -> Result<(), String> {
         master_agent_id: args.master_agent_id,
         master_session_key: args.master_session_key,
         runtime_workspace: args.runtime_workspace,
+        now_ms: args.now_ms,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)
+}
+
+/// Enqueues a deliberately bounded, audited coordinator replay. The core
+/// rejects anything other than two catalog-admitted children on the exact main
+/// Telegram/Discord lane; this CLI also requires an explicit operator flag and
+/// explicit source/target paths so it cannot run accidentally from defaults.
+fn run_subagent_coordinator_smoke(args: &[String]) -> Result<(), String> {
+    let args = controlled_coordinator_smoke_args_from_args(args)?;
+    let report = enqueue_controlled_coordinator_smoke(ControlledCoordinatorSmokeOptionsV1 {
+        harness_home: args.target_home,
+        source: args.source,
+        runtime_workspace: args.runtime_workspace,
+        lane: args.lane,
+        children: args.children,
         now_ms: args.now_ms,
     })
     .map_err(|err| err.to_string())?;
@@ -8694,6 +9011,8 @@ fn virtual_session_context_args_from_args(
         "virtual-session-context",
         &[
             "--platform",
+            "--account-id",
+            "--account",
             "--channel-id",
             "--user-id",
             "--agent-id",
@@ -8715,6 +9034,10 @@ fn virtual_session_context_args_from_args(
     Ok(VirtualSessionContextArgs {
         target_home: options.target_home.clone(),
         platform: options.required("--platform")?,
+        account_id: options
+            .optional("--account-id")
+            .or_else(|| options.optional("--account"))
+            .map(ToString::to_string),
         channel_id: options.required("--channel-id")?,
         user_id: options.required("--user-id")?,
         agent_id,
@@ -9346,6 +9669,7 @@ struct ContextRolloverArgs {
 struct VirtualSessionContextArgs {
     target_home: PathBuf,
     platform: String,
+    account_id: Option<String>,
     channel_id: String,
     user_id: String,
     agent_id: String,
@@ -9625,6 +9949,7 @@ struct SupervisorPlanArgs {
     include_worker: bool,
     include_cron_scheduler: bool,
     include_progress: bool,
+    include_ledger_maintenance: bool,
     include_telegram: bool,
     include_discord: bool,
     idle_ms: u64,
@@ -9718,6 +10043,15 @@ struct ProgressDeliveryOnceArgs {
 #[derive(Debug, Clone)]
 struct ProgressDeliveryLoopArgs {
     send: ProgressDeliveryOnceArgs,
+    iterations: usize,
+    idle_ms: u64,
+    max_consecutive_errors: usize,
+    stop_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct LedgerMaintenanceLoopArgs {
+    target_home: PathBuf,
     iterations: usize,
     idle_ms: u64,
     max_consecutive_errors: usize,
@@ -10213,6 +10547,7 @@ struct SupervisorReconcileArgs {
     include_worker: Option<bool>,
     include_cron_scheduler: Option<bool>,
     include_progress: Option<bool>,
+    include_ledger_maintenance: Option<bool>,
     include_telegram: Option<bool>,
     include_discord: Option<bool>,
     desired_services: Option<Vec<SupervisorInventoryServiceConfig>>,
@@ -10249,6 +10584,16 @@ struct WorkerAdapterEnqueueArgs {
     master_agent_id: Option<String>,
     master_session_key: Option<String>,
     runtime_workspace: Option<PathBuf>,
+    now_ms: i64,
+}
+
+#[derive(Debug)]
+struct ControlledCoordinatorSmokeArgs {
+    source: AgentSource,
+    target_home: PathBuf,
+    runtime_workspace: Option<PathBuf>,
+    lane: ControlledCoordinatorSmokeLaneV1,
+    children: Vec<ControlledCoordinatorSmokeChildV1>,
     now_ms: i64,
 }
 
@@ -12040,6 +12385,8 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
             "--no-cron-scheduler",
             "--include-progress",
             "--no-progress",
+            "--include-ledger-maintenance",
+            "--no-ledger-maintenance",
             "--include-telegram",
             "--no-telegram",
             "--include-discord",
@@ -12076,6 +12423,11 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
     let include_cron_scheduler =
         include_bool_flag(&options, "--include-cron-scheduler", "--no-cron-scheduler")?;
     let include_progress = include_bool_flag(&options, "--include-progress", "--no-progress")?;
+    let include_ledger_maintenance = include_bool_flag(
+        &options,
+        "--include-ledger-maintenance",
+        "--no-ledger-maintenance",
+    )?;
     let include_telegram = include_bool_flag(&options, "--include-telegram", "--no-telegram")?;
     let include_discord = include_bool_flag(&options, "--include-discord", "--no-discord")?;
     let explicit_desired_input = explicit_desired_input
@@ -12083,6 +12435,7 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
         || include_worker.is_some()
         || include_cron_scheduler.is_some()
         || include_progress.is_some()
+        || include_ledger_maintenance.is_some()
         || include_telegram.is_some()
         || include_discord.is_some();
     let source_home = options
@@ -12181,6 +12534,7 @@ fn supervisor_reconcile_args_from_args(args: &[String]) -> Result<SupervisorReco
         include_worker,
         include_cron_scheduler,
         include_progress,
+        include_ledger_maintenance,
         include_telegram,
         include_discord,
         desired_services,
@@ -12282,6 +12636,14 @@ fn supervisor_reconcile_desired_services(
         all,
     ) {
         insert_supervisor_default_service(&mut services, args, "progress-delivery-loop", None);
+    }
+    if supervisor_loop_enabled(
+        args.include_ledger_maintenance,
+        supervisor,
+        "ledgerMaintenanceLoop",
+        all,
+    ) {
+        insert_supervisor_default_service(&mut services, args, "ledger-maintenance-loop", None);
     }
     if supervisor_loop_enabled(args.include_telegram, supervisor, "telegramLoop", all) {
         let accounts = if args.telegram_accounts.is_empty() {
@@ -12984,6 +13346,7 @@ fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs,
     let mut include_worker = true;
     let mut include_cron_scheduler = false;
     let mut include_progress = true;
+    let mut include_ledger_maintenance = false;
     let mut include_telegram = true;
     let mut include_discord = true;
     let mut idle_ms = 1_000;
@@ -13090,6 +13453,7 @@ fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs,
             "--include-cron-scheduler" => include_cron_scheduler = true,
             "--no-cron-scheduler" => include_cron_scheduler = false,
             "--no-progress" => include_progress = false,
+            "--include-ledger-maintenance" => include_ledger_maintenance = true,
             "--no-telegram" => include_telegram = false,
             "--no-discord" => include_discord = false,
             "--idle-ms" => {
@@ -13169,6 +13533,7 @@ fn supervisor_plan_args_from_args(args: &[String]) -> Result<SupervisorPlanArgs,
         include_worker,
         include_cron_scheduler,
         include_progress,
+        include_ledger_maintenance,
         include_telegram,
         include_discord,
         idle_ms,
@@ -13874,6 +14239,39 @@ fn progress_delivery_loop_args_from_args(
 
     Ok(ProgressDeliveryLoopArgs {
         send: progress_delivery_once_args_from_args(&send_args)?,
+        iterations,
+        idle_ms,
+        max_consecutive_errors,
+        stop_file,
+    })
+}
+
+fn ledger_maintenance_loop_args_from_args(
+    args: &[String],
+) -> Result<LedgerMaintenanceLoopArgs, String> {
+    let options = SimpleOptions::parse(
+        args,
+        "ledger-maintenance-loop",
+        &[
+            "--iterations",
+            "--idle-ms",
+            "--max-consecutive-errors",
+            "--stop-file",
+        ],
+        &[],
+    )?;
+    let idle_ms = options.optional_u64("--idle-ms")?.unwrap_or(60_000);
+    if idle_ms == 0 {
+        return Err("--idle-ms must be greater than zero".to_string());
+    }
+    let iterations = options.optional_usize("--iterations")?.unwrap_or(0);
+    let max_consecutive_errors = options
+        .optional_usize("--max-consecutive-errors")?
+        .unwrap_or(5)
+        .max(1);
+    let stop_file = options.optional("--stop-file").map(PathBuf::from);
+    Ok(LedgerMaintenanceLoopArgs {
+        target_home: options.target_home,
         iterations,
         idle_ms,
         max_consecutive_errors,
@@ -15558,6 +15956,133 @@ fn worker_adapter_enqueue_args_from_args(
         master_session_key,
         runtime_workspace,
         now_ms,
+    })
+}
+
+fn controlled_coordinator_smoke_args_from_args(
+    args: &[String],
+) -> Result<ControlledCoordinatorSmokeArgs, String> {
+    let mut source_home = None;
+    let mut workspace = None;
+    let mut target_home = None;
+    let mut runtime_workspace = None;
+    let mut platform = None;
+    let mut account_id = None;
+    let mut channel_id = None;
+    let mut user_id = None;
+    let mut agent_id = None;
+    let mut session_key = None;
+    let mut children = Vec::new();
+    let mut now_ms = current_time_ms()?;
+    let mut confirmed = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--source-home" => {
+                i += 1;
+                source_home = Some(PathBuf::from(required_arg(args, i, "--source-home")?));
+            }
+            "--workspace" => {
+                i += 1;
+                workspace = Some(PathBuf::from(required_arg(args, i, "--workspace")?));
+            }
+            flag if is_harness_home_arg(flag) => {
+                i += 1;
+                target_home = Some(parse_harness_home_path(args, i, flag)?);
+            }
+            "--runtime-workspace" => {
+                i += 1;
+                runtime_workspace =
+                    Some(PathBuf::from(required_arg(args, i, "--runtime-workspace")?));
+            }
+            "--platform" => {
+                i += 1;
+                platform = Some(required_arg(args, i, "--platform")?.to_string());
+            }
+            "--account-id" => {
+                i += 1;
+                account_id = Some(required_arg(args, i, "--account-id")?.to_string());
+            }
+            "--channel-id" => {
+                i += 1;
+                channel_id = Some(required_arg(args, i, "--channel-id")?.to_string());
+            }
+            "--user-id" => {
+                i += 1;
+                user_id = Some(required_arg(args, i, "--user-id")?.to_string());
+            }
+            "--agent-id" => {
+                i += 1;
+                agent_id = Some(required_arg(args, i, "--agent-id")?.to_string());
+            }
+            "--session-key" => {
+                i += 1;
+                session_key = Some(required_arg(args, i, "--session-key")?.to_string());
+            }
+            "--child" => {
+                i += 1;
+                children.push(parse_controlled_coordinator_smoke_child(required_arg(
+                    args, i, "--child",
+                )?)?);
+            }
+            "--now-ms" => {
+                i += 1;
+                now_ms = parse_i64(required_arg(args, i, "--now-ms")?, "--now-ms")?;
+            }
+            "--confirm-controlled-replay" => confirmed = true,
+            flag => {
+                return Err(format!(
+                    "subagent-coordinator-smoke: unknown argument: {flag}"
+                ));
+            }
+        }
+        i += 1;
+    }
+
+    if !confirmed {
+        return Err("subagent-coordinator-smoke requires --confirm-controlled-replay".to_string());
+    }
+    let source_home = source_home
+        .ok_or_else(|| "subagent-coordinator-smoke requires explicit --source-home".to_string())?;
+    let workspace = workspace
+        .ok_or_else(|| "subagent-coordinator-smoke requires explicit --workspace".to_string())?;
+    let target_home = target_home.ok_or_else(|| {
+        "subagent-coordinator-smoke requires explicit --harness-home or --target-home".to_string()
+    })?;
+    let required = |value: Option<String>, flag: &str| {
+        value.ok_or_else(|| format!("subagent-coordinator-smoke requires {flag}"))
+    };
+    Ok(ControlledCoordinatorSmokeArgs {
+        source: AgentSource::with_workspace(source_home, workspace),
+        target_home,
+        runtime_workspace,
+        lane: ControlledCoordinatorSmokeLaneV1 {
+            platform: required(platform, "--platform")?,
+            account_id: required(account_id, "--account-id")?,
+            channel_id: required(channel_id, "--channel-id")?,
+            user_id: required(user_id, "--user-id")?,
+            agent_id: required(agent_id, "--agent-id")?,
+            session_key: required(session_key, "--session-key")?,
+        },
+        children,
+        now_ms,
+    })
+}
+
+fn parse_controlled_coordinator_smoke_child(
+    value: &str,
+) -> Result<ControlledCoordinatorSmokeChildV1, String> {
+    let parts = value.split(',').collect::<Vec<_>>();
+    if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
+        return Err(
+            "--child requires exactly run-id,model,effort without empty fields".to_string(),
+        );
+    }
+    Ok(ControlledCoordinatorSmokeChildV1 {
+        run_id: parts[0].to_string(),
+        model: parts[1].to_string(),
+        effort: parts[2].to_string(),
     })
 }
 
@@ -20408,93 +20933,15 @@ fn pending_runtime_typing_context(
     harness_home: &Path,
     requested_queue_id: Option<&str>,
 ) -> Result<Option<RuntimeTypingContext>, String> {
-    let queue_dir = harness_home.join("state").join("runtime-queue");
-    let pending_file = queue_dir.join("pending.jsonl");
-    if !pending_file.is_file() {
-        return Ok(None);
-    }
-    let terminal_ids = terminal_runtime_queue_ids(&queue_dir.join("run-once-receipts.jsonl"))?;
-    let text = fs::read_to_string(&pending_file)
-        .map_err(|err| format!("failed to read {}: {err}", pending_file.display()))?;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let value: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let queue_id = json_string_field(&value, &["queueId", "queue_id"]);
-        if let Some(requested_queue_id) = requested_queue_id
-            && queue_id != Some(requested_queue_id)
-        {
-            continue;
-        }
-        if json_string_field(&value, &["status"]) != Some("queued") {
-            continue;
-        }
-        if queue_id.is_some_and(|queue_id| terminal_ids.contains(queue_id)) {
-            continue;
-        }
-        let Some(agent_id) = json_string_field(&value, &["agentId", "agent_id"]) else {
-            continue;
-        };
-        let Some(platform) = json_string_field(&value, &["platform"]) else {
-            continue;
-        };
-        let Some(channel_id) = json_string_field(&value, &["channelId", "channel_id"]) else {
-            continue;
-        };
-        return Ok(Some(RuntimeTypingContext {
-            agent_id: agent_id.to_string(),
-            platform: platform.to_string(),
-            channel_id: channel_id.to_string(),
-        }));
-    }
-    Ok(None)
-}
-
-fn terminal_runtime_queue_ids(path: &Path) -> Result<BTreeSet<String>, String> {
-    let mut ids = BTreeSet::new();
-    if !path.is_file() {
-        return Ok(ids);
-    }
-    let text = fs::read_to_string(path)
-        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let value: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        if let Some(queue_id) = json_string_field(&value, &["queueId", "queue_id"])
-            && json_string_field(&value, &["status"]).is_some_and(is_runtime_terminal_status)
-        {
-            ids.insert(queue_id.to_string());
-        }
-    }
-    Ok(ids)
-}
-
-fn is_runtime_terminal_status(status: &str) -> bool {
-    matches!(
-        status,
-        "completed"
-            | "timeout"
-            | "failed-terminal"
-            | "canceled"
-            | "skipped"
-            | "dead-letter"
-            | "suppressed"
-    )
-}
-
-fn json_string_field<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {
-    names.iter().find_map(|name| value.get(*name)?.as_str())
+    resolve_runtime_queue_typing_context_nonblocking(harness_home, requested_queue_id)
+        .map(|context| {
+            context.map(|context| RuntimeTypingContext {
+                agent_id: context.agent_id,
+                platform: context.platform,
+                channel_id: context.channel_id,
+            })
+        })
+        .map_err(|error| format!("failed to resolve runtime typing context: {error}"))
 }
 
 fn stop_file_requested(stop_file: Option<&Path>) -> bool {
@@ -20719,19 +21166,13 @@ fn append_gateway_restart_completion_outbox(
     else {
         return Ok(false);
     };
-    let outbox_file = harness_home
-        .join("state")
-        .join("channels")
-        .join("outbox.jsonl");
-    if let Some(parent) = outbox_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    let outbound = ChannelOutboundMessage {
+    let mut outbound = ChannelOutboundMessage {
         platform: platform.to_string(),
         account_id: None,
         channel_id: channel_id.to_string(),
         user_id: user_id.to_string(),
         session_key: session_key.to_string(),
+        delivery_id: None,
         kind: ChannelOutboundMessageKind::CommandReply,
         source_queue_id: None,
         source_completion_file: None,
@@ -20740,7 +21181,7 @@ fn append_gateway_restart_completion_outbox(
         delivery_intent: None,
         attachments: Vec::new(),
     };
-    append_jsonl_value(&outbox_file, &outbound)
+    append_channel_outbox_message(harness_home, &mut outbound)
         .map(|_| true)
         .map_err(|err| format!("failed to append gateway restart completion outbox: {err}"))
 }
@@ -20788,6 +21229,7 @@ fn loop_service_kind(name: &str) -> &'static str {
         "worker-loop" => "worker",
         "cron-scheduler-loop" => "cron",
         "progress-delivery-loop" => "progress-delivery",
+        "ledger-maintenance-loop" => "ledger-maintenance",
         "telegram-loop" => "telegram-ingress",
         "discord-outbox-loop" => "final-outbox",
         "discord-gateway-loop" => "discord-gateway",
@@ -22782,6 +23224,8 @@ fn print_help() {
     );
     println!("  config-validate Validate harness-config.json with fail-closed schema checks");
     println!("  log-rotate      Rotate harness.jsonl and receipt the rotation decision");
+    println!("  runtime-receipt-compact Compact bounded runtime receipt journals safely");
+    println!("  ledger-maintenance-once Run bounded receipt/history retention once");
     println!(
         "  resource-exhaustion-readback Read recent Windows Resource-Exhaustion-Detector events"
     );
@@ -22886,6 +23330,7 @@ fn print_help() {
     println!("  channel-identity-check Verify platform/account/channel binding before ingress");
     println!("  progress-delivery-once Send/edit compact runtime progress panels once");
     println!("  progress-delivery-loop Send/edit compact runtime progress panels continuously");
+    println!("  ledger-maintenance-loop Run isolated receipt/history retention continuously");
     println!("  telegram-probe  Probe Telegram Bot API getMe without consuming updates");
     println!("  telegram-poll-once Poll Telegram once, run DM pipeline, and deliver replies");
     println!("  telegram-loop     Run Telegram polling continuously until stopped");
@@ -22928,6 +23373,7 @@ fn print_help() {
     println!("  virtual-session-context Resolve read-only virtual-session working context");
     println!("  subagent-plan   Dry-run subagent ledger cutover/resume planning");
     println!("  subagent-enqueue Persist resumable subagent work into worker dispatch");
+    println!("  subagent-coordinator-smoke Enqueue one bounded two-child coordinator replay");
     println!("  subagent-lifecycle Show, close, or smoke-test subagent lifecycle receipts");
     println!();
     println!("Options:");
@@ -22976,6 +23422,11 @@ fn print_help() {
     println!("  --channel-id <id>       Channel identity for session mapping");
     println!("  --user-id <id>          User identity for session mapping");
     println!("  --session-key <key>     Existing session key override");
+    println!("  --account-id <id>       Exact account identity for coordinator smoke replay");
+    println!("  --child <run,model,effort> Repeat twice for coordinator smoke children");
+    println!(
+        "  --confirm-controlled-replay Required explicit acknowledgement for coordinator smoke"
+    );
     println!("  --delivery-id <id>      Channel outbox delivery id");
     println!("  --status <value>        Delivery status: delivered, failed, or skipped-permanent");
     println!("  --provider-message-id <id> Telegram/Discord message id after delivery");
@@ -23003,6 +23454,9 @@ fn print_help() {
     );
     println!("  --no-worker             Exclude worker-loop from supervisor-plan");
     println!("  --no-progress           Exclude progress-delivery-loop from supervisor-plan");
+    println!(
+        "  --include-ledger-maintenance Include the isolated ledger-maintenance-loop in supervisor-plan"
+    );
     println!("  --no-telegram           Exclude telegram-loop from supervisor-plan");
     println!("  --no-discord            Exclude discord-gateway-loop from supervisor-plan");
     println!(
@@ -23182,10 +23636,12 @@ mod tests {
             &agent_harness_core::ChannelSessionState {
                 schema: "agent-harness.channel-session-state.v1".to_string(),
                 platform: "discord".to_string(),
+                account_id: None,
                 channel_id: "channel-42".to_string(),
                 user_id: "user-7".to_string(),
                 active_session_key: session_key.to_string(),
                 agent_id: Some("main".to_string()),
+                config_revision: None,
                 provider: None,
                 model: None,
                 session_topic: None,
@@ -23249,6 +23705,51 @@ mod tests {
         );
         assert_eq!(envelope.current_session_key.as_deref(), Some(session_key));
         assert!(envelope.recent_queue_ids.contains(&"queue-cli".to_string()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn coordinator_smoke_cli_requires_explicit_scoped_admission() {
+        let root = cli_temp_root("coordinator_smoke_cli_requires_explicit_scope");
+        let source_home = root.join("source");
+        let workspace = root.join("workspace");
+        let harness_home = root.join("harness");
+        let args = vec![
+            "--source-home".to_string(),
+            source_home.display().to_string(),
+            "--workspace".to_string(),
+            workspace.display().to_string(),
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--platform".to_string(),
+            "telegram".to_string(),
+            "--account-id".to_string(),
+            "account-1".to_string(),
+            "--channel-id".to_string(),
+            "channel-1".to_string(),
+            "--user-id".to_string(),
+            "user-1".to_string(),
+            "--agent-id".to_string(),
+            "main".to_string(),
+            "--session-key".to_string(),
+            "telegram:channel-1:user-1:main:t4-smoke".to_string(),
+            "--child".to_string(),
+            "queued-1,gpt-5.6-terra,max".to_string(),
+            "--child".to_string(),
+            "queued-2,gpt-5.6-sol,high".to_string(),
+            "--confirm-controlled-replay".to_string(),
+            "--now-ms".to_string(),
+            "1000".to_string(),
+        ];
+        let parsed = controlled_coordinator_smoke_args_from_args(&args).unwrap();
+        assert_eq!(parsed.target_home, harness_home);
+        assert_eq!(parsed.children.len(), 2);
+        assert_eq!(parsed.children[0].effort, "max");
+
+        let mut missing_confirmation = args;
+        missing_confirmation.retain(|value| value != "--confirm-controlled-replay");
+        let error = controlled_coordinator_smoke_args_from_args(&missing_confirmation).unwrap_err();
+        assert!(error.contains("confirm-controlled-replay"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -23732,6 +24233,78 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_reconcile_all_includes_isolated_ledger_maintenance_owner() {
+        let root =
+            cli_temp_root("supervisor_reconcile_all_includes_isolated_ledger_maintenance_owner");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"supervisor":{"enabled":true,"manageAllLoops":true}}"#,
+        )
+        .unwrap();
+
+        let args = supervisor_reconcile_args_from_args(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+            "--all".to_string(),
+        ])
+        .unwrap();
+        let services = supervisor_reconcile_desired_services(&args).unwrap();
+        let ledger = services
+            .iter()
+            .find(|service| service.service_id == "ledger-maintenance-loop")
+            .expect("all-loop reconciliation owns the isolated ledger-maintenance service");
+
+        assert_eq!(ledger.service_kind, "ledger-maintenance");
+        assert_eq!(ledger.priority, "maintenance");
+        let expected_stop_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("stop")
+            .join("ledger-maintenance-loop.stop")
+            .display()
+            .to_string();
+        assert_eq!(
+            arg_value(&ledger.args, "--stop-file").as_deref(),
+            Some(expected_stop_file.as_str())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn supervisor_reconcile_explicit_ledger_maintenance_flag_selects_owner() {
+        let root =
+            cli_temp_root("supervisor_reconcile_explicit_ledger_maintenance_flag_selects_owner");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+
+        let args = supervisor_reconcile_args_from_args(&[
+            "--target-home".to_string(),
+            harness_home.display().to_string(),
+            "--include-ledger-maintenance".to_string(),
+        ])
+        .expect("the explicit ledger-maintenance owner flag is accepted");
+        let services = supervisor_reconcile_desired_services(&args).unwrap();
+        assert!(
+            services
+                .iter()
+                .any(|service| service.service_id == "ledger-maintenance-loop"),
+            "explicit ledger-maintenance selection must add the owner"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn supervisor_plan_accepts_explicit_ledger_maintenance_flag() {
+        let args = supervisor_plan_args_from_args(&["--include-ledger-maintenance".to_string()])
+            .expect("the Windows supervisor-plan must expose the isolated maintenance owner");
+        assert!(args.include_ledger_maintenance);
+    }
+
+    #[test]
     fn context_pack_cli_report_includes_schema_translation_fields() {
         let report = parse_context_pack(ContextPackParseOptions {
             raw_json: serde_json::json!({
@@ -23783,6 +24356,7 @@ mod tests {
             message_kind: agent_harness_core::AgentProgressDeliveryMessageKind::Body,
             action: AgentProgressDeliveryAction::Send,
             provider_message_id: None,
+            event_id: None,
             event_line: 1,
             terminal: false,
             text: "progress".to_string(),
@@ -23843,11 +24417,44 @@ mod tests {
     }
 
     #[test]
+    fn progress_delivery_prioritizes_nonterminal_status_before_raw_body() {
+        let body = progress_pending("telegram", "dm-1", "operator");
+        let mut status = body.clone();
+        status.message_kind = agent_harness_core::AgentProgressDeliveryMessageKind::Status;
+        status.status_surface_key =
+            "telegram:default:dm-1:operator:main:session-1:queue-1:status".to_string();
+
+        assert!(
+            progress_delivery_pending_priority(&status) < progress_delivery_pending_priority(&body),
+            "the working/status surface must reach the user before raw tool activity"
+        );
+    }
+
+    #[test]
+    fn progress_delivery_prioritizes_newest_nonterminal_status_before_stale_status() {
+        let mut stale = progress_pending("telegram", "dm-1", "operator");
+        stale.message_kind = agent_harness_core::AgentProgressDeliveryMessageKind::Status;
+        stale.event_line = 10;
+
+        let mut newest = stale.clone();
+        newest.event_line = 11;
+
+        assert!(
+            progress_delivery_pending_priority(&newest)
+                < progress_delivery_pending_priority(&stale),
+            "newer working status must not wait behind stale progress from the same delivery pass"
+        );
+    }
+
+    #[test]
     fn progress_delivery_preempts_nonterminal_pending_when_wake_advances() {
         let stale = progress_pending("telegram", "dm-1", "operator");
         assert!(!progress_delivery_should_preempt_stale_pending(
             &stale,
-            Some(2)
+            Some(agent_harness_core::AgentProgressEventIdentity {
+                event_id: None,
+                event_line: 2,
+            })
         ));
 
         let mut stale_edit = stale.clone();
@@ -23855,18 +24462,27 @@ mod tests {
         stale_edit.provider_message_id = Some("provider-1".to_string());
         assert!(progress_delivery_should_preempt_stale_pending(
             &stale_edit,
-            Some(2)
+            Some(agent_harness_core::AgentProgressEventIdentity {
+                event_id: None,
+                event_line: 2,
+            })
         ));
 
         let mut terminal = stale_edit.clone();
         terminal.terminal = true;
         assert!(!progress_delivery_should_preempt_stale_pending(
             &terminal,
-            Some(2)
+            Some(agent_harness_core::AgentProgressEventIdentity {
+                event_id: None,
+                event_line: 2,
+            })
         ));
         assert!(!progress_delivery_should_preempt_stale_pending(
             &stale_edit,
-            Some(1)
+            Some(agent_harness_core::AgentProgressEventIdentity {
+                event_id: None,
+                event_line: 1,
+            })
         ));
     }
 
@@ -23962,6 +24578,7 @@ mod tests {
                 },
                 AgentProgressDeliveryRecordContext {
                     status_surface_key: pending.status_surface_key.clone(),
+                    event_id: pending.event_id.clone(),
                     existing_provider_message_id: pending.provider_message_id.clone(),
                     decision: Some("test".to_string()),
                     fresh_send_reason: pending.fresh_send_reason,
@@ -23971,6 +24588,28 @@ mod tests {
             )
             .unwrap();
         }
+
+        // This is the plan snapshot an in-flight delivery loop would still
+        // hold after it has claimed the first lane's provider surfaces.  A
+        // newer event then arrives before that snapshot is sent.
+        let mut stale_plan = first_plan.clone();
+        for pending in stale_plan
+            .pending
+            .iter_mut()
+            .filter(|pending| pending.queue_id == context_1.queue_id)
+        {
+            pending.action = AgentProgressDeliveryAction::Edit;
+            pending.provider_message_id = Some(format!("provider-{:?}", pending.message_kind));
+            pending.fresh_send_reason = None;
+        }
+        assert!(
+            stale_plan.pending.iter().any(|pending| {
+                pending.queue_id == context_1.queue_id
+                    && pending.action == AgentProgressDeliveryAction::Edit
+                    && pending.provider_message_id.is_some()
+            }),
+            "expected an editable first-lane surface before its newer event: {stale_plan:?}"
+        );
 
         let preempt_sequence = read_loop_wake_sequence(&harness_home, "progress-delivery");
         agent_harness_core::append_agent_progress_event(
@@ -23986,26 +24625,10 @@ mod tests {
         )
         .unwrap();
 
-        let events_len = fs::metadata(agent_harness_core::agent_progress_events_file(
-            &harness_home,
-        ))
-        .unwrap()
-        .len();
-        let state_file = agent_harness_core::agent_progress_delivery_state_file(&harness_home);
-        let mut state_json: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
-        state_json["ledger"]["offsetBytes"] = serde_json::json!(events_len);
-        state_json["ledger"]["lineNumber"] = serde_json::json!(3);
-        fs::write(
-            &state_file,
-            serde_json::to_string_pretty(&state_json).unwrap(),
-        )
-        .unwrap();
-
         let mut args = progress_args();
         args.target_home = harness_home.clone();
         args.preempt_after_wake_sequence = Some(preempt_sequence);
-        let report = execute_progress_delivery_once(&args).unwrap();
+        let report = execute_progress_delivery_plan(&args, stale_plan, None).unwrap();
 
         assert!(report.pending_count >= 3, "{report:?}");
         assert_eq!(report.sent_messages, 0);
@@ -24020,6 +24643,81 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("preempted by newer events for the same queue")),
             "{report:?}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn progress_delivery_stop_releases_unattempted_surface_claims_before_provider_io() {
+        let root = cli_temp_root(
+            "progress_delivery_stop_releases_unattempted_surface_claims_before_provider_io",
+        );
+        let harness_home = root.join(".agent-harness");
+        let context = agent_harness_core::AgentProgressContext {
+            queue_id: "turn:1:telegram:dm-1:operator:main:session-1".to_string(),
+            agent_id: Some("main".to_string()),
+            account_id: None,
+            thread_id: None,
+            session_key: "telegram:dm-1:operator:main:session-1".to_string(),
+            platform: "telegram".to_string(),
+            channel_id: "dm-1".to_string(),
+            user_id: "operator".to_string(),
+        };
+        agent_harness_core::append_agent_progress_event(
+            &harness_home,
+            &agent_harness_core::AgentProgressEvent::new(
+                &context,
+                agent_harness_core::AgentProgressKind::ToolCall,
+                "tool_call",
+                "prepared before stop",
+                agent_harness_core::AgentProgressStatus::Started,
+                1_000,
+            ),
+        )
+        .unwrap();
+        let plan = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2_000,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        assert!(!plan.pending.is_empty(), "{plan:?}");
+
+        let claims_dir = harness_home
+            .join("state")
+            .join("progress")
+            .join("surface-claims");
+        assert!(
+            fs::read_dir(&claims_dir).unwrap().next().is_some(),
+            "the prepared plan must own at least one claim before stop"
+        );
+        let stop_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("stop-requested");
+        fs::create_dir_all(stop_file.parent().unwrap()).unwrap();
+        fs::write(&stop_file, "stop").unwrap();
+
+        let mut args = progress_args();
+        args.target_home = harness_home.clone();
+        let report = execute_progress_delivery_plan(&args, plan, Some(&stop_file)).unwrap();
+
+        assert!(report.pending_count > 0, "{report:?}");
+        assert_eq!(report.sent_messages, 0, "{report:?}");
+        assert_eq!(report.edited_messages, 0, "{report:?}");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("stop requested before provider delivery")),
+            "{report:?}"
+        );
+        assert!(
+            fs::read_dir(&claims_dir).unwrap().next().is_none(),
+            "stop must release unattempted fresh-send claims"
         );
 
         let _ = fs::remove_dir_all(root);
@@ -24542,6 +25240,11 @@ mod tests {
             request.receive.status,
             agent_harness_core::ChannelReceiveStatus::CommandApplied
         );
+        let received_session_key = request.receive.session_key.clone();
+        assert!(
+            received_session_key.starts_with("discord:fixture-dm:fixture-operator:main:acct-"),
+            "restart request must retain the account-bound session lane"
+        );
 
         let consumed = consume_gateway_restart_request(&harness_home, "discord-gateway-loop")
             .unwrap()
@@ -24567,7 +25270,7 @@ mod tests {
                 .latest_request
                 .as_ref()
                 .and_then(|value| value.session_key.as_deref()),
-            Some("discord:fixture-dm:fixture-operator:main")
+            Some(received_session_key.as_str())
         );
         assert_eq!(
             report
@@ -25085,6 +25788,61 @@ mod tests {
             runtime_child_args
                 .windows(2)
                 .any(|pair| pair[0] == "--loop-name" && pair[1] == "runtime-loop")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn supervisor_run_ledger_maintenance_child_args_are_bounded_and_isolated() {
+        let root = cli_temp_root("supervisor_run_ledger_maintenance_child_args");
+        let harness_home = root.join(".agent-harness");
+        let stop_file = harness_home
+            .join("state")
+            .join("supervisor")
+            .join("stop")
+            .join("ledger-maintenance-loop.stop");
+        let harness_cli = root.join("agent-harness.exe");
+        let args = supervisor_run_args_from_args(&[
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--service".to_string(),
+            "ledger-maintenance-loop".to_string(),
+            "--harness-cli".to_string(),
+            harness_cli.display().to_string(),
+            "--idle-ms".to_string(),
+            "25".to_string(),
+            "--max-consecutive-errors".to_string(),
+            "3".to_string(),
+            "--child-iterations".to_string(),
+            "7".to_string(),
+            "--stop-file".to_string(),
+            stop_file.display().to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(args.service, "ledger-maintenance-loop");
+        assert_eq!(supervisor_service_priority(&args.service), "maintenance");
+        assert_eq!(supervisor_delivery_lane(&args.service), None);
+        let child_args = supervisor_child_args(&args);
+        let has_pair = |flag: &str, value: String| {
+            child_args
+                .windows(2)
+                .any(|pair| pair[0] == flag && pair[1] == value)
+        };
+        assert_eq!(child_args[0], "ledger-maintenance-loop");
+        assert!(has_pair(
+            "--harness-home",
+            harness_home.display().to_string()
+        ));
+        assert!(has_pair("--iterations", "7".to_string()));
+        assert!(has_pair("--idle-ms", "60000".to_string()));
+        assert!(has_pair("--max-consecutive-errors", "3".to_string()));
+        assert!(has_pair("--stop-file", stop_file.display().to_string()));
+        assert!(
+            !child_args
+                .iter()
+                .any(|argument| argument == "--source-home")
         );
 
         let _ = fs::remove_dir_all(root);
@@ -25945,6 +26703,7 @@ mod tests {
             channel_id: "dm-42".to_string(),
             user_id: "user-7".to_string(),
             session_key: format!("{platform}:dm-42:user-7:main"),
+            delivery_id: None,
             kind: agent_harness_core::ChannelOutboundMessageKind::AgentReply,
             source_queue_id: Some("queue-rich".to_string()),
             source_completion_file: None,

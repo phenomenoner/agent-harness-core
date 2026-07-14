@@ -1,11 +1,22 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::json;
 
-use crate::child_execution_policy::{ChildExecutionPolicyV1, ChildExecutionPolicyV2};
+use crate::backend_reasoning::{
+    BackendReasoningPolicyV1, BackendReasoningSource, ReasoningPreference,
+};
+use crate::child_execution_policy::{
+    ChildExecutionPolicyV1, ChildExecutionPolicyV1Input, ChildExecutionPolicyV2,
+};
+use crate::lane::FullLaneKeyV1;
+use crate::model_catalog::{
+    ModelCatalogRolloutMode, ReasoningResolutionStatus, UnsupportedReasoningPolicy,
+    model_catalog_rollout_mode_for_agent, parse_codex_model_catalog, resolve_reasoning_effort,
+};
 use crate::worker_coordination::{
     WorkerCoordinatorWaitCreateOptionsV1, persist_waiting_for_children_in_transaction,
 };
@@ -26,6 +37,11 @@ use crate::{
 const WORKER_ADAPTER_ENQUEUE_SCHEMA: &str = "agent-harness.worker-adapter-enqueue.v1";
 const DEFAULT_WORKER_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_WATCHDOG_TIMEOUT_MS: u64 = 900_000;
+const CONTROLLED_COORDINATOR_SMOKE_CHILD_COUNT: usize = 2;
+const CONTROLLED_COORDINATOR_SMOKE_PROVIDER: &str = "openai";
+const CONTROLLED_COORDINATOR_SMOKE_SOURCE_MARKER: &str = "t4-coordinator-smoke.json";
+const CONTROLLED_COORDINATOR_SMOKE_SOURCE_SCHEMA: &str =
+    "agent-harness.controlled-coordinator-smoke-source.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeterministicCronWorkerEnqueueOptions {
@@ -93,6 +109,42 @@ pub struct SubagentWorkerEnqueueOptionsV5 {
     pub options: SubagentWorkerEnqueueOptionsV4,
     /// Independent V2 policy/snapshot pairs keyed by imported subagent run id.
     pub child_policies_v2_by_run_id: BTreeMap<String, ChildExecutionPolicyV2>,
+}
+
+/// Exact live lane used by the intentionally narrow coordinator replay probe.
+/// The adapter only permits the main interactive Telegram or Discord lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlledCoordinatorSmokeLaneV1 {
+    pub platform: String,
+    pub account_id: String,
+    pub channel_id: String,
+    pub user_id: String,
+    pub agent_id: String,
+    pub session_key: String,
+}
+
+/// One catalog-admitted child in the intentionally fixed two-child replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlledCoordinatorSmokeChildV1 {
+    pub run_id: String,
+    pub model: String,
+    pub effort: String,
+}
+
+/// Operator-only admission for a bounded, durable child-to-master replay.
+///
+/// This does not invoke a provider itself. It validates the exact source ledger
+/// and authoritative catalog, then delegates atomically to the existing V5
+/// worker adapter so the normal worker, mailbox, watchdog, and runtime paths
+/// remain the only execution path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlledCoordinatorSmokeOptionsV1 {
+    pub harness_home: PathBuf,
+    pub source: AgentSource,
+    pub runtime_workspace: Option<PathBuf>,
+    pub lane: ControlledCoordinatorSmokeLaneV1,
+    pub children: Vec<ControlledCoordinatorSmokeChildV1>,
+    pub now_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -623,6 +675,405 @@ pub fn enqueue_subagent_workers_v5(
     })
 }
 
+/// Enqueues one bounded, real-lane coordinator replay without introducing a
+/// second dispatch path. The source ledger must contain exactly the requested
+/// two queued children; when exact channel state exists the lane session must
+/// be current, and the main lane and every planned child agent, plus each child
+/// route and effort, must be accepted by the current authoritative Codex model
+/// catalog before the worker store is opened.
+pub fn enqueue_controlled_coordinator_smoke(
+    options: ControlledCoordinatorSmokeOptionsV1,
+) -> io::Result<WorkerAdapterEnqueueReport> {
+    validate_controlled_coordinator_smoke_lane(&options.lane)?;
+    validate_controlled_coordinator_smoke_current_session(&options.harness_home, &options.lane)?;
+    if options.children.len() != CONTROLLED_COORDINATOR_SMOKE_CHILD_COUNT {
+        return Err(controlled_smoke_invalid_input(format!(
+            "controlled coordinator smoke requires exactly {CONTROLLED_COORDINATOR_SMOKE_CHILD_COUNT} children"
+        )));
+    }
+
+    let mut requested_children = BTreeMap::new();
+    for child in &options.children {
+        if child.run_id.trim().is_empty() || child.run_id != child.run_id.trim() {
+            return Err(controlled_smoke_invalid_input(
+                "controlled coordinator smoke child runId must be non-empty and canonical",
+            ));
+        }
+        if requested_children
+            .insert(child.run_id.clone(), child)
+            .is_some()
+        {
+            return Err(controlled_smoke_invalid_input(format!(
+                "controlled coordinator smoke repeats child runId `{}`",
+                child.run_id
+            )));
+        }
+    }
+    if !options.children.iter().any(|child| child.effort == "max") {
+        return Err(controlled_smoke_invalid_input(
+            "controlled coordinator smoke requires at least one exact `max` child",
+        ));
+    }
+    if options.children[0].model == options.children[1].model {
+        return Err(controlled_smoke_invalid_input(
+            "controlled coordinator smoke requires heterogeneous child models",
+        ));
+    }
+    validate_controlled_coordinator_smoke_source(&options.source)?;
+
+    // The intentionally scoped probe must never be pointed at a historical or
+    // broad imported ledger. Prove the two caller-provided ids are the complete
+    // resume plan before considering catalog or worker-store state.
+    let ledger = load_subagent_ledger(&options.source)?;
+    let plan = plan_subagents(
+        &ledger,
+        SubagentPlanInput {
+            resume_subagents: true,
+        },
+    );
+    let mut planned_run_ids = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.action == SubagentPlanAction::ResumeCandidate)
+        .map(|entry| entry.run_id.clone())
+        .collect::<Vec<_>>();
+    planned_run_ids.sort();
+    let requested_run_ids = requested_children.keys().cloned().collect::<Vec<_>>();
+    if plan.entries.len() != CONTROLLED_COORDINATOR_SMOKE_CHILD_COUNT
+        || planned_run_ids.len() != CONTROLLED_COORDINATOR_SMOKE_CHILD_COUNT
+        || planned_run_ids != requested_run_ids
+        || !plan.warnings.is_empty()
+    {
+        return Err(controlled_smoke_invalid_input(
+            "controlled coordinator smoke source must plan exactly its two requested resume candidates without warnings",
+        ));
+    }
+
+    // `enqueue_subagent_workers_v5` resolves a missing source agent to the
+    // master agent, but otherwise dispatches under the source entry's agent.
+    // Gate that exact execution identity here, before the worker store is
+    // opened, so a catalog rollout cannot admit a child which runtime would
+    // later quarantine fail-closed.
+    let mut rollout_agent_ids = BTreeSet::from([options.lane.agent_id.clone()]);
+    rollout_agent_ids.extend(
+        plan.entries
+            .iter()
+            .filter(|entry| entry.action == SubagentPlanAction::ResumeCandidate)
+            .map(|entry| {
+                entry
+                    .agent_id
+                    .clone()
+                    .unwrap_or_else(|| options.lane.agent_id.clone())
+            }),
+    );
+    for agent_id in rollout_agent_ids {
+        if model_catalog_rollout_mode_for_agent(Some(&options.harness_home), Some(&agent_id))
+            != ModelCatalogRolloutMode::Authoritative
+        {
+            let scope = if agent_id == options.lane.agent_id {
+                "the exact main lane".to_string()
+            } else {
+                format!("planned child agent `{agent_id}`")
+            };
+            return Err(controlled_smoke_invalid_input(format!(
+                "controlled coordinator smoke requires authoritative modelCatalogV2 for {scope} before persisting workers",
+            )));
+        }
+    }
+    let catalog_file = options
+        .harness_home
+        .join("codex-home")
+        .join("models_cache.json");
+    let catalog_text = fs::read_to_string(&catalog_file).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "controlled coordinator smoke could not read authoritative Codex model catalog {}: {error}",
+                catalog_file.display()
+            ),
+        )
+    })?;
+    let catalog = parse_codex_model_catalog(&catalog_text).map_err(|error| {
+        controlled_smoke_invalid_input(format!(
+            "controlled coordinator smoke rejected authoritative Codex model catalog: {error}"
+        ))
+    })?;
+
+    let root_session_key = crate::root_working_session_key(&options.lane.session_key);
+    let full_lane = FullLaneKeyV1::new(
+        options.lane.platform.clone(),
+        options.lane.account_id.clone(),
+        options.lane.channel_id.clone(),
+        options.lane.user_id.clone(),
+        options.lane.agent_id.clone(),
+        "interactive",
+        root_session_key.clone(),
+        options.lane.session_key.clone(),
+    )
+    .map_err(|error| {
+        controlled_smoke_invalid_input(format!("invalid exact smoke lane: {error}"))
+    })?;
+    let virtual_session_id = crate::context_rollover::derive_virtual_session_id(
+        &options.lane.platform,
+        &options.lane.channel_id,
+        &options.lane.user_id,
+        &options.lane.agent_id,
+        &root_session_key,
+    );
+    let replay_key = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        options.source.home.display(),
+        options.source.workspace.display(),
+        options.lane.session_key,
+        options.now_ms,
+        requested_run_ids.join(",")
+    );
+    let replay_id = fnv1a_64_hex(&replay_key);
+    let parent_queue_id = format!("t4-coordinator-smoke-parent-{replay_id}");
+    let wait_id = format!("t4-coordinator-smoke-wait-{replay_id}");
+
+    let mut child_policies_v2_by_run_id = BTreeMap::new();
+    let mut result_owners_by_run_id = BTreeMap::new();
+    let mut coordinator_owner = None;
+    for (index, child) in options.children.iter().enumerate() {
+        validate_controlled_smoke_route(child)?;
+        let resolution = resolve_reasoning_effort(
+            Some(&catalog),
+            ModelCatalogRolloutMode::Authoritative,
+            CONTROLLED_COORDINATOR_SMOKE_PROVIDER,
+            &child.model,
+            &child.effort,
+            UnsupportedReasoningPolicy::Reject,
+        );
+        if resolution.status != ReasoningResolutionStatus::Accepted
+            || !resolution.authoritative
+            || resolution.effective_effort.as_deref() != Some(child.effort.as_str())
+            || resolution.effective_provider.as_deref()
+                != Some(CONTROLLED_COORDINATOR_SMOKE_PROVIDER)
+            || resolution.effective_model.as_deref() != Some(child.model.as_str())
+        {
+            return Err(controlled_smoke_invalid_input(format!(
+                "controlled coordinator smoke child `{}` route {}/{} effort `{}` was not advertised by the authoritative catalog: {}",
+                child.run_id,
+                CONTROLLED_COORDINATOR_SMOKE_PROVIDER,
+                child.model,
+                child.effort,
+                resolution.reason
+            )));
+        }
+        let policy_revision = u64::try_from(options.now_ms)
+            .unwrap_or(1)
+            .max(1)
+            .saturating_add(u64::try_from(index).unwrap_or(0));
+        let child_policy = ChildExecutionPolicyV1::new(ChildExecutionPolicyV1Input {
+            policy_revision,
+            provider: Some(CONTROLLED_COORDINATOR_SMOKE_PROVIDER.to_string()),
+            model: Some(child.model.clone()),
+            reasoning_preference: Some(
+                ReasoningPreference::explicit(child.effort.clone()).map_err(|error| {
+                    controlled_smoke_invalid_input(format!(
+                        "controlled coordinator smoke child `{}` has invalid effort: {error}",
+                        child.run_id
+                    ))
+                })?,
+            ),
+            backend_reasoning_policy: Some(
+                BackendReasoningPolicyV1::new(BackendReasoningSource::ChildAdmission, resolution)
+                    .map_err(|error| {
+                        controlled_smoke_invalid_input(format!(
+                            "controlled coordinator smoke child `{}` cannot bind an authoritative backend policy: {error}",
+                            child.run_id
+                        ))
+                    })?,
+            ),
+            catalog_revision: Some(catalog.revision.clone()),
+            tools_profile: "default".to_string(),
+            sandbox_profile: "workspace-write".to_string(),
+            timeout_ms: DEFAULT_WORKER_TIMEOUT_MS,
+            heartbeat_timeout_ms: 60_000,
+            max_attempts: 3,
+            token_or_cost_budget: None,
+            delegation_limit: None,
+            result_contract: "child-result-envelope-v1".to_string(),
+        })
+        .map_err(|error| {
+            controlled_smoke_invalid_input(format!(
+                "controlled coordinator smoke child `{}` has invalid execution policy: {error}",
+                child.run_id
+            ))
+        })?;
+        let owner = ExactWorkerResultOwnerV1::new(
+            full_lane.clone(),
+            virtual_session_id.clone(),
+            None,
+            Some(parent_queue_id.clone()),
+            format!(
+                "t4-coordinator-smoke-source-{}-{replay_id}",
+                normalize_key_part(&child.run_id)
+            ),
+            None,
+            None,
+        )
+        .map_err(|error| {
+            controlled_smoke_invalid_input(format!(
+                "controlled coordinator smoke child `{}` has invalid exact owner: {error}",
+                child.run_id
+            ))
+        })?;
+        if coordinator_owner.is_none() {
+            coordinator_owner = Some(owner.clone());
+        }
+        child_policies_v2_by_run_id.insert(
+            child.run_id.clone(),
+            ChildExecutionPolicyV2::new(child_policy, None).map_err(|error| {
+                controlled_smoke_invalid_input(format!(
+                    "controlled coordinator smoke child `{}` could not wrap its policy: {error}",
+                    child.run_id
+                ))
+            })?,
+        );
+        result_owners_by_run_id.insert(child.run_id.clone(), WorkerResultOwnerV1::Exact(owner));
+    }
+
+    let coordinator_owner = coordinator_owner.ok_or_else(|| {
+        controlled_smoke_invalid_input(
+            "controlled coordinator smoke has no exact coordinator owner",
+        )
+    })?;
+    enqueue_subagent_workers_v5(SubagentWorkerEnqueueOptionsV5 {
+        options: SubagentWorkerEnqueueOptionsV4 {
+            options: SubagentWorkerEnqueueOptionsV3 {
+                options: SubagentWorkerEnqueueOptionsV2 {
+                    options: SubagentWorkerEnqueueOptions {
+                        harness_home: options.harness_home,
+                        source: options.source,
+                        resume_subagents: true,
+                        master_agent_id: Some(options.lane.agent_id),
+                        master_session_key: Some(options.lane.session_key),
+                        runtime_workspace: options.runtime_workspace,
+                        now_ms: options.now_ms,
+                    },
+                    child_policies_by_run_id: BTreeMap::new(),
+                },
+                result_owners_by_run_id,
+            },
+            coordinator: Some(SubagentCoordinatorResumeOptionsV1 {
+                wait_id,
+                owner: coordinator_owner,
+            }),
+        },
+        child_policies_v2_by_run_id,
+    })
+}
+
+fn controlled_smoke_invalid_input(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+fn validate_controlled_coordinator_smoke_lane(
+    lane: &ControlledCoordinatorSmokeLaneV1,
+) -> io::Result<()> {
+    if !matches!(lane.platform.as_str(), "telegram" | "discord") {
+        return Err(controlled_smoke_invalid_input(
+            "controlled coordinator smoke only permits telegram or discord interactive lanes",
+        ));
+    }
+    if lane.agent_id != "main" {
+        return Err(controlled_smoke_invalid_input(
+            "controlled coordinator smoke only permits the exact main agent lane",
+        ));
+    }
+    for (label, value) in [
+        ("accountId", lane.account_id.as_str()),
+        ("channelId", lane.channel_id.as_str()),
+        ("userId", lane.user_id.as_str()),
+        ("sessionKey", lane.session_key.as_str()),
+    ] {
+        if value.trim().is_empty() || value != value.trim() {
+            return Err(controlled_smoke_invalid_input(format!(
+                "controlled coordinator smoke {label} must be non-empty and canonical"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_controlled_coordinator_smoke_current_session(
+    harness_home: &Path,
+    lane: &ControlledCoordinatorSmokeLaneV1,
+) -> io::Result<()> {
+    let channel_lane = crate::ChannelStateLane::new(
+        &lane.platform,
+        Some(&lane.account_id),
+        &lane.channel_id,
+        &lane.user_id,
+        &lane.agent_id,
+    )
+    .map_err(|error| {
+        controlled_smoke_invalid_input(format!(
+            "controlled coordinator smoke has invalid exact channel lane: {error}"
+        ))
+    })?;
+    let state =
+        crate::read_channel_session_state_v2(harness_home, &channel_lane).map_err(|error| {
+            controlled_smoke_invalid_input(format!(
+                "controlled coordinator smoke could not read exact channel session state: {error}"
+            ))
+        })?;
+    if state.is_some_and(|state| state.active_session_key != lane.session_key) {
+        return Err(controlled_smoke_invalid_input(
+            "controlled coordinator smoke requires the exact active channel session when v2 state exists",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_controlled_coordinator_smoke_source(source: &AgentSource) -> io::Result<()> {
+    let marker_file = source.home.join(CONTROLLED_COORDINATOR_SMOKE_SOURCE_MARKER);
+    let marker_text = fs::read_to_string(&marker_file).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "controlled coordinator smoke requires its explicit source marker {}: {error}",
+                marker_file.display()
+            ),
+        )
+    })?;
+    let marker = serde_json::from_str::<serde_json::Value>(&marker_text).map_err(|error| {
+        controlled_smoke_invalid_input(format!(
+            "controlled coordinator smoke source marker is not valid JSON: {error}"
+        ))
+    })?;
+    if marker.get("schema").and_then(serde_json::Value::as_str)
+        != Some(CONTROLLED_COORDINATOR_SMOKE_SOURCE_SCHEMA)
+        || marker.get("purpose").and_then(serde_json::Value::as_str)
+            != Some("bounded-two-child-replay")
+    {
+        return Err(controlled_smoke_invalid_input(
+            "controlled coordinator smoke source marker has an unexpected schema or purpose",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_controlled_smoke_route(child: &ControlledCoordinatorSmokeChildV1) -> io::Result<()> {
+    let canonical_model = child.model.trim().to_ascii_lowercase();
+    if child.model != canonical_model || !child.model.starts_with("gpt-5.6-") {
+        return Err(controlled_smoke_invalid_input(format!(
+            "controlled coordinator smoke child `{}` must use a canonical gpt-5.6 model id",
+            child.run_id
+        )));
+    }
+    let canonical_effort = child.effort.trim().to_ascii_lowercase();
+    if child.effort != canonical_effort || child.effort == "ultra" {
+        return Err(controlled_smoke_invalid_input(format!(
+            "controlled coordinator smoke child `{}` must use a canonical non-ultra effort",
+            child.run_id
+        )));
+    }
+    Ok(())
+}
+
 pub fn enqueue_subagent_workers_v4(
     options: SubagentWorkerEnqueueOptionsV4,
 ) -> io::Result<WorkerAdapterEnqueueReport> {
@@ -1039,6 +1490,7 @@ fn _now_ms_fallback() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1433,6 +1885,250 @@ mod tests {
     }
 
     #[test]
+    fn controlled_coordinator_smoke_enqueues_only_two_catalog_admitted_children() {
+        let root = temp_root("controlled_coordinator_smoke_catalog_admission");
+        let source = write_main_controlled_coordinator_source(&root);
+        write_controlled_coordinator_smoke_source_marker(&source);
+        let harness_home = root.join("harness");
+        write_authoritative_model_catalog_fixture(&harness_home);
+        write_controlled_coordinator_smoke_active_session(
+            &harness_home,
+            "telegram:channel-1:user-1:main:t4-smoke",
+        );
+
+        let report = enqueue_controlled_coordinator_smoke(ControlledCoordinatorSmokeOptionsV1 {
+            harness_home: harness_home.clone(),
+            source,
+            runtime_workspace: None,
+            lane: ControlledCoordinatorSmokeLaneV1 {
+                platform: "telegram".to_string(),
+                account_id: "account-1".to_string(),
+                channel_id: "channel-1".to_string(),
+                user_id: "user-1".to_string(),
+                agent_id: "main".to_string(),
+                session_key: "telegram:channel-1:user-1:main:t4-smoke".to_string(),
+            },
+            children: vec![
+                ControlledCoordinatorSmokeChildV1 {
+                    run_id: "queued-1".to_string(),
+                    model: "gpt-5.6-terra".to_string(),
+                    effort: "max".to_string(),
+                },
+                ControlledCoordinatorSmokeChildV1 {
+                    run_id: "queued-2".to_string(),
+                    model: "gpt-5.6-sol".to_string(),
+                    effort: "high".to_string(),
+                },
+            ],
+            now_ms: 1_000,
+        })
+        .unwrap();
+
+        assert_eq!(report.summary.plan_entries, 2);
+        assert_eq!(report.summary.inserted_jobs, 2);
+        assert!(report.summary.watchdog_inserted);
+
+        let conn = rusqlite::Connection::open(crate::worker_db_file(&harness_home)).unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT payload_json, child_policy_json, result_owner_json FROM jobs WHERE kind='llm_subagent' ORDER BY job_id",
+            )
+            .unwrap();
+        let stored = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .map(|row| {
+                let (payload, policy, owner) = row.unwrap();
+                let run_id = serde_json::from_str::<serde_json::Value>(&payload).unwrap()["runId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                (
+                    run_id,
+                    (
+                        serde_json::from_str::<ChildExecutionPolicyV1>(&policy).unwrap(),
+                        serde_json::from_str::<WorkerResultOwnerV1>(&owner).unwrap(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored["queued-1"].0.model(), Some("gpt-5.6-terra"));
+        assert_eq!(
+            stored["queued-1"].0.reasoning_preference(),
+            Some(&ReasoningPreference::explicit("max").unwrap())
+        );
+        assert_eq!(stored["queued-2"].0.model(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            stored["queued-2"].0.reasoning_preference(),
+            Some(&ReasoningPreference::explicit("high").unwrap())
+        );
+        let coordinator_keys = stored
+            .values()
+            .map(|(_, owner)| match owner {
+                WorkerResultOwnerV1::Exact(owner) => owner.coordinator_key().unwrap(),
+                WorkerResultOwnerV1::LegacyIncomplete(_) => {
+                    panic!("controlled coordinator smoke must use exact owners")
+                }
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(coordinator_keys.len(), 1);
+        assert!(report.watchdog.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn controlled_coordinator_smoke_rejects_stale_live_session_before_persisting_workers() {
+        let root = temp_root("controlled_coordinator_smoke_rejects_stale_live_session");
+        let source = write_main_controlled_coordinator_source(&root);
+        write_controlled_coordinator_smoke_source_marker(&source);
+        let harness_home = root.join("harness");
+        write_authoritative_model_catalog_fixture(&harness_home);
+        write_controlled_coordinator_smoke_active_session(
+            &harness_home,
+            "telegram:channel-1:user-1:main:currently-active",
+        );
+
+        let error = enqueue_controlled_coordinator_smoke(ControlledCoordinatorSmokeOptionsV1 {
+            harness_home: harness_home.clone(),
+            source,
+            runtime_workspace: None,
+            lane: ControlledCoordinatorSmokeLaneV1 {
+                platform: "telegram".to_string(),
+                account_id: "account-1".to_string(),
+                channel_id: "channel-1".to_string(),
+                user_id: "user-1".to_string(),
+                agent_id: "main".to_string(),
+                session_key: "telegram:channel-1:user-1:main:t4-smoke".to_string(),
+            },
+            children: vec![
+                ControlledCoordinatorSmokeChildV1 {
+                    run_id: "queued-1".to_string(),
+                    model: "gpt-5.6-terra".to_string(),
+                    effort: "max".to_string(),
+                },
+                ControlledCoordinatorSmokeChildV1 {
+                    run_id: "queued-2".to_string(),
+                    model: "gpt-5.6-sol".to_string(),
+                    effort: "high".to_string(),
+                },
+            ],
+            now_ms: 1_000,
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires the exact active channel session"),
+            "{error}"
+        );
+        assert!(
+            !crate::worker_db_file(&harness_home).exists(),
+            "stale live-session rejection must occur before the worker store is opened"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn controlled_coordinator_smoke_rejects_non_authoritative_child_agent_before_persisting_workers()
+     {
+        let root = temp_root("controlled_coordinator_smoke_rejects_non_authoritative_child_agent");
+        let source = write_heterogeneous_subagent_source(&root);
+        write_controlled_coordinator_smoke_source_marker(&source);
+        let harness_home = root.join("harness");
+        write_authoritative_model_catalog_fixture(&harness_home);
+
+        let error = enqueue_controlled_coordinator_smoke(ControlledCoordinatorSmokeOptionsV1 {
+            harness_home: harness_home.clone(),
+            source,
+            runtime_workspace: None,
+            lane: ControlledCoordinatorSmokeLaneV1 {
+                platform: "telegram".to_string(),
+                account_id: "account-1".to_string(),
+                channel_id: "channel-1".to_string(),
+                user_id: "user-1".to_string(),
+                agent_id: "main".to_string(),
+                session_key: "telegram:channel-1:user-1:main:t4-smoke".to_string(),
+            },
+            children: vec![
+                ControlledCoordinatorSmokeChildV1 {
+                    run_id: "queued-1".to_string(),
+                    model: "gpt-5.6-terra".to_string(),
+                    effort: "max".to_string(),
+                },
+                ControlledCoordinatorSmokeChildV1 {
+                    run_id: "queued-2".to_string(),
+                    model: "gpt-5.6-sol".to_string(),
+                    effort: "high".to_string(),
+                },
+            ],
+            now_ms: 1_000,
+        })
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("planned child agent `"),
+            "{error}"
+        );
+        assert!(
+            !crate::worker_db_file(&harness_home).exists(),
+            "child-agent catalog rejection must occur before the worker store is opened"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn controlled_coordinator_smoke_rejects_ultra_before_persisting_workers() {
+        let root = temp_root("controlled_coordinator_smoke_rejects_ultra");
+        let source = write_main_controlled_coordinator_source(&root);
+        write_controlled_coordinator_smoke_source_marker(&source);
+        let harness_home = root.join("harness");
+        write_authoritative_model_catalog_fixture(&harness_home);
+
+        let error = enqueue_controlled_coordinator_smoke(ControlledCoordinatorSmokeOptionsV1 {
+            harness_home: harness_home.clone(),
+            source,
+            runtime_workspace: None,
+            lane: ControlledCoordinatorSmokeLaneV1 {
+                platform: "telegram".to_string(),
+                account_id: "account-1".to_string(),
+                channel_id: "channel-1".to_string(),
+                user_id: "user-1".to_string(),
+                agent_id: "main".to_string(),
+                session_key: "telegram:channel-1:user-1:main:t4-smoke".to_string(),
+            },
+            children: vec![
+                ControlledCoordinatorSmokeChildV1 {
+                    run_id: "queued-1".to_string(),
+                    model: "gpt-5.6-terra".to_string(),
+                    effort: "max".to_string(),
+                },
+                ControlledCoordinatorSmokeChildV1 {
+                    run_id: "queued-2".to_string(),
+                    model: "gpt-5.6-sol".to_string(),
+                    effort: "ultra".to_string(),
+                },
+            ],
+            now_ms: 1_000,
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("non-ultra"), "{error}");
+        assert!(
+            !crate::worker_db_file(&harness_home).exists(),
+            "catalog rejection must occur before the worker store is opened"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn subagent_adapter_v5_rolls_back_children_wait_and_watchdog_together() {
         let root = temp_root("subagent_adapter_v5_atomic_rollback");
         let source = write_heterogeneous_subagent_source(&root);
@@ -1704,6 +2400,124 @@ mod tests {
         )
         .unwrap();
         AgentSource::with_workspace(home, workspace)
+    }
+
+    fn write_main_controlled_coordinator_source(root: &Path) -> AgentSource {
+        let home = root.join(".openclaw");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(home.join("subagents")).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            home.join("subagents").join("runs.json"),
+            r#"{
+              "runs": [
+                {
+                  "id": "queued-1",
+                  "agentId": "main",
+                  "parentAgentId": "main",
+                  "status": "queued",
+                  "task": "continue controlled coordinator smoke one"
+                },
+                {
+                  "id": "queued-2",
+                  "agentId": "main",
+                  "parentAgentId": "main",
+                  "status": "queued",
+                  "task": "continue controlled coordinator smoke two"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        AgentSource::with_workspace(home, workspace)
+    }
+
+    fn write_controlled_coordinator_smoke_active_session(harness_home: &Path, session_key: &str) {
+        let lane = crate::ChannelStateLane::new(
+            "telegram",
+            Some("account-1"),
+            "channel-1",
+            "user-1",
+            "main",
+        )
+        .unwrap();
+        let mut state = crate::ChannelSessionState {
+            schema: "agent-harness.channel-session-state.v2".to_string(),
+            platform: "telegram".to_string(),
+            account_id: Some("account-1".to_string()),
+            channel_id: "channel-1".to_string(),
+            user_id: "user-1".to_string(),
+            active_session_key: session_key.to_string(),
+            agent_id: Some("main".to_string()),
+            config_revision: None,
+            provider: None,
+            model: None,
+            session_topic: None,
+            model_override: None,
+            model_override_provider: None,
+            model_override_model: None,
+            thinking_enabled: false,
+            thinking_level: None,
+            thinking_instruction: None,
+            reasoning_preference: None,
+            backend_reasoning_policy: None,
+            fast_mode: None,
+            stop_requested: false,
+            stop_reason: None,
+            steering_notes: Vec::new(),
+            btw_notes: Vec::new(),
+            last_command: None,
+            updated_at_ms: 1_000,
+        };
+        crate::bind_channel_session_state_to_lane_v2(&mut state, &lane);
+        crate::write_channel_session_state_v2(harness_home, &lane, &state).unwrap();
+    }
+
+    fn write_authoritative_model_catalog_fixture(harness_home: &Path) {
+        fs::create_dir_all(harness_home.join("codex-home")).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{
+              "orchestration": {
+                "features": {
+                  "modelCatalogV2": {
+                    "mode": "authoritative",
+                    "enabledAgentIds": ["main"]
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join("codex-home").join("models_cache.json"),
+            r#"{
+              "models": [
+                {
+                  "slug": "gpt-5.6-terra",
+                  "default_reasoning_level": "medium",
+                  "supported_reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+                },
+                {
+                  "slug": "gpt-5.6-sol",
+                  "default_reasoning_level": "low",
+                  "supported_reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+    }
+
+    fn write_controlled_coordinator_smoke_source_marker(source: &AgentSource) {
+        fs::write(
+            source.home.join(CONTROLLED_COORDINATOR_SMOKE_SOURCE_MARKER),
+            r#"{
+              "schema": "agent-harness.controlled-coordinator-smoke-source.v1",
+              "purpose": "bounded-two-child-replay"
+            }"#,
+        )
+        .unwrap();
     }
 
     fn temp_root(test_name: &str) -> PathBuf {

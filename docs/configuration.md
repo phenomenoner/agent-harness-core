@@ -14,6 +14,29 @@ Agent Harness Core reads most operator state from a harness home directory suppl
 
 Use `--source-home` for imported prompt files, registry, skills, and legacy context. Use `--runtime-workspace` only for the Codex working directory. Prompt assembly falls back to the imported source workspace when the runtime workspace does not contain prompt files.
 
+## Supervisor Plans and Receipt Maintenance
+
+`supervisor-plan` generates the Windows Task Scheduler start/stop bundle from the authoritative harness configuration. Do not hand-edit generated runner scripts: regenerate the bundle after changing supervised loop configuration, first using `supervisor-reconcile --all --dry-run` to review ownership.
+
+An enabled secondary Telegram lane is declared under `supervisor.telegramLoops`. Each entry needs a distinct safe `serviceId` with a `telegram-loop-` prefix and an account selector; `agent` is optional:
+
+```json
+{
+  "supervisor": {
+    "telegramLoops": [
+      {
+        "enabled": true,
+        "serviceId": "telegram-loop-secondary",
+        "account": "secondary",
+        "agent": "secondary"
+      }
+    ]
+  }
+}
+```
+
+When `supervisor-plan --include-ledger-maintenance` is used, the generated bundle retains every enabled configured Telegram loop and adds the isolated `ledger-maintenance-loop`. That owner performs bounded receipt/history retention after interactive work; ingress, progress, runtime completion, and final delivery only signal it and do not synchronously compact histories.
+
 ## Model Capability and Reasoning Control
 
 v0.8.0 resolves reasoning against the exact effective provider/model route. Codex capability discovery supplies the model slug, default reasoning effort, and supported effort strings; the harness records a catalog revision and preserves the exact accepted effort through channel state, queue admission, and `turn/start`. Do not assume that two GPT-5.6 routes expose the same capabilities. For example, `gpt-5.6-sol` may use exact `max` only when the current exact route advertises `max`.

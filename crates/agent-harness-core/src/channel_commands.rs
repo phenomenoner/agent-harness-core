@@ -95,6 +95,9 @@ pub enum ChannelCommandIntent {
 pub const DEFAULT_THINKING_LEVEL: &str = "medium";
 pub const THINKING_LEVELS: &[&str] = &["minimal", "low", "medium", "high"];
 pub const XHIGH_THINKING_LEVEL: &str = "xhigh";
+/// `max` is a distinct, catalog-gated GPT-5.6 reasoning effort.  It must
+/// never be silently normalized down to the legacy `xhigh` prompt level.
+pub const MAX_THINKING_LEVEL: &str = "max";
 
 impl ChannelCommand {
     pub fn name(&self) -> &'static str {
@@ -287,9 +290,8 @@ pub fn normalize_thinking_level(level: &str) -> Option<String> {
     }
     match normalized.as_str() {
         "xhigh" | "x-high" | "x_high" | "extra-high" | "extra_high" | "very-high" | "very_high"
-        | "ultra-high" | "ultra_high" | "max" | "maximum" | "超高" | "最高" => {
-            Some(XHIGH_THINKING_LEVEL.to_string())
-        }
+        | "ultra-high" | "ultra_high" | "超高" => Some(XHIGH_THINKING_LEVEL.to_string()),
+        "max" | "maximum" | "最高" | "最大" => Some(MAX_THINKING_LEVEL.to_string()),
         "最小" | "最低" => Some("minimal".to_string()),
         "低" => Some("low".to_string()),
         "中" | "中等" | "普通" | "標準" => Some("medium".to_string()),
@@ -394,6 +396,8 @@ mod tests {
             normalize_thinking_level("ultra-high").as_deref(),
             Some("xhigh")
         );
+        assert_eq!(normalize_thinking_level("max").as_deref(), Some("max"));
+        assert_eq!(normalize_thinking_level("最高").as_deref(), Some("max"));
     }
 
     #[test]

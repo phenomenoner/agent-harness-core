@@ -4,11 +4,7 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "c19664340eb324699c75256bd92106f07c004c2667545274d5148b55efec4c57"
-    },
-    {
-      "path": "docs/.private/agent-harness-operations-handbook.md",
-      "sha256": "local-only"
+      "sha256": "2706b6a4a0e595be546ee52d72670df7be5dfac6cd5fa4b6ba418da725edc255"
     }
   ],
   "syncCommand": "python tools/generate_topology_explorer.py",
@@ -24,13 +20,13 @@
       ]
     },
     {
-      "id": "ops-current-live-validation",
-      "label": "Current Live Validation",
+      "id": "release-verification",
+      "label": "Release Verification",
       "group": "canon",
-      "state": "live",
-      "summary": "Live validation evidence is intentionally local-only and is not embedded in the public topology explorer.",
+      "state": "published",
+      "summary": "Sanitized release verification is published in the changelog; machine-specific live evidence is not part of the public graph.",
       "refs": [
-        "docs/.private/agent-harness-operations-handbook.md (local-only, optional)"
+        "CHANGELOG.md"
       ]
     },
     {
@@ -207,10 +203,36 @@
       "label": "progress",
       "group": "component",
       "state": "implemented",
-      "summary": "progress narration delivery, separate from final replies",
-      "reads": "progress events, channel policy",
-      "writes": "progress outbox/delivery state",
-      "invariants": "I2, I4, I9",
+      "summary": "source-authoritative progress narration delivery, separate from final replies",
+      "reads": "progress events/index, channel policy, watched stop file",
+      "writes": "progress outbox/delivery state, source cursor/cache, surface claims",
+      "invariants": "I2, I4, I9, I17, I25, I27",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-ledger-maintenance",
+      "label": "ledger_maintenance",
+      "group": "component",
+      "state": "implemented",
+      "summary": "source-aware, expensive runtime/channel-delivery/progress history retention outside interactive paths",
+      "reads": "coalesced terminal wakes, committed ledger/index state, maintenance policy",
+      "writes": "bounded per-ledger maintenance report and isolated warnings",
+      "invariants": "I3, I5, I9, I25",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-supervisor-plan-reconcile",
+      "label": "supervisor plan/reconcile",
+      "group": "component",
+      "state": "implemented",
+      "summary": "derive durable Windows Task Scheduler and reconcile ownership from the authoritative harness supervisor config",
+      "reads": "enabled supervisor.telegramLoops, loop/service identities, maintenance-owner selection",
+      "writes": "generated start/stop scripts, scheduled-task plan receipt, reconcile inventory/launch plan",
+      "invariants": "I26",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -365,7 +387,7 @@
       "label": "Codex runtime, final outbox, delivery, or progress",
       "group": "gate",
       "state": "release-gate",
-      "summary": "completion/protocol-error terminality; duplicate and stale-owner suppression; progress/final separation; provider delivery and terminal receipt precedence; bounded interruption evidence",
+      "summary": "completion/protocol-error terminality; duplicate and stale-owner suppression; progress/final separation; provider delivery and terminal receipt precedence; source-index freshness/defer; historical fresh-send suppression; watched-stop claim release; bounded interruption evidence",
       "reviewDocs": "docs/invariants.md, docs/schema-registry.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
@@ -427,14 +449,51 @@
       ]
     },
     {
+      "id": "impact-supervisor-task-scheduler-or-cutover-ownership",
+      "label": "Supervisor, Task Scheduler, or cutover ownership",
+      "group": "gate",
+      "state": "release-gate",
+      "summary": "configured loop plan/reconcile parity; generated start/stop bundle preserves enabled channel loops; dedicated maintenance owner and fresh post-cutover heartbeats",
+      "reviewDocs": "docs/invariants.md, docs/configuration.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "bounded-ledger-maintenance-live-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Bounded receipt history and isolated maintenance owner",
+      "designTarget": "Interactive ingress, progress, runtime completion, and final delivery read source-authoritative bounded snapshots and only signal retention; expensive compaction runs under the independently supervised ledger-maintenance-loop.",
+      "currentEvidence": "Focused 100k history, busy-lock snapshot, wake-coalescing, failure-isolation, queue-index migration, and full-workspace staging tests are green. Candidate supervisor dry-run plans the owner; controlled live long-turn ordering/latency evidence remains pending.",
+      "promotionGate": "Promote only after candidate preflight includes the dedicated owner and controlled live evidence proves progress/final delivery does not wait for retention, with bounded maintenance receipts and no recurring rebuild warning.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-supervisor-plan-configured-loop-parity-live-gap",
+      "label": "supervisor-plan-configured-loop-parity-live-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Task Scheduler plan/reconcile configured-loop parity",
+      "designTarget": "Regenerating the Windows Task Scheduler bundle preserves every enabled configured supervisor.telegramLoops runner while adding the isolated maintenance owner.",
+      "currentEvidence": "Fail-first/green plan regression and a staged nine-owner plan show the configured Telegram loop and ledger-maintenance-loop together. Live plan regeneration and fresh heartbeat readback remain pending.",
+      "promotionGate": "Promote only after the guarded cutover regenerates the authoritative plan, all configured channel and maintenance owners are fresh, and reconcile reports no missing/stale/launch actions.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
       "id": "gap-gpt56-max-prompt-coordinator-cutover-gap",
       "label": "gpt56-max-prompt-coordinator-cutover-gap",
       "group": "gap",
       "state": "open-gap",
       "summary": "GPT-5.6 Max-only prompt/child/coordinator upgrade",
       "designTarget": "GPT-5.6 routes accept catalog-supported efforts through exact max; exact ultra is unsupported and cannot be enabled through command, persisted state, child policy, or configuration. Prompt configuration is isolated per agent and exact full lane/backend generation. Heterogeneous child policies are immutable, child results carry bounded/redacted content or explicit failed omissions to the exact owner, and one exact-lane-safe master continuation owns user-facing output.",
-      "currentEvidence": "Implementation and staging evidence are still being assembled. This contract does not assert T4, live cutover, or post-cutover proof.",
-      "promotionGate": "Promote only after focused and broad staging gates prove command aliases/max propagation/Ultra rejection, prompt/path isolation, WorkerJobKind route binding, typed terminal provenance, complete mailbox batches, master-only progress/final/error ownership, exact-lane mutual exclusion, and restart/replay idempotency; then complete the guarded release gates.",
+      "currentEvidence": "Fresh focused and full-workspace staging evidence is green for exact Max/Ultra command/catalog/runtime behavior, exact-lane prompt manifests, immutable heterogeneous child policy, typed mailbox/coordinator resume, and parent-only final routing. The 2026-07-15 guarded cutover and provider-visible T4 replay used the current exact V2 lane session, admitted two authoritative heterogeneous children (including exact max), completed the mailbox/resume path, and delivered one master final with no child final outbox.",
+      "promotionGate": "The initial cutover/T4 gate is passed. Promote to broader operational parity only after the scheduled read-only soak confirms no duplicate final surface, route/policy drift, queue convergence failure, or cross-lane regression; add a controlled cross-platform exercise when the changed deployment scope requires it.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -767,9 +826,9 @@
   ],
   "edges": [
     {
-      "source": "ops-current-live-validation",
+      "source": "release-verification",
       "target": "canon-topology-contract",
-      "label": "live evidence maps to"
+      "label": "verification maps to"
     },
     {
       "source": "canon-topology-contract",
@@ -839,6 +898,16 @@
     {
       "source": "canon-topology-contract",
       "target": "component-progress",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-ledger-maintenance",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-supervisor-plan-reconcile",
       "label": "owns boundary"
     },
     {
@@ -998,6 +1067,11 @@
     },
     {
       "source": "axis-agentid",
+      "target": "component-supervisor-plan-reconcile",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
       "target": "component-memory-session-history-retrieval",
       "label": "must survive through"
     },
@@ -1038,6 +1112,11 @@
     },
     {
       "source": "axis-sessionkey",
+      "target": "component-supervisor-plan-reconcile",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-sessionkey",
       "target": "component-memory-session-history-retrieval",
       "label": "must survive through"
     },
@@ -1059,6 +1138,11 @@
     {
       "source": "axis-virtualsessionid",
       "target": "component-worker-result-mailbox-coordinator-resume",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-virtualsessionid",
+      "target": "component-supervisor-plan-reconcile",
       "label": "must survive through"
     },
     {
@@ -1109,6 +1193,11 @@
     {
       "source": "axis-backendcontextgeneration",
       "target": "component-workers-child-execution-policy",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-backendcontextgeneration",
+      "target": "component-ledger-maintenance",
       "label": "must survive through"
     },
     {
@@ -1247,12 +1336,107 @@
       "label": "reviewed by"
     },
     {
+      "source": "impact-supervisor-task-scheduler-or-cutover-ownership",
+      "target": "canon-topology-contract",
+      "label": "reviewed by"
+    },
+    {
+      "source": "component-cron-scheduler-deterministic-cron",
+      "target": "impact-supervisor-task-scheduler-or-cutover-ownership",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "impact-supervisor-task-scheduler-or-cutover-ownership",
+      "label": "changes trigger"
+    },
+    {
+      "source": "gap-bounded-ledger-maintenance-live-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-progress",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-ledger-maintenance",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-supervisor-plan-configured-loop-parity-live-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-cron-scheduler-deterministic-cron",
+      "target": "gap-supervisor-plan-configured-loop-parity-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-ledger-maintenance",
+      "target": "gap-supervisor-plan-configured-loop-parity-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "gap-supervisor-plan-configured-loop-parity-live-gap",
+      "label": "has gap"
+    },
+    {
       "source": "gap-gpt56-max-prompt-coordinator-cutover-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
     },
     {
       "source": "component-channel-state",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
       "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
       "label": "has gap"
     },
@@ -1272,7 +1456,22 @@
       "label": "has gap"
     },
     {
+      "source": "component-codex-runtime",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-provider-request-policy",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
       "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
       "label": "has gap"
     },
@@ -1343,6 +1542,11 @@
     },
     {
       "source": "component-provider-request-policy",
+      "target": "gap-openclaw-mem-full-parity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
       "target": "gap-openclaw-mem-full-parity-gap",
       "label": "has gap"
     },
@@ -1582,6 +1786,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "gap-progress-delivery-volume-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-memory-session-history-retrieval",
       "target": "gap-progress-delivery-volume-gap",
       "label": "has gap"
@@ -1653,6 +1862,11 @@
     },
     {
       "source": "component-provider-request-policy",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
       "target": "gap-tool-use-timeout-recovery-gap",
       "label": "has gap"
     },
@@ -1922,6 +2136,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-memory-session-history-retrieval",
       "target": "gap-first-class-command-plane-gap",
       "label": "has gap"
@@ -2182,12 +2401,22 @@
       "label": "has gap"
     },
     {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "gap-repo-code-graph-support-gap",
+      "label": "has gap"
+    },
+    {
       "source": "gap-supervisor-service-health-precedence-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
     },
     {
       "source": "component-channel-state",
+      "target": "gap-supervisor-service-health-precedence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
       "target": "gap-supervisor-service-health-precedence-gap",
       "label": "has gap"
     },
@@ -2330,7 +2559,6 @@
       "summary": "Understand the Store / Pack / Observe boundary, current fallback posture, and what remains before openclaw-mem parity.",
       "why": "Use this when recall quality, graph freshness, Qdrant Edge, or per-agent memory scope looks suspicious.",
       "nodes": [
-        "ops-current-live-validation",
         "gap-openclaw-mem-full-parity-gap",
         "gap-per-agent-memory-recall-compartment-gap",
         "gap-repo-code-graph-support-gap"
@@ -2361,7 +2589,6 @@
       "why": "Use this before a behavior-changing diff, especially runtime, channel, prompt, delivery, memory, or supervisor work.",
       "nodes": [
         "canon-topology-contract",
-        "ops-current-live-validation",
         "gap-scenario-matrix-coverage-gap",
         "gap-supervisor-service-health-precedence-gap"
       ],

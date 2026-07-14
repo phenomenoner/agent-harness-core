@@ -3,9 +3,14 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use ring::digest;
 use serde::{Deserialize, Serialize};
 
+use crate::context_rollover::{
+    VirtualSessionTaskBoundaryCloseV2Options, close_virtual_session_for_task_boundary_for_lane,
+};
 use crate::execution_mode::{ExecutionModePolicyV1, ExecutionModePreference};
+use crate::runtime_pending_index::read_queued_pending_values_from_index;
 use crate::{
     ChannelCommandEffect, ChannelOutboundMessage, ChannelStep,
     VirtualSessionTaskBoundaryCloseOptions,
@@ -19,17 +24,132 @@ use crate::{
 
 const CHANNEL_COMMAND_APPLY_SCHEMA: &str = "agent-harness.channel-command-apply.v1";
 const CHANNEL_STATE_SCHEMA: &str = "agent-harness.channel-session-state.v1";
+pub const CHANNEL_SESSION_STATE_V2_SCHEMA: &str = "agent-harness.channel-session-state.v2";
 const CHANNEL_COMMAND_EVENT_SCHEMA: &str = "agent-harness.channel-command-event.v1";
 const AGENT_OVERRIDES_SCHEMA: &str = "agent-harness.agent-overrides.v1";
 const CHANNEL_EXECUTION_MODE_SCHEMA: &str = "agent-harness.channel-execution-mode.v1";
 const AGENT_EXECUTION_MODE_OVERRIDES_SCHEMA: &str =
     "agent-harness.agent-execution-mode-overrides.v1";
 const RUNTIME_CANCEL_REQUEST_SCHEMA: &str = "agent-harness.runtime-cancel-request.v1";
+const DEFAULT_CHANNEL_STATE_ACCOUNT_ID: &str = "default";
+const MAX_CHANNEL_STATE_LANE_AXIS_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelCommandApplyOptions {
     pub harness_home: PathBuf,
     pub now_ms: i64,
+}
+
+/// Exact durable ownership boundary for v2 channel session state.
+///
+/// All axes are required after construction. A missing or blank provider
+/// account is normalized to the explicit `default` account; the other axes
+/// reject blank or control-character values. The fields are intentionally
+/// private so callers cannot create an unnormalized or partial lane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelStateLane {
+    platform: String,
+    account_id: String,
+    channel_id: String,
+    user_id: String,
+    agent_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChannelStateLaneWire {
+    platform: String,
+    #[serde(alias = "account_id")]
+    account_id: String,
+    #[serde(alias = "channel_id")]
+    channel_id: String,
+    #[serde(alias = "user_id")]
+    user_id: String,
+    #[serde(alias = "agent_id")]
+    agent_id: String,
+}
+
+impl<'de> Deserialize<'de> for ChannelStateLane {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ChannelStateLaneWire::deserialize(deserializer)?;
+        Self::new(
+            &wire.platform,
+            Some(&wire.account_id),
+            &wire.channel_id,
+            &wire.user_id,
+            &wire.agent_id,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+impl ChannelStateLane {
+    pub fn new(
+        platform: &str,
+        account_id: Option<&str>,
+        channel_id: &str,
+        user_id: &str,
+        agent_id: &str,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            platform: normalize_channel_state_lane_platform(platform)?,
+            account_id: normalize_channel_state_lane_account_id(account_id)?,
+            channel_id: normalize_required_channel_state_lane_axis(channel_id, "channelId", false)?,
+            user_id: normalize_required_channel_state_lane_axis(user_id, "userId", false)?,
+            agent_id: normalize_required_channel_state_lane_axis(agent_id, "agentId", false)?,
+        })
+    }
+
+    pub fn platform(&self) -> &str {
+        &self.platform
+    }
+
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub fn channel_id(&self) -> &str {
+        &self.channel_id
+    }
+
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    fn has_default_account(&self) -> bool {
+        self.account_id == DEFAULT_CHANNEL_STATE_ACCOUNT_ID
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChannelSessionStateV2MigrationStatus {
+    ExistingV2,
+    MigratedLegacyDefaultAccount,
+    LegacyStateMissing,
+    RejectedLegacyUnknownAccount,
+    RejectedLegacyMissingAgent,
+    RejectedLegacyAgentMismatch,
+    RejectedLegacyIdentityMismatch,
+}
+
+/// Result of an explicit, fail-closed v1-to-v2 state migration attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelSessionStateV2MigrationReport {
+    pub status: ChannelSessionStateV2MigrationStatus,
+    pub state_file: PathBuf,
+    pub legacy_state_file: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<ChannelSessionState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -52,6 +172,8 @@ pub struct ChannelCommandApplyReport {
 pub struct ChannelCommandApplyReceipt {
     pub status: ChannelCommandApplyReceiptStatus,
     pub session_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub state_file: PathBuf,
     pub events_file: PathBuf,
     pub reason: String,
@@ -80,6 +202,8 @@ pub struct ChannelCommandEvent {
     pub schema: &'static str,
     pub at_ms: i64,
     pub platform: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub channel_id: String,
     pub user_id: String,
     pub session_key: String,
@@ -93,10 +217,14 @@ pub struct ChannelCommandEvent {
 pub struct ChannelSessionState {
     pub schema: String,
     pub platform: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub channel_id: String,
     pub user_id: String,
     pub active_session_key: String,
     pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_revision: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub session_topic: Option<String>,
@@ -184,6 +312,8 @@ struct RuntimeCancelRequest {
     schema: &'static str,
     at_ms: i64,
     platform: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
     channel_id: String,
     user_id: String,
     session_key: String,
@@ -203,26 +333,57 @@ pub fn apply_channel_command_step(
     step: &ChannelStep,
     options: ChannelCommandApplyOptions,
 ) -> io::Result<ChannelCommandApplyReport> {
-    let state_dir = channel_session_state_dir(
-        &options.harness_home,
-        &step.platform,
-        &step.channel_id,
-        &step.user_id,
+    let mut warnings = step.warnings.clone();
+    let exact_lane = match step.account_id.as_deref() {
+        Some(account_id) => {
+            let agent_id = step_agent_id(step).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "account-scoped channel command has no exact selected agent",
+                )
+            })?;
+            Some(ChannelStateLane::new(
+                &step.platform,
+                Some(account_id),
+                &step.channel_id,
+                &step.user_id,
+                &agent_id,
+            )?)
+        }
+        None => None,
+    };
+    let state_file = exact_lane.as_ref().map_or_else(
+        || {
+            channel_session_state_file(
+                &options.harness_home,
+                &step.platform,
+                &step.channel_id,
+                &step.user_id,
+            )
+        },
+        |lane| channel_session_state_v2_file(&options.harness_home, lane),
     );
+    let state_dir = state_file.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("channel state file has no parent: {}", state_file.display()),
+        )
+    })?;
     fs::create_dir_all(&state_dir)?;
-    let state_file = state_dir.join("state.json");
     let events_file = state_dir.join("events.jsonl");
     let receipts_file = options
         .harness_home
         .join("state")
         .join("channels")
         .join("command-apply-receipts.jsonl");
-    let mut warnings = step.warnings.clone();
 
     let Some(effect) = step.command_effect.clone() else {
         let receipt = ChannelCommandApplyReceipt {
             status: ChannelCommandApplyReceiptStatus::SkippedNotCommand,
             session_key: step.session_key.clone(),
+            account_id: exact_lane
+                .as_ref()
+                .map(|lane| lane.account_id().to_string()),
             state_file: state_file.clone(),
             events_file: events_file.clone(),
             reason: "channel step has no command effect".to_string(),
@@ -247,7 +408,14 @@ pub fn apply_channel_command_step(
         });
     };
 
-    let mut state = read_channel_state(&state_file)?.unwrap_or_else(|| new_state(step));
+    let mut state = match exact_lane.as_ref() {
+        Some(lane) => read_channel_session_state_v2(&options.harness_home, lane)?
+            .unwrap_or_else(|| new_state(step, Some(lane))),
+        None => read_channel_state(&state_file)?.unwrap_or_else(|| new_state(step, None)),
+    };
+    if let Some(lane) = exact_lane.as_ref() {
+        bind_channel_session_state_to_lane_v2(&mut state, lane);
+    }
     let stop_applied_queue_ids = apply_effect(
         &mut state,
         &effect,
@@ -269,6 +437,9 @@ pub fn apply_channel_command_step(
         schema: CHANNEL_COMMAND_EVENT_SCHEMA,
         at_ms: options.now_ms,
         platform: step.platform.clone(),
+        account_id: exact_lane
+            .as_ref()
+            .map(|lane| lane.account_id().to_string()),
         channel_id: step.channel_id.clone(),
         user_id: step.user_id.clone(),
         session_key: step.session_key.clone(),
@@ -277,12 +448,19 @@ pub fn apply_channel_command_step(
         effect,
     };
 
-    write_json_atomic(&state_file, &state)?;
+    if let Some(lane) = exact_lane.as_ref() {
+        write_channel_session_state_v2(&options.harness_home, lane, &state)?;
+    } else {
+        write_json_atomic(&state_file, &state)?;
+    }
     append_json_line(&events_file, &event)?;
 
     let receipt = ChannelCommandApplyReceipt {
         status: ChannelCommandApplyReceiptStatus::Applied,
         session_key: state.active_session_key.clone(),
+        account_id: exact_lane
+            .as_ref()
+            .map(|lane| lane.account_id().to_string()),
         state_file: state_file.clone(),
         events_file: events_file.clone(),
         reason: "channel command state updated".to_string(),
@@ -329,6 +507,159 @@ pub fn channel_session_state_file(
     user_id: &str,
 ) -> PathBuf {
     channel_session_state_dir(harness_home, platform, channel_id, user_id).join("state.json")
+}
+
+/// Returns the deterministic v2 state path for one exact provider/account/
+/// channel/user/agent lane. The path is a SHA-256 digest of an unambiguous
+/// canonical lane encoding, not a lossy sanitization of provider identifiers.
+pub fn channel_session_state_v2_file(
+    harness_home: impl AsRef<Path>,
+    lane: &ChannelStateLane,
+) -> PathBuf {
+    harness_home
+        .as_ref()
+        .join("state")
+        .join("channels")
+        .join("v2")
+        .join(channel_state_lane_v2_key(lane))
+        .join("state.json")
+}
+
+/// Reads only the exact v2 lane state. This API never falls back to a legacy
+/// state file; callers that deliberately want migration must invoke the
+/// explicit migration API below.
+pub fn read_channel_session_state_v2(
+    harness_home: impl AsRef<Path>,
+    lane: &ChannelStateLane,
+) -> io::Result<Option<ChannelSessionState>> {
+    let state_file = channel_session_state_v2_file(harness_home, lane);
+    let Some(state) = read_channel_state(&state_file)? else {
+        return Ok(None);
+    };
+    validate_channel_session_state_v2_lane(&state, lane)?;
+    Ok(Some(state))
+}
+
+/// Binds a state object to an exact v2 lane before it is persisted.
+///
+/// This is deliberately explicit because v1 callers have no account axis and
+/// may leave `agent_id` unset. It preserves all non-identity fields, including
+/// `config_revision`, so callers can stamp a current configuration revision
+/// without losing it during an upgrade.
+pub fn bind_channel_session_state_to_lane_v2(
+    state: &mut ChannelSessionState,
+    lane: &ChannelStateLane,
+) {
+    state.schema = CHANNEL_SESSION_STATE_V2_SCHEMA.to_string();
+    state.platform = lane.platform.clone();
+    state.account_id = Some(lane.account_id.clone());
+    state.channel_id = lane.channel_id.clone();
+    state.user_id = lane.user_id.clone();
+    state.agent_id = Some(lane.agent_id.clone());
+}
+
+/// Writes one state object after checking that its persisted identity exactly
+/// matches the supplied v2 lane. An existing file is read first so a corrupted
+/// or hash-colliding lane cannot be overwritten as another lane's state.
+pub fn write_channel_session_state_v2(
+    harness_home: impl AsRef<Path>,
+    lane: &ChannelStateLane,
+    state: &ChannelSessionState,
+) -> io::Result<PathBuf> {
+    validate_channel_session_state_v2_lane(state, lane)?;
+    let harness_home = harness_home.as_ref();
+    let state_file = channel_session_state_v2_file(harness_home, lane);
+    if state_file.is_file() {
+        let _ = read_channel_session_state_v2(harness_home, lane)?;
+    }
+    write_json_atomic(&state_file, state)?;
+    Ok(state_file)
+}
+
+/// Explicitly migrates a legacy state file only when it is provably the same
+/// default-account lane. Unknown/non-default accounts and missing or mismatched
+/// agents remain unavailable rather than becoming wildcard state.
+pub fn migrate_legacy_channel_session_state_to_v2(
+    harness_home: impl AsRef<Path>,
+    lane: &ChannelStateLane,
+) -> io::Result<ChannelSessionStateV2MigrationReport> {
+    let harness_home = harness_home.as_ref();
+    let state_file = channel_session_state_v2_file(harness_home, lane);
+    let legacy_state_file = channel_session_state_file(
+        harness_home,
+        lane.platform(),
+        lane.channel_id(),
+        lane.user_id(),
+    );
+
+    if let Some(state) = read_channel_session_state_v2(harness_home, lane)? {
+        return Ok(ChannelSessionStateV2MigrationReport {
+            status: ChannelSessionStateV2MigrationStatus::ExistingV2,
+            state_file,
+            legacy_state_file,
+            state: Some(state),
+        });
+    }
+
+    let Some(mut state) = read_channel_state(&legacy_state_file)? else {
+        return Ok(ChannelSessionStateV2MigrationReport {
+            status: ChannelSessionStateV2MigrationStatus::LegacyStateMissing,
+            state_file,
+            legacy_state_file,
+            state: None,
+        });
+    };
+
+    if !lane.has_default_account() || !legacy_state_has_default_account(&state) {
+        return Ok(ChannelSessionStateV2MigrationReport {
+            status: ChannelSessionStateV2MigrationStatus::RejectedLegacyUnknownAccount,
+            state_file,
+            legacy_state_file,
+            state: None,
+        });
+    }
+    if !legacy_state_matches_non_agent_lane_axes(&state, lane) {
+        return Ok(ChannelSessionStateV2MigrationReport {
+            status: ChannelSessionStateV2MigrationStatus::RejectedLegacyIdentityMismatch,
+            state_file,
+            legacy_state_file,
+            state: None,
+        });
+    }
+    let Some(agent_id) = state.agent_id.as_deref() else {
+        return Ok(ChannelSessionStateV2MigrationReport {
+            status: ChannelSessionStateV2MigrationStatus::RejectedLegacyMissingAgent,
+            state_file,
+            legacy_state_file,
+            state: None,
+        });
+    };
+    let Ok(agent_id) = normalize_required_channel_state_lane_axis(agent_id, "agentId", false)
+    else {
+        return Ok(ChannelSessionStateV2MigrationReport {
+            status: ChannelSessionStateV2MigrationStatus::RejectedLegacyAgentMismatch,
+            state_file,
+            legacy_state_file,
+            state: None,
+        });
+    };
+    if agent_id != lane.agent_id() {
+        return Ok(ChannelSessionStateV2MigrationReport {
+            status: ChannelSessionStateV2MigrationStatus::RejectedLegacyAgentMismatch,
+            state_file,
+            legacy_state_file,
+            state: None,
+        });
+    }
+
+    bind_channel_session_state_to_lane_v2(&mut state, lane);
+    write_channel_session_state_v2(harness_home, lane, &state)?;
+    Ok(ChannelSessionStateV2MigrationReport {
+        status: ChannelSessionStateV2MigrationStatus::MigratedLegacyDefaultAccount,
+        state_file,
+        legacy_state_file,
+        state: Some(state),
+    })
 }
 
 pub fn agent_overrides_file(harness_home: impl AsRef<Path>) -> PathBuf {
@@ -494,10 +825,12 @@ mod execution_mode_state_tests {
         let state = ChannelSessionState {
             schema: CHANNEL_STATE_SCHEMA.to_string(),
             platform: "discord".to_string(),
+            account_id: None,
             channel_id: "channel-1".to_string(),
             user_id: "user-1".to_string(),
             active_session_key: "session-1".to_string(),
             agent_id: Some("main".to_string()),
+            config_revision: None,
             provider: Some("openai".to_string()),
             model: Some("gpt-5.6-sol".to_string()),
             session_topic: None,
@@ -546,14 +879,22 @@ mod execution_mode_state_tests {
     }
 }
 
-fn new_state(step: &ChannelStep) -> ChannelSessionState {
+fn new_state(step: &ChannelStep, exact_lane: Option<&ChannelStateLane>) -> ChannelSessionState {
+    let agent_id = exact_lane
+        .map(|lane| lane.agent_id().to_string())
+        .or_else(|| step_agent_id(step));
     ChannelSessionState {
-        schema: CHANNEL_STATE_SCHEMA.to_string(),
+        schema: exact_lane.map_or_else(
+            || CHANNEL_STATE_SCHEMA.to_string(),
+            |_| CHANNEL_SESSION_STATE_V2_SCHEMA.to_string(),
+        ),
         platform: step.platform.clone(),
+        account_id: exact_lane.map(|lane| lane.account_id().to_string()),
         channel_id: step.channel_id.clone(),
         user_id: step.user_id.clone(),
         active_session_key: step.session_key.clone(),
-        agent_id: None,
+        agent_id,
+        config_revision: None,
         provider: None,
         model: None,
         session_topic: None,
@@ -575,6 +916,13 @@ fn new_state(step: &ChannelStep) -> ChannelSessionState {
     }
 }
 
+fn step_agent_id(step: &ChannelStep) -> Option<String> {
+    step.agent_turn
+        .as_ref()
+        .map(|dispatch| dispatch.agent_id.clone())
+        .or_else(|| active_session_key_agent_segment(&step.session_key))
+}
+
 fn apply_effect(
     state: &mut ChannelSessionState,
     effect: &ChannelCommandEffect,
@@ -591,14 +939,39 @@ fn apply_effect(
             topic,
             new_session_key,
         } => {
-            if let Err(error) =
-                close_virtual_session_for_task_boundary(VirtualSessionTaskBoundaryCloseOptions {
-                    harness_home: harness_home.to_path_buf(),
-                    previous_session_key: state.active_session_key.clone(),
-                    ended_by: "channel-command:/new".to_string(),
-                    now_ms,
-                })
-            {
+            let close_result = match (state.account_id.as_deref(), state.agent_id.as_deref()) {
+                (Some(account_id), Some(agent_id)) => match ChannelStateLane::new(
+                    &state.platform,
+                    Some(account_id),
+                    &state.channel_id,
+                    &state.user_id,
+                    agent_id,
+                ) {
+                    Ok(channel_lane) => close_virtual_session_for_task_boundary_for_lane(
+                        VirtualSessionTaskBoundaryCloseV2Options {
+                            harness_home: harness_home.to_path_buf(),
+                            channel_lane,
+                            previous_session_key: state.active_session_key.clone(),
+                            ended_by: "channel-command:/new".to_string(),
+                            now_ms,
+                        },
+                    ),
+                    Err(error) => Err(error),
+                },
+                (Some(_), None) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "account-scoped channel state has no agent for v2 virtual-session close",
+                )),
+                (None, _) => close_virtual_session_for_task_boundary(
+                    VirtualSessionTaskBoundaryCloseOptions {
+                        harness_home: harness_home.to_path_buf(),
+                        previous_session_key: state.active_session_key.clone(),
+                        ended_by: "channel-command:/new".to_string(),
+                        now_ms,
+                    },
+                ),
+            };
+            if let Err(error) = close_result {
                 warnings.push(format!(
                     "virtual session task boundary close failed for previous session `{}`: {error}",
                     state.active_session_key
@@ -609,7 +982,7 @@ fn apply_effect(
                     AgentProgressSessionSupersedeOptions {
                         harness_home: harness_home.to_path_buf(),
                         platform: state.platform.clone(),
-                        account_id: None,
+                        account_id: state.account_id.clone(),
                         channel_id: state.channel_id.clone(),
                         user_id: state.user_id.clone(),
                         agent_id: state.agent_id.clone(),
@@ -910,29 +1283,26 @@ fn active_session_sibling_queue_ids(
     harness_home: &Path,
     state: &ChannelSessionState,
 ) -> io::Result<Vec<String>> {
-    let pending_file = harness_home
-        .join("state")
-        .join("runtime-queue")
-        .join("pending.jsonl");
-    let text = match fs::read_to_string(&pending_file) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let mut warnings = Vec::new();
+    // This is an operator control path, but it still must not replay an
+    // unbounded pending.jsonl just to stop siblings.  The source-authoritative
+    // sidecar tails new bytes under the append lock and returns only active
+    // rows; it fails closed rather than silently omitting runnable work.
+    let values = read_queued_pending_values_from_index(&queue_dir, &mut warnings)?;
+    if !warnings.is_empty() {
+        return Err(io::Error::other(format!(
+            "could not establish an exact active pending snapshot for sibling stop: {}",
+            warnings.join("; ")
+        )));
+    }
     let expected_agent = state
         .agent_id
         .clone()
         .or_else(|| active_session_key_agent_segment(&state.active_session_key));
     let mut seen = BTreeSet::new();
     let mut queue_ids = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
+    for value in values {
         if value.get("platform").and_then(serde_json::Value::as_str)
             != Some(state.platform.as_str())
             || value.get("channelId").and_then(serde_json::Value::as_str)
@@ -943,6 +1313,26 @@ fn active_session_sibling_queue_ids(
                 != Some(state.active_session_key.as_str())
         {
             continue;
+        }
+        match state.account_id.as_deref() {
+            Some(expected_account)
+                if value.get("accountId").and_then(serde_json::Value::as_str)
+                    != Some(expected_account) =>
+            {
+                continue;
+            }
+            None if value
+                .get("accountId")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|account_id| {
+                    !account_id.trim().is_empty() && account_id != DEFAULT_CHANNEL_STATE_ACCOUNT_ID
+                }) =>
+            {
+                // An old account-less state file has no authority to stop a
+                // non-default provider account.
+                continue;
+            }
+            _ => {}
         }
         if let Some(expected_agent) = expected_agent.as_deref() {
             if value.get("agentId").and_then(serde_json::Value::as_str) != Some(expected_agent) {
@@ -1197,6 +1587,7 @@ fn write_runtime_cancel_request(
             schema: RUNTIME_CANCEL_REQUEST_SCHEMA,
             at_ms: now_ms,
             platform: state.platform.clone(),
+            account_id: state.account_id.clone(),
             channel_id: state.channel_id.clone(),
             user_id: state.user_id.clone(),
             session_key: state.active_session_key.clone(),
@@ -1288,6 +1679,122 @@ fn write_agent_override_fast_mode(
 
 fn agent_overrides_schema() -> String {
     AGENT_OVERRIDES_SCHEMA.to_string()
+}
+
+fn validate_channel_session_state_v2_lane(
+    state: &ChannelSessionState,
+    lane: &ChannelStateLane,
+) -> io::Result<()> {
+    if state.schema != CHANNEL_SESSION_STATE_V2_SCHEMA {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "channel state schema `{}` is not the required v2 schema",
+                state.schema
+            ),
+        ));
+    }
+    if state.platform != lane.platform()
+        || state.account_id.as_deref() != Some(lane.account_id())
+        || state.channel_id != lane.channel_id()
+        || state.user_id != lane.user_id()
+        || state.agent_id.as_deref() != Some(lane.agent_id())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "channel session state does not match its requested v2 lane",
+        ));
+    }
+    Ok(())
+}
+
+fn legacy_state_has_default_account(state: &ChannelSessionState) -> bool {
+    normalize_channel_state_lane_account_id(state.account_id.as_deref())
+        .is_ok_and(|account_id| account_id == DEFAULT_CHANNEL_STATE_ACCOUNT_ID)
+}
+
+fn legacy_state_matches_non_agent_lane_axes(
+    state: &ChannelSessionState,
+    lane: &ChannelStateLane,
+) -> bool {
+    state.schema == CHANNEL_STATE_SCHEMA
+        && normalize_channel_state_lane_platform(&state.platform)
+            .is_ok_and(|platform| platform == lane.platform())
+        && normalize_required_channel_state_lane_axis(&state.channel_id, "channelId", false)
+            .is_ok_and(|channel_id| channel_id == lane.channel_id())
+        && normalize_required_channel_state_lane_axis(&state.user_id, "userId", false)
+            .is_ok_and(|user_id| user_id == lane.user_id())
+}
+
+fn normalize_channel_state_lane_platform(value: &str) -> io::Result<String> {
+    normalize_required_channel_state_lane_axis(value, "platform", true)
+}
+
+fn normalize_channel_state_lane_account_id(value: Option<&str>) -> io::Result<String> {
+    match value {
+        Some(value) if !value.trim().is_empty() => {
+            normalize_required_channel_state_lane_axis(value, "accountId", true)
+        }
+        _ => Ok(DEFAULT_CHANNEL_STATE_ACCOUNT_ID.to_string()),
+    }
+}
+
+fn normalize_required_channel_state_lane_axis(
+    value: &str,
+    axis: &str,
+    lowercase: bool,
+) -> io::Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("channel-state v2 lane requires a non-empty {axis}"),
+        ));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("channel-state v2 lane {axis} cannot contain control characters"),
+        ));
+    }
+    let normalized = if lowercase {
+        trimmed.to_ascii_lowercase()
+    } else {
+        trimmed.to_string()
+    };
+    if normalized.len() > MAX_CHANNEL_STATE_LANE_AXIS_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "channel-state v2 lane {axis} exceeds {MAX_CHANNEL_STATE_LANE_AXIS_BYTES} bytes"
+            ),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn channel_state_lane_v2_key(lane: &ChannelStateLane) -> String {
+    let mut canonical = Vec::new();
+    for (axis, value) in [
+        ("platform", lane.platform()),
+        ("accountId", lane.account_id()),
+        ("channelId", lane.channel_id()),
+        ("userId", lane.user_id()),
+        ("agentId", lane.agent_id()),
+    ] {
+        canonical.extend_from_slice(axis.as_bytes());
+        canonical.push(0);
+        canonical.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        canonical.extend_from_slice(value.as_bytes());
+    }
+    let digest = digest::digest(&digest::SHA256, &canonical);
+    let mut key = String::with_capacity(digest.as_ref().len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest.as_ref() {
+        key.push(char::from(HEX[usize::from(*byte >> 4)]));
+        key.push(char::from(HEX[usize::from(*byte & 0x0f)]));
+    }
+    key
 }
 
 fn channel_session_state_dir(
@@ -2138,6 +2645,224 @@ mod tests {
         c3_per_agent_same_channel_user_command_defaults_are_not_collapsed();
     }
 
+    #[test]
+    fn v2_lane_state_isolates_same_channel_user_by_account_and_agent() {
+        let root = temp_root("v2_lane_state_isolates_same_channel_user_by_account_and_agent");
+        let harness_home = root.join(".agent-harness");
+        let account_a_main = ChannelStateLane::new(
+            "discord",
+            Some("bot-a"),
+            "shared-channel",
+            "shared-user",
+            "main",
+        )
+        .unwrap();
+        let account_b_main = ChannelStateLane::new(
+            "discord",
+            Some("bot-b"),
+            "shared-channel",
+            "shared-user",
+            "main",
+        )
+        .unwrap();
+        let account_a_side = ChannelStateLane::new(
+            "discord",
+            Some("bot-a"),
+            "shared-channel",
+            "shared-user",
+            "side",
+        )
+        .unwrap();
+
+        let mut a_main =
+            sample_channel_state("discord", "shared-channel", "shared-user", "main", "a-main");
+        bind_channel_session_state_to_lane_v2(&mut a_main, &account_a_main);
+        write_channel_session_state_v2(&harness_home, &account_a_main, &a_main).unwrap();
+
+        let mut b_main =
+            sample_channel_state("discord", "shared-channel", "shared-user", "main", "b-main");
+        bind_channel_session_state_to_lane_v2(&mut b_main, &account_b_main);
+        write_channel_session_state_v2(&harness_home, &account_b_main, &b_main).unwrap();
+
+        let mut a_side =
+            sample_channel_state("discord", "shared-channel", "shared-user", "side", "a-side");
+        bind_channel_session_state_to_lane_v2(&mut a_side, &account_a_side);
+        write_channel_session_state_v2(&harness_home, &account_a_side, &a_side).unwrap();
+
+        assert_ne!(
+            channel_session_state_v2_file(&harness_home, &account_a_main),
+            channel_session_state_v2_file(&harness_home, &account_b_main)
+        );
+        assert_ne!(
+            channel_session_state_v2_file(&harness_home, &account_a_main),
+            channel_session_state_v2_file(&harness_home, &account_a_side)
+        );
+        assert_eq!(
+            read_channel_session_state_v2(&harness_home, &account_a_main)
+                .unwrap()
+                .unwrap()
+                .session_topic
+                .as_deref(),
+            Some("a-main")
+        );
+        assert_eq!(
+            read_channel_session_state_v2(&harness_home, &account_b_main)
+                .unwrap()
+                .unwrap()
+                .session_topic
+                .as_deref(),
+            Some("b-main")
+        );
+        assert_eq!(
+            read_channel_session_state_v2(&harness_home, &account_a_side)
+                .unwrap()
+                .unwrap()
+                .session_topic
+                .as_deref(),
+            Some("a-side")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn v2_state_path_is_deterministic_safe_and_not_lossy() {
+        let harness_home = PathBuf::from("C:/harness-home");
+        let canonical =
+            ChannelStateLane::new("discord", Some("ops"), "channel/a", "user?one", "main").unwrap();
+        let equivalent =
+            ChannelStateLane::new(" Discord ", Some(" OPS "), "channel/a", "user?one", "main")
+                .unwrap();
+        let distinct =
+            ChannelStateLane::new("discord", Some("ops"), "channel?a", "user?one", "main").unwrap();
+
+        let path = channel_session_state_v2_file(&harness_home, &canonical);
+        assert_eq!(
+            path,
+            channel_session_state_v2_file(&harness_home, &equivalent)
+        );
+        assert_ne!(
+            path,
+            channel_session_state_v2_file(&harness_home, &distinct)
+        );
+        let v2_root = harness_home.join("state").join("channels").join("v2");
+        let relative = path.strip_prefix(v2_root).unwrap();
+        let parts = relative.components().collect::<Vec<_>>();
+        assert_eq!(parts.len(), 2);
+        let key = parts[0].as_os_str().to_str().unwrap();
+        assert_eq!(key.len(), 64);
+        assert!(
+            key.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(parts[1].as_os_str(), "state.json");
+        assert!(!path.to_string_lossy().contains("channel/a"));
+    }
+
+    #[test]
+    fn legacy_unknown_account_or_missing_or_mismatched_agent_cannot_bleed_into_v2() {
+        let root =
+            temp_root("legacy_unknown_account_or_missing_or_mismatched_agent_cannot_bleed_into_v2");
+        let harness_home = root.join(".agent-harness");
+        let default_main =
+            ChannelStateLane::new("discord", None, "channel-1", "user-1", "main").unwrap();
+        let legacy_file =
+            channel_session_state_file(&harness_home, "discord", "channel-1", "user-1");
+
+        let missing_agent = sample_channel_state("discord", "channel-1", "user-1", "", "missing");
+        write_json_atomic(&legacy_file, &missing_agent).unwrap();
+        let missing =
+            migrate_legacy_channel_session_state_to_v2(&harness_home, &default_main).unwrap();
+        assert_eq!(
+            missing.status,
+            ChannelSessionStateV2MigrationStatus::RejectedLegacyMissingAgent
+        );
+        assert!(missing.state.is_none());
+        assert!(!channel_session_state_v2_file(&harness_home, &default_main).is_file());
+
+        let mismatched_agent =
+            sample_channel_state("discord", "channel-1", "user-1", "side", "mismatch");
+        write_json_atomic(&legacy_file, &mismatched_agent).unwrap();
+        let mismatch =
+            migrate_legacy_channel_session_state_to_v2(&harness_home, &default_main).unwrap();
+        assert_eq!(
+            mismatch.status,
+            ChannelSessionStateV2MigrationStatus::RejectedLegacyAgentMismatch
+        );
+        assert!(mismatch.state.is_none());
+        assert!(!channel_session_state_v2_file(&harness_home, &default_main).is_file());
+
+        let mismatched_channel =
+            sample_channel_state("discord", "other-channel", "user-1", "main", "wrong lane");
+        write_json_atomic(&legacy_file, &mismatched_channel).unwrap();
+        let wrong_lane =
+            migrate_legacy_channel_session_state_to_v2(&harness_home, &default_main).unwrap();
+        assert_eq!(
+            wrong_lane.status,
+            ChannelSessionStateV2MigrationStatus::RejectedLegacyIdentityMismatch
+        );
+        assert!(wrong_lane.state.is_none());
+        assert!(!channel_session_state_v2_file(&harness_home, &default_main).is_file());
+
+        let configured_account =
+            ChannelStateLane::new("discord", Some("ops"), "channel-1", "user-1", "main").unwrap();
+        let account =
+            migrate_legacy_channel_session_state_to_v2(&harness_home, &configured_account).unwrap();
+        assert_eq!(
+            account.status,
+            ChannelSessionStateV2MigrationStatus::RejectedLegacyUnknownAccount
+        );
+        assert!(account.state.is_none());
+        assert!(!channel_session_state_v2_file(&harness_home, &configured_account).is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exact_default_legacy_state_migrates_to_v2_without_losing_fields() {
+        let root = temp_root("exact_default_legacy_state_migrates_to_v2_without_losing_fields");
+        let harness_home = root.join(".agent-harness");
+        let lane = ChannelStateLane::new("discord", None, "channel-1", "user-1", "main").unwrap();
+        let legacy_file =
+            channel_session_state_file(&harness_home, "discord", "channel-1", "user-1");
+        let mut legacy =
+            sample_channel_state("discord", "channel-1", "user-1", "main", "migration topic");
+        legacy.provider = Some("openai".to_string());
+        legacy.model = Some("gpt-5.6-sol".to_string());
+        legacy.thinking_level = Some("max".to_string());
+        legacy.config_revision = Some("config-revision-7".to_string());
+        legacy.steering_notes.push(ChannelSessionNote {
+            at_ms: 7,
+            text: "retain this note".to_string(),
+        });
+        write_json_atomic(&legacy_file, &legacy).unwrap();
+
+        let report = migrate_legacy_channel_session_state_to_v2(&harness_home, &lane).unwrap();
+        assert_eq!(
+            report.status,
+            ChannelSessionStateV2MigrationStatus::MigratedLegacyDefaultAccount
+        );
+        let migrated = report.state.unwrap();
+        assert_eq!(migrated.schema, CHANNEL_SESSION_STATE_V2_SCHEMA);
+        assert_eq!(migrated.account_id.as_deref(), Some("default"));
+        assert_eq!(
+            migrated.config_revision.as_deref(),
+            Some("config-revision-7")
+        );
+        assert_eq!(migrated.provider, legacy.provider);
+        assert_eq!(migrated.model, legacy.model);
+        assert_eq!(migrated.thinking_level, legacy.thinking_level);
+        assert_eq!(migrated.session_topic, legacy.session_topic);
+        assert_eq!(migrated.steering_notes, legacy.steering_notes);
+        assert!(legacy_file.is_file());
+        assert_eq!(
+            read_channel_session_state_v2(&harness_home, &lane).unwrap(),
+            Some(migrated)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn command_step(effect: ChannelCommandEffect) -> ChannelStep {
         command_step_with_session("telegram:dm:user:main", effect)
     }
@@ -2164,6 +2889,7 @@ mod tests {
                 channel_id: "dm".to_string(),
                 user_id: "user".to_string(),
                 session_key: session_key.to_string(),
+                delivery_id: None,
                 kind: ChannelOutboundMessageKind::CommandReply,
                 source_queue_id: None,
                 source_completion_file: None,
@@ -2173,6 +2899,43 @@ mod tests {
                 attachments: Vec::new(),
             }],
             warnings: Vec::new(),
+        }
+    }
+
+    fn sample_channel_state(
+        platform: &str,
+        channel_id: &str,
+        user_id: &str,
+        agent_id: &str,
+        topic: &str,
+    ) -> ChannelSessionState {
+        ChannelSessionState {
+            schema: CHANNEL_STATE_SCHEMA.to_string(),
+            platform: platform.to_string(),
+            account_id: None,
+            channel_id: channel_id.to_string(),
+            user_id: user_id.to_string(),
+            active_session_key: format!("{platform}:{channel_id}:{user_id}:{agent_id}:session"),
+            agent_id: (!agent_id.is_empty()).then(|| agent_id.to_string()),
+            provider: None,
+            model: None,
+            session_topic: Some(topic.to_string()),
+            model_override: None,
+            model_override_provider: None,
+            model_override_model: None,
+            thinking_enabled: false,
+            thinking_level: None,
+            thinking_instruction: None,
+            reasoning_preference: None,
+            backend_reasoning_policy: None,
+            fast_mode: None,
+            stop_requested: false,
+            stop_reason: None,
+            steering_notes: Vec::new(),
+            btw_notes: Vec::new(),
+            last_command: None,
+            config_revision: None,
+            updated_at_ms: 1,
         }
     }
 

@@ -7,14 +7,20 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::channel_state::ChannelStateLane;
 use crate::codex_runtime::{
     CodexContextRecoveryReceipt, CodexThreadHealthStatus, tool_timeout_summary,
+};
+use crate::context_rollover::{
+    VirtualSessionTerminalV2Options, mark_virtual_session_terminal_for_lane,
 };
 use crate::rich_presentation::{
     RichMessagePresentation, rich_presentation_from_plain_final_with_attachment_count,
 };
 use crate::runtime_worker::{
-    QueueTerminalControl, record_terminal_control_suppression, resolve_queue_terminal_control,
+    QueueTerminalControl, record_terminal_control_suppression, refresh_runtime_queue_state_index,
+    resolve_queue_terminal_control, runtime_queue_prior_failure_count_from_index,
+    runtime_queue_status_count_from_index,
 };
 use crate::{
     AgentProgressContext, AgentProgressEvent, AgentProgressKind, AgentProgressStatus,
@@ -30,12 +36,13 @@ use crate::{
     RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeQueuePreparedItem,
     SelfImprovementNotificationTarget, SelfImprovementReviewHookOptions,
     VirtualSessionTerminalOptions, advance_learning_nudge_counters, append_agent_progress_event,
-    append_harness_log, apply_response_tone, attachment_kind_from_path, continuation_session_key,
-    current_log_time_ms, evaluate_outbound_media_path, inspect_runtime_backoff_policy,
-    is_deliverable_media_path, load_assistant_narration_config, load_context_rollover_config,
-    load_harness_media_config, load_response_tone_config, mark_cron_run_runtime_status_by_queue_id,
+    append_channel_outbox_message, append_harness_log, apply_response_tone,
+    attachment_kind_from_path, continuation_session_key, current_log_time_ms,
+    evaluate_outbound_media_path, inspect_runtime_backoff_policy, is_deliverable_media_path,
+    load_assistant_narration_config, load_context_rollover_config, load_harness_media_config,
+    load_response_tone_config, mark_cron_run_runtime_status_by_queue_id,
     mark_virtual_session_terminal, plan_codex_runtime, prepare_runtime_queue_item,
-    read_channel_session_state, record_completed_turn_working_set_snapshot,
+    read_channel_session_state_v2, record_completed_turn_working_set_snapshot,
     record_memory_lifecycle_turn, record_skill_usage_from_prompt_bundle,
     release_runtime_queue_lease, requeue_prepared_context_rollover_if_no_parent_siblings,
     resolve_inbound_media_artifact_reference, root_working_session_key, run_codex_runtime,
@@ -52,6 +59,11 @@ struct RuntimeContinuationCandidate {
     session_key: String,
     runtime_class: String,
     origin: String,
+    platform: Option<String>,
+    account_id: Option<String>,
+    channel_id: Option<String>,
+    user_id: Option<String>,
+    agent_id: Option<String>,
     inbound_media_artifacts: Vec<InboundMediaArtifact>,
     continuation: RuntimeContinuationMetadata,
 }
@@ -63,6 +75,11 @@ impl RuntimeContinuationCandidate {
             session_key: item.session_key.clone(),
             runtime_class: item.runtime_class.clone(),
             origin: item.origin.clone(),
+            platform: Some(item.platform.clone()),
+            account_id: item.account_id.clone(),
+            channel_id: Some(item.channel_id.clone()),
+            user_id: Some(item.user_id.clone()),
+            agent_id: Some(item.agent_id.clone()),
             inbound_media_artifacts: item.inbound_media_artifacts.clone(),
             continuation: item.continuation.clone(),
         }
@@ -79,6 +96,16 @@ struct PendingContinuationCandidateRecord {
     #[serde(default = "default_channel_origin_text")]
     origin: String,
     #[serde(default)]
+    platform: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    channel_id: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
     inbound_media_artifacts: Vec<InboundMediaArtifact>,
     #[serde(default, flatten)]
     continuation: RuntimeContinuationMetadata,
@@ -91,6 +118,11 @@ impl From<PendingContinuationCandidateRecord> for RuntimeContinuationCandidate {
             session_key: record.session_key,
             runtime_class: record.runtime_class,
             origin: record.origin,
+            platform: record.platform,
+            account_id: record.account_id,
+            channel_id: record.channel_id,
+            user_id: record.user_id,
+            agent_id: record.agent_id,
             inbound_media_artifacts: record.inbound_media_artifacts,
             continuation: record.continuation,
         }
@@ -208,6 +240,23 @@ impl RuntimeRunOnceStatus {
     }
 }
 
+fn should_request_ledger_maintenance_after_terminal(
+    status: RuntimeRunOnceStatus,
+    queue_id: Option<&str>,
+) -> bool {
+    queue_id.is_some()
+        && matches!(
+            status,
+            RuntimeRunOnceStatus::Completed
+                | RuntimeRunOnceStatus::Timeout
+                | RuntimeRunOnceStatus::FailedTerminal
+                | RuntimeRunOnceStatus::Canceled
+                | RuntimeRunOnceStatus::Skipped
+                | RuntimeRunOnceStatus::DeadLetter
+                | RuntimeRunOnceStatus::Suppressed
+        )
+}
+
 fn should_record_failed_memory_lifecycle(status: &RuntimeRunOnceStatus) -> bool {
     matches!(
         status,
@@ -319,6 +368,8 @@ struct FinalOutboxReceipt {
     user_id: String,
     session_key: String,
     kind: ChannelOutboundMessageKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,6 +378,7 @@ struct QueueChannelContext {
     account_id: Option<String>,
     channel_id: String,
     user_id: String,
+    agent_id: String,
     session_key: String,
     inbound_context: Option<String>,
     inbound_media_artifacts: Vec<InboundMediaArtifact>,
@@ -582,7 +634,11 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             .queue_id
             .as_deref()
             .map(|queue_id| {
-                count_prior_run_once_status(&receipts_file, queue_id, "no-prepared-execution")
+                count_prior_run_once_status(
+                    &options.harness_home,
+                    queue_id,
+                    "no-prepared-execution",
+                )
             })
             .transpose()?
             .map(|attempts| attempts.saturating_add(1))
@@ -712,7 +768,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         .queue_id
         .as_deref()
         .filter(|_| run.receipt.status != CodexRuntimeRunStatus::Completed)
-        .map(|queue_id| count_prior_runtime_failures(&receipts_file, queue_id))
+        .map(|queue_id| count_prior_runtime_failures(&options.harness_home, queue_id))
         .transpose()?
         .map(|attempts| attempts.saturating_add(1))
         .unwrap_or(0);
@@ -943,12 +999,13 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                         &mut warnings,
                                     )?;
                                 }
-                                let message = ChannelOutboundMessage {
+                                let mut message = ChannelOutboundMessage {
                                     platform: context.platform.clone(),
                                     account_id: context.account_id.clone(),
                                     channel_id: context.channel_id.clone(),
                                     user_id: context.user_id.clone(),
                                     session_key: context.session_key.clone(),
+                                    delivery_id: None,
                                     kind: outbound_kind,
                                     source_queue_id: run.receipt.queue_id.clone(),
                                     source_completion_file: run.receipt.completion_file.clone(),
@@ -965,7 +1022,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                     &options.harness_home,
                                     run.receipt.execution_dir.as_deref(),
                                     run.receipt.completion_file.as_deref(),
-                                    &message,
+                                    &mut message,
                                     &mut warnings,
                                 )?;
                                 outbox_file = Some(file);
@@ -1077,12 +1134,13 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                     input_kind, decision.disposition
                 ));
             } else {
-                let message = ChannelOutboundMessage {
+                let mut message = ChannelOutboundMessage {
                     platform: context.platform.clone(),
                     account_id: context.account_id.clone(),
                     channel_id: context.channel_id.clone(),
                     user_id: context.user_id.clone(),
                     session_key: context.session_key.clone(),
+                    delivery_id: None,
                     kind: decision
                         .outbound_kind
                         .unwrap_or(ChannelOutboundMessageKind::ErrorReply),
@@ -1101,9 +1159,17 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                     ),
                     attachments: Vec::new(),
                 };
-                let file = append_outbound_message(&options.harness_home, &message)?;
+                let (file, appended) = append_final_outbound_message_once(
+                    &options.harness_home,
+                    run.receipt.execution_dir.as_deref(),
+                    run.receipt.completion_file.as_deref(),
+                    &mut message,
+                    &mut warnings,
+                )?;
                 outbox_file = Some(file);
-                outbound_message = Some(message);
+                if appended {
+                    outbound_message = Some(message);
+                }
             }
         } else {
             let receipt = RuntimeRunOnceReceipt {
@@ -1992,6 +2058,8 @@ fn looks_like_read_only_review_evidence(text: &str) -> bool {
         || (lower.contains("no files changed") && lower.contains("no tests run"))
         || (lower.contains("recommended seam") && lower.contains("fail-first tests"))
         || (lower.contains("dirty worktree risks") && lower.contains("read-only"))
+        || (lower.contains("audit complete")
+            && (lower.contains("sent root") || lower.contains("sent to root")))
 }
 
 fn continuation_candidate_for_run(
@@ -2087,7 +2155,7 @@ fn maybe_enqueue_tool_timeout_retry_continuation(
         ));
         mark_virtual_session_terminal_after_depth_limit(
             harness_home,
-            &item.session_key,
+            &item,
             config.max_continuation_depth,
             warnings,
         )?;
@@ -2164,7 +2232,7 @@ fn maybe_enqueue_polluted_thread_continuation(
         ));
         mark_virtual_session_terminal_after_depth_limit(
             harness_home,
-            &item.session_key,
+            &item,
             config.max_continuation_depth,
             warnings,
         )?;
@@ -2246,7 +2314,7 @@ fn maybe_enqueue_stream_unstable_retry_continuation(
         ));
         mark_virtual_session_terminal_after_depth_limit(
             harness_home,
-            &item.session_key,
+            &item,
             config.max_continuation_depth,
             warnings,
         )?;
@@ -2300,17 +2368,30 @@ fn maybe_enqueue_stream_unstable_retry_continuation(
 
 fn mark_virtual_session_terminal_after_depth_limit(
     harness_home: &Path,
-    session_key: &str,
+    item: &RuntimeContinuationCandidate,
     max_continuation_depth: u64,
     warnings: &mut Vec<String>,
 ) -> io::Result<()> {
     let ended_by = format!("max-continuation-depth:{max_continuation_depth}");
-    match mark_virtual_session_terminal(VirtualSessionTerminalOptions {
-        harness_home: harness_home.to_path_buf(),
-        session_key: session_key.to_string(),
-        ended_by,
-        now_ms: current_log_time_ms()?,
-    }) {
+    let now_ms = current_log_time_ms()?;
+    let v2_lane = exact_channel_state_lane_for_continuation(item);
+    let result = if let Some(channel_lane) = v2_lane {
+        mark_virtual_session_terminal_for_lane(VirtualSessionTerminalV2Options {
+            harness_home: harness_home.to_path_buf(),
+            channel_lane,
+            session_key: item.session_key.clone(),
+            ended_by,
+            now_ms,
+        })
+    } else {
+        mark_virtual_session_terminal(VirtualSessionTerminalOptions {
+            harness_home: harness_home.to_path_buf(),
+            session_key: item.session_key.clone(),
+            ended_by,
+            now_ms,
+        })
+    };
+    match result {
         Ok(Some(file)) => warnings.push(format!(
             "virtual session marked terminal after continuation depth limit: {}",
             file.display()
@@ -2324,6 +2405,19 @@ fn mark_virtual_session_terminal_after_depth_limit(
         )),
     }
     Ok(())
+}
+
+fn exact_channel_state_lane_for_continuation(
+    item: &RuntimeContinuationCandidate,
+) -> Option<ChannelStateLane> {
+    ChannelStateLane::new(
+        item.platform.as_deref()?,
+        item.account_id.as_deref(),
+        item.channel_id.as_deref()?,
+        item.user_id.as_deref()?,
+        item.agent_id.as_deref()?,
+    )
+    .ok()
 }
 
 fn interrupted_long_task_rollover_reason(status: &str, run: &CodexRuntimeRunReport) -> String {
@@ -2449,67 +2543,43 @@ fn write_runtime_run_once_report(
                 current_log_time_ms().unwrap_or(0),
             )?;
         }
+        if should_request_ledger_maintenance_after_terminal(
+            report.receipt.status,
+            report.receipt.queue_id.as_deref(),
+        ) {
+            // Completion must not acquire a large ledger lock or replay old
+            // receipts.  The separate maintenance owner receives this
+            // coalesced wake after the durable terminal append.
+            let _ = crate::request_ledger_maintenance(
+                &report.harness_home,
+                "terminal runtime queue receipt recorded",
+            );
+        }
+        write_json_atomic(&report.report_file, &report)?;
     }
     Ok(report)
 }
 
-fn count_prior_runtime_failures(receipts_file: &Path, queue_id: &str) -> io::Result<usize> {
-    if !receipts_file.is_file() {
-        return Ok(0);
-    }
-    let text = fs::read_to_string(receipts_file)?;
-    let mut failures = 0usize;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let value: Value = match serde_json::from_str(trimmed) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        if string_field(&value, &["queueId", "queue_id"]) != Some(queue_id) {
-            continue;
-        }
-        let Some(status) = string_field(&value, &["status"]) else {
-            continue;
-        };
-        if is_terminal_run_once_status(status) {
-            continue;
-        }
-        if status != "completed" && status != "no-work" {
-            failures = failures.saturating_add(1);
-        }
-    }
-    Ok(failures)
+fn count_prior_runtime_failures(harness_home: &Path, queue_id: &str) -> io::Result<usize> {
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let index = refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new())?;
+    Ok(runtime_queue_prior_failure_count_from_index(
+        &index, queue_id,
+    ))
 }
 
 fn count_prior_run_once_status(
-    receipts_file: &Path,
+    harness_home: &Path,
     queue_id: &str,
     expected_status: &str,
 ) -> io::Result<usize> {
-    if !receipts_file.is_file() {
-        return Ok(0);
-    }
-    let text = fs::read_to_string(receipts_file)?;
-    let mut count = 0usize;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let value: Value = match serde_json::from_str(trimmed) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        if string_field(&value, &["queueId", "queue_id"]) == Some(queue_id)
-            && string_field(&value, &["status"]) == Some(expected_status)
-        {
-            count = count.saturating_add(1);
-        }
-    }
-    Ok(count)
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let index = refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new())?;
+    Ok(runtime_queue_status_count_from_index(
+        &index,
+        queue_id,
+        expected_status,
+    ))
 }
 
 fn no_prepared_execution_terminal_threshold(harness_home: &Path) -> usize {
@@ -2527,19 +2597,6 @@ fn no_prepared_execution_terminal_threshold(harness_home: &Path) -> usize {
         .and_then(|value| usize::try_from(value).ok())
         .filter(|value| *value > 0)
         .unwrap_or(3)
-}
-
-fn is_terminal_run_once_status(status: &str) -> bool {
-    matches!(
-        status,
-        "completed"
-            | "timeout"
-            | "failed-terminal"
-            | "canceled"
-            | "skipped"
-            | "dead-letter"
-            | "suppressed"
-    )
 }
 
 fn append_runtime_run_once_log(
@@ -2580,6 +2637,7 @@ fn channel_context_from_prepared_item(item: &RuntimeQueuePreparedItem) -> QueueC
         account_id: item.account_id.clone(),
         channel_id: item.channel_id.clone(),
         user_id: item.user_id.clone(),
+        agent_id: item.agent_id.clone(),
         session_key: item.session_key.clone(),
         inbound_context: item.inbound_context.clone(),
         inbound_media_artifacts: item.inbound_media_artifacts.clone(),
@@ -2591,34 +2649,32 @@ fn channel_session_is_current(
     context: &QueueChannelContext,
     warnings: &mut Vec<String>,
 ) -> io::Result<bool> {
-    let Some(state) = read_channel_session_state(
-        harness_home,
+    // Freshness is an exact provider/account/channel/user/agent boundary.  A
+    // legacy state file has no account axis and must never act as wildcard
+    // suppression for a queued v2 lane.
+    let lane = ChannelStateLane::new(
         &context.platform,
+        context.account_id.as_deref(),
         &context.channel_id,
         &context.user_id,
-    )?
-    else {
+        &context.agent_id,
+    )?;
+    let Some(state) = read_channel_session_state_v2(harness_home, &lane)? else {
         return Ok(true);
     };
     if state.active_session_key == context.session_key {
         return Ok(true);
     }
-    let active_agent = session_key_agent_segment(&state.active_session_key);
-    let context_agent = session_key_agent_segment(&context.session_key);
-    if let (Some(active_agent), Some(context_agent)) =
-        (active_agent.as_deref(), context_agent.as_deref())
-        && active_agent != context_agent
-    {
-        warnings.push(format!(
-            "assistant reply session {} is not suppressed by active session {} because active state belongs to agent `{}` while the reply belongs to agent `{}`",
-            context.session_key, state.active_session_key, active_agent, context_agent
-        ));
-        return Ok(true);
-    }
 
     warnings.push(format!(
-        "assistant reply for stale session {} suppressed because active session is {}",
-        context.session_key, state.active_session_key
+        "assistant reply for stale session {} suppressed because exact active lane {}/{}/{}/{}/{} has session {}",
+        context.session_key,
+        lane.platform(),
+        lane.account_id(),
+        lane.channel_id(),
+        lane.user_id(),
+        lane.agent_id(),
+        state.active_session_key
     ));
     Ok(false)
 }
@@ -2679,6 +2735,9 @@ fn find_queue_channel_context(
             user_id: string_field(&value, &["userId", "user_id"])
                 .unwrap_or("unknown")
                 .to_string(),
+            agent_id: string_field(&value, &["agentId", "agent_id"])
+                .unwrap_or("unknown")
+                .to_string(),
             session_key: string_field(&value, &["sessionKey", "session_key"])
                 .unwrap_or("unknown")
                 .to_string(),
@@ -2715,6 +2774,7 @@ fn queue_channel_context_from_queue_id(queue_id: &str) -> Option<QueueChannelCon
         account_id: None,
         channel_id,
         user_id,
+        agent_id,
         inbound_context: None,
         inbound_media_artifacts: Vec::new(),
     })
@@ -3460,13 +3520,13 @@ fn final_text_has_media_delivery_clue(text: &str) -> bool {
 
 fn append_outbound_message(
     harness_home: &Path,
-    message: &ChannelOutboundMessage,
-) -> io::Result<PathBuf> {
-    let outbox_file = harness_home
-        .join("state")
-        .join("channels")
-        .join("outbox.jsonl");
-    append_json_line(&outbox_file, message)?;
+    message: &mut ChannelOutboundMessage,
+    warnings: &mut Vec<String>,
+) -> io::Result<(PathBuf, bool)> {
+    let report = append_channel_outbox_message(harness_home, message)?;
+    if let Some(warning) = report.index_warning {
+        warnings.push(warning);
+    }
     let wake_file = harness_home
         .join("state")
         .join("wake")
@@ -3477,14 +3537,20 @@ fn append_outbound_message(
         "final-outbox",
         "channel outbox message appended",
     );
-    Ok(outbox_file)
+    Ok((
+        report.outbox_file,
+        !matches!(
+            report.outcome,
+            crate::ChannelOutboxAppendOutcome::AlreadyPresent
+        ),
+    ))
 }
 
 fn append_final_outbound_message_once(
     harness_home: &Path,
     execution_dir: Option<&Path>,
     completion_file: Option<&Path>,
-    message: &ChannelOutboundMessage,
+    message: &mut ChannelOutboundMessage,
     warnings: &mut Vec<String>,
 ) -> io::Result<(PathBuf, bool)> {
     let _lock = acquire_final_outbox_lock(execution_dir, warnings)?;
@@ -3501,7 +3567,8 @@ fn append_final_outbound_message_once(
             message.source_queue_id.as_deref().unwrap_or("-")
         ));
     }
-    if let Some(outbox_file) = find_existing_source_outbox_message(harness_home, message)? {
+    if let Some(outbox_file) = find_existing_source_outbox_message(harness_home, message, warnings)?
+    {
         if let Some(execution_dir) = execution_dir {
             record_final_outbox_receipt(
                 execution_dir,
@@ -3518,7 +3585,7 @@ fn append_final_outbound_message_once(
         return Ok((outbox_file, false));
     }
 
-    let outbox_file = append_outbound_message(harness_home, message)?;
+    let (outbox_file, appended) = append_outbound_message(harness_home, message, warnings)?;
     if let Some(execution_dir) = execution_dir {
         record_final_outbox_receipt(
             execution_dir,
@@ -3528,7 +3595,7 @@ fn append_final_outbound_message_once(
             warnings,
         )?;
     }
-    Ok((outbox_file, true))
+    Ok((outbox_file, appended))
 }
 
 struct FinalOutboxLockGuard {
@@ -3661,6 +3728,7 @@ fn record_final_outbox_receipt(
         user_id: message.user_id.clone(),
         session_key: message.session_key.clone(),
         kind: message.kind,
+        delivery_id: message.delivery_id.clone(),
     };
     let receipt_file = final_outbox_receipt_file(execution_dir);
     if let Err(error) = write_json_atomic(&receipt_file, &receipt) {
@@ -3674,27 +3742,20 @@ fn record_final_outbox_receipt(
 fn find_existing_source_outbox_message(
     harness_home: &Path,
     message: &ChannelOutboundMessage,
+    warnings: &mut Vec<String>,
 ) -> io::Result<Option<PathBuf>> {
     let Some(source_queue_id) = message.source_queue_id.as_deref() else {
         return Ok(None);
     };
-    let outbox_file = harness_home
-        .join("state")
-        .join("channels")
-        .join("outbox.jsonl");
-    let text = match fs::read_to_string(&outbox_file) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(existing) = serde_json::from_str::<ChannelOutboundMessage>(trimmed) else {
-            continue;
-        };
+    let channel_dir = harness_home.join("state").join("channels");
+    let outbox_file = channel_dir.join("outbox.jsonl");
+    let indexed = crate::channel_delivery_index::channel_delivery_states_for_source_queue_blocking(
+        &channel_dir,
+        source_queue_id,
+        warnings,
+    )?;
+    for state in indexed {
+        let existing = state.message;
         if existing.source_queue_id.as_deref() == Some(source_queue_id)
             && existing.kind == message.kind
             && (existing.source_completion_file == message.source_completion_file
@@ -3764,6 +3825,60 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn receipt_compaction_runs_only_after_terminal_queue_turns() {
+        assert!(should_request_ledger_maintenance_after_terminal(
+            RuntimeRunOnceStatus::Completed,
+            Some("queue-1")
+        ));
+        assert!(should_request_ledger_maintenance_after_terminal(
+            RuntimeRunOnceStatus::Timeout,
+            Some("queue-1")
+        ));
+        assert!(!should_request_ledger_maintenance_after_terminal(
+            RuntimeRunOnceStatus::LeaseBusy,
+            Some("queue-1")
+        ));
+        assert!(!should_request_ledger_maintenance_after_terminal(
+            RuntimeRunOnceStatus::Completed,
+            None
+        ));
+    }
+
+    #[test]
+    fn retry_accounting_reads_per_queue_counts_from_the_hot_index() {
+        let root = temp_root("retry_accounting_reads_per_queue_counts_from_the_hot_index");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        fs::write(
+            queue_dir.join("run-once-receipts.jsonl"),
+            [
+                serde_json::json!({"queueId":"turn:retry","status":"failed-retryable"}).to_string(),
+                serde_json::json!({"queueId":"turn:retry","status":"no-prepared-execution"})
+                    .to_string(),
+                serde_json::json!({"queueId":"turn:retry","status":"retry-pending"}).to_string(),
+                serde_json::json!({"queueId":"turn:retry","status":"completed"}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        crate::runtime_worker::rebuild_runtime_queue_state_index(&queue_dir, &mut Vec::new())
+            .unwrap();
+
+        assert_eq!(
+            count_prior_runtime_failures(&harness_home, "turn:retry").unwrap(),
+            3
+        );
+        assert_eq!(
+            count_prior_run_once_status(&harness_home, "turn:retry", "no-prepared-execution")
+                .unwrap(),
+            1
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn split_outbound_media_directives_extracts_attachments() {
@@ -4142,6 +4257,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+        let exact_account_id = receive.account_id.clone();
+        let exact_session_key = receive.session_key.clone();
         let fake_codex = fake_codex_executable(&root);
         let codex_home = root.join("codex-home");
         fs::create_dir_all(&codex_home).unwrap();
@@ -4225,10 +4342,11 @@ mod tests {
             crate::resolve_virtual_session_working_context(crate::VirtualSessionContextQuery {
                 harness_home: harness_home.clone(),
                 platform: "telegram".to_string(),
+                account_id: exact_account_id,
                 channel_id: "dm-42".to_string(),
                 user_id: "user-7".to_string(),
                 agent_id: "main".to_string(),
-                session_key: Some("telegram:dm-42:user-7:main".to_string()),
+                session_key: Some(exact_session_key),
                 now_ms: 1235,
             })
             .unwrap();
@@ -4513,12 +4631,16 @@ mod tests {
             .join("channels")
             .join("outbox.jsonl");
         fs::create_dir_all(outbox_file.parent().unwrap()).unwrap();
+        let queue_context = find_queue_channel_context(&harness_home, &queue_id, &mut Vec::new())
+            .unwrap()
+            .expect("prepared queue retains its exact channel lane");
         let seeded = ChannelOutboundMessage {
-            platform: "telegram".to_string(),
-            account_id: None,
-            channel_id: "dm-42".to_string(),
-            user_id: "user-7".to_string(),
-            session_key: "telegram:dm-42:user-7:main".to_string(),
+            platform: queue_context.platform,
+            account_id: queue_context.account_id,
+            channel_id: queue_context.channel_id,
+            user_id: queue_context.user_id,
+            session_key: queue_context.session_key,
+            delivery_id: None,
             kind: ChannelOutboundMessageKind::AgentReply,
             source_queue_id: Some(queue_id.clone()),
             source_completion_file: Some(
@@ -5581,6 +5703,19 @@ mod tests {
         })
         .unwrap();
         let queue_id = receive.queue_id.unwrap();
+        // Channel ingress intentionally emits one immediate, user-facing
+        // "queued" event before this test rewrites the synthetic fixture to
+        // an external origin. That ingress event belongs to the parent turn;
+        // only progress appended by the subsequently executed external child
+        // would be a delivery-boundary violation.
+        let progress_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("progress-events.jsonl");
+        let progress_lines_before_external_run = fs::read_to_string(&progress_file)
+            .unwrap_or_default()
+            .lines()
+            .count();
         rewrite_pending_queue_identity(
             &harness_home,
             &queue_id,
@@ -5610,14 +5745,13 @@ mod tests {
         assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
         assert!(report.outbound_message.is_none());
         assert!(report.outbox_file.is_none());
-        let progress_file = harness_home
-            .join("state")
-            .join("runtime-queue")
-            .join("progress-events.jsonl");
         let progress = fs::read_to_string(&progress_file).unwrap_or_default();
         assert!(
-            progress.lines().all(|line| !line.contains(&queue_id)),
-            "external child progress must remain internal even when agentId and sessionKey spoof the parent lane: {progress}"
+            progress
+                .lines()
+                .skip(progress_lines_before_external_run)
+                .all(|line| !line.contains(&queue_id)),
+            "external child runtime progress must remain internal even when agentId and sessionKey spoof the parent lane: {progress}"
         );
         let delivery = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
             harness_home: harness_home.clone(),
@@ -5631,8 +5765,9 @@ mod tests {
             delivery
                 .pending
                 .iter()
-                .all(|pending| pending.queue_id != queue_id),
-            "external child progress must never become user-deliverable: {:#?}",
+                .filter(|pending| pending.queue_id == queue_id)
+                .all(|pending| pending.event_line <= progress_lines_before_external_run),
+            "external child runtime progress must never become user-deliverable: {:#?}",
             delivery.pending
         );
 
@@ -5683,10 +5818,12 @@ mod tests {
             &crate::ChannelSessionState {
                 schema: "agent-harness.channel-session-state.v1".to_string(),
                 platform: "telegram".to_string(),
+                account_id: None,
                 channel_id: "dm-42".to_string(),
                 user_id: "user-7".to_string(),
                 active_session_key: "telegram:dm-42:user-7:main:live-parent".to_string(),
                 agent_id: Some("main".to_string()),
+                config_revision: None,
                 provider: None,
                 model: None,
                 session_topic: None,
@@ -5775,12 +5912,15 @@ mod tests {
         .unwrap();
         assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
 
-        let session_key = "telegram:dm-42:user-7:main";
+        // Cancel requests are keyed by the exact persisted lane. Ingress
+        // adds the deterministic account suffix even when the caller used
+        // the legacy account-less session hint.
+        let session_key = receive.session_key;
         let cancel_file = harness_home
             .join("state")
             .join("runtime-queue")
             .join("cancel-requests")
-            .join(format!("{}.json", test_normalize_key_part(session_key)));
+            .join(format!("{}.json", test_normalize_key_part(&session_key)));
         let fake_codex =
             fake_interrupted_command_codex_executable(&root, &cancel_file, &source.workspace);
         let codex_home = root.join("codex-home");
@@ -5959,6 +6099,18 @@ mod tests {
                 "telegram:dm-42:user-7:main",
                 Some("開 goal 把所有 package 都完成，落實下來，準備進入實作"),
                 review_text,
+            ),
+            FinalOutboxInputKind::ReviewEvidence
+        );
+        assert_eq!(
+            final_outbox_input_kind_for_completed_response(
+                Some("interactive"),
+                Some("channel"),
+                Some("main"),
+                Some("telegram:dm-42:user-7:main"),
+                "telegram:dm-42:user-7:main",
+                Some("開 goal 把所有 package 都完成，落實下來，準備進入實作"),
+                "Audit complete; sent root the detailed findings.",
             ),
             FinalOutboxInputKind::ReviewEvidence
         );
@@ -6621,6 +6773,7 @@ mod tests {
                 "origin": "channel",
                 "agentId": "main",
                 "platform": "discord",
+                "accountId": "default",
                 "channelId": "dm-42",
                 "userId": "user-7",
                 "sessionKey": session_key
@@ -6652,6 +6805,65 @@ mod tests {
         )
         .unwrap();
         assert!(!pending.contains("\"requeuedFromQueueId\":\"queue-stream\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stream_unstable_retry_continuation_ignores_other_account_parent_session_sibling() {
+        let root = temp_root("stream_unstable_retry_continuation_other_account_sibling");
+        let harness_home = root.join(".agent-harness");
+        let queue_id = "queue-stream";
+        let session_key = "discord:dm-42:user-7:main";
+        seed_prepared_pending_for_stream_retry(&harness_home, queue_id, session_key);
+        append_json_line(
+            &harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+            &serde_json::json!({
+                "queueId": "queue-other-account-sibling",
+                "status": "queued",
+                "runtimeClass": "interactive",
+                "origin": "channel",
+                "agentId": "main",
+                "platform": "discord",
+                "accountId": "other-account",
+                "channelId": "dm-42",
+                "userId": "user-7",
+                "sessionKey": session_key
+            }),
+        )
+        .unwrap();
+        let item = prepared_test_item(queue_id, session_key, None);
+        let run = stream_unstable_failed_run(queue_id, Some(90_038), true);
+        let mut warnings = Vec::new();
+
+        let rollover = maybe_enqueue_stream_unstable_retry_continuation(
+            &harness_home,
+            Some(&item),
+            &run,
+            2,
+            &mut warnings,
+        )
+        .unwrap()
+        .expect("a sibling in another account must not block exact-lane rollover");
+
+        assert!(
+            rollover
+                .requeued_queue_id
+                .starts_with("queue-stream:rollover-requeue-")
+        );
+        assert!(warnings.is_empty());
+        let pending = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        assert!(pending.contains("\"accountId\":\"default\""));
+        assert!(pending.contains("\"accountId\":\"other-account\""));
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6695,7 +6907,7 @@ mod tests {
             "discord",
             "dm-42",
             "user-7",
-            "discord:dm-42:user-7:main",
+            &receive.session_key,
             "main",
         );
         let codex_home = root.join("codex-home");
@@ -6820,12 +7032,13 @@ mod tests {
         })
         .unwrap();
         let parent_queue_id = receive.queue_id.unwrap();
+        let expected_child_session_key = format!("{}:cont-1", receive.session_key);
         write_test_channel_session_state(
             &harness_home,
             "discord",
             "dm-42",
             "user-7",
-            "discord:dm-42:user-7:main",
+            &receive.session_key,
             "main",
         );
         let codex_home = root.join("codex-home");
@@ -6869,7 +7082,7 @@ mod tests {
         assert_ne!(child_queue_id, parent_queue_id);
         assert_eq!(
             second.receipt.child_session_key.as_deref(),
-            Some("discord:dm-42:user-7:main:cont-1")
+            Some(expected_child_session_key.as_str())
         );
 
         let child = run_runtime_queue_once(RuntimeRunOnceOptions {
@@ -7210,6 +7423,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+        let exact_session_key = receive.session_key.clone();
 
         let codex_home = root.join("codex-home");
         fs::create_dir_all(&codex_home).unwrap();
@@ -7260,7 +7474,7 @@ mod tests {
         );
         assert_eq!(
             row.get("sessionKey").and_then(serde_json::Value::as_str),
-            Some("telegram:group-alpha:user-limited:xiaoxiaoli")
+            Some(exact_session_key.as_str())
         );
         assert!(
             !report
@@ -7545,8 +7759,8 @@ mod tests {
     }
 
     #[test]
-    fn channel_session_freshness_does_not_cross_suppress_other_agent() {
-        let root = temp_root("channel_session_freshness_does_not_cross_suppress_other_agent");
+    fn legacy_channel_session_state_does_not_suppress_a_v2_lane() {
+        let root = temp_root("legacy_channel_session_state_does_not_suppress_a_v2_lane");
         let harness_home = root.join(".agent-harness");
         let state_file = crate::channel_session_state_file(
             &harness_home,
@@ -7560,12 +7774,14 @@ mod tests {
             &crate::ChannelSessionState {
                 schema: "agent-harness.channel-session-state.v1".to_string(),
                 platform: "telegram".to_string(),
+                account_id: None,
                 channel_id: "dm-agent-boundary".to_string(),
                 user_id: "user-agent-boundary".to_string(),
                 active_session_key:
                     "telegram:dm-agent-boundary:user-agent-boundary:main:session-live-main"
                         .to_string(),
                 agent_id: Some("main".to_string()),
+                config_revision: None,
                 provider: None,
                 model: None,
                 session_topic: None,
@@ -7592,6 +7808,7 @@ mod tests {
             account_id: None,
             channel_id: "dm-agent-boundary".to_string(),
             user_id: "user-agent-boundary".to_string(),
+            agent_id: "xiaoxiaoli".to_string(),
             session_key:
                 "telegram:dm-agent-boundary:user-agent-boundary:xiaoxiaoli:session-completed"
                     .to_string(),
@@ -7601,10 +7818,86 @@ mod tests {
         let mut warnings = Vec::new();
 
         assert!(channel_session_is_current(&harness_home, &context, &mut warnings).unwrap());
+        assert!(warnings.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_session_freshness_reads_only_the_exact_v2_lane() {
+        let root = temp_root("channel_session_freshness_reads_only_the_exact_v2_lane");
+        let harness_home = root.join(".agent-harness");
+        let lane = ChannelStateLane::new(
+            "telegram",
+            Some("account-a"),
+            "dm-exact-lane",
+            "user-exact-lane",
+            "main",
+        )
+        .unwrap();
+        let mut state = crate::ChannelSessionState {
+            schema: "agent-harness.channel-session-state.v1".to_string(),
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-exact-lane".to_string(),
+            user_id: "user-exact-lane".to_string(),
+            active_session_key: "telegram:dm-exact-lane:user-exact-lane:main:session-live"
+                .to_string(),
+            agent_id: Some("main".to_string()),
+            config_revision: None,
+            provider: None,
+            model: None,
+            session_topic: None,
+            model_override: None,
+            model_override_provider: None,
+            model_override_model: None,
+            thinking_enabled: false,
+            thinking_level: None,
+            thinking_instruction: None,
+            reasoning_preference: None,
+            backend_reasoning_policy: None,
+            fast_mode: None,
+            stop_requested: false,
+            stop_reason: None,
+            steering_notes: Vec::new(),
+            btw_notes: Vec::new(),
+            last_command: None,
+            updated_at_ms: 1234,
+        };
+        crate::bind_channel_session_state_to_lane_v2(&mut state, &lane);
+        crate::write_channel_session_state_v2(&harness_home, &lane, &state).unwrap();
+
+        let stale_same_lane = QueueChannelContext {
+            platform: "telegram".to_string(),
+            account_id: Some("account-a".to_string()),
+            channel_id: "dm-exact-lane".to_string(),
+            user_id: "user-exact-lane".to_string(),
+            agent_id: "main".to_string(),
+            session_key: "telegram:dm-exact-lane:user-exact-lane:main:session-completed"
+                .to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+        };
+        let different_account = QueueChannelContext {
+            account_id: Some("account-b".to_string()),
+            ..stale_same_lane.clone()
+        };
+        let different_agent = QueueChannelContext {
+            agent_id: "audit-worker".to_string(),
+            session_key: "telegram:dm-exact-lane:user-exact-lane:audit-worker:session-completed"
+                .to_string(),
+            ..stale_same_lane.clone()
+        };
+        let mut warnings = Vec::new();
+
         assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("belongs to agent `main`"))
+            !channel_session_is_current(&harness_home, &stale_same_lane, &mut warnings).unwrap()
+        );
+        assert!(
+            channel_session_is_current(&harness_home, &different_account, &mut warnings).unwrap()
+        );
+        assert!(
+            channel_session_is_current(&harness_home, &different_agent, &mut warnings).unwrap()
         );
 
         let _ = fs::remove_dir_all(root);
@@ -8051,6 +8344,7 @@ mod tests {
                 "origin": "channel",
                 "agentId": "main",
                 "platform": "discord",
+                "accountId": "default",
                 "channelId": "dm-42",
                 "userId": "user-7",
                 "sessionKey": session_key,
@@ -8085,10 +8379,12 @@ mod tests {
             &crate::ChannelSessionState {
                 schema: "agent-harness.channel-session-state.v1".to_string(),
                 platform: "discord".to_string(),
+                account_id: None,
                 channel_id: "dm-42".to_string(),
                 user_id: "user-7".to_string(),
                 active_session_key: session_key.to_string(),
                 agent_id: Some("main".to_string()),
+                config_revision: None,
                 provider: None,
                 model: None,
                 session_topic: None,
@@ -8127,10 +8423,12 @@ mod tests {
             &crate::ChannelSessionState {
                 schema: "agent-harness.channel-session-state.v1".to_string(),
                 platform: platform.to_string(),
+                account_id: None,
                 channel_id: channel_id.to_string(),
                 user_id: user_id.to_string(),
                 active_session_key: session_key.to_string(),
                 agent_id: Some(agent_id.to_string()),
+                config_revision: None,
                 provider: None,
                 model: None,
                 session_topic: None,

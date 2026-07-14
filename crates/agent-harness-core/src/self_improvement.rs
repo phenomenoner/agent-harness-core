@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 use crate::{
     ChannelOutboundMessage, ChannelOutboundMessageKind, SKILL_FILE_NAME, WorkerEnqueueOptions,
-    WorkerEnqueueReport, WorkerJobKind, append_jsonl_value, config::harness_config_candidates,
-    enqueue_worker_job,
+    WorkerEnqueueReport, WorkerJobKind, append_channel_outbox_message, append_jsonl_value,
+    config::harness_config_candidates, enqueue_worker_job,
 };
 
 const SELF_IMPROVEMENT_REVIEW_SCHEMA: &str = "agent-harness.self-improvement-review.v1";
@@ -386,16 +386,13 @@ pub fn append_self_improvement_notification(
     text: String,
 ) -> io::Result<PathBuf> {
     let harness_home = harness_home.as_ref();
-    let outbox_file = harness_home
-        .join("state")
-        .join("channels")
-        .join("outbox.jsonl");
-    let message = ChannelOutboundMessage {
+    let mut message = ChannelOutboundMessage {
         platform: target.platform.clone(),
         account_id: target.account_id.clone(),
         channel_id: target.channel_id.clone(),
         user_id: target.user_id.clone(),
         session_key: target.session_key.clone(),
+        delivery_id: None,
         kind: ChannelOutboundMessageKind::CommandReply,
         source_queue_id: None,
         source_completion_file: None,
@@ -404,7 +401,7 @@ pub fn append_self_improvement_notification(
         delivery_intent: None,
         attachments: Vec::new(),
     };
-    append_jsonl_value(&outbox_file, &message)?;
+    let append = append_channel_outbox_message(harness_home, &mut message)?;
     let wake_file = harness_home
         .join("state")
         .join("wake")
@@ -415,7 +412,7 @@ pub fn append_self_improvement_notification(
         "final-outbox",
         "self-improvement notification appended",
     );
-    Ok(outbox_file)
+    Ok(append.outbox_file)
 }
 
 fn collect_enqueue_report(

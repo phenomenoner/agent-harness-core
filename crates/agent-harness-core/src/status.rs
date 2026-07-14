@@ -16,6 +16,8 @@ use crate::memory::{
     memory_qdrant_native_recall_status, openclaw_mem_service_store_file_for_agent,
 };
 use crate::memory_owner::{MemoryOwnerState, read_memory_owner_state_or_default};
+use crate::runtime_receipt_history::find_runtime_queue_terminal_history;
+use crate::runtime_worker::{refresh_runtime_queue_state_index, terminal_run_once_ids_from_index};
 use crate::skill_apply::skill_apply_receipts_file;
 use crate::skill_doctor::skill_doctor_receipts_file;
 use crate::skill_learning::skill_proposals_file;
@@ -1570,6 +1572,15 @@ fn runtime_status(
     let queue_dir = harness_home.join("state").join("runtime-queue");
     let pending_file = queue_dir.join("pending.jsonl");
     let pending = read_runtime_pending_queue(&pending_file, warnings)?;
+    // Current open-work accounting is driven by the hot materialized index.
+    // Cold history is consulted only for the exact currently-pending IDs as a
+    // defensive recovery guard; it must never turn an arbitrary old terminal
+    // turn into apparent current work.
+    let hot_index = refresh_runtime_queue_state_index(&queue_dir, warnings)?;
+    let mut terminal_run_ids = terminal_run_once_ids_from_index(&hot_index);
+    for terminal in find_runtime_queue_terminal_history(&queue_dir, &pending.queue_ids)? {
+        terminal_run_ids.insert(terminal.queue_id);
+    }
     let prepared_ids = read_receipt_queue_ids_with_status(
         &queue_dir.join("execution-receipts.jsonl"),
         &["prepared", "already-prepared"],
@@ -1581,20 +1592,6 @@ fn runtime_status(
         &["recorded", "already-recorded"],
         warnings,
         "runtime completion receipts",
-    )?;
-    let terminal_run_ids = read_receipt_queue_ids_with_status(
-        &queue_dir.join("run-once-receipts.jsonl"),
-        &[
-            "completed",
-            "timeout",
-            "failed-terminal",
-            "canceled",
-            "skipped",
-            "dead-letter",
-            "suppressed",
-        ],
-        warnings,
-        "runtime run-once receipts",
     )?;
     let mut open_by_runtime_class = BTreeMap::new();
     let mut open_by_origin = BTreeMap::new();
@@ -4101,6 +4098,58 @@ mod tests {
         assert!(custom.present);
         assert_eq!(custom.status.as_deref(), Some("running"));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_status_treats_history_as_an_exact_pending_recovery_guard_not_current_telemetry() {
+        let root = temp_root("runtime_status_history_exact_pending_recovery_guard");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let staged = crate::runtime_receipt_history::stage_runtime_queue_receipt_history(
+            &queue_dir,
+            "status-history",
+            br#"{"queueId":"queue-terminal","status":"completed","reason":"old terminal"}
+"#,
+            b"",
+            &std::collections::HashSet::new(),
+            100,
+        )
+        .unwrap();
+        crate::runtime_receipt_history::commit_runtime_queue_receipt_history(&staged, 101).unwrap();
+        fs::write(
+            queue_dir.join("pending.jsonl"),
+            [
+                serde_json::json!({
+                    "queueId":"queue-terminal",
+                    "status":"queued",
+                    "runtimeClass":"interactive",
+                    "origin":"channel"
+                })
+                .to_string(),
+                serde_json::json!({
+                    "queueId":"queue-open",
+                    "status":"queued",
+                    "runtimeClass":"interactive",
+                    "origin":"channel"
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        fs::write(queue_dir.join("run-once-receipts.jsonl"), "").unwrap();
+
+        let report = runtime_status(&harness_home, &mut Vec::new()).unwrap();
+
+        assert_eq!(report.queued_items, 2);
+        assert_eq!(report.open_items, 1);
+        assert!(
+            report.latest_non_idle_run_once.is_none(),
+            "cold history must not replace current-ledger telemetry"
+        );
+        assert_eq!(report.run_once_receipts.lines, 0);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -1,17 +1,20 @@
 # Changelog
 
-## v0.8.0 - Unreleased
+## v0.8.0 - 2026-07-15
 
 ### Changed
 
 - Added exact-route model capability discovery for GPT-5.6-family reasoning. `/think` and `/reasoning` now share one last-write-wins state; exact `max` is preserved when advertised, exact `ultra` is filtered and rejected, and legacy `ultra-high` / `ultra_high` canonicalize to `xhigh`.
 - Added an exact-lane, backend-generation-scoped manifest for the eight per-agent static prompt files, including alias handling and deletion tombstones. Non-main agents no longer inherit main-agent prompt files when their own workspace is absent.
 - Added immutable heterogeneous child execution policies, exact-owner result mailboxes, lease-safe coordinator resume, explicit failed omissions for missing child evidence, and master-only user-facing progress/final/error ownership.
+- Added bounded source-authoritative receipt histories and an isolated `ledger-maintenance-loop`, so interactive ingress, progress, runtime completion, and final delivery signal retention without running compaction inline.
+- Windows Task Scheduler plans now retain every enabled configured secondary Telegram loop while adding the maintenance owner; plan and reconcile use the same supervisor configuration source.
 
 ### Fixed
 
 - Hardened deterministic cron with per-entry `timeoutMs` and `maxAttempts`, `TZ` / `CRON_TZ`-aware current and catch-up scheduling, calendar day/month fields, and exact crontab source filtering that ignores backup and temporary copies.
 - Exhausted worker jobs are terminalized before lease, and timed-out deterministic jobs terminate their Windows descendant process tree instead of leaving child processes running.
+- Explicitly untrusted runtime receipt schemas are no longer accepted as terminal-history evidence, and stale derived queue indexes rebuild from trusted receipt-ledger evidence.
 
 ### Security
 
@@ -20,6 +23,13 @@
 ### Compatibility
 
 - This is a pre-1.0 Rust source boundary. The v0.8 reader retains documented legacy artifact readers, but older binaries must not be assumed to read V2 state written by v0.8. See `docs/migration-0.8.md`.
+
+### Verification
+
+- Passed `cargo fmt --all -- --check` and the full workspace all-target test suite (1,170 tests) in an isolated staging target.
+- Passed the exact-current-session coordinator scenario replay: two heterogeneous child completions remained internal, the master emitted one continuation/final, and child runs emitted no user-facing final.
+- Passed a controlled live cutover check with the same master-owned coordination and delivery invariants, followed by ready/live health and clean platform-specific outbox plans.
+- Passed `git diff --check` and `agent-harness public-hygiene` against a tracked-file public export before tagging.
 
 ## v0.7.0 - 2026-07-09
 

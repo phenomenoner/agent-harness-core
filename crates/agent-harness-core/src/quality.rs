@@ -177,6 +177,21 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
             statement: "coordinator resume is durable, exact-lane, coalesced, and at-most-once: an active parent lease suppresses wakeup, a confirmed released lease schedules one typed continuation, and mailbox acknowledgement follows continuation lease acquisition",
             owner: "worker_coordination/worker_resume/coordinator_resume/workers/runtime_worker",
         },
+        InvariantEntry {
+            id: "I25",
+            statement: "interactive ingress, progress, runtime completion, and final delivery use bounded committed receipt snapshots; expensive history retention is only signaled on their path and runs under the isolated ledger-maintenance owner",
+            owner: "runtime_receipt_history/channel_delivery_history/progress_history/ledger_maintenance/supervisor",
+        },
+        InvariantEntry {
+            id: "I26",
+            statement: "the Windows Task Scheduler plan preserves every enabled configured supervisor.telegramLoops runner while adding the isolated ledger-maintenance owner; plan and reconcile derive custom channel loop identity from the same harness config",
+            owner: "supervisor/harness_config/supervisor_inventory",
+        },
+        InvariantEntry {
+            id: "I27",
+            statement: "provider-visible progress delivery is source-authoritative and stop-responsive: a non-fresh progress snapshot cannot replay cached state, historical events without a known provider surface cannot create a fresh surface, and a stop request releases unattempted fresh-send claims before provider I/O",
+            owner: "progress/progress_event_index/agent-harness-cli/supervisor",
+        },
     ]
 }
 
@@ -186,6 +201,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             schema: "agent-harness.runtime-run-once.v1",
             owner_module: "runtime_pipeline",
             compatibility: "append-only JSONL, additive fields only in v1 including terminalControlMatched, terminalControlSource, suppressedRunOnceReason, and preparedExecutionTerminalizationReason",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.ledger-maintenance.v1",
+            owner_module: "ledger_maintenance",
+            compatibility: "read-only maintenance report; additive per-ledger compaction fields only in v1, normal passes remain source-aware and bounded while force is operator-only",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.codex-runtime-run.v1",
@@ -251,6 +271,11 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             schema: "agent-harness.progress-delivery-state.v1",
             owner_module: "progress",
             compatibility: "state JSON may add cursor/cache/counter fields in v1; existing lane cursors remain readable; progressSuppressedReason is additive on delivery receipts/pending context",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.progress-delivery-plan.v1",
+            owner_module: "progress",
+            compatibility: "plan summary counters and warnings are additive in v1; non-fresh source snapshots produce no provider pending items, and historical providerless queues stay suppressed",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.codex-context-preflight.v1",
@@ -874,7 +899,7 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "runtime pipeline",
                 "channel delivery",
             ],
-            required_invariants: vec!["I2", "I7", "I9", "I13"],
+            required_invariants: vec!["I2", "I7", "I9", "I13", "I17", "I25", "I27"],
             required_evidence: vec![
                 "bounded per-queue body/action edit volume",
                 "status/current-step heartbeat after body cap",
@@ -887,6 +912,9 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "internal worker results summarized without leaking raw worker final text into action progress",
                 "queue-local wake preemption with first-surface sends preserved",
                 "same-queue providerless orphan surface claims are reclaimed without TTL wait",
+                "a non-fresh source snapshot defers cached progress instead of replaying a provider surface",
+                "a historical queue without an existing provider surface cannot create a fresh progress send",
+                "a watched stop request releases unattempted fresh-send claims before provider I/O",
             ],
             runnable_tests: vec![
                 "progress::tests::progress_delivery_repeated_events_converge_to_one_provider_message",
@@ -901,9 +929,12 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "progress::tests::progress_surface_claim_reclaims_same_queue_orphan_without_ttl",
                 "progress::tests::terminal_progress_waits_until_source_final_delivery_is_delivered",
                 "agent-harness-cli::tests::progress_delivery_preempts_nonterminal_pending_when_wake_advances",
+                "progress::tests::progress_delivery_defers_cached_events_while_index_snapshot_is_not_fresh",
+                "progress::tests::progress_delivery_does_not_fresh_send_historical_event_without_existing_surface",
+                "agent-harness-cli::tests::progress_delivery_stop_releases_unattempted_surface_claims_before_provider_io",
                 "codex_runtime::tests::run_codex_runtime_rejects_stdout_recovery_narration_without_final_answer",
             ],
-            promotion_gate: "Replay Telegram and Discord long-running turns through progress caps, recovery, final outbox, and terminal convergence.",
+            promotion_gate: "Replay Telegram and Discord long-running turns through progress caps, recovery, final outbox, terminal convergence, source-index contention, historical-cache recovery, and a watched progress-owner stop.",
         },
         ScenarioMatrixEntry {
             id: "cron-freshness-canon",
@@ -1076,11 +1107,16 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "released parent creates one typed coordinator continuation and no legacy master wakeup",
                 "duplicate/restart attempts coalesce to one resume intent and acknowledge mailbox rows after lease acquisition",
                 "child or owner-mismatched terminal output never reaches the parent final outbox",
+                "a controlled real-lane replay admits only an explicit marker-protected two-child source when its exact lane session is current and the main lane plus every planned child execution agent pass authoritative catalog policy before persistence",
             ],
             runnable_tests: vec![
                 "child_execution_policy::tests::heterogeneous_siblings_preserve_independent_open_ended_routes_and_efforts",
                 "worker_adapters::tests::subagent_adapter_v5_atomically_preserves_heterogeneous_models_and_efforts",
                 "worker_adapters::tests::subagent_adapter_v5_rolls_back_children_wait_and_watchdog_together",
+                "worker_adapters::tests::controlled_coordinator_smoke_enqueues_only_two_catalog_admitted_children",
+                "worker_adapters::tests::controlled_coordinator_smoke_rejects_stale_live_session_before_persisting_workers",
+                "worker_adapters::tests::controlled_coordinator_smoke_rejects_non_authoritative_child_agent_before_persisting_workers",
+                "worker_adapters::tests::controlled_coordinator_smoke_rejects_ultra_before_persisting_workers",
                 "worker_result_mailbox::tests::unread_lookup_and_claim_are_isolated_by_every_exact_owner_axis",
                 "worker_resume::tests::active_parent_quarantines_without_claiming_then_idle_schedules_once",
                 "worker_resume::tests::restart_replays_same_claim_and_intent_without_duplication",
@@ -1088,7 +1124,7 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "runtime_pipeline::tests::run_runtime_queue_once_suppresses_owner_mismatched_agent_final_outbox",
                 "coordinator_resume::released_parent_schedules_one_durable_coordinator_resume_and_no_master_wakeup",
             ],
-            promotion_gate: "Promote after heterogeneous siblings, atomic rollback, exact-owner isolation, active/released parent lease transitions, duplicate/restart recovery, mailbox acknowledgement, and child-final suppression pass in one staging candidate; live gateway control remains on the main lane.",
+            promotion_gate: "Promote after heterogeneous siblings, marker-protected controlled admission that proves the exact channel session is current plus authoritative catalog rollout for the main lane and every child execution agent before persistence, atomic rollback, exact-owner isolation, active/released parent lease transitions, duplicate/restart recovery, mailbox acknowledgement, and child-final suppression pass in one staging candidate; live gateway control remains on the main lane.",
         },
         ScenarioMatrixEntry {
             id: "provider-request-acceleration",
@@ -1226,6 +1262,56 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
             ],
             promotion_gate: "Promote only after parser/policy, lint, provider senders, inbound artifact hygiene, referenced-media provenance, native-input readiness, and context-bloat rollover tests pass for both channel adapters; live cutover keeps media.nativeImageInput and media.lintFailClosed default-off until post-cutover enablement.",
         },
+        ScenarioMatrixEntry {
+            id: "bounded-ledger-maintenance",
+            title: "Bounded interactive receipt reads and isolated retention owner",
+            changed_areas: vec![
+                "runtime receipt history",
+                "channel delivery receipt history",
+                "progress history",
+                "ledger maintenance supervisor owner",
+            ],
+            required_invariants: vec!["I3", "I5", "I9", "I25"],
+            required_evidence: vec![
+                "terminal append paths signal a coalesced maintenance wake without synchronously replaying or compacting history",
+                "interactive readers return a committed snapshot or conservative result when an append/index lock is busy",
+                "one-hundred-thousand-row receipt and progress histories compact without retaining unbounded hot payloads",
+                "each ledger fails closed independently while the maintenance owner records an isolated warning and continues other ledgers",
+                "supervisor dry-run includes the dedicated ledger-maintenance owner before live promotion",
+            ],
+            runnable_tests: vec![
+                "ledger_maintenance::tests::maintenance_wake_coalesces_sequence_and_latest_reason",
+                "ledger_maintenance::tests::normal_maintenance_leaves_missing_ledgers_untouched",
+                "ledger_maintenance::tests::forced_maintenance_contains_one_ledger_failure_and_continues_independently",
+                "runtime_receipt_history::tests::nonblocking_reader_returns_would_block_for_an_exclusive_history_lock",
+                "channel_delivery::tests::outbox_plan_uses_last_committed_index_while_an_outbox_append_is_locked",
+                "channel_delivery_history::tests::compaction_plan_handles_one_hundred_thousand_terminal_v2_records",
+                "progress_history::tests::compacts_one_hundred_thousand_terminal_events_without_retaining_an_unbounded_hot_payload",
+            ],
+            promotion_gate: "Promote only after the isolated maintenance owner is present in candidate supervisor dry-run, large-history and busy-lock regressions are green, and a controlled live long-turn proves progress/final delivery ordering without compaction on the interactive path.",
+        },
+        ScenarioMatrixEntry {
+            id: "supervisor-plan-configured-loop-parity",
+            title: "Task Scheduler plan preserves configured channel loops with maintenance owner",
+            changed_areas: vec![
+                "Windows Task Scheduler plan",
+                "configured Telegram loop inventory",
+                "ledger maintenance cutover ownership",
+            ],
+            required_invariants: vec!["I26"],
+            required_evidence: vec![
+                "the authoritative harness config validates before plan generation",
+                "a staged plan includes the main Telegram loop, every enabled configured Telegram loop, and ledger-maintenance-loop",
+                "the generated start/stop bundle contains each configured channel loop and the maintenance owner",
+                "candidate reconcile and generated Task Scheduler plan agree before live promotion",
+            ],
+            runnable_tests: vec![
+                "supervisor::tests::plan_includes_enabled_configured_telegram_loop_with_ledger_maintenance",
+                "supervisor_inventory::tests::inventory_accepts_isolated_ledger_maintenance_service_and_plans_owner",
+                "agent-harness-cli::tests::supervisor_reconcile_all_includes_isolated_ledger_maintenance_owner",
+            ],
+            promotion_gate: "Promote only after a staged nine-owner bundle and candidate reconcile preserve configured channel loops, then post-cutover readback confirms all expected owner heartbeats are fresh.",
+        },
     ]
 }
 
@@ -1276,7 +1362,9 @@ pub fn release_checklist() -> ReleaseChecklist {
             "progress delivery changes passed edit-volume replay checks",
             "progress final-order changes passed source final provider-delivery-before-terminal-progress replay checks",
             "progress ordering changes passed queue-local preemption, first-surface send, orphan-claim recovery, and terminal-control ghost-close replay checks",
+            "progress source-authority changes passed non-fresh-cache defer, historical fresh-send suppression, and stop-file claim-release checks",
             "progress panel lane-cap heartbeat/current-step checks passed across channel platforms",
+            "interactive receipt readers passed bounded-history, busy-lock, and isolated ledger-maintenance-owner scenario checks",
             "cron freshness changes passed config run-cap validation, cron-canon health/status warnings, deterministic catch-up, and stale-source sender suppression checks",
             "cron/backup incident hardening passed exact-source, timezone/calendar, per-entry timeout/attempt, pre-lease exhaustion, process-tree timeout, occurrence-idempotency, verified-retention, and zero-stale-catch-up checks",
             "Codex tool-use timeout changes passed bounded recovery checks",
@@ -1410,6 +1498,9 @@ mod tests {
         );
         assert!(release_checklist().required_items.contains(
             &"progress ordering changes passed queue-local preemption, first-surface send, orphan-claim recovery, and terminal-control ghost-close replay checks"
+        ));
+        assert!(release_checklist().required_items.contains(
+            &"progress source-authority changes passed non-fresh-cache defer, historical fresh-send suppression, and stop-file claim-release checks"
         ));
         assert!(release_checklist().required_items.contains(
             &"progress panel lane-cap heartbeat/current-step checks passed across channel platforms"
@@ -1556,7 +1647,7 @@ mod tests {
             .into_iter()
             .map(|entry| entry.id)
             .collect::<std::collections::HashSet<_>>();
-        for invariant in ["I21", "I22", "I23", "I24"] {
+        for invariant in ["I21", "I22", "I23", "I24", "I25", "I26", "I27"] {
             assert!(
                 invariant_ids.contains(invariant),
                 "missing orchestration invariant {invariant}"
@@ -1578,6 +1669,8 @@ mod tests {
             "agent-harness.worker-resume-intent.v1",
             "agent-harness.coordinator-resume.v1",
             "agent-harness.safe-resume-readiness.v1",
+            "agent-harness.ledger-maintenance.v1",
+            "agent-harness.progress-delivery-plan.v1",
         ] {
             assert!(
                 schemas.contains(schema),
@@ -1598,6 +1691,36 @@ mod tests {
             &"channel_runtime::tests::exact_ultra_is_rejected_as_non_effort_for_both_command_aliases"
         ));
 
+        let maintenance = scenarios
+            .iter()
+            .find(|entry| entry.id == "bounded-ledger-maintenance")
+            .expect("bounded ledger maintenance scenario");
+        assert!(maintenance.required_invariants.contains(&"I25"));
+        assert!(maintenance.runnable_tests.contains(
+            &"ledger_maintenance::tests::maintenance_wake_coalesces_sequence_and_latest_reason"
+        ));
+
+        let supervisor_plan = scenarios
+            .iter()
+            .find(|entry| entry.id == "supervisor-plan-configured-loop-parity")
+            .expect("supervisor plan configured loop parity scenario");
+        assert!(supervisor_plan.required_invariants.contains(&"I26"));
+        assert!(supervisor_plan.runnable_tests.contains(
+            &"supervisor::tests::plan_includes_enabled_configured_telegram_loop_with_ledger_maintenance"
+        ));
+
+        let progress = scenarios
+            .iter()
+            .find(|entry| entry.id == "progress-surface-volume")
+            .expect("progress source-authority scenario");
+        assert!(progress.required_invariants.contains(&"I27"));
+        assert!(progress.runnable_tests.contains(
+            &"progress::tests::progress_delivery_defers_cached_events_while_index_snapshot_is_not_fresh"
+        ));
+        assert!(progress.runnable_tests.contains(
+            &"agent-harness-cli::tests::progress_delivery_stop_releases_unattempted_surface_claims_before_provider_io"
+        ));
+
         let prompt = scenarios
             .iter()
             .find(|entry| entry.id == "per-agent-prompt-manifest")
@@ -1613,6 +1736,15 @@ mod tests {
             .expect("master-owned coordination scenario");
         assert!(coordination.required_invariants.contains(&"I23"));
         assert!(coordination.required_invariants.contains(&"I24"));
+        assert!(coordination.runnable_tests.contains(
+            &"worker_adapters::tests::controlled_coordinator_smoke_enqueues_only_two_catalog_admitted_children"
+        ));
+        assert!(coordination.runnable_tests.contains(
+            &"worker_adapters::tests::controlled_coordinator_smoke_rejects_stale_live_session_before_persisting_workers"
+        ));
+        assert!(coordination.runnable_tests.contains(
+            &"worker_adapters::tests::controlled_coordinator_smoke_rejects_non_authoritative_child_agent_before_persisting_workers"
+        ));
         assert!(coordination
             .runnable_tests
             .contains(&"coordinator_resume::released_parent_schedules_one_durable_coordinator_resume_and_no_master_wakeup"));

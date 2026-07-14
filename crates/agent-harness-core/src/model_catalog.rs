@@ -791,7 +791,7 @@ mod tests {
         assert_eq!(receipt.requested_model, "GPT-5.6-SOL");
         assert_eq!(receipt.effective_provider.as_deref(), Some("codex"));
         assert_eq!(receipt.effective_model.as_deref(), Some("GPT-5.6-SOL"));
-        assert_eq!(receipt.effective_effort.as_deref(), Some("xhigh"));
+        assert_eq!(receipt.effective_effort.as_deref(), Some("max"));
         assert_eq!(receipt.catalog_effective_effort.as_deref(), Some("max"));
     }
 
@@ -972,7 +972,7 @@ mod tests {
             UnsupportedReasoningPolicy::Reject,
         );
         assert_eq!(receipt.status, ReasoningResolutionStatus::Shadow);
-        assert_eq!(receipt.effective_effort.as_deref(), Some("xhigh"));
+        assert_eq!(receipt.effective_effort.as_deref(), Some("max"));
         assert_eq!(receipt.catalog_effective_effort.as_deref(), Some("max"));
         assert!(!receipt.authoritative);
     }

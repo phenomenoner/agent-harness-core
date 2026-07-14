@@ -10,6 +10,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::runtime_receipt_history::{
+    find_runtime_queue_terminal_history, runtime_queue_receipt_history_file,
+};
+use crate::runtime_worker::{
+    refresh_runtime_queue_state_index, runtime_queue_state_index_file,
+    terminal_run_once_ids_from_index, terminal_runtime_queue_hot_receipt_from_index,
+};
 use crate::{
     AuthorizedExecutionModeSnapshotV2, CronRunSummary, HarnessLogEvent, HarnessLogLevel,
     LearningReviewOptions, RuntimeQueueItem, RuntimeQueueItemStatus, RuntimeQueueSource,
@@ -951,51 +958,62 @@ fn collect_downstream_runtime_status(
 ) -> io::Result<WorkerDownstreamRuntimeStatus> {
     let queue_dir = harness_home.join("state").join("runtime-queue");
     let runtime_queue_file = queue_dir.join("pending.jsonl");
-    let terminal_ids = read_runtime_terminal_ids(&queue_dir.join("run-once-receipts.jsonl"))?;
+    let mut index_warnings = Vec::new();
+    let hot_index = refresh_runtime_queue_state_index(&queue_dir, &mut index_warnings)?;
+    let mut terminal_ids = terminal_run_once_ids_from_index(&hot_index);
+    let pending_values = if runtime_queue_file.is_file() {
+        fs::read_to_string(&runtime_queue_file)?
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let pending_ids = pending_values
+        .iter()
+        .filter_map(|value| {
+            string_path_any(value, &["queueId", "queue_id"]).map(ToString::to_string)
+        })
+        .collect::<BTreeSet<_>>();
+    // Cold terminal history is an exact-ID recovery guard only. It never
+    // enumerates old work as current downstream activity.
+    for terminal in find_runtime_queue_terminal_history(&queue_dir, &pending_ids)? {
+        terminal_ids.insert(terminal.queue_id);
+    }
     let mut open_runtime_items = 0usize;
     let mut open_cron_runtime_items = 0usize;
     let mut open_by_runtime_class = BTreeMap::new();
     let mut open_by_origin = BTreeMap::new();
-    if runtime_queue_file.is_file() {
-        let text = fs::read_to_string(&runtime_queue_file)?;
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-                continue;
-            };
-            let Some(queue_id) = string_path_any(&value, &["queueId", "queue_id"]) else {
-                continue;
-            };
-            if terminal_ids.contains(queue_id) {
-                continue;
-            }
-            let platform = string_path_any(&value, &["platform"]).unwrap_or("worker");
-            let runtime_class = string_path_any(&value, &["runtimeClass", "runtime_class"])
-                .map(ToString::to_string)
-                .unwrap_or_else(|| {
-                    if platform == "native-cron" {
-                        "cron".to_string()
-                    } else {
-                        "interactive".to_string()
-                    }
-                });
-            let origin = string_path_any(&value, &["origin"])
-                .unwrap_or(if platform == "native-cron" {
-                    "cron-scheduler"
-                } else {
-                    "unknown"
-                })
-                .to_string();
-            open_runtime_items += 1;
-            if runtime_class == "cron" {
-                open_cron_runtime_items += 1;
-            }
-            *open_by_runtime_class.entry(runtime_class).or_insert(0) += 1;
-            *open_by_origin.entry(origin).or_insert(0) += 1;
+    for value in pending_values {
+        let Some(queue_id) = string_path_any(&value, &["queueId", "queue_id"]) else {
+            continue;
+        };
+        if terminal_ids.contains(queue_id) {
+            continue;
         }
+        let platform = string_path_any(&value, &["platform"]).unwrap_or("worker");
+        let runtime_class = string_path_any(&value, &["runtimeClass", "runtime_class"])
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                if platform == "native-cron" {
+                    "cron".to_string()
+                } else {
+                    "interactive".to_string()
+                }
+            });
+        let origin = string_path_any(&value, &["origin"])
+            .unwrap_or(if platform == "native-cron" {
+                "cron-scheduler"
+            } else {
+                "unknown"
+            })
+            .to_string();
+        open_runtime_items += 1;
+        if runtime_class == "cron" {
+            open_cron_runtime_items += 1;
+        }
+        *open_by_runtime_class.entry(runtime_class).or_insert(0) += 1;
+        *open_by_origin.entry(origin).or_insert(0) += 1;
     }
     let cron_runs = collect_cron_run_summary(harness_home)
         .map(|report| report.summary)
@@ -1008,44 +1026,6 @@ fn collect_downstream_runtime_status(
         open_by_origin,
         cron_runs,
     })
-}
-
-fn read_runtime_terminal_ids(path: &Path) -> io::Result<std::collections::BTreeSet<String>> {
-    let mut terminal = std::collections::BTreeSet::new();
-    if !path.is_file() {
-        return Ok(terminal);
-    }
-    let text = fs::read_to_string(path)?;
-    let mut latest = BTreeMap::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        if let Some(queue_id) = string_path_any(&value, &["queueId", "queue_id"])
-            && let Some(status) = string_path_any(&value, &["status"])
-        {
-            latest.insert(queue_id.to_string(), status.to_string());
-        }
-    }
-    for (queue_id, status) in latest {
-        if matches!(
-            status.as_str(),
-            "completed"
-                | "timeout"
-                | "failed-terminal"
-                | "canceled"
-                | "skipped"
-                | "dead-letter"
-                | "suppressed"
-        ) {
-            terminal.insert(queue_id);
-        }
-    }
-    Ok(terminal)
 }
 
 pub fn reap_stale_worker_jobs(
@@ -2197,11 +2177,16 @@ fn run_deterministic_shell_job(
     }
 
     let mut child = command.spawn().map_err(io::Error::other)?;
+    #[cfg(windows)]
+    let process_tree_job = WindowsWorkerProcessJob::assign(&child);
     let timed_out = loop {
         if child.try_wait().map_err(io::Error::other)?.is_some() {
             break false;
         }
         if epoch_ms()?.saturating_sub(started) > i64::try_from(timeout_ms).unwrap_or(i64::MAX) {
+            #[cfg(windows)]
+            terminate_worker_child_process_tree(&mut child, process_tree_job.as_ref());
+            #[cfg(not(windows))]
             terminate_worker_child_process_tree(&mut child);
             break true;
         }
@@ -2259,12 +2244,63 @@ fn run_deterministic_shell_job(
 }
 
 #[cfg(windows)]
-fn terminate_worker_child_process_tree(child: &mut std::process::Child) {
+struct WindowsWorkerProcessJob {
+    handle: isize,
+}
+
+#[cfg(windows)]
+impl WindowsWorkerProcessJob {
+    fn assign(child: &std::process::Child) -> Option<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+
+        unsafe {
+            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle == 0 {
+                return None;
+            }
+            if AssignProcessToJobObject(handle, child.as_raw_handle() as isize) == 0 {
+                let _ = CloseHandle(handle);
+                return None;
+            }
+            Some(Self { handle })
+        }
+    }
+
+    fn terminate(&self) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        unsafe {
+            let _ = TerminateJobObject(self.handle, 1);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsWorkerProcessJob {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn terminate_worker_child_process_tree(
+    child: &mut std::process::Child,
+    process_tree_job: Option<&WindowsWorkerProcessJob>,
+) {
     let _ = Command::new("taskkill")
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+    if let Some(process_tree_job) = process_tree_job {
+        process_tree_job.terminate();
+    }
     let _ = child.kill();
 }
 
@@ -2328,6 +2364,25 @@ fn queue_llm_worker_turn(
         requested_origin.as_deref(),
         coordinator_resume.as_ref(),
     )?;
+    if let Some(metadata) = coordinator_resume.as_ref() {
+        let queued_lane = crate::coordinator_resume::CoordinatorResumeQueuedLaneV1 {
+            platform: required_payload_string(&job.payload, "platform")?,
+            account_id: required_payload_string(&job.payload, "accountId")?,
+            channel_id: required_payload_string(&job.payload, "channelId")?,
+            user_id: required_payload_string(&job.payload, "userId")?,
+            agent_id: required_payload_string(&job.payload, "agentId")?,
+            runtime_class: required_payload_string(&job.payload, "runtimeClass")?,
+            session_key: required_payload_string(&job.payload, "sessionKey")?,
+        };
+        metadata
+            .validate_queued_lane(queued_lane)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid coordinator resume queued lane: {error}"),
+                )
+            })?;
+    }
     let sessions_dir = confined_agent_sessions_dir(harness_home, agent_id, &runtime_class, true)?;
     let queue_dir = harness_home.join("state").join("runtime-queue");
     fs::create_dir_all(&queue_dir)?;
@@ -3367,6 +3422,7 @@ struct RuntimeWorkerTerminal {
     origin: String,
     reason: String,
     transcript_file: Option<PathBuf>,
+    receipt_file: PathBuf,
 }
 
 fn reconcile_runtime_queued_jobs(
@@ -3385,58 +3441,6 @@ fn reconcile_runtime_queued_jobs(
         return Ok(0);
     }
 
-    let receipts_file = harness_home
-        .join("state")
-        .join("runtime-queue")
-        .join("run-once-receipts.jsonl");
-    let receipts = match fs::read_to_string(&receipts_file) {
-        Ok(receipts) => receipts,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error),
-    };
-    let mut terminals = BTreeMap::<String, RuntimeWorkerTerminal>::new();
-    for line in receipts.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if string_path(&value, "schema") != Some("agent-harness.runtime-run-once.v1") {
-            continue;
-        }
-        let Some(queue_id) = string_path_any(&value, &["queueId", "queue_id"]) else {
-            continue;
-        };
-        let Some(runtime_status) = string_path(&value, "status") else {
-            continue;
-        };
-        let Some(worker_status) = worker_status_from_runtime_terminal(runtime_status) else {
-            continue;
-        };
-        let Some(runtime_class) = string_path_any(&value, &["runtimeClass", "runtime_class"])
-        else {
-            continue;
-        };
-        let Some(origin) = string_path(&value, "origin") else {
-            continue;
-        };
-        terminals.insert(
-            queue_id.to_string(),
-            RuntimeWorkerTerminal {
-                worker_status,
-                runtime_status: runtime_status.to_string(),
-                runtime_class: runtime_class.to_string(),
-                origin: origin.to_string(),
-                reason: string_path(&value, "reason")
-                    .unwrap_or("runtime terminal receipt recorded")
-                    .to_string(),
-                transcript_file: string_path_any(&value, &["transcriptFile", "transcript_file"])
-                    .map(PathBuf::from),
-            },
-        );
-    }
-    if terminals.is_empty() {
-        return Ok(0);
-    }
-
     let jobs = {
         let mut stmt = conn
             .prepare("SELECT * FROM jobs WHERE status=?1 ORDER BY created_at_ms ASC")
@@ -3446,6 +3450,69 @@ fn reconcile_runtime_queued_jobs(
             .collect::<Result<Vec<_>, _>>()
             .map_err(io::Error::other)?
     };
+
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let history_file = runtime_queue_receipt_history_file(&queue_dir);
+    let requested_queue_ids = jobs
+        .iter()
+        .filter_map(|job| runtime_queue_id_from_worker_job(job).map(ToString::to_string))
+        .collect::<BTreeSet<_>>();
+    let mut terminals = BTreeMap::<String, RuntimeWorkerTerminal>::new();
+    for record in find_runtime_queue_terminal_history(&queue_dir, &requested_queue_ids)? {
+        let Some(worker_status) = worker_status_from_runtime_terminal(&record.status) else {
+            continue;
+        };
+        let (Some(runtime_class), Some(origin)) = (record.runtime_class, record.origin) else {
+            continue;
+        };
+        terminals.insert(
+            record.queue_id,
+            RuntimeWorkerTerminal {
+                worker_status,
+                runtime_status: record.status,
+                runtime_class,
+                origin,
+                reason: record
+                    .reason
+                    .unwrap_or_else(|| "runtime terminal receipt recorded".to_string()),
+                transcript_file: record.transcript_file,
+                receipt_file: history_file.clone(),
+            },
+        );
+    }
+    let hot_index = refresh_runtime_queue_state_index(&queue_dir, &mut Vec::new())?;
+    let hot_index_file = runtime_queue_state_index_file(&queue_dir);
+    for queue_id in &requested_queue_ids {
+        let Some(record) = terminal_runtime_queue_hot_receipt_from_index(&hot_index, queue_id)
+        else {
+            continue;
+        };
+        let Some(worker_status) = worker_status_from_runtime_terminal(&record.status) else {
+            continue;
+        };
+        let (Some(runtime_class), Some(origin)) = (record.runtime_class, record.origin) else {
+            continue;
+        };
+        // The mutable hot index is incrementally materialized from the ledger
+        // and is newer than any committed cold summary for the same queue ID.
+        terminals.insert(
+            record.queue_id,
+            RuntimeWorkerTerminal {
+                worker_status,
+                runtime_status: record.status,
+                runtime_class,
+                origin,
+                reason: record
+                    .reason
+                    .unwrap_or_else(|| "runtime terminal receipt recorded".to_string()),
+                transcript_file: record.transcript_file,
+                receipt_file: hot_index_file.clone(),
+            },
+        );
+    }
+    if terminals.is_empty() {
+        return Ok(0);
+    }
 
     let mut reconciled = 0;
     for job in jobs {
@@ -3481,7 +3548,6 @@ fn reconcile_runtime_queued_jobs(
             runtime_queue_id,
             terminal,
             now_ms,
-            &receipts_file,
         )?;
         reconciled += 1;
     }
@@ -3495,14 +3561,13 @@ fn set_runtime_terminal_with_mailbox(
     runtime_queue_id: &str,
     terminal: &RuntimeWorkerTerminal,
     now_ms: i64,
-    receipts_file: &Path,
 ) -> io::Result<()> {
     let transaction = conn.unchecked_transaction().map_err(io::Error::other)?;
     let result = json!({
         "runtimeQueueId": runtime_queue_id,
         "runtimeStatus": terminal.runtime_status,
         "reason": terminal.reason,
-        "terminalReceiptFile": receipts_file,
+        "terminalReceiptFile": terminal.receipt_file,
         "correlation": "exact-runtime-queue-id"
     });
     let updated = transaction
@@ -3511,7 +3576,7 @@ fn set_runtime_terminal_with_mailbox(
             params![
                 terminal.worker_status.as_str(),
                 result.to_string(),
-                receipts_file.to_string_lossy().to_string(),
+                terminal.receipt_file.to_string_lossy().to_string(),
                 now_ms,
                 job.job_id,
                 WorkerJobStatus::RuntimeQueued.as_str(),
@@ -4712,6 +4777,7 @@ mod tests {
             origin: "worker".to_string(),
             reason: "test terminal".to_string(),
             transcript_file: None,
+            receipt_file: PathBuf::from("receipts.jsonl"),
         };
         set_runtime_terminal_with_mailbox(
             &harness_home,
@@ -4720,7 +4786,6 @@ mod tests {
             "queue-corrupt",
             &terminal,
             2000,
-            Path::new("receipts.jsonl"),
         )
         .unwrap();
         set_runtime_terminal_with_mailbox(
@@ -4730,7 +4795,6 @@ mod tests {
             "queue-healthy",
             &terminal,
             2001,
-            Path::new("receipts.jsonl"),
         )
         .unwrap();
         let corrupt_resumable: i64 = conn
@@ -5099,6 +5163,183 @@ mod tests {
         assert_eq!(queued.len(), 2);
         assert_runtime_route(&queued, "session-sol-child", "gpt-5.6-sol", "max");
         assert_runtime_route(&queued, "session-terra-child", "gpt-5.6-terra", "high");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_worker_reconciliation_uses_committed_cold_history_after_hot_compaction() {
+        let root = temp_root(
+            "runtime_worker_reconciliation_uses_committed_cold_history_after_hot_compaction",
+        );
+        let harness_home = root.join(".agent-harness");
+        let source = root.join("source");
+        let workspace = source.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let mut options = llm_options(
+            &harness_home,
+            &source,
+            &workspace,
+            "history-reconcile",
+            1000,
+        );
+        options.rate_key = None;
+        let job = enqueue_worker_job(options).unwrap().job;
+
+        let dispatched = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("llm".to_string()),
+            worker_id: "history-reconcile-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1001,
+        })
+        .unwrap();
+        assert_eq!(dispatched.status, WorkerRunOnceStatus::Dispatched);
+        let queue_id = runtime_queue_values(&harness_home)[0]["queueId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+        fs::write(
+            &receipts_file,
+            serde_json::json!({
+                "schema": "agent-harness.runtime-run-once.v1",
+                "queueId": queue_id,
+                "traceId": "trace:history-reconcile",
+                "sessionKey": "session-history-reconcile",
+                "status": "completed",
+                "reason": "compacted worker terminal",
+                "runtimeClass": "worker",
+                "origin": "worker",
+                "completedAtMs": 1002
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let compacted = crate::compact_runtime_queue_receipts_if_needed(
+            crate::RuntimeQueueReceiptCompactionOptions {
+                harness_home: harness_home.clone(),
+                max_bytes: 1,
+                max_archives: 1,
+                now_ms: 1003,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            compacted.status,
+            crate::RuntimeQueueReceiptCompactionStatus::Compacted
+        );
+        assert!(
+            !fs::read_to_string(&receipts_file)
+                .unwrap()
+                .contains(&queue_id),
+            "the terminal must be available only from cold history during reconciliation"
+        );
+
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        assert_eq!(
+            reconcile_runtime_queued_jobs(&harness_home, &conn, 1004).unwrap(),
+            1
+        );
+        let (status, result, audit_path): (String, String, String) = conn
+            .query_row(
+                "SELECT status, result_json, audit_path FROM jobs WHERE job_id=?1",
+                params![job.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, WorkerJobStatus::Succeeded.as_str());
+        assert!(result.contains("runtimeQueueId"));
+        assert!(
+            audit_path.ends_with("run-once-receipt-history.sqlite"),
+            "worker audit evidence must point at the cold history source"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_worker_reconciliation_prefers_exact_hot_index_terminal_over_cold_history() {
+        let root = temp_root(
+            "runtime_worker_reconciliation_prefers_exact_hot_index_terminal_over_cold_history",
+        );
+        let harness_home = root.join(".agent-harness");
+        let source = root.join("source");
+        let workspace = source.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let mut options = llm_options(&harness_home, &source, &workspace, "hot-reconcile", 1000);
+        options.rate_key = None;
+        let job = enqueue_worker_job(options).unwrap().job;
+
+        let dispatched = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("llm".to_string()),
+            worker_id: "hot-reconcile-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1001,
+        })
+        .unwrap();
+        assert_eq!(dispatched.status, WorkerRunOnceStatus::Dispatched);
+        let queue_id = runtime_queue_values(&harness_home)[0]["queueId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+        fs::write(
+            &receipts_file,
+            serde_json::json!({
+                "schema": "agent-harness.runtime-run-once.v1",
+                "queueId": queue_id.clone(),
+                "status": "completed",
+                "reason": "newer hot completion",
+                "runtimeClass": "worker",
+                "origin": "worker",
+                "completedAtMs": 1002
+            })
+            .to_string(),
+        )
+        .unwrap();
+        crate::runtime_worker::rebuild_runtime_queue_state_index(&queue_dir, &mut Vec::new())
+            .unwrap();
+        let staged = crate::runtime_receipt_history::stage_runtime_queue_receipt_history(
+            &queue_dir,
+            "worker-hot-wins",
+            serde_json::json!({
+                "queueId": queue_id,
+                "status": "failed-terminal",
+                "reason": "older cold failure",
+                "runtimeClass": "worker",
+                "origin": "worker"
+            })
+            .to_string()
+            .as_bytes(),
+            b"",
+            &std::collections::HashSet::new(),
+            100,
+        )
+        .unwrap();
+        crate::runtime_receipt_history::commit_runtime_queue_receipt_history(&staged, 101).unwrap();
+
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        assert_eq!(
+            reconcile_runtime_queued_jobs(&harness_home, &conn, 1004).unwrap(),
+            1
+        );
+        let (status, audit_path): (String, String) = conn
+            .query_row(
+                "SELECT status, audit_path FROM jobs WHERE job_id=?1",
+                params![job.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, WorkerJobStatus::Succeeded.as_str());
+        assert!(
+            audit_path.ends_with("queue-state-index.json"),
+            "the newer hot terminal must be materialized from the exact hot index"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -5881,6 +6122,84 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn exhausted_pending_cron_worker_terminalizes_linked_cron_run_without_spawn() {
+        let root = temp_root("exhausted_pending_cron_worker_terminalizes_linked_cron_run");
+        let harness_home = root.join(".agent-harness");
+        let script_dir = harness_home.join("state").join("workers").join("scripts");
+        fs::create_dir_all(&script_dir).unwrap();
+        let marker = script_dir.join("unexpected-cron-run.txt");
+        let script = write_marker_script(&script_dir, &marker);
+        let cron_run = crate::admit_cron_run(crate::CronRunAdmitOptions {
+            harness_home: harness_home.clone(),
+            source_kind: "deterministic-cron".to_string(),
+            source_id: "cron-source-1".to_string(),
+            entry_id: "exhausted-before-lease".to_string(),
+            agent_id: "cron-scheduler".to_string(),
+            scheduled_for_ms: 42,
+            runtime_class: "deterministic-shell".to_string(),
+            session_key: "cron:deterministic:exhausted-before-lease:42".to_string(),
+            session_policy: "one-shot".to_string(),
+            max_attempts: 3,
+            now_ms: 1000,
+        })
+        .unwrap();
+        let mut options = shell_options(&harness_home, "exhausted-cron-before-lease", 1000);
+        options.payload = json!({
+            "scriptPath": script,
+            "cwd": script_dir,
+            "cronRunId": &cron_run.run_id,
+        });
+        options.max_attempts = 3;
+        let enqueued = enqueue_worker_job(options).unwrap();
+        crate::mark_cron_run_worker_enqueued(
+            &harness_home,
+            &cron_run.run_id,
+            &enqueued.job.job_id,
+            1000,
+        )
+        .unwrap();
+
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        conn.execute(
+            "UPDATE jobs SET status='pending', attempt=97, max_attempts=3 WHERE job_id=?1",
+            params![enqueued.job.job_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("shell".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1001,
+        })
+        .unwrap();
+
+        assert_eq!(run.status, WorkerRunOnceStatus::NoWork);
+        assert!(
+            !marker.exists(),
+            "exhausted cron worker unexpectedly ran its script"
+        );
+        let cron_runs = crate::collect_cron_run_summary(&harness_home).unwrap();
+        let updated = cron_runs
+            .runs
+            .iter()
+            .find(|run| run.run_id == cron_run.run_id)
+            .unwrap();
+        assert_eq!(updated.status, crate::CronRunStatus::FailedTerminal);
+        assert!(
+            updated
+                .failure_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("retry attempts exhausted")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(windows)]
     #[test]
     fn deterministic_timeout_terminates_descendant_process_tree() {
@@ -6439,6 +6758,258 @@ mod tests {
         assert!(policy.is_none());
         let status = collect_worker_status(WorkerStatusOptions { harness_home }).unwrap();
         assert_eq!(status.totals.pending, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn coordinator_resume_dispatch_rejects_mismatched_owner_lane_before_append() {
+        let root = temp_root("coordinator_resume_dispatch_rejects_mismatched_owner_lane");
+        let harness_home = root.join(".agent-harness");
+        let source = root.join("source");
+        let workspace = source.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let session_key = "telegram:dm:user:main:root-session:cont-1";
+        let root_session = crate::root_working_session_key(session_key);
+        let owner = crate::worker_result_mailbox::ExactWorkerResultOwnerV1::new(
+            FullLaneKeyV1::new(
+                "telegram",
+                "account-a",
+                "dm",
+                "user",
+                "main",
+                "interactive",
+                &root_session,
+                session_key,
+            )
+            .unwrap(),
+            crate::context_rollover::derive_virtual_session_id(
+                "telegram",
+                "dm",
+                "user",
+                "main",
+                &root_session,
+            ),
+            None,
+            Some("turn:parent-exact".to_string()),
+            "turn:parent-exact",
+            None,
+            None,
+        )
+        .unwrap();
+        let metadata = crate::coordinator_resume::CoordinatorResumeMetadataV1::new(
+            "intent-exact",
+            "wait-exact",
+            "coordinator-resume:intent-exact",
+            owner,
+        )
+        .unwrap();
+        let report = enqueue_worker_job(WorkerEnqueueOptions {
+            harness_home: harness_home.clone(),
+            kind: WorkerJobKind::CoordinatorResume,
+            lane: Some("llm".to_string()),
+            payload: json!({
+                "sourceHome": source,
+                "sourceWorkspace": workspace,
+                "agentId": "main",
+                "sessionKey": session_key,
+                "messageText": "continue the parent task",
+                "runtimeClass": "interactive",
+                "origin": "coordinator-resume",
+                "platform": "discord",
+                "accountId": "account-a",
+                "channelId": "dm",
+                "userId": "user",
+                "coordinatorResume": metadata,
+            }),
+            idempotency_key: Some("coordinator-resume-mismatch".to_string()),
+            parent_job_id: None,
+            job_group_id: Some("group-exact".to_string()),
+            master_agent_id: Some("main".to_string()),
+            master_session_key: Some(session_key.to_string()),
+            wake_policy: None,
+            source: Some("test".to_string()),
+            priority: 0,
+            available_at_ms: Some(1000),
+            max_attempts: 1,
+            timeout_ms: Some(DEFAULT_TIMEOUT_MS),
+            cascade_timeout_ms: None,
+            rate_key: Some("coordinator-resume".to_string()),
+            concurrency_group_key: Some("master:main".to_string()),
+            now_ms: 1000,
+        })
+        .unwrap();
+
+        let result = queue_llm_worker_turn(&harness_home, &report.job, 1001);
+        let pending_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("pending.jsonl");
+        let pending_exists = pending_file.exists();
+        let _ = fs::remove_dir_all(root);
+
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("platform"), "{error}");
+        assert!(
+            !pending_exists,
+            "mismatched coordinator owner must be rejected before appending pending.jsonl"
+        );
+    }
+
+    #[test]
+    fn audit_mailbox_summary_stays_in_durable_coordinator_resume_context() {
+        let root = temp_root("audit_mailbox_summary_stays_in_coordinator_resume_context");
+        let harness_home = root.join(".agent-harness");
+        let source = root.join("source");
+        let workspace = source.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let session_key = "discord:dm:user:main:root-session:cont-1";
+        let root_session = crate::root_working_session_key(session_key);
+        let owner = crate::worker_result_mailbox::ExactWorkerResultOwnerV1::new(
+            FullLaneKeyV1::new(
+                "discord",
+                "account-a",
+                "dm",
+                "user",
+                "main",
+                "interactive",
+                &root_session,
+                session_key,
+            )
+            .unwrap(),
+            crate::context_rollover::derive_virtual_session_id(
+                "discord",
+                "dm",
+                "user",
+                "main",
+                &root_session,
+            ),
+            Some("worker-parent-1".to_string()),
+            Some("parent-queue-1".to_string()),
+            "source-queue-1",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut child_options =
+            llm_options(&harness_home, &source, &workspace, "audit-child", 1000);
+        child_options.job_group_id = Some("group-audit".to_string());
+        let child = enqueue_worker_job(child_options).unwrap().job;
+        let watchdog = enqueue_worker_job(WorkerEnqueueOptions {
+            harness_home: harness_home.clone(),
+            kind: WorkerJobKind::Watchdog,
+            lane: Some("watchdog".to_string()),
+            payload: json!({
+                "sourceHome": source,
+                "sourceWorkspace": workspace,
+                "coordinatorWaitId": "wait-audit",
+            }),
+            idempotency_key: Some("watchdog-audit".to_string()),
+            parent_job_id: None,
+            job_group_id: Some("group-audit".to_string()),
+            master_agent_id: Some("main".to_string()),
+            master_session_key: Some(session_key.to_string()),
+            wake_policy: None,
+            source: Some("test".to_string()),
+            priority: 10,
+            available_at_ms: Some(1000),
+            max_attempts: 3,
+            timeout_ms: Some(DEFAULT_TIMEOUT_MS),
+            cascade_timeout_ms: None,
+            rate_key: None,
+            concurrency_group_key: Some("master:main".to_string()),
+            now_ms: 1000,
+        })
+        .unwrap()
+        .job;
+
+        let conn = Connection::open(worker_db_file(&harness_home)).unwrap();
+        let transaction = conn.unchecked_transaction().unwrap();
+        crate::worker_coordination::persist_waiting_for_children_in_transaction(
+            &transaction,
+            &crate::worker_coordination::WorkerCoordinatorWaitCreateOptionsV1 {
+                wait_id: "wait-audit".to_string(),
+                owner: owner.clone(),
+                child_group_id: "group-audit".to_string(),
+                expected_child_job_ids: vec![child.job_id.clone()],
+                now_ms: 1000,
+            },
+        )
+        .unwrap();
+        insert_terminal_result_in_transaction(
+            &transaction,
+            &WorkerResultMailboxInsertV1 {
+                terminal_event_key: "child-terminal-audit".to_string(),
+                owner: WorkerResultOwnerV1::Exact(owner.clone()),
+                envelope: WorkerResultEnvelopeV1::new(
+                    WorkerResultOutcomeV1::Succeeded,
+                    "Audit complete; sent root. Child evidence is ready for the parent.",
+                    Vec::new(),
+                )
+                .unwrap(),
+                source_worker_job_id: Some(child.job_id.clone()),
+                terminal_at_ms: 1100,
+            },
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+
+        let run = run_durable_coordinator_watchdog(
+            &harness_home,
+            &conn,
+            &watchdog,
+            "group-audit",
+            "all children terminal",
+            &[child],
+            &[json!({"status":"completed"})],
+            1200,
+        )
+        .unwrap();
+        assert_eq!(run.status, WorkerJobStatus::Succeeded);
+
+        let intent_id = run
+            .artifact_refs
+            .as_ref()
+            .and_then(|refs| refs.get("resumeIntentId"))
+            .and_then(Value::as_str)
+            .expect("watchdog must report the coordinator resume intent");
+        let resume = find_job_by_idempotency(&conn, &format!("coordinator-resume:{intent_id}"))
+            .unwrap()
+            .expect("watchdog must schedule one coordinator resume");
+        assert_eq!(resume.kind, WorkerJobKind::CoordinatorResume);
+        assert_eq!(resume.payload["platform"], "discord");
+        assert_eq!(resume.payload["accountId"], "account-a");
+        assert_eq!(resume.payload["agentId"], "main");
+        assert!(
+            !resume.payload["messageText"]
+                .as_str()
+                .unwrap()
+                .contains("Audit complete"),
+            "worker evidence must not become the parent prompt's user-facing final text"
+        );
+        let inbound_context = resume.payload["inboundContext"].as_str().unwrap();
+        assert!(inbound_context.contains("Audit complete; sent root"));
+
+        let queued = queue_llm_worker_turn(&harness_home, &resume, 1201).unwrap();
+        assert_eq!(queued.status, WorkerJobStatus::RuntimeQueued);
+        let pending = runtime_queue_values(&harness_home);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["origin"], "coordinator-resume");
+        assert_eq!(pending[0]["platform"], "discord");
+        assert_eq!(pending[0]["accountId"], "account-a");
+        assert_eq!(pending[0]["agentId"], "main");
+        assert!(
+            pending[0]["inboundContext"]
+                .as_str()
+                .unwrap()
+                .contains("Audit complete; sent root")
+        );
+        assert!(
+            !harness_home.join("state").join("channel-outbox").exists(),
+            "a child audit summary may only reach the coordinator mailbox/context, never outbox"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

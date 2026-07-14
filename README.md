@@ -118,9 +118,9 @@ One binary, `agent-harness`, grouped into clear families:
 | **Channels** | `channel-identity-check`, `channel-receive`, `channel-run-once`, `channel-outbox-plan`, `telegram-probe`, `telegram-loop`, `discord-gateway-loop`, `discord-outbox-send-once`, … | Telegram/Discord ingress, identity binding, permission gating, slash commands, outbox delivery with retry ledgers. |
 | **Runtime & queue** | `queue-enqueue`, `queue-prepare`, `runtime-run-once`, `runtime-loop`, `progress-delivery-loop` | Durable agent-turn queue, bounded-concurrency runtime loop, live progress panels, final-reply tone policy. |
 | **Codex pipeline** | `codex-plan`, `codex-preflight`, `codex-launch-probe`, `codex-run`, `codex-complete`, `prompt-bundle` | Plan → preflight → launch → run → record, each stage inspectable and receipt-backed. |
-| **Workers & scheduling** | `worker-enqueue`, `worker-loop`, `worker-status`, `cron-runs`, `cron-run-control`, `cron-plan`, `cron-scheduler-lint`, `cron-scheduler-run-once`, `cron-scheduler-loop`, `native-cron-enqueue`, `deterministic-cron-plan`, `subagent-plan`, … | SQLite-durable jobs: LLM subagents, native/deterministic cron scheduler ticks, no-LLM deterministic shell jobs, watchdogs, master wakeups, dedicated cron worker/runtime lanes, and cron skip/retry/quarantine controls. |
+| **Workers & scheduling** | `worker-enqueue`, `worker-loop`, `worker-status`, `cron-runs`, `cron-run-control`, `cron-plan`, `cron-scheduler-lint`, `cron-scheduler-run-once`, `cron-scheduler-loop`, `ledger-maintenance-once`, `ledger-maintenance-loop`, `native-cron-enqueue`, `deterministic-cron-plan`, `subagent-plan`, … | SQLite-durable jobs: LLM subagents, native/deterministic cron scheduler ticks, no-LLM deterministic shell jobs, watchdogs, master wakeups, dedicated cron worker/runtime lanes, isolated bounded receipt/history maintenance, and cron skip/retry/quarantine controls. |
 | **Memory** | `memory-hook`, `memory-search`, `memory-vector-search`, `memory-service-status/recall/propose/store`, `memory-read-path-smoke` | OpenClaw-compatible memory hooks, vector recall over imported snapshots, redacted credential/coverage reporting, and read-only memory smoke checks. |
-| **Ops & security** | `status`, `enable-check`, `healthz`, `ops-backup`, `ops-cutover-request/approve/apply/status`, `ops-control`, `supervisor-plan`, `supervisor-run`, `vault-put`/`vault-get`, `public-hygiene`, `invariants`, `schema-registry` | Health, supervisor service registry, telemetry and final-delivery child supervision, live-control cutover tokens, backups, Windows Task Scheduler supervision plans, encrypted vault, release hygiene. |
+| **Ops & security** | `status`, `enable-check`, `healthz`, `ops-backup`, `ops-cutover-request/approve/apply/status`, `ops-control`, `supervisor-plan`, `supervisor-run`, `vault-put`/`vault-get`, `public-hygiene`, `invariants`, `schema-registry` | Health, supervisor service registry, telemetry and final-delivery child supervision, live-control cutover tokens, backups, Windows Task Scheduler supervision plans that preserve enabled configured channel loops, encrypted vault, release hygiene. |
 
 ## Design Principles
 
@@ -132,7 +132,7 @@ One binary, `agent-harness`, grouped into clear families:
 
 ## Project Status
 
-Version **0.8.0** is pre-release and under active development. Interfaces may still change before 1.0; the invariant catalog, schema registry, and scenario matrix define the public verification contracts for each release.
+Version **0.8.0** is the current checkpoint release. The project remains pre-1.0, so interfaces may still change; the invariant catalog, schema registry, and scenario matrix define the public verification contracts for each release.
 
 See the [Changelog](CHANGELOG.md) and the [Roadmap & Backlog](docs/agent-harness-core-roadmap-backlog.md) for what's done, gated, and next.
 

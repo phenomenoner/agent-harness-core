@@ -8,6 +8,11 @@ use serde_json::Value;
 use crate::backend_reasoning::{
     BackendReasoningPolicyV1, BackendReasoningSource, ReasoningPreference,
 };
+use crate::channel_state::{
+    ChannelSessionStateV2MigrationStatus, ChannelStateLane,
+    migrate_legacy_channel_session_state_to_v2, read_channel_session_state_v2,
+};
+use crate::lane::FullLaneKeyV1;
 use crate::{
     AgentOverride, AgentProfile, AgentRegistry, AgentSource, ChannelCommand, ChannelCommandIntent,
     ChannelSessionState, DEFAULT_THINKING_LEVEL, InboundMediaArtifact, PROMPT_FILE_NAMES,
@@ -40,6 +45,10 @@ pub struct TurnPlan {
     pub source_home: PathBuf,
     pub source_workspace: PathBuf,
     pub platform: String,
+    /// `Some` denotes an exact v2 channel/account lane. `None` is retained
+    /// only for legacy callers that deliberately use the v1 channel state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub channel_id: String,
     pub user_id: String,
     pub message_text: String,
@@ -141,7 +150,26 @@ pub fn build_turn_plan(
     skill_index: &SkillIndex,
     input: TurnPlanInput,
 ) -> io::Result<TurnPlan> {
+    build_turn_plan_for_account(source, registry, skill_index, input, None)
+}
+
+/// Builds an interactive turn for an explicit provider account. This is the
+/// only entry point that reads or migrates v2 channel state; the compatibility
+/// wrapper above intentionally retains the legacy, account-less behavior for
+/// older integrations.
+pub fn build_turn_plan_for_account(
+    source: &AgentSource,
+    registry: &AgentRegistry,
+    skill_index: &SkillIndex,
+    input: TurnPlanInput,
+    account_id: Option<String>,
+) -> io::Result<TurnPlan> {
     let mut warnings = Vec::new();
+    // An explicit account turns this into a full-lane operation.  If the
+    // selected agent/lane cannot be derived, do not fall through to the
+    // account-less compatibility state file: that would let one account
+    // inherit another account's session overrides.
+    let account_scope_requested = account_id.is_some();
     let selected_agent = select_agent(registry, input.requested_agent_id.as_deref(), &mut warnings);
     let agent = selected_agent.map(turn_agent);
     let mut model_policy = selected_agent.map(turn_model_policy).unwrap_or_default();
@@ -177,13 +205,48 @@ pub fn build_turn_plan(
     }
 
     let selected_agent_id = agent.as_ref().map(|agent| agent.id.as_str());
-    let channel_state = load_channel_state(
-        input.harness_home.as_deref(),
-        &input.platform,
-        &input.channel_id,
-        &input.user_id,
-        &mut warnings,
-    )
+    let account_lane = match (account_id.as_deref(), selected_agent_id) {
+        (Some(account_id), Some(agent_id)) => {
+            match ChannelStateLane::new(
+                &input.platform,
+                Some(account_id),
+                &input.channel_id,
+                &input.user_id,
+                agent_id,
+            ) {
+                Ok(lane) => Some(lane),
+                Err(error) => {
+                    warnings.push(format!(
+                        "exact channel account lane is invalid; refusing legacy state fallback: {error}"
+                    ));
+                    None
+                }
+            }
+        }
+        (Some(_), None) => {
+            warnings.push(
+                "exact channel account lane could not be built because no agent was selected"
+                    .to_string(),
+            );
+            None
+        }
+        (None, _) => None,
+    };
+    let account_id = account_lane
+        .as_ref()
+        .map(|lane| lane.account_id().to_string());
+    let channel_state = if account_scope_requested && account_lane.is_none() {
+        None
+    } else {
+        load_channel_state_for_turn(
+            input.harness_home.as_deref(),
+            &input.platform,
+            &input.channel_id,
+            &input.user_id,
+            account_lane.as_ref(),
+            &mut warnings,
+        )
+    }
     .and_then(|state| channel_state_for_selected_agent(state, selected_agent_id, &mut warnings));
     if let Some(state) = &channel_state {
         apply_model_override(&mut model_policy, state);
@@ -224,22 +287,52 @@ pub fn build_turn_plan(
         agent_override.as_ref(),
         input.harness_home.as_deref(),
     );
-    let session_key = input
-        .session_hint
-        .clone()
-        .or_else(|| {
-            channel_state
-                .as_ref()
-                .map(|state| state.active_session_key.clone())
-        })
-        .unwrap_or_else(|| {
-            session_key(
-                &input.platform,
-                &input.channel_id,
-                &input.user_id,
-                agent.as_ref().map(|agent| agent.id.as_str()),
-            )
-        });
+    let session_key = if let Some(account_id) = account_id.as_deref() {
+        input
+            .session_hint
+            .clone()
+            .or_else(|| {
+                channel_state
+                    .as_ref()
+                    .map(|state| state.active_session_key.clone())
+            })
+            .map(|session_key| {
+                bind_session_key_to_account(
+                    &session_key,
+                    &input.platform,
+                    account_id,
+                    &input.channel_id,
+                    &input.user_id,
+                    agent.as_ref().map(|agent| agent.id.as_str()),
+                )
+            })
+            .unwrap_or_else(|| {
+                session_key_for_account(
+                    &input.platform,
+                    account_id,
+                    &input.channel_id,
+                    &input.user_id,
+                    agent.as_ref().map(|agent| agent.id.as_str()),
+                )
+            })
+    } else {
+        input
+            .session_hint
+            .clone()
+            .or_else(|| {
+                channel_state
+                    .as_ref()
+                    .map(|state| state.active_session_key.clone())
+            })
+            .unwrap_or_else(|| {
+                session_key(
+                    &input.platform,
+                    &input.channel_id,
+                    &input.user_id,
+                    agent.as_ref().map(|agent| agent.id.as_str()),
+                )
+            })
+    };
 
     let (prompt_workspace, prompt_files) =
         prompt_files_for_selected_agent(source, selected_agent, &mut warnings)?;
@@ -295,6 +388,7 @@ pub fn build_turn_plan(
         source_home: source.home.clone(),
         source_workspace: prompt_workspace,
         platform: input.platform,
+        account_id,
         channel_id: input.channel_id,
         user_id: input.user_id,
         message_text: input.text,
@@ -557,14 +651,65 @@ fn turn_model_policy(agent: &AgentProfile) -> TurnModelPolicy {
     }
 }
 
-fn load_channel_state(
+fn load_channel_state_for_turn(
     harness_home: Option<&Path>,
     platform: &str,
     channel_id: &str,
     user_id: &str,
+    exact_lane: Option<&ChannelStateLane>,
     warnings: &mut Vec<String>,
 ) -> Option<ChannelSessionState> {
     let harness_home = harness_home?;
+    if let Some(exact_lane) = exact_lane {
+        match read_channel_session_state_v2(harness_home, exact_lane) {
+            Ok(Some(state)) => return Some(state),
+            Ok(None) => {
+                match migrate_legacy_channel_session_state_to_v2(harness_home, exact_lane) {
+                    Ok(report) => {
+                        if let Some(state) = report.state {
+                            if report.status
+                            == ChannelSessionStateV2MigrationStatus::MigratedLegacyDefaultAccount
+                        {
+                            warnings.push(format!(
+                                "migrated exact default-account channel state into v2 lane for agent `{}`",
+                                exact_lane.agent_id()
+                            ));
+                        }
+                            return Some(state);
+                        }
+                        if !matches!(
+                            report.status,
+                            ChannelSessionStateV2MigrationStatus::LegacyStateMissing
+                        ) {
+                            warnings.push(format!(
+                            "legacy channel state was not used for exact v2 lane `{}` / `{}`: {:?}",
+                            exact_lane.account_id(),
+                            exact_lane.agent_id(),
+                            report.status
+                        ));
+                        }
+                        return None;
+                    }
+                    Err(error) => {
+                        warnings.push(format!(
+                            "exact channel session state could not be read or migrated from {}: {}",
+                            harness_home.display(),
+                            error
+                        ));
+                        return None;
+                    }
+                }
+            }
+            Err(error) => {
+                warnings.push(format!(
+                    "exact channel session state could not be read from {}: {}",
+                    harness_home.display(),
+                    error
+                ));
+                return None;
+            }
+        }
+    }
     match read_channel_session_state(harness_home, platform, channel_id, user_id) {
         Ok(state) => state,
         Err(error) => {
@@ -698,10 +843,12 @@ mod reasoning_override_precedence_tests {
         let state = ChannelSessionState {
             schema: "agent-harness.channel-session.v1".to_string(),
             platform: "telegram".to_string(),
+            account_id: None,
             channel_id: "dm".to_string(),
             user_id: "user".to_string(),
             active_session_key: "telegram:dm:user:main".to_string(),
             agent_id: Some("main".to_string()),
+            config_revision: None,
             provider: None,
             model: None,
             session_topic: None,
@@ -901,6 +1048,59 @@ fn session_key(platform: &str, channel_id: &str, user_id: &str, agent_id: Option
         normalize_key_part(user_id),
         normalize_key_part(agent_id.unwrap_or("unassigned"))
     )
+}
+
+pub(crate) fn session_key_for_account(
+    platform: &str,
+    account_id: &str,
+    channel_id: &str,
+    user_id: &str,
+    agent_id: Option<&str>,
+) -> String {
+    let base = session_key(platform, channel_id, user_id, agent_id);
+    bind_session_key_to_account(&base, platform, account_id, channel_id, user_id, agent_id)
+}
+
+pub(crate) fn bind_session_key_to_account(
+    session_key: &str,
+    platform: &str,
+    account_id: &str,
+    channel_id: &str,
+    user_id: &str,
+    agent_id: Option<&str>,
+) -> String {
+    let suffix = account_session_suffix(platform, account_id, channel_id, user_id, agent_id);
+    let suffix_with_separator = format!(":{suffix}");
+    if session_key.ends_with(&suffix_with_separator) {
+        session_key.to_string()
+    } else {
+        format!("{session_key}{suffix_with_separator}")
+    }
+}
+
+fn account_session_suffix(
+    platform: &str,
+    account_id: &str,
+    channel_id: &str,
+    user_id: &str,
+    agent_id: Option<&str>,
+) -> String {
+    let fallback = format!("acct-{}", normalize_key_part(account_id));
+    let Ok(lane) = FullLaneKeyV1::new(
+        platform,
+        account_id,
+        channel_id,
+        user_id,
+        agent_id.unwrap_or("unassigned"),
+        "interactive",
+        "channel-session",
+        "channel-session",
+    ) else {
+        return fallback;
+    };
+    lane.identity_hash()
+        .map(|identity_hash| format!("acct-{identity_hash}"))
+        .unwrap_or(fallback)
 }
 
 fn normalize_key_part(value: &str) -> String {

@@ -1,9 +1,14 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 
 use serde::Serialize;
 use serde_json::Value;
+
+use crate::runtime_receipt_history::{
+    find_runtime_queue_terminal_history, runtime_queue_receipt_history_file,
+};
 
 const TRACE_REPORT_SCHEMA: &str = "agent-harness.trace.v1";
 
@@ -47,6 +52,34 @@ pub fn trace_harness_event(options: TraceOptions) -> io::Result<TraceReport> {
             Err(error) => diagnostics.push(format!("{}: {error}", source.display())),
         }
     }
+    let queue_dir = options.harness_home.join("state").join("runtime-queue");
+    let history_identifiers = trace_history_identifiers(&options.id, &records);
+    match find_runtime_queue_terminal_history(&queue_dir, &history_identifiers) {
+        Ok(history) => {
+            let history_file = runtime_queue_receipt_history_file(&queue_dir);
+            for historical in history {
+                let summary = historical.reason.unwrap_or_else(|| {
+                    format!(
+                        "historical terminal runtime receipt with status `{}`",
+                        historical.status
+                    )
+                });
+                records.push(TraceRecord {
+                    source: history_file.clone(),
+                    line_number: usize::try_from(historical.row_id).unwrap_or(usize::MAX),
+                    trace_id: historical.trace_id,
+                    queue_id: Some(historical.queue_id),
+                    status: Some(historical.status),
+                    event: Some("runtime-receipt-history".to_string()),
+                    summary: summary.chars().take(240).collect(),
+                });
+            }
+        }
+        Err(error) => diagnostics.push(format!(
+            "{}: {error}",
+            runtime_queue_receipt_history_file(&queue_dir).display()
+        )),
+    }
     records.sort_by(|left, right| {
         left.source
             .cmp(&right.source)
@@ -69,6 +102,7 @@ pub fn trace_harness_event(options: TraceOptions) -> io::Result<TraceReport> {
                     | "timeout"
                     | "skipped"
                     | "canceled"
+                    | "suppressed"
             )
         })
     });
@@ -83,6 +117,30 @@ pub fn trace_harness_event(options: TraceOptions) -> io::Result<TraceReport> {
         diagnostics,
         terminal,
     })
+}
+
+fn trace_history_identifiers(id: &str, records: &[TraceRecord]) -> BTreeSet<String> {
+    let mut identifiers = BTreeSet::new();
+    if !id.trim().is_empty() {
+        identifiers.insert(id.to_string());
+    }
+    for record in records {
+        if let Some(trace_id) = record
+            .trace_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            identifiers.insert(trace_id.to_string());
+        }
+        if let Some(queue_id) = record
+            .queue_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            identifiers.insert(queue_id.to_string());
+        }
+    }
+    identifiers
 }
 
 fn trace_sources(harness_home: &std::path::Path) -> Vec<PathBuf> {
@@ -174,6 +232,7 @@ fn string_path(value: &Value, keys: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -234,6 +293,51 @@ mod tests {
         assert_eq!(report.records.len(), 1);
         assert!(report.terminal);
         assert!(report.diagnostics.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn trace_reads_committed_terminal_history_without_scanning_raw_archives() {
+        let root =
+            temp_root("trace_reads_committed_terminal_history_without_scanning_raw_archives");
+        let harness_home = root.join(".agent-harness");
+        let queue = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue).unwrap();
+        let staged = crate::runtime_receipt_history::stage_runtime_queue_receipt_history(
+            &queue,
+            "trace-history",
+            br#"{"queueId":"queue-history","traceId":"trace-history","sessionKey":"session-history","status":"completed","reason":"historical completion","runtimeClass":"interactive","origin":"channel","completedAtMs":42}
+"#,
+            b"",
+            &HashSet::new(),
+            100,
+        )
+        .unwrap();
+        crate::runtime_receipt_history::commit_runtime_queue_receipt_history(&staged, 101).unwrap();
+        let archive_dir = queue.join("run-once-receipts-archive");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(
+            archive_dir.join("run-once-receipts-old.jsonl"),
+            r#"{"queueId":"queue-history","traceId":"trace-history","status":"failed-terminal","reason":"archive must not be scanned"}
+"#,
+        )
+        .unwrap();
+
+        let report = trace_harness_event(TraceOptions {
+            harness_home,
+            id: "trace-history".to_string(),
+        })
+        .unwrap();
+
+        assert!(report.terminal, "{report:#?}");
+        assert_eq!(report.records.len(), 1, "{report:#?}");
+        assert_eq!(report.records[0].queue_id.as_deref(), Some("queue-history"));
+        assert_eq!(report.records[0].trace_id.as_deref(), Some("trace-history"));
+        assert_eq!(
+            report.records[0].source,
+            crate::runtime_receipt_history::runtime_queue_receipt_history_file(&queue)
+        );
 
         let _ = fs::remove_dir_all(root);
     }
