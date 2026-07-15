@@ -615,7 +615,8 @@ pub use skill_synthesis::{
 };
 pub use skill_usage::{
     SkillUsageAction, SkillUsageEventOptions, SkillUsageProvenance, SkillUsageRecord,
-    SkillUsageReport, SkillUsageSnapshot, collect_skill_usage_snapshot, record_skill_usage_event,
+    SkillUsageReport, SkillUsageSnapshot, collect_skill_usage_snapshot,
+    collect_skill_usage_snapshot_for_agent, record_skill_usage_event,
     record_skill_usage_from_prompt_bundle, skill_usage_events_file, skill_usage_snapshot_file,
 };
 pub use skill_view::{SkillViewOptions, SkillViewReport, view_skill};

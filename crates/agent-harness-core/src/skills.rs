@@ -14,7 +14,7 @@ use crate::{
 const SKILL_INDEX_SCHEMA: &str = "agent-harness.skill-index.v1";
 pub const SKILL_SELECTION_RECEIPT_SCHEMA: &str = "agent-harness.skill-selection.v1";
 pub const SKILL_MATCHER_NAME: &str = "agent-harness-skill-matcher";
-pub const SKILL_MATCHER_VERSION: &str = "v3";
+pub const SKILL_MATCHER_VERSION: &str = "v4";
 pub const SKILL_MATCHER_TOKENIZER: &str = "mixed-v1";
 const IMPORTED_SKILL_NAMESPACE: &str = "legacy-imports";
 const OPENCLAW_IMPORTED_SKILL_NAMESPACE: &str = "openclaw-imports";
@@ -117,6 +117,8 @@ pub struct SkillRecord {
 #[serde(rename_all = "camelCase")]
 pub struct SkillFrontmatter {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub triggers: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<String>,
@@ -133,6 +135,12 @@ pub struct SkillFrontmatter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_mode: Option<SkillDeliveryMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_invocable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_model_invocation: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
@@ -142,6 +150,17 @@ pub struct SkillFrontmatter {
     pub author: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related_skills: Vec<String>,
+}
+
+impl SkillFrontmatter {
+    fn is_retired(&self) -> bool {
+        self.lifecycle.as_deref().is_some_and(|lifecycle| {
+            matches!(
+                normalize_frontmatter_key(lifecycle).as_str(),
+                "retired" | "retired_historical"
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,6 +380,11 @@ pub fn select_skills(index: &SkillIndex, query: &SkillSelectionQuery) -> Vec<Ski
             .as_ref()
             .filter(|invocation| skill_id_matches(skill, &invocation.skill_id));
         if explicit.is_some() && explicit_match.is_none() {
+            continue;
+        }
+        if selection_eligibility_blocker(skill, explicit_match.is_some(), query.agent_id.as_deref())
+            .is_some()
+        {
             continue;
         }
         let Some((score, score_components, reasons)) =
@@ -656,6 +680,7 @@ fn parse_skill_frontmatter(body: &str) -> SkillFrontmatter {
     tags.sort();
     tags.dedup();
     SkillFrontmatter {
+        agents: frontmatter_values(body, &["agents", "agentIds", "agent_ids"]),
         triggers: frontmatter_values(body, &["triggers", "trigger"]),
         conditions: frontmatter_values(body, &["conditions", "condition"]),
         platforms: frontmatter_values(body, &["platforms", "platform"]),
@@ -668,6 +693,19 @@ fn parse_skill_frontmatter(body: &str) -> SkillFrontmatter {
         channels: frontmatter_values(body, &["channels", "channel"]),
         delivery_mode: frontmatter_value(body, &["deliveryMode", "delivery_mode"])
             .and_then(|value| parse_delivery_mode(&value)),
+        user_invocable: frontmatter_bool(
+            body,
+            &["userInvocable", "user_invocable", "user-invocable"],
+        ),
+        disable_model_invocation: frontmatter_bool(
+            body,
+            &[
+                "disableModelInvocation",
+                "disable_model_invocation",
+                "disable-model-invocation",
+            ],
+        ),
+        lifecycle: frontmatter_value(body, &["lifecycle"]),
         category: frontmatter_value(body, &["category"]).or_else(|| {
             frontmatter_nested_value(body, &["metadata", "agent_harness"], &["category"])
         }),
@@ -703,6 +741,15 @@ fn frontmatter_value(body: &str, keys: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+fn frontmatter_bool(body: &str, keys: &[&str]) -> Option<bool> {
+    let value = frontmatter_value(body, keys)?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 fn frontmatter_values(body: &str, keys: &[&str]) -> Vec<String> {
@@ -1318,6 +1365,34 @@ fn frontmatter_gate_blocker(
         )
     {
         return Some("required toolsets are not available".to_string());
+    }
+    None
+}
+
+fn selection_eligibility_blocker(
+    skill: &SkillRecord,
+    explicit_invocation: bool,
+    agent_id: Option<&str>,
+) -> Option<&'static str> {
+    if skill.frontmatter.is_retired() {
+        return Some("skill lifecycle is retired");
+    }
+    if !skill.frontmatter.agents.is_empty()
+        && !agent_id.is_some_and(|agent_id| {
+            skill
+                .frontmatter
+                .agents
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(agent_id))
+        })
+    {
+        return Some("skill agent allowlist does not include selected agent");
+    }
+    if explicit_invocation && skill.frontmatter.user_invocable == Some(false) {
+        return Some("skill disables user invocation");
+    }
+    if !explicit_invocation && skill.frontmatter.disable_model_invocation == Some(true) {
+        return Some("skill disables model invocation");
     }
     None
 }
@@ -1973,6 +2048,146 @@ mod tests {
         let receipts = fs::read_to_string(skill_selection_receipts_file(&home)).unwrap();
         assert!(receipts.contains(SKILL_SELECTION_RECEIPT_SCHEMA));
         assert!(receipts.contains("telegram-media"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_selection_honors_retirement_and_invocation_controls() {
+        let root = temp_root("skill_selection_honors_retirement_and_invocation_controls");
+        let home = root.join(".openclaw");
+        let workspace = home.join("workspace");
+        let retired = workspace.join("skills").join("retired-skill");
+        let historical = workspace.join("skills").join("retired-historical-skill");
+        let model_disabled = workspace.join("skills").join("model-disabled-skill");
+        let user_disabled = workspace.join("skills").join("user-disabled-skill");
+        let active = workspace.join("skills").join("active-skill");
+        for skill in [
+            &retired,
+            &historical,
+            &model_disabled,
+            &user_disabled,
+            &active,
+        ] {
+            fs::create_dir_all(skill).unwrap();
+        }
+        fs::write(
+            retired.join(SKILL_FILE_NAME),
+            "---\nlifecycle: retired\n---\n# Retired Skill\n\nHandle lifecycle policy regression checks.\n",
+        )
+        .unwrap();
+        fs::write(
+            historical.join(SKILL_FILE_NAME),
+            "---\nlifecycle: retired_historical\n---\n# Retired Historical Skill\n\nHandle lifecycle policy regression checks.\n",
+        )
+        .unwrap();
+        fs::write(
+            model_disabled.join(SKILL_FILE_NAME),
+            "---\ndisable-model-invocation: true\n---\n# Model Disabled Skill\n\nHandle lifecycle policy regression checks.\n",
+        )
+        .unwrap();
+        fs::write(
+            user_disabled.join(SKILL_FILE_NAME),
+            "---\nuser-invocable: false\n---\n# User Disabled Skill\n\nHandle lifecycle policy regression checks.\n",
+        )
+        .unwrap();
+        fs::write(
+            active.join(SKILL_FILE_NAME),
+            "# Active Skill\n\nHandle lifecycle policy regression checks.\n",
+        )
+        .unwrap();
+
+        let index =
+            build_source_skill_index(&AgentSource::with_workspace(&home, &workspace)).unwrap();
+        let select = |text: &str| {
+            select_skills(
+                &index,
+                &SkillSelectionQuery {
+                    text: text.to_string(),
+                    agent_id: None,
+                    channel: None,
+                    workspace: None,
+                    agent_mode: None,
+                    available_tools: Vec::new(),
+                    available_toolsets: Vec::new(),
+                    fts_enabled: false,
+                    vector_tie_break_enabled: false,
+                    usage_snapshot: None,
+                    usage_prior_enabled: false,
+                    limit: 10,
+                },
+            )
+        };
+
+        let automatic_ids = select("handle lifecycle policy regression checks")
+            .into_iter()
+            .map(|selection| selection.skill_id)
+            .collect::<Vec<_>>();
+        assert!(automatic_ids.contains(&"workspace:active-skill".to_string()));
+        assert!(automatic_ids.contains(&"workspace:user-disabled-skill".to_string()));
+        assert!(!automatic_ids.contains(&"workspace:retired-skill".to_string()));
+        assert!(!automatic_ids.contains(&"workspace:retired-historical-skill".to_string()));
+        assert!(!automatic_ids.contains(&"workspace:model-disabled-skill".to_string()));
+
+        assert!(select("$retired-skill run it").is_empty());
+        assert!(select("$retired-historical-skill run it").is_empty());
+        assert!(select("$user-disabled-skill run it").is_empty());
+
+        let explicit = select("$model-disabled-skill run it");
+        assert_eq!(explicit.len(), 1);
+        assert_eq!(explicit[0].skill_id, "workspace:model-disabled-skill");
+        assert_eq!(
+            explicit[0].delivery_mode,
+            SkillDeliveryMode::InvocationEnvelope
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_selection_agent_allowlist_is_fail_closed_for_model_and_explicit_invocation() {
+        let root = temp_root("skill_selection_agent_allowlist_is_fail_closed");
+        let home = root.join(".openclaw");
+        let workspace = home.join("workspace");
+        let skill = workspace.join("skills").join("xiaoxiaoli-coach");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join(SKILL_FILE_NAME),
+            "---\nagents: [xiaoxiaoli]\n---\n# Xiaoxiaoli Coach\n\nHandle cross agent coaching.\n",
+        )
+        .unwrap();
+        let index =
+            build_source_skill_index(&AgentSource::with_workspace(&home, &workspace)).unwrap();
+        let select = |agent_id: &str, text: &str| {
+            select_skills(
+                &index,
+                &SkillSelectionQuery {
+                    text: text.to_string(),
+                    agent_id: Some(agent_id.to_string()),
+                    channel: None,
+                    workspace: None,
+                    agent_mode: None,
+                    available_tools: Vec::new(),
+                    available_toolsets: Vec::new(),
+                    fts_enabled: false,
+                    vector_tie_break_enabled: false,
+                    usage_snapshot: None,
+                    usage_prior_enabled: false,
+                    limit: 10,
+                },
+            )
+        };
+
+        assert!(select("main", "handle cross agent coaching").is_empty());
+        assert!(select("main", "$xiaoxiaoli-coach run it").is_empty());
+        assert_eq!(
+            select("xiaoxiaoli", "handle cross agent coaching")[0].skill_id,
+            "workspace:xiaoxiaoli-coach"
+        );
+        assert_eq!(
+            select("xiaoxiaoli", "$xiaoxiaoli-coach run it")[0].delivery_mode,
+            SkillDeliveryMode::InvocationEnvelope
+        );
 
         let _ = fs::remove_dir_all(root);
     }

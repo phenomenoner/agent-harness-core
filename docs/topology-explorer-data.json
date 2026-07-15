@@ -4,7 +4,7 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "2706b6a4a0e595be546ee52d72670df7be5dfac6cd5fa4b6ba418da725edc255"
+      "sha256": "5d94cfba887ecaad3cc9bb7446a630b8c8d30b316f90f618a056c50e21d38626"
     }
   ],
   "syncCommand": "python tools/generate_topology_explorer.py",
@@ -99,10 +99,10 @@
       "label": "prompt / turns",
       "group": "component",
       "state": "implemented",
-      "summary": "exact-full-lane, agent-scoped prompt bundle, eight-file OpenClaw-style per-agent config manifest, selected skill context, and backend-generation reinjection",
-      "reads": "registry, agent workspace/config files including static MEMORY.md, dynamic per-agent memory recall, channel state, artifact summaries, full lane, backend context generation",
-      "writes": "prompt bundle, prompt manifest, and lane-scoped injection ledger",
-      "invariants": "I8, I11",
+      "summary": "exact-full-lane, agent-scoped prompt bundle, eight-file OpenClaw-style per-agent config manifest, agent-scoped skill source/usage-prior selection, and backend-generation reinjection",
+      "reads": "registry, selected agent home/workspace and shared allowlisted skill namespaces, agent workspace/config files including static MEMORY.md, dynamic per-agent memory recall, channel state, artifact summaries, full lane, backend context generation",
+      "writes": "prompt bundle, prompt manifest, skill-selection receipt, and lane-scoped injection ledger",
+      "invariants": "I8, I11, I20",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -712,9 +712,9 @@
       "group": "gap",
       "state": "open-gap",
       "summary": "Skill ecosystem closed loop",
-      "designTarget": "Skills should behave as runtime state with deterministic discovery/selection, guarded prompt exposure, proposal-mediated mutation, first-class autonomous review/apply, reversible lifecycle curation, checksum-locked packs, and aggregate health evidence.",
-      "currentEvidence": "Staging adds matcher v3 with mixed CJK tokenizer, category/tag/usage scoring, catalog retrieval, skill-view, skill-lint, skill-guard, reversible curator archive/restore/pin, file-based skill packs, skill-synthesize with autonomous apply by default, skill-apply --autonomous, skill-doctor, schema entries, and invariant I20. Direct writes remain forbidden; autonomous apply still uses proposal ids, checksum validation, target locks, backups, lint/guard decisions, and receipts.",
-      "promotionGate": "Promote only after focused tests plus the staging closed-loop replay prove CJK selection, no-skill complex turn synthesis, autonomous review/apply, re-selection of the created skill, pack export/import/remove round-trip, curator dry-run, skill-doctor --json, public/private hygiene, and no live cutover until explicit operator approval.",
+      "designTarget": "Skills should behave as runtime state with deterministic per-agent discovery/selection, guarded prompt exposure, proposal-mediated mutation, first-class autonomous review/apply, reversible lifecycle curation, checksum-locked packs, and aggregate health evidence.",
+      "currentEvidence": "Staging adds matcher v4 with mixed CJK tokenizer, category/tag scoring, exact-agent usage priors, per-agent source roots, hard agents allowlists, lifecycle and explicit/model invocation gates, catalog retrieval, skill-view, skill-lint, skill-guard, reversible curator archive/restore/pin, file-based skill packs, skill-synthesize with autonomous apply by default, skill-apply --autonomous, skill-doctor, schema entries, and invariants I8/I20. lifecycle: retired / retired_historical and a non-matching agents allowlist cannot reach prompt selection; disabled model/user invocation remains independently enforceable. Direct writes remain forbidden; autonomous apply still uses proposal ids, checksum validation, target locks, backups, lint/guard decisions, and receipts.",
+      "promotionGate": "Promote only after focused tests plus the staging closed-loop replay prove CJK selection, retired/disabled/agent frontmatter gates, a main/non-main/third-agent source and usage-prior isolation matrix, no-skill complex turn synthesis, autonomous review/apply, re-selection of the created skill, pack export/import/remove round-trip, curator dry-run, skill-doctor --json, public/private hygiene, and no live cutover until explicit operator approval.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]

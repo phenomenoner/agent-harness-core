@@ -94,8 +94,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I8",
-            statement: "agent identity and /new task boundaries are routing boundaries across channel state, session freshness, prompt, runtime, outbox, delivery, and memory namespaces",
-            owner: "channel_state/runtime_pipeline/prompt/memory",
+            statement: "agent identity and /new task boundaries are routing boundaries across channel state, session freshness, prompt, skill source/eligibility/usage priors, runtime, outbox, delivery, and memory namespaces",
+            owner: "channel_state/runtime_pipeline/prompt/turns/skills/skill_usage/memory",
         },
         InvariantEntry {
             id: "I9",
@@ -154,8 +154,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I20",
-            statement: "skill ecosystem mutation is proposal-mediated but autonomous review/apply is a first-class path; lint/guard gates run before prompt exposure or apply, archive is reversible move-not-delete, and selection/view/apply decisions leave receipts",
-            owner: "skills/skill_apply/skill_guard/skill_lint/skill_curator/prompt",
+            statement: "skill ecosystem mutation is proposal-mediated but autonomous review/apply is a first-class path; selection is agent-scoped across source roots, hard allowlists, and usage priors; lint/guard gates run before prompt exposure or apply; archive is reversible move-not-delete; and selection/view/apply decisions leave receipts",
+            owner: "skills/skill_usage/turns/skill_apply/skill_guard/skill_lint/skill_curator/prompt",
         },
         InvariantEntry {
             id: "I21",
@@ -525,7 +525,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.skill-selection.v1",
             owner_module: "skills",
-            compatibility: "append-only selection receipts; matcherVersion=v3/tokenizer=mixed-v1 and additive skill catalog fields remain v1-compatible",
+            compatibility: "append-only selection receipts; matcherVersion=v4/tokenizer=mixed-v1 records lifecycle and invocation-policy filtering while additive skill catalog fields remain v1-compatible",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.prompt-injection-ledger.v2",
@@ -1078,6 +1078,9 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
             ],
             runnable_tests: vec![
                 "turns::tests::prompt_file_aliases_are_fallback_only_and_conflicts_are_deterministic",
+                "turns::tests::multi_agent_skill_matrix_isolates_workspaces_allowlists_and_usage_priors",
+                "skills::tests::skill_selection_agent_allowlist_is_fail_closed_for_model_and_explicit_invocation",
+                "skill_usage::tests::skill_usage_snapshot_for_agent_excludes_other_agent_events",
                 "prompt::tests::prompt_manifest_tracks_generation_reinjection_and_delete_tombstone",
                 "prompt::tests::prompt_ledger_exact_lane_digest_separates_account_runtime_and_root_axes",
                 "prompt::tests::operation_plan_prompt_exact_lane_requires_matching_digest_without_legacy_fallback",
@@ -1346,7 +1349,7 @@ pub fn release_checklist() -> ReleaseChecklist {
             "scenario matrix gate reviewed for changed components",
             "CHANGELOG.md updated",
             "docs/skills/help stale guidance review completed",
-            "skill ecosystem changes passed selection, autonomous synthesis/apply, lint, guard, lifecycle, pack, doctor, and closed-loop scenario gates",
+            "skill ecosystem changes passed per-agent source/allowlist/usage-prior isolation, selection, autonomous synthesis/apply, lint, guard, lifecycle, pack, doctor, and closed-loop scenario gates",
             "topology contract impact matrix reviewed for changed modules",
             "channel/runtime changes passed the agent-boundary scenario matrix",
             "runtime terminal-control changes passed sticky terminal, suppression idempotency, final progress surface silence, lease reconcile, prepared-terminalization, retry-fresh-id, and live ghost-queue replay checks",

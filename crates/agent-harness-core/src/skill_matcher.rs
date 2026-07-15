@@ -9,7 +9,7 @@ pub struct SkillMatcherInfo {
     pub version: &'static str,
     pub tokenizer: &'static str,
     pub vector_enabled_by_default: bool,
-    pub stages: [&'static str; 3],
+    pub stages: [&'static str; 4],
 }
 
 pub fn skill_matcher_info() -> SkillMatcherInfo {
@@ -20,6 +20,7 @@ pub fn skill_matcher_info() -> SkillMatcherInfo {
         vector_enabled_by_default: false,
         stages: [
             "explicit-invocation-or-skill-id",
+            "agent-lifecycle-and-invocation-policy",
             "frontmatter-triggers-and-gates",
             "weighted-lexical-score",
         ],
@@ -40,12 +41,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn skill_matcher_info_exposes_v3_mixed_tokenizer_defaults() {
+    fn skill_matcher_info_exposes_v4_mixed_tokenizer_defaults() {
         let info = skill_matcher_info();
-        assert_eq!(info.version, "v3");
+        assert_eq!(info.version, "v4");
         assert_eq!(info.tokenizer, "mixed-v1");
         assert!(!info.vector_enabled_by_default);
         assert_eq!(info.stages[0], "explicit-invocation-or-skill-id");
+        assert_eq!(info.stages[1], "agent-lifecycle-and-invocation-policy");
     }
 
     #[test]

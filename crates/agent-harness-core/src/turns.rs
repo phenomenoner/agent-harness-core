@@ -16,7 +16,8 @@ use crate::lane::FullLaneKeyV1;
 use crate::{
     AgentOverride, AgentProfile, AgentRegistry, AgentSource, ChannelCommand, ChannelCommandIntent,
     ChannelSessionState, DEFAULT_THINKING_LEVEL, InboundMediaArtifact, PROMPT_FILE_NAMES,
-    SkillIndex, SkillSelection, SkillSelectionQuery, collect_skill_usage_snapshot,
+    SkillIndex, SkillSelection, SkillSelectionQuery, build_runtime_skill_index,
+    build_source_skill_index, collect_skill_usage_snapshot_for_agent,
     config::harness_config_candidates, parse_channel_command, read_agent_override,
     read_channel_session_state, select_skills, write_skill_selection_receipt,
 };
@@ -171,6 +172,15 @@ pub fn build_turn_plan_for_account(
     // inherit another account's session overrides.
     let account_scope_requested = account_id.is_some();
     let selected_agent = select_agent(registry, input.requested_agent_id.as_deref(), &mut warnings);
+    let skill_source = skill_source_for_agent(source, selected_agent);
+    let scoped_skill_index = if let Some(harness_home) = input.harness_home.as_ref() {
+        Some(build_runtime_skill_index(&skill_source, harness_home)?)
+    } else if skill_source != *source {
+        Some(build_source_skill_index(&skill_source)?)
+    } else {
+        None
+    };
+    let skill_index = scoped_skill_index.as_ref().unwrap_or(skill_index);
     let agent = selected_agent.map(turn_agent);
     let mut model_policy = selected_agent.map(turn_model_policy).unwrap_or_default();
     let mut thinking_policy = TurnThinkingPolicy::default();
@@ -343,12 +353,14 @@ pub fn build_turn_plan_for_account(
         .map(|harness_home| load_skill_selection_config(harness_home))
         .transpose()?
         .unwrap_or_default();
-    let usage_snapshot = if input.harness_home.is_some() && skill_config.usage_prior_enabled {
-        input
-            .harness_home
-            .as_ref()
-            .map(collect_skill_usage_snapshot)
-            .transpose()?
+    let usage_snapshot = if skill_config.usage_prior_enabled {
+        match (input.harness_home.as_ref(), selected_agent_id) {
+            (Some(harness_home), Some(agent_id)) => Some(collect_skill_usage_snapshot_for_agent(
+                harness_home,
+                agent_id,
+            )?),
+            _ => None,
+        }
     } else {
         None
     };
@@ -1035,6 +1047,19 @@ fn independent_agent_workspace(source: &AgentSource, agent: &AgentProfile) -> Pa
     agent.directory.join("workspace")
 }
 
+fn skill_source_for_agent(source: &AgentSource, agent: Option<&AgentProfile>) -> AgentSource {
+    let Some(agent) = agent else {
+        return source.clone();
+    };
+    if !is_independent_agent(agent) {
+        return source.clone();
+    }
+    AgentSource::with_workspace(
+        agent.directory.clone(),
+        independent_agent_workspace(source, agent),
+    )
+}
+
 fn independent_workspace_value(value: &str) -> Option<&str> {
     let value = value.trim();
     if value.is_empty() { None } else { Some(value) }
@@ -1122,7 +1147,11 @@ fn normalize_key_part(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_source_skill_index, load_agent_registry};
+    use crate::{
+        SkillDeliveryMode, SkillSourceKind, SkillUsageAction, SkillUsageEventOptions,
+        build_runtime_skill_index, build_source_skill_index, load_agent_registry,
+        record_skill_usage_event,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1302,6 +1331,20 @@ mod tests {
             "# Xiaoxiaoli\n\nIndependent prompt.",
         )
         .unwrap();
+        let main_skill = source.workspace.join("skills").join("main-private");
+        let xiaoxiaoli_skill = agent_workspace.join("skills").join("xiaoxiaoli-private");
+        fs::create_dir_all(&main_skill).unwrap();
+        fs::create_dir_all(&xiaoxiaoli_skill).unwrap();
+        fs::write(
+            main_skill.join(crate::SKILL_FILE_NAME),
+            "# Main Private\n\nHandle isolated routing skill.",
+        )
+        .unwrap();
+        fs::write(
+            xiaoxiaoli_skill.join(crate::SKILL_FILE_NAME),
+            "# Xiaoxiaoli Private\n\nHandle isolated routing skill.",
+        )
+        .unwrap();
         let registry = load_agent_registry(&source).unwrap();
         let skills = build_source_skill_index(&source).unwrap();
 
@@ -1314,7 +1357,7 @@ mod tests {
                 platform: "telegram".to_string(),
                 channel_id: "dm".to_string(),
                 user_id: "user".to_string(),
-                text: "hello".to_string(),
+                text: "handle isolated routing skill".to_string(),
                 inbound_context: None,
                 inbound_media_artifacts: Vec::new(),
                 requested_agent_id: Some("xiaoxiaoli".to_string()),
@@ -1335,6 +1378,16 @@ mod tests {
                 .prompt_files
                 .iter()
                 .any(|file| file.path.starts_with(&source.workspace))
+        );
+        assert!(
+            plan.selected_skills
+                .iter()
+                .any(|skill| skill.skill_id == "workspace:xiaoxiaoli-private")
+        );
+        assert!(
+            plan.selected_skills
+                .iter()
+                .all(|skill| skill.skill_id != "workspace:main-private")
         );
 
         let _ = fs::remove_dir_all(root);
@@ -1431,6 +1484,150 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("independent agent `other`"))
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn multi_agent_skill_matrix_isolates_workspaces_allowlists_and_usage_priors() {
+        let root = temp_root("multi_agent_skill_matrix_isolates_skills");
+        let source = write_turn_source(&root);
+        let xiaoxiaoli_workspace = add_directory_agent(&source, "xiaoxiaoli");
+        let other_workspace = source.home.join("agents").join("other").join("workspace");
+
+        let write_skill = |directory: PathBuf, body: &str| {
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join(crate::SKILL_FILE_NAME), body).unwrap();
+        };
+        write_skill(
+            source.workspace.join("skills").join("main-private"),
+            "# Main Private\n\nHandle isolation operations.",
+        );
+        write_skill(
+            xiaoxiaoli_workspace
+                .join("skills")
+                .join("xiaoxiaoli-private"),
+            "# Xiaoxiaoli Private\n\nHandle isolation operations.",
+        );
+        write_skill(
+            other_workspace.join("skills").join("other-private"),
+            "# Other Private\n\nHandle isolation operations.",
+        );
+        let imported_root = source
+            .home
+            .join("skills")
+            .join("openclaw-imports")
+            .join("workspace");
+        write_skill(
+            imported_root.join("shared-ops"),
+            "# Shared Ops\n\nHandle isolation operations.",
+        );
+        write_skill(
+            imported_root.join("xiaoxiaoli-vibe"),
+            "---\nagents: [xiaoxiaoli]\n---\n# Xiaoxiaoli Vibe\n\nHandle isolation operations.",
+        );
+
+        record_skill_usage_event(SkillUsageEventOptions {
+            harness_home: source.home.clone(),
+            action: SkillUsageAction::Injected,
+            skill_id: "imported-workspace:shared-ops".to_string(),
+            source_kind: Some(SkillSourceKind::ImportedWorkspace),
+            source_turn_id: Some("turn-xiaoxiaoli".to_string()),
+            runtime_queue_id: Some("queue-xiaoxiaoli".to_string()),
+            session_key: Some("discord:dm:user:xiaoxiaoli".to_string()),
+            channel: Some("discord".to_string()),
+            agent_id: Some("xiaoxiaoli".to_string()),
+            delivery_mode: Some(SkillDeliveryMode::InjectedBody),
+            body_checksum: None,
+            selection_receipt_id: None,
+            reason: Some("multi-agent isolation regression".to_string()),
+            now_ms: 42,
+        })
+        .unwrap();
+
+        let registry = load_agent_registry(&source).unwrap();
+        let plan_for = |agent_id: &str| {
+            let agent = registry.agents.iter().find(|agent| agent.id == agent_id);
+            let skill_source = skill_source_for_agent(&source, agent);
+            let skill_index = build_runtime_skill_index(&skill_source, &source.home).unwrap();
+            build_turn_plan(
+                &source,
+                &registry,
+                &skill_index,
+                TurnPlanInput {
+                    harness_home: Some(source.home.clone()),
+                    platform: "discord".to_string(),
+                    channel_id: "dm".to_string(),
+                    user_id: "user".to_string(),
+                    text: "handle isolation operations".to_string(),
+                    inbound_context: None,
+                    inbound_media_artifacts: Vec::new(),
+                    requested_agent_id: Some(agent_id.to_string()),
+                    session_hint: None,
+                    skill_limit: 20,
+                },
+            )
+            .unwrap()
+        };
+
+        let main = plan_for("main");
+        let main_ids = main
+            .selected_skills
+            .iter()
+            .map(|skill| skill.skill_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(main_ids.contains(&"workspace:main-private"));
+        assert!(main_ids.contains(&"imported-workspace:shared-ops"));
+        assert!(!main_ids.contains(&"workspace:xiaoxiaoli-private"));
+        assert!(!main_ids.contains(&"workspace:other-private"));
+        assert!(!main_ids.contains(&"imported-workspace:xiaoxiaoli-vibe"));
+        assert!(
+            main.selected_skills
+                .iter()
+                .find(|skill| skill.skill_id == "imported-workspace:shared-ops")
+                .unwrap()
+                .score_components
+                .iter()
+                .all(|component| component.name != "usage-prior")
+        );
+
+        let xiaoxiaoli = plan_for("xiaoxiaoli");
+        let xiaoxiaoli_ids = xiaoxiaoli
+            .selected_skills
+            .iter()
+            .map(|skill| skill.skill_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(xiaoxiaoli_ids.contains(&"workspace:xiaoxiaoli-private"));
+        assert!(xiaoxiaoli_ids.contains(&"imported-workspace:shared-ops"));
+        assert!(xiaoxiaoli_ids.contains(&"imported-workspace:xiaoxiaoli-vibe"));
+        assert!(!xiaoxiaoli_ids.contains(&"workspace:main-private"));
+        assert!(!xiaoxiaoli_ids.contains(&"workspace:other-private"));
+        assert!(
+            xiaoxiaoli
+                .selected_skills
+                .iter()
+                .find(|skill| skill.skill_id == "imported-workspace:shared-ops")
+                .unwrap()
+                .score_components
+                .iter()
+                .any(|component| component.name == "usage-prior")
+        );
+
+        let other = plan_for("other");
+        let other_ids = other
+            .selected_skills
+            .iter()
+            .map(|skill| skill.skill_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(other_ids.contains(&"workspace:other-private"));
+        assert!(other_ids.contains(&"imported-workspace:shared-ops"));
+        assert!(!other_ids.contains(&"workspace:main-private"));
+        assert!(!other_ids.contains(&"workspace:xiaoxiaoli-private"));
+        assert!(!other_ids.contains(&"imported-workspace:xiaoxiaoli-vibe"));
+
+        assert_eq!(main.source_workspace, source.workspace);
+        assert_eq!(xiaoxiaoli.source_workspace, xiaoxiaoli_workspace);
+        assert_eq!(other.source_workspace, other_workspace);
 
         let _ = fs::remove_dir_all(root);
     }

@@ -287,7 +287,20 @@ pub fn record_skill_usage_from_prompt_bundle(
 pub fn collect_skill_usage_snapshot(
     harness_home: impl AsRef<Path>,
 ) -> io::Result<SkillUsageSnapshot> {
-    let harness_home = harness_home.as_ref();
+    collect_skill_usage_snapshot_inner(harness_home.as_ref(), None)
+}
+
+pub fn collect_skill_usage_snapshot_for_agent(
+    harness_home: impl AsRef<Path>,
+    agent_id: &str,
+) -> io::Result<SkillUsageSnapshot> {
+    collect_skill_usage_snapshot_inner(harness_home.as_ref(), Some(agent_id))
+}
+
+fn collect_skill_usage_snapshot_inner(
+    harness_home: &Path,
+    agent_id: Option<&str>,
+) -> io::Result<SkillUsageSnapshot> {
     let events_file = skill_usage_events_file(harness_home);
     let mut snapshot = SkillUsageSnapshot {
         schema: SKILL_USAGE_SNAPSHOT_SCHEMA.to_string(),
@@ -304,6 +317,13 @@ pub fn collect_skill_usage_snapshot(
         let Ok(record) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        if agent_id.is_some_and(|agent_id| {
+            !string_value(&record, "agentId")
+                .as_deref()
+                .is_some_and(|record_agent_id| record_agent_id.eq_ignore_ascii_case(agent_id))
+        }) {
+            continue;
+        }
         let action = delivery_action_from_value(record.get("action"));
         let provenance = provenance_from_value(record.get("provenance"));
         let Some(skill_id) = string_value(&record, "skillId") else {
@@ -536,6 +556,66 @@ mod tests {
         assert_eq!(report.records_appended, 2);
         assert_eq!(report.snapshot.by_action.get("selected"), Some(&1));
         assert_eq!(report.snapshot.by_action.get("invoked"), Some(&1));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_usage_snapshot_for_agent_excludes_other_agent_events() {
+        let root = temp_root("skill_usage_snapshot_for_agent_excludes_other_agent_events");
+        let home = root.join(".openclaw");
+        for (agent_id, skill_id, at_ms) in [
+            ("main", "workspace:main-skill", 41),
+            ("xiaoxiaoli", "workspace:xiaoxiaoli-skill", 42),
+            ("xiaoxiaoli", "imported-workspace:shared-skill", 43),
+        ] {
+            record_skill_usage_event(SkillUsageEventOptions {
+                harness_home: home.clone(),
+                action: SkillUsageAction::Injected,
+                skill_id: skill_id.to_string(),
+                source_kind: Some(SkillSourceKind::Workspace),
+                source_turn_id: None,
+                runtime_queue_id: None,
+                session_key: None,
+                channel: Some("discord".to_string()),
+                agent_id: Some(agent_id.to_string()),
+                delivery_mode: Some(SkillDeliveryMode::InjectedBody),
+                body_checksum: None,
+                selection_receipt_id: None,
+                reason: Some("agent isolation regression".to_string()),
+                now_ms: at_ms,
+            })
+            .unwrap();
+        }
+
+        let main = collect_skill_usage_snapshot_for_agent(&home, "main").unwrap();
+        assert_eq!(main.total_events, 1);
+        assert_eq!(main.latest_at_ms, Some(41));
+        assert!(main.by_skill.contains_key("workspace:main-skill"));
+        assert!(!main.by_skill.contains_key("workspace:xiaoxiaoli-skill"));
+        assert!(
+            !main
+                .by_skill
+                .contains_key("imported-workspace:shared-skill")
+        );
+
+        let xiaoxiaoli = collect_skill_usage_snapshot_for_agent(&home, "xiaoxiaoli").unwrap();
+        assert_eq!(xiaoxiaoli.total_events, 2);
+        assert_eq!(xiaoxiaoli.latest_at_ms, Some(43));
+        assert!(!xiaoxiaoli.by_skill.contains_key("workspace:main-skill"));
+        assert!(
+            xiaoxiaoli
+                .by_skill
+                .contains_key("workspace:xiaoxiaoli-skill")
+        );
+        assert!(
+            xiaoxiaoli
+                .by_skill
+                .contains_key("imported-workspace:shared-skill")
+        );
+
+        let global = collect_skill_usage_snapshot(&home).unwrap();
+        assert_eq!(global.total_events, 3);
 
         let _ = fs::remove_dir_all(root);
     }

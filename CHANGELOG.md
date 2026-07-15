@@ -12,6 +12,8 @@
 
 ### Fixed
 
+- Retired skills can no longer enter prompt selection. Matcher v4 now honors `lifecycle`, `disable-model-invocation`, and `user-invocable` frontmatter controls for automatic and explicit selection.
+- Skill discovery and usage-prior scoring are now agent-scoped. Non-main agents read their own home/workspace skill roots, shared/imported skills may use an `agents` allowlist, and one agent's usage events cannot boost another agent's matcher score.
 - Hardened deterministic cron with per-entry `timeoutMs` and `maxAttempts`, `TZ` / `CRON_TZ`-aware current and catch-up scheduling, calendar day/month fields, and exact crontab source filtering that ignores backup and temporary copies.
 - Exhausted worker jobs are terminalized before lease, and timed-out deterministic jobs terminate their Windows descendant process tree instead of leaving child processes running.
 - Explicitly untrusted runtime receipt schemas are no longer accepted as terminal-history evidence, and stale derived queue indexes rebuild from trusted receipt-ledger evidence.
