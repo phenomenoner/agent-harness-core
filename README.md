@@ -7,7 +7,7 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](rust-toolchain.toml)
 [![Edition 2024](https://img.shields.io/badge/edition-2024-red.svg)](Cargo.toml)
-[![Version 0.8.0](https://img.shields.io/badge/version-0.8.0-blue.svg)](crates/agent-harness-core/Cargo.toml)
+[![Version 0.8.1](https://img.shields.io/badge/version-0.8.1-blue.svg)](crates/agent-harness-core/Cargo.toml)
 [![Platform: Windows-first](https://img.shields.io/badge/platform-Windows--first-0078d4.svg)](#faq)
 [![Status: Pre-release](https://img.shields.io/badge/status-pre--release-yellow.svg)](CHANGELOG.md)
 
@@ -132,7 +132,7 @@ One binary, `agent-harness`, grouped into clear families:
 
 ## Project Status
 
-Version **0.8.0** is the current checkpoint release. The project remains pre-1.0, so interfaces may still change; the invariant catalog, schema registry, and scenario matrix define the public verification contracts for each release.
+Version **0.8.1** is the current checkpoint release. The project remains pre-1.0, so interfaces may still change; the invariant catalog, schema registry, and scenario matrix define the public verification contracts for each release.
 
 See the [Changelog](CHANGELOG.md) and the [Roadmap & Backlog](docs/agent-harness-core-roadmap-backlog.md) for what's done, gated, and next.
 

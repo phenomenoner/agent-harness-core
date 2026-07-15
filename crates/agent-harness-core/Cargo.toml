@@ -1,6 +1,6 @@
 [package]
 name = "agent-harness-core"
-version = "0.8.0"
+version = "0.8.1"
 description = "Self-hosted AI agent harness core: durable queues, channel permission gates, Codex/OpenRouter runtime pipeline, and JSONL receipts"
 edition.workspace = true
 license.workspace = true
