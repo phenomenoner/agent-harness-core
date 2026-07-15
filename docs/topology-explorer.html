@@ -219,7 +219,7 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "5d94cfba887ecaad3cc9bb7446a630b8c8d30b316f90f618a056c50e21d38626"
+      "sha256": "86b0c597a6f0a9300c67cbd7b0a63596b7f71bcac53b79e93c1e0586c2190a98"
     }
   ],
   "syncCommand": "python tools/generate_topology_explorer.py",
@@ -839,6 +839,19 @@
       "designTarget": "Long external tools should not be allowed to silently stall the app-server until the parent queue item is dead-lettered. The harness should stop the stalled tool path, surface the timeout to the model, and allow bounded recovery, virtual-session continuation, or a clear blocker report.",
       "currentEvidence": "Round10 adds active tool-use tracking for Codex item events and converts an in-flight tool idle timeout into one fresh-thread recovery prompt with toolUseTimeout receipt metadata. Round17 interrupted-task staging rotates stale timeout stdout before retry recovery, routes failed tool-timeout fallback to virtual-session continuation, carries bounded tool summary into the working-set decision/requeue reason, and keeps provider-outage-shaped timeouts out of the continuation predicate. This remains short of a dedicated per-tool supervisor with resumable cancellation.",
       "promotionGate": "Promote to full parity only after per-tool cancellation semantics, retry budgets, trace replay, and long-review soak tests prove a timed-out tool can be killed or isolated without losing queue trace, final outbox, continuation prompt evidence, or follow-up model control.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-codex-absolute-deadline-drain-gap",
+      "label": "codex-absolute-deadline-drain-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Codex absolute deadline drain and productive continuation",
+      "designTarget": "A fixed interactive wall-clock deadline must not replay a turn that already changed files, ran tools, or emitted substantive narration, and it must not invite new long work or same-turn steering in its final minutes.",
+      "currentEvidence": "Staging classifies productive absolute timeouts from concrete Codex stdout item evidence rather than raw event volume, resolves sibling eligibility through effective queue terminal state, sends one receipted deadline-drain turn/steer in the final 10% capped at three minutes, and defers late user steering to retained next-turn/passive context. Focused replays cover productive versus handshake-only timeout, historical-terminal versus genuinely pending sibling, one-shot drain steering, and deadline-window user-steer deferral.",
+      "promotionGate": "Promote only after a candidate or controlled long-turn replay shows no new long command after the drain receipt, one guarded continuation for productive timeout, no continuation for handshake-only timeout, no original prepared-turn replay, and retained late steering visible on the next exact-lane prompt.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -2088,6 +2101,26 @@
     {
       "source": "component-memory-session-history-retrieval",
       "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-codex-absolute-deadline-drain-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-codex-absolute-deadline-drain-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-codex-absolute-deadline-drain-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime",
+      "target": "gap-codex-absolute-deadline-drain-gap",
       "label": "has gap"
     },
     {
