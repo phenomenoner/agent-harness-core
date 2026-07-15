@@ -8710,59 +8710,35 @@ while ($true) {
 
     #[cfg(windows)]
     fn fake_external_review_only_codex_executable(root: &Path) -> PathBuf {
-        let script = root.join("fake-external-review-only-app-server.ps1");
+        let script = root.join("fake-external-review-only-app-server.cmd");
         fs::write(
             &script,
-            r#"
-$countFile = Join-Path $PSScriptRoot 'external-review-only-attempt.txt'
-$attempt = 0
-if (Test-Path -LiteralPath $countFile) {
-    $raw = Get-Content -LiteralPath $countFile -Raw
-    [void][int]::TryParse($raw.Trim(), [ref]$attempt)
-}
-Set-Content -LiteralPath $countFile -Value ([string]($attempt + 1))
-while ($true) {
-    $line = [Console]::In.ReadLine()
-    if ($null -eq $line) { break }
-    try {
-        $msg = $line | ConvertFrom-Json
-    } catch {
-        continue
-    }
-    if ($msg.id -eq 0) {
-        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
-        [Console]::Out.Flush()
-    } elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {
-        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-review-evidence"}}}')
-        [Console]::Out.Flush()
-    } elseif ($msg.method -eq 'turn/start') {
-        if ($attempt -eq 0) {
-            [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-timeout","kind":"regular"}}}')
-            [Console]::Out.WriteLine('{"method":"item/started","params":{"item":{"type":"commandExecution","id":"cmd-review-timeout","command":"claude -p review prompt"},"threadId":"thread-review-evidence","turnId":"turn-review-timeout"}}')
-            [Console]::Out.Flush()
-            Start-Sleep -Seconds 10
-        } else {
-            [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-only","kind":"regular"}}}')
-            [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-review-only","text":"Claude second brain review: PASS. Findings only; implementation still needs to continue.","phase":"final_answer"},"threadId":"thread-review-evidence","turnId":"turn-review-only","completedAtMs":1234}}')
-            [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-only","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}')
-            [Console]::Out.Flush()
-            break
-        }
-    }
-}
+            r#"@echo off
+setlocal
+set "countFile=%~dp0external-review-only-attempt.txt"
+set "attempt=0"
+if exist "%countFile%" set /p attempt=<"%countFile%"
+set /a next=attempt+1
+>"%countFile%" echo %next%
+set /p "request="
+echo {"id":0,"result":{"ok":true}}
+set /p "request="
+echo {"id":1,"result":{"thread":{"id":"thread-review-evidence"}}}
+set /p "request="
+if "%attempt%"=="0" (
+    echo {"method":"turn/started","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-timeout","kind":"regular"}}}
+    echo {"method":"item/started","params":{"item":{"type":"commandExecution","id":"cmd-review-timeout","command":"claude -p review prompt"},"threadId":"thread-review-evidence","turnId":"turn-review-timeout"}}
+    %SystemRoot%\System32\ping.exe -n 11 127.0.0.1 >nul
+) else (
+    echo {"method":"turn/started","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-only","kind":"regular"}}}
+    echo {"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-review-only","text":"Claude second brain review: PASS. Findings only; implementation still needs to continue.","phase":"final_answer"},"threadId":"thread-review-evidence","turnId":"turn-review-only","completedAtMs":1234}}
+    echo {"method":"turn/completed","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-only","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}
+    %SystemRoot%\System32\ping.exe -n 4 127.0.0.1 >nul
+)
 "#,
         )
         .unwrap();
-        let cmd = root.join("fake-external-review-only-codex.cmd");
-        fs::write(
-            &cmd,
-            format!(
-                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
-                script.display()
-            ),
-        )
-        .unwrap();
-        cmd
+        script
     }
 
     #[cfg(windows)]

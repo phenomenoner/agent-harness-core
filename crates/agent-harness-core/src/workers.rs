@@ -6220,7 +6220,12 @@ mod tests {
         let mut options = shell_options(&harness_home, "timeout-process-tree", 1000);
         options.payload = json!({"scriptPath": script, "cwd": script_dir});
         options.max_attempts = 1;
-        options.timeout_ms = Some(1500);
+        // Give a cold Windows PowerShell enough time to start its descendant and
+        // persist the PID before the worker timeout exercises tree termination.
+        // The descendant's 30-second sleep remains well above this bound, so the
+        // assertion still proves active process-tree termination rather than a
+        // natural child exit.
+        options.timeout_ms = Some(15_000);
         enqueue_worker_job(options).unwrap();
 
         let run = run_worker_once(WorkerRunOnceOptions {

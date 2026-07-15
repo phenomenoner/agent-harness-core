@@ -15602,7 +15602,10 @@ mod tests {
             execution_dir: None,
             plan_file: None,
             timeout_ms: 20_000,
-            idle_timeout_ms: 3_000,
+            // Keep the 10-second stalled tool attempt above the idle budget while
+            // leaving enough headroom for a replacement app-server process to
+            // complete its handshake on Windows.
+            idle_timeout_ms: 6_000,
             progress_context: None,
         })
         .unwrap();
@@ -17383,63 +17386,46 @@ while ($true) {
 
     #[cfg(windows)]
     fn tool_timeout_then_success_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
-        let script = root.join("tool-timeout-then-success-app-server.ps1");
+        let script = root.join("tool-timeout-then-success-app-server.cmd");
         fs::write(
             &script,
-            r#"
-$countFile = Join-Path $PSScriptRoot 'tool-timeout-attempt.txt'
-$attempt = 0
-if (Test-Path -LiteralPath $countFile) {
-    $raw = Get-Content -LiteralPath $countFile -Raw
-    [void][int]::TryParse($raw.Trim(), [ref]$attempt)
-}
-Set-Content -LiteralPath $countFile -Value ([string]($attempt + 1))
-while ($true) {
-    $line = [Console]::In.ReadLine()
-    if ($null -eq $line) { break }
-    try {
-        $msg = $line | ConvertFrom-Json
-    } catch {
-        continue
-    }
-    if ($msg.id -eq 0) {
-        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
-        [Console]::Out.Flush()
-    } elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {
-        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-tool-timeout"}}}')
-        [Console]::Out.Flush()
-    } elseif ($msg.method -eq 'turn/start') {
-        if ($attempt -eq 0) {
-            [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-tool-timeout","turn":{"id":"turn-tool-timeout","kind":"regular"}}}')
-            [Console]::Out.WriteLine('{"method":"item/started","params":{"item":{"type":"commandExecution","id":"cmd-timeout","command":"claude -p review prompt"},"threadId":"thread-tool-timeout","turnId":"turn-tool-timeout"}}')
-            [Console]::Out.Flush()
-            Start-Sleep -Seconds 10
-        } else {
-            [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-tool-timeout","turn":{"id":"turn-recovered","kind":"regular"}}}')
-            [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-recovered","text":"Recovered after tool timeout.","phase":"final_answer"},"threadId":"thread-tool-timeout","turnId":"turn-recovered","completedAtMs":1234}}')
-            [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-tool-timeout","turn":{"id":"turn-recovered","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}')
-            [Console]::Out.Flush()
-            break
-        }
-    }
-}
+            r#"@echo off
+setlocal
+set "countFile=%~dp0tool-timeout-attempt.txt"
+set "attempt=0"
+if exist "%countFile%" set /p attempt=<"%countFile%"
+set /a next=attempt+1
+>"%countFile%" echo %next%
+set /p "request="
+echo {"id":0,"result":{"ok":true}}
+set /p "request="
+echo {"id":1,"result":{"thread":{"id":"thread-tool-timeout"}}}
+set /p "request="
+if "%attempt%"=="0" (
+    echo {"method":"turn/started","params":{"threadId":"thread-tool-timeout","turn":{"id":"turn-tool-timeout","kind":"regular"}}}
+    echo {"method":"item/started","params":{"item":{"type":"commandExecution","id":"cmd-timeout","command":"claude -p review prompt"},"threadId":"thread-tool-timeout","turnId":"turn-tool-timeout"}}
+    %SystemRoot%\System32\ping.exe -n 11 127.0.0.1 >nul
+) else (
+    echo {"method":"turn/started","params":{"threadId":"thread-tool-timeout","turn":{"id":"turn-recovered","kind":"regular"}}}
+    echo {"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-recovered","text":"Recovered after tool timeout.","phase":"final_answer"},"threadId":"thread-tool-timeout","turnId":"turn-recovered","completedAtMs":1234}}
+    echo {"method":"turn/completed","params":{"threadId":"thread-tool-timeout","turn":{"id":"turn-recovered","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}
+    %SystemRoot%\System32\ping.exe -n 4 127.0.0.1 >nul
+)
 "#,
         )
         .unwrap();
-        let system_powershell =
-            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
-        let executable = if system_powershell.is_file() {
-            system_powershell
+        let system_cmd = PathBuf::from(r"C:\Windows\System32\cmd.exe");
+        let executable = if system_cmd.is_file() {
+            system_cmd
         } else {
-            PathBuf::from("powershell.exe")
+            PathBuf::from("cmd.exe")
         };
         (
             executable,
             vec![
-                "-NoProfile".to_string(),
-                "-ExecutionPolicy".to_string(),
-                "Bypass".to_string(),
-                "-File".to_string(),
+                "/D".to_string(),
+                "/Q".to_string(),
+                "/C".to_string(),
                 script.display().to_string(),
             ],
         )
@@ -17447,63 +17433,46 @@ while ($true) {
 
     #[cfg(windows)]
     fn tool_timeout_then_review_only_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
-        let script = root.join("tool-timeout-then-review-only-app-server.ps1");
+        let script = root.join("tool-timeout-then-review-only-app-server.cmd");
         fs::write(
             &script,
-            r#"
-$countFile = Join-Path $PSScriptRoot 'tool-timeout-review-only-attempt.txt'
-$attempt = 0
-if (Test-Path -LiteralPath $countFile) {
-    $raw = Get-Content -LiteralPath $countFile -Raw
-    [void][int]::TryParse($raw.Trim(), [ref]$attempt)
-}
-Set-Content -LiteralPath $countFile -Value ([string]($attempt + 1))
-while ($true) {
-    $line = [Console]::In.ReadLine()
-    if ($null -eq $line) { break }
-    try {
-        $msg = $line | ConvertFrom-Json
-    } catch {
-        continue
-    }
-    if ($msg.id -eq 0) {
-        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
-        [Console]::Out.Flush()
-    } elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {
-        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-review-evidence"}}}')
-        [Console]::Out.Flush()
-    } elseif ($msg.method -eq 'turn/start') {
-        if ($attempt -eq 0) {
-            [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-timeout","kind":"regular"}}}')
-            [Console]::Out.WriteLine('{"method":"item/started","params":{"item":{"type":"commandExecution","id":"cmd-review-timeout","command":"claude -p review prompt"},"threadId":"thread-review-evidence","turnId":"turn-review-timeout"}}')
-            [Console]::Out.Flush()
-            Start-Sleep -Seconds 10
-        } else {
-            [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-only","kind":"regular"}}}')
-            [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-review-only","text":"Claude second brain review: PASS. Findings only; implementation still needs to continue.","phase":"final_answer"},"threadId":"thread-review-evidence","turnId":"turn-review-only","completedAtMs":1234}}')
-            [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-only","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}')
-            [Console]::Out.Flush()
-            break
-        }
-    }
-}
+            r#"@echo off
+setlocal
+set "countFile=%~dp0tool-timeout-review-only-attempt.txt"
+set "attempt=0"
+if exist "%countFile%" set /p attempt=<"%countFile%"
+set /a next=attempt+1
+>"%countFile%" echo %next%
+set /p "request="
+echo {"id":0,"result":{"ok":true}}
+set /p "request="
+echo {"id":1,"result":{"thread":{"id":"thread-review-evidence"}}}
+set /p "request="
+if "%attempt%"=="0" (
+    echo {"method":"turn/started","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-timeout","kind":"regular"}}}
+    echo {"method":"item/started","params":{"item":{"type":"commandExecution","id":"cmd-review-timeout","command":"claude -p review prompt"},"threadId":"thread-review-evidence","turnId":"turn-review-timeout"}}
+    %SystemRoot%\System32\ping.exe -n 11 127.0.0.1 >nul
+) else (
+    echo {"method":"turn/started","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-only","kind":"regular"}}}
+    echo {"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-review-only","text":"Claude second brain review: PASS. Findings only; implementation still needs to continue.","phase":"final_answer"},"threadId":"thread-review-evidence","turnId":"turn-review-only","completedAtMs":1234}}
+    echo {"method":"turn/completed","params":{"threadId":"thread-review-evidence","turn":{"id":"turn-review-only","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}
+    %SystemRoot%\System32\ping.exe -n 4 127.0.0.1 >nul
+)
 "#,
         )
         .unwrap();
-        let system_powershell =
-            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
-        let executable = if system_powershell.is_file() {
-            system_powershell
+        let system_cmd = PathBuf::from(r"C:\Windows\System32\cmd.exe");
+        let executable = if system_cmd.is_file() {
+            system_cmd
         } else {
-            PathBuf::from("powershell.exe")
+            PathBuf::from("cmd.exe")
         };
         (
             executable,
             vec![
-                "-NoProfile".to_string(),
-                "-ExecutionPolicy".to_string(),
-                "Bypass".to_string(),
-                "-File".to_string(),
+                "/D".to_string(),
+                "/Q".to_string(),
+                "/C".to_string(),
                 script.display().to_string(),
             ],
         )
