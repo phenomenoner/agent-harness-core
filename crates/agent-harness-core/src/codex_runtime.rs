@@ -100,6 +100,9 @@ const CODEX_CAPABILITY_MODEL_LIST_FIRST_REQUEST_ID: i64 = 9_100;
 const CODEX_CAPABILITY_MODEL_LIST_PAGE_SIZE: usize = 256;
 const CODEX_CAPABILITY_MODEL_LIST_MAX_PAGES: usize = 16;
 const CODEX_CAPABILITY_HANDSHAKE_TIMEOUT_MS: u64 = 30_000;
+const CODEX_DEADLINE_DRAIN_MAX_WINDOW_MS: u64 = 180_000;
+const CODEX_DEADLINE_DRAIN_DIVISOR: u64 = 10;
+const CODEX_DEADLINE_DRAIN_MESSAGE: &str = "Runtime deadline guard: this turn entered its final drain window. Do not start new long-running commands. Finish the current bounded action, persist checkpoint and verification receipts, summarize remaining work, and return a continuation handoff before the hard deadline.";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum OwnedCodexEventsRolloutMode {
@@ -880,6 +883,7 @@ pub enum CodexTurnSteerQueueStatus {
     QueuedSameTurn,
     DeferredNoActiveTurn,
     DeferredNoActiveTurnId,
+    DeferredDeadlineDrain,
     RejectedEmpty,
 }
 
@@ -1102,6 +1106,10 @@ struct CodexActiveTurnBindingRecord {
     prompt_bundle_json: PathBuf,
     prompt_markdown: PathBuf,
     started_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    absolute_deadline_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deadline_drain_at_ms: Option<i64>,
     updated_at_ms: i64,
     reason: String,
 }
@@ -2688,6 +2696,39 @@ pub fn queue_codex_turn_steer_request(
             reason: receipt.reason,
         });
     };
+    if binding
+        .deadline_drain_at_ms
+        .is_some_and(|deadline_ms| options.now_ms >= deadline_ms)
+    {
+        let reason = format!(
+            "active Codex turn is inside its deadline drain window; steering remains in channel state for the next prompt (drainAtMs={}; absoluteDeadlineAtMs={})",
+            binding.deadline_drain_at_ms.unwrap_or_default(),
+            binding.absolute_deadline_at_ms.unwrap_or_default()
+        );
+        let receipt = CodexTurnSteerReceipt {
+            schema: CODEX_TURN_STEER_RECEIPT_SCHEMA.to_string(),
+            at_ms: options.now_ms,
+            request_id: request_id.clone(),
+            session_key: options.session_key.clone(),
+            status: "deferred-deadline-drain".to_string(),
+            delivery: "next-turn-or-passive-context".to_string(),
+            thread_id: Some(binding.thread_id),
+            expected_turn_id: binding.active_turn_id,
+            accepted_turn_id: None,
+            request_file: None,
+            reason: reason.clone(),
+        };
+        append_json_line(&receipts_file, &receipt)?;
+        return Ok(CodexTurnSteerRequestReport {
+            schema: CODEX_TURN_STEER_REQUEST_SCHEMA,
+            harness_home: options.harness_home,
+            request_id,
+            status: CodexTurnSteerQueueStatus::DeferredDeadlineDrain,
+            request_file: None,
+            receipts_file,
+            reason,
+        });
+    }
 
     let pending_dir = codex_turn_steer_pending_dir(&options.harness_home);
     fs::create_dir_all(&pending_dir)?;
@@ -4696,6 +4737,7 @@ fn drive_codex_app_server(
         plan_file,
         thread_id.clone(),
         turn_start_request_id,
+        &timeouts,
     ) {
         Ok(bridge) => bridge,
         Err(error) => {
@@ -5602,6 +5644,14 @@ fn wait_for_codex_capability_rpc_response(
                     )));
                 }
                 if is_turn_completed(&value) {
+                    if is_compact_only_turn_completed(&value)
+                        && !state.has_captured_assistant_output()
+                    {
+                        state.warnings.push(format!(
+                            "ignored late compact-only Codex turn/completed while waiting for {method}"
+                        ));
+                        continue;
+                    }
                     return Ok(Err(CodexCapabilityHandshakeFailure::Failed(format!(
                         "Codex app-server reported turn completion while waiting for {method}"
                     ))));
@@ -8278,6 +8328,8 @@ struct CodexTurnSteerBridge {
     turn_start_request_id: i64,
     next_rpc_id: i64,
     in_flight: BTreeMap<i64, InFlightCodexTurnSteer>,
+    deadline_drain_rpc: Option<(i64, String)>,
+    deadline_drain_sent: bool,
     rollout_mode: OwnedCodexEventsRolloutMode,
     owned_turn_id: Option<String>,
     owned_item_ids: Vec<String>,
@@ -8291,8 +8343,11 @@ impl CodexTurnSteerBridge {
         plan_file: &Path,
         thread_id: String,
         turn_start_request_id: i64,
+        timeouts: &CodexProtocolTimeouts,
     ) -> io::Result<Self> {
         let now_ms = current_log_time_ms()?;
+        let (absolute_deadline_at_ms, deadline_drain_at_ms) =
+            timeouts.deadline_epoch_bounds(now_ms);
         let binding_file = codex_active_turn_binding_file(harness_home, &plan.session_key);
         let binding = CodexActiveTurnBindingRecord {
             schema: CODEX_ACTIVE_TURN_SCHEMA.to_string(),
@@ -8311,6 +8366,8 @@ impl CodexTurnSteerBridge {
             prompt_bundle_json: plan.prompt_bundle_json.clone(),
             prompt_markdown: plan.prompt_markdown.clone(),
             started_at_ms: now_ms,
+            absolute_deadline_at_ms: Some(absolute_deadline_at_ms),
+            deadline_drain_at_ms: Some(deadline_drain_at_ms),
             updated_at_ms: now_ms,
             reason: "turn/start sent; waiting for active Codex turn id".to_string(),
         };
@@ -8322,6 +8379,8 @@ impl CodexTurnSteerBridge {
             turn_start_request_id,
             next_rpc_id: 10_000,
             in_flight: BTreeMap::new(),
+            deadline_drain_rpc: None,
+            deadline_drain_sent: false,
             rollout_mode: owned_codex_events_rollout_mode(harness_home, plan.agent_id.as_deref()),
             owned_turn_id: None,
             owned_item_ids: Vec::new(),
@@ -8451,7 +8510,7 @@ impl CodexTurnSteerBridge {
     fn observe_json(
         &mut self,
         value: &Value,
-        stdin: &mut impl Write,
+        _stdin: &mut impl Write,
         state: &mut CodexProtocolState,
     ) -> io::Result<bool> {
         if self.handle_rpc_response(value, state)? {
@@ -8471,14 +8530,71 @@ impl CodexTurnSteerBridge {
                 self.set_active_turn_id(turn_id)?;
             }
         }
-        self.drain_pending(stdin, state)?;
         Ok(false)
+    }
+
+    fn maybe_send_deadline_drain(
+        &mut self,
+        stdin: &mut impl Write,
+        state: &mut CodexProtocolState,
+        timeouts: &CodexProtocolTimeouts,
+    ) -> io::Result<bool> {
+        if self.deadline_drain_sent || !timeouts.is_deadline_drain_window(Instant::now()) {
+            return Ok(false);
+        }
+        let Some(active_turn_id) = self.binding.active_turn_id.clone() else {
+            return Ok(false);
+        };
+        let at_ms = current_log_time_ms()?;
+        let rpc_id = self.next_rpc_id;
+        self.next_rpc_id = self.next_rpc_id.saturating_add(1);
+        let request_id = format!(
+            "deadline-drain-{}-{at_ms}",
+            normalize_key_part(
+                self.binding
+                    .queue_id
+                    .as_deref()
+                    .unwrap_or(&self.binding.session_key)
+            )
+        );
+        write_json_rpc(
+            stdin,
+            &json!({
+                "id": rpc_id,
+                "method": "turn/steer",
+                "params": {
+                    "threadId": self.binding.thread_id.clone(),
+                    "expectedTurnId": active_turn_id.clone(),
+                    "clientUserMessageId": format!("agent-harness:{request_id}"),
+                    "input": [{"type": "text", "text": CODEX_DEADLINE_DRAIN_MESSAGE}]
+                }
+            }),
+        )?;
+        self.write_deadline_drain_receipt(
+            &request_id,
+            "sent-deadline-drain",
+            "same-turn-deadline-drain-pending",
+            Some(active_turn_id),
+            "deadline drain guard sent before the hard turn timeout".to_string(),
+        )?;
+        self.deadline_drain_rpc = Some((rpc_id, request_id));
+        self.deadline_drain_sent = true;
+        self.binding.updated_at_ms = at_ms;
+        self.binding.reason =
+            "deadline drain guard sent; late steering will be deferred".to_string();
+        write_codex_active_turn_binding(&self.binding_file, &self.binding)?;
+        state.warnings.push(format!(
+            "Codex deadline drain guard sent with {}ms maximum drain window",
+            CODEX_DEADLINE_DRAIN_MAX_WINDOW_MS
+        ));
+        Ok(true)
     }
 
     fn drain_pending(
         &mut self,
         stdin: &mut impl Write,
         state: &mut CodexProtocolState,
+        defer_for_deadline_drain: bool,
     ) -> io::Result<()> {
         let Some(active_turn_id) = self.binding.active_turn_id.clone() else {
             return Ok(());
@@ -8541,6 +8657,18 @@ impl CodexTurnSteerBridge {
                 continue;
             }
             record.expected_turn_id = Some(active_turn_id.clone());
+            if defer_for_deadline_drain {
+                self.write_request_receipt(
+                    &record,
+                    Some(file.clone()),
+                    "deferred-deadline-drain",
+                    "next-turn-or-passive-context",
+                    None,
+                    "same-turn steering arrived inside the deadline drain window; retained channel state will carry it into the next prompt".to_string(),
+                )?;
+                move_steer_request_file(&self.harness_home, &file, "deferred")?;
+                continue;
+            }
             let rpc_id = self.next_rpc_id;
             self.next_rpc_id = self.next_rpc_id.saturating_add(1);
             let inflight_file = move_steer_request_file(&self.harness_home, &file, "in-flight")?;
@@ -8582,6 +8710,32 @@ impl CodexTurnSteerBridge {
         let Some(id) = json_id(value) else {
             return Ok(false);
         };
+        if self
+            .deadline_drain_rpc
+            .as_ref()
+            .is_some_and(|(rpc_id, _)| *rpc_id == id)
+        {
+            let (_, request_id) = self.deadline_drain_rpc.take().unwrap();
+            let accepted_turn_id = extract_turn_id(value).or(self.binding.active_turn_id.clone());
+            if let Some(error) = protocol_error(value) {
+                self.write_deadline_drain_receipt(
+                    &request_id,
+                    "failed-deadline-drain",
+                    "same-turn-deadline-drain-failed",
+                    accepted_turn_id,
+                    error,
+                )?;
+            } else {
+                self.write_deadline_drain_receipt(
+                    &request_id,
+                    "accepted-deadline-drain",
+                    "same-turn-deadline-drain",
+                    accepted_turn_id,
+                    "Codex app-server accepted the deadline drain guard".to_string(),
+                )?;
+            }
+            return Ok(true);
+        }
         let Some(in_flight) = self.in_flight.remove(&id) else {
             return Ok(false);
         };
@@ -8619,6 +8773,15 @@ impl CodexTurnSteerBridge {
     }
 
     fn finish_pending(&mut self, reason: &str) -> io::Result<()> {
+        if let Some((_, request_id)) = self.deadline_drain_rpc.take() {
+            self.write_deadline_drain_receipt(
+                &request_id,
+                "unconfirmed-deadline-drain",
+                "same-turn-deadline-drain-unconfirmed",
+                self.binding.active_turn_id.clone(),
+                format!("turn ended before deadline drain acknowledgement: {reason}"),
+            )?;
+        }
         for (_, in_flight) in std::mem::take(&mut self.in_flight) {
             self.write_request_receipt(
                 &in_flight.record,
@@ -8713,12 +8876,39 @@ impl CodexTurnSteerBridge {
             },
         )
     }
+
+    fn write_deadline_drain_receipt(
+        &self,
+        request_id: &str,
+        status: &str,
+        delivery: &str,
+        accepted_turn_id: Option<String>,
+        reason: String,
+    ) -> io::Result<()> {
+        append_json_line(
+            &codex_turn_steer_receipts_file(&self.harness_home),
+            &CodexTurnSteerReceipt {
+                schema: CODEX_TURN_STEER_RECEIPT_SCHEMA.to_string(),
+                at_ms: current_log_time_ms()?,
+                request_id: request_id.to_string(),
+                session_key: self.binding.session_key.clone(),
+                status: status.to_string(),
+                delivery: delivery.to_string(),
+                thread_id: Some(self.binding.thread_id.clone()),
+                expected_turn_id: self.binding.active_turn_id.clone(),
+                accepted_turn_id,
+                request_file: None,
+                reason,
+            },
+        )
+    }
 }
 
 struct CodexProtocolTimeouts {
     absolute_deadline: Instant,
     idle_deadline: Instant,
     idle_timeout: Duration,
+    deadline_drain_window: Duration,
     max_turn_ms: u64,
     idle_timeout_ms: u64,
 }
@@ -8729,10 +8919,16 @@ impl CodexProtocolTimeouts {
         let max_turn_ms = max_turn_ms.max(1);
         let idle_timeout_ms = idle_timeout_ms.max(1);
         let idle_timeout = Duration::from_millis(idle_timeout_ms);
+        let deadline_drain_window = Duration::from_millis(
+            (max_turn_ms / CODEX_DEADLINE_DRAIN_DIVISOR)
+                .max(1)
+                .min(CODEX_DEADLINE_DRAIN_MAX_WINDOW_MS),
+        );
         Self {
             absolute_deadline: now + Duration::from_millis(max_turn_ms),
             idle_deadline: now + idle_timeout,
             idle_timeout,
+            deadline_drain_window,
             max_turn_ms,
             idle_timeout_ms,
         }
@@ -8756,6 +8952,23 @@ impl CodexProtocolTimeouts {
         } else {
             None
         }
+    }
+
+    fn is_deadline_drain_window(&self, now: Instant) -> bool {
+        now < self.absolute_deadline
+            && self.absolute_deadline.saturating_duration_since(now) <= self.deadline_drain_window
+    }
+
+    fn deadline_epoch_bounds(&self, now_ms: i64) -> (i64, i64) {
+        let now = Instant::now();
+        let remaining = self.absolute_deadline.saturating_duration_since(now);
+        let drain_remaining = remaining.saturating_sub(self.deadline_drain_window);
+        let to_i64_ms =
+            |duration: Duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
+        (
+            now_ms.saturating_add(to_i64_ms(remaining)),
+            now_ms.saturating_add(to_i64_ms(drain_remaining)),
+        )
     }
 
     fn next_poll_timeout(&self, now: Instant, poll_interval: Option<Duration>) -> Duration {
@@ -8948,7 +9161,9 @@ fn wait_for_turn_completed(
 ) -> io::Result<ProtocolWait> {
     loop {
         if let Some(bridge) = steer_bridge.as_deref_mut() {
-            bridge.drain_pending(stdin, state)?;
+            let deadline_drain = timeouts.is_deadline_drain_window(Instant::now());
+            bridge.maybe_send_deadline_drain(stdin, state, timeouts)?;
+            bridge.drain_pending(stdin, state, deadline_drain)?;
         }
         let poll_interval = steer_bridge.as_ref().map(|_| Duration::from_millis(250));
         match receive_protocol_event(line_rx, child, state, timeouts, cancel_check, poll_interval)?
@@ -15059,6 +15274,123 @@ mod tests {
     }
 
     #[test]
+    fn queue_codex_turn_steer_request_defers_inside_deadline_drain_window() {
+        let root = temp_root("queue_codex_turn_steer_request_defers_inside_deadline_drain_window");
+        let harness_home = root.join(".agent-harness");
+        let session_key = "telegram:dm-42:user-7:main";
+        let binding_file = codex_active_turn_binding_file(&harness_home, session_key);
+        fs::create_dir_all(binding_file.parent().unwrap()).unwrap();
+        write_json_atomic(
+            &binding_file,
+            &serde_json::json!({
+                "schema": CODEX_ACTIVE_TURN_SCHEMA,
+                "queueId": "queue-deadline-drain",
+                "sessionKey": session_key,
+                "agentId": "main",
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "threadId": "thread-deadline-drain",
+                "activeTurnId": "turn-deadline-drain",
+                "turnKind": "regular",
+                "status": "running",
+                "runtimePid": 42,
+                "planFile": "plan.json",
+                "workingDirectory": root,
+                "promptBundleJson": "prompt-bundle.json",
+                "promptMarkdown": "prompt.md",
+                "startedAtMs": 1_000,
+                "absoluteDeadlineAtMs": 10_000,
+                "deadlineDrainAtMs": 8_000,
+                "updatedAtMs": 7_000,
+                "reason": "running"
+            }),
+        )
+        .unwrap();
+
+        let report = queue_codex_turn_steer_request(CodexTurnSteerRequestOptions {
+            harness_home: harness_home.clone(),
+            platform: "telegram".to_string(),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            session_key: session_key.to_string(),
+            agent_id: Some("main".to_string()),
+            text: "also run the full release suite".to_string(),
+            client_user_message_id: None,
+            now_ms: 9_000,
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.status,
+            CodexTurnSteerQueueStatus::DeferredDeadlineDrain
+        );
+        assert!(report.request_file.is_none());
+        let receipts = fs::read_to_string(report.receipts_file).unwrap();
+        assert!(receipts.contains("deferred-deadline-drain"));
+        assert!(receipts.contains("next-turn-or-passive-context"));
+        assert!(!codex_turn_steer_pending_dir(&harness_home).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deadline_drain_guard_is_sent_once_with_receipt() {
+        let root = temp_root("deadline_drain_guard_is_sent_once_with_receipt");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        let plan: CodexRuntimePlanFile = read_json_file_as(plan_file).unwrap();
+        let mut timeouts = CodexProtocolTimeouts::new(30_000, 30_000);
+        timeouts.absolute_deadline = Instant::now() + Duration::from_millis(50);
+        timeouts.deadline_drain_window = Duration::from_millis(100);
+        let mut bridge = CodexTurnSteerBridge::new(
+            &harness_home,
+            &plan,
+            plan_file,
+            "thread-deadline-drain".to_string(),
+            7,
+            &timeouts,
+        )
+        .unwrap();
+        bridge
+            .set_active_turn_id("turn-deadline-drain".to_string())
+            .unwrap();
+        let mut stdin = Vec::new();
+        let mut state = CodexProtocolState::default();
+
+        assert!(
+            bridge
+                .maybe_send_deadline_drain(&mut stdin, &mut state, &timeouts)
+                .unwrap()
+        );
+        assert!(
+            !bridge
+                .maybe_send_deadline_drain(&mut stdin, &mut state, &timeouts)
+                .unwrap()
+        );
+        let wire = String::from_utf8(stdin).unwrap();
+        assert_eq!(wire.lines().count(), 1);
+        let request: Value = serde_json::from_str(wire.lines().next().unwrap()).unwrap();
+        assert_eq!(request["method"], "turn/steer");
+        assert_eq!(request["params"]["expectedTurnId"], "turn-deadline-drain");
+        assert_eq!(
+            request["params"]["input"][0]["text"],
+            CODEX_DEADLINE_DRAIN_MESSAGE
+        );
+        let receipts = fs::read_to_string(codex_turn_steer_receipts_file(&harness_home)).unwrap();
+        assert_eq!(receipts.matches("sent-deadline-drain").count(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_codex_runtime_sends_pending_turn_steer_to_app_server() {
         let root = temp_root("run_codex_runtime_sends_pending_turn_steer_to_app_server");
         let source = write_codex_runtime_source(&root);
@@ -15894,6 +16226,109 @@ mod tests {
         let compact_index = events.find("thread/compact/start").unwrap();
         let turn_index = events.find("turn/start").unwrap();
         assert!(compact_index < turn_index);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_reasoning_ignores_late_compact_turn_completed_during_capability_handshake() {
+        let root = temp_root(
+            "managed_reasoning_ignores_late_compact_turn_completed_during_capability_handshake",
+        );
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan = plan_report.plan.as_ref().unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        replace_invocation_thread_id(plan_file, Some("thread-existing"));
+        enable_managed_reasoning_fixture(&harness_home, plan_file, "max");
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{
+                "orchestration":{"features":{"modelCatalogV2":{"mode":"authoritative","enabledAgentIds":["main"]}}},
+                "codexContext":{"modelContextWindow":1000,"compactAtActiveContextRatio":0.5,"modelAutoCompactTokenLimit":900}
+            }"#,
+        )
+        .unwrap();
+        let receipts_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-runtime-run-receipts.jsonl");
+        fs::write(
+            &receipts_file,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "codexBindingFile": plan.outputs.codex_binding_file.to_string_lossy(),
+                    "usage": {
+                        "inputTokens": 920,
+                        "outputTokens": 10,
+                        "totalTokens": 930,
+                        "source": "test"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let (executable, arguments, events_file) =
+            compact_turn_completed_then_reply_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 10_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.receipt.status,
+            CodexRuntimeRunStatus::Completed,
+            "I10/I21 T3 replay: a compact-only terminal event must not abort the later config/read handshake: {}",
+            report.receipt.reason
+        );
+        assert_eq!(
+            report
+                .receipt
+                .context_recovery
+                .as_ref()
+                .map(|receipt| receipt.status.as_str()),
+            Some("compact-before-turn")
+        );
+        assert_eq!(
+            report
+                .receipt
+                .backend_reasoning_execution
+                .as_ref()
+                .and_then(|evidence| evidence.durable_wire_action.as_deref()),
+            Some("sent")
+        );
+        let transcript = fs::read_to_string(
+            report
+                .completion
+                .as_ref()
+                .unwrap()
+                .transcript_file
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(transcript.contains("Reply after compact turn boundary."));
+        let events = fs::read_to_string(events_file).unwrap();
+        assert!(events.contains("config/read"));
+        assert!(events.contains("model/list"));
+        assert!(events.contains("turn/start"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -17730,9 +18165,19 @@ while ($true) {
         [Console]::Out.WriteLine('{"id":2,"result":{}}')
         [Console]::Out.WriteLine('{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}')
         [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'config/read') {
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-before-user","status":"completed","items":[],"itemsView":"notLoaded"}}}')
+        [Console]::Out.WriteLine('{"id":9000,"result":{"config":{"model_provider":"openai"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'model/list') {
+        [Console]::Out.WriteLine('{"id":9100,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-sol","defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"xhigh"},{"reasoningEffort":"max"}]}],"nextCursor":null}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
+        if ($null -eq $compactBoundarySent) {
+            [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-before-user","status":"completed","items":[],"itemsView":"notLoaded"}}}')
+            $compactBoundarySent = $true
+        }
         [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Reply after compact turn boundary.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}')
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}')
         [Console]::Out.Flush()
@@ -18433,9 +18878,19 @@ while IFS= read -r line; do
             printf '%s\n' '{"id":2,"result":{}}'
             printf '%s\n' '{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}'
             printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}'
+            ;;
+        *'"method":"config/read"'*)
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-before-user","status":"completed","items":[],"itemsView":"notLoaded"}}}'
+            printf '%s\n' '{"id":9000,"result":{"config":{"model_provider":"openai"}}}'
+            ;;
+        *'"method":"model/list"'*)
+            printf '%s\n' '{"id":9100,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-sol","defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"xhigh"},{"reasoningEffort":"max"}]}],"nextCursor":null}}'
             ;;
         *'"method":"turn/start"'*)
+            if [ -z "${compact_boundary_sent:-}" ]; then
+                printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-before-user","status":"completed","items":[],"itemsView":"notLoaded"}}}'
+                compact_boundary_sent=1
+            fi
             printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-test","text":"Reply after compact turn boundary.","phase":"final_answer"},"threadId":"thread-test","turnId":"turn-test","completedAtMs":1234}}'
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}'
             exit 0

@@ -149,7 +149,7 @@ This keeps the turn payload compact and aligns with Codex session continuity ins
 - /new starts or switches to a fresh session key for the channel and agent.
 - /think records reasoning-mode preference or instruction in channel state for future turns.
 - /stop records a stop request and reason.
-- /steer appends steering notes for future skill matching and turn context. During an active Codex app-server turn for the same session, channel-apply also queues a `turn/steer` request under `state/runtime-queue/codex-turn-steer/`; codex-run sends it only after it has the real active turn id and records accepted/deferred receipts. If no active turn or turn id is available, the note remains passive next-turn context.
+- /steer appends steering notes for future skill matching and turn context. During an active Codex app-server turn for the same session, channel-apply also queues a `turn/steer` request under `state/runtime-queue/codex-turn-steer/`; codex-run sends it only after it has the real active turn id and records accepted/deferred receipts. If no active turn or turn id is available, or the turn is inside its final deadline-drain window, the note remains passive next-turn context. The deadline guard uses one receipted same-turn steer to stop opening long commands and persist a continuation handoff before the hard timeout.
 - /btw appends side notes without resetting the session.
 - /model records a per-channel or per-session model override.
 - /status reports session, queue, runtime, model, and activation state.

@@ -2138,7 +2138,7 @@ fn maybe_enqueue_tool_timeout_retry_continuation(
     if item.runtime_class != "interactive" || !runtime_origin_is_parent_channel(&item.origin) {
         return Ok(None);
     }
-    if !context_recovery_indicates_interrupted_long_task(&run.receipt) {
+    if !context_recovery_indicates_interrupted_long_task(run) {
         return Ok(None);
     }
     let config = load_context_rollover_config(harness_home)?;
@@ -2213,7 +2213,7 @@ fn maybe_enqueue_polluted_thread_continuation(
     if item.runtime_class != "interactive" || !runtime_origin_is_parent_channel(&item.origin) {
         return Ok(None);
     }
-    let interrupted_long_task = context_recovery_indicates_interrupted_long_task(&run.receipt);
+    let interrupted_long_task = context_recovery_indicates_interrupted_long_task(run);
     if !context_recovery_indicates_polluted_thread(run.receipt.context_recovery.as_ref())
         && !interrupted_long_task
     {
@@ -2433,9 +2433,8 @@ fn interrupted_long_task_rollover_reason(status: &str, run: &CodexRuntimeRunRepo
     )
 }
 
-fn context_recovery_indicates_interrupted_long_task(
-    receipt: &crate::CodexRuntimeRunReceipt,
-) -> bool {
+fn context_recovery_indicates_interrupted_long_task(run: &CodexRuntimeRunReport) -> bool {
+    let receipt = &run.receipt;
     let recovery_status = receipt
         .context_recovery
         .as_ref()
@@ -2451,10 +2450,49 @@ fn context_recovery_indicates_interrupted_long_task(
     {
         return true;
     }
+    if receipt.status == CodexRuntimeRunStatus::Timeout
+        && receipt
+            .reason
+            .to_ascii_lowercase()
+            .contains("timed out waiting for codex app-server completion after")
+        && codex_stdout_has_productive_progress(run.stdout_log.as_deref())
+    {
+        return true;
+    }
     receipt
         .reason
         .to_ascii_lowercase()
         .contains(crate::codex_runtime::NO_FINAL_ANSWER_WITH_NARRATION_MARKER)
+}
+
+fn codex_stdout_has_productive_progress(path: Option<&Path>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|value| {
+            let item = value.pointer("/params/item");
+            let item_type = item
+                .and_then(|item| string_field(item, &["type"]))
+                .unwrap_or_default();
+            let normalized_type = item_type.to_ascii_lowercase();
+            if normalized_type == "filechange" || is_tool_call_type(item_type) {
+                return true;
+            }
+            let phase = item
+                .and_then(|item| string_field(item, &["phase"]))
+                .unwrap_or_default();
+            let text = item
+                .and_then(|item| string_field(item, &["text"]))
+                .unwrap_or_default();
+            normalized_type == "agentmessage"
+                && matches!(phase, "commentary" | "narration")
+                && !text.trim().is_empty()
+        })
 }
 
 fn should_enqueue_stream_unstable_retry_continuation(
@@ -6648,6 +6686,107 @@ mod tests {
         .unwrap();
         assert!(!pending.contains("\"requeuedFromQueueId\":\"queue-provider-timeout\""));
         assert!(warnings.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn productive_absolute_timeout_retry_requeues_continuation_instead_of_replaying_parent() {
+        let root = temp_root(
+            "productive_absolute_timeout_retry_requeues_continuation_instead_of_replaying_parent",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_id = "queue-productive-absolute-timeout";
+        let session_key = "discord:dm-42:user-7:main";
+        seed_prepared_pending_for_stream_retry(&harness_home, queue_id, session_key);
+        let item = prepared_test_item(queue_id, session_key, None);
+        let mut run =
+            interrupted_long_task_run(queue_id, CodexRuntimeRunStatus::Timeout, None, false);
+        run.receipt.reason =
+            "timed out waiting for Codex app-server completion after 1800000ms".to_string();
+        run.receipt.event_count = 64;
+        run.receipt.elapsed_ms = 1_800_010;
+        let stdout_log = root.join("productive-timeout.stdout.jsonl");
+        fs::write(
+            &stdout_log,
+            r#"{"method":"item/started","params":{"item":{"type":"commandExecution","id":"cmd-1","command":"cargo test -p agent-harness-core"}}}
+"#,
+        )
+        .unwrap();
+        run.stdout_log = Some(stdout_log);
+        let mut warnings = Vec::new();
+
+        let rollover = maybe_enqueue_tool_timeout_retry_continuation(
+            &harness_home,
+            Some(&item),
+            &run,
+            &mut warnings,
+        )
+        .unwrap()
+        .expect(
+            "I3/I10/I13 T3 replay: a productive local absolute timeout must checkpoint into one continuation instead of replaying the prepared parent",
+        );
+
+        assert_eq!(rollover.queue_id, queue_id);
+        assert_eq!(
+            rollover.new_working_session_key,
+            "discord:dm-42:user-7:main:cont-1"
+        );
+        let pending = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(pending.matches("rollover-requeue").count(), 1);
+        assert!(pending.contains("interrupted long-task"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn absolute_timeout_without_productive_progress_does_not_requeue_continuation() {
+        let root =
+            temp_root("absolute_timeout_without_productive_progress_does_not_requeue_continuation");
+        let harness_home = root.join(".agent-harness");
+        let queue_id = "queue-handshake-only-timeout";
+        let session_key = "discord:dm-42:user-7:main";
+        seed_prepared_pending_for_stream_retry(&harness_home, queue_id, session_key);
+        let item = prepared_test_item(queue_id, session_key, None);
+        let mut run =
+            interrupted_long_task_run(queue_id, CodexRuntimeRunStatus::Timeout, None, false);
+        run.receipt.reason =
+            "timed out waiting for Codex app-server completion after 1800000ms".to_string();
+        run.receipt.event_count = 64;
+        let stdout_log = root.join("handshake-only-timeout.stdout.jsonl");
+        fs::write(
+            &stdout_log,
+            r#"{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"}}}
+{"method":"turn/started","params":{"turn":{"id":"turn-1","kind":"regular"}}}
+"#,
+        )
+        .unwrap();
+        run.stdout_log = Some(stdout_log);
+        let mut warnings = Vec::new();
+
+        let rollover = maybe_enqueue_tool_timeout_retry_continuation(
+            &harness_home,
+            Some(&item),
+            &run,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert!(rollover.is_none());
+        let pending = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        assert!(!pending.contains("rollover-requeue"));
 
         let _ = fs::remove_dir_all(root);
     }

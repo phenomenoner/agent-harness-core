@@ -69,7 +69,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I3",
-            statement: "terminal states are irreversible, and pending or retryable worker jobs already at their attempt cap become terminal before selection or lease",
+            statement: "terminal states are irreversible, pending or retryable worker jobs already at their attempt cap become terminal before selection or lease, and append-only queued admission rows cannot override effective terminal state in sibling guards",
             owner: "runtime_pipeline/workers",
         },
         InvariantEntry {
@@ -104,7 +104,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I10",
-            statement: "active Codex tool-use idle timeouts are stopped and routed through bounded recovery, virtual-session continuation, or an explicit terminal trace instead of directly dead-lettering the parent task",
+            statement: "active Codex tool-use idle timeouts and productive absolute turn timeouts are routed through bounded recovery or virtual-session continuation; the final deadline window drains work and defers late steering instead of starting another long action",
             owner: "codex_runtime/runtime_pipeline/trace/context_rollover/prompt",
         },
         InvariantEntry {
@@ -119,7 +119,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I13",
-            statement: "inline-image, native-image-input, oversized-output polluted Codex threads, interrupted long-task terminal failures, and repeated high-usage stream-unstable retries feed bounded context-rollover continuity before parent error delivery when continuation gates allow it",
+            statement: "inline-image, native-image-input, oversized-output polluted Codex threads, interrupted productive long-task failures, and repeated high-usage stream-unstable retries feed bounded context-rollover continuity when exact-lane depth and effective-sibling-state gates allow it",
             owner: "codex_runtime/context_rollover/runtime_queue/prompt/runtime_pipeline",
         },
         InvariantEntry {
@@ -154,7 +154,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I20",
-            statement: "skill ecosystem mutation is proposal-mediated but autonomous review/apply is a first-class path; selection is agent-scoped across source roots, hard allowlists, and usage priors; lint/guard gates run before prompt exposure or apply; archive is reversible move-not-delete; and selection/view/apply decisions leave receipts",
+            statement: "skill ecosystem mutation is proposal-mediated but autonomous review/apply is a first-class path; selection is agent-scoped, rejects weak body-only automatic matches, deduplicates active/imported copies by original id with active-source preference, and preserves hard lifecycle/allowlist/invocation gates and receipts",
             owner: "skills/skill_usage/turns/skill_apply/skill_guard/skill_lint/skill_curator/prompt",
         },
         InvariantEntry {
@@ -210,7 +210,17 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.codex-runtime-run.v1",
             owner_module: "codex_runtime",
-            compatibility: "append-only JSONL plus per-execution JSON; v1 accepts additive recovery fields such as toolUseTimeout, interruptionReason, interruptedToolUses, and contextRecovery.threadHealthStatus",
+            compatibility: "append-only JSONL plus per-execution JSON; v1 accepts additive recovery fields such as toolUseTimeout, interruptionReason, interruptedToolUses, and contextRecovery.threadHealthStatus; productive absolute timeout classification uses bounded stdout evidence rather than eventCount alone",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.codex-active-turn.v1",
+            owner_module: "codex_runtime",
+            compatibility: "per-session state JSON; absoluteDeadlineAtMs and deadlineDrainAtMs are optional additive fields, and legacy bindings without them remain readable",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.codex-turn-steer-receipt.v1",
+            owner_module: "codex_runtime",
+            compatibility: "append-only JSONL; deadline-drain sent/accepted/failed/unconfirmed and deferred-deadline-drain statuses are additive in v1",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.external-review-evidence.v1",
@@ -525,7 +535,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.skill-selection.v1",
             owner_module: "skills",
-            compatibility: "append-only selection receipts; matcherVersion=v4/tokenizer=mixed-v1 records lifecycle and invocation-policy filtering while additive skill catalog fields remain v1-compatible",
+            compatibility: "append-only selection receipts; matcherVersion=v4/tokenizer=mixed-v1 records lifecycle/invocation filtering, structured lexical-anchor policy, and deterministic original-id deduplication while additive skill catalog fields remain v1-compatible",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.prompt-injection-ledger.v2",
@@ -889,6 +899,49 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "context_rollover::tests::virtual_session_thread_backfill_updates_matching_working_session",
             ],
             promotion_gate: "Force high-context compact rollover, interrupted long-task rollover, and repeated high-usage stream-unstable retry scenarios, then prove rollover/final-delivery parity across Discord/TG identity axes.",
+        },
+        ScenarioMatrixEntry {
+            id: "codex-deadline-continuation",
+            title: "Codex absolute deadline drain and productive continuation",
+            changed_areas: vec![
+                "codex runtime",
+                "context rollover",
+                "runtime pipeline",
+                "runtime queue",
+            ],
+            required_invariants: vec!["I2", "I3", "I7", "I8", "I10", "I13"],
+            required_evidence: vec![
+                "the final bounded fraction of an absolute runtime deadline emits one receipted drain steer and defers later user steering",
+                "absolute timeout continuation requires bounded stdout evidence of productive tool, file-change, or completed assistant progress",
+                "handshake-only event volume cannot classify an absolute timeout as productive work",
+                "historical terminal queue rows cannot block a fresh continuation sibling",
+                "late compact completion notifications cannot satisfy an unrelated capability handshake",
+            ],
+            runnable_tests: vec![
+                "codex_runtime::tests::queue_codex_turn_steer_request_defers_inside_deadline_drain_window",
+                "codex_runtime::tests::deadline_drain_guard_is_sent_once_with_receipt",
+                "runtime_pipeline::tests::productive_absolute_timeout_retry_requeues_continuation_instead_of_replaying_parent",
+                "runtime_pipeline::tests::absolute_timeout_without_productive_progress_does_not_requeue_continuation",
+                "context_rollover::tests::prepared_auto_requeue_ignores_historical_completed_parent_session_sibling",
+                "codex_runtime::tests::managed_reasoning_ignores_late_compact_turn_completed_during_capability_handshake",
+            ],
+            promotion_gate: "Run the focused deadline-drain, absolute-timeout, sibling-state, and compact-handshake regressions plus the broader codex-runtime/context-rollover/runtime-pipeline packs. Live promotion remains a separate operator-authorized cutover with exact-lane receipts and rollback evidence.",
+        },
+        ScenarioMatrixEntry {
+            id: "skill-selection-anchor-dedupe",
+            title: "Skill selection lexical anchors and active-source deduplication",
+            changed_areas: vec!["skill selection", "agent-scoped skill sources"],
+            required_invariants: vec!["I20"],
+            required_evidence: vec![
+                "body-only lexical noise cannot auto-select a skill without a structured id, title, description, trigger, tag, or category anchor",
+                "explicit invocation remains eligible after automatic-selection hardening",
+                "active workspace and imported copies sharing an original id collapse to one selection with active-source preference",
+            ],
+            runnable_tests: vec![
+                "skills::tests::skill_selection_rejects_weak_body_only_matches_and_deduplicates_active_workspace_copy",
+                "skills::tests::skill_selection_honors_retirement_and_invocation_controls",
+            ],
+            promotion_gate: "Run the complete skill-selection regression selector and inspect the selected-skill ledger for one active copy, no body-only false positives, and preserved explicit invocation.",
         },
         ScenarioMatrixEntry {
             id: "progress-surface-volume",
@@ -1428,6 +1481,16 @@ mod tests {
             scenario_matrix
                 .iter()
                 .any(|entry| entry.id == "virtual-session-rollover")
+        );
+        assert!(
+            scenario_matrix
+                .iter()
+                .any(|entry| entry.id == "codex-deadline-continuation")
+        );
+        assert!(
+            scenario_matrix
+                .iter()
+                .any(|entry| entry.id == "skill-selection-anchor-dedupe")
         );
         assert!(
             scenario_matrix

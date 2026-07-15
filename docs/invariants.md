@@ -1,6 +1,6 @@
 # Agent Harness Core Invariants
 
-Date: 2026-07-13
+Date: 2026-07-15
 
 This catalog is the release-gate source for deterministic simulation, scenario replay, and review evidence. The same invariant IDs are exposed by `agent-harness invariants` through `agent_harness_core::quality::invariant_catalog`.
 
@@ -37,6 +37,8 @@ This catalog is the release-gate source for deterministic simulation, scenario r
 Round16-1 progress ordering binding: I9 requires progress delivery to preserve visible progress/final ordering by using queue-local wake freshness, continuing past stale non-terminal edits instead of dropping the whole pending batch, exempting first-surface sends from preemption, and reclaiming same-queue providerless surface claims without waiting for TTL. I17 requires progress delivery to consume durable terminal-control evidence before rendering cached non-terminal progress, emit at most one terminal close for existing provider surfaces, receipt `progressSuppressedReason=terminal-control-present`, and keep normal terminal cursor context intact for late-event monotonicity and retryable lane failures.
 
 Cron incident binding: I17 also requires each deterministic occurrence to come from one exact crontab source, apply timezone/calendar and bounded per-entry execution policy before enqueue, carry stable occurrence metadata, and receipt explicit catch-up suppression. I3/I4 require already-exhausted jobs to terminalize before lease and deterministic timeouts to stop only the selected process tree.
+
+Timeout-continuation binding: I3/I13 require sibling guards to resolve the effective queue state from trusted indexes and terminal controls instead of treating historical `status=queued` admission rows as live forever. I10/I13 require a productive absolute timeout to have concrete stdout evidence of tool/file-change activity or completed narration before it can become one guarded virtual-session continuation; handshake-only event volume remains ordinary retry/terminal evidence. I10 also requires the last 10% of a turn, capped at three minutes, to emit one receipted deadline-drain steer, avoid starting new long commands, and defer new user steering to next-turn/passive channel context. I20 requires automatic skill selection to have a structured lexical anchor rather than FTS/usage prior plus weak body-only coincidence, and runtime-merged duplicate `originalId` copies prefer the active workspace source when scores tie.
 
 I27 release extension: the release-rule range is I1-I27. A non-fresh progress source snapshot, a historical providerless queue, or a watched progress-owner stop that leaves unattempted fresh-send claims is a cutover blocker.
 

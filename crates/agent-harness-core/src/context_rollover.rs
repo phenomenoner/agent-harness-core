@@ -15,6 +15,10 @@ use crate::channel_state::{
 use crate::config::HARNESS_CONFIG_FILE_NAME;
 use crate::lane::FullLaneKeyV1;
 use crate::runtime_execution_receipt_index::has_prepared_execution_receipt_from_index;
+use crate::runtime_worker::{
+    QueueTerminalControl, refresh_runtime_queue_state_index,
+    resolve_queue_terminal_control_from_index,
+};
 use crate::{append_jsonl_value, write_json_atomic};
 
 const CONTEXT_COMPACT_COUNTER_SCHEMA: &str = "agent-harness.context-compact-counter.v1";
@@ -3073,6 +3077,17 @@ fn queued_parent_session_sibling_exists(
     if !queue_file.is_file() {
         return Ok(false);
     }
+    let queue_dir = queue_file.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "runtime queue file has no parent directory: {}",
+                queue_file.display()
+            ),
+        )
+    })?;
+    let mut index_warnings = Vec::new();
+    let queue_state_index = refresh_runtime_queue_state_index(queue_dir, &mut index_warnings)?;
     let text = fs::read_to_string(queue_file)?;
     for line in text.lines() {
         let trimmed = line.trim();
@@ -3082,13 +3097,28 @@ fn queued_parent_session_sibling_exists(
         let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
-        if string_field(&value, &["queueId", "queue_id"]) == Some(queue_id) {
+        let sibling_queue_id = string_field(&value, &["queueId", "queue_id"]);
+        if sibling_queue_id == Some(queue_id) {
             continue;
         }
         if string_field(&value, &["status"]) != Some("queued") {
             continue;
         }
-        if string_field(&value, &["sessionKey", "session_key"]) == Some(parent_session)
+        let sibling_session = string_field(&value, &["sessionKey", "session_key"]);
+        if let Some(sibling_queue_id) = sibling_queue_id
+            && matches!(
+                resolve_queue_terminal_control_from_index(
+                    queue_dir,
+                    sibling_queue_id,
+                    sibling_session,
+                    queue_state_index.queues.get(sibling_queue_id),
+                )?,
+                QueueTerminalControl::Terminal(_)
+            )
+        {
+            continue;
+        }
+        if sibling_session == Some(parent_session)
             && string_field(&value, &["agentId", "agent_id"]) == Some(agent_id)
             && string_field(&value, &["platform"]) == Some(platform)
             && string_field(&value, &["channelId", "channel_id"]) == Some(channel_id)
@@ -3109,6 +3139,17 @@ fn queued_parent_session_sibling_exists_for_lane(
     if !queue_file.is_file() {
         return Ok(false);
     }
+    let queue_dir = queue_file.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "runtime queue file has no parent directory: {}",
+                queue_file.display()
+            ),
+        )
+    })?;
+    let mut index_warnings = Vec::new();
+    let queue_state_index = refresh_runtime_queue_state_index(queue_dir, &mut index_warnings)?;
     let text = fs::read_to_string(queue_file)?;
     for line in text.lines() {
         let trimmed = line.trim();
@@ -3118,15 +3159,28 @@ fn queued_parent_session_sibling_exists_for_lane(
         let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
-        if string_field(&value, &["queueId", "queue_id"]) == Some(queue_id) {
+        let sibling_queue_id = string_field(&value, &["queueId", "queue_id"]);
+        if sibling_queue_id == Some(queue_id) {
             continue;
         }
         if string_field(&value, &["status"]) != Some("queued") {
             continue;
         }
-        if string_field(&value, &["sessionKey", "session_key"]) == Some(parent_session)
-            && v2_value_matches_lane(&value, lane)
+        let sibling_session = string_field(&value, &["sessionKey", "session_key"]);
+        if let Some(sibling_queue_id) = sibling_queue_id
+            && matches!(
+                resolve_queue_terminal_control_from_index(
+                    queue_dir,
+                    sibling_queue_id,
+                    sibling_session,
+                    queue_state_index.queues.get(sibling_queue_id),
+                )?,
+                QueueTerminalControl::Terminal(_)
+            )
         {
+            continue;
+        }
+        if sibling_session == Some(parent_session) && v2_value_matches_lane(&value, lane) {
             return Ok(true);
         }
     }
@@ -4888,6 +4942,118 @@ mod tests {
         assert_eq!(state.active_session_key, "telegram:dm:user:main");
         let queue_text = fs::read_to_string(queue_dir.join("pending.jsonl")).unwrap();
         assert!(!queue_text.contains(":cont-1"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepared_auto_requeue_ignores_historical_completed_parent_session_sibling() {
+        let root =
+            temp_root("prepared_auto_requeue_ignores_historical_completed_parent_session_sibling");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let state_file = channel_session_state_file(&harness_home, "telegram", "dm", "user");
+        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        write_json_atomic(
+            &state_file,
+            &ChannelSessionState {
+                schema: "agent-harness.channel-session-state.v1".to_string(),
+                platform: "telegram".to_string(),
+                account_id: None,
+                channel_id: "dm".to_string(),
+                user_id: "user".to_string(),
+                active_session_key: "telegram:dm:user:main".to_string(),
+                agent_id: Some("main".to_string()),
+                config_revision: None,
+                provider: None,
+                model: None,
+                session_topic: None,
+                model_override: None,
+                model_override_provider: None,
+                model_override_model: None,
+                thinking_enabled: false,
+                thinking_level: None,
+                thinking_instruction: None,
+                reasoning_preference: None,
+                backend_reasoning_policy: None,
+                fast_mode: None,
+                stop_requested: false,
+                stop_reason: None,
+                steering_notes: Vec::new(),
+                btw_notes: Vec::new(),
+                last_command: None,
+                updated_at_ms: 1,
+            },
+        )
+        .unwrap();
+        for queue_id in ["queue-1", "queue-2"] {
+            append_jsonl_value(
+                &queue_dir.join("pending.jsonl"),
+                &serde_json::json!({
+                    "schema": "agent-harness.runtime-queue-item.v1",
+                    "queueId": queue_id,
+                    "status": "queued",
+                    "runtimeClass": "interactive",
+                    "origin": "channel",
+                    "source": {"kind": "channel", "sourceHome": root, "sourceWorkspace": root},
+                    "createdAtMs": 1,
+                    "agentId": "main",
+                    "sessionKey": "telegram:dm:user:main",
+                    "platform": "telegram",
+                    "channelId": "dm",
+                    "userId": "user",
+                    "messageText": "continue",
+                    "plannedTranscriptFile": "old.jsonl",
+                    "plannedTrajectoryFile": "old.trajectory.jsonl"
+                }),
+            )
+            .unwrap();
+        }
+        append_jsonl_value(
+            &queue_dir.join("execution-receipts.jsonl"),
+            &serde_json::json!({
+                "queueId": "queue-1",
+                "status": "prepared",
+                "runtimeClass": "interactive",
+                "origin": "channel",
+                "executionDir": queue_dir.join("executions").join("queue-1"),
+                "promptBundleJson": "old-prompt-bundle.json"
+            }),
+        )
+        .unwrap();
+        append_jsonl_value(
+            &queue_dir.join("run-once-receipts.jsonl"),
+            &serde_json::json!({
+                "queueId": "queue-2",
+                "status": "completed",
+                "runtimeClass": "interactive",
+                "origin": "channel",
+                "reason": "historical sibling completed"
+            }),
+        )
+        .unwrap();
+
+        let report = requeue_prepared_context_rollover_if_no_parent_siblings(
+            ContextRolloverRequeuePreparedOptions {
+                harness_home: harness_home.clone(),
+                queue_id: "queue-1".to_string(),
+                new_working_session_key: "telegram:dm:user:main:cont-1".to_string(),
+                reason: "interrupted long-task recovery".to_string(),
+                now_ms: 42,
+            },
+        )
+        .expect(
+            "I3/I13 T3 replay: append-only queued admission rows with terminal effective state must not block one continuation",
+        );
+
+        assert!(report.requeued);
+        assert_eq!(
+            report.new_working_session_key,
+            "telegram:dm:user:main:cont-1"
+        );
+        let queue_text = fs::read_to_string(queue_dir.join("pending.jsonl")).unwrap();
+        assert_eq!(queue_text.matches("rollover-requeue").count(), 1);
+
         let _ = fs::remove_dir_all(root);
     }
 

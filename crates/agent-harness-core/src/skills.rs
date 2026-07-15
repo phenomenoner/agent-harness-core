@@ -429,10 +429,32 @@ pub fn select_skills(index: &SkillIndex, query: &SkillSelectionQuery) -> Vec<Ski
         right
             .score
             .cmp(&left.score)
+            .then_with(|| {
+                skill_source_preference(left.source_kind)
+                    .cmp(&skill_source_preference(right.source_kind))
+            })
             .then_with(|| left.skill_id.cmp(&right.skill_id))
+    });
+    let mut selected_original_ids = BTreeSet::new();
+    selections.retain(|selection| {
+        selected_original_ids.insert(selection.original_id.trim().to_ascii_lowercase())
     });
     selections.truncate(query.limit.max(1));
     selections
+}
+
+fn skill_source_preference(source: SkillSourceKind) -> u8 {
+    match source {
+        SkillSourceKind::Workspace => 0,
+        SkillSourceKind::Managed => 1,
+        SkillSourceKind::ProjectAgent => 2,
+        SkillSourceKind::AgentCreated => 3,
+        SkillSourceKind::Pack => 4,
+        SkillSourceKind::HarnessBuiltin => 5,
+        SkillSourceKind::ImportedWorkspace => 6,
+        SkillSourceKind::ImportedManaged => 7,
+        SkillSourceKind::ImportedProjectAgent => 8,
+    }
 }
 
 pub fn skill_selection_receipts_file(harness_home: impl AsRef<Path>) -> PathBuf {
@@ -1039,6 +1061,7 @@ fn score_skill(
     fts_scores: &BTreeMap<String, usize>,
 ) -> Option<(usize, Vec<SkillScoreComponent>, Vec<String>)> {
     let mut score = 0;
+    let mut has_structured_lexical_anchor = false;
     let mut components = Vec::new();
     let mut reasons = Vec::new();
     if let Some(reason) = frontmatter_gate_blocker(skill, query_tokens, query) {
@@ -1089,6 +1112,7 @@ fn score_skill(
     if id_matches > 0 {
         let component_score = id_matches * 20;
         score += component_score;
+        has_structured_lexical_anchor = true;
         components.push(SkillScoreComponent {
             name: "id".to_string(),
             score: component_score,
@@ -1101,6 +1125,7 @@ fn score_skill(
     if title_matches > 0 {
         let component_score = title_matches * 12;
         score += component_score;
+        has_structured_lexical_anchor = true;
         components.push(SkillScoreComponent {
             name: "title".to_string(),
             score: component_score,
@@ -1113,6 +1138,7 @@ fn score_skill(
     if description_matches > 0 {
         let component_score = description_matches * 8;
         score += component_score;
+        has_structured_lexical_anchor = true;
         components.push(SkillScoreComponent {
             name: "description".to_string(),
             score: component_score,
@@ -1138,6 +1164,7 @@ fn score_skill(
     if trigger_matches > 0 {
         let component_score = trigger_matches * 16;
         score += component_score;
+        has_structured_lexical_anchor = true;
         components.push(SkillScoreComponent {
             name: "declared-triggers".to_string(),
             score: component_score,
@@ -1150,6 +1177,7 @@ fn score_skill(
     if tag_matches > 0 {
         let component_score = tag_matches * 10;
         score += component_score;
+        has_structured_lexical_anchor = true;
         components.push(SkillScoreComponent {
             name: "tags".to_string(),
             score: component_score,
@@ -1162,6 +1190,7 @@ fn score_skill(
     if category_matches > 0 {
         let component_score = category_matches * 6;
         score += component_score;
+        has_structured_lexical_anchor = true;
         components.push(SkillScoreComponent {
             name: "category".to_string(),
             score: component_score,
@@ -1196,6 +1225,10 @@ fn score_skill(
             matches: 1,
         });
         reasons.push("channel appears in skill id".to_string());
+    }
+
+    if !explicit_invocation && !has_structured_lexical_anchor {
+        return None;
     }
 
     if let Some(fts_score) = fts_scores
@@ -1892,6 +1925,101 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("id"))
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_selection_rejects_weak_body_only_matches_and_deduplicates_active_workspace_copy() {
+        let root = temp_root(
+            "skill_selection_rejects_weak_body_only_matches_and_deduplicates_active_workspace_copy",
+        );
+        let home = root.join(".openclaw");
+        let workspace = home.join("workspace");
+        let harness_home = root.join("harness-home");
+        let runtime_skill = workspace
+            .join("skills")
+            .join("runtime-timeout-continuation");
+        let noisy_skill = workspace.join("skills").join("generic-writing-helper");
+        let active_social = workspace.join("skills").join("lyria-social-leg-series");
+        let imported_social = harness_home
+            .join("skills")
+            .join(OPENCLAW_IMPORTED_SKILL_NAMESPACE)
+            .join("workspace")
+            .join("lyria-social-leg-series");
+        for directory in [
+            &runtime_skill,
+            &noisy_skill,
+            &active_social,
+            &imported_social,
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(
+            runtime_skill.join(SKILL_FILE_NAME),
+            "---\ndescription: Repair runtime queue timeout continuation and dead-letter recovery.\ntriggers: [timeout, continuation]\n---\n# Runtime Timeout Continuation\n\nCheckpoint productive turns instead of replaying them.\n",
+        )
+        .unwrap();
+        fs::write(
+            noisy_skill.join(SKILL_FILE_NAME),
+            "---\ndescription: General prose editing helper.\n---\n# Generic Writing Helper\n\nA long unrelated writing workflow that happens to mention runtime once in an appendix.\n",
+        )
+        .unwrap();
+        let social_body = "---\ndescription: Lyria social image production workflow.\ntriggers: [social image]\n---\n# Lyria Social Leg Series\n\nCreate social image packs.\n";
+        fs::write(active_social.join(SKILL_FILE_NAME), social_body).unwrap();
+        fs::write(imported_social.join(SKILL_FILE_NAME), social_body).unwrap();
+        let index = build_runtime_skill_index(
+            &AgentSource::with_workspace(&home, &workspace),
+            &harness_home,
+        )
+        .unwrap();
+
+        let runtime = select_skills(
+            &index,
+            &SkillSelectionQuery {
+                text: "patch runtime queue timeout continuation".to_string(),
+                agent_id: Some("main".to_string()),
+                channel: Some("discord".to_string()),
+                workspace: None,
+                agent_mode: None,
+                available_tools: Vec::new(),
+                available_toolsets: Vec::new(),
+                fts_enabled: true,
+                vector_tie_break_enabled: false,
+                usage_snapshot: None,
+                usage_prior_enabled: false,
+                limit: 5,
+            },
+        );
+        assert_eq!(
+            runtime
+                .iter()
+                .map(|selection| selection.skill_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["workspace:runtime-timeout-continuation"],
+            "I20 T3 matcher replay: one weak body keyword plus FTS must not inject an unrelated large skill"
+        );
+
+        let social = select_skills(
+            &index,
+            &SkillSelectionQuery {
+                text: "create a Lyria social image pack".to_string(),
+                agent_id: Some("main".to_string()),
+                channel: Some("telegram".to_string()),
+                workspace: None,
+                agent_mode: None,
+                available_tools: Vec::new(),
+                available_toolsets: Vec::new(),
+                fts_enabled: true,
+                vector_tie_break_enabled: false,
+                usage_snapshot: None,
+                usage_prior_enabled: false,
+                limit: 5,
+            },
+        );
+        assert_eq!(social.len(), 1);
+        assert_eq!(social[0].skill_id, "workspace:lyria-social-leg-series");
+        assert_eq!(social[0].source_kind, SkillSourceKind::Workspace);
 
         let _ = fs::remove_dir_all(root);
     }

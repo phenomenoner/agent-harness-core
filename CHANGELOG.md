@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Prevent late compact-only completion events from aborting the capability handshake before the real user turn starts.
+- Resolve continuation sibling guards through effective terminal state, and checkpoint productive absolute timeouts into one guarded virtual-session continuation instead of replaying the prepared parent turn.
+- Add a one-shot, receipted deadline-drain steer in the final 10% of a turn (capped at three minutes) and defer late user steering to next-turn context.
+- Reject weak body-only automatic skill matches and deduplicate active/imported copies by original skill id while preserving explicit invocation and lifecycle gates.
+
+### Verification
+
+- Added focused fail-first/replay coverage for compact-handshake ordering, historical-terminal sibling rows, productive versus handshake-only absolute timeouts, deadline-drain and late-steer behavior, and matcher noise/deduplication.
+
 ## v0.8.1 - 2026-07-15
 
 ### Fixed
