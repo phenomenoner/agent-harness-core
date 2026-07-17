@@ -14,9 +14,9 @@ Prompt assembly includes a stable skill catalog with id, description, category, 
 
 ## Learning And Quality Gates
 
-Skill mutation remains proposal-mediated, but autonomous review/apply is a first-class path. Create, patch, replace, and archive proposals are recorded under `state/learning/skill-proposals.jsonl`; operator-approved and autonomously approved apply both use checksum validation, a per-target lock, backup creation, approved-root checks, and receipts before writing.
+Skill mutation remains proposal-mediated, and guarded apply is an explicitly authorized path. Create, patch, replace, and archive proposals are recorded under `state/learning/skill-proposals.jsonl`; operator-approved and explicitly authorized worker apply both use checksum validation, a per-target lock, backup creation, approved-root checks, and receipts before writing.
 
-`skill-synthesize` defaults to autonomous apply. The runtime self-improvement hook can enqueue `skill_synthesis` worker jobs for complex successful turns that had no selected skill, and those jobs synthesize an agent-created skill proposal before running the same autonomous lint/guard/apply pipeline. `--propose-only` and `learning.skillSynthesis.mode = "propose-only"` are opt-out controls for recording proposals without applying them.
+`skill-synthesize` defaults to proposal-only. The runtime self-improvement hook can enqueue `skill_synthesis` worker jobs for complex successful turns that had no selected skill, and those jobs synthesize an agent-created skill proposal without applying it unless both worker apply authorization fields are present. CLI mutation requires `--apply`; guarded apply then uses the same lint/guard/checksum/backup pipeline.
 
 Quality gates are additive:
 

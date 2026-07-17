@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 const WINDOWS_SUPERVISOR_PLAN_SCHEMA: &str = "agent-harness.windows-supervisor-plan.v1";
-const LEGACY_RUNTIME_WORKSPACE_ROOTS: &[&str] = &["D:\\Warehouse\\Research\\OpenClaw_WSL"];
+const LEGACY_RUNTIME_WORKSPACE_MARKERS: &[&str] = &["openclaw_wsl"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowsSupervisorPlanOptions {
@@ -89,6 +89,13 @@ pub fn write_windows_supervisor_plan(
         .as_deref()
         .map(absolutize_path)
         .transpose()?;
+    let explicit_codex_executable = if options.include_runtime {
+        explicit_codex_executable
+            .map(fs::canonicalize)
+            .transpose()?
+    } else {
+        explicit_codex_executable
+    };
     let codex_executable = explicit_codex_executable.or_else(|| {
         discover_repo_local_codex_executable(&harness_cli, &harness_home, &source_home)
     });
@@ -113,10 +120,10 @@ pub fn write_windows_supervisor_plan(
     let mut warnings = Vec::new();
 
     if codex_executable.is_none() && options.include_runtime {
-        warnings.push(
-            "codex executable was not pinned; generated runtime commands will rely on PATH"
-                .to_string(),
-        );
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "runtime supervisor plan requires a deployment-owned canonical Codex executable; PATH fallback is forbidden",
+        ));
     }
     if is_retired_legacy_source_home(&source_home, &harness_home) {
         warnings.push(format!(
@@ -1092,9 +1099,9 @@ fn is_retired_legacy_source_home(source_home: &Path, harness_home: &Path) -> boo
 
 fn is_legacy_runtime_workspace(path: &Path) -> bool {
     let normalized = normalize_path_text(path);
-    LEGACY_RUNTIME_WORKSPACE_ROOTS
+    LEGACY_RUNTIME_WORKSPACE_MARKERS
         .iter()
-        .any(|root| normalized.starts_with(&normalize_path_text(Path::new(root))))
+        .any(|marker| normalized.split('\\').any(|part| part == *marker))
 }
 
 fn scan_stale_runtime_workspace_artifacts(
@@ -1156,7 +1163,7 @@ fn discover_repo_local_codex_executable(
     for root in roots {
         for candidate in repo_local_codex_candidates(&root) {
             if candidate.is_file() {
-                return Some(candidate);
+                return fs::canonicalize(candidate).ok();
             }
         }
     }
@@ -1201,9 +1208,10 @@ fn file_contains_legacy_root(path: &Path) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::InvalidData => return Ok(false),
         Err(error) => return Err(error),
     };
-    Ok(LEGACY_RUNTIME_WORKSPACE_ROOTS
+    let normalized = text.to_ascii_lowercase();
+    Ok(LEGACY_RUNTIME_WORKSPACE_MARKERS
         .iter()
-        .any(|root| text.contains(root)))
+        .any(|marker| normalized.contains(marker)))
 }
 
 fn normalize_path_text(path: &Path) -> String {
@@ -1236,6 +1244,8 @@ mod tests {
         let root = temp_root("writes_windows_supervisor_scripts_and_receipt");
         let harness_home = root.join(".agent-harness");
         let output_dir = root.join("supervisor");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("codex.cmd"), "").unwrap();
         let report = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
             harness_home: harness_home.clone(),
             source_home: root.join(".openclaw"),
@@ -1406,6 +1416,7 @@ mod tests {
 }"#,
         )
         .unwrap();
+        fs::write(root.join("codex.exe"), "").unwrap();
 
         let report = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
             harness_home: harness_home.clone(),
@@ -1467,6 +1478,48 @@ mod tests {
         assert!(start_script.contains("AgentHarness-telegram-loop-secondary"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn runtime_plan_fails_closed_without_deployment_owned_codex() {
+        let root = temp_root("runtime_plan_fails_closed_without_deployment_owned_codex");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+
+        let error = write_windows_supervisor_plan(WindowsSupervisorPlanOptions {
+            harness_home: harness_home.clone(),
+            source_home: harness_home.clone(),
+            workspace: Some(harness_home.join("workspace")),
+            runtime_workspace: None,
+            harness_cli: root.join("target").join("debug").join("agent-harness.exe"),
+            codex_executable: None,
+            node_executable: PathBuf::from("node"),
+            discord_gateway_script: root.join("tools").join("discord").join("index.mjs"),
+            agent_id: Some("main".to_string()),
+            output_dir: Some(root.join("supervisor")),
+            task_prefix: "AgentHarness".to_string(),
+            include_runtime: true,
+            runtime_workers: 1,
+            include_worker: false,
+            include_cron_scheduler: false,
+            include_progress: false,
+            include_ledger_maintenance: false,
+            include_telegram: false,
+            include_discord: false,
+            idle_ms: 1_000,
+            runtime_timeout_ms: 1_800_000,
+            runtime_idle_timeout_ms: 300_000,
+            max_consecutive_errors: 5,
+            telegram_poll_timeout_seconds: 1,
+            telegram_max_updates: 10,
+            telegram_outbox_limit: 20,
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("PATH fallback is forbidden"));
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1691,14 +1744,10 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         let legacy_script = scripts_dir.join("telegram-loop.ps1");
         let legacy_session = session_dir.join("session.codex-app-server.json");
-        fs::write(
-            &legacy_script,
-            "before D:\\Warehouse\\Research\\OpenClaw_WSL after",
-        )
-        .unwrap();
+        fs::write(&legacy_script, "before C:\\Legacy\\OpenClaw_WSL after").unwrap();
         fs::write(
             &legacy_session,
-            r#"{"workingDirectory":"D:\Warehouse\Research\OpenClaw_WSL"}"#,
+            r#"{"workingDirectory":"C:\Legacy\OpenClaw_WSL"}"#,
         )
         .unwrap();
 
@@ -1706,7 +1755,7 @@ mod tests {
             harness_home: harness_home.clone(),
             source_home: harness_home.clone(),
             workspace: Some(harness_home.join("workspace")),
-            runtime_workspace: Some(PathBuf::from("D:\\Warehouse\\Research\\OpenClaw_WSL")),
+            runtime_workspace: Some(PathBuf::from("C:\\Legacy\\OpenClaw_WSL")),
             harness_cli: root.join("agent-harness.exe"),
             codex_executable: Some(root.join("codex.cmd")),
             node_executable: PathBuf::from("node"),
@@ -1744,7 +1793,7 @@ mod tests {
         assert!(
             fs::read_to_string(&legacy_session)
                 .unwrap()
-                .contains("D:\\Warehouse\\Research\\OpenClaw_WSL")
+                .contains("C:\\Legacy\\OpenClaw_WSL")
         );
 
         let _ = fs::remove_dir_all(root);

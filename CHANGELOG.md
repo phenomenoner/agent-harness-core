@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v0.9.0 - 2026-07-17
+
+### Added
+
+- Added provider-scoped Codex homes and an operator-only backend-auth lifecycle covering account inspection, browser/device-code/API-key login, cancellation, logout, refresh, restart reconciliation, and `needs-operator-auth` defer/resume without exposing credentials to ordinary channel turns.
+- Added exact Codex bundle provenance receipts, built-in web-search policy modes (`cached`, explicit-freshness `live`, and forced `disabled`), exact-lane virtual-session authority, goal lineage/projection/transition receipts, and shadow skill runtime/outcome receipts.
+
+### Changed
+
+- Exact-pin the deployment-owned Codex CLI at 0.144.5. Supervisors must launch its canonical executable path and receipt the executable path, version, and SHA-256.
+- Preserve backend-reported `modelContextWindow`, evaluate measured context before fallback thresholds, serialize resume/compact settling, and correlate compact-specific completion before safe rollover.
+- Default generated skill learning to proposal-only. Runtime shadow receipts and virtual skill manifests do not change serving behavior unless separately activated; guarded apply requires explicit operator authorization.
+
 ### Fixed
 
 - Prevent late compact-only completion events from aborting the capability handshake before the real user turn starts.
@@ -9,9 +22,14 @@
 - Add a one-shot, receipted deadline-drain steer in the final 10% of a turn (capped at three minutes) and defer late user steering to next-turn context.
 - Reject weak body-only automatic skill matches and deduplicate active/imported copies by original skill id while preserving explicit invocation and lifecycle gates.
 
+### Security
+
+- Redact credential, device-code, and authorization material from auth receipts and defer credentialed actions to operator-only surfaces.
+- Keep web search disabled for sensitive, offline, and replay contexts; sandbox mode is not allowed to select a search policy.
+
 ### Verification
 
-- Added focused fail-first/replay coverage for compact-handshake ordering, historical-terminal sibling rows, productive versus handshake-only absolute timeouts, deadline-drain and late-steer behavior, and matcher noise/deduplication.
+- Added focused fail-first/replay coverage for compact-handshake ordering, historical-terminal sibling rows, productive versus handshake-only absolute timeouts, deadline-drain and late-steer behavior, matcher noise/deduplication, auth lifecycle, web-search policy, exact-lane goal continuation, and zero-side-effect skill shadowing.
 
 ## v0.8.1 - 2026-07-15
 

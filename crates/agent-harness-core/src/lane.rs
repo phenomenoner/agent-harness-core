@@ -8,6 +8,7 @@ pub const FULL_LANE_KEY_SCHEMA: &str = "agent-harness.full-lane-key.v1";
 pub const MAX_FULL_LANE_AXIS_BYTES: usize = 4096;
 
 const CANONICAL_DOMAIN: &[u8] = b"agent-harness/full-lane-key/v1";
+const VIRTUAL_CANONICAL_DOMAIN: &[u8] = b"agent-harness/full-virtual-lane-key/v1";
 const LEGACY_UNKNOWN_PREFIX: &str = "urn:agent-harness:lane:legacy-unknown:v1:";
 
 /// Every identity axis that participates in a full runtime lane boundary.
@@ -330,6 +331,21 @@ impl FullLaneKeyV1 {
         Ok(lower_hex(hash.as_ref()))
     }
 
+    /// Stable identity for one exact account-aware virtual lane. Concrete
+    /// backend sessions are generations inside this boundary and therefore do
+    /// not participate in this digest.
+    pub fn virtual_identity_hash(&self) -> Result<String, FullLaneKeyError> {
+        self.validate()?;
+        let mut bytes = Vec::with_capacity(256);
+        append_component(&mut bytes, b"domain", VIRTUAL_CANONICAL_DOMAIN);
+        append_component(&mut bytes, b"schema", self.schema.as_bytes());
+        for (axis, value) in self.axes().into_iter().take(7) {
+            append_component(&mut bytes, axis.field_name().as_bytes(), value.as_bytes());
+        }
+        let hash = digest::digest(&digest::SHA256, &bytes);
+        Ok(lower_hex(hash.as_ref()))
+    }
+
     fn axes(&self) -> [(FullLaneAxisV1, &str); 8] {
         [
             (FullLaneAxisV1::Platform, self.platform.as_str()),
@@ -469,6 +485,41 @@ mod tests {
                 FullLaneAxisV1::ConcreteSession => changed.concrete_session.push_str("-other"),
             }
             assert_ne!(changed.identity_hash().unwrap(), baseline, "{axis:?}");
+        }
+    }
+
+    #[test]
+    fn virtual_identity_hash_is_exact_but_stable_across_concrete_rollover() {
+        let expected = lane();
+        let baseline = expected.virtual_identity_hash().unwrap();
+
+        let mut rollover = expected.clone();
+        rollover.concrete_session = "session-2".to_string();
+        assert_eq!(rollover.virtual_identity_hash().unwrap(), baseline);
+        assert_ne!(
+            rollover.identity_hash().unwrap(),
+            expected.identity_hash().unwrap()
+        );
+
+        for axis in FullLaneAxisV1::ALL.into_iter().take(7) {
+            let mut changed = expected.clone();
+            match axis {
+                FullLaneAxisV1::Platform => changed.platform.push_str("-other"),
+                FullLaneAxisV1::AccountId => changed.account_id.push_str("-other"),
+                FullLaneAxisV1::ChannelId => changed.channel_id.push_str("-other"),
+                FullLaneAxisV1::UserId => changed.user_id.push_str("-other"),
+                FullLaneAxisV1::AgentId => changed.agent_id.push_str("-other"),
+                FullLaneAxisV1::RuntimeClass => changed.runtime_class.push_str("-other"),
+                FullLaneAxisV1::RootVirtualSession => {
+                    changed.root_virtual_session.push_str("-other")
+                }
+                FullLaneAxisV1::ConcreteSession => unreachable!(),
+            }
+            assert_ne!(
+                changed.virtual_identity_hash().unwrap(),
+                baseline,
+                "{axis:?}"
+            );
         }
     }
 

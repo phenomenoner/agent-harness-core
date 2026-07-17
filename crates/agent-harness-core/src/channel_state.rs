@@ -1838,7 +1838,8 @@ mod tests {
         AgentProgressContext, AgentProgressDeliveryPlanOptions, AgentProgressKind,
         AgentProgressStatus, ChannelOutboundMessageKind, ChannelStatusSnapshot, ChannelStepAction,
         CompletedTurnWorkingSetSnapshotOptions, ContextVirtualSessionRecord,
-        append_agent_progress_event, plan_agent_progress_delivery,
+        SkillEcosystemIdentity, VirtualSkillManifestStatus, append_agent_progress_event,
+        create_virtual_skill_manifest, load_virtual_skill_manifest, plan_agent_progress_delivery,
         record_completed_turn_working_set_snapshot,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2091,6 +2092,20 @@ mod tests {
                 now_ms: 900,
             })
             .unwrap();
+        create_virtual_skill_manifest(
+            &harness_home,
+            SkillEcosystemIdentity {
+                virtual_session_id: snapshot.virtual_session_id.clone(),
+                root_session_key_hash: "abcdef123456".to_string(),
+                concrete_session_hash: "123456abcdef".to_string(),
+                exact_lane_digest: "feedface1234".to_string(),
+                agent_id: "main".to_string(),
+            },
+            Some("turn-sha256:abcdef123456".to_string()),
+            "catalog-1".to_string(),
+            "topology-1".to_string(),
+        )
+        .unwrap();
         let new_step = command_step_with_session(
             previous_session,
             ChannelCommandEffect::StartNewSession {
@@ -2119,6 +2134,15 @@ mod tests {
             .expect("previous working session");
         assert_eq!(previous.ended_at_ms, Some(1000));
         assert_eq!(previous.ended_by.as_deref(), Some("channel-command:/new"));
+        let skill_manifest =
+            load_virtual_skill_manifest(&harness_home, &snapshot.virtual_session_id)
+                .unwrap()
+                .expect("previous task skill manifest");
+        assert_eq!(skill_manifest.status, VirtualSkillManifestStatus::Completed);
+        assert_eq!(
+            skill_manifest.close_reason.as_deref(),
+            Some("channel-command:/new")
+        );
 
         let _ = fs::remove_dir_all(root);
     }

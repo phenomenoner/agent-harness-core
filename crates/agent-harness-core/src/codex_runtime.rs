@@ -9,9 +9,15 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ring::digest;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::backend_auth::{
+    BackendAuthLifecycleState, backend_auth_runtime_gate_enabled, load_backend_auth_state,
+    record_backend_auth_defer_intent, resolve_or_create_provider_codex_home,
+    resume_backend_auth_defer_intent,
+};
 use crate::backend_reasoning_execution::{
     BackendReasoningCapabilitySourceV1, BackendReasoningExecutionEvidenceFieldsV2,
     BackendReasoningExecutionEvidenceV2, BackendReasoningWireActionV1,
@@ -21,6 +27,13 @@ use crate::codex_capability::{
     CodexModelListCollector, CodexModelListPage, SameConnectionCapabilityProofV1,
     SameConnectionProofContext, bind_effective_provider, build_live_model_catalog_observation,
     build_same_connection_proof, decide_cache_live_drift,
+};
+use crate::codex_web_search::{
+    CodexWebSearchObserver, CodexWebSearchPlan, codex_web_search_resume_is_stable,
+    codex_web_search_thread_bindings_file, decide_effective_codex_web_search,
+    parse_codex_web_search_capability, persist_codex_web_search_decision,
+    persist_codex_web_search_thread_binding, plan_codex_web_search,
+    read_codex_web_search_thread_binding, unavailable_codex_web_search_capability,
 };
 use crate::runtime_execution_receipt_index::latest_prepared_execution_dir_from_index;
 use crate::virtual_session_runtime_index::latest_codex_runtime_usage as latest_codex_runtime_usage_from_index;
@@ -49,6 +62,10 @@ const CODEX_RUNTIME_LAUNCH_PROBE_SCHEMA: &str = "agent-harness.codex-runtime-lau
 const CODEX_RUNTIME_RUN_SCHEMA: &str = "agent-harness.codex-runtime-run.v1";
 const CODEX_RUNTIME_COMPLETION_SCHEMA: &str = "agent-harness.codex-runtime-completion.v1";
 const CODEX_CONTEXT_PREFLIGHT_SCHEMA: &str = "agent-harness.codex-context-preflight.v1";
+const CODEX_RESUME_SETTLE_SCHEMA: &str = "agent-harness.codex-resume-settle.v1";
+const CODEX_COMPACT_ATTEMPT_SCHEMA: &str = "agent-harness.compact-attempt.v1";
+const CODEX_GOAL_PROJECTION_SCHEMA: &str = "agent-harness.codex-goal-projection.v1";
+const CODEX_GOAL_REHYDRATION_SCHEMA: &str = "agent-harness.codex-goal-rehydration.v1";
 const CODEX_CONTEXT_CHECKPOINT_SCHEMA: &str = "agent-harness.codex-context-checkpoint.v1";
 const CODEX_CONTEXT_ROLLOVER_SCHEMA: &str = "agent-harness.codex-context-rollover.v1";
 const CODEX_TRANSCRIPT_MESSAGE_SCHEMA: &str = "agent-harness.transcript-message.v1";
@@ -95,11 +112,16 @@ const CODEX_THREAD_INLINE_IMAGE_TOTAL_BYTES_LIMIT: u64 = 3_000_000;
 const CODEX_THREAD_TOOL_OUTPUT_BYTES_LIMIT: u64 = 1_000_000;
 const CODEX_ROLLOUT_SCAN_MAX_FILES: usize = 256;
 const DEFAULT_HIGH_CONTEXT_USAGE_COMPACT_TOKEN_LIMIT: u64 = 120_000;
+const DEFAULT_CONTEXT_CAPACITY_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1_000;
+const CODEX_RESUME_SETTLE_QUIET_MS: u64 = 300;
+const CODEX_RESUME_SETTLE_MAX_MS: u64 = 1_000;
 const CODEX_CAPABILITY_CONFIG_READ_REQUEST_ID: i64 = 9_000;
+const CODEX_WEB_SEARCH_CAPABILITY_REQUEST_ID: i64 = 8_900;
 const CODEX_CAPABILITY_MODEL_LIST_FIRST_REQUEST_ID: i64 = 9_100;
 const CODEX_CAPABILITY_MODEL_LIST_PAGE_SIZE: usize = 256;
 const CODEX_CAPABILITY_MODEL_LIST_MAX_PAGES: usize = 16;
 const CODEX_CAPABILITY_HANDSHAKE_TIMEOUT_MS: u64 = 30_000;
+const CODEX_WEB_SEARCH_CAPABILITY_TIMEOUT_MS: u64 = 5_000;
 const CODEX_DEADLINE_DRAIN_MAX_WINDOW_MS: u64 = 180_000;
 const CODEX_DEADLINE_DRAIN_DIVISOR: u64 = 10;
 const CODEX_DEADLINE_DRAIN_MESSAGE: &str = "Runtime deadline guard: this turn entered its final drain window. Do not start new long-running commands. Finish the current bounded action, persist checkpoint and verification receipts, summarize remaining work, and return a continuation handoff before the hard deadline.";
@@ -395,6 +417,8 @@ pub struct CodexRuntimePlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_reasoning_policy: Option<crate::backend_reasoning::BackendReasoningPolicyV1>,
     pub provider_request_policy: crate::TurnProviderRequestPolicy,
+    #[serde(default)]
+    pub web_search: CodexWebSearchPlan,
     /// Trusted, redacted prompt-boundary metadata. This is derived only from
     /// the prepared receipt and locally generated prompt bundle; it is never
     /// populated from inbound chat content.
@@ -647,6 +671,18 @@ pub struct CodexRuntimeUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context_window_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_context_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<i64>,
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
@@ -730,6 +766,7 @@ struct CodexContextPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_auto_compact_token_limit: Option<u64>,
     high_context_usage_compact_token_limit: u64,
+    context_capacity_max_age_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_auto_compact_token_limit_scope: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -787,6 +824,7 @@ impl Default for CodexContextPolicy {
             model_context_window: None,
             model_auto_compact_token_limit: None,
             high_context_usage_compact_token_limit: DEFAULT_HIGH_CONTEXT_USAGE_COMPACT_TOKEN_LIMIT,
+            context_capacity_max_age_ms: DEFAULT_CONTEXT_CAPACITY_MAX_AGE_MS,
             model_auto_compact_token_limit_scope: None,
             tool_output_token_limit: None,
             compact_prompt: None,
@@ -820,6 +858,10 @@ struct CodexContextPreflightReceipt {
     latest_usage: Option<CodexRuntimeUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_context_window: Option<u64>,
+    model_context_window_source: String,
+    model_context_window_freshness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_context_window_observed_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_context_ratio: Option<f64>,
     thread_health_status: CodexThreadHealthStatus,
@@ -832,6 +874,231 @@ struct CodexContextPreflightReceipt {
 struct CodexContextPreflightRun {
     receipt: CodexContextPreflightReceipt,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexResumeSettleReceipt {
+    schema: &'static str,
+    queue_id: Option<String>,
+    session_key: String,
+    thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lane_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend_context_generation: Option<String>,
+    started_at_ms: i64,
+    settled_at_ms: i64,
+    observed_event_count: usize,
+    usage_observed: bool,
+    active_goal_observed: bool,
+    thread_active_observed: bool,
+    restored_turn_observed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restored_turn_id: Option<String>,
+    restored_turn_completed: bool,
+    status: String,
+    reason: String,
+}
+
+struct CodexResumeSettleRun {
+    receipt: CodexResumeSettleReceipt,
+    restored_turn_wait: Option<ProtocolWait>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexGoalProjectionV1 {
+    schema: String,
+    queue_id: Option<String>,
+    session_key: String,
+    source_thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_turn_id: Option<String>,
+    #[serde(default)]
+    goal_reference: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend_goal_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lane_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend_context_generation: Option<String>,
+    objective: String,
+    status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token_budget: Option<u64>,
+    #[serde(default)]
+    completion_criteria: Vec<String>,
+    goal_checksum: String,
+    completion_criteria_checksum: String,
+    projection_checksum: String,
+    #[serde(default = "default_true")]
+    projection_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    projection_reason: Option<String>,
+    #[serde(default)]
+    observation_order: u64,
+    observed_at_ms: i64,
+}
+
+struct CodexGoalProjectionObserver {
+    receipts_file: PathBuf,
+    queue_id: Option<String>,
+    session_key: String,
+    lane_digest: Option<String>,
+    backend_context_generation: Option<String>,
+    current_thread_id: Option<String>,
+    latest_by_thread: BTreeMap<String, CodexGoalProjectionV1>,
+}
+
+impl CodexGoalProjectionObserver {
+    fn new(harness_home: &Path, plan: &CodexRuntimePlanFile) -> io::Result<Self> {
+        let receipts_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-goal-projection-receipts.jsonl");
+        let mut latest_by_thread = BTreeMap::new();
+        if receipts_file.is_file() {
+            for line in fs::read_to_string(&receipts_file)?.lines() {
+                let Ok(projection) = serde_json::from_str::<CodexGoalProjectionV1>(line) else {
+                    continue;
+                };
+                if projection.schema == CODEX_GOAL_PROJECTION_SCHEMA
+                    && projection.queue_id == plan.queue_id
+                    && projection.session_key == plan.session_key
+                    && projection.lane_digest == plan.prompt_authority.lane_digest
+                    && projection.backend_context_generation
+                        == plan.prompt_authority.backend_context_generation
+                {
+                    latest_by_thread.insert(projection.source_thread_id.clone(), projection);
+                }
+            }
+        }
+        Ok(Self {
+            receipts_file,
+            queue_id: plan.queue_id.clone(),
+            session_key: plan.session_key.clone(),
+            lane_digest: plan.prompt_authority.lane_digest.clone(),
+            backend_context_generation: plan.prompt_authority.backend_context_generation.clone(),
+            current_thread_id: plan.invocation.thread_id.clone(),
+            latest_by_thread,
+        })
+    }
+
+    fn set_current_thread(&mut self, thread_id: &str) {
+        self.current_thread_id = Some(thread_id.to_string());
+    }
+
+    fn observe(&mut self, value: &Value, observation_order: u64) -> io::Result<bool> {
+        if !matches!(json_method(value), Some("thread/goal/updated")) {
+            return Ok(false);
+        }
+        let thread_id = extract_thread_id(value)
+            .or_else(|| self.current_thread_id.clone())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "thread/goal/updated lacked an exact source thread id",
+                )
+            })?;
+        let prior = self.latest_by_thread.get(&thread_id);
+        let projection =
+            goal_projection_from_event(self, &thread_id, observation_order, value, prior)?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "thread/goal/updated could not be projected",
+                    )
+                })?;
+        append_json_line(&self.receipts_file, &projection)?;
+        self.latest_by_thread.insert(thread_id, projection);
+        Ok(true)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexGoalRehydrationRequest {
+    projection: CodexGoalProjectionV1,
+    checkpoint_checksum: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexGoalRehydrationReceiptV1 {
+    schema: &'static str,
+    queue_id: Option<String>,
+    session_key: String,
+    source_thread_id: String,
+    replacement_thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lane_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_backend_context_generation: Option<String>,
+    replacement_backend_context_generation: String,
+    rpc_request_id: i64,
+    goal_checksum: String,
+    completion_criteria_checksum: String,
+    projection_checksum: String,
+    checkpoint_checksum: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    echoed_goal_checksum: Option<String>,
+    echoed_status: Option<String>,
+    auto_turn_observed: bool,
+    auto_turn_id: Option<String>,
+    status: String,
+    verified: bool,
+    reason: String,
+    updated_at_ms: i64,
+}
+
+struct CodexGoalRehydrationRun {
+    auto_turn_id: Option<String>,
+    auto_turn_wait: Option<ProtocolWait>,
+}
+
+#[derive(Debug, Clone)]
+struct CodexCompactAttemptAuthority {
+    receipts_file: PathBuf,
+    queue_id: Option<String>,
+    session_key: String,
+    lane_digest: Option<String>,
+    backend_context_generation: Option<String>,
+    resume_settle_status: Option<String>,
+    active_goal_observed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexCompactAttemptReceipt {
+    schema: &'static str,
+    queue_id: Option<String>,
+    session_key: String,
+    thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lane_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend_context_generation: Option<String>,
+    rpc_request_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_settle_status: Option<String>,
+    active_goal_observed: bool,
+    requested_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acknowledged_at_ms: Option<i64>,
+    observed_turn_ids: Vec<String>,
+    observed_item_ids: Vec<String>,
+    observed_event_classifications: Vec<String>,
+    compaction_started: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    core_rollout_abort_reason: Option<String>,
+    status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_classification: Option<String>,
+    updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -935,6 +1202,8 @@ struct CodexRuntimePlanFile {
     #[serde(default)]
     pub provider_request_policy: crate::TurnProviderRequestPolicy,
     #[serde(default)]
+    pub web_search: CodexWebSearchPlan,
+    #[serde(default)]
     pub prompt_authority: CodexPromptAuthority,
     pub prompt_bundle_json: PathBuf,
     pub prompt_markdown: PathBuf,
@@ -942,6 +1211,8 @@ struct CodexRuntimePlanFile {
     pub media_plan: InboundMediaInputPlan,
     pub invocation: CodexInvocationPlan,
     pub outputs: CodexOutputPlan,
+    #[serde(skip)]
+    goal_rehydration: Option<CodexGoalRehydrationRequest>,
 }
 
 fn prompt_authority_from_prepared_turn(
@@ -979,6 +1250,13 @@ fn prompt_authority_from_prepared_turn(
             })
             .and_then(canonical_static_config_revision)
             .map(ToString::to_string);
+    let backend_context_generation = string_field(
+        manifest,
+        &["backendContextGeneration", "backend_context_generation"],
+    )
+    .map(str::trim)
+    .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+    .map(ToString::to_string);
     let requires_fresh_backend_thread = bundle
         .get("requiresFreshBackendThread")
         .or_else(|| bundle.get("requires_fresh_backend_thread"))
@@ -994,6 +1272,7 @@ fn prompt_authority_from_prepared_turn(
         role,
         lane_digest,
         static_config_revision,
+        backend_context_generation,
         requires_fresh_backend_thread,
     }
 }
@@ -1221,6 +1500,15 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
         .and_then(|value| serde_json::from_value::<crate::TurnProviderRequestPolicy>(value).ok())
         .unwrap_or_default();
     let prompt_authority = prompt_authority_from_prepared_turn(&bundle, &prepared_receipt);
+    let user_message = prompt_bundle_user_message(&prompt_bundle_json)?;
+    let web_search = plan_codex_web_search(
+        &options.harness_home,
+        user_message.as_deref(),
+        &bundle,
+        &prepared_receipt,
+        prompt_authority.lane_digest.as_deref(),
+        provider.as_deref(),
+    )?;
     let inbound_media_artifacts =
         inbound_media_artifacts_from_prepared_receipt(&prepared_receipt, &mut warnings);
     let native_image_input_enabled = codex_native_media_input_enabled(&options.harness_home);
@@ -1287,7 +1575,10 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
     };
     let app_server_sandbox = resolve_codex_sandbox_policy(&options.harness_home, &mut warnings);
     let provider_config = codex_provider_config(provider.as_deref());
-    let codex_home = harness_codex_home(&options.harness_home, provider_config.as_ref());
+    let codex_home = Some(harness_codex_home(
+        &options.harness_home,
+        provider_config.as_ref(),
+    )?);
     ensure_harness_codex_config(
         codex_home.as_deref(),
         &working_directory,
@@ -1327,6 +1618,7 @@ pub fn plan_codex_runtime(options: CodexRuntimePlanOptions) -> io::Result<CodexR
         reasoning_preference,
         backend_reasoning_policy,
         provider_request_policy,
+        web_search,
         prompt_authority,
         prompt_bundle_json,
         prompt_markdown,
@@ -1492,6 +1784,7 @@ pub fn preflight_codex_runtime(
         &options.harness_home,
         &plan.invocation.env_requirements,
     ));
+    checks.push(check_backend_auth_readiness(&options.harness_home, &plan)?);
     let has_failures = checks
         .iter()
         .any(|check| check.status == CodexRuntimePreflightCheckStatus::Fail);
@@ -1509,7 +1802,15 @@ pub fn preflight_codex_runtime(
             "codex runtime plan passed local preflight checks".to_string()
         }
         CodexRuntimePreflightStatus::Blocked => {
-            format!("codex runtime preflight blocked by {failed_count} failed check(s)")
+            if checks.iter().any(|check| {
+                check.name == "backend-auth"
+                    && check.status == CodexRuntimePreflightCheckStatus::Fail
+                    && check.detail.contains("needs-operator-auth")
+            }) {
+                "needs-operator-auth; codex runtime preflight deferred".to_string()
+            } else {
+                format!("codex runtime preflight blocked by {failed_count} failed check(s)")
+            }
         }
         CodexRuntimePreflightStatus::NoRuntimePlan => unreachable!(),
     };
@@ -1586,13 +1887,14 @@ pub fn probe_codex_runtime_launch(
             );
         }
         CodexRuntimePreflightStatus::Blocked => {
+            let reason = preflight.receipt.reason.clone();
             let receipt = CodexRuntimeLaunchProbeReceipt {
                 queue_id: preflight.receipt.queue_id,
                 status: CodexRuntimeLaunchProbeStatus::PreflightBlocked,
                 execution_dir: preflight.execution_dir,
                 plan_file: preflight.plan_file,
                 launch_file: launch_file.clone(),
-                reason: "codex runtime launch blocked by preflight failures".to_string(),
+                reason,
             };
             return write_launch_probe_report(
                 CodexRuntimeLaunchProbeReport {
@@ -1766,6 +2068,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             );
         }
         CodexRuntimePreflightStatus::Blocked => {
+            let reason = preflight.receipt.reason.clone();
             let receipt = CodexRuntimeRunReceipt {
                 queue_id: preflight.receipt.queue_id,
                 status: CodexRuntimeRunStatus::PreflightBlocked,
@@ -1776,7 +2079,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 transcript_file: None,
                 trajectory_file: None,
                 codex_binding_file: None,
-                reason: "codex runtime run blocked by preflight failures".to_string(),
+                reason,
                 elapsed_ms: 0,
                 event_count: 0,
                 usage: None,
@@ -1939,6 +2242,7 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
     warnings.extend(narration_config.warnings.clone());
     if let Some(stdout_log_path) = stdout_log.as_ref()
         && let Some(recovered) = recover_completed_codex_run_from_stdout_log(
+            &options.harness_home,
             &plan,
             stdout_log_path,
             stderr_log.clone(),
@@ -2160,6 +2464,12 @@ fn finish_codex_runtime_run(
     {
         run_result.stdout_log = Some(stale_stdout_log);
     }
+    if let Some(usage) = run_result.usage.as_mut() {
+        usage.provider = plan.provider.clone();
+        usage.model = plan.model.clone();
+        usage.backend_context_generation = plan.prompt_authority.backend_context_generation.clone();
+        usage.observed_at_ms.get_or_insert(finished_at_ms);
+    }
     let receipt = CodexRuntimeRunReceipt {
         queue_id: plan.queue_id.clone(),
         status,
@@ -2177,7 +2487,8 @@ fn finish_codex_runtime_run(
             .and_then(|report| report.trajectory_file.clone()),
         codex_binding_file: completion
             .as_ref()
-            .and_then(|report| report.codex_binding_file.clone()),
+            .and_then(|report| report.codex_binding_file.clone())
+            .or_else(|| Some(plan.outputs.codex_binding_file.clone())),
         reason,
         elapsed_ms,
         event_count: run_result.event_count,
@@ -2279,6 +2590,7 @@ fn rotate_stale_stdout_log(
 }
 
 fn recover_completed_codex_run_from_stdout_log(
+    harness_home: &Path,
     plan: &CodexRuntimePlanFile,
     stdout_log: &Path,
     stderr_log: Option<PathBuf>,
@@ -2290,7 +2602,10 @@ fn recover_completed_codex_run_from_stdout_log(
 
     let file = fs::File::open(stdout_log)?;
     let reader = BufReader::new(file);
-    let mut state = CodexProtocolState::default();
+    let mut state = CodexProtocolState {
+        goal_projection_observer: Some(CodexGoalProjectionObserver::new(harness_home, plan)?),
+        ..CodexProtocolState::default()
+    };
     let mut progress = None;
     let mut event_count = 0usize;
     let mut completed = false;
@@ -2301,6 +2616,7 @@ fn recover_completed_codex_run_from_stdout_log(
     for line in reader.lines() {
         let line = line?;
         event_count += 1;
+        state.event_count = event_count;
         match serde_json::from_str::<Value>(&line) {
             Ok(value) => {
                 record_protocol_usage_event(&value, &mut state);
@@ -2857,12 +3173,77 @@ fn preflight_codex_context(
     )
     .or_else(|| thread_health.latest_usage.clone());
     let latest_tokens = latest_usage.as_ref().and_then(codex_usage_total_tokens);
-    let model_context_window = policy.model_context_window;
+    let now_ms = current_log_time_ms().unwrap_or(0);
+    let (live_model_context_window, live_capacity_freshness) = match latest_usage.as_ref() {
+        Some(usage) if usage.model_context_window.is_some() => {
+            let route_matches = plan.provider.is_some()
+                && plan.model.is_some()
+                && usage.provider.as_deref() == plan.provider.as_deref()
+                && usage.model.as_deref() == plan.model.as_deref();
+            let generation_matches = plan
+                .prompt_authority
+                .backend_context_generation
+                .as_deref()
+                .is_some_and(|generation| {
+                    usage.backend_context_generation.as_deref() == Some(generation)
+                });
+            let observation_fresh = usage.observed_at_ms.is_some_and(|observed_at_ms| {
+                observed_at_ms <= now_ms
+                    && now_ms.saturating_sub(observed_at_ms)
+                        <= i64::try_from(policy.context_capacity_max_age_ms).unwrap_or(i64::MAX)
+            });
+            if !route_matches {
+                (None, "route-mismatch")
+            } else if !generation_matches {
+                (None, "backend-generation-mismatch")
+            } else if !observation_fresh {
+                (None, "stale")
+            } else {
+                (usage.model_context_window, "fresh")
+            }
+        }
+        _ => (None, "missing"),
+    };
+    if latest_usage
+        .as_ref()
+        .and_then(|usage| usage.model_context_window)
+        .is_some()
+        && live_model_context_window.is_none()
+    {
+        warnings.push(format!(
+            "ignored backend-reported model context capacity because its freshness classification is {live_capacity_freshness}"
+        ));
+    }
+    let (model_context_window, model_context_window_source, model_context_window_freshness) =
+        if let Some(window) = live_model_context_window {
+            (
+                Some(window),
+                latest_usage
+                    .as_ref()
+                    .and_then(|usage| usage.model_context_window_source.clone())
+                    .unwrap_or_else(|| "backend-token-usage".to_string()),
+                live_capacity_freshness.to_string(),
+            )
+        } else if let Some(window) = policy.model_context_window {
+            (
+                Some(window),
+                "static-route-config".to_string(),
+                "static".to_string(),
+            )
+        } else {
+            (
+                None,
+                "unknown".to_string(),
+                live_capacity_freshness.to_string(),
+            )
+        };
     let active_context_ratio = latest_tokens.and_then(|tokens| {
         model_context_window
             .filter(|window| *window > 0)
             .map(|window| tokens as f64 / window as f64)
     });
+    let model_context_window_observed_at_ms =
+        latest_usage.as_ref().and_then(|usage| usage.observed_at_ms);
     let has_existing_thread = plan.invocation.thread_id.is_some();
     let (compact_before_turn, reason) = if !policy.enabled {
         (false, "codexContext policy disabled".to_string())
@@ -2909,16 +3290,6 @@ fn preflight_codex_context(
                 "latest usage {tokens} token(s) is at or above model_auto_compact_token_limit {limit}"
             ),
         )
-    } else if let Some(tokens) = latest_tokens
-        && tokens >= policy.high_context_usage_compact_token_limit
-    {
-        (
-            true,
-            format!(
-                "latest absolute usage {tokens} token(s) is at or above highContextUsageCompactTokenLimit {}",
-                policy.high_context_usage_compact_token_limit
-            ),
-        )
     } else if let Some(ratio) = active_context_ratio
         && ratio >= policy.compact_at_active_context_ratio
     {
@@ -2939,6 +3310,17 @@ fn preflight_codex_context(
         (
             false,
             "known usage is above warning threshold but below compact threshold".to_string(),
+        )
+    } else if model_context_window.is_none()
+        && let Some(tokens) = latest_tokens
+        && tokens >= policy.high_context_usage_compact_token_limit
+    {
+        (
+            true,
+            format!(
+                "model context capacity is unknown or stale; latest absolute usage {tokens} token(s) is at or above failsafe highContextUsageCompactTokenLimit {}",
+                policy.high_context_usage_compact_token_limit
+            ),
         )
     } else {
         (
@@ -2970,6 +3352,9 @@ fn preflight_codex_context(
         thread_id: plan.invocation.thread_id.clone(),
         latest_usage,
         model_context_window,
+        model_context_window_source,
+        model_context_window_freshness,
+        model_context_window_observed_at_ms,
         active_context_ratio,
         thread_health_status,
         thread_health,
@@ -3050,6 +3435,8 @@ pub struct CodexPromptAuthority {
     pub lane_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_config_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_context_generation: Option<String>,
     #[serde(default)]
     pub requires_fresh_backend_thread: bool,
 }
@@ -3413,6 +3800,14 @@ fn load_codex_context_policy(harness_home: &Path) -> io::Result<CodexContextPoli
         {
             policy.high_context_usage_compact_token_limit = value;
         }
+        if let Some(value) = context_u64(
+            context,
+            &["contextCapacityMaxAgeMs", "context_capacity_max_age_ms"],
+        )
+        .filter(|value| *value > 0)
+        {
+            policy.context_capacity_max_age_ms = value;
+        }
         policy.model_auto_compact_token_limit_scope = context_string(
             context,
             &[
@@ -3620,6 +4015,7 @@ impl RuntimeCancelCheck {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if is_transient_cancel_request_read_error(&error) => return Ok(None),
             Err(error) => return Err(error),
         };
         let request: RuntimeCancelRequest =
@@ -3644,6 +4040,20 @@ impl RuntimeCancelCheck {
             },
         )?;
         Ok(Some(reason))
+    }
+}
+
+fn is_transient_cancel_request_read_error(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        // A producer may still be closing a newly written cancel marker. Missing this
+        // poll is safe because the marker remains present and the next poll consumes it.
+        matches!(error.raw_os_error(), Some(32 | 33))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
     }
 }
 
@@ -3837,7 +4247,10 @@ fn drive_codex_app_server(
     };
     let (line_rx, mut reader_handle) = spawn_stdout_reader(stdout, stdout_log.clone());
     let mut timeouts = CodexProtocolTimeouts::new(timeout_ms, idle_timeout_ms);
-    let mut state = CodexProtocolState::default();
+    let mut state = CodexProtocolState {
+        goal_projection_observer: Some(CodexGoalProjectionObserver::new(harness_home, plan)?),
+        ..CodexProtocolState::default()
+    };
     let cancel_check =
         RuntimeCancelCheck::new(harness_home, &plan.session_key, plan.queue_id.clone());
     let mut progress =
@@ -3876,6 +4289,38 @@ fn drive_codex_app_server(
             error,
         ));
     }
+    let initialize_started = Instant::now();
+    let initialize_deadline = (initialize_started
+        + Duration::from_millis(CODEX_CAPABILITY_HANDSHAKE_TIMEOUT_MS))
+    .min(timeouts.absolute_deadline);
+    match wait_for_codex_capability_rpc_response(
+        &line_rx,
+        &mut child,
+        &mut stdin,
+        &mut state,
+        &mut progress,
+        &mut timeouts,
+        plan.invocation.approval_policy,
+        Some(&cancel_check),
+        0,
+        "initialize",
+        CODEX_CAPABILITY_HANDSHAKE_TIMEOUT_MS,
+        initialize_deadline,
+    )? {
+        Ok(_) => {}
+        Err(failure) => {
+            return Ok(codex_app_server_terminal_failure_result(
+                &mut child,
+                &mut reader_handle,
+                &mut state,
+                &stdout_log,
+                &stderr_log,
+                failure.status(),
+                failure.reason().to_string(),
+                None,
+            ));
+        }
+    }
     if let Err(error) = write_json_rpc(
         &mut stdin,
         &json!({
@@ -3893,7 +4338,6 @@ fn drive_codex_app_server(
             error,
         ));
     }
-    let mut thread_params = json!({});
     let app_server_approval_policy = app_server_approval_policy_for_plan(harness_home, plan);
     let app_server_sandbox = app_server_sandbox_for_plan(plan);
     let runtime_workspace_root = plan
@@ -3901,6 +4345,90 @@ fn drive_codex_app_server(
         .working_directory
         .to_string_lossy()
         .to_string();
+    let web_search_capability = if let Err(error) = write_json_rpc(
+        &mut stdin,
+        &json!({
+            "id": CODEX_WEB_SEARCH_CAPABILITY_REQUEST_ID,
+            "method": "modelProvider/capabilities/read",
+            "params": {}
+        }),
+    ) {
+        unavailable_codex_web_search_capability(&format!(
+            "model-provider-capability-request-write-failed:{error}"
+        ))
+    } else {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(
+                CODEX_WEB_SEARCH_CAPABILITY_TIMEOUT_MS,
+            ))
+            .unwrap_or_else(Instant::now);
+        match wait_for_codex_capability_rpc_response(
+            &line_rx,
+            &mut child,
+            &mut stdin,
+            &mut state,
+            &mut progress,
+            &mut timeouts,
+            plan.invocation.approval_policy,
+            Some(&cancel_check),
+            CODEX_WEB_SEARCH_CAPABILITY_REQUEST_ID,
+            "modelProvider/capabilities/read",
+            CODEX_WEB_SEARCH_CAPABILITY_TIMEOUT_MS,
+            deadline,
+        )? {
+            Ok(result) => parse_codex_web_search_capability(&result).unwrap_or_else(|error| {
+                state.warnings.push(format!(
+                    "Codex provider web-search capability response was unusable: {error}"
+                ));
+                unavailable_codex_web_search_capability(
+                    "model-provider-capability-response-invalid",
+                )
+            }),
+            Err(failure) => {
+                state.warnings.push(format!(
+                    "Codex provider web-search capability could not be verified: {}",
+                    failure.reason()
+                ));
+                unavailable_codex_web_search_capability(failure.reason())
+            }
+        }
+    };
+    let web_search_receipt = decide_effective_codex_web_search(
+        &plan.web_search,
+        web_search_capability,
+        plan.channel_lane.clone(),
+        plan.queue_id.clone(),
+    );
+    if let Err(error) = persist_codex_web_search_decision(&execution_dir, &web_search_receipt) {
+        return Ok(codex_app_server_terminal_failure_result(
+            &mut child,
+            &mut reader_handle,
+            &mut state,
+            &stdout_log,
+            &stderr_log,
+            CodexRuntimeRunStatus::ProtocolError,
+            format!("failed to persist Codex web-search decision before thread start: {error}"),
+            None,
+        ));
+    }
+    state.web_search_observer = Some(CodexWebSearchObserver::new(
+        &execution_dir,
+        web_search_receipt.clone(),
+    ));
+    let web_search_bindings_file =
+        codex_web_search_thread_bindings_file(&plan.outputs.codex_binding_file);
+    let mut selected_resume_thread_id = plan.invocation.thread_id.clone();
+    if let Some(thread_id) = selected_resume_thread_id.as_deref() {
+        let prior_binding =
+            read_codex_web_search_thread_binding(&web_search_bindings_file, thread_id)?;
+        if !codex_web_search_resume_is_stable(prior_binding.as_ref(), &web_search_receipt) {
+            state.warnings.push(format!(
+                "Codex web-search mode/provider/lane binding changed or was not previously receipted; starting a fresh thread instead of resuming {thread_id}"
+            ));
+            selected_resume_thread_id = None;
+        }
+    }
+    let mut thread_params = json!({});
     if let Some(model) = &plan.model {
         thread_params["model"] = json!(model);
     }
@@ -3912,10 +4440,15 @@ fn drive_codex_app_server(
     thread_params["approvalPolicy"] = json!(app_server_approval_policy.clone());
     thread_params["sandbox"] = json!(app_server_sandbox_mode_value(&app_server_sandbox));
     thread_params["runtimeWorkspaceRoots"] = json!([runtime_workspace_root.clone()]);
-    thread_params["developerInstructions"] = json!(codex_app_server_developer_instructions(
-        &plan.prompt_authority,
-    ));
-    let thread_method = if let Some(thread_id) = &plan.invocation.thread_id {
+    let mut developer_instructions =
+        codex_app_server_developer_instructions(&plan.prompt_authority);
+    if let Some(limitation) = web_search_receipt.limitation_notice.as_deref() {
+        developer_instructions.push_str("\n\nWeb-search policy limitation: ");
+        developer_instructions.push_str(limitation);
+    }
+    thread_params["developerInstructions"] = json!(developer_instructions);
+    thread_params["web_search"] = web_search_receipt.effective_mode_value();
+    let thread_method = if let Some(thread_id) = &selected_resume_thread_id {
         thread_params["threadId"] = json!(thread_id);
         "thread/resume"
     } else {
@@ -4116,8 +4649,150 @@ fn drive_codex_app_server(
             });
         }
     };
+    if let Err(error) = persist_codex_web_search_thread_binding(
+        &web_search_bindings_file,
+        &thread_id,
+        &web_search_receipt,
+    ) {
+        return Ok(codex_app_server_terminal_failure_result(
+            &mut child,
+            &mut reader_handle,
+            &mut state,
+            &stdout_log,
+            &stderr_log,
+            CodexRuntimeRunStatus::ProtocolError,
+            format!("failed to persist Codex web-search thread binding: {error}"),
+            Some(thread_id),
+        ));
+    }
+    if let Some(observer) = state.goal_projection_observer.as_mut() {
+        observer.set_current_thread(&thread_id);
+    }
     let mut context_recovery = None;
+    let mut resume_settle_status = None;
+    let mut resume_active_goal_observed = false;
+    if plan.invocation.thread_id.is_some() {
+        let mut settle = settle_resumed_thread(
+            harness_home,
+            plan,
+            &thread_id,
+            &line_rx,
+            &mut child,
+            &mut stdin,
+            &mut state,
+            &mut progress,
+            &mut timeouts,
+            plan.invocation.approval_policy,
+            Some(&cancel_check),
+            narration_config,
+        )?;
+        let restored_wait = match settle.restored_turn_wait.take() {
+            Some(wait) => Some(wait),
+            None if settle.receipt.restored_turn_observed => Some(wait_for_turn_completed(
+                &line_rx,
+                &mut child,
+                &mut stdin,
+                &mut state,
+                &mut progress,
+                &mut timeouts,
+                plan.invocation.approval_policy,
+                Some(&cancel_check),
+                narration_config,
+                None,
+            )?),
+            None => None,
+        };
+        if let Some(restored_wait) = restored_wait {
+            match restored_wait {
+                ProtocolWait::TurnCompleted => {
+                    settle.receipt.restored_turn_completed = true;
+                    settle.receipt.status = "restored-turn-drained".to_string();
+                    settle.receipt.reason =
+                        "resume-restored turn completed before maintenance dispatch".to_string();
+                    settle.receipt.settled_at_ms = current_log_time_ms()?;
+                    append_json_line(
+                        &harness_home
+                            .join("state")
+                            .join("runtime-queue")
+                            .join("codex-resume-settle-receipts.jsonl"),
+                        &settle.receipt,
+                    )?;
+                    state.warnings.push(
+                        "resume-settle drained a restored goal turn before same-thread maintenance"
+                            .to_string(),
+                    );
+                    // Restored automatic-turn output is internal postlude. The
+                    // explicit queued turn remains the only delivery owner.
+                    state.assistant_output = AssistantOutputCapture::default();
+                    state.active_tool_use = None;
+                }
+                ProtocolWait::TimedOut(reason) => {
+                    return Ok(codex_app_server_terminal_failure_result(
+                        &mut child,
+                        &mut reader_handle,
+                        &mut state,
+                        &stdout_log,
+                        &stderr_log,
+                        CodexRuntimeRunStatus::Timeout,
+                        format!("resume-settle timed out before maintenance: {reason}"),
+                        Some(thread_id.clone()),
+                    ));
+                }
+                ProtocolWait::Canceled(reason) => {
+                    return Ok(codex_app_server_terminal_failure_result(
+                        &mut child,
+                        &mut reader_handle,
+                        &mut state,
+                        &stdout_log,
+                        &stderr_log,
+                        CodexRuntimeRunStatus::Canceled,
+                        format!("resume-settle canceled before maintenance: {reason}"),
+                        Some(thread_id.clone()),
+                    ));
+                }
+                ProtocolWait::ToolUseTimedOut { reason, .. } | ProtocolWait::Failed(reason) => {
+                    return Ok(codex_app_server_terminal_failure_result(
+                        &mut child,
+                        &mut reader_handle,
+                        &mut state,
+                        &stdout_log,
+                        &stderr_log,
+                        CodexRuntimeRunStatus::ProtocolError,
+                        format!("resume-settle failed before maintenance: {reason}"),
+                        Some(thread_id.clone()),
+                    ));
+                }
+                ProtocolWait::ThreadStarted(_) | ProtocolWait::CompactCompleted => {
+                    return Ok(codex_app_server_terminal_failure_result(
+                        &mut child,
+                        &mut reader_handle,
+                        &mut state,
+                        &stdout_log,
+                        &stderr_log,
+                        CodexRuntimeRunStatus::ProtocolError,
+                        "resume-settle observed an unexpected maintenance/thread response"
+                            .to_string(),
+                        Some(thread_id.clone()),
+                    ));
+                }
+            }
+        }
+        resume_active_goal_observed = settle.receipt.active_goal_observed;
+        resume_settle_status = Some(settle.receipt.status.clone());
+    }
     if compact_before_turn {
+        let compact_authority = CodexCompactAttemptAuthority {
+            receipts_file: harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("codex-compact-attempt-receipts.jsonl"),
+            queue_id: plan.queue_id.clone(),
+            session_key: plan.session_key.clone(),
+            lane_digest: plan.prompt_authority.lane_digest.clone(),
+            backend_context_generation: plan.prompt_authority.backend_context_generation.clone(),
+            resume_settle_status: resume_settle_status.clone(),
+            active_goal_observed: resume_active_goal_observed,
+        };
         match run_official_context_compact(
             &line_rx,
             &mut child,
@@ -4130,6 +4805,7 @@ fn drive_codex_app_server(
             narration_config,
             &thread_id,
             2,
+            compact_authority,
         )? {
             ProtocolWait::CompactCompleted => {
                 record_official_compact_rollover_accounting(
@@ -4349,7 +5025,44 @@ fn drive_codex_app_server(
             }
         }
     }
-    let turn_start_request_id = if compact_before_turn { 3 } else { 2 };
+    let mut turn_start_request_id = if compact_before_turn { 3 } else { 2 };
+    if let Some(rehydration) = plan.goal_rehydration.as_ref() {
+        let rehydrated = rehydrate_goal_on_thread(
+            harness_home,
+            plan,
+            rehydration,
+            &thread_id,
+            turn_start_request_id,
+            &line_rx,
+            &mut child,
+            &mut stdin,
+            &mut state,
+            &mut progress,
+            &mut timeouts,
+            plan.invocation.approval_policy,
+            Some(&cancel_check),
+            narration_config,
+        )?;
+        turn_start_request_id += 1;
+        if rehydrated.auto_turn_id.is_some() {
+            return finish_rehydrated_goal_auto_turn(
+                &line_rx,
+                &mut child,
+                &mut reader_handle,
+                &mut stdin,
+                &mut state,
+                &mut progress,
+                &mut timeouts,
+                plan.invocation.approval_policy,
+                Some(&cancel_check),
+                narration_config,
+                rehydrated.auto_turn_wait,
+                &thread_id,
+                &stdout_log,
+                &stderr_log,
+            );
+        }
+    }
     let reasoning_snapshot_present =
         plan.reasoning_preference.is_some() || plan.backend_reasoning_policy.is_some();
     let validated_reasoning = match validated_codex_turn_effort(harness_home, plan) {
@@ -5069,6 +5782,7 @@ fn drive_codex_app_server(
                 .to_string(),
         ),
     };
+    let deadline_drain_sent = steer_bridge.deadline_drain_sent;
     steer_bridge.finish(active_status, &active_reason)?;
 
     let status = match wait_result {
@@ -5296,7 +6010,12 @@ fn drive_codex_app_server(
     );
     Ok(CodexAppServerRunResult {
         status,
-        reason: "codex app-server turn completed and assistant output was captured".to_string(),
+        reason: if deadline_drain_sent {
+            "codex app-server turn completed after deadline drain and assistant output was captured"
+                .to_string()
+        } else {
+            "codex app-server turn completed and assistant output was captured".to_string()
+        },
         assistant_message,
         assistant_narration,
         assistant_raw_message,
@@ -5591,13 +6310,14 @@ fn wait_for_codex_capability_rpc_response(
     cancel_check: Option<&RuntimeCancelCheck>,
     request_id: i64,
     method: &str,
+    timeout_ms: u64,
     handshake_deadline: Instant,
 ) -> io::Result<Result<Value, CodexCapabilityHandshakeFailure>> {
     loop {
         let now = Instant::now();
         if now >= handshake_deadline {
             return Ok(Err(CodexCapabilityHandshakeFailure::TimedOut(format!(
-                "timed out waiting for Codex app-server {method} response after {CODEX_CAPABILITY_HANDSHAKE_TIMEOUT_MS}ms"
+                "timed out waiting for Codex app-server {method} response after {timeout_ms}ms"
             ))));
         }
         let poll_interval = handshake_deadline
@@ -5724,6 +6444,7 @@ fn verify_codex_reasoning_capability_same_connection(
         cancel_check,
         CODEX_CAPABILITY_CONFIG_READ_REQUEST_ID,
         "config/read",
+        CODEX_CAPABILITY_HANDSHAKE_TIMEOUT_MS,
         handshake_deadline,
     )? {
         Ok(result) => result,
@@ -5787,6 +6508,7 @@ fn verify_codex_reasoning_capability_same_connection(
             cancel_check,
             request_id,
             "model/list",
+            CODEX_CAPABILITY_HANDSHAKE_TIMEOUT_MS,
             handshake_deadline,
         )? {
             Ok(result) => result,
@@ -6841,6 +7563,12 @@ fn run_context_checkpoint_fallback(
     let mut fallback_plan = plan.clone();
     fallback_plan.invocation.thread_id = None;
     fallback_plan.invocation.prompt_input_file = fallback_prompt_file;
+    fallback_plan.goal_rehydration = load_goal_rehydration_request(
+        harness_home,
+        plan,
+        original_thread_id.as_deref(),
+        &checkpoint_file,
+    )?;
     let mut fallback_result = drive_codex_app_server(
         harness_home,
         &fallback_plan,
@@ -6901,6 +7629,49 @@ fn run_context_checkpoint_fallback(
         },
     });
     Ok(fallback_result)
+}
+
+fn load_goal_rehydration_request(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    original_thread_id: Option<&str>,
+    checkpoint_file: &Path,
+) -> io::Result<Option<CodexGoalRehydrationRequest>> {
+    let Some(original_thread_id) = original_thread_id else {
+        return Ok(None);
+    };
+    let projections_file = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("codex-goal-projection-receipts.jsonl");
+    if !projections_file.is_file() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&projections_file)?;
+    let projection = text
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<CodexGoalProjectionV1>(line).ok())
+        .find(|projection| {
+            projection.schema == CODEX_GOAL_PROJECTION_SCHEMA
+                && projection.queue_id == plan.queue_id
+                && projection.session_key == plan.session_key
+                && projection.source_thread_id == original_thread_id
+                && projection.lane_digest == plan.prompt_authority.lane_digest
+                && projection.backend_context_generation
+                    == plan.prompt_authority.backend_context_generation
+        })
+        .filter(|projection| {
+            projection.projection_complete && projection.status.eq_ignore_ascii_case("active")
+        });
+    let Some(projection) = projection else {
+        return Ok(None);
+    };
+    let checkpoint_checksum = sha256_prefixed(&fs::read(checkpoint_file)?);
+    Ok(Some(CodexGoalRehydrationRequest {
+        projection,
+        checkpoint_checksum,
+    }))
 }
 
 struct ContextRolloverFiles {
@@ -7431,6 +8202,8 @@ struct CodexProtocolState {
     warnings: Vec<String>,
     denied_approval_requests: Vec<String>,
     backend_reasoning_execution: Option<CodexBackendReasoningExecutionReference>,
+    goal_projection_observer: Option<CodexGoalProjectionObserver>,
+    web_search_observer: Option<CodexWebSearchObserver>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9039,6 +9812,569 @@ fn wait_for_thread_start(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn settle_resumed_thread(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    thread_id: &str,
+    line_rx: &mpsc::Receiver<Result<String, String>>,
+    child: &mut std::process::Child,
+    stdin: &mut impl Write,
+    state: &mut CodexProtocolState,
+    progress: &mut Option<CodexProgressEmitter>,
+    timeouts: &mut CodexProtocolTimeouts,
+    approval_policy: CodexApprovalPolicy,
+    cancel_check: Option<&RuntimeCancelCheck>,
+    narration_config: &AssistantNarrationConfig,
+) -> io::Result<CodexResumeSettleRun> {
+    let started = Instant::now();
+    let started_at_ms = current_log_time_ms()?;
+    let starting_event_count = state.event_count;
+    let mut active_goal_observed = false;
+    let mut thread_active_observed = false;
+    let mut restored_turn_id = None;
+    let mut restored_turn_completed = false;
+    let mut terminal = None;
+    let mut status = "quiescent".to_string();
+    let mut reason = "resume postlude reached a bounded quiet window".to_string();
+
+    loop {
+        match receive_protocol_event(
+            line_rx,
+            child,
+            state,
+            timeouts,
+            cancel_check,
+            Some(Duration::from_millis(CODEX_RESUME_SETTLE_QUIET_MS)),
+        )? {
+            ProtocolEvent::Json(value) => {
+                record_protocol_usage_event(&value, state);
+                if let Some(error) = protocol_error(&value) {
+                    status = "failed".to_string();
+                    reason = format!("resume postlude reported an error: {error}");
+                    terminal = Some(ProtocolWait::Failed(error));
+                    break;
+                }
+                emit_codex_progress(progress, &value, state);
+                if answer_unattended_server_request(&value, stdin, state, approval_policy)? {
+                    continue;
+                }
+                if is_active_goal_update(&value) && compact_event_matches_thread(&value, thread_id)
+                {
+                    active_goal_observed = true;
+                }
+                thread_active_observed |= is_thread_active_status(&value);
+                if is_regular_turn_started(&value)
+                    && let Some(turn_id) = extract_turn_id(&value)
+                {
+                    restored_turn_id = Some(turn_id);
+                    status = "restored-turn-active".to_string();
+                    reason =
+                        "resume restored an automatic regular turn; maintenance ownership deferred"
+                            .to_string();
+                    break;
+                }
+                collect_agent_output(&value, state, progress, narration_config);
+                if is_turn_completed(&value) {
+                    record_turn_usage(&value, state);
+                    restored_turn_id = restored_turn_id.or_else(|| extract_turn_id(&value));
+                    restored_turn_completed = true;
+                    terminal = Some(match turn_completed_failure_reason(&value) {
+                        Some(error) => ProtocolWait::Failed(error),
+                        None => ProtocolWait::TurnCompleted,
+                    });
+                    status = "restored-turn-drained".to_string();
+                    reason =
+                        "resume-restored turn completed before maintenance dispatch".to_string();
+                    break;
+                }
+            }
+            ProtocolEvent::Poll => {
+                if thread_active_observed
+                    && started.elapsed() < Duration::from_millis(CODEX_RESUME_SETTLE_MAX_MS)
+                {
+                    continue;
+                }
+                if thread_active_observed {
+                    status = "active-without-turn-id".to_string();
+                    reason =
+                        "resume postlude remained active without a correlated turn id".to_string();
+                    terminal = Some(ProtocolWait::Failed(reason.clone()));
+                }
+                break;
+            }
+            ProtocolEvent::TimedOut(timeout_reason) => {
+                status = "timed-out".to_string();
+                reason = timeout_reason.clone();
+                terminal = Some(ProtocolWait::TimedOut(timeout_reason));
+                break;
+            }
+            ProtocolEvent::Failed(failure) => {
+                status = "failed".to_string();
+                reason = failure.clone();
+                terminal = Some(ProtocolWait::Failed(failure));
+                break;
+            }
+            ProtocolEvent::Canceled(cancel_reason) => {
+                status = "canceled".to_string();
+                reason = cancel_reason.clone();
+                terminal = Some(ProtocolWait::Canceled(cancel_reason));
+                break;
+            }
+        }
+    }
+    let receipt = CodexResumeSettleReceipt {
+        schema: CODEX_RESUME_SETTLE_SCHEMA,
+        queue_id: plan.queue_id.clone(),
+        session_key: plan.session_key.clone(),
+        thread_id: thread_id.to_string(),
+        lane_digest: plan.prompt_authority.lane_digest.clone(),
+        backend_context_generation: plan.prompt_authority.backend_context_generation.clone(),
+        started_at_ms,
+        settled_at_ms: current_log_time_ms()?,
+        observed_event_count: state.event_count.saturating_sub(starting_event_count),
+        usage_observed: state.usage.is_some(),
+        active_goal_observed,
+        thread_active_observed,
+        restored_turn_observed: restored_turn_id.is_some(),
+        restored_turn_id,
+        restored_turn_completed,
+        status,
+        reason,
+    };
+    append_json_line(
+        &harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-resume-settle-receipts.jsonl"),
+        &receipt,
+    )?;
+    Ok(CodexResumeSettleRun {
+        receipt,
+        restored_turn_wait: terminal,
+    })
+}
+
+fn is_active_goal_update(value: &Value) -> bool {
+    if !matches!(json_method(value), Some("thread/goal/updated")) {
+        return false;
+    }
+    first_string_pointer(
+        value,
+        &[
+            "/params/goal/status",
+            "/params/goal/state",
+            "/params/status",
+        ],
+    )
+    .map(|status| {
+        status
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_', ' '], "")
+    })
+    .is_some_and(|status| matches!(status.as_str(), "active" | "running" | "inprogress"))
+}
+
+fn goal_projection_from_event(
+    observer: &CodexGoalProjectionObserver,
+    expected_thread_id: &str,
+    observation_order: u64,
+    value: &Value,
+    prior: Option<&CodexGoalProjectionV1>,
+) -> io::Result<Option<CodexGoalProjectionV1>> {
+    if !matches!(json_method(value), Some("thread/goal/updated")) {
+        return Ok(None);
+    }
+    let objective = first_string_pointer(value, &["/params/goal/objective", "/params/objective"])
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| prior.map(|projection| projection.objective.clone()))
+        .unwrap_or_default();
+    let status = first_string_pointer(value, &["/params/goal/status", "/params/status"])
+        .or_else(|| prior.map(|projection| projection.status.clone()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let token_budget = ["/params/goal/tokenBudget", "/params/tokenBudget"]
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(json_value_u64))
+        .or_else(|| prior.and_then(|projection| projection.token_budget));
+    let completion_criteria = value
+        .pointer("/params/goal/completionCriteria")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .take(32)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .or_else(|| prior.map(|projection| projection.completion_criteria.clone()))
+        .unwrap_or_default();
+    let goal_checksum = codex_goal_checksum(&objective, &status, token_budget, &[])?;
+    let backend_goal_ref = first_string_pointer(
+        value,
+        &["/params/goal/id", "/params/goal/goalId", "/params/goalId"],
+    )
+    .or_else(|| prior.and_then(|projection| projection.backend_goal_ref.clone()));
+    let goal_reference = backend_goal_ref
+        .clone()
+        .or_else(|| {
+            prior
+                .map(|projection| projection.goal_reference.clone())
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| goal_checksum.clone());
+    let completion_criteria_checksum =
+        sha256_prefixed(&serde_json::to_vec(&completion_criteria).map_err(io::Error::other)?);
+    let projection_checksum =
+        codex_goal_checksum(&objective, &status, token_budget, &completion_criteria)?;
+    let projection_complete = !objective.is_empty()
+        && !matches!(status.trim().to_ascii_lowercase().as_str(), "" | "unknown");
+    Ok(Some(CodexGoalProjectionV1 {
+        schema: CODEX_GOAL_PROJECTION_SCHEMA.to_string(),
+        queue_id: observer.queue_id.clone(),
+        session_key: observer.session_key.clone(),
+        source_thread_id: expected_thread_id.to_string(),
+        source_turn_id: extract_turn_id(value)
+            .or_else(|| prior.and_then(|projection| projection.source_turn_id.clone())),
+        goal_reference,
+        backend_goal_ref,
+        lane_digest: observer.lane_digest.clone(),
+        backend_context_generation: observer.backend_context_generation.clone(),
+        objective,
+        status,
+        token_budget,
+        completion_criteria,
+        goal_checksum,
+        completion_criteria_checksum,
+        projection_checksum,
+        projection_complete,
+        projection_reason: (!projection_complete).then(|| {
+            "backend goal update lacked an objective or status and no exact prior projection supplied it"
+                .to_string()
+        }),
+        observation_order,
+        observed_at_ms: current_log_time_ms()?,
+    }))
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn codex_goal_checksum(
+    objective: &str,
+    status: &str,
+    token_budget: Option<u64>,
+    completion_criteria: &[String],
+) -> io::Result<String> {
+    let canonical = serde_json::to_vec(&json!({
+        "objective": objective,
+        "status": status,
+        "tokenBudget": token_budget,
+        "completionCriteria": completion_criteria,
+    }))
+    .map_err(io::Error::other)?;
+    Ok(sha256_prefixed(&canonical))
+}
+
+fn sha256_prefixed(bytes: &[u8]) -> String {
+    let digest = digest::digest(&digest::SHA256, bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest.as_ref() {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    format!("sha256:{hex}")
+}
+
+fn json_value_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|value| value.try_into().ok()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rehydrate_goal_on_thread(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+    request: &CodexGoalRehydrationRequest,
+    replacement_thread_id: &str,
+    request_id: i64,
+    line_rx: &mpsc::Receiver<Result<String, String>>,
+    child: &mut std::process::Child,
+    stdin: &mut impl Write,
+    state: &mut CodexProtocolState,
+    progress: &mut Option<CodexProgressEmitter>,
+    timeouts: &mut CodexProtocolTimeouts,
+    approval_policy: CodexApprovalPolicy,
+    cancel_check: Option<&RuntimeCancelCheck>,
+    narration_config: &AssistantNarrationConfig,
+) -> io::Result<CodexGoalRehydrationRun> {
+    let receipts_file = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("codex-goal-rehydration-receipts.jsonl");
+    let replacement_generation = format!(
+        "codex-thread:{replacement_thread_id}:goal={}",
+        request.projection.projection_checksum
+    );
+    let mut receipt = CodexGoalRehydrationReceiptV1 {
+        schema: CODEX_GOAL_REHYDRATION_SCHEMA,
+        queue_id: plan.queue_id.clone(),
+        session_key: plan.session_key.clone(),
+        source_thread_id: request.projection.source_thread_id.clone(),
+        replacement_thread_id: replacement_thread_id.to_string(),
+        lane_digest: request.projection.lane_digest.clone(),
+        source_backend_context_generation: request.projection.backend_context_generation.clone(),
+        replacement_backend_context_generation: replacement_generation,
+        rpc_request_id: request_id,
+        goal_checksum: request.projection.goal_checksum.clone(),
+        completion_criteria_checksum: request.projection.completion_criteria_checksum.clone(),
+        projection_checksum: request.projection.projection_checksum.clone(),
+        checkpoint_checksum: request.checkpoint_checksum.clone(),
+        echoed_goal_checksum: None,
+        echoed_status: None,
+        auto_turn_observed: false,
+        auto_turn_id: None,
+        status: "planned".to_string(),
+        verified: false,
+        reason: "goal rehydration planned for verified replacement thread".to_string(),
+        updated_at_ms: current_log_time_ms()?,
+    };
+    append_json_line(&receipts_file, &receipt)?;
+    write_json_rpc(
+        stdin,
+        &json!({
+            "id": request_id,
+            "method": "thread/goal/set",
+            "params": {
+                "threadId": replacement_thread_id,
+                "objective": request.projection.objective,
+                "status": "active",
+                "tokenBudget": request.projection.token_budget
+            }
+        }),
+    )?;
+
+    let mut acknowledged = false;
+    let mut echoed = false;
+    let mut verified_since = None;
+    let mut auto_turn_wait = None;
+    loop {
+        let poll_interval =
+            verified_since.map(|_| Duration::from_millis(CODEX_RESUME_SETTLE_QUIET_MS));
+        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check, poll_interval)?
+        {
+            ProtocolEvent::Json(value) => {
+                record_protocol_usage_event(&value, state);
+                emit_codex_progress(progress, &value, state);
+                if answer_unattended_server_request(&value, stdin, state, approval_policy)? {
+                    continue;
+                }
+                if json_id(&value) == Some(request_id) {
+                    if let Some(error) = protocol_error(&value) {
+                        receipt.status = "failed".to_string();
+                        receipt.reason = compact_attempt_bounded_text(&error);
+                        receipt.updated_at_ms = current_log_time_ms()?;
+                        append_json_line(&receipts_file, &receipt)?;
+                        return Err(io::Error::other(error));
+                    }
+                    acknowledged = true;
+                } else if matches!(json_method(&value), Some("thread/goal/updated"))
+                    && compact_event_matches_thread(&value, replacement_thread_id)
+                {
+                    let objective = first_string_pointer(
+                        &value,
+                        &["/params/goal/objective", "/params/objective"],
+                    )
+                    .unwrap_or_default();
+                    let status =
+                        first_string_pointer(&value, &["/params/goal/status", "/params/status"])
+                            .unwrap_or_default();
+                    let token_budget = ["/params/goal/tokenBudget", "/params/tokenBudget"]
+                        .iter()
+                        .find_map(|pointer| value.pointer(pointer).and_then(json_value_u64));
+                    let checksum = codex_goal_checksum(&objective, &status, token_budget, &[])?;
+                    receipt.echoed_goal_checksum = Some(checksum.clone());
+                    receipt.echoed_status = Some(status.clone());
+                    if checksum != request.projection.goal_checksum
+                        || !status.eq_ignore_ascii_case("active")
+                    {
+                        receipt.status = "failed".to_string();
+                        receipt.reason = "replacement thread echoed a mismatched goal checksum or non-active status".to_string();
+                        receipt.updated_at_ms = current_log_time_ms()?;
+                        append_json_line(&receipts_file, &receipt)?;
+                        return Err(io::Error::other(receipt.reason.clone()));
+                    }
+                    echoed = true;
+                } else if matches!(json_method(&value), Some("turn/started"))
+                    && compact_event_matches_thread(&value, replacement_thread_id)
+                {
+                    receipt.auto_turn_observed = true;
+                    receipt.auto_turn_id = extract_turn_id(&value);
+                } else if is_turn_completed(&value)
+                    && receipt.auto_turn_observed
+                    && compact_event_matches_thread(&value, replacement_thread_id)
+                {
+                    record_turn_usage(&value, state);
+                    collect_agent_output(&value, state, progress, narration_config);
+                    auto_turn_wait = Some(match turn_completed_failure_reason(&value) {
+                        Some(reason) => ProtocolWait::Failed(reason),
+                        None => ProtocolWait::TurnCompleted,
+                    });
+                } else {
+                    collect_agent_output(&value, state, progress, narration_config);
+                }
+                if acknowledged && echoed && verified_since.is_none() {
+                    verified_since = Some(Instant::now());
+                }
+            }
+            ProtocolEvent::Poll if acknowledged && echoed => break,
+            ProtocolEvent::Poll => continue,
+            ProtocolEvent::TimedOut(reason)
+            | ProtocolEvent::Failed(reason)
+            | ProtocolEvent::Canceled(reason) => {
+                receipt.status = "failed".to_string();
+                receipt.reason = compact_attempt_bounded_text(&reason);
+                receipt.updated_at_ms = current_log_time_ms()?;
+                append_json_line(&receipts_file, &receipt)?;
+                return Err(io::Error::other(reason));
+            }
+        }
+    }
+    receipt.status = "verified".to_string();
+    receipt.verified = true;
+    receipt.reason = "replacement thread acknowledged goal/set and echoed the exact active goal checksum before continuation".to_string();
+    receipt.updated_at_ms = current_log_time_ms()?;
+    append_json_line(&receipts_file, &receipt)?;
+    Ok(CodexGoalRehydrationRun {
+        auto_turn_id: receipt.auto_turn_id,
+        auto_turn_wait,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_rehydrated_goal_auto_turn(
+    line_rx: &mpsc::Receiver<Result<String, String>>,
+    child: &mut std::process::Child,
+    reader_handle: &mut StdoutReaderHandle,
+    stdin: &mut impl Write,
+    state: &mut CodexProtocolState,
+    progress: &mut Option<CodexProgressEmitter>,
+    timeouts: &mut CodexProtocolTimeouts,
+    approval_policy: CodexApprovalPolicy,
+    cancel_check: Option<&RuntimeCancelCheck>,
+    narration_config: &AssistantNarrationConfig,
+    observed_wait: Option<ProtocolWait>,
+    thread_id: &str,
+    stdout_log: &Path,
+    stderr_log: &Path,
+) -> io::Result<CodexAppServerRunResult> {
+    let wait = match observed_wait {
+        Some(wait) => wait,
+        None => wait_for_turn_completed(
+            line_rx,
+            child,
+            stdin,
+            state,
+            progress,
+            timeouts,
+            approval_policy,
+            cancel_check,
+            narration_config,
+            None,
+        )?,
+    };
+    if !matches!(wait, ProtocolWait::TurnCompleted) {
+        let (status, reason, tool) = match wait {
+            ProtocolWait::TimedOut(reason) => (CodexRuntimeRunStatus::Timeout, reason, None),
+            ProtocolWait::Canceled(reason) => (CodexRuntimeRunStatus::Canceled, reason, None),
+            ProtocolWait::ToolUseTimedOut { reason, tool } => {
+                (CodexRuntimeRunStatus::Timeout, reason, Some(tool))
+            }
+            ProtocolWait::Failed(reason) => {
+                (codex_status_for_protocol_failure(&reason), reason, None)
+            }
+            _ => (
+                CodexRuntimeRunStatus::ProtocolError,
+                "unexpected protocol result while draining rehydrated goal turn".to_string(),
+                None,
+            ),
+        };
+        finish_codex_child_and_stdout_reader(
+            child,
+            reader_handle,
+            &mut state.warnings,
+            "rehydrated goal turn failed",
+        );
+        return Ok(CodexAppServerRunResult {
+            status,
+            reason,
+            assistant_message: state.assistant_message_with_harness_notices(),
+            assistant_narration: state.assistant_narration_records(),
+            assistant_raw_message: state.assistant_raw_message(),
+            assistant_final_found: state.assistant_final_found(),
+            thread_id: Some(thread_id.to_string()),
+            event_count: state.event_count,
+            usage: state.usage.clone(),
+            stdout_log: Some(stdout_log.to_path_buf()),
+            stderr_log: Some(stderr_log.to_path_buf()),
+            context_recovery: None,
+            tool_use_timeout: tool,
+            interruption_reason: None,
+            interrupted_tool_uses: Vec::new(),
+            backend_reasoning_execution: state.backend_reasoning_execution.clone(),
+            warnings: state.warnings.clone(),
+        });
+    }
+    let assistant_output = state.assistant_message();
+    let status = if assistant_output.trim().is_empty() {
+        CodexRuntimeRunStatus::ProtocolError
+    } else {
+        CodexRuntimeRunStatus::Completed
+    };
+    let reason = if status == CodexRuntimeRunStatus::Completed {
+        "rehydrated goal auto-turn completed after checksum verification".to_string()
+    } else {
+        "rehydrated goal auto-turn completed without captured assistant output".to_string()
+    };
+    finish_codex_child_and_stdout_reader(
+        child,
+        reader_handle,
+        &mut state.warnings,
+        "rehydrated goal turn completed",
+    );
+    Ok(CodexAppServerRunResult {
+        status,
+        reason,
+        assistant_message: state.assistant_message_with_harness_notices(),
+        assistant_narration: state.assistant_narration_records(),
+        assistant_raw_message: state.assistant_raw_message(),
+        assistant_final_found: state.assistant_final_found(),
+        thread_id: Some(thread_id.to_string()),
+        event_count: state.event_count,
+        usage: state.usage.clone(),
+        stdout_log: Some(stdout_log.to_path_buf()),
+        stderr_log: Some(stderr_log.to_path_buf()),
+        context_recovery: None,
+        tool_use_timeout: None,
+        interruption_reason: None,
+        interrupted_tool_uses: Vec::new(),
+        backend_reasoning_execution: state.backend_reasoning_execution.clone(),
+        warnings: state.warnings.clone(),
+    })
+}
+
+fn is_thread_active_status(value: &Value) -> bool {
+    matches!(json_method(value), Some("thread/status/changed"))
+        && first_string_pointer(value, &["/params/status", "/params/thread/status"])
+            .is_some_and(|status| status.eq_ignore_ascii_case("active"))
+}
+
 fn run_official_context_compact(
     line_rx: &mpsc::Receiver<Result<String, String>>,
     child: &mut std::process::Child,
@@ -9051,8 +10387,34 @@ fn run_official_context_compact(
     narration_config: &AssistantNarrationConfig,
     thread_id: &str,
     request_id: i64,
+    authority: CodexCompactAttemptAuthority,
 ) -> io::Result<ProtocolWait> {
-    write_json_rpc(
+    let requested_at_ms = current_log_time_ms()?;
+    let mut receipt = CodexCompactAttemptReceipt {
+        schema: CODEX_COMPACT_ATTEMPT_SCHEMA,
+        queue_id: authority.queue_id,
+        session_key: authority.session_key,
+        thread_id: thread_id.to_string(),
+        lane_digest: authority.lane_digest,
+        backend_context_generation: authority.backend_context_generation,
+        rpc_request_id: request_id,
+        resume_settle_status: authority.resume_settle_status,
+        active_goal_observed: authority.active_goal_observed,
+        requested_at_ms,
+        acknowledged_at_ms: None,
+        observed_turn_ids: Vec::new(),
+        observed_item_ids: Vec::new(),
+        observed_event_classifications: vec!["compact-request-planned".to_string()],
+        compaction_started: false,
+        public_status: None,
+        public_error: None,
+        core_rollout_abort_reason: None,
+        status: "planned".to_string(),
+        final_classification: None,
+        updated_at_ms: requested_at_ms,
+    };
+    append_json_line(&authority.receipts_file, &receipt)?;
+    if let Err(error) = write_json_rpc(
         stdin,
         &json!({
             "id": request_id,
@@ -9061,7 +10423,15 @@ fn run_official_context_compact(
                 "threadId": thread_id
             }
         }),
-    )?;
+    ) {
+        receipt.status = "failed".to_string();
+        receipt.final_classification = Some("compact-failed".to_string());
+        receipt.public_error = Some(compact_attempt_bounded_text(&error.to_string()));
+        receipt.updated_at_ms = current_log_time_ms()?;
+        compact_attempt_push_classification(&mut receipt, "compact-request-write-failed");
+        append_json_line(&authority.receipts_file, &receipt)?;
+        return Err(error);
+    }
     wait_for_context_compaction_completed(
         line_rx,
         child,
@@ -9073,6 +10443,8 @@ fn run_official_context_compact(
         cancel_check,
         narration_config,
         request_id,
+        &authority.receipts_file,
+        receipt,
     )
 }
 
@@ -9086,65 +10458,265 @@ fn wait_for_context_compaction_completed(
     approval_policy: CodexApprovalPolicy,
     cancel_check: Option<&RuntimeCancelCheck>,
     narration_config: &AssistantNarrationConfig,
-    _request_id: i64,
+    request_id: i64,
+    receipts_file: &Path,
+    mut receipt: CodexCompactAttemptReceipt,
 ) -> io::Result<ProtocolWait> {
-    let mut compaction_item_completed = false;
     loop {
-        let poll_interval = compaction_item_completed.then_some(Duration::from_millis(100));
-        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check, poll_interval)?
-        {
+        match receive_protocol_event(line_rx, child, state, timeouts, cancel_check, None)? {
             ProtocolEvent::Json(value) => {
                 record_protocol_usage_event(&value, state);
-                if let Some(error) = protocol_error(&value) {
-                    return Ok(ProtocolWait::Failed(error));
-                }
                 emit_codex_progress(progress, &value, state);
                 if answer_unattended_server_request(&value, stdin, state, approval_policy)? {
                     continue;
                 }
-                if is_context_compaction_started(&value) {
+
+                if json_id(&value) == Some(request_id) {
+                    if let Some(error) = protocol_error(&value) {
+                        receipt.status = "failed".to_string();
+                        receipt.final_classification = Some("compact-failed".to_string());
+                        receipt.public_error = Some(compact_attempt_bounded_text(&error));
+                        receipt.updated_at_ms = current_log_time_ms()?;
+                        compact_attempt_push_classification(
+                            &mut receipt,
+                            "compact-rpc-error-response",
+                        );
+                        append_json_line(receipts_file, &receipt)?;
+                        return Ok(ProtocolWait::Failed(error));
+                    }
+                    receipt.acknowledged_at_ms = Some(current_log_time_ms()?);
+                    if !receipt.compaction_started {
+                        receipt.status = "rpc-acknowledged".to_string();
+                    }
+                    receipt.updated_at_ms = current_log_time_ms()?;
+                    compact_attempt_push_classification(&mut receipt, "compact-rpc-acknowledged");
+                    append_json_line(receipts_file, &receipt)?;
+                    continue;
+                }
+
+                if let Some(error) = protocol_error(&value) {
+                    receipt.status = "failed".to_string();
+                    receipt.final_classification = Some("compact-failed".to_string());
+                    receipt.public_error = Some(compact_attempt_bounded_text(&error));
+                    receipt.updated_at_ms = current_log_time_ms()?;
+                    compact_attempt_push_classification(&mut receipt, "compact-protocol-error");
+                    append_json_line(receipts_file, &receipt)?;
+                    return Ok(ProtocolWait::Failed(error));
+                }
+
+                if is_active_goal_update(&value) {
+                    receipt.active_goal_observed = true;
+                    compact_attempt_push_classification(&mut receipt, "active-goal-observed");
+                }
+                if is_context_compaction_started(&value)
+                    && compact_event_matches_thread(&value, &receipt.thread_id)
+                {
+                    receipt.compaction_started = true;
+                    receipt.status = "compact-item-started".to_string();
+                    receipt.updated_at_ms = current_log_time_ms()?;
+                    if let Some(item_id) = extract_protocol_item_id(&value) {
+                        compact_attempt_push_unique(&mut receipt.observed_item_ids, item_id);
+                    }
+                    compact_attempt_push_classification(&mut receipt, "compact-item-started");
+                    append_json_line(receipts_file, &receipt)?;
                     state
                         .warnings
                         .push("Codex official context compaction started".to_string());
                     continue;
                 }
-                if is_thread_compacted(&value) {
+                if is_thread_compacted(&value)
+                    && compact_event_matches_thread(&value, &receipt.thread_id)
+                {
+                    receipt.status = "compacted".to_string();
+                    receipt.final_classification = Some("succeeded".to_string());
+                    receipt.updated_at_ms = current_log_time_ms()?;
+                    compact_attempt_push_classification(&mut receipt, "thread-compacted");
+                    append_json_line(receipts_file, &receipt)?;
                     state
                         .warnings
                         .push("Codex official context compaction completed".to_string());
                     return Ok(ProtocolWait::CompactCompleted);
                 }
-                if is_context_compaction_completed(&value) {
-                    compaction_item_completed = true;
-                    continue;
+                if is_context_compaction_completed(&value)
+                    && compact_event_matches_thread(&value, &receipt.thread_id)
+                {
+                    let completed_item_id = extract_protocol_item_id(&value);
+                    if receipt.compaction_started
+                        && completed_item_id.as_ref().is_some_and(|item_id| {
+                            !receipt.observed_item_ids.is_empty()
+                                && !receipt.observed_item_ids.contains(item_id)
+                        })
+                    {
+                        compact_attempt_push_classification(
+                            &mut receipt,
+                            "foreign-compact-item-completed",
+                        );
+                        continue;
+                    }
+                    if let Some(item_id) = completed_item_id {
+                        compact_attempt_push_unique(&mut receipt.observed_item_ids, item_id);
+                    }
+                    receipt.status = "compacted".to_string();
+                    receipt.final_classification = Some("succeeded".to_string());
+                    receipt.updated_at_ms = current_log_time_ms()?;
+                    compact_attempt_push_classification(&mut receipt, "compact-item-completed");
+                    append_json_line(receipts_file, &receipt)?;
+                    state
+                        .warnings
+                        .push("Codex official context compaction completed".to_string());
+                    return Ok(ProtocolWait::CompactCompleted);
                 }
                 if is_turn_completed(&value) {
                     record_turn_usage(&value, state);
-                    if let Some(reason) = turn_completed_failure_reason(&value) {
-                        return Ok(ProtocolWait::Failed(reason));
+                    if let Some(turn_id) = extract_turn_id(&value) {
+                        compact_attempt_push_unique(&mut receipt.observed_turn_ids, turn_id);
                     }
-                    if compaction_item_completed {
-                        state
-                            .warnings
-                            .push("Codex official context compaction completed".to_string());
-                        return Ok(ProtocolWait::CompactCompleted);
+                    receipt.public_status = turn_completed_public_status(&value);
+                    receipt.public_error = turn_completed_public_error(&value)
+                        .map(|error| compact_attempt_bounded_text(&error));
+                    receipt.core_rollout_abort_reason = compact_attempt_core_abort_reason(&value);
+                    let classification = if is_compact_only_turn_completed(&value) {
+                        "uncorrelated-compact-only-turn-completed"
+                    } else if turn_completed_failure_reason(&value).is_some() {
+                        "intervening-turn-aborted"
+                    } else {
+                        "intervening-turn-completed"
+                    };
+                    compact_attempt_push_classification(&mut receipt, classification);
+                    receipt.updated_at_ms = current_log_time_ms()?;
+                    append_json_line(receipts_file, &receipt)?;
+                    state.warnings.push(format!(
+                        "ignored {classification} while awaiting exact compact item correlation"
+                    ));
+                    continue;
+                }
+                if is_context_compaction_started(&value)
+                    || is_context_compaction_completed(&value)
+                    || is_thread_compacted(&value)
+                {
+                    compact_attempt_push_classification(
+                        &mut receipt,
+                        "foreign-thread-compact-event",
+                    );
+                    receipt.updated_at_ms = current_log_time_ms()?;
+                    append_json_line(receipts_file, &receipt)?;
+                    continue;
+                }
+                if json_id(&value).is_some() {
+                    compact_attempt_push_classification(&mut receipt, "foreign-rpc-response");
+                    if receipt.acknowledged_at_ms.is_none() {
+                        receipt.updated_at_ms = current_log_time_ms()?;
+                        append_json_line(receipts_file, &receipt)?;
                     }
-                    return Ok(ProtocolWait::TurnCompleted);
                 }
                 collect_agent_output(&value, state, progress, narration_config);
             }
-            ProtocolEvent::Poll if compaction_item_completed => {
-                state
-                    .warnings
-                    .push("Codex official context compaction completed".to_string());
-                return Ok(ProtocolWait::CompactCompleted);
-            }
             ProtocolEvent::Poll => continue,
-            ProtocolEvent::TimedOut(reason) => return Ok(ProtocolWait::TimedOut(reason)),
-            ProtocolEvent::Failed(reason) => return Ok(ProtocolWait::Failed(reason)),
-            ProtocolEvent::Canceled(reason) => return Ok(ProtocolWait::Canceled(reason)),
+            ProtocolEvent::TimedOut(reason) => {
+                compact_attempt_finalize_uncertain(&mut receipt, &reason, "timeout");
+                append_json_line(receipts_file, &receipt)?;
+                return Ok(ProtocolWait::TimedOut(reason));
+            }
+            ProtocolEvent::Failed(reason) => {
+                compact_attempt_finalize_uncertain(&mut receipt, &reason, "stream-failed");
+                append_json_line(receipts_file, &receipt)?;
+                return Ok(ProtocolWait::Failed(reason));
+            }
+            ProtocolEvent::Canceled(reason) => {
+                receipt.status = "failed".to_string();
+                receipt.final_classification = Some("compact-failed".to_string());
+                receipt.public_error = Some(compact_attempt_bounded_text(&reason));
+                receipt.updated_at_ms = current_log_time_ms()?;
+                compact_attempt_push_classification(&mut receipt, "compact-canceled");
+                append_json_line(receipts_file, &receipt)?;
+                return Ok(ProtocolWait::Canceled(reason));
+            }
         }
     }
+}
+
+fn compact_attempt_finalize_uncertain(
+    receipt: &mut CodexCompactAttemptReceipt,
+    reason: &str,
+    event: &str,
+) {
+    let acknowledged_or_started =
+        receipt.acknowledged_at_ms.is_some() || receipt.compaction_started;
+    receipt.status = if acknowledged_or_started {
+        "ambiguous".to_string()
+    } else {
+        "failed".to_string()
+    };
+    receipt.final_classification = Some(if acknowledged_or_started {
+        "ambiguous".to_string()
+    } else {
+        "compact-failed".to_string()
+    });
+    receipt.public_error = Some(compact_attempt_bounded_text(reason));
+    receipt.updated_at_ms = current_log_time_ms().unwrap_or(receipt.updated_at_ms);
+    compact_attempt_push_classification(receipt, event);
+}
+
+fn compact_attempt_push_classification(
+    receipt: &mut CodexCompactAttemptReceipt,
+    classification: &str,
+) {
+    if receipt.observed_event_classifications.len() < 64 {
+        receipt
+            .observed_event_classifications
+            .push(classification.to_string());
+    }
+}
+
+fn compact_attempt_push_unique(values: &mut Vec<String>, value: String) {
+    if values.len() < 32 && !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn compact_event_matches_thread(value: &Value, expected_thread_id: &str) -> bool {
+    extract_thread_id(value)
+        .as_deref()
+        .is_none_or(|thread_id| thread_id == expected_thread_id)
+}
+
+fn extract_protocol_item_id(value: &Value) -> Option<String> {
+    first_string_pointer(value, &["/params/item/id", "/params/itemId", "/params/id"])
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn turn_completed_public_status(value: &Value) -> Option<String> {
+    first_string_pointer(value, &["/params/turn/status", "/params/status"])
+        .map(|status| status.trim().to_string())
+        .filter(|status| !status.is_empty())
+}
+
+fn turn_completed_public_error(value: &Value) -> Option<String> {
+    value
+        .pointer("/params/turn/error")
+        .or_else(|| value.pointer("/params/error"))
+        .filter(|error| !error.is_null())
+        .map(render_protocol_error)
+        .filter(|error| !error.trim().is_empty())
+}
+
+fn compact_attempt_core_abort_reason(value: &Value) -> Option<String> {
+    first_string_pointer(
+        value,
+        &[
+            "/params/turn/error/additionalDetails",
+            "/params/error/additionalDetails",
+            "/params/turn/abortReason",
+            "/params/abortReason",
+        ],
+    )
+    .map(|reason| compact_attempt_bounded_text(&reason))
+    .filter(|reason| !reason.is_empty())
+}
+
+fn compact_attempt_bounded_text(value: &str) -> String {
+    crate::progress::sanitize_progress_preview(value, 256)
 }
 
 fn wait_for_turn_completed(
@@ -9699,6 +11271,8 @@ fn extract_thread_id(value: &Value) -> Option<String> {
         "/result/id",
         "/params/thread/id",
         "/params/threadId",
+        "/params/goal/thread/id",
+        "/params/goal/threadId",
     ] {
         if let Some(text) = value.pointer(pointer).and_then(Value::as_str) {
             return Some(text.to_string());
@@ -10030,6 +11604,7 @@ fn turn_completed_failure_reason(value: &Value) -> Option<String> {
     let detail = value
         .pointer("/params/turn/error")
         .or_else(|| value.pointer("/params/error"))
+        .filter(|error| !error.is_null())
         .map(render_protocol_error)
         .or_else(|| {
             value
@@ -10048,14 +11623,58 @@ fn turn_completed_failure_reason(value: &Value) -> Option<String> {
 
 fn record_turn_usage(value: &Value, state: &mut CodexProtocolState) {
     if let Some(usage) = extract_turn_usage(value) {
-        state.usage = Some(usage);
+        merge_protocol_usage(&mut state.usage, usage);
     }
 }
 
 fn record_protocol_usage_event(value: &Value, state: &mut CodexProtocolState) {
     if let Some(usage) = extract_protocol_usage(value) {
-        state.usage = Some(usage);
+        merge_protocol_usage(&mut state.usage, usage);
     }
+    if let Some(mut observer) = state.goal_projection_observer.take() {
+        if let Err(error) = observer.observe(value, state.event_count as u64) {
+            state.warnings.push(format!(
+                "goal projection observer rejected a backend event: {}",
+                compact_attempt_bounded_text(&error.to_string())
+            ));
+        }
+        state.goal_projection_observer = Some(observer);
+    }
+    if let Some(mut observer) = state.web_search_observer.take() {
+        if let Err(error) = observer.observe(value, state.event_count as u64) {
+            state.warnings.push(format!(
+                "web-search observer rejected a backend event: {}",
+                compact_attempt_bounded_text(&error.to_string())
+            ));
+        }
+        state.web_search_observer = Some(observer);
+    }
+}
+
+fn merge_protocol_usage(current: &mut Option<CodexRuntimeUsage>, incoming: CodexRuntimeUsage) {
+    let Some(previous) = current.take() else {
+        *current = Some(incoming);
+        return;
+    };
+    *current = Some(CodexRuntimeUsage {
+        input_tokens: incoming.input_tokens.or(previous.input_tokens),
+        output_tokens: incoming.output_tokens.or(previous.output_tokens),
+        total_tokens: incoming.total_tokens.or(previous.total_tokens),
+        model_context_window: incoming
+            .model_context_window
+            .or(previous.model_context_window),
+        model_context_window_source: incoming
+            .model_context_window_source
+            .or(previous.model_context_window_source),
+        provider: incoming.provider.or(previous.provider),
+        model: incoming.model.or(previous.model),
+        backend_context_generation: incoming
+            .backend_context_generation
+            .or(previous.backend_context_generation),
+        observed_at_ms: incoming.observed_at_ms.or(previous.observed_at_ms),
+        source: incoming.source,
+        raw: incoming.raw.or(previous.raw),
+    });
 }
 
 fn extract_protocol_usage(value: &Value) -> Option<CodexRuntimeUsage> {
@@ -10091,6 +11710,9 @@ fn extract_turn_usage(value: &Value) -> Option<CodexRuntimeUsage> {
             ],
         );
         let total_tokens = usage_u64(usage, &["totalTokens", "total_tokens"]);
+        let model_context_window =
+            usage_u64(usage, &["modelContextWindow", "model_context_window"])
+                .filter(|value| *value > 0);
         let raw = serde_json::to_string(usage)
             .ok()
             .map(|text| truncate_for_notice(&text, 512));
@@ -10103,6 +11725,17 @@ fn extract_turn_usage(value: &Value) -> Option<CodexRuntimeUsage> {
                 input_tokens,
                 output_tokens,
                 total_tokens,
+                model_context_window,
+                model_context_window_source: model_context_window.map(|_| {
+                    format!(
+                        "{}.modelContextWindow",
+                        pointer.trim_start_matches('/').replace('/', ".")
+                    )
+                }),
+                provider: None,
+                model: None,
+                backend_context_generation: None,
+                observed_at_ms: current_log_time_ms().ok(),
                 source: pointer.trim_start_matches('/').replace('/', "."),
                 raw,
             });
@@ -10148,11 +11781,7 @@ fn extract_token_usage_event(value: &Value) -> Option<CodexRuntimeUsage> {
         if let Some(candidate) = value.pointer(pointer)
             && let Some(usage) = token_usage_from_value(
                 candidate,
-                &format!(
-                    "{}.{}",
-                    pointer.trim_start_matches('/').replace('/', "."),
-                    "token"
-                ),
+                &pointer.trim_start_matches('/').replace('/', "."),
             )
         {
             return Some(usage);
@@ -10207,7 +11836,13 @@ fn direct_token_usage(value: &Value, source: &str) -> Option<CodexRuntimeUsage> 
             "total_token_usage",
         ],
     );
-    if input_tokens.is_none() && output_tokens.is_none() && total_tokens.is_none() {
+    let model_context_window = usage_u64(value, &["modelContextWindow", "model_context_window"])
+        .filter(|value| *value > 0);
+    if input_tokens.is_none()
+        && output_tokens.is_none()
+        && total_tokens.is_none()
+        && model_context_window.is_none()
+    {
         return None;
     }
     let raw = serde_json::to_string(value)
@@ -10217,6 +11852,13 @@ fn direct_token_usage(value: &Value, source: &str) -> Option<CodexRuntimeUsage> 
         input_tokens,
         output_tokens,
         total_tokens,
+        model_context_window,
+        model_context_window_source: model_context_window
+            .map(|_| format!("{source}.modelContextWindow")),
+        provider: None,
+        model: None,
+        backend_context_generation: None,
+        observed_at_ms: current_log_time_ms().ok(),
         source: source.to_string(),
         raw,
     })
@@ -10242,7 +11884,7 @@ fn protocol_error(value: &Value) -> Option<String> {
     } else {
         value.get("error")?
     };
-    Some(render_protocol_error(error))
+    (!error.is_null()).then(|| render_protocol_error(error))
 }
 
 fn codex_status_for_protocol_failure(reason: &str) -> CodexRuntimeRunStatus {
@@ -11547,6 +13189,65 @@ fn codex_oauth_auth_candidates() -> Vec<PathBuf> {
         .collect()
 }
 
+fn check_backend_auth_readiness(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+) -> io::Result<CodexRuntimePreflightCheck> {
+    if !backend_auth_runtime_gate_enabled(harness_home)? {
+        return Ok(pass_check(
+            "backend-auth",
+            "runtime auth gate disabled by default",
+        ));
+    }
+    let provider = plan.provider.as_deref().unwrap_or("openai");
+    if provider != "openai" {
+        return Ok(pass_check(
+            "backend-auth",
+            format!("provider {provider} uses its configured environment requirement gate"),
+        ));
+    }
+    let Some(codex_home) = plan.invocation.codex_home.as_deref() else {
+        return Ok(fail_check(
+            "backend-auth",
+            "needs-operator-auth; provider CODEX_HOME is missing",
+        ));
+    };
+    let state = load_backend_auth_state(codex_home, provider)?;
+    if state.lifecycle_state == BackendAuthLifecycleState::Ready {
+        let resumed = if let Some(queue_id) = plan.queue_id.as_deref() {
+            resume_backend_auth_defer_intent(harness_home, queue_id, provider, &state)?
+                .is_some_and(|decision| decision.changed)
+        } else {
+            false
+        };
+        return Ok(pass_check(
+            "backend-auth",
+            format!(
+                "provider ready at generation {}; continuationResumed={resumed}",
+                state.readiness_generation
+            ),
+        ));
+    }
+    let changed = if let Some(queue_id) = plan.queue_id.as_deref() {
+        record_backend_auth_defer_intent(
+            harness_home,
+            queue_id,
+            provider,
+            state.readiness_generation,
+        )?
+        .changed
+    } else {
+        false
+    };
+    Ok(fail_check(
+        "backend-auth",
+        format!(
+            "needs-operator-auth; lifecycle={:?}; generation={}; continuationDeferred={changed}",
+            state.lifecycle_state, state.readiness_generation
+        ),
+    ))
+}
+
 fn pass_check(name: impl Into<String>, detail: impl Into<String>) -> CodexRuntimePreflightCheck {
     CodexRuntimePreflightCheck {
         name: name.into(),
@@ -11848,24 +13549,11 @@ fn completion_receipt_file(plan: &CodexRuntimePlanFile) -> PathBuf {
 fn harness_codex_home(
     harness_home: &Path,
     provider_config: Option<&CodexProviderConfig>,
-) -> Option<PathBuf> {
-    let harness_home = absolute_for_config(harness_home);
-    if let Some(provider_config) = provider_config {
-        return Some(
-            harness_home
-                .join("codex-home-providers")
-                .join(safe_path_component(&provider_config.provider)),
-        );
-    }
-    let codex_home = harness_home.join("codex-home");
-    if [codex_home.join("auth.json"), codex_home.join("auth.toml")]
-        .iter()
-        .any(|path| path.is_file())
-    {
-        Some(codex_home)
-    } else {
-        None
-    }
+) -> io::Result<PathBuf> {
+    let provider = provider_config
+        .map(|config| config.provider.as_str())
+        .unwrap_or("openai");
+    resolve_or_create_provider_codex_home(harness_home, provider)
 }
 
 fn ensure_harness_codex_config(
@@ -12302,6 +13990,7 @@ mod tests {
             role: CodexPromptAuthorityRole::SubagentWorker,
             lane_digest: Some("c".repeat(64)),
             static_config_revision: Some(format!("sha256:{}", "d".repeat(64))),
+            backend_context_generation: Some("codex-thread:test:policy=managed".to_string()),
             requires_fresh_backend_thread: true,
         };
         let instructions = codex_app_server_developer_instructions(&authority);
@@ -12405,7 +14094,8 @@ mod tests {
                 "tokenUsage": {
                     "input": 1200,
                     "output": 34,
-                    "total": 1234
+                    "total": 1234,
+                    "modelContextWindow": 258400
                 }
             }
         });
@@ -12416,6 +14106,14 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(34));
         assert_eq!(usage.total_tokens, Some(1234));
         assert!(usage.source.contains("params.tokenUsage"));
+        assert_eq!(
+            serde_json::to_value(&usage)
+                .unwrap()
+                .pointer("/modelContextWindow")
+                .and_then(Value::as_u64),
+            Some(258_400),
+            "the runtime usage contract must retain backend-reported capacity"
+        );
     }
 
     #[test]
@@ -13139,7 +14837,7 @@ mod tests {
         assert_eq!(main_plan.provider.as_deref(), Some("openai"));
         assert_eq!(
             main_plan.invocation.codex_home.as_deref(),
-            Some(shared_codex_home.as_path())
+            Some(shared_codex_home.canonicalize().unwrap().as_path())
         );
         let shared_after_main = fs::read_to_string(shared_codex_home.join("config.toml")).unwrap();
         assert!(shared_after_main.starts_with("# Generated by agent-harness."));
@@ -13251,13 +14949,11 @@ mod tests {
     }
 
     #[test]
-    fn plan_codex_runtime_uses_harness_codex_home_when_auth_is_present() {
-        let root = temp_root("plan_codex_runtime_uses_harness_codex_home_when_auth_is_present");
+    fn plan_codex_runtime_creates_harness_codex_home_without_auth() {
+        let root = temp_root("plan_codex_runtime_creates_harness_codex_home_without_auth");
         let source = write_codex_runtime_source(&root);
         let harness_home = root.join(".agent-harness");
         let codex_home = harness_home.join("codex-home");
-        fs::create_dir_all(&codex_home).unwrap();
-        fs::write(codex_home.join("auth.json"), "{}").unwrap();
         enqueue_and_prepare(&source, &harness_home);
 
         let report = plan_codex_runtime(CodexRuntimePlanOptions {
@@ -13268,7 +14964,11 @@ mod tests {
         .unwrap();
 
         let plan = report.plan.unwrap();
-        assert_eq!(plan.invocation.codex_home, Some(codex_home));
+        assert_eq!(
+            plan.invocation.codex_home,
+            Some(codex_home.canonicalize().unwrap())
+        );
+        assert!(!codex_home.join("auth.json").exists());
         let config = fs::read_to_string(
             plan.invocation
                 .codex_home
@@ -13611,9 +15311,6 @@ mod tests {
             current_log_time_ms().unwrap()
         ));
         let harness_home = root.join(".agent-harness");
-        let codex_home = harness_home.join("codex-home");
-        fs::create_dir_all(&codex_home).unwrap();
-        fs::write(codex_home.join("auth.json"), "{}").unwrap();
 
         let resolved = harness_codex_home(&harness_home, None).unwrap();
 
@@ -13726,6 +15423,92 @@ mod tests {
                 .iter()
                 .any(|check| check.name == "codex-executable")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preflight_backend_auth_defers_and_resumes_once_on_newer_ready_generation() {
+        use crate::backend_auth::{
+            BACKEND_AUTH_STATE_SCHEMA, BackendAuthStateV1, persist_backend_auth_state,
+        };
+
+        let root = temp_root("preflight_backend_auth_defer_resume");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"backendAuth":{"runtimeGateEnabled":true}}"#,
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let plan = plan_report.plan.as_ref().unwrap();
+        let queue_id = plan.queue_id.as_deref().unwrap();
+        let codex_home = plan.invocation.codex_home.as_deref().unwrap();
+
+        let deferred = preflight_codex_runtime(CodexRuntimePreflightOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+        })
+        .unwrap();
+        assert_eq!(
+            deferred.receipt.status,
+            CodexRuntimePreflightStatus::Blocked
+        );
+        assert!(deferred.checks.iter().any(|check| {
+            check.name == "backend-auth"
+                && check.status == CodexRuntimePreflightCheckStatus::Fail
+                && check.detail.contains("needs-operator-auth")
+                && check.detail.contains("continuationDeferred=true")
+        }));
+
+        let ready = BackendAuthStateV1 {
+            schema: BACKEND_AUTH_STATE_SCHEMA.to_string(),
+            provider: "openai".to_string(),
+            lifecycle_state: BackendAuthLifecycleState::Ready,
+            readiness_generation: 1,
+            observed_at_ms: current_log_time_ms().unwrap(),
+            operation_id: None,
+            requires_openai_auth: Some(false),
+            failure_code: None,
+        };
+        persist_backend_auth_state(codex_home, &ready).unwrap();
+
+        let resumed = preflight_codex_runtime(CodexRuntimePreflightOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+        })
+        .unwrap();
+        assert_eq!(resumed.receipt.status, CodexRuntimePreflightStatus::Ready);
+        assert!(resumed.checks.iter().any(|check| {
+            check.name == "backend-auth" && check.detail.contains("continuationResumed=true")
+        }));
+        let repeated = preflight_codex_runtime(CodexRuntimePreflightOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+        })
+        .unwrap();
+        assert!(repeated.checks.iter().any(|check| {
+            check.name == "backend-auth" && check.detail.contains("continuationResumed=false")
+        }));
+        let intent = resume_backend_auth_defer_intent(&harness_home, queue_id, "openai", &ready)
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.intent.defer_count, 1);
+        assert_eq!(intent.intent.resume_count, 1);
+        assert!(!intent.changed);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -14145,7 +15928,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
-        assert_eq!(report.receipt.event_count, 4);
+        assert_eq!(report.receipt.event_count, 5);
         assert_eq!(
             report
                 .receipt
@@ -14163,6 +15946,12 @@ mod tests {
             fs::read_to_string(root.join("fake-app-server-input.jsonl")).unwrap();
         assert!(!app_server_input.contains("config/read"));
         assert!(!app_server_input.contains("model/list"));
+        assert!(app_server_input.contains("modelProvider/capabilities/read"));
+        assert!(app_server_input.contains(r#""web_search":"cached""#));
+        let execution_dir = plan_report.execution_dir.as_ref().unwrap();
+        let web_decision =
+            fs::read_to_string(execution_dir.join("codex-web-search-decision.v1.json")).unwrap();
+        assert!(web_decision.contains(r#""effectiveMode": "cached""#));
         let completion = report.completion.unwrap();
         assert_eq!(
             completion.receipt.status,
@@ -14202,6 +15991,101 @@ mod tests {
             fs::read_to_string(transcript_file).unwrap().lines().count(),
             2
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn web_search_live_mode_and_redacted_action_receipt_cross_app_server_boundary() {
+        let root =
+            temp_root("web_search_live_mode_and_redacted_action_receipt_cross_app_server_boundary");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, json!([]));
+        let mut plan: Value = read_json_file(plan_file).unwrap();
+        plan["webSearch"]["requestedMode"] = json!("live");
+        plan["webSearch"]["intent"] = json!("freshness");
+        plan["webSearch"]["reason"] = json!("fixed-integration-freshness-fixture");
+        fs::write(plan_file, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
+        fs::write(root.join("fake-app-server-web-search-event"), "enabled").unwrap();
+        let (executable, arguments) = fake_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let input = fs::read_to_string(root.join("fake-app-server-input.jsonl")).unwrap();
+        assert!(input.contains(r#""web_search":"live""#));
+        let execution_dir = plan_report.execution_dir.unwrap();
+        let action_receipt =
+            fs::read_to_string(execution_dir.join("codex-web-search-actions.v1.jsonl")).unwrap();
+        assert!(action_receipt.contains(r#""effectiveMode":"live""#));
+        assert!(action_receipt.contains(r#""action":"search""#));
+        assert!(action_receipt.contains("queryDigest"));
+        assert!(!action_receipt.contains("private fixture query"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn web_search_capability_absent_forces_disabled_and_limitation_notice() {
+        let root = temp_root("web_search_capability_absent_forces_disabled_and_limitation_notice");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, json!([]));
+        let mut plan: Value = read_json_file(plan_file).unwrap();
+        plan["webSearch"]["requestedMode"] = json!("live");
+        plan["webSearch"]["intent"] = json!("freshness");
+        fs::write(plan_file, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
+        fs::write(root.join("fake-app-server-web-search-absent"), "enabled").unwrap();
+        let (executable, arguments) = fake_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let input = fs::read_to_string(root.join("fake-app-server-input.jsonl")).unwrap();
+        assert!(input.contains(r#""web_search":"disabled""#));
+        assert!(input.contains("Do not claim that online verification or browsing occurred"));
+        let decision = fs::read_to_string(
+            plan_report
+                .execution_dir
+                .unwrap()
+                .join("codex-web-search-decision.v1.json"),
+        )
+        .unwrap();
+        assert!(decision.contains(r#""effectiveMode": "disabled""#));
+        assert!(decision.contains("provider-web-search-capability-absent"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -15348,8 +17232,10 @@ mod tests {
         let plan_file = plan_report.plan_file.as_ref().unwrap();
         let plan: CodexRuntimePlanFile = read_json_file_as(plan_file).unwrap();
         let mut timeouts = CodexProtocolTimeouts::new(30_000, 30_000);
-        timeouts.absolute_deadline = Instant::now() + Duration::from_millis(50);
-        timeouts.deadline_drain_window = Duration::from_millis(100);
+        // Keep the assertion in the drain window without making filesystem setup race a
+        // 50 ms wall-clock deadline on slower Windows hosts.
+        timeouts.absolute_deadline = Instant::now() + Duration::from_secs(5);
+        timeouts.deadline_drain_window = Duration::from_secs(10);
         let mut bridge = CodexTurnSteerBridge::new(
             &harness_home,
             &plan,
@@ -15412,7 +17298,7 @@ mod tests {
         let queue_thread = thread::spawn(move || {
             let session_key = "telegram:dm-42:user-7:main";
             let binding_file = codex_active_turn_binding_file(&queue_harness_home, session_key);
-            for _ in 0..100 {
+            for _ in 0..300 {
                 if let Ok(Some(binding)) = read_codex_active_turn_binding(&binding_file)
                     && binding.active_turn_id.as_deref() == Some("turn-test")
                 {
@@ -15621,6 +17507,7 @@ mod tests {
         );
         assert!(
             recover_completed_codex_run_from_stdout_log(
+                &harness_home,
                 &serde_json::from_slice(&fs::read(plan_file).unwrap()).unwrap(),
                 &stdout_log,
                 None,
@@ -15664,8 +17551,8 @@ mod tests {
             harness_home,
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 10_000,
-            idle_timeout_ms: 10_000,
+            timeout_ms: if cfg!(windows) { 30_000 } else { 10_000 },
+            idle_timeout_ms: if cfg!(windows) { 30_000 } else { 10_000 },
             progress_context: None,
         })
         .unwrap();
@@ -15709,8 +17596,8 @@ mod tests {
             harness_home,
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 10_000,
-            idle_timeout_ms: 10_000,
+            timeout_ms: if cfg!(windows) { 30_000 } else { 10_000 },
+            idle_timeout_ms: if cfg!(windows) { 30_000 } else { 10_000 },
             progress_context: None,
         })
         .unwrap();
@@ -15836,8 +17723,8 @@ mod tests {
             harness_home,
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 10_000,
-            idle_timeout_ms: 10_000,
+            timeout_ms: if cfg!(windows) { 30_000 } else { 10_000 },
+            idle_timeout_ms: if cfg!(windows) { 30_000 } else { 10_000 },
             progress_context: None,
         })
         .unwrap();
@@ -15881,8 +17768,8 @@ mod tests {
             harness_home,
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 20_000,
-            idle_timeout_ms: 3_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 6_000,
             progress_context: None,
         })
         .unwrap();
@@ -15963,6 +17850,399 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    fn run_compact_correlation_fixture(
+        root: &Path,
+        mode: &str,
+    ) -> (PathBuf, CodexRuntimeRunReport) {
+        let source = write_codex_runtime_source(root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"codexContext":{"modelContextWindow":1000,"compactAtActiveContextRatio":0.5,"modelAutoCompactTokenLimit":900}}"#,
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan = plan_report.plan.as_ref().unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, json!([]));
+        replace_invocation_thread_id(plan_file, Some("thread-test"));
+        fs::write(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("codex-runtime-run-receipts.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "codexBindingFile": plan.outputs.codex_binding_file.clone(),
+                    "usage": {
+                        "inputTokens": 920,
+                        "outputTokens": 10,
+                        "totalTokens": 930,
+                        "source": "compact-correlation-schedule"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let (executable, arguments) = compact_correlation_schedule_app_server_command(root, mode);
+        replace_invocation(plan_file, executable, arguments);
+        let plan: CodexRuntimePlanFile = read_json_file_as(plan_file).unwrap();
+        let capability = parse_codex_web_search_capability(&json!({
+            "namespaceTools": true,
+            "imageGeneration": true,
+            "webSearch": true
+        }))
+        .unwrap();
+        let decision = decide_effective_codex_web_search(
+            &plan.web_search,
+            capability,
+            plan.channel_lane.clone(),
+            plan.queue_id.clone(),
+        );
+        persist_codex_web_search_thread_binding(
+            &codex_web_search_thread_bindings_file(&plan.outputs.codex_binding_file),
+            "thread-test",
+            &decision,
+        )
+        .unwrap();
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 10_000,
+            idle_timeout_ms: 10_000,
+            progress_context: None,
+        })
+        .unwrap();
+        (harness_home, report)
+    }
+
+    fn latest_compact_attempt(harness_home: &Path) -> Value {
+        let receipts = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("codex-compact-attempt-receipts.jsonl"),
+        )
+        .unwrap();
+        serde_json::from_str(
+            receipts
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .last()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn compact_attempt_accepts_reordered_item_start_before_rpc_ack() {
+        let root = temp_root("compact-attempt-reordered-item-start-before-ack");
+        let (harness_home, report) = run_compact_correlation_fixture(&root, "reordered");
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let attempt = latest_compact_attempt(&harness_home);
+        assert_eq!(
+            attempt.get("finalClassification").and_then(Value::as_str),
+            Some("succeeded")
+        );
+        let events = attempt
+            .get("observedEventClassifications")
+            .and_then(Value::as_array)
+            .unwrap();
+        let started = events
+            .iter()
+            .position(|event| event.as_str() == Some("compact-item-started"))
+            .unwrap();
+        let acknowledged = events
+            .iter()
+            .position(|event| event.as_str() == Some("compact-rpc-acknowledged"))
+            .unwrap();
+        assert!(started < acknowledged);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compact_attempt_death_after_ack_is_ambiguous_not_success() {
+        let root = temp_root("compact-attempt-death-after-ack");
+        let (harness_home, report) = run_compact_correlation_fixture(&root, "death-after-ack");
+        assert_eq!(
+            report.receipt.status,
+            CodexRuntimeRunStatus::Completed,
+            "the existing checkpoint-and-fresh-thread fallback may finish the queued turn, but it must not rewrite the ambiguous compact attempt as success"
+        );
+        let attempt = latest_compact_attempt(&harness_home);
+        assert_eq!(
+            attempt.get("status").and_then(Value::as_str),
+            Some("ambiguous")
+        );
+        assert_eq!(
+            attempt.get("finalClassification").and_then(Value::as_str),
+            Some("ambiguous")
+        );
+        assert!(attempt.get("acknowledgedAtMs").is_some());
+        assert_ne!(
+            report
+                .receipt
+                .context_recovery
+                .as_ref()
+                .map(|receipt| receipt.status.as_str()),
+            Some("compact-before-turn")
+        );
+        let projections = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("codex-goal-projection-receipts.jsonl"),
+        )
+        .unwrap();
+        assert!(projections.contains("Preserve the sanitized campaign goal across rollover."));
+        assert!(projections.contains(r#""completionCriteriaChecksum":"sha256:"#));
+        let rehydrations = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("codex-goal-rehydration-receipts.jsonl"),
+        )
+        .unwrap();
+        let final_rehydration: Value = serde_json::from_str(
+            rehydrations
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            final_rehydration.get("status").and_then(Value::as_str),
+            Some("verified")
+        );
+        assert_eq!(
+            final_rehydration.get("verified").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            final_rehydration
+                .get("replacementThreadId")
+                .and_then(Value::as_str),
+            Some("thread-fresh")
+        );
+        assert_eq!(
+            final_rehydration.get("goalChecksum"),
+            final_rehydration.get("echoedGoalChecksum")
+        );
+        assert!(
+            final_rehydration
+                .get("checkpointChecksum")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.starts_with("sha256:"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn goal_projection_observer_captures_normal_and_status_only_updates_fail_closed() {
+        let root = temp_root("goal-projection-all-path-observer");
+        let receipts_file = root
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-goal-projection-receipts.jsonl");
+        let mut state = CodexProtocolState {
+            goal_projection_observer: Some(CodexGoalProjectionObserver {
+                receipts_file: receipts_file.clone(),
+                queue_id: Some("queue-goal".to_string()),
+                session_key: "session-goal".to_string(),
+                lane_digest: Some("lane-goal".to_string()),
+                backend_context_generation: Some("generation-goal".to_string()),
+                current_thread_id: Some("thread-goal".to_string()),
+                latest_by_thread: BTreeMap::new(),
+            }),
+            ..CodexProtocolState::default()
+        };
+        state.event_count = 41;
+        record_protocol_usage_event(
+            &json!({
+                "method": "thread/goal/updated",
+                "params": {
+                    "threadId": "thread-goal",
+                    "turnId": "turn-goal-1",
+                    "goal": {
+                        "id": "backend-goal-1",
+                        "objective": "finish the exact-lane campaign",
+                        "status": "active",
+                        "tokenBudget": 10_000,
+                        "completionCriteria": ["T3 replay is green"]
+                    }
+                }
+            }),
+            &mut state,
+        );
+        state.event_count = 42;
+        record_protocol_usage_event(
+            &json!({
+                "method": "thread/goal/updated",
+                "params": {
+                    "threadId": "thread-goal",
+                    "goal": {"id": "backend-goal-1", "status": "completed"}
+                }
+            }),
+            &mut state,
+        );
+        state.event_count = 43;
+        record_protocol_usage_event(
+            &json!({
+                "method": "thread/goal/updated",
+                "params": {
+                    "threadId": "thread-without-prior",
+                    "goal": {"status": "active"}
+                }
+            }),
+            &mut state,
+        );
+
+        assert!(state.warnings.is_empty());
+        let projections = fs::read_to_string(&receipts_file)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<CodexGoalProjectionV1>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(projections.len(), 3);
+        assert_eq!(projections[0].goal_reference, "backend-goal-1");
+        assert_eq!(
+            projections[0].source_turn_id.as_deref(),
+            Some("turn-goal-1")
+        );
+        assert_eq!(projections[0].observation_order, 41);
+        assert!(projections[0].projection_complete);
+        assert_eq!(projections[1].objective, projections[0].objective);
+        assert_eq!(
+            projections[1].completion_criteria,
+            projections[0].completion_criteria
+        );
+        assert_eq!(projections[1].status, "completed");
+        assert_eq!(projections[1].observation_order, 42);
+        assert!(projections[1].projection_complete);
+        assert_eq!(projections[2].source_thread_id, "thread-without-prior");
+        assert!(!projections[2].projection_complete);
+        assert!(projections[2].projection_reason.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn latest_completed_goal_projection_cannot_rehydrate_an_older_active_goal() {
+        let root = temp_root("goal-projection-no-active-resurrection");
+        let harness_home = root.join(".agent-harness");
+        let source = write_codex_runtime_source(&root);
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan: CodexRuntimePlanFile =
+            serde_json::from_slice(&fs::read(plan_report.plan_file.as_ref().unwrap()).unwrap())
+                .unwrap();
+        let checkpoint_file = root.join("checkpoint.json");
+        fs::write(&checkpoint_file, b"{}\n").unwrap();
+        let mut state = CodexProtocolState {
+            goal_projection_observer: Some(
+                CodexGoalProjectionObserver::new(&harness_home, &plan).unwrap(),
+            ),
+            ..CodexProtocolState::default()
+        };
+        state.event_count = 1;
+        record_protocol_usage_event(
+            &json!({
+                "method": "thread/goal/updated",
+                "params": {
+                    "threadId": "thread-goal",
+                    "goal": {
+                        "id": "goal-1",
+                        "objective": "do not resurrect this goal",
+                        "status": "active"
+                    }
+                }
+            }),
+            &mut state,
+        );
+        assert!(
+            load_goal_rehydration_request(
+                &harness_home,
+                &plan,
+                Some("thread-goal"),
+                &checkpoint_file,
+            )
+            .unwrap()
+            .is_some()
+        );
+        state.event_count = 2;
+        record_protocol_usage_event(
+            &json!({
+                "method": "thread/goal/updated",
+                "params": {
+                    "threadId": "thread-goal",
+                    "goal": {"id": "goal-1", "status": "completed"}
+                }
+            }),
+            &mut state,
+        );
+        assert!(
+            load_goal_rehydration_request(
+                &harness_home,
+                &plan,
+                Some("thread-goal"),
+                &checkpoint_file,
+            )
+            .unwrap()
+            .is_none()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_null_error_is_absent_and_core_abort_detail_is_preserved() {
+        let public_only = json!({
+            "method": "turn/completed",
+            "params": {
+                "turn": {
+                    "id": "turn-replaced",
+                    "status": "interrupted",
+                    "error": null
+                }
+            }
+        });
+        let reason = turn_completed_failure_reason(&public_only).unwrap();
+        assert!(!reason.contains("null"));
+        assert_eq!(turn_completed_public_error(&public_only), None);
+        assert_eq!(protocol_error(&json!({"id": 2, "error": null})), None);
+
+        let joined = json!({
+            "method": "turn/completed",
+            "params": {
+                "turn": {
+                    "id": "turn-replaced",
+                    "status": "interrupted",
+                    "error": {
+                        "message": "turn replaced",
+                        "additionalDetails": "core rollout abort: superseded by compact request 2"
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            compact_attempt_core_abort_reason(&joined).as_deref(),
+            Some("core rollout abort: superseded by compact request 2")
+        );
+    }
+
     #[test]
     fn run_codex_runtime_preflight_compacts_existing_thread_before_turn() {
         let root = temp_root("run_codex_runtime_preflight_compacts_existing_thread_before_turn");
@@ -16012,8 +18292,8 @@ mod tests {
             harness_home: harness_home.clone(),
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 10_000,
-            idle_timeout_ms: 10_000,
+            timeout_ms: if cfg!(windows) { 30_000 } else { 10_000 },
+            idle_timeout_ms: if cfg!(windows) { 30_000 } else { 10_000 },
             progress_context: None,
         })
         .unwrap();
@@ -16040,6 +18320,40 @@ mod tests {
         )
         .unwrap();
         assert!(preflight.contains(r#""compactBeforeTurn": true"#));
+        let compact_attempts = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("codex-compact-attempt-receipts.jsonl"),
+        )
+        .unwrap();
+        let final_attempt: Value = serde_json::from_str(
+            compact_attempts
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            final_attempt
+                .get("finalClassification")
+                .and_then(Value::as_str),
+            Some("succeeded")
+        );
+        assert_eq!(
+            final_attempt.get("publicStatus").and_then(Value::as_str),
+            Some("interrupted")
+        );
+        assert!(final_attempt.get("publicError").is_none());
+        assert!(
+            final_attempt
+                .get("observedEventClassifications")
+                .and_then(Value::as_array)
+                .is_some_and(|values| values
+                    .iter()
+                    .any(|value| value.as_str() == Some("intervening-turn-aborted")))
+        );
         let counter_lane = ContextRolloverLane {
             runtime_class: "interactive".to_string(),
             agent_id: plan.agent_id.clone().unwrap_or_else(|| "main".to_string()),
@@ -16153,6 +18467,275 @@ mod tests {
     }
 
     #[test]
+    fn resumed_restored_goal_turn_settles_before_same_thread_compact() {
+        let root = temp_root("resume-restored-goal-turn-settle-before-compact");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"codexContext":{"modelContextWindow":1000,"compactAtActiveContextRatio":0.5}}"#,
+        )
+        .unwrap();
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan = plan_report.plan.as_ref().unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, json!([]));
+        replace_invocation_thread_id(plan_file, Some("thread-restored-goal"));
+        let receipts_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-runtime-run-receipts.jsonl");
+        fs::write(
+            receipts_file,
+            format!(
+                "{}\n",
+                json!({
+                    "codexBindingFile": plan.outputs.codex_binding_file.clone(),
+                    "usage": {
+                        "inputTokens": 900,
+                        "outputTokens": 30,
+                        "totalTokens": 930,
+                        "source": "resume-race-fixture"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let (executable, arguments, events_file) =
+            resumed_goal_turn_then_compact_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+        let plan: CodexRuntimePlanFile = read_json_file_as(plan_file).unwrap();
+        let capability = parse_codex_web_search_capability(&json!({
+            "namespaceTools": true,
+            "imageGeneration": true,
+            "webSearch": true
+        }))
+        .unwrap();
+        let decision = decide_effective_codex_web_search(
+            &plan.web_search,
+            capability,
+            plan.channel_lane.clone(),
+            plan.queue_id.clone(),
+        );
+        persist_codex_web_search_thread_binding(
+            &codex_web_search_thread_bindings_file(&plan.outputs.codex_binding_file),
+            "thread-restored-goal",
+            &decision,
+        )
+        .unwrap();
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: None,
+            // This scenario verifies resume/compact ordering across a real Windows child
+            // process boundary; timeout behavior is covered by dedicated fixtures.
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        assert_eq!(
+            report
+                .receipt
+                .context_recovery
+                .as_ref()
+                .map(|receipt| receipt.status.as_str()),
+            Some("compact-before-turn")
+        );
+        let events = fs::read_to_string(events_file).unwrap();
+        let restored_complete = events.find("restored-turn-completed").unwrap();
+        let compact_request = events.find("thread/compact/start").unwrap();
+        assert!(
+            restored_complete < compact_request,
+            "same-thread compact must wait until the resume-restored goal turn is quiescent"
+        );
+        let transcript = fs::read_to_string(
+            report
+                .completion
+                .as_ref()
+                .and_then(|completion| completion.transcript_file.as_ref())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(transcript.contains("Explicit queued turn after settle."));
+        assert!(!transcript.contains("RESTORED GOAL INTERNAL OUTPUT"));
+        let settle_receipts = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-resume-settle-receipts.jsonl");
+        let settle = fs::read_to_string(settle_receipts).unwrap();
+        assert!(settle.contains(r#""activeGoalObserved":true"#));
+        assert!(settle.contains(r#""restoredTurnObserved":true"#));
+        assert!(settle.contains(r#""status":"restored-turn-drained""#));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preflight_uses_fresh_binding_route_generation_capacity_before_120k_failsafe() {
+        for (label, total_tokens, expect_warning) in [
+            ("below-warning", 134_993_u64, false),
+            ("warning-only", 204_759_u64, true),
+        ] {
+            let root = temp_root(&format!("model-context-window-{label}"));
+            let source = write_codex_runtime_source(&root);
+            let harness_home = root.join(".agent-harness");
+            fs::create_dir_all(&harness_home).unwrap();
+            fs::write(
+                harness_home.join(HARNESS_CONFIG_FILE_NAME),
+                r#"{"codexContext":{"warnAtActiveContextRatio":0.75,"compactAtActiveContextRatio":0.85}}"#,
+            )
+            .unwrap();
+            enqueue_and_prepare(&source, &harness_home);
+            let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+                harness_home: harness_home.clone(),
+                execution_dir: None,
+                codex_executable: Some(std::env::current_exe().unwrap()),
+            })
+            .unwrap();
+            let plan_file = plan_report.plan_file.as_ref().unwrap();
+            replace_invocation_thread_id(plan_file, Some("thread-context-window"));
+            let plan: CodexRuntimePlanFile =
+                serde_json::from_slice(&fs::read(plan_file).unwrap()).unwrap();
+            let generation = plan
+                .prompt_authority
+                .backend_context_generation
+                .clone()
+                .expect("prepared prompt must carry backend generation");
+            let receipts_file = harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("codex-runtime-run-receipts.jsonl");
+            fs::write(
+                receipts_file,
+                format!(
+                    "{}\n",
+                    json!({
+                        "codexBindingFile": plan.outputs.codex_binding_file.clone(),
+                        "usage": {
+                            "inputTokens": total_tokens - 100,
+                            "outputTokens": 100,
+                            "totalTokens": total_tokens,
+                            "modelContextWindow": 258400,
+                            "modelContextWindowSource": "params.tokenUsage.modelContextWindow",
+                            "provider": plan.provider.clone(),
+                            "model": plan.model.clone(),
+                            "backendContextGeneration": generation,
+                            "observedAtMs": current_log_time_ms().unwrap(),
+                            "source": "params.tokenUsage.token"
+                        }
+                    })
+                ),
+            )
+            .unwrap();
+
+            let preflight = preflight_codex_context(
+                &harness_home,
+                &plan,
+                plan_file,
+                plan_report.execution_dir.as_deref(),
+            )
+            .unwrap();
+
+            assert_eq!(preflight.receipt.model_context_window, Some(258_400));
+            assert_eq!(
+                preflight.receipt.model_context_window_source,
+                "params.tokenUsage.modelContextWindow"
+            );
+            assert_eq!(preflight.receipt.model_context_window_freshness, "fresh");
+            assert!(!preflight.receipt.compact_before_turn);
+            assert_eq!(
+                preflight
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("warnAtActiveContextRatio")),
+                expect_warning
+            );
+            if expect_warning {
+                assert!(
+                    preflight
+                        .receipt
+                        .reason
+                        .contains("above warning threshold but below compact threshold")
+                );
+            } else {
+                assert!(preflight.receipt.active_context_ratio.unwrap() < 0.75);
+            }
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn preflight_rejects_wrong_backend_generation_capacity_and_keeps_unknown_failsafe() {
+        let root = temp_root("model-context-window-wrong-generation");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_invocation_thread_id(plan_file, Some("thread-current"));
+        let plan: CodexRuntimePlanFile =
+            serde_json::from_slice(&fs::read(plan_file).unwrap()).unwrap();
+        let receipts_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-runtime-run-receipts.jsonl");
+        fs::write(
+            receipts_file,
+            format!(
+                "{}\n",
+                json!({
+                    "codexBindingFile": plan.outputs.codex_binding_file.clone(),
+                    "usage": {
+                        "inputTokens": 134893,
+                        "outputTokens": 100,
+                        "totalTokens": 134993,
+                        "modelContextWindow": 258400,
+                        "modelContextWindowSource": "params.tokenUsage.modelContextWindow",
+                        "provider": plan.provider.clone(),
+                        "model": plan.model.clone(),
+                        "backendContextGeneration": "codex-thread:stale-generation",
+                        "observedAtMs": current_log_time_ms().unwrap(),
+                        "source": "params.tokenUsage.token"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+
+        let preflight = preflight_codex_context(
+            &harness_home,
+            &plan,
+            plan_file,
+            plan_report.execution_dir.as_deref(),
+        )
+        .unwrap();
+
+        assert_eq!(preflight.receipt.model_context_window, None);
+        assert_eq!(
+            preflight.receipt.model_context_window_freshness,
+            "backend-generation-mismatch"
+        );
+        assert!(preflight.receipt.compact_before_turn);
+        assert!(preflight.receipt.reason.contains("failsafe"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_codex_runtime_preflight_drains_compact_turn_completed_before_user_turn() {
         let root =
             temp_root("run_codex_runtime_preflight_drains_compact_turn_completed_before_user_turn");
@@ -16161,7 +18744,7 @@ mod tests {
         fs::create_dir_all(&harness_home).unwrap();
         fs::write(
             harness_home.join(HARNESS_CONFIG_FILE_NAME),
-            r#"{"codexContext":{"modelContextWindow":1000,"compactAtActiveContextRatio":0.5,"modelAutoCompactTokenLimit":900}}"#,
+            r#"{"codexContext":{"modelContextWindow":1000,"compactAtActiveContextRatio":0.5,"modelAutoCompactTokenLimit":900},"codexWebSearch":{"defaultMode":"disabled"}}"#,
         )
         .unwrap();
         enqueue_and_prepare(&source, &harness_home);
@@ -16198,13 +18781,32 @@ mod tests {
         let (executable, arguments, events_file) =
             compact_turn_completed_then_reply_app_server_command(&root);
         replace_invocation(plan_file, executable, arguments);
+        let plan: CodexRuntimePlanFile = read_json_file_as(plan_file).unwrap();
+        let capability = parse_codex_web_search_capability(&json!({
+            "namespaceTools": true,
+            "imageGeneration": true,
+            "webSearch": true
+        }))
+        .unwrap();
+        let decision = decide_effective_codex_web_search(
+            &plan.web_search,
+            capability,
+            plan.channel_lane.clone(),
+            plan.queue_id.clone(),
+        );
+        persist_codex_web_search_thread_binding(
+            &codex_web_search_thread_bindings_file(&plan.outputs.codex_binding_file),
+            "thread-existing",
+            &decision,
+        )
+        .unwrap();
 
         let report = run_codex_runtime(CodexRuntimeRunOptions {
             harness_home: harness_home.clone(),
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 10_000,
-            idle_timeout_ms: 10_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             progress_context: None,
         })
         .unwrap();
@@ -16238,6 +18840,11 @@ mod tests {
         let source = write_codex_runtime_source(&root);
         let harness_home = root.join(".agent-harness");
         fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"codexWebSearch":{"defaultMode":"disabled"}}"#,
+        )
+        .unwrap();
         enqueue_and_prepare(&source, &harness_home);
         let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
             harness_home: harness_home.clone(),
@@ -16254,7 +18861,8 @@ mod tests {
             harness_home.join(HARNESS_CONFIG_FILE_NAME),
             r#"{
                 "orchestration":{"features":{"modelCatalogV2":{"mode":"authoritative","enabledAgentIds":["main"]}}},
-                "codexContext":{"modelContextWindow":1000,"compactAtActiveContextRatio":0.5,"modelAutoCompactTokenLimit":900}
+                "codexContext":{"modelContextWindow":1000,"compactAtActiveContextRatio":0.5,"modelAutoCompactTokenLimit":900},
+                "codexWebSearch":{"defaultMode":"disabled"}
             }"#,
         )
         .unwrap();
@@ -16281,13 +18889,32 @@ mod tests {
         let (executable, arguments, events_file) =
             compact_turn_completed_then_reply_app_server_command(&root);
         replace_invocation(plan_file, executable, arguments);
+        let plan: CodexRuntimePlanFile = read_json_file_as(plan_file).unwrap();
+        let capability = parse_codex_web_search_capability(&json!({
+            "namespaceTools": true,
+            "imageGeneration": true,
+            "webSearch": true
+        }))
+        .unwrap();
+        let decision = decide_effective_codex_web_search(
+            &plan.web_search,
+            capability,
+            plan.channel_lane.clone(),
+            plan.queue_id.clone(),
+        );
+        persist_codex_web_search_thread_binding(
+            &codex_web_search_thread_bindings_file(&plan.outputs.codex_binding_file),
+            "thread-existing",
+            &decision,
+        )
+        .unwrap();
 
         let report = run_codex_runtime(CodexRuntimeRunOptions {
             harness_home: harness_home.clone(),
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 10_000,
-            idle_timeout_ms: 10_000,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
             progress_context: None,
         })
         .unwrap();
@@ -16394,10 +19021,11 @@ mod tests {
         let (executable, arguments, events_file) =
             preflight_compact_problem_then_fresh_thread_app_server_command(&root, scenario);
         replace_invocation(plan_file, executable, arguments);
-        let timeout_ms = if cfg!(windows) && scenario == "timeout" {
-            45_000
+        let timeout_ms = if cfg!(windows) { 45_000 } else { 10_000 };
+        let idle_timeout_ms = if cfg!(windows) {
+            idle_timeout_ms.max(30_000)
         } else {
-            10_000
+            idle_timeout_ms
         };
 
         let report = run_codex_runtime(CodexRuntimeRunOptions {
@@ -16513,8 +19141,8 @@ mod tests {
             harness_home,
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 10_000,
-            idle_timeout_ms: 10_000,
+            timeout_ms: if cfg!(windows) { 45_000 } else { 10_000 },
+            idle_timeout_ms: if cfg!(windows) { 30_000 } else { 10_000 },
             progress_context: None,
         })
         .unwrap();
@@ -16553,6 +19181,25 @@ mod tests {
         let (executable, arguments) = fake_app_server_command(&root);
         replace_invocation(plan_file, executable, arguments);
         replace_invocation_thread_id(plan_file, Some("thread-existing"));
+        let plan: CodexRuntimePlanFile = read_json_file_as(plan_file).unwrap();
+        let capability = parse_codex_web_search_capability(&json!({
+            "namespaceTools": true,
+            "imageGeneration": true,
+            "webSearch": true
+        }))
+        .unwrap();
+        let decision = decide_effective_codex_web_search(
+            &plan.web_search,
+            capability,
+            plan.channel_lane.clone(),
+            plan.queue_id.clone(),
+        );
+        persist_codex_web_search_thread_binding(
+            &codex_web_search_thread_bindings_file(&plan.outputs.codex_binding_file),
+            "thread-existing",
+            &decision,
+        )
+        .unwrap();
 
         let report = run_codex_runtime(CodexRuntimeRunOptions {
             harness_home,
@@ -16568,6 +19215,46 @@ mod tests {
         let transcript_file = report.completion.unwrap().transcript_file.unwrap();
         let transcript = fs::read_to_string(transcript_file).unwrap();
         assert!(transcript.contains("method=thread/resume"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_runtime_rolls_over_legacy_thread_without_web_search_binding() {
+        let root =
+            temp_root("run_codex_runtime_rolls_over_legacy_thread_without_web_search_binding");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, json!([]));
+        let (executable, arguments) = fake_app_server_command(&root);
+        replace_invocation(plan_file, executable, arguments);
+        replace_invocation_thread_id(plan_file, Some("legacy-thread"));
+
+        let report = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home,
+            execution_dir: None,
+            plan_file: None,
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
+        let transcript =
+            fs::read_to_string(report.completion.unwrap().transcript_file.unwrap()).unwrap();
+        assert!(transcript.contains("method=thread/start"));
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("starting a fresh thread instead of resuming legacy-thread")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -16593,8 +19280,8 @@ mod tests {
             harness_home,
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 20_000,
-            idle_timeout_ms: 6_000,
+            timeout_ms: if cfg!(windows) { 45_000 } else { 20_000 },
+            idle_timeout_ms: if cfg!(windows) { 15_000 } else { 6_000 },
             progress_context: None,
         })
         .unwrap();
@@ -17432,6 +20119,8 @@ mod tests {
             r#"
 $capture = Join-Path $PSScriptRoot 'fake-app-server-input.jsonl'
 $denyMax = Join-Path $PSScriptRoot 'fake-app-server-live-deny-max'
+$webSearchAbsent = Join-Path $PSScriptRoot 'fake-app-server-web-search-absent'
+$webSearchEvent = Join-Path $PSScriptRoot 'fake-app-server-web-search-event'
 while ($true) {
     if ($null -eq $threadMethod) { $threadMethod = 'unknown' }
     $line = [Console]::In.ReadLine()
@@ -17444,6 +20133,13 @@ while ($true) {
     }
     if ($msg.id -eq 0) {
         [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        if (Test-Path -LiteralPath $webSearchAbsent) {
+            [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":false}}')
+        } else {
+            [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
+        }
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/start') {
         $threadMethod = 'thread/start'
@@ -17464,6 +20160,9 @@ while ($true) {
         }
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'turn/start') {
+        if (Test-Path -LiteralPath $webSearchEvent) {
+            [Console]::Out.WriteLine('{"method":"item/started","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"web-test","type":"webSearch","query":"private fixture query","action":{"type":"search","query":"private fixture query","queries":["private fixture query"]}}}}')
+        }
         [Console]::Out.WriteLine(('{"method":"item/agentMessage/delta","params":{"delta":"Fake assistant reply. method=' + $threadMethod + '"}}'))
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}')
         [Console]::Out.Flush()
@@ -17506,6 +20205,9 @@ while ($true) {
     try { $msg = $line | ConvertFrom-Json } catch { continue }
     if ($msg.id -eq 0) {
         [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/start') {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
@@ -17556,6 +20258,9 @@ while ($true) {
     try { $msg = $line | ConvertFrom-Json } catch { continue }
     if ($msg.id -eq 0) {
         [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/start') {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
@@ -17620,6 +20325,9 @@ while ($true) {{
     if ($msg.id -eq 0) {{
         [Console]::Out.WriteLine('{{"id":0,"result":{{"ok":true}}}}')
         [Console]::Out.Flush()
+    }} elseif ($msg.method -eq 'modelProvider/capabilities/read') {{
+        [Console]::Out.WriteLine('{{"id":8900,"result":{{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}}}')
+        [Console]::Out.Flush()
     }} elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {{
         [Console]::Out.WriteLine('{{"id":1,"result":{{"thread":{{"id":"thread-interrupted-command"}}}}}}')
         [Console]::Out.Flush()
@@ -17668,6 +20376,9 @@ while ($true) {
     try { $msg = $line | ConvertFrom-Json } catch { continue }
     if ($msg.id -eq 0) {
         [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/start') {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
@@ -17720,6 +20431,9 @@ while ($true) {{
     }}
     if ($msg.id -eq 0) {{
         [Console]::Out.WriteLine('{{"id":0,"result":{{"ok":true}}}}')
+        [Console]::Out.Flush()
+    }} elseif ($msg.method -eq 'modelProvider/capabilities/read') {{
+        [Console]::Out.WriteLine('{{"id":8900,"result":{{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}}}')
         [Console]::Out.Flush()
     }} elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {{
         [Console]::Out.WriteLine('{{"id":1,"result":{{"thread":{{"id":"thread-test"}}}}}}')
@@ -17781,6 +20495,9 @@ while ($true) {
     if ($msg.id -eq 0) {
         [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
         [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
+        [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/start') {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
         [Console]::Out.Flush()
@@ -17834,6 +20551,9 @@ set /a next=attempt+1
 set /p "request="
 echo {"id":0,"result":{"ok":true}}
 set /p "request="
+set /p "request="
+echo {"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}
+set /p "request="
 echo {"id":1,"result":{"thread":{"id":"thread-tool-timeout"}}}
 set /p "request="
 if "%attempt%"=="0" (
@@ -17880,6 +20600,9 @@ set /a next=attempt+1
 >"%countFile%" echo %next%
 set /p "request="
 echo {"id":0,"result":{"ok":true}}
+set /p "request="
+set /p "request="
+echo {"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}
 set /p "request="
 echo {"id":1,"result":{"thread":{"id":"thread-review-evidence"}}}
 set /p "request="
@@ -17929,6 +20652,9 @@ while ($true) {
     }
     if ($msg.id -eq 0) {
         [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/start') {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
@@ -17983,6 +20709,9 @@ while ($true) {
     if ($msg.id -eq 0) {
         [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
         [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
+        [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/start') {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
         [Console]::Out.Flush()
@@ -17996,6 +20725,148 @@ while ($true) {
 "#,
         )
         .unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
+
+    #[cfg(windows)]
+    fn resumed_goal_turn_then_compact_app_server_command(
+        root: &Path,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        let script = root.join("resume-goal-settle-app-server.ps1");
+        let events = root.join("resume-goal-settle-events.jsonl");
+        fs::write(
+            &script,
+            r#"
+$events = Join-Path $PSScriptRoot 'resume-goal-settle-events.jsonl'
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.method -and @('initialize', 'initialized', 'modelProvider/capabilities/read') -notcontains $msg.method) {
+        Add-Content -LiteralPath $events -Value $msg.method
+    }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/resume') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-restored-goal"}}}')
+        [Console]::Out.WriteLine('{"method":"thread/goal/updated","params":{"threadId":"thread-restored-goal","goal":{"id":"goal-active","status":"active","objective":"sanitized active goal"}}}')
+        [Console]::Out.WriteLine('{"method":"thread/status/changed","params":{"threadId":"thread-restored-goal","status":"active"}}')
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-restored-goal","turn":{"id":"turn-restored","kind":"regular"}}}')
+        [Console]::Out.Flush()
+        Start-Sleep -Milliseconds 150
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"threadId":"thread-restored-goal","turnId":"turn-restored","item":{"type":"agentMessage","id":"restored-output","text":"RESTORED GOAL INTERNAL OUTPUT","phase":"final_answer"}}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-restored-goal","turn":{"id":"turn-restored","status":"completed","usage":{"inputTokens":910,"outputTokens":30,"totalTokens":940}}}}')
+        [Console]::Out.Flush()
+        Add-Content -LiteralPath $events -Value 'restored-turn-completed'
+    } elseif ($msg.method -eq 'thread/compact/start') {
+        [Console]::Out.WriteLine('{"id":2,"result":{}}')
+        [Console]::Out.WriteLine('{"method":"item/started","params":{"threadId":"thread-restored-goal","item":{"type":"contextCompaction","id":"compact-after-settle"}}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"threadId":"thread-restored-goal","item":{"type":"contextCompaction","id":"compact-after-settle"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"id":3,"result":{"turn":{"id":"turn-explicit"}}}')
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-restored-goal","turn":{"id":"turn-explicit","kind":"regular"}}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"threadId":"thread-restored-goal","turnId":"turn-explicit","item":{"type":"agentMessage","id":"explicit-output","text":"Explicit queued turn after settle.","phase":"final_answer"}}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-restored-goal","turn":{"id":"turn-explicit","status":"completed","usage":{"inputTokens":40,"outputTokens":10,"totalTokens":50}}}}')
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#,
+        )
+        .unwrap();
+        (
+            PathBuf::from("powershell"),
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.to_string_lossy().to_string(),
+            ],
+            events,
+        )
+    }
+
+    #[cfg(windows)]
+    fn compact_correlation_schedule_app_server_command(
+        root: &Path,
+        mode: &str,
+    ) -> (PathBuf, Vec<String>) {
+        let script = root.join("compact-correlation-schedule-app-server.ps1");
+        let source = r#"
+$mode = '__MODE__'
+$thread = 'thread-test'
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/resume') {
+        $thread = 'thread-test'
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        if ($mode -eq 'death-after-ack') {
+            [Console]::Out.WriteLine('{"method":"thread/goal/updated","params":{"threadId":"thread-test","goal":{"objective":"Preserve the sanitized campaign goal across rollover.","status":"active","tokenBudget":10000,"completionCriteria":["verified rollover"]}}}')
+        }
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start') {
+        $thread = 'thread-fresh'
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-fresh"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/compact/start') {
+        if ($mode -eq 'death-after-ack') {
+            [Console]::Out.WriteLine('{"id":2,"result":{}}')
+            [Console]::Out.Flush()
+            exit 7
+        }
+        [Console]::Out.WriteLine('{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-reordered"},"threadId":"thread-test"}}')
+        [Console]::Out.WriteLine('{"id":2,"result":{}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-reordered"},"threadId":"thread-test"}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/goal/set') {
+        $goal = $msg.params
+        $response = @{ id = $msg.id; result = @{ goal = @{ threadId = $thread; objective = $goal.objective; status = $goal.status; tokenBudget = $goal.tokenBudget; completionCriteria = @('verified rollover') } } } | ConvertTo-Json -Compress -Depth 8
+        $updated = @{ method = 'thread/goal/updated'; params = @{ threadId = $thread; goal = @{ objective = $goal.objective; status = $goal.status; tokenBudget = $goal.tokenBudget; completionCriteria = @('verified rollover') } } } | ConvertTo-Json -Compress -Depth 8
+        [Console]::Out.WriteLine($response)
+        [Console]::Out.WriteLine($updated)
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        $item = @{ method = 'item/completed'; params = @{ item = @{ type = 'agentMessage'; id = 'msg-test'; text = 'Reordered compact reply.'; phase = 'final_answer' }; threadId = $thread } } | ConvertTo-Json -Compress -Depth 8
+        $completed = @{ method = 'turn/completed'; params = @{ threadId = $thread; turn = @{ id = 'turn-test'; status = 'completed' } } } | ConvertTo-Json -Compress -Depth 8
+        [Console]::Out.WriteLine($item)
+        [Console]::Out.WriteLine($completed)
+        [Console]::Out.Flush()
+        break
+    }
+}
+"#
+        .replace("__MODE__", mode);
+        fs::write(&script, source).unwrap();
         let system_powershell =
             PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
         let executable = if system_powershell.is_file() {
@@ -18031,6 +20902,9 @@ while ($true) {
     if ($msg.id -eq 0) {
         [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
         [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
+        [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/start') {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
         [Console]::Out.Flush()
@@ -18039,6 +20913,7 @@ while ($true) {
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/compact/start') {
         [Console]::Out.WriteLine('{"id":2,"result":{}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-resume-replaced","status":"interrupted","error":null}}}')
         [Console]::Out.WriteLine('{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}')
         [Console]::Out.WriteLine('{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}')
         [Console]::Out.Flush()
@@ -18091,6 +20966,9 @@ while ($true) {
     if ($msg.method) { Add-Content -LiteralPath $events -Value $msg.method }
     if ($msg.id -eq 0) {
         [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/resume') {
         Set-Content -LiteralPath $resumed -Value 'resumed'
@@ -18154,9 +21032,14 @@ while ($true) {
     $line = [Console]::In.ReadLine()
     if ($null -eq $line) { break }
     try { $msg = $line | ConvertFrom-Json } catch { continue }
-    if ($msg.method) { Add-Content -LiteralPath $events -Value $msg.method }
+    if ($msg.method -and @('initialize', 'initialized', 'modelProvider/capabilities/read') -notcontains $msg.method) {
+        Add-Content -LiteralPath $events -Value $msg.method
+    }
     if ($msg.id -eq 0) {
         [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/resume') {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
@@ -18220,6 +21103,9 @@ while ($true) {
     if ($msg.id -eq 0) {
         [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
         [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
+        [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/start') {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
         [Console]::Out.Flush()
@@ -18262,6 +21148,9 @@ while ($true) {
     try { $msg = $line | ConvertFrom-Json } catch { continue }
     if ($msg.id -eq 0) {
         [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/start') {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
@@ -18317,6 +21206,9 @@ while ($true) {
     if ($msg.method) { Add-Content -LiteralPath $events -Value $msg.method }
     if ($msg.id -eq 0) {
         [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
         [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
@@ -18385,6 +21277,9 @@ while ($true) {
     if ($msg.id -eq 0) {
         [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
         [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
+        [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
         [Console]::Out.Flush()
@@ -18450,6 +21345,9 @@ while ($true) {
     if ($msg.id -eq 0) {
         [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
         [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
+        [Console]::Out.Flush()
     } elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
         [Console]::Out.Flush()
@@ -18503,11 +21401,20 @@ while ($true) {
             r#"
 capture="$(dirname "$0")/fake-app-server-input.jsonl"
 deny_max="$(dirname "$0")/fake-app-server-live-deny-max"
+web_search_absent="$(dirname "$0")/fake-app-server-web-search-absent"
+web_search_event="$(dirname "$0")/fake-app-server-web-search-event"
 while IFS= read -r line; do
     printf '%s\n' "$line" >> "$capture"
     case "$line" in
         *'"id":0'*)
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            if [ -f "$web_search_absent" ]; then
+                printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":false}}'
+            else
+                printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
+            fi
             ;;
         *'"method":"thread/start"'*)
             thread_method='thread/start'
@@ -18528,6 +21435,9 @@ while IFS= read -r line; do
             fi
             ;;
         *'"method":"turn/start"'*)
+            if [ -f "$web_search_event" ]; then
+                printf '%s\n' '{"method":"item/started","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"web-test","type":"webSearch","query":"private fixture query","action":{"type":"search","query":"private fixture query","queries":["private fixture query"]}}}}'
+            fi
             printf '%s\n' "{\"method\":\"item/agentMessage/delta\",\"params\":{\"delta\":\"Fake assistant reply. method=${thread_method:-unknown}\"}}"
             printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}'
             exit 0
@@ -18551,6 +21461,9 @@ while IFS= read -r line; do
     case "$line" in
         *'"id":0'*)
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
             ;;
         *'"method":"thread/start"'*)
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
@@ -18584,6 +21497,9 @@ while IFS= read -r line; do
         *'"id":0'*)
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
             ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
+            ;;
         *'"method":"thread/start"'*)
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
             ;;
@@ -18616,6 +21532,9 @@ while IFS= read -r line; do
         *'"id":0'*)
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
             ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
+            ;;
         *'"method":"thread/start"'*)
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
             ;;
@@ -18645,6 +21564,9 @@ while IFS= read -r line; do
     case "$line" in
         *'"id":0'*)
             printf '%s\n' '{{"id":0,"result":{{"ok":true}}}}'
+            ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{{"id":8900,"result":{{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}}}'
             ;;
         *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
             printf '%s\n' '{{"id":1,"result":{{"thread":{{"id":"thread-test"}}}}}}'
@@ -18680,6 +21602,9 @@ while IFS= read -r line; do
         *'"id":0'*)
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
             ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
+            ;;
         *'"method":"thread/start"'*)
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
             ;;
@@ -18712,6 +21637,9 @@ while IFS= read -r line; do
         *'"id":0'*)
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
             ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
+            ;;
         *'"method":"thread/start"'*)
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
             ;;
@@ -18741,6 +21669,9 @@ while IFS= read -r line; do
         *'"id":0'*)
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
             ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
+            ;;
         *'"method":"thread/start"'*)
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
             ;;
@@ -18754,6 +21685,113 @@ done
 "#,
         )
         .unwrap();
+        make_executable(&script);
+        (PathBuf::from("sh"), vec![script.display().to_string()])
+    }
+
+    #[cfg(not(windows))]
+    fn resumed_goal_turn_then_compact_app_server_command(
+        root: &Path,
+    ) -> (PathBuf, Vec<String>, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = root.join("resume-goal-settle-app-server.sh");
+        let events = root.join("resume-goal-settle-events.jsonl");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+events="$(dirname "$0")/resume-goal-settle-events.jsonl"
+while IFS= read -r line; do
+    method="$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')"
+    [ -n "$method" ] && printf '%s\n' "$method" >> "$events"
+    case "$line" in
+        *'"id":0'*) printf '%s\n' '{"id":0,"result":{"ok":true}}' ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
+            ;;
+        *'"method":"thread/resume"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-restored-goal"}}}'
+            printf '%s\n' '{"method":"thread/goal/updated","params":{"threadId":"thread-restored-goal","goal":{"id":"goal-active","status":"active","objective":"sanitized active goal"}}}'
+            printf '%s\n' '{"method":"thread/status/changed","params":{"threadId":"thread-restored-goal","status":"active"}}'
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-restored-goal","turn":{"id":"turn-restored","kind":"regular"}}}'
+            sleep 0.15
+            printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread-restored-goal","turnId":"turn-restored","item":{"type":"agentMessage","id":"restored-output","text":"RESTORED GOAL INTERNAL OUTPUT","phase":"final_answer"}}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-restored-goal","turn":{"id":"turn-restored","status":"completed","usage":{"inputTokens":910,"outputTokens":30,"totalTokens":940}}}}'
+            printf '%s\n' 'restored-turn-completed' >> "$events"
+            ;;
+        *'"method":"thread/compact/start"'*)
+            printf '%s\n' '{"id":2,"result":{}}'
+            printf '%s\n' '{"method":"item/started","params":{"threadId":"thread-restored-goal","item":{"type":"contextCompaction","id":"compact-after-settle"}}}'
+            printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread-restored-goal","item":{"type":"contextCompaction","id":"compact-after-settle"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-explicit"}}}'
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-restored-goal","turn":{"id":"turn-explicit","kind":"regular"}}}'
+            printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread-restored-goal","turnId":"turn-explicit","item":{"type":"agentMessage","id":"explicit-output","text":"Explicit queued turn after settle.","phase":"final_answer"}}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-restored-goal","turn":{"id":"turn-explicit","status":"completed","usage":{"inputTokens":40,"outputTokens":10,"totalTokens":50}}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        (script, Vec::new(), events)
+    }
+
+    #[cfg(not(windows))]
+    fn compact_correlation_schedule_app_server_command(
+        root: &Path,
+        mode: &str,
+    ) -> (PathBuf, Vec<String>) {
+        let script = root.join("compact-correlation-schedule-app-server.sh");
+        let source = r#"
+mode='__MODE__'
+thread='thread-test'
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
+            ;;
+        *'"method":"thread/resume"'*)
+            thread='thread-test'
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
+            if [ "$mode" = 'death-after-ack' ]; then
+                printf '%s\n' '{"method":"thread/goal/updated","params":{"threadId":"thread-test","goal":{"objective":"Preserve the sanitized campaign goal across rollover.","status":"active","tokenBudget":10000,"completionCriteria":["verified rollover"]}}}'
+            fi
+            ;;
+        *'"method":"thread/start"'*)
+            thread='thread-fresh'
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-fresh"}}}'
+            ;;
+        *'"method":"thread/compact/start"'*)
+            if [ "$mode" = 'death-after-ack' ]; then
+                printf '%s\n' '{"id":2,"result":{}}'
+                exit 7
+            fi
+            printf '%s\n' '{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-reordered"},"threadId":"thread-test"}}'
+            printf '%s\n' '{"id":2,"result":{}}'
+            printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-reordered"},"threadId":"thread-test"}}'
+            ;;
+        *'"method":"thread/goal/set"'*)
+            printf '%s\n' '{"id":2,"result":{"goal":{"threadId":"thread-fresh","objective":"Preserve the sanitized campaign goal across rollover.","status":"active","tokenBudget":10000,"completionCriteria":["verified rollover"]}}}'
+            printf '%s\n' '{"method":"thread/goal/updated","params":{"threadId":"thread-fresh","goal":{"objective":"Preserve the sanitized campaign goal across rollover.","status":"active","tokenBudget":10000,"completionCriteria":["verified rollover"]}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"msg-test\",\"text\":\"Reordered compact reply.\",\"phase\":\"final_answer\"},\"threadId\":\"$thread\"}}"
+            printf '%s\n' "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"$thread\",\"turn\":{\"id\":\"turn-test\",\"status\":\"completed\"}}}"
+            exit 0
+            ;;
+    esac
+done
+"#
+        .replace("__MODE__", mode);
+        fs::write(&script, source).unwrap();
         make_executable(&script);
         (PathBuf::from("sh"), vec![script.display().to_string()])
     }
@@ -18773,11 +21811,15 @@ while IFS= read -r line; do
         *'"id":0'*)
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
             ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
+            ;;
         *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
             ;;
         *'"method":"thread/compact/start"'*)
             printf '%s\n' '{"id":2,"result":{}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-resume-replaced","status":"interrupted","error":null}}}'
             printf '%s\n' '{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}'
             printf '%s\n' '{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"compact-1"},"threadId":"thread-test"}}'
             ;;
@@ -18818,6 +21860,9 @@ while IFS= read -r line; do
     case "$line" in
         *'"id":0'*)
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
             ;;
         *'"method":"thread/resume"'*)
             printf resumed > "$resumed"
@@ -18871,6 +21916,9 @@ while IFS= read -r line; do
         *'"id":0'*)
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
             ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
+            ;;
         *'"method":"thread/resume"'*)
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
             ;;
@@ -18923,6 +21971,9 @@ while IFS= read -r line; do
         *'"id":0'*)
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
             ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
+            ;;
         *'"method":"thread/start"'*)
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
             ;;
@@ -18952,6 +22003,9 @@ while IFS= read -r line; do
     case "$line" in
         *'"id":0'*)
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
             ;;
         *'"method":"thread/start"'*)
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
@@ -18995,6 +22049,9 @@ while IFS= read -r line; do
     case "$line" in
         *'"id":0'*)
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
             ;;
         *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
@@ -19053,6 +22110,9 @@ while IFS= read -r line; do
         *'"id":0'*)
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
             ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
+            ;;
         *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
             ;;
@@ -19103,6 +22163,9 @@ while IFS= read -r line; do
     case "$line" in
         *'"id":0'*)
             printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}'
             ;;
         *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
             printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}'
@@ -19233,5 +22296,19 @@ done
             "agent-harness-codex-runtime-{test_name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancel_request_read_treats_sharing_violations_as_retryable() {
+        assert!(is_transient_cancel_request_read_error(
+            &io::Error::from_raw_os_error(32)
+        ));
+        assert!(is_transient_cancel_request_read_error(
+            &io::Error::from_raw_os_error(33)
+        ));
+        assert!(!is_transient_cancel_request_read_error(
+            &io::Error::from_raw_os_error(5)
+        ));
     }
 }

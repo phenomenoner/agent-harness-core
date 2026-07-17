@@ -1,0 +1,35 @@
+{
+  "schema": "agent-harness.skill-replay-manifest.v1",
+  "corpusId": "cli-private-fixture",
+  "immutable": true,
+  "privacyClassification": "synthetic private-local guard fixture",
+  "requiredClassOwners": {
+    "explicit-single-skill-invocation": "test-owner",
+    "explicit-multi-skill-bundle": "test-owner",
+    "strong-automatic-match": "fixture:cli-private-case",
+    "ambiguous-confusing-pair": "test-owner",
+    "no-skill-general-task": "test-owner",
+    "short-continuation-social-turn": "test-owner",
+    "cross-channel-platform-negative": "test-owner",
+    "cjk-mixed-language-intent": "test-owner",
+    "novel-reusable-workflow": "test-owner",
+    "existing-skill-improvement": "test-owner",
+    "concrete-session-rollover": "test-owner",
+    "new-virtual-task-boundary": "test-owner",
+    "knowledge-store-classification": "test-owner",
+    "existing-memory-reclassification": "test-owner",
+    "dream-source-admission-negative": "test-owner",
+    "topology-operation": "test-owner",
+    "nightly-rerun-recovery": "test-owner",
+    "trigger-equivalence": "test-owner",
+    "unchanged-dream-workspace": "test-owner",
+    "memory-local-skill-bridge": "test-owner"
+  },
+  "entries": [
+    {
+      "path": "cases.json",
+      "sha256": "sha256:fe673517205c43a7eaf2a4215e5036a00f3527c3687fc44db126b71ef07e4cbb",
+      "caseCount": 1
+    }
+  ]
+}

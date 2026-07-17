@@ -236,6 +236,7 @@ mod tests {
             &index,
             &SkillSelectionQuery {
                 text: "請幫我做天氣檢查".to_string(),
+                include_context_tokens: true,
                 agent_id: None,
                 channel: None,
                 workspace: None,
@@ -279,6 +280,7 @@ mod tests {
             &SkillSelectionQuery {
                 text: "Please use the receipt triage workflow for queue replay failures"
                     .to_string(),
+                include_context_tokens: true,
                 agent_id: None,
                 channel: None,
                 workspace: None,

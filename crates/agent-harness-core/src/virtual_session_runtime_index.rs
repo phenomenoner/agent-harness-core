@@ -28,7 +28,7 @@ pub(crate) const VIRTUAL_SESSION_RUNTIME_INDEX_SCHEMA: &str =
     "agent-harness.virtual-session-runtime-index.v1";
 
 const INDEX_FILE_NAME: &str = "virtual-session-runtime-index.sqlite";
-const INDEX_REVISION: i64 = 2;
+const INDEX_REVISION: i64 = 3;
 const META_SCHEMA: &str = "schema";
 const META_REVISION: &str = "revision";
 const META_PENDING_CURSOR: &str = "pending-cursor";
@@ -324,7 +324,20 @@ pub(crate) fn latest_codex_runtime_usage(
             if exact.is_some() {
                 return Ok(exact);
             }
-            read_global_codex_usage(connection)
+            read_global_codex_usage(connection).map(|usage| {
+                usage.map(|mut usage| {
+                    // Legacy token fallback remains available for the absolute
+                    // unknown-capacity guard, but a capacity observation is
+                    // never allowed to cross a binding/lane boundary.
+                    usage.model_context_window = None;
+                    usage.model_context_window_source = None;
+                    usage.provider = None;
+                    usage.model = None;
+                    usage.backend_context_generation = None;
+                    usage.observed_at_ms = None;
+                    usage
+                })
+            })
         },
         || None,
     ) {
@@ -500,6 +513,12 @@ fn initialize_index(connection: &mut Connection) -> io::Result<()> {
             input_tokens TEXT,
             output_tokens TEXT,
             total_tokens TEXT,
+            model_context_window TEXT,
+            model_context_window_source TEXT,
+            provider TEXT,
+            model TEXT,
+            backend_context_generation TEXT,
+            observed_at_ms INTEGER,
             source TEXT NOT NULL,
             raw TEXT
         );
@@ -511,11 +530,28 @@ fn initialize_index(connection: &mut Connection) -> io::Result<()> {
             input_tokens TEXT,
             output_tokens TEXT,
             total_tokens TEXT,
+            model_context_window TEXT,
+            model_context_window_source TEXT,
+            provider TEXT,
+            model TEXT,
+            backend_context_generation TEXT,
+            observed_at_ms INTEGER,
             source TEXT NOT NULL,
             raw TEXT
         );
         ",
     ).map_err(io::Error::other)?;
+    for table in [
+        "virtual_session_runtime_codex_usage_by_binding",
+        "virtual_session_runtime_codex_usage_fallback",
+    ] {
+        ensure_index_column(connection, table, "model_context_window", "TEXT")?;
+        ensure_index_column(connection, table, "model_context_window_source", "TEXT")?;
+        ensure_index_column(connection, table, "provider", "TEXT")?;
+        ensure_index_column(connection, table, "model", "TEXT")?;
+        ensure_index_column(connection, table, "backend_context_generation", "TEXT")?;
+        ensure_index_column(connection, table, "observed_at_ms", "INTEGER")?;
+    }
     let schema = read_meta(connection, META_SCHEMA)?;
     let revision = read_meta(connection, META_REVISION)?;
     if schema.as_deref() == Some(VIRTUAL_SESSION_RUNTIME_INDEX_SCHEMA)
@@ -562,6 +598,27 @@ fn initialize_index(connection: &mut Connection) -> io::Result<()> {
         write_meta(&transaction, key, "0")?;
     }
     transaction.commit().map_err(io::Error::other)
+}
+
+fn ensure_index_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    sql_type: &str,
+) -> io::Result<()> {
+    let query = format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1");
+    let count: i64 = connection
+        .query_row(&query, params![column], |row| row.get(0))
+        .map_err(io::Error::other)?;
+    if count == 0 {
+        connection
+            .execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {sql_type}"),
+                [],
+            )
+            .map_err(io::Error::other)?;
+    }
+    Ok(())
 }
 
 fn refresh_source_index_locked(
@@ -840,6 +897,24 @@ fn index_codex_runtime_usage(
     let input_tokens = usage.input_tokens.map(|value| value.to_string());
     let output_tokens = usage.output_tokens.map(|value| value.to_string());
     let total_tokens = usage.total_tokens.map(|value| value.to_string());
+    let model_context_window = usage.model_context_window.map(|value| value.to_string());
+    let model_context_window_source = usage
+        .model_context_window_source
+        .as_deref()
+        .map(|value| truncate_chars(value, MAX_CODEX_USAGE_SOURCE_CHARS));
+    let provider = usage
+        .provider
+        .as_deref()
+        .map(|value| truncate_chars(value, 128));
+    let model = usage
+        .model
+        .as_deref()
+        .map(|value| truncate_chars(value, 128));
+    let backend_context_generation = usage
+        .backend_context_generation
+        .as_deref()
+        .map(|value| truncate_chars(value, MAX_CODEX_USAGE_SOURCE_CHARS));
+    let observed_at_ms = usage.observed_at_ms;
     let source = truncate_chars(&usage.source, MAX_CODEX_USAGE_SOURCE_CHARS);
     let raw = usage
         .raw
@@ -849,17 +924,37 @@ fn index_codex_runtime_usage(
     transaction
         .execute(
             "INSERT INTO virtual_session_runtime_codex_usage_fallback
-             (singleton, line_number, input_tokens, output_tokens, total_tokens, source, raw)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+             (singleton, line_number, input_tokens, output_tokens, total_tokens, model_context_window,
+              model_context_window_source, provider, model, backend_context_generation, observed_at_ms, source, raw)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(singleton) DO UPDATE SET
                  line_number = excluded.line_number,
                  input_tokens = excluded.input_tokens,
                  output_tokens = excluded.output_tokens,
                  total_tokens = excluded.total_tokens,
+                 model_context_window = excluded.model_context_window,
+                 model_context_window_source = excluded.model_context_window_source,
+                 provider = excluded.provider,
+                 model = excluded.model,
+                 backend_context_generation = excluded.backend_context_generation,
+                 observed_at_ms = excluded.observed_at_ms,
                  source = excluded.source,
                  raw = excluded.raw
              WHERE excluded.line_number >= virtual_session_runtime_codex_usage_fallback.line_number",
-            params![line_number, input_tokens, output_tokens, total_tokens, source, raw],
+            params![
+                line_number,
+                input_tokens,
+                output_tokens,
+                total_tokens,
+                model_context_window,
+                model_context_window_source,
+                provider,
+                model,
+                backend_context_generation,
+                observed_at_ms,
+                source,
+                raw
+            ],
         )
         .map_err(io::Error::other)?;
 
@@ -874,13 +969,20 @@ fn index_codex_runtime_usage(
     transaction
         .execute(
             "INSERT INTO virtual_session_runtime_codex_usage_by_binding
-             (binding_key, line_number, input_tokens, output_tokens, total_tokens, source, raw)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             (binding_key, line_number, input_tokens, output_tokens, total_tokens, model_context_window,
+              model_context_window_source, provider, model, backend_context_generation, observed_at_ms, source, raw)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(binding_key) DO UPDATE SET
                  line_number = excluded.line_number,
                  input_tokens = excluded.input_tokens,
                  output_tokens = excluded.output_tokens,
                  total_tokens = excluded.total_tokens,
+                 model_context_window = excluded.model_context_window,
+                 model_context_window_source = excluded.model_context_window_source,
+                 provider = excluded.provider,
+                 model = excluded.model,
+                 backend_context_generation = excluded.backend_context_generation,
+                 observed_at_ms = excluded.observed_at_ms,
                  source = excluded.source,
                  raw = excluded.raw
              WHERE excluded.line_number >= virtual_session_runtime_codex_usage_by_binding.line_number",
@@ -890,6 +992,12 @@ fn index_codex_runtime_usage(
                 input_tokens,
                 output_tokens,
                 total_tokens,
+                model_context_window,
+                model_context_window_source,
+                provider,
+                model,
+                backend_context_generation,
+                observed_at_ms,
                 source,
                 raw,
             ],
@@ -1158,7 +1266,9 @@ fn read_codex_usage_for_binding(
 ) -> io::Result<Option<CodexRuntimeUsage>> {
     let row = connection
         .query_row(
-            "SELECT input_tokens, output_tokens, total_tokens, source, raw
+            "SELECT input_tokens, output_tokens, total_tokens, model_context_window,
+                    model_context_window_source, provider, model, backend_context_generation,
+                    observed_at_ms, source, raw
              FROM virtual_session_runtime_codex_usage_by_binding
              WHERE binding_key = ?1",
             params![binding_key],
@@ -1172,7 +1282,9 @@ fn read_codex_usage_for_binding(
 fn read_global_codex_usage(connection: &Connection) -> io::Result<Option<CodexRuntimeUsage>> {
     let row = connection
         .query_row(
-            "SELECT input_tokens, output_tokens, total_tokens, source, raw
+            "SELECT input_tokens, output_tokens, total_tokens, model_context_window,
+                    model_context_window_source, provider, model, backend_context_generation,
+                    observed_at_ms, source, raw
              FROM virtual_session_runtime_codex_usage_fallback
              WHERE singleton = 1",
             [],
@@ -1189,6 +1301,12 @@ fn read_codex_usage_row(
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
     String,
     Option<String>,
 )> {
@@ -1198,14 +1316,38 @@ fn read_codex_usage_row(
         row.get(2)?,
         row.get(3)?,
         row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
     ))
 }
 
 fn codex_usage_from_index_row(
-    (input_tokens, output_tokens, total_tokens, source, raw): (
+    (
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        model_context_window,
+        model_context_window_source,
+        provider,
+        model,
+        backend_context_generation,
+        observed_at_ms,
+        source,
+        raw,
+    ): (
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
         String,
         Option<String>,
     ),
@@ -1214,6 +1356,12 @@ fn codex_usage_from_index_row(
         input_tokens: parse_optional_u64(input_tokens, "input token")?,
         output_tokens: parse_optional_u64(output_tokens, "output token")?,
         total_tokens: parse_optional_u64(total_tokens, "total token")?,
+        model_context_window: parse_optional_u64(model_context_window, "model context window")?,
+        model_context_window_source,
+        provider,
+        model,
+        backend_context_generation,
+        observed_at_ms,
         source,
         raw,
     })
@@ -1447,11 +1595,11 @@ mod tests {
         fs::write(
             &receipts_file,
             concat!(
-                r#"{"codexBindingFile":"c:/bindings/main.json","usage":{"inputTokens":10,"outputTokens":1,"totalTokens":11,"source":"bound-old","raw":"bound-old-raw"}}"#,
+                r#"{"codexBindingFile":"c:/bindings/main.json","usage":{"inputTokens":10,"outputTokens":1,"totalTokens":11,"modelContextWindow":258400,"modelContextWindowSource":"params.tokenUsage.modelContextWindow","provider":"openai","model":"gpt-5.6-sol","backendContextGeneration":"codex-thread:main","observedAtMs":1700000000000,"source":"bound-old","raw":"bound-old-raw"}}"#,
                 "\n",
                 r#"{"codexBindingFile":"c:/bindings/other.json","usage":{"inputTokens":20,"outputTokens":2,"totalTokens":22,"source":"other"}}"#,
                 "\n",
-                r#"{"usage":{"inputTokens":30,"outputTokens":3,"totalTokens":33,"source":"global"}}"#,
+                r#"{"usage":{"inputTokens":30,"outputTokens":3,"totalTokens":33,"modelContextWindow":999999,"modelContextWindowSource":"wrong-lane","provider":"openai","model":"gpt-other","backendContextGeneration":"codex-thread:other","observedAtMs":1700000000000,"source":"global"}}"#,
                 "\n"
             ),
         )
@@ -1466,6 +1614,14 @@ mod tests {
         assert_eq!(bound.total_tokens, Some(11));
         assert_eq!(bound.source, "bound-old");
         assert_eq!(bound.raw.as_deref(), Some("bound-old-raw"));
+        assert_eq!(bound.model_context_window, Some(258_400));
+        assert_eq!(bound.provider.as_deref(), Some("openai"));
+        assert_eq!(bound.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            bound.backend_context_generation.as_deref(),
+            Some("codex-thread:main")
+        );
+        assert_eq!(bound.observed_at_ms, Some(1_700_000_000_000));
         let fallback = latest_codex_runtime_usage(
             &harness_home,
             Path::new(r"C:\BINDINGS\missing.json"),
@@ -1474,6 +1630,9 @@ mod tests {
         .unwrap();
         assert_eq!(fallback.total_tokens, Some(33));
         assert_eq!(fallback.source, "global");
+        assert_eq!(fallback.model_context_window, None);
+        assert_eq!(fallback.backend_context_generation, None);
+        assert_eq!(fallback.observed_at_ms, None);
 
         fs::OpenOptions::new()
             .append(true)

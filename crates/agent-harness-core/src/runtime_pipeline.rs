@@ -12,7 +12,26 @@ use crate::codex_runtime::{
     CodexContextRecoveryReceipt, CodexThreadHealthStatus, tool_timeout_summary,
 };
 use crate::context_rollover::{
-    VirtualSessionTerminalV2Options, mark_virtual_session_terminal_for_lane,
+    CompletedTurnWorkingSetSnapshotV2Options, VirtualSessionTerminalV2Options,
+    mark_virtual_session_terminal_for_lane, record_completed_turn_working_set_snapshot_for_lane,
+};
+use crate::goal_budget::{
+    GoalCampaignBudgetInput, current_goal_campaign_timeouts, evaluate_goal_campaign_budget,
+    load_goal_campaign_policy,
+};
+use crate::goal_continuation::{
+    GoalAutonomyMode, acknowledge_goal_continuation_after_lease, commit_goal_continuation_intent,
+    ensure_goal_continuation_enqueued, load_goal_autonomy_activation,
+    reconcile_goal_continuation_intents,
+};
+use crate::goal_lineage::{
+    GoalLineageDisposition, GoalLineageDoctorOptions, GoalLineageDoctorStatus, GoalProjectionHint,
+    latest_goal_projection_for_queue, run_goal_lineage_doctor,
+};
+use crate::goal_transition::{
+    GoalTransitionAuthority, GoalTransitionDecision, GoalTransitionEventKind, GoalTransitionInput,
+    GoalTransitionReceiptV1, GoalTransitionSurface, evaluate_goal_transition,
+    record_goal_transition,
 };
 use crate::rich_presentation::{
     RichMessagePresentation, rich_presentation_from_plain_final_with_attachment_count,
@@ -28,23 +47,23 @@ use crate::{
     ChannelDeliveryIntentKind, ChannelOutboundAttachment, ChannelOutboundAttachmentKind,
     ChannelOutboundMessage, ChannelOutboundMessageKind, CodexRuntimePlan, CodexRuntimePlanOptions,
     CodexRuntimePlanReport, CodexRuntimeReceiptStatus, CodexRuntimeRunOptions,
-    CodexRuntimeRunReport, CodexRuntimeRunStatus, CompletedTurnWorkingSetSnapshotOptions,
-    ContextRolloverMode, ContextRolloverPreparedRequeueReport,
-    ContextRolloverRequeuePreparedOptions, HarnessLogEvent, HarnessLogLevel, InboundMediaArtifact,
-    MediaDeliveryVerdict, MemoryLifecycleTurnOptions, PromptAssemblyOptions, ResponseToneConfig,
-    ResponseToneContext, RuntimeContinuationMetadata, RuntimeExecutionReceiptStatus,
-    RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeQueuePreparedItem,
-    SelfImprovementNotificationTarget, SelfImprovementReviewHookOptions,
-    VirtualSessionTerminalOptions, advance_learning_nudge_counters, append_agent_progress_event,
-    append_channel_outbox_message, append_harness_log, apply_response_tone,
-    attachment_kind_from_path, continuation_session_key, current_log_time_ms,
+    CodexRuntimeRunReport, CodexRuntimeRunStatus, ContextRolloverMode,
+    ContextRolloverPreparedRequeueReport, ContextRolloverRequeuePreparedOptions, HarnessLogEvent,
+    HarnessLogLevel, InboundMediaArtifact, MediaDeliveryVerdict, MemoryLifecycleTurnOptions,
+    PromptAssemblyOptions, ResponseToneConfig, ResponseToneContext, RuntimeContinuationMetadata,
+    RuntimeExecutionReceiptStatus, RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport,
+    RuntimeQueuePreparedItem, SelfImprovementNotificationTarget, SelfImprovementReviewHookOptions,
+    SkillEpisodeRuntimeCaptureOptions, SkillOutcomeStatusV1, VirtualSessionTerminalOptions,
+    advance_learning_nudge_counters, append_agent_progress_event, append_channel_outbox_message,
+    append_harness_log, apply_response_tone, attachment_kind_from_path,
+    capture_skill_episode_runtime_evidence, continuation_session_key, current_log_time_ms,
     evaluate_outbound_media_path, inspect_runtime_backoff_policy, is_deliverable_media_path,
     load_assistant_narration_config, load_context_rollover_config, load_harness_media_config,
     load_response_tone_config, mark_cron_run_runtime_status_by_queue_id,
     mark_virtual_session_terminal, plan_codex_runtime, prepare_runtime_queue_item,
-    read_channel_session_state_v2, record_completed_turn_working_set_snapshot,
-    record_memory_lifecycle_turn, record_skill_usage_from_prompt_bundle,
-    release_runtime_queue_lease, requeue_prepared_context_rollover_if_no_parent_siblings,
+    read_channel_session_state_v2, record_memory_lifecycle_turn,
+    record_skill_usage_from_prompt_bundle, release_runtime_queue_lease,
+    requeue_prepared_context_rollover_if_no_parent_siblings,
     resolve_inbound_media_artifact_reference, root_working_session_key, run_codex_runtime,
     run_self_improvement_review_hook, write_json_atomic, write_media_policy_receipt,
     write_runtime_queue_quarantine_marker,
@@ -53,6 +72,50 @@ use crate::{
 const RUNTIME_RUN_ONCE_SCHEMA: &str = "agent-harness.runtime-run-once.v1";
 const RUNTIME_DEAD_LETTER_SCHEMA: &str = "agent-harness.runtime-dead-letter.v1";
 const FINAL_OUTBOX_RECEIPT_SCHEMA: &str = "agent-harness.runtime-final-outbox.v1";
+const VIRTUAL_SESSION_AUTHORITY_SCHEMA: &str = "agent-harness.virtual-session-authority.v1";
+const GOAL_TERMINAL_OUTBOX_SCHEMA: &str = "agent-harness.goal-terminal-outbox.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum GoalTerminalOutboxState {
+    Committed,
+    Appended,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoalTerminalOutboxReceiptV1 {
+    schema: String,
+    terminal_key: String,
+    delivery_id: String,
+    campaign_family_id: String,
+    lane_digest: String,
+    virtual_session_id: String,
+    decision: GoalTransitionDecision,
+    surface: GoalTransitionSurface,
+    source_queue_id: Option<String>,
+    message: ChannelOutboundMessage,
+    state: GoalTerminalOutboxState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outbox_file: Option<PathBuf>,
+    recorded_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VirtualSessionAuthorityReceiptV1 {
+    schema: &'static str,
+    queue_id: Option<String>,
+    virtual_session_id: String,
+    working_session_key: String,
+    lane_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend_context_generation: Option<String>,
+    working_set_file: PathBuf,
+    status: String,
+    reason: String,
+    updated_at_ms: i64,
+}
 #[derive(Debug, Clone)]
 struct RuntimeContinuationCandidate {
     queue_id: String,
@@ -207,6 +270,7 @@ pub enum RuntimeRunOnceStatus {
     NoPreparedExecution,
     NoRuntimePlan,
     PreflightBlocked,
+    AuthDeferred,
     SpawnFailed,
     ProtocolError,
     ContextExhausted,
@@ -228,6 +292,7 @@ impl RuntimeRunOnceStatus {
             Self::NoPreparedExecution => "no-prepared-execution",
             Self::NoRuntimePlan => "no-runtime-plan",
             Self::PreflightBlocked => "preflight-blocked",
+            Self::AuthDeferred => "auth-deferred",
             Self::SpawnFailed => "spawn-failed",
             Self::ProtocolError => "protocol-error",
             Self::ContextExhausted => "context-exhausted",
@@ -418,12 +483,20 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
     let receipts_file = queue_dir.join("run-once-receipts.jsonl");
     fs::create_dir_all(&queue_dir)?;
 
+    let reconciled_goal_intents =
+        reconcile_goal_continuation_intents(&options.harness_home, current_log_time_ms()?)?;
     let prepare = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
         harness_home: options.harness_home.clone(),
         queue_id: options.queue_id.clone(),
         prompt_options: options.prompt_options,
     })?;
     let mut warnings = prepare.warnings.clone();
+    if !reconciled_goal_intents.is_empty() {
+        warnings.push(format!(
+            "reconciled {} committed goal continuation intent(s) before queue selection",
+            reconciled_goal_intents.len()
+        ));
+    }
     let mut channel_context = prepare
         .item
         .as_ref()
@@ -550,6 +623,19 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             },
             append_receipt,
         );
+    }
+
+    if let Some(item) = prepare.item.as_ref()
+        && let Some(acknowledged) = acknowledge_goal_continuation_after_lease(
+            &options.harness_home,
+            item,
+            current_log_time_ms()?,
+        )?
+    {
+        warnings.push(format!(
+            "goal continuation intent {} acknowledged after child lane lease acquisition",
+            acknowledged.intent_key
+        ));
     }
 
     let plan = plan_codex_runtime(CodexRuntimePlanOptions {
@@ -754,20 +840,35 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         warnings.push(format!("skill usage ledger recording failed: {error}"));
     }
 
+    let (_, effective_timeout_ms, effective_idle_timeout_ms) = current_goal_campaign_timeouts(
+        &options.harness_home,
+        options.timeout_ms,
+        options.idle_timeout_ms,
+    )?;
+    if effective_timeout_ms != options.timeout_ms
+        || effective_idle_timeout_ms != options.idle_timeout_ms
+    {
+        warnings.push(format!(
+            "runtime slice timeouts bounded by goal campaign policy: hard={}ms idle={}ms",
+            effective_timeout_ms, effective_idle_timeout_ms
+        ));
+    }
     let run = run_codex_runtime(CodexRuntimeRunOptions {
         harness_home: options.harness_home.clone(),
         execution_dir: plan.execution_dir.clone(),
         plan_file: plan.plan_file.clone(),
-        timeout_ms: options.timeout_ms,
-        idle_timeout_ms: options.idle_timeout_ms,
+        timeout_ms: effective_timeout_ms,
+        idle_timeout_ms: effective_idle_timeout_ms,
         progress_context: progress_context.clone(),
     })?;
     warnings.extend(run.warnings.clone());
+    let auth_deferred = run.receipt.status == CodexRuntimeRunStatus::PreflightBlocked
+        && run.receipt.reason.contains("needs-operator-auth");
     let queue_failure_attempts = run
         .receipt
         .queue_id
         .as_deref()
-        .filter(|_| run.receipt.status != CodexRuntimeRunStatus::Completed)
+        .filter(|_| run.receipt.status != CodexRuntimeRunStatus::Completed && !auth_deferred)
         .map(|queue_id| count_prior_runtime_failures(&options.harness_home, queue_id))
         .transpose()?
         .map(|attempts| attempts.saturating_add(1))
@@ -845,7 +946,170 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
     let mut outbound_message = None;
     let mut child_queue_id = None;
     let mut child_session_key = None;
-    if run.receipt.status == CodexRuntimeRunStatus::Completed {
+    let goal_authority = establish_runtime_goal_authority_before_outbox(
+        &options.harness_home,
+        prepare.item.as_ref(),
+        plan.plan.as_ref(),
+        &run,
+        receipt_status,
+        &receipts_file,
+        &mut warnings,
+    );
+    let goal_transition = evaluate_runtime_goal_transition(
+        &options.harness_home,
+        &run,
+        receipt_status,
+        &prepare.receipt.continuation,
+        &goal_authority,
+        &mut warnings,
+    )?;
+    warnings.push(format!(
+        "goal transition decided {:?} with {:?} surface before final-outbox selection",
+        goal_transition.decision, goal_transition.surface
+    ));
+    if goal_transition.schedule_continuation
+        && goal_transition
+            .goal_status
+            .as_deref()
+            .is_some_and(is_goal_status_active)
+    {
+        let activation = load_goal_autonomy_activation(
+            &options.harness_home,
+            goal_transition.lane_digest.as_deref(),
+        )?;
+        warnings.push(format!(
+            "goal autonomy mode {:?}: {}",
+            activation.mode, activation.reason
+        ));
+        if activation.mode == GoalAutonomyMode::Active {
+            let scheduling_result = (|| -> io::Result<_> {
+                let item = prepare.item.as_ref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "active goal transition has no prepared queue item",
+                    )
+                })?;
+                let now_ms = current_log_time_ms()?;
+                let intent = commit_goal_continuation_intent(
+                    &options.harness_home,
+                    &goal_transition,
+                    &item.session_key,
+                    &item.continuation,
+                    now_ms,
+                )?;
+                ensure_goal_continuation_enqueued(&options.harness_home, &intent.intent_key, now_ms)
+            })();
+            let enqueued = match scheduling_result {
+                Ok(enqueued) => enqueued,
+                Err(error) => {
+                    if let Some(queue_id) = prepare.receipt.queue_id.as_deref() {
+                        let _ = release_runtime_queue_lease(&options.harness_home, queue_id);
+                    }
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "active goal continuation failed closed before final outbox: {error}"
+                        ),
+                    ));
+                }
+            };
+            child_queue_id = enqueued.child_queue_id.clone();
+            child_session_key = Some(enqueued.working_session_key.clone());
+            receipt_status = RuntimeRunOnceStatus::Skipped;
+            receipt_reason = format!(
+                "goal slice yielded to deterministic continuation {}; childQueueId={}; priorReason={}",
+                enqueued.intent_key,
+                enqueued.child_queue_id.as_deref().unwrap_or("missing"),
+                receipt_reason
+            );
+            warnings.push(format!(
+                "goal continuation intent {} enqueued one logical child before final-outbox selection",
+                enqueued.intent_key
+            ));
+        }
+    }
+    if goal_transition.surface == GoalTransitionSurface::TerminalNotice
+        && goal_transition.campaign_family_id.is_some()
+    {
+        if let Some(context) = channel_context {
+            let agent_id = prepare
+                .item
+                .as_ref()
+                .map(|item| item.agent_id.as_str())
+                .or_else(|| plan.plan.as_ref().and_then(|plan| plan.agent_id.as_deref()));
+            let run_session_key = prepare
+                .item
+                .as_ref()
+                .map(|item| item.session_key.as_str())
+                .or_else(|| plan.plan.as_ref().map(|plan| plan.session_key.as_str()));
+            if !final_outbox_run_owns_channel_parent(
+                prepare.receipt.runtime_class.as_deref(),
+                prepare.receipt.origin.as_deref(),
+                agent_id,
+                run_session_key,
+                &context.session_key,
+            ) {
+                warnings.push(
+                    "goal terminal notice suppressed because this run does not own the exact channel parent"
+                        .to_string(),
+                );
+            } else if !channel_session_is_current(&options.harness_home, &context, &mut warnings)? {
+                warnings.push(
+                    "goal terminal notice suppressed because the exact channel session is stale"
+                        .to_string(),
+                );
+            } else if let Some(text) = goal_terminal_notice_text(goal_transition.decision) {
+                let mut message = ChannelOutboundMessage {
+                    platform: context.platform.clone(),
+                    account_id: context.account_id.clone(),
+                    channel_id: context.channel_id.clone(),
+                    user_id: context.user_id.clone(),
+                    session_key: context.session_key.clone(),
+                    delivery_id: None,
+                    kind: ChannelOutboundMessageKind::AgentReply,
+                    source_queue_id: run.receipt.queue_id.clone(),
+                    source_completion_file: run.receipt.completion_file.clone(),
+                    presentation: None,
+                    text: text.to_string(),
+                    delivery_intent: delivery_intent_from_inbound_context(
+                        &context.platform,
+                        &context.channel_id,
+                        context.inbound_context.as_deref(),
+                    ),
+                    attachments: Vec::new(),
+                };
+                let (file, appended) = append_goal_terminal_outbound_message_once(
+                    &options.harness_home,
+                    run.receipt.execution_dir.as_deref(),
+                    run.receipt.completion_file.as_deref(),
+                    &goal_transition,
+                    &mut message,
+                    &mut warnings,
+                )?;
+                outbox_file = Some(file);
+                if appended {
+                    outbound_message = Some(message);
+                }
+            } else {
+                warnings.push(format!(
+                    "goal terminal notice suppressed because decision {:?} has no sanitized provider surface",
+                    goal_transition.decision
+                ));
+            }
+        } else {
+            warnings.push(
+                "queue channel context was unavailable; goal terminal notice was not written to outbox"
+                    .to_string(),
+            );
+        }
+    } else if run.receipt.status == CodexRuntimeRunStatus::Completed
+        && !goal_transition.allow_campaign_final
+    {
+        warnings.push(format!(
+            "completed slice final outbox suppressed by unified goal transition {:?}: {}",
+            goal_transition.decision, goal_transition.reason
+        ));
+    } else if run.receipt.status == CodexRuntimeRunStatus::Completed {
         if run.receipt.event_count == 0 && run.receipt.reason.contains("already recorded") {
             warnings.push(
                 "codex-run reported an already recorded completion; checking final outbox idempotency"
@@ -1018,13 +1282,25 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                     ),
                                     attachments,
                                 };
-                                let (file, appended) = append_final_outbound_message_once(
-                                    &options.harness_home,
-                                    run.receipt.execution_dir.as_deref(),
-                                    run.receipt.completion_file.as_deref(),
-                                    &mut message,
-                                    &mut warnings,
-                                )?;
+                                let (file, appended) =
+                                    if goal_transition.campaign_family_id.is_some() {
+                                        append_goal_terminal_outbound_message_once(
+                                            &options.harness_home,
+                                            run.receipt.execution_dir.as_deref(),
+                                            run.receipt.completion_file.as_deref(),
+                                            &goal_transition,
+                                            &mut message,
+                                            &mut warnings,
+                                        )?
+                                    } else {
+                                        append_final_outbound_message_once(
+                                            &options.harness_home,
+                                            run.receipt.execution_dir.as_deref(),
+                                            run.receipt.completion_file.as_deref(),
+                                            &mut message,
+                                            &mut warnings,
+                                        )?
+                                    };
                                 outbox_file = Some(file);
                                 if appended {
                                     if let Some(codex_plan) = plan.plan.as_ref() {
@@ -1088,6 +1364,16 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                     .to_string(),
             );
         }
+    } else if should_write_failure_outbox(receipt_status)
+        && matches!(
+            goal_transition.surface,
+            GoalTransitionSurface::ProgressOnly | GoalTransitionSurface::SuppressStale
+        )
+    {
+        warnings.push(format!(
+            "failure outbox suppressed by unified goal transition {:?}: {}",
+            goal_transition.decision, goal_transition.reason
+        ));
     } else if should_write_failure_outbox(receipt_status)
         && let Some(context) = channel_context
     {
@@ -1271,26 +1557,58 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         prepared_execution_terminalization_reason: None,
         reason: receipt_reason,
     };
-    if receipt.status == RuntimeRunOnceStatus::Completed
-        && let Some(item) = prepare.item.as_ref()
+    if matches!(
+        run.receipt.status,
+        CodexRuntimeRunStatus::Completed
+            | CodexRuntimeRunStatus::Timeout
+            | CodexRuntimeRunStatus::ContextExhausted
+            | CodexRuntimeRunStatus::ProtocolError
+            | CodexRuntimeRunStatus::Canceled
+    ) && let Some(item) = prepare.item.as_ref()
+        && let Some(manifest_file) = item.virtual_skill_manifest_file.as_ref()
+        && !item.skill_delivery_receipt_files.is_empty()
     {
-        match record_completed_turn_working_set_snapshot(CompletedTurnWorkingSetSnapshotOptions {
+        let terminal_eligible = (receipt.status == RuntimeRunOnceStatus::Completed
+            && outbound_message.is_some()
+            && receipt.child_queue_id.is_none())
+            || matches!(
+                receipt.status,
+                RuntimeRunOnceStatus::DeadLetter | RuntimeRunOnceStatus::FailedTerminal
+            );
+        let outcome_status = if matches!(
+            receipt.status,
+            RuntimeRunOnceStatus::DeadLetter | RuntimeRunOnceStatus::FailedTerminal
+        ) {
+            SkillOutcomeStatusV1::Abandoned
+        } else {
+            // A model final is not a verifier result.
+            SkillOutcomeStatusV1::Unknown
+        };
+        match capture_skill_episode_runtime_evidence(SkillEpisodeRuntimeCaptureOptions {
             harness_home: options.harness_home.clone(),
-            platform: item.platform.clone(),
-            channel_id: item.channel_id.clone(),
-            user_id: item.user_id.clone(),
-            agent_id: item.agent_id.clone(),
-            working_session_key: item.session_key.clone(),
-            queue_id: receipt.queue_id.clone(),
-            message_text: Some(item.message_text.clone()),
-            status: receipt.status.as_str().to_string(),
-            run_once_receipt_file: Some(receipts_file.clone()),
-            outbox_file: outbox_file.clone(),
-            completion_file: run.receipt.completion_file.clone(),
+            manifest_file: manifest_file.clone(),
+            delivery_receipt_files: item.skill_delivery_receipt_files.clone(),
+            queue_id: item.queue_id.clone(),
+            execution_class: item.runtime_class.clone(),
+            source_origin: item.origin.clone(),
+            outcome_status,
+            verifier_type: None,
+            verifier_ref: None,
+            correction_ref: None,
+            terminal_eligible,
             now_ms: current_log_time_ms()?,
         }) {
-            Ok(_) => {}
-            Err(error) => warnings.push(format!("working-set snapshot write failed: {error}")),
+            Ok(report) => {
+                if let Some(review) = report.terminal_review {
+                    warnings.push(format!(
+                        "skill terminal review {} recorded in evidence-only mode ({})",
+                        review.review_id, review.disposition
+                    ));
+                }
+            }
+            Err(error) => warnings.push(format!(
+                "skill episode runtime evidence capture failed: {error}"
+            )),
         }
     }
     let log_level = match receipt.status {
@@ -1305,6 +1623,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         | RuntimeRunOnceStatus::Suppressed
         | RuntimeRunOnceStatus::Skipped
         | RuntimeRunOnceStatus::RetryPending
+        | RuntimeRunOnceStatus::AuthDeferred
         | RuntimeRunOnceStatus::LeaseBusy => HarnessLogLevel::Warn,
         RuntimeRunOnceStatus::NoWork
         | RuntimeRunOnceStatus::NoPreparedExecution
@@ -1320,6 +1639,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         RuntimeRunOnceStatus::NoPreparedExecution => "runtime.run-once.no-prepared-execution",
         RuntimeRunOnceStatus::NoRuntimePlan => "runtime.run-once.no-runtime-plan",
         RuntimeRunOnceStatus::PreflightBlocked => "runtime.run-once.preflight-blocked",
+        RuntimeRunOnceStatus::AuthDeferred => "runtime.run-once.auth-deferred",
         RuntimeRunOnceStatus::SpawnFailed => "runtime.run-once.spawn-failed",
         RuntimeRunOnceStatus::ProtocolError => "runtime.run-once.protocol-error",
         RuntimeRunOnceStatus::ContextExhausted => "runtime.run-once.context-exhausted",
@@ -1641,7 +1961,9 @@ fn append_runtime_progress_finished(
             AgentProgressStatus::Completed
         }
         RuntimeRunOnceStatus::Skipped => AgentProgressStatus::Completed,
-        RuntimeRunOnceStatus::RetryPending => AgentProgressStatus::Progress,
+        RuntimeRunOnceStatus::RetryPending | RuntimeRunOnceStatus::AuthDeferred => {
+            AgentProgressStatus::Progress
+        }
         _ => AgentProgressStatus::Failed,
     };
     let preview = runtime_progress_preview(status, reason);
@@ -1668,6 +1990,9 @@ fn runtime_progress_preview(status: RuntimeRunOnceStatus, reason: &str) -> Strin
         RuntimeRunOnceStatus::Skipped => "skipped because continuation work was queued".to_string(),
         RuntimeRunOnceStatus::RetryPending => {
             "transient runtime failure; preserving session for retry".to_string()
+        }
+        RuntimeRunOnceStatus::AuthDeferred => {
+            "waiting for operator authentication; preserving queued work".to_string()
         }
         RuntimeRunOnceStatus::DeadLetter if is_retryable_codex_protocol_error(reason) => {
             "transient Codex stream disconnect exhausted retry budget; moved to dead-letter"
@@ -1755,6 +2080,9 @@ fn final_run_once_status(
     match codex_status {
         CodexRuntimeRunStatus::Completed => RuntimeRunOnceStatus::Completed,
         CodexRuntimeRunStatus::Canceled => RuntimeRunOnceStatus::Canceled,
+        CodexRuntimeRunStatus::PreflightBlocked if reason.contains("needs-operator-auth") => {
+            RuntimeRunOnceStatus::AuthDeferred
+        }
         CodexRuntimeRunStatus::Timeout if failure_attempts < max_failure_attempts => {
             RuntimeRunOnceStatus::RetryPending
         }
@@ -2172,6 +2500,11 @@ fn maybe_enqueue_tool_timeout_retry_continuation(
             new_working_session_key,
             reason: interrupted_long_task_rollover_reason("retry-pending", run),
             now_ms,
+            preserve_continuation_index: false,
+            campaign_slice_generation: None,
+            continuation_intent_key: None,
+            completion_kind: None,
+            allow_exact_state_bootstrap: false,
         },
     ) {
         Ok(report) => Ok(Some(report)),
@@ -2258,6 +2591,11 @@ fn maybe_enqueue_polluted_thread_continuation(
                 )
             },
             now_ms,
+            preserve_continuation_index: false,
+            campaign_slice_generation: None,
+            continuation_intent_key: None,
+            completion_kind: None,
+            allow_exact_state_bootstrap: false,
         },
     ) {
         Ok(report) => Ok(Some(report)),
@@ -2347,6 +2685,11 @@ fn maybe_enqueue_stream_unstable_retry_continuation(
                 run.receipt.reason
             ),
             now_ms,
+            preserve_continuation_index: false,
+            campaign_slice_generation: None,
+            continuation_intent_key: None,
+            completion_kind: None,
+            allow_exact_state_bootstrap: false,
         },
     ) {
         Ok(report) => Ok(Some(report)),
@@ -2418,6 +2761,532 @@ fn exact_channel_state_lane_for_continuation(
         item.agent_id.as_deref()?,
     )
     .ok()
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeGoalAuthorityContext {
+    lane_digest: Option<String>,
+    virtual_session_id: Option<String>,
+    projection_hint: Option<GoalProjectionHint>,
+}
+
+fn establish_runtime_goal_authority_before_outbox(
+    harness_home: &Path,
+    item: Option<&RuntimeQueuePreparedItem>,
+    codex_plan: Option<&CodexRuntimePlan>,
+    run: &CodexRuntimeRunReport,
+    receipt_status: RuntimeRunOnceStatus,
+    run_once_receipts_file: &Path,
+    warnings: &mut Vec<String>,
+) -> RuntimeGoalAuthorityContext {
+    let projection_hint =
+        run.receipt.queue_id.as_deref().and_then(
+            |queue_id| match latest_goal_projection_for_queue(harness_home, queue_id) {
+                Ok(value) => value,
+                Err(error) => {
+                    warnings.push(format!(
+                        "goal transition projection hint failed closed: {error}"
+                    ));
+                    None
+                }
+            },
+        );
+    let Some(item) = item else {
+        return RuntimeGoalAuthorityContext {
+            lane_digest: None,
+            virtual_session_id: None,
+            projection_hint,
+        };
+    };
+    let full_lane = match crate::lane::FullLaneKeyV1::new(
+        item.platform.clone(),
+        item.account_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string()),
+        item.channel_id.clone(),
+        item.user_id.clone(),
+        item.agent_id.clone(),
+        item.runtime_class.clone(),
+        root_working_session_key(&item.session_key),
+        item.session_key.clone(),
+    ) {
+        Ok(lane) => lane,
+        Err(error) => {
+            warnings.push(format!(
+                "goal transition exact full-lane construction failed closed: {error}"
+            ));
+            return RuntimeGoalAuthorityContext {
+                lane_digest: None,
+                virtual_session_id: None,
+                projection_hint,
+            };
+        }
+    };
+    let lane_digest = match full_lane.identity_hash() {
+        Ok(value) => value,
+        Err(error) => {
+            warnings.push(format!(
+                "goal transition exact full-lane digest failed closed: {error}"
+            ));
+            return RuntimeGoalAuthorityContext {
+                lane_digest: None,
+                virtual_session_id: None,
+                projection_hint,
+            };
+        }
+    };
+    let plan_generation =
+        codex_plan.and_then(|plan| plan.prompt_authority.backend_context_generation.as_deref());
+    let active_exact_projection = projection_hint.as_ref().is_some_and(|projection| {
+        projection.projection_complete
+            && is_goal_status_active(&projection.status)
+            && projection.session_key == item.session_key
+            && projection.lane_digest.as_deref() == Some(lane_digest.as_str())
+            && projection.backend_context_generation.as_deref() == plan_generation
+    });
+    let should_snapshot =
+        run.receipt.status == CodexRuntimeRunStatus::Completed || active_exact_projection;
+    if !should_snapshot {
+        return RuntimeGoalAuthorityContext {
+            lane_digest: Some(lane_digest),
+            virtual_session_id: None,
+            projection_hint,
+        };
+    }
+    let channel_lane = match ChannelStateLane::new(
+        &item.platform,
+        item.account_id.as_deref(),
+        &item.channel_id,
+        &item.user_id,
+        &item.agent_id,
+    ) {
+        Ok(lane) => lane,
+        Err(error) => {
+            warnings.push(format!(
+                "goal transition exact channel lane failed closed: {error}"
+            ));
+            return RuntimeGoalAuthorityContext {
+                lane_digest: Some(lane_digest),
+                virtual_session_id: None,
+                projection_hint,
+            };
+        }
+    };
+    match record_completed_turn_working_set_snapshot_for_lane(
+        CompletedTurnWorkingSetSnapshotV2Options {
+            harness_home: harness_home.to_path_buf(),
+            channel_lane,
+            working_session_key: item.session_key.clone(),
+            queue_id: run.receipt.queue_id.clone(),
+            message_text: Some(item.message_text.clone()),
+            status: receipt_status.as_str().to_string(),
+            run_once_receipt_file: Some(run_once_receipts_file.to_path_buf()),
+            outbox_file: None,
+            completion_file: run.receipt.completion_file.clone(),
+            now_ms: current_log_time_ms().unwrap_or(0),
+        },
+    ) {
+        Ok(snapshot) => {
+            if let Err(error) =
+                record_virtual_session_authority(harness_home, item, codex_plan, &snapshot)
+            {
+                warnings.push(format!(
+                    "pre-outbox exact-lane virtual-session authority receipt failed: {error}"
+                ));
+                return RuntimeGoalAuthorityContext {
+                    lane_digest: Some(lane_digest),
+                    virtual_session_id: None,
+                    projection_hint,
+                };
+            }
+            RuntimeGoalAuthorityContext {
+                lane_digest: Some(lane_digest),
+                virtual_session_id: Some(snapshot.virtual_session_id),
+                projection_hint,
+            }
+        }
+        Err(error) => {
+            warnings.push(format!(
+                "pre-outbox exact-lane working-set authority failed closed: {error}"
+            ));
+            RuntimeGoalAuthorityContext {
+                lane_digest: Some(lane_digest),
+                virtual_session_id: None,
+                projection_hint,
+            }
+        }
+    }
+}
+
+fn evaluate_runtime_goal_transition(
+    harness_home: &Path,
+    run: &CodexRuntimeRunReport,
+    receipt_status: RuntimeRunOnceStatus,
+    continuation: &RuntimeContinuationMetadata,
+    authority_context: &RuntimeGoalAuthorityContext,
+    warnings: &mut Vec<String>,
+) -> io::Result<GoalTransitionReceiptV1> {
+    let report = run_goal_lineage_doctor(GoalLineageDoctorOptions {
+        harness_home: harness_home.to_path_buf(),
+        lane_digest: authority_context.lane_digest.clone(),
+        virtual_session_id: authority_context.virtual_session_id.clone(),
+    });
+    let mut authority;
+    let mut selected = None;
+    let mut older_than_authoritative_lineage = false;
+    match report {
+        Ok(report) => {
+            let current_queue = run.receipt.queue_id.as_deref();
+            let current_selected = report
+                .lineages
+                .iter()
+                .filter(|lineage| lineage.queue_id.as_deref() == current_queue)
+                .max_by_key(|lineage| (lineage.observed_at_ms, lineage.observation_order))
+                .cloned();
+            older_than_authoritative_lineage = current_selected.as_ref().is_some_and(|current| {
+                report.lineages.iter().any(|candidate| {
+                    candidate.campaign_family_id == current.campaign_family_id
+                        && candidate.lineage_id != current.lineage_id
+                        && (candidate.observed_at_ms, candidate.observation_order)
+                            > (current.observed_at_ms, current.observation_order)
+                })
+            });
+            selected = current_selected.or_else(|| {
+                report
+                    .lineages
+                    .iter()
+                    .filter(|lineage| {
+                        is_goal_status_active(&lineage.goal_status) && lineage.runnable
+                    })
+                    .max_by_key(|lineage| (lineage.observed_at_ms, lineage.observation_order))
+                    .cloned()
+            });
+            authority = match report.status {
+                GoalLineageDoctorStatus::ReconciliationRequired => {
+                    GoalTransitionAuthority::Conflict
+                }
+                GoalLineageDoctorStatus::Blocked => GoalTransitionAuthority::Invalid,
+                GoalLineageDoctorStatus::Ready => selected
+                    .as_ref()
+                    .map(|lineage| match lineage.disposition {
+                        GoalLineageDisposition::Runnable | GoalLineageDisposition::Inactive => {
+                            GoalTransitionAuthority::Ready
+                        }
+                        GoalLineageDisposition::StaleGeneration => GoalTransitionAuthority::Stale,
+                        GoalLineageDisposition::MissingAuthority => {
+                            GoalTransitionAuthority::Missing
+                        }
+                        GoalLineageDisposition::InvalidIdentity => GoalTransitionAuthority::Invalid,
+                        GoalLineageDisposition::Superseded => GoalTransitionAuthority::Conflict,
+                    })
+                    .unwrap_or(GoalTransitionAuthority::NotApplicable),
+                GoalLineageDoctorStatus::Empty => GoalTransitionAuthority::NotApplicable,
+            };
+            if older_than_authoritative_lineage {
+                authority = GoalTransitionAuthority::Stale;
+            }
+        }
+        Err(error) => {
+            warnings.push(format!(
+                "goal transition lineage doctor failed closed: {error}"
+            ));
+            authority = GoalTransitionAuthority::Invalid;
+        }
+    }
+    let hint = authority_context.projection_hint.as_ref();
+    if selected.is_none() && hint.is_some() && authority == GoalTransitionAuthority::NotApplicable {
+        authority = GoalTransitionAuthority::Missing;
+    }
+    let event = if older_than_authoritative_lineage {
+        GoalTransitionEventKind::OlderCompletion
+    } else {
+        classify_goal_transition_event(run, receipt_status)
+    };
+    let goal_status = selected
+        .as_ref()
+        .map(|lineage| lineage.goal_status.clone())
+        .or_else(|| hint.map(|projection| projection.status.clone()));
+    let lineage_id = selected.as_ref().map(|lineage| lineage.lineage_id.clone());
+    let campaign_family_id = selected
+        .as_ref()
+        .map(|lineage| lineage.campaign_family_id.clone());
+    let lane_digest = selected
+        .as_ref()
+        .and_then(|lineage| lineage.lane_digest.clone())
+        .or_else(|| authority_context.lane_digest.clone());
+    let virtual_session_id = selected
+        .as_ref()
+        .and_then(|lineage| lineage.virtual_session_id.clone())
+        .or_else(|| authority_context.virtual_session_id.clone());
+    let backend_context_generation = selected
+        .as_ref()
+        .and_then(|lineage| lineage.backend_context_generation.clone())
+        .or_else(|| hint.and_then(|projection| projection.backend_context_generation.clone()));
+    let source_thread_id = selected
+        .as_ref()
+        .map(|lineage| lineage.source_thread_id.clone())
+        .or_else(|| hint.map(|projection| projection.source_thread_id.clone()));
+    let source_turn_id = selected
+        .as_ref()
+        .and_then(|lineage| lineage.source_turn_id.clone())
+        .or_else(|| hint.and_then(|projection| projection.source_turn_id.clone()));
+    let goal_checksum = selected
+        .as_ref()
+        .map(|lineage| lineage.goal_checksum.clone())
+        .or_else(|| hint.map(|projection| projection.goal_checksum.clone()));
+    let source_slice_generation = continuation.campaign_slice_generation.unwrap_or(0);
+    if let Some(existing) = find_existing_goal_transition(
+        harness_home,
+        run.receipt.queue_id.as_deref(),
+        event,
+        receipt_status,
+        source_slice_generation,
+        source_turn_id.as_deref(),
+        goal_checksum.as_deref(),
+    )? {
+        return Ok(existing);
+    }
+    let campaign_budget = if goal_status.as_deref().is_some_and(is_goal_status_active) {
+        match (
+            campaign_family_id.as_deref(),
+            lane_digest.as_deref(),
+            virtual_session_id.as_deref(),
+        ) {
+            (Some(campaign_family_id), Some(lane_digest), Some(virtual_session_id)) => {
+                let policy = load_goal_campaign_policy(harness_home)?;
+                let receipt = evaluate_goal_campaign_budget(
+                    harness_home,
+                    &policy,
+                    GoalCampaignBudgetInput {
+                        campaign_family_id,
+                        lane_digest,
+                        virtual_session_id,
+                        queue_id: run.receipt.queue_id.as_deref(),
+                        goal_checksum: goal_checksum.as_deref(),
+                        source_slice_generation,
+                        event,
+                        slice_elapsed_ms: run.receipt.elapsed_ms.min(u128::from(u64::MAX)) as u64,
+                        slice_tokens: run
+                            .receipt
+                            .usage
+                            .as_ref()
+                            .and_then(|usage| usage.total_tokens)
+                            .unwrap_or(0),
+                        output_tokens: run
+                            .receipt
+                            .usage
+                            .as_ref()
+                            .and_then(|usage| usage.output_tokens)
+                            .unwrap_or(0),
+                        event_count: run.receipt.event_count,
+                        runtime_status: receipt_status.as_str(),
+                        recovery_slice: run.receipt.context_recovery.is_some(),
+                        now_ms: current_log_time_ms()?,
+                    },
+                )?;
+                warnings.push(format!(
+                    "goal campaign budget boundary {:?}: slices={} tokens={} noProgress={} recoveries={} elapsed={}ms",
+                    receipt.boundary,
+                    receipt.slices_observed,
+                    receipt.total_tokens_observed,
+                    receipt.consecutive_no_progress_slices,
+                    receipt.recovery_slices_observed,
+                    receipt.campaign_elapsed_ms
+                ));
+                Some(receipt)
+            }
+            _ => {
+                warnings.push(
+                    "goal campaign budget evaluation skipped because exact campaign authority is incomplete"
+                        .to_string(),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let decision_generation =
+        next_goal_transition_generation(harness_home, run.receipt.queue_id.as_deref())?;
+    let receipt = evaluate_goal_transition(GoalTransitionInput {
+        queue_id: run.receipt.queue_id.clone(),
+        event,
+        runtime_status: receipt_status.as_str().to_string(),
+        runtime_reason: run.receipt.reason.clone(),
+        goal_status,
+        lineage_id,
+        campaign_family_id,
+        lane_digest,
+        virtual_session_id,
+        backend_context_generation,
+        source_thread_id,
+        source_turn_id,
+        goal_checksum,
+        source_slice_generation,
+        decision_generation,
+        authority,
+        retryable_failure: receipt_status == RuntimeRunOnceStatus::RetryPending,
+        context_rollover_required: context_recovery_indicates_interrupted_long_task(run)
+            || context_recovery_indicates_polluted_thread(run.receipt.context_recovery.as_ref()),
+        budget_exhausted: campaign_budget
+            .as_ref()
+            .is_some_and(|receipt| receipt.budget_exhausted),
+        no_progress_exhausted: campaign_budget
+            .as_ref()
+            .is_some_and(|receipt| receipt.no_progress_exhausted),
+        observed_at_ms: current_log_time_ms()?,
+    });
+    record_goal_transition(harness_home, &receipt)?;
+    Ok(receipt)
+}
+
+fn classify_goal_transition_event(
+    run: &CodexRuntimeRunReport,
+    receipt_status: RuntimeRunOnceStatus,
+) -> GoalTransitionEventKind {
+    if run.receipt.status == CodexRuntimeRunStatus::PreflightBlocked
+        && run.receipt.reason.contains("needs-operator-auth")
+    {
+        return GoalTransitionEventKind::AuthDeferred;
+    }
+    if run.receipt.status == CodexRuntimeRunStatus::Canceled {
+        return if run.receipt.interruption_reason.as_deref() == Some("interrupted_by_new_turn") {
+            GoalTransitionEventKind::NewerSteer
+        } else {
+            GoalTransitionEventKind::OperatorStop
+        };
+    }
+    if run.receipt.event_count == 0 && run.receipt.reason.contains("already recorded") {
+        return GoalTransitionEventKind::ProcessRestart;
+    }
+    if run.receipt.status == CodexRuntimeRunStatus::Completed {
+        return if run.receipt.reason.contains("deadline drain") {
+            GoalTransitionEventKind::DrainCompletion
+        } else {
+            GoalTransitionEventKind::NormalCompletion
+        };
+    }
+    if run.receipt.context_recovery.is_some() {
+        return GoalTransitionEventKind::CompactRollover;
+    }
+    if run.receipt.status == CodexRuntimeRunStatus::Timeout {
+        if run.receipt.tool_use_timeout.is_some() {
+            return GoalTransitionEventKind::ToolTimeout;
+        }
+        if run.receipt.reason.contains("JSONL event") || run.receipt.reason.contains("inactivity") {
+            return GoalTransitionEventKind::IdleTimeout;
+        }
+        return GoalTransitionEventKind::AbsoluteTimeout;
+    }
+    let _ = receipt_status;
+    GoalTransitionEventKind::RuntimeFailure
+}
+
+fn next_goal_transition_generation(harness_home: &Path, queue_id: Option<&str>) -> io::Result<u64> {
+    let file = crate::goal_transition::goal_transition_receipts_file(harness_home);
+    let text = match fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(1),
+        Err(error) => return Err(error),
+    };
+    let count = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|value| value.get("queueId").and_then(Value::as_str) == queue_id)
+        .count() as u64;
+    Ok(count.saturating_add(1))
+}
+
+fn find_existing_goal_transition(
+    harness_home: &Path,
+    queue_id: Option<&str>,
+    event: GoalTransitionEventKind,
+    runtime_status: RuntimeRunOnceStatus,
+    source_slice_generation: u64,
+    source_turn_id: Option<&str>,
+    goal_checksum: Option<&str>,
+) -> io::Result<Option<GoalTransitionReceiptV1>> {
+    let file = crate::goal_transition::goal_transition_receipts_file(harness_home);
+    let text = match fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<GoalTransitionReceiptV1>(line).ok())
+        .filter(|receipt| {
+            receipt.queue_id.as_deref() == queue_id
+                && receipt.event == event
+                && receipt.runtime_status == runtime_status.as_str()
+                && receipt.source_slice_generation == source_slice_generation
+                && receipt.source_turn_id.as_deref() == source_turn_id
+                && receipt.goal_checksum.as_deref() == goal_checksum
+        })
+        .last())
+}
+
+fn is_goal_status_active(status: &str) -> bool {
+    matches!(
+        status
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_', ' '], "")
+            .as_str(),
+        "active" | "running" | "inprogress"
+    )
+}
+
+fn record_virtual_session_authority(
+    harness_home: &Path,
+    item: &RuntimeQueuePreparedItem,
+    codex_plan: Option<&CodexRuntimePlan>,
+    snapshot: &crate::context_rollover::CompletedTurnWorkingSetSnapshotReport,
+) -> io::Result<()> {
+    let full_lane = crate::lane::FullLaneKeyV1::new(
+        item.platform.clone(),
+        item.account_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string()),
+        item.channel_id.clone(),
+        item.user_id.clone(),
+        item.agent_id.clone(),
+        item.runtime_class.clone(),
+        root_working_session_key(&item.session_key),
+        item.session_key.clone(),
+    )
+    .map_err(io::Error::other)?;
+    let lane_digest = full_lane.identity_hash().map_err(io::Error::other)?;
+    let backend_context_generation =
+        codex_plan.and_then(|plan| plan.prompt_authority.backend_context_generation.clone());
+    let generation_bound = backend_context_generation.is_some();
+    let receipt = VirtualSessionAuthorityReceiptV1 {
+        schema: VIRTUAL_SESSION_AUTHORITY_SCHEMA,
+        queue_id: item.queue_id.clone().into(),
+        virtual_session_id: snapshot.virtual_session_id.clone(),
+        working_session_key: snapshot.working_session_key.clone(),
+        lane_digest,
+        backend_context_generation,
+        working_set_file: snapshot.working_set_file.clone(),
+        status: if generation_bound {
+            "authoritative-v2".to_string()
+        } else {
+            "generation-unbound".to_string()
+        },
+        reason: if generation_bound {
+            "production completion wrote exact-account v2 working-set state bound to the prepared backend generation".to_string()
+        } else {
+            "production completion wrote exact-account v2 working-set state but no trusted backend generation was available; autonomy must fail closed".to_string()
+        },
+        updated_at_ms: current_log_time_ms()?,
+    };
+    append_json_line(
+        &harness_home
+            .join("state")
+            .join("context-rollover")
+            .join("virtual-session-authority-receipts.jsonl"),
+        &receipt,
+    )
 }
 
 fn interrupted_long_task_rollover_reason(status: &str, run: &CodexRuntimeRunReport) -> String {
@@ -3636,6 +4505,319 @@ fn append_final_outbound_message_once(
     Ok((outbox_file, appended))
 }
 
+fn append_goal_terminal_outbound_message_once(
+    harness_home: &Path,
+    execution_dir: Option<&Path>,
+    completion_file: Option<&Path>,
+    transition: &GoalTransitionReceiptV1,
+    message: &mut ChannelOutboundMessage,
+    warnings: &mut Vec<String>,
+) -> io::Result<(PathBuf, bool)> {
+    let (terminal_key, delivery_id) = goal_terminal_outbox_identity(transition)?;
+    let receipt_file = goal_terminal_outbox_receipts_file(harness_home);
+    let _lock = acquire_goal_terminal_outbox_lock(harness_home, &terminal_key, warnings)?;
+    let existing = read_latest_goal_terminal_outbox_receipt(&receipt_file, &terminal_key)?;
+    let mut canonical = if let Some(existing) = existing.as_ref() {
+        if existing.delivery_id != delivery_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "goal terminal outbox receipt {} has a conflicting delivery identity",
+                    existing.terminal_key
+                ),
+            ));
+        }
+        if &existing.message != message {
+            warnings.push(format!(
+                "goal terminal {} already committed by queue {}; reusing the canonical campaign surface",
+                terminal_key,
+                existing.source_queue_id.as_deref().unwrap_or("-")
+            ));
+        }
+        existing.message.clone()
+    } else {
+        message.delivery_id = Some(delivery_id.clone());
+        let committed = GoalTerminalOutboxReceiptV1 {
+            schema: GOAL_TERMINAL_OUTBOX_SCHEMA.to_string(),
+            terminal_key: terminal_key.clone(),
+            delivery_id: delivery_id.clone(),
+            campaign_family_id: transition
+                .campaign_family_id
+                .clone()
+                .expect("goal terminal identity validated campaign family"),
+            lane_digest: transition
+                .lane_digest
+                .clone()
+                .expect("goal terminal identity validated lane digest"),
+            virtual_session_id: transition
+                .virtual_session_id
+                .clone()
+                .expect("goal terminal identity validated virtual session"),
+            decision: transition.decision,
+            surface: transition.surface,
+            source_queue_id: message.source_queue_id.clone(),
+            message: message.clone(),
+            state: GoalTerminalOutboxState::Committed,
+            outbox_file: None,
+            recorded_at_ms: current_log_time_ms()?,
+        };
+        append_json_line(&receipt_file, &committed)?;
+        committed.message
+    };
+
+    if let Some(existing) = existing
+        && existing.state == GoalTerminalOutboxState::Appended
+    {
+        let outbox_file = existing.outbox_file.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "appended goal terminal receipt is missing its outbox file",
+            )
+        })?;
+        *message = canonical;
+        warnings.push(format!(
+            "goal terminal {} was already appended; suppressing duplicate campaign surface",
+            terminal_key
+        ));
+        return Ok((outbox_file, false));
+    }
+
+    let (outbox_file, appended) = append_final_outbound_message_once(
+        harness_home,
+        execution_dir,
+        completion_file,
+        &mut canonical,
+        warnings,
+    )?;
+    let appended_receipt = GoalTerminalOutboxReceiptV1 {
+        schema: GOAL_TERMINAL_OUTBOX_SCHEMA.to_string(),
+        terminal_key,
+        delivery_id,
+        campaign_family_id: transition
+            .campaign_family_id
+            .clone()
+            .expect("goal terminal identity validated campaign family"),
+        lane_digest: transition
+            .lane_digest
+            .clone()
+            .expect("goal terminal identity validated lane digest"),
+        virtual_session_id: transition
+            .virtual_session_id
+            .clone()
+            .expect("goal terminal identity validated virtual session"),
+        decision: transition.decision,
+        surface: transition.surface,
+        source_queue_id: canonical.source_queue_id.clone(),
+        message: canonical.clone(),
+        state: GoalTerminalOutboxState::Appended,
+        outbox_file: Some(outbox_file.clone()),
+        recorded_at_ms: current_log_time_ms()?,
+    };
+    append_json_line(&receipt_file, &appended_receipt)?;
+    *message = canonical;
+    Ok((outbox_file, appended))
+}
+
+fn goal_terminal_outbox_identity(
+    transition: &GoalTransitionReceiptV1,
+) -> io::Result<(String, String)> {
+    if !transition.terminal
+        || !matches!(
+            transition.surface,
+            GoalTransitionSurface::CampaignFinal | GoalTransitionSurface::TerminalNotice
+        )
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "goal terminal outbox identity requires a terminal campaign surface",
+        ));
+    }
+    let campaign_family_id = required_goal_terminal_identity_field(
+        transition.campaign_family_id.as_deref(),
+        "campaignFamilyId",
+    )?;
+    let lane_digest =
+        required_goal_terminal_identity_field(transition.lane_digest.as_deref(), "laneDigest")?;
+    let virtual_session_id = required_goal_terminal_identity_field(
+        transition.virtual_session_id.as_deref(),
+        "virtualSessionId",
+    )?;
+    let mut canonical = Vec::new();
+    for value in [
+        "goal-terminal-outbox-v1",
+        campaign_family_id,
+        lane_digest,
+        virtual_session_id,
+        goal_transition_decision_token(transition.decision),
+    ] {
+        canonical.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        canonical.extend_from_slice(value.as_bytes());
+    }
+    let digest = ring::digest::digest(&ring::digest::SHA256, &canonical);
+    let terminal_key = digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let delivery_id = format!("delivery:v2:{}", &terminal_key[..32]);
+    Ok((terminal_key, delivery_id))
+}
+
+fn required_goal_terminal_identity_field<'a>(
+    value: Option<&'a str>,
+    name: &str,
+) -> io::Result<&'a str> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("goal terminal surface lacks exact {name} authority"),
+            )
+        })
+}
+
+fn goal_transition_decision_token(decision: GoalTransitionDecision) -> &'static str {
+    match decision {
+        GoalTransitionDecision::Continue => "continue",
+        GoalTransitionDecision::Complete => "complete",
+        GoalTransitionDecision::Pause => "pause",
+        GoalTransitionDecision::Stop => "stop",
+        GoalTransitionDecision::NeedsUser => "needs-user",
+        GoalTransitionDecision::NeedsAuthority => "needs-authority",
+        GoalTransitionDecision::NeedsOperatorAuth => "needs-operator-auth",
+        GoalTransitionDecision::Rollover => "rollover",
+        GoalTransitionDecision::BudgetExhausted => "budget-exhausted",
+        GoalTransitionDecision::NoProgressExhausted => "no-progress-exhausted",
+        GoalTransitionDecision::Failed => "failed",
+    }
+}
+
+fn goal_terminal_notice_text(decision: GoalTransitionDecision) -> Option<&'static str> {
+    match decision {
+        GoalTransitionDecision::Pause => Some("The goal is paused."),
+        GoalTransitionDecision::Stop => Some("The goal was stopped."),
+        GoalTransitionDecision::NeedsUser => {
+            Some("The goal needs your input before it can continue.")
+        }
+        GoalTransitionDecision::NeedsAuthority => {
+            Some("The goal needs additional authorization before it can continue.")
+        }
+        GoalTransitionDecision::NeedsOperatorAuth => {
+            Some("The goal needs an operator to authenticate before it can continue.")
+        }
+        GoalTransitionDecision::BudgetExhausted => Some("The goal budget is exhausted."),
+        GoalTransitionDecision::NoProgressExhausted => {
+            Some("The goal stopped after reaching its no-progress limit.")
+        }
+        _ => None,
+    }
+}
+
+fn goal_terminal_outbox_receipts_file(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("goal-lineage")
+        .join("terminal-outbox-receipts.jsonl")
+}
+
+fn read_latest_goal_terminal_outbox_receipt(
+    receipt_file: &Path,
+    terminal_key: &str,
+) -> io::Result<Option<GoalTerminalOutboxReceiptV1>> {
+    let text = match fs::read_to_string(receipt_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut latest = None;
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let receipt =
+            serde_json::from_str::<GoalTerminalOutboxReceiptV1>(line).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid goal terminal outbox receipt at {}:{}: {error}",
+                        receipt_file.display(),
+                        index + 1
+                    ),
+                )
+            })?;
+        if receipt.schema != GOAL_TERMINAL_OUTBOX_SCHEMA {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported goal terminal outbox schema {}", receipt.schema),
+            ));
+        }
+        if receipt.terminal_key == terminal_key {
+            latest = Some(receipt);
+        }
+    }
+    Ok(latest)
+}
+
+struct GoalTerminalOutboxLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for GoalTerminalOutboxLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_goal_terminal_outbox_lock(
+    harness_home: &Path,
+    terminal_key: &str,
+    warnings: &mut Vec<String>,
+) -> io::Result<GoalTerminalOutboxLockGuard> {
+    let lock_dir = harness_home
+        .join("state")
+        .join("goal-lineage")
+        .join("locks");
+    fs::create_dir_all(&lock_dir)?;
+    let lock_file = lock_dir.join(format!("{terminal_key}.lock"));
+    for attempt in 0..25 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_file)
+        {
+            Ok(_) => return Ok(GoalTerminalOutboxLockGuard { path: lock_file }),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if final_outbox_lock_is_stale(&lock_file) {
+                    match fs::remove_file(&lock_file) {
+                        Ok(()) => {
+                            warnings.push(
+                                "removed stale goal terminal outbox lock before enqueue"
+                                    .to_string(),
+                            );
+                            continue;
+                        }
+                        Err(remove_error) if remove_error.kind() == io::ErrorKind::NotFound => {
+                            continue;
+                        }
+                        Err(remove_error) => return Err(remove_error),
+                    }
+                }
+                if attempt == 24 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!("goal terminal outbox lock is busy: {}", lock_file.display()),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("goal terminal outbox lock loop returns on every terminal branch")
+}
+
 struct FinalOutboxLockGuard {
     path: PathBuf,
 }
@@ -3863,6 +5045,122 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn goal_terminal_outbox_is_exactly_once_across_source_queues() {
+        let root = temp_root("goal_terminal_outbox_is_exactly_once_across_source_queues");
+        let harness_home = root.join(".agent-harness");
+        let transition = test_goal_terminal_transition(GoalTransitionDecision::Complete);
+        let mut first = test_goal_terminal_message("queue-goal-1", "Authoritative final.");
+        let mut warnings = Vec::new();
+        let (outbox_file, appended) = append_goal_terminal_outbound_message_once(
+            &harness_home,
+            None,
+            None,
+            &transition,
+            &mut first,
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(appended);
+        assert!(
+            first
+                .delivery_id
+                .as_deref()
+                .is_some_and(|value| value.starts_with("delivery:v2:"))
+        );
+
+        let mut replay = test_goal_terminal_message("queue-goal-2", "Late duplicate final.");
+        let (_, replay_appended) = append_goal_terminal_outbound_message_once(
+            &harness_home,
+            None,
+            None,
+            &transition,
+            &mut replay,
+            &mut warnings,
+        )
+        .unwrap();
+        assert!(!replay_appended);
+        assert_eq!(replay.source_queue_id.as_deref(), Some("queue-goal-1"));
+        assert_eq!(replay.text, "Authoritative final.");
+        assert_eq!(fs::read_to_string(outbox_file).unwrap().lines().count(), 1);
+        let receipts =
+            fs::read_to_string(goal_terminal_outbox_receipts_file(&harness_home)).unwrap();
+        assert_eq!(receipts.lines().count(), 2);
+        assert!(receipts.contains(r#""state":"committed""#));
+        assert!(receipts.contains(r#""state":"appended""#));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn goal_terminal_notices_are_fixed_and_do_not_expose_runtime_reason() {
+        assert_eq!(
+            goal_terminal_notice_text(GoalTransitionDecision::NeedsUser),
+            Some("The goal needs your input before it can continue.")
+        );
+        assert_eq!(
+            goal_terminal_notice_text(GoalTransitionDecision::NeedsAuthority),
+            Some("The goal needs additional authorization before it can continue.")
+        );
+        assert_eq!(
+            goal_terminal_notice_text(GoalTransitionDecision::NeedsOperatorAuth),
+            Some("The goal needs an operator to authenticate before it can continue.")
+        );
+    }
+
+    fn test_goal_terminal_transition(decision: GoalTransitionDecision) -> GoalTransitionReceiptV1 {
+        GoalTransitionReceiptV1 {
+            schema: crate::goal_transition::GOAL_TRANSITION_SCHEMA.to_string(),
+            slice_schema: crate::goal_transition::GOAL_SLICE_SCHEMA.to_string(),
+            queue_id: Some("queue-goal-1".to_string()),
+            event: GoalTransitionEventKind::NormalCompletion,
+            runtime_status: "completed".to_string(),
+            runtime_reason: "test".to_string(),
+            goal_status: Some("completed".to_string()),
+            lineage_id: Some("lineage-1".to_string()),
+            campaign_family_id: Some("campaign-1".to_string()),
+            lane_digest: Some("a".repeat(64)),
+            virtual_session_id: Some("virtual-session-1".to_string()),
+            backend_context_generation: Some("generation-1".to_string()),
+            source_thread_id: Some("thread-1".to_string()),
+            source_turn_id: Some("turn-1".to_string()),
+            goal_checksum: Some("sha256:goal".to_string()),
+            source_slice_generation: 2,
+            decision_generation: 1,
+            authority: GoalTransitionAuthority::Ready,
+            decision,
+            surface: GoalTransitionSurface::CampaignFinal,
+            schedule_continuation: false,
+            allow_campaign_final: true,
+            terminal: true,
+            reason: "test".to_string(),
+            observed_at_ms: 1,
+        }
+    }
+
+    fn test_goal_terminal_message(queue_id: &str, text: &str) -> ChannelOutboundMessage {
+        ChannelOutboundMessage {
+            platform: "telegram".to_string(),
+            account_id: Some("acct-goal".to_string()),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            session_key: "agent:main:telegram:dm:dm-42:user:user-7".to_string(),
+            delivery_id: None,
+            kind: ChannelOutboundMessageKind::AgentReply,
+            source_queue_id: Some(queue_id.to_string()),
+            source_completion_file: None,
+            presentation: None,
+            text: text.to_string(),
+            delivery_intent: None,
+            attachments: Vec::new(),
+        }
+    }
 
     #[test]
     fn receipt_compaction_runs_only_after_terminal_queue_turns() {
@@ -4269,10 +5567,21 @@ mod tests {
 
     #[test]
     fn run_runtime_queue_once_records_agent_reply_outbox() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("run_runtime_queue_once_records_agent_reply_outbox");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{
+              "skills": {
+                "matcher": {"shadowV2Enabled": true},
+                "virtualManifest": {"observeEnabled": true}
+              }
+            }"#,
+        )
+        .unwrap();
         let skills = build_source_skill_index(&source).unwrap();
         let receive = receive_channel_message(ChannelReceiveOptions {
             source,
@@ -4317,6 +5626,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        let prepared_item = report
+            .prepare
+            .as_ref()
+            .and_then(|prepare| prepare.item.as_ref())
+            .expect("prepared runtime item");
+        let skill_manifest_file = prepared_item
+            .virtual_skill_manifest_file
+            .clone()
+            .expect("observe-enabled virtual skill manifest");
+        let skill_delivery_files = prepared_item.skill_delivery_receipt_files.clone();
+        assert!(skill_manifest_file.is_file());
+        assert!(!skill_delivery_files.is_empty());
+        assert!(skill_delivery_files.iter().all(|path| path.is_file()));
         assert_eq!(
             report.prepare.as_ref().unwrap().receipt.status,
             RuntimeExecutionReceiptStatus::Prepared
@@ -4376,36 +5698,772 @@ mod tests {
         )
         .unwrap();
         assert_eq!(episodes.lines().count(), 2);
-        let envelope =
-            crate::resolve_virtual_session_working_context(crate::VirtualSessionContextQuery {
+        let full_lane = crate::lane::FullLaneKeyV1::new(
+            "telegram",
+            exact_account_id.as_deref().unwrap_or("default"),
+            "dm-42",
+            "user-7",
+            "main",
+            "interactive",
+            root_working_session_key(&exact_session_key),
+            exact_session_key.clone(),
+        )
+        .unwrap();
+        let envelope = crate::resolve_virtual_session_working_context_for_lane(
+            crate::VirtualSessionContextQuery {
                 harness_home: harness_home.clone(),
                 platform: "telegram".to_string(),
-                account_id: exact_account_id,
+                account_id: exact_account_id.clone(),
                 channel_id: "dm-42".to_string(),
                 user_id: "user-7".to_string(),
                 agent_id: "main".to_string(),
-                session_key: Some(exact_session_key),
+                session_key: Some(exact_session_key.clone()),
                 now_ms: 1235,
-            })
-            .unwrap();
+            },
+            Some(&full_lane),
+        )
+        .unwrap();
         assert_eq!(
             envelope.scope_decision.status, "same-virtual-session",
             "completed runtime turn should write a root working-set snapshot"
         );
-        assert!(envelope.working_set_file.as_ref().unwrap().is_file());
+        assert!(
+            envelope.working_set_file.is_some(),
+            "exact-lane resolver should return an opaque working-set reference"
+        );
         assert!(
             envelope
                 .recent_queue_ids
                 .iter()
                 .any(|queue_id| queue_id == &completed_queue_id)
         );
+        let exact_lane = ChannelStateLane::new(
+            "telegram",
+            exact_account_id.as_deref(),
+            "dm-42",
+            "user-7",
+            "main",
+        )
+        .unwrap();
+        let v2_index = crate::context_rollover::working_set_session_index_v2_file(
+            &harness_home,
+            &exact_lane,
+            &exact_session_key,
+        );
+        assert!(
+            v2_index.is_file(),
+            "production completion must write the exact-account v2 session index"
+        );
+        assert!(
+            !crate::context_rollover::working_set_session_index_file(
+                &harness_home,
+                &exact_session_key
+            )
+            .is_file(),
+            "new production completion must not create an accountless legacy index"
+        );
+        let v2_index_text = fs::read_to_string(v2_index).unwrap();
+        let v2_index_json: Value = serde_json::from_str(&v2_index_text).unwrap();
+        assert_eq!(
+            v2_index_json.get("accountId").and_then(Value::as_str),
+            Some(exact_account_id.as_deref().unwrap_or("default"))
+        );
+        let authority_receipts = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("context-rollover")
+                .join("virtual-session-authority-receipts.jsonl"),
+        )
+        .unwrap();
+        let authority: Value = serde_json::from_str(
+            authority_receipts
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            authority.get("status").and_then(Value::as_str),
+            Some("authoritative-v2")
+        );
+        assert!(
+            authority
+                .get("laneDigest")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.len() == 64)
+        );
+        assert!(authority.get("backendContextGeneration").is_some());
+
+        let manifest: crate::VirtualSkillManifestV1 =
+            serde_json::from_slice(&fs::read(&skill_manifest_file).unwrap()).unwrap();
+        let outcome_dir =
+            crate::skill_outcome_receipt_dir(&harness_home, &manifest.identity.virtual_session_id);
+        let episode_dir =
+            crate::skill_episode_receipt_dir(&harness_home, &manifest.identity.virtual_session_id);
+        let review_dir = crate::skill_terminal_review_receipt_dir(
+            &harness_home,
+            &manifest.identity.virtual_session_id,
+        );
+        assert_eq!(fs::read_dir(outcome_dir).unwrap().count(), 1);
+        assert_eq!(
+            fs::read_dir(episode_dir).unwrap().count(),
+            skill_delivery_files.len()
+        );
+        assert_eq!(fs::read_dir(review_dir).unwrap().count(), 1);
+        assert!(
+            !crate::skill_improvement_proposal_dir(
+                &harness_home,
+                &manifest.identity.virtual_session_id,
+            )
+            .exists()
+        );
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
+    fn active_goal_completed_slice_is_transitioned_before_final_outbox() {
+        let _guard = env_lock();
+        let root = temp_root("active-goal-pre-outbox-transition");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "continue the durable campaign".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        assert_eq!(receive.status, ChannelReceiveStatus::AgentTurnQueued);
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            codex_executable: Some(fake_active_goal_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert_eq!(
+            report.run.as_ref().unwrap().receipt.status,
+            CodexRuntimeRunStatus::Completed
+        );
+        assert!(report.outbound_message.is_none());
+        assert!(report.outbox_file.is_none());
+        let transitions = fs::read_to_string(
+            crate::goal_transition::goal_transition_receipts_file(&harness_home),
+        )
+        .unwrap();
+        let transition: GoalTransitionReceiptV1 = serde_json::from_str(
+            transitions
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            transition.decision,
+            crate::goal_transition::GoalTransitionDecision::Continue
+        );
+        assert_eq!(transition.surface, GoalTransitionSurface::ProgressOnly);
+        assert_eq!(transition.authority, GoalTransitionAuthority::Ready);
+        assert!(transition.schedule_continuation);
+        assert!(!transition.allow_campaign_final);
+        assert!(transition.lineage_id.is_some());
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("failed closed"))
+        );
+
+        let projection_file = harness_home
+            .join("state")
+            .join("runtime-queue")
+            .join("codex-goal-projection-receipts.jsonl");
+        let mut newer_projection: Value = serde_json::from_str(
+            fs::read_to_string(&projection_file)
+                .unwrap()
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        newer_projection["queueId"] = Value::String("queue-newer-goal-slice".to_string());
+        newer_projection["sourceThreadId"] = Value::String("thread-newer-goal".to_string());
+        newer_projection["sourceTurnId"] = Value::String("turn-newer-goal".to_string());
+        newer_projection["observationOrder"] = Value::from(
+            newer_projection
+                .get("observationOrder")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                + 1,
+        );
+        newer_projection["observedAtMs"] = Value::from(
+            newer_projection
+                .get("observedAtMs")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                + 1,
+        );
+        append_json_line(&projection_file, &newer_projection).unwrap();
+
+        let authority_file = harness_home
+            .join("state")
+            .join("context-rollover")
+            .join("virtual-session-authority-receipts.jsonl");
+        let mut newer_authority: Value = serde_json::from_str(
+            fs::read_to_string(&authority_file)
+                .unwrap()
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        newer_authority["queueId"] = Value::String("queue-newer-goal-slice".to_string());
+        newer_authority["updatedAtMs"] = Value::from(
+            newer_authority
+                .get("updatedAtMs")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                + 1,
+        );
+        append_json_line(&authority_file, &newer_authority).unwrap();
+
+        let current_queue = transition.queue_id.as_deref().unwrap();
+        let mut replay_warnings = Vec::new();
+        let late_transition = evaluate_runtime_goal_transition(
+            &harness_home,
+            report.run.as_ref().unwrap(),
+            RuntimeRunOnceStatus::Completed,
+            &report.receipt.continuation,
+            &RuntimeGoalAuthorityContext {
+                lane_digest: transition.lane_digest.clone(),
+                virtual_session_id: transition.virtual_session_id.clone(),
+                projection_hint: latest_goal_projection_for_queue(&harness_home, current_queue)
+                    .unwrap(),
+            },
+            &mut replay_warnings,
+        )
+        .unwrap();
+        assert_eq!(
+            late_transition.event,
+            GoalTransitionEventKind::OlderCompletion
+        );
+        assert_eq!(late_transition.authority, GoalTransitionAuthority::Stale);
+        assert_eq!(
+            late_transition.surface,
+            GoalTransitionSurface::SuppressStale
+        );
+        assert!(!late_transition.allow_campaign_final);
+        assert!(report.outbox_file.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn paused_goal_emits_one_sanitized_terminal_notice() {
+        let _guard = env_lock();
+        let root = temp_root("paused_goal_emits_one_sanitized_terminal_notice");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: Some("acct-goal".to_string()),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "pause the durable campaign".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: receive.queue_id,
+            codex_executable: Some(fake_terminal_goal_codex_executable(
+                &root,
+                "paused",
+                "raw credential-like material must not surface",
+            )),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        let outbound = report.outbound_message.as_ref().unwrap();
+        assert_eq!(outbound.text, "The goal is paused.");
+        assert!(!outbound.text.contains("credential"));
+        let outbox = fs::read_to_string(report.outbox_file.as_ref().unwrap()).unwrap();
+        assert_eq!(outbox.lines().count(), 1);
+        assert!(outbox.contains("The goal is paused."));
+        assert!(!outbox.contains("credential-like"));
+        let terminal_receipts =
+            fs::read_to_string(goal_terminal_outbox_receipts_file(&harness_home)).unwrap();
+        assert!(terminal_receipts.contains(r#""decision":"pause""#));
+        assert!(terminal_receipts.contains(r#""state":"appended""#));
+        let transition_receipts = fs::read_to_string(
+            crate::goal_transition::goal_transition_receipts_file(&harness_home),
+        )
+        .unwrap();
+        let transition: GoalTransitionReceiptV1 = serde_json::from_str(
+            transition_receipts
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(transition.decision, GoalTransitionDecision::Pause);
+        assert_eq!(transition.surface, GoalTransitionSurface::TerminalNotice);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_goal_budget_boundary_blocks_continuation_and_emits_one_notice() {
+        let _guard = env_lock();
+        let root = temp_root("active_goal_budget_boundary_blocks_continuation");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: Some("acct-goal".to_string()),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "continue within the campaign budget".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        let queue_id = receive.queue_id.unwrap();
+        let pending_text = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        let pending: Value = pending_text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| value.get("queueId").and_then(Value::as_str) == Some(&queue_id))
+            .unwrap();
+        let session_key = pending.get("sessionKey").and_then(Value::as_str).unwrap();
+        let lane = crate::lane::FullLaneKeyV1::new(
+            pending.get("platform").and_then(Value::as_str).unwrap(),
+            pending.get("accountId").and_then(Value::as_str).unwrap(),
+            pending.get("channelId").and_then(Value::as_str).unwrap(),
+            pending.get("userId").and_then(Value::as_str).unwrap(),
+            pending.get("agentId").and_then(Value::as_str).unwrap(),
+            pending.get("runtimeClass").and_then(Value::as_str).unwrap(),
+            root_working_session_key(session_key),
+            session_key,
+        )
+        .unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "goalAutonomy": {
+                    "mode": "active",
+                    "activeLaneDigests": [lane.identity_hash().unwrap()],
+                    "maxSlices": 1
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id),
+            codex_executable: Some(fake_active_goal_codex_executable(&root)),
+            timeout_ms: 60 * 60 * 1_000,
+            idle_timeout_ms: 10 * 60 * 1_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert!(report.receipt.child_queue_id.is_none());
+        assert_eq!(
+            report
+                .outbound_message
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            Some("The goal budget is exhausted.")
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("hard=1800000ms idle=300000ms") })
+        );
+        let budget_receipts = fs::read_to_string(
+            crate::goal_budget::goal_campaign_budget_receipts_file(&harness_home),
+        )
+        .unwrap();
+        assert!(budget_receipts.contains(r#""boundary":"slice-count""#));
+        let transitions = fs::read_to_string(
+            crate::goal_transition::goal_transition_receipts_file(&harness_home),
+        )
+        .unwrap();
+        let transition: GoalTransitionReceiptV1 = serde_json::from_str(
+            transitions
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(transition.decision, GoalTransitionDecision::BudgetExhausted);
+        assert!(!transition.schedule_continuation);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_goal_continuation_is_exactly_once_and_acknowledged_after_child_lease() {
+        let _guard = env_lock();
+        let root = temp_root("active-goal-exactly-once-continuation");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: Some("acct-goal".to_string()),
+            channel_id: "dm-42".to_string(),
+            user_id: "user-7".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "continue the durable campaign".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        let parent_queue_id = receive.queue_id.clone().unwrap();
+        let pending_text = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        let pending: Value = pending_text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| value.get("queueId").and_then(Value::as_str) == Some(&parent_queue_id))
+            .unwrap();
+        let session_key = pending.get("sessionKey").and_then(Value::as_str).unwrap();
+        let lane = crate::lane::FullLaneKeyV1::new(
+            pending.get("platform").and_then(Value::as_str).unwrap(),
+            pending
+                .get("accountId")
+                .and_then(Value::as_str)
+                .unwrap_or("default"),
+            pending.get("channelId").and_then(Value::as_str).unwrap(),
+            pending.get("userId").and_then(Value::as_str).unwrap(),
+            pending.get("agentId").and_then(Value::as_str).unwrap(),
+            pending.get("runtimeClass").and_then(Value::as_str).unwrap(),
+            root_working_session_key(session_key),
+            session_key,
+        )
+        .unwrap();
+        let lane_digest = lane.identity_hash().unwrap();
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "goalAutonomy": {
+                    "mode": "active",
+                    "activeLaneDigests": [lane_digest]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+        let executable = fake_active_goal_codex_executable(&root);
+        let first = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(parent_queue_id),
+            codex_executable: Some(executable.clone()),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(first.receipt.status, RuntimeRunOnceStatus::Skipped);
+        assert!(first.outbox_file.is_none());
+        let first_child = first.receipt.child_queue_id.clone().unwrap();
+        assert_eq!(
+            first.receipt.child_session_key.as_deref(),
+            Some(session_key)
+        );
+        let intents_file = crate::goal_continuation::goal_continuation_intents_file(&harness_home);
+        let first_intent: crate::goal_continuation::GoalContinuationIntentV1 =
+            fs::read_to_string(&intents_file)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .find(
+                    |intent: &crate::goal_continuation::GoalContinuationIntentV1| {
+                        intent.child_queue_id.as_deref() == Some(first_child.as_str())
+                    },
+                )
+                .unwrap();
+        assert_eq!(first_intent.campaign_slice_generation, 1);
+        assert_eq!(first_intent.recovery_continuation_index, 0);
+        crate::goal_continuation::ensure_goal_continuation_enqueued(
+            &harness_home,
+            &first_intent.intent_key,
+            2000,
+        )
+        .unwrap();
+        crate::goal_continuation::reconcile_goal_continuation_intents(&harness_home, 2001).unwrap();
+        let pending_after_replay = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(
+            pending_after_replay
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|value| {
+                    value.get("continuationIntentKey").and_then(Value::as_str)
+                        == Some(first_intent.intent_key.as_str())
+                })
+                .count(),
+            1,
+            "replay and reconciliation must retain one logical child"
+        );
+        let second = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(first_child.clone()),
+            codex_executable: Some(executable),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(second.receipt.status, RuntimeRunOnceStatus::Skipped);
+        let acknowledged = crate::goal_continuation::latest_goal_continuation_intent(
+            &harness_home,
+            &first_intent.intent_key,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            acknowledged.status,
+            crate::goal_continuation::GoalContinuationIntentStatus::Acknowledged
+        );
+        assert_eq!(
+            acknowledged.child_queue_id.as_deref(),
+            Some(first_child.as_str())
+        );
+        assert_eq!(
+            second.receipt.continuation.campaign_slice_generation,
+            Some(1)
+        );
+        assert_eq!(second.receipt.continuation.continuation_index, Some(0));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn auth_deferred_turn_has_zero_delivery_side_effects_and_wakes_once_when_ready() {
+        let _guard = env_lock();
+        let root = temp_root("auth_deferred_turn_zero_side_effect_replay");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"backendAuth":{"runtimeGateEnabled":true}}"#,
+        )
+        .unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: None,
+            channel_id: "dm-auth".to_string(),
+            user_id: "user-auth".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "wait for operator auth without replying".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        let queue_id = receive.queue_id.unwrap();
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            codex_executable: Some(fake_failing_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::AuthDeferred);
+        assert_eq!(
+            report.run.as_ref().unwrap().receipt.status,
+            CodexRuntimeRunStatus::PreflightBlocked
+        );
+        assert!(report.receipt.reason.contains("needs-operator-auth"));
+        assert!(report.outbound_message.is_none());
+        assert!(report.outbox_file.is_none());
+        assert!(
+            !harness_home
+                .join("state")
+                .join("channels")
+                .join("outbox.jsonl")
+                .exists()
+        );
+        let receipts = fs::read_to_string(&report.receipts_file).unwrap();
+        assert!(receipts.contains(r#""status":"auth-deferred""#));
+        assert!(!receipts.contains(r#""status":"failed-terminal""#));
+        let deferred_capacity =
+            crate::inspect_runtime_queue_capacity(crate::RuntimeQueueCapacityOptions {
+                harness_home: harness_home.clone(),
+            })
+            .unwrap();
+        assert_eq!(deferred_capacity.claimable_items, 0);
+
+        let codex_home =
+            crate::resolve_or_create_provider_codex_home(&harness_home, "openai").unwrap();
+        let ready = crate::BackendAuthStateV1 {
+            schema: crate::BACKEND_AUTH_STATE_SCHEMA.to_string(),
+            provider: "openai".to_string(),
+            lifecycle_state: crate::BackendAuthLifecycleState::Ready,
+            readiness_generation: 1,
+            observed_at_ms: 1235,
+            operation_id: None,
+            requires_openai_auth: Some(false),
+            failure_code: None,
+        };
+        crate::persist_backend_auth_state(&codex_home, &ready).unwrap();
+        assert_eq!(
+            crate::resume_all_backend_auth_defer_intents(&harness_home, "openai", &ready).unwrap(),
+            1
+        );
+        assert_eq!(
+            crate::resume_all_backend_auth_defer_intents(&harness_home, "openai", &ready).unwrap(),
+            0
+        );
+        let wake_capacity =
+            crate::inspect_runtime_queue_capacity(crate::RuntimeQueueCapacityOptions {
+                harness_home: harness_home.clone(),
+            })
+            .unwrap();
+        assert_eq!(wake_capacity.claimable_items, 1);
+        assert_eq!(wake_capacity.claimable_queue_ids, vec![queue_id]);
+        let wake_receipts = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("run-once-receipts.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(
+            wake_receipts.matches(r#""status":"retry-pending""#).count(),
+            1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn run_runtime_queue_once_keeps_media_attachments_in_rich_presentation() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("run_runtime_queue_once_keeps_media_attachments_in_rich_presentation");
         fs::create_dir_all(&root).unwrap();
         let media_file = root.join("final-artifact.txt");
@@ -4476,7 +6534,7 @@ mod tests {
 
     #[test]
     fn run_runtime_queue_once_repairs_outbox_for_already_recorded_completion() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root =
             temp_root("run_runtime_queue_once_repairs_outbox_for_already_recorded_completion");
         let (harness_home, queue_id, execution_dir, _env) =
@@ -4514,7 +6572,7 @@ mod tests {
 
     #[test]
     fn already_recorded_completion_repair_keeps_progress_panel_out_of_final_outbox() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root(
             "already_recorded_completion_repair_keeps_progress_panel_out_of_final_outbox",
         );
@@ -4588,7 +6646,7 @@ mod tests {
 
     #[test]
     fn already_recorded_completion_repair_keeps_progress_panel_out_of_discord_final_outbox() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root(
             "already_recorded_completion_repair_keeps_progress_panel_out_of_discord_final_outbox",
         );
@@ -4659,7 +6717,7 @@ mod tests {
 
     #[test]
     fn run_runtime_queue_once_skips_duplicate_for_existing_final_outbox_marker() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root =
             temp_root("run_runtime_queue_once_skips_duplicate_for_existing_final_outbox_marker");
         let (harness_home, queue_id, execution_dir, _env) =
@@ -4730,7 +6788,7 @@ mod tests {
 
     #[test]
     fn run_runtime_queue_once_respects_emoji_accent_off_config() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("run_runtime_queue_once_respects_emoji_accent_off_config");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -4790,7 +6848,7 @@ mod tests {
 
     #[test]
     fn run_runtime_queue_once_treats_busy_lease_lock_as_retryable_no_work() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("run_runtime_queue_once_treats_busy_lease_lock_as_retryable_no_work");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -4855,7 +6913,7 @@ mod tests {
 
     #[test]
     fn prepared_protocol_error_terminalizes_after_threshold() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("prepared_protocol_error_terminalizes_after_threshold");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -4938,7 +6996,7 @@ mod tests {
 
     #[test]
     fn scoped_stop_suppresses_missing_prepared_execution_before_no_prepared_churn() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root =
             temp_root("scoped_stop_suppresses_missing_prepared_execution_before_no_prepared_churn");
         let source = write_pipeline_source(&root);
@@ -5023,7 +7081,7 @@ mod tests {
 
     #[test]
     fn untargeted_terminal_control_suppression_appends_progress_with_queue_id() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root =
             temp_root("untargeted_terminal_control_suppression_appends_progress_with_queue_id");
         let source = write_pipeline_source(&root);
@@ -5096,7 +7154,7 @@ mod tests {
 
     #[test]
     fn quarantine_suppression_records_terminal_progress_once_then_silent() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("quarantine_suppression_records_terminal_progress_once_then_silent");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -5197,7 +7255,7 @@ mod tests {
             "../tests/fixtures/round16/e2e1-ghost-queue-replay.json"
         ))
         .unwrap();
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("e2e_1_ghost_queue_replay_from_sanitized_fixture");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -5348,7 +7406,7 @@ mod tests {
 
     #[test]
     fn e2e_2_duplicate_ingress_stop_progress_replay() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("e2e_2_duplicate_ingress_stop_progress_replay");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -5478,7 +7536,7 @@ mod tests {
 
     #[test]
     fn run_runtime_queue_once_records_runtime_failure_error_outbox() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("run_runtime_queue_once_records_runtime_failure_error_outbox");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -5561,7 +7619,7 @@ mod tests {
 
     #[test]
     fn failed_worker_child_with_channel_context_does_not_write_parent_error_outbox() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("failed_worker_child_does_not_write_parent_error_outbox");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -5638,7 +7696,7 @@ mod tests {
 
     #[test]
     fn failed_external_agent_origin_with_channel_context_does_not_write_error_outbox() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("failed_external_agent_does_not_write_error_outbox");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -5715,7 +7773,7 @@ mod tests {
 
     #[test]
     fn external_agent_with_spoofed_parent_identity_emits_no_deliverable_progress() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("external_agent_with_spoofed_parent_identity_emits_no_progress");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -5814,7 +7872,7 @@ mod tests {
 
     #[test]
     fn failed_stale_same_agent_channel_run_remains_suppressed() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("failed_stale_same_agent_channel_run_remains_suppressed");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -5921,8 +7979,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn run_runtime_queue_once_interrupted_command_uses_structured_reason_outbox() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn run_runtime_queue_once_newer_steer_suppresses_stale_outbox_and_keeps_evidence() {
+        let _guard = env_lock();
         let root =
             temp_root("run_runtime_queue_once_interrupted_command_uses_structured_reason_outbox");
         let source = write_pipeline_source(&root);
@@ -5987,15 +8045,25 @@ mod tests {
             Some("interrupted_by_new_turn")
         );
         assert_eq!(run.receipt.interrupted_tool_uses.len(), 1);
-        let outbound = report.outbound_message.unwrap();
-        assert_eq!(outbound.kind, ChannelOutboundMessageKind::ErrorReply);
-        assert!(outbound.text.contains("interrupted by a newer turn"));
-        assert!(outbound.text.contains("cargo test"));
-        assert!(outbound.text.contains("verification-rerun-eligible"));
-        assert_ne!(outbound.text, "Stopped.");
-        let outbox = fs::read_to_string(report.outbox_file.unwrap()).unwrap();
-        assert!(outbox.contains("\"kind\":\"error-reply\""));
-        assert!(outbox.contains("interrupted by a newer turn"));
+        assert!(report.outbound_message.is_none());
+        assert!(report.outbox_file.is_none());
+        let transitions = fs::read_to_string(
+            crate::goal_transition::goal_transition_receipts_file(&harness_home),
+        )
+        .unwrap();
+        let transition: GoalTransitionReceiptV1 = serde_json::from_str(
+            transitions
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(transition.event, GoalTransitionEventKind::NewerSteer);
+        assert_eq!(transition.surface, GoalTransitionSurface::SuppressStale);
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("failure outbox suppressed by unified goal transition")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -7008,7 +9076,7 @@ mod tests {
 
     #[test]
     fn stream_unstable_retry_continuation_tombstones_parent_queue_item() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("stream_unstable_retry_continuation_tombstones_parent_queue_item");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -7138,7 +9206,7 @@ mod tests {
 
     #[test]
     fn stream_unstable_retry_continuation_child_writes_exactly_one_final_outbox() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("stream_unstable_retry_continuation_child_writes_final_outbox");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -7277,7 +9345,7 @@ mod tests {
 
     #[test]
     fn run_runtime_queue_once_retries_reconnecting_protocol_error_then_dead_letters() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root(
             "run_runtime_queue_once_retries_reconnecting_protocol_error_then_dead_letters",
         );
@@ -7379,13 +9447,21 @@ mod tests {
         .unwrap();
         assert!(dead_letter.contains("\"status\":\"dead-letter\""));
         assert!(dead_letter.contains(&queue_id));
+        let transitions = fs::read_to_string(
+            crate::goal_transition::goal_transition_receipts_file(&harness_home),
+        )
+        .unwrap();
+        let transition_rows = transitions.lines().collect::<Vec<_>>();
+        assert_eq!(transition_rows.len(), 2);
+        assert!(transition_rows[0].contains("\"runtimeStatus\":\"retry-pending\""));
+        assert!(transition_rows[1].contains("\"runtimeStatus\":\"dead-letter\""));
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn run_runtime_queue_once_keeps_external_review_evidence_resumable_without_final_outbox() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root(
             "run_runtime_queue_once_keeps_external_review_evidence_resumable_without_final_outbox",
         );
@@ -7424,7 +9500,7 @@ mod tests {
             queue_id: Some(queue_id.clone()),
             codex_executable: Some(fake_external_review_only_codex_executable(&root)),
             timeout_ms: 30_000,
-            idle_timeout_ms: 3_000,
+            idle_timeout_ms: 6_000,
             prompt_options: PromptAssemblyOptions {
                 harness_home: Some(harness_home.clone()),
                 ..PromptAssemblyOptions::default()
@@ -7472,7 +9548,7 @@ mod tests {
 
     #[test]
     fn run_runtime_queue_once_suppresses_read_only_review_final_for_implementation_goal() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("run_runtime_queue_once_suppresses_read_only_review_final_for_goal");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -7536,7 +9612,7 @@ mod tests {
 
     #[test]
     fn run_runtime_queue_once_writes_final_outbox_for_non_main_agent_owned_group_lane() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("run_runtime_queue_once_writes_non_main_group_final_outbox");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -7636,7 +9712,7 @@ mod tests {
 
     #[test]
     fn run_runtime_queue_once_suppresses_owner_mismatched_agent_final_outbox() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root =
             temp_root("run_runtime_queue_once_suppresses_owner_mismatched_agent_final_outbox");
         let source = write_pipeline_source(&root);
@@ -7736,7 +9812,7 @@ mod tests {
 
     #[test]
     fn run_runtime_queue_once_suppresses_stale_session_reply_after_new() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("run_runtime_queue_once_suppresses_stale_session_reply_after_new");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -7827,7 +9903,7 @@ mod tests {
 
     #[test]
     fn run_runtime_queue_once_agent_reply_outbox_includes_plain_final_presentation() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("run_runtime_queue_once_agent_reply_has_presentation");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -8044,7 +10120,7 @@ mod tests {
 
     #[test]
     fn run_runtime_queue_once_stops_when_only_terminal_queue_items_remain() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = temp_root("no_work_after_terminal");
         let source = write_pipeline_source(&root);
         let harness_home = root.join(".agent-harness");
@@ -8283,6 +10359,8 @@ mod tests {
             planned_transcript_file: PathBuf::from("transcript.jsonl"),
             planned_trajectory_file: PathBuf::from("trajectory.jsonl"),
             selected_skill_ids: Vec::new(),
+            virtual_skill_manifest_file: None,
+            skill_delivery_receipt_files: Vec::new(),
             continuation: RuntimeContinuationMetadata {
                 continuation_index,
                 ..RuntimeContinuationMetadata::legacy()
@@ -8383,6 +10461,12 @@ mod tests {
                     input_tokens: Some(tokens),
                     output_tokens: Some(2_513),
                     total_tokens: Some(tokens.saturating_add(2_513)),
+                    model_context_window: None,
+                    model_context_window_source: None,
+                    provider: None,
+                    model: None,
+                    backend_context_generation: None,
+                    observed_at_ms: None,
                     source: "test".to_string(),
                     raw: None,
                 }),
@@ -8724,6 +10808,92 @@ while ($true) {
     }
 
     #[cfg(windows)]
+    fn fake_active_goal_codex_executable(root: &Path) -> PathBuf {
+        let script = root.join("fake-active-goal-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-active-goal"}}}')
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-active-goal","turn":{"id":"turn-active-goal","kind":"regular"}}}')
+        [Console]::Out.WriteLine('{"method":"thread/goal/updated","params":{"threadId":"thread-active-goal","turnId":"turn-active-goal","goal":{"id":"goal-active","objective":"finish the durable campaign","status":"active","completionCriteria":["T3 replay passes"]}}}')
+        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"delta":"Slice checkpoint only."}}')
+        [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-active-goal","turn":{"id":"turn-active-goal","status":"completed"}}}')
+        [Console]::Out.Flush()
+        break
+    }
+    [Console]::Out.Flush()
+}
+"#,
+        )
+        .unwrap();
+        let cmd = root.join("fake-active-goal-codex.cmd");
+        fs::write(
+            &cmd,
+            format!(
+                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        cmd
+    }
+
+    #[cfg(windows)]
+    fn fake_terminal_goal_codex_executable(
+        root: &Path,
+        status: &str,
+        assistant_text: &str,
+    ) -> PathBuf {
+        let status = serde_json::to_string(status).unwrap();
+        let assistant_text = serde_json::to_string(assistant_text).unwrap();
+        let script = root.join("fake-terminal-goal-app-server.ps1");
+        fs::write(
+            &script,
+            format!(
+                r#"
+while ($true) {{
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) {{ break }}
+    try {{ $msg = $line | ConvertFrom-Json }} catch {{ continue }}
+    if ($msg.id -eq 0) {{
+        [Console]::Out.WriteLine('{{"id":0,"result":{{"ok":true}}}}')
+    }} elseif ($msg.method -eq 'thread/start') {{
+        [Console]::Out.WriteLine('{{"id":1,"result":{{"thread":{{"id":"thread-terminal-goal"}}}}}}')
+    }} elseif ($msg.method -eq 'turn/start') {{
+        [Console]::Out.WriteLine('{{"method":"turn/started","params":{{"threadId":"thread-terminal-goal","turn":{{"id":"turn-terminal-goal","kind":"regular"}}}}}}')
+        [Console]::Out.WriteLine('{{"method":"thread/goal/updated","params":{{"threadId":"thread-terminal-goal","turnId":"turn-terminal-goal","goal":{{"id":"goal-terminal","objective":"finish the durable campaign","status":{status},"completionCriteria":["T3 replay passes"]}}}}}}')
+        [Console]::Out.WriteLine('{{"method":"item/agentMessage/delta","params":{{"delta":{assistant_text}}}}}')
+        [Console]::Out.WriteLine('{{"method":"turn/completed","params":{{"threadId":"thread-terminal-goal","turn":{{"id":"turn-terminal-goal","status":"completed"}}}}}}')
+        [Console]::Out.Flush()
+        break
+    }}
+    [Console]::Out.Flush()
+}}
+"#,
+            ),
+        )
+        .unwrap();
+        let cmd = root.join("fake-terminal-goal-codex.cmd");
+        fs::write(
+            &cmd,
+            format!(
+                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        cmd
+    }
+
+    #[cfg(windows)]
     fn fake_interrupted_command_codex_executable(
         root: &Path,
         cancel_file: &Path,
@@ -8748,6 +10918,9 @@ while ($true) {{
     }}
     if ($msg.id -eq 0) {{
         [Console]::Out.WriteLine('{{"id":0,"result":{{"ok":true}}}}')
+        [Console]::Out.Flush()
+    }} elseif ($msg.method -eq 'modelProvider/capabilities/read') {{
+        [Console]::Out.WriteLine('{{"id":8900,"result":{{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}}}')
         [Console]::Out.Flush()
     }} elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {{
         [Console]::Out.WriteLine('{{"id":1,"result":{{"thread":{{"id":"thread-interrupted-pipeline"}}}}}}')
@@ -8861,6 +11034,9 @@ set /a next=attempt+1
 >"%countFile%" echo %next%
 set /p "request="
 echo {"id":0,"result":{"ok":true}}
+set /p "request="
+set /p "request="
+echo {"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}
 set /p "request="
 echo {"id":1,"result":{"thread":{"id":"thread-review-evidence"}}}
 set /p "request="
@@ -9065,6 +11241,86 @@ while IFS= read -r line; do
     esac
 done
 "#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+        script
+    }
+
+    #[cfg(not(windows))]
+    fn fake_active_goal_codex_executable(root: &Path) -> PathBuf {
+        let script = root.join("fake-active-goal-codex");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{"id":0,"result":{"ok":true}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-active-goal"}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-active-goal","turn":{"id":"turn-active-goal","kind":"regular"}}}'
+            printf '%s\n' '{"method":"thread/goal/updated","params":{"threadId":"thread-active-goal","turnId":"turn-active-goal","goal":{"id":"goal-active","objective":"finish the durable campaign","status":"active","completionCriteria":["T3 replay passes"]}}}'
+            printf '%s\n' '{"method":"item/agentMessage/delta","params":{"delta":"Slice checkpoint only."}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-active-goal","turn":{"id":"turn-active-goal","status":"completed"}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+        script
+    }
+
+    #[cfg(not(windows))]
+    fn fake_terminal_goal_codex_executable(
+        root: &Path,
+        status: &str,
+        assistant_text: &str,
+    ) -> PathBuf {
+        let status = serde_json::to_string(status).unwrap();
+        let assistant_text = serde_json::to_string(assistant_text).unwrap();
+        let script = root.join("fake-terminal-goal-codex");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{{"id":0,"result":{{"ok":true}}}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{{"id":1,"result":{{"thread":{{"id":"thread-terminal-goal"}}}}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{{"method":"turn/started","params":{{"threadId":"thread-terminal-goal","turn":{{"id":"turn-terminal-goal","kind":"regular"}}}}}}'
+            printf '%s\n' '{{"method":"thread/goal/updated","params":{{"threadId":"thread-terminal-goal","turnId":"turn-terminal-goal","goal":{{"id":"goal-terminal","objective":"finish the durable campaign","status":{status},"completionCriteria":["T3 replay passes"]}}}}}}'
+            printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"delta":{assistant_text}}}}}'
+            printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"thread-terminal-goal","turn":{{"id":"turn-terminal-goal","status":"completed"}}}}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+            ),
         )
         .unwrap();
         #[cfg(unix)]

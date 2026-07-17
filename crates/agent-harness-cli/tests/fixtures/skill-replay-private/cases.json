@@ -1,0 +1,32 @@
+[
+  {
+    "schema": "agent-harness.skill-replay-case.v1",
+    "caseId": "cli-private-case",
+    "class": "strong-automatic-match",
+    "exactLaneDigest": "synthetic-lane",
+    "turnHash": "synthetic-turn",
+    "labels": {
+      "requiredSkills": ["skill-a"],
+      "supportingSkills": [],
+      "forbiddenSkills": [],
+      "expectedAbstain": false,
+      "expectedDelivery": "catalog-card",
+      "privacyClass": "private-local",
+      "outcomeVerifier": "test:cli-private-case",
+      "reviewers": [],
+      "highRisk": false,
+      "routingLabelsReviewed": true,
+      "novelIntent": "none",
+      "expectedDeliveryReason": "first-load",
+      "canonicalDisposition": "replay",
+      "dreamAdmission": "exclude:test",
+      "topologyOperation": "none"
+    },
+    "observed": {
+      "selectedSkills": ["skill-a"],
+      "deliveredBytes": 10,
+      "duplicateSourceCount": 0,
+      "learningTarget": "skill-a"
+    }
+  }
+]

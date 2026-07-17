@@ -121,6 +121,8 @@ pub struct SkillFrontmatter {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub triggers: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub negative_triggers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub platforms: Vec<String>,
@@ -132,6 +134,16 @@ pub struct SkillFrontmatter {
     pub agent_modes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub channels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_types: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub risks: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_mode: Option<SkillDeliveryMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,6 +162,16 @@ pub struct SkillFrontmatter {
     pub author: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related_skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_created_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_trust: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learning_mutability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learning_pinned: Option<bool>,
 }
 
 impl SkillFrontmatter {
@@ -187,6 +209,7 @@ impl SkillDeliveryMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillSelectionQuery {
     pub text: String,
+    pub include_context_tokens: bool,
     pub agent_id: Option<String>,
     pub channel: Option<String>,
     pub workspace: Option<String>,
@@ -704,6 +727,10 @@ fn parse_skill_frontmatter(body: &str) -> SkillFrontmatter {
     SkillFrontmatter {
         agents: frontmatter_values(body, &["agents", "agentIds", "agent_ids"]),
         triggers: frontmatter_values(body, &["triggers", "trigger"]),
+        negative_triggers: frontmatter_values(
+            body,
+            &["negativeTriggers", "negative_triggers", "negative-triggers"],
+        ),
         conditions: frontmatter_values(body, &["conditions", "condition"]),
         platforms: frontmatter_values(body, &["platforms", "platform"]),
         requires_tools: frontmatter_values(body, &["requiresTools", "requires_tools"]),
@@ -713,6 +740,11 @@ fn parse_skill_frontmatter(body: &str) -> SkillFrontmatter {
         ),
         agent_modes: frontmatter_values(body, &["agentModes", "agent_modes"]),
         channels: frontmatter_values(body, &["channels", "channel"]),
+        task_types: frontmatter_values(body, &["taskTypes", "task_types", "task-types"]),
+        domains: frontmatter_values(body, &["domains", "domain"]),
+        roles: frontmatter_values(body, &["roles", "role"]),
+        aliases: frontmatter_values(body, &["aliases", "alias"]),
+        risks: frontmatter_values(body, &["risks", "risk"]),
         delivery_mode: frontmatter_value(body, &["deliveryMode", "delivery_mode"])
             .and_then(|value| parse_delivery_mode(&value)),
         user_invocable: frontmatter_bool(
@@ -735,6 +767,25 @@ fn parse_skill_frontmatter(body: &str) -> SkillFrontmatter {
         version: frontmatter_value(body, &["version"]),
         author: frontmatter_value(body, &["author"]),
         related_skills: frontmatter_values(body, &["relatedSkills", "related_skills"]),
+        provenance_owner: frontmatter_nested_value(body, &["provenance"], &["owner"]),
+        provenance_created_by: frontmatter_nested_value(
+            body,
+            &["provenance"],
+            &["createdBy", "created_by", "created-by"],
+        ),
+        provenance_trust: frontmatter_nested_value(body, &["provenance"], &["trust"]),
+        learning_mutability: frontmatter_nested_value(
+            body,
+            &["learning"],
+            &["mutable", "mutability"],
+        ),
+        learning_pinned: frontmatter_nested_value(body, &["learning"], &["pinned"]).and_then(
+            |value| match value.trim().to_ascii_lowercase().as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            },
+        ),
     }
 }
 
@@ -982,6 +1033,15 @@ fn skill_keywords(
     for tag in &frontmatter.tags {
         extend_tokens(&mut tokens, tag);
     }
+    for value in frontmatter
+        .task_types
+        .iter()
+        .chain(&frontmatter.domains)
+        .chain(&frontmatter.roles)
+        .chain(&frontmatter.aliases)
+    {
+        extend_tokens(&mut tokens, value);
+    }
     extend_tokens(&mut tokens, &body.chars().take(6000).collect::<String>());
     tokens.into_iter().take(MAX_KEYWORDS).collect()
 }
@@ -989,14 +1049,16 @@ fn skill_keywords(
 fn query_tokens(query: &SkillSelectionQuery) -> BTreeSet<String> {
     let mut tokens = BTreeSet::new();
     extend_tokens(&mut tokens, &query.text);
-    if let Some(agent_id) = &query.agent_id {
-        extend_tokens(&mut tokens, agent_id);
-    }
-    if let Some(channel) = &query.channel {
-        extend_tokens(&mut tokens, channel);
-    }
-    if let Some(workspace) = &query.workspace {
-        extend_tokens(&mut tokens, workspace);
+    if query.include_context_tokens {
+        if let Some(agent_id) = &query.agent_id {
+            extend_tokens(&mut tokens, agent_id);
+        }
+        if let Some(channel) = &query.channel {
+            extend_tokens(&mut tokens, channel);
+        }
+        if let Some(workspace) = &query.workspace {
+            extend_tokens(&mut tokens, workspace);
+        }
     }
     tokens
 }
@@ -1349,6 +1411,14 @@ fn frontmatter_gate_blocker(
     query_tokens: &BTreeSet<String>,
     query: &SkillSelectionQuery,
 ) -> Option<String> {
+    if !skill.frontmatter.negative_triggers.is_empty()
+        && count_matches(
+            query_tokens,
+            &values_token_set(&skill.frontmatter.negative_triggers),
+        ) > 0
+    {
+        return Some("negative trigger matched".to_string());
+    }
     if !skill.frontmatter.platforms.is_empty()
         && !query
             .channel
@@ -1903,6 +1973,7 @@ mod tests {
             &index,
             &SkillSelectionQuery {
                 text: "fix openclaw mem cron delivery runner".to_string(),
+                include_context_tokens: true,
                 agent_id: Some("mem-cron".to_string()),
                 channel: None,
                 workspace: None,
@@ -1978,6 +2049,7 @@ mod tests {
             &index,
             &SkillSelectionQuery {
                 text: "patch runtime queue timeout continuation".to_string(),
+                include_context_tokens: true,
                 agent_id: Some("main".to_string()),
                 channel: Some("discord".to_string()),
                 workspace: None,
@@ -2004,6 +2076,7 @@ mod tests {
             &index,
             &SkillSelectionQuery {
                 text: "create a Lyria social image pack".to_string(),
+                include_context_tokens: true,
                 agent_id: Some("main".to_string()),
                 channel: Some("telegram".to_string()),
                 workspace: None,
@@ -2079,6 +2152,7 @@ mod tests {
             &index,
             &SkillSelectionQuery {
                 text: "neoapi trading orders".to_string(),
+                include_context_tokens: true,
                 agent_id: None,
                 channel: None,
                 workspace: None,
@@ -2148,6 +2222,7 @@ mod tests {
             build_source_skill_index(&AgentSource::with_workspace(&home, &workspace)).unwrap();
         let query = SkillSelectionQuery {
             text: "handle inbound photo media".to_string(),
+            include_context_tokens: true,
             agent_id: Some("main".to_string()),
             channel: Some("telegram".to_string()),
             workspace: None,
@@ -2232,6 +2307,7 @@ mod tests {
                 &index,
                 &SkillSelectionQuery {
                     text: text.to_string(),
+                    include_context_tokens: true,
                     agent_id: None,
                     channel: None,
                     workspace: None,
@@ -2291,6 +2367,7 @@ mod tests {
                 &index,
                 &SkillSelectionQuery {
                     text: text.to_string(),
+                    include_context_tokens: true,
                     agent_id: Some(agent_id.to_string()),
                     channel: None,
                     workspace: None,

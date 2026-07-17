@@ -551,6 +551,7 @@ mod tests {
             &index,
             &SkillSelectionQuery {
                 text: "orders routing".to_string(),
+                include_context_tokens: true,
                 agent_id: None,
                 channel: None,
                 workspace: None,

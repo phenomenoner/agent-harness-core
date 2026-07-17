@@ -343,9 +343,9 @@ Use it when a turn involves:
 5. Prefer narrow replacement over broad append-only growth. Remove stale or contradictory guidance when the new version supersedes it.
 6. Include verification notes for risky procedures, especially live operations, autonomous apply, provider routing, memory, channel identity, or supervisor control.
 
-## Autonomous Review And Apply
+## Proposal Review And Explicit Apply
 
-Autonomous review/apply is a first-class skill ecosystem path. The safe shape is not manual-only; the safe shape is a structured apply pipeline:
+Skill synthesis defaults to a reviewable proposal. Apply is a separate explicitly authorized path through the same structured pipeline:
 
 1. Generate or receive a proposal with target path, expected checksum when replacing, body checksum, and source evidence.
 2. Run lint before apply. Block malformed frontmatter, missing identity, unsupported operation shape, or trigger collisions.
@@ -354,7 +354,7 @@ Autonomous review/apply is a first-class skill ecosystem path. The safe shape is
 5. Apply approved changes through the same checksum and backup/archive path used by operator-approved changes.
 6. Record usage and apply receipts so later doctor/status checks can explain what happened.
 
-`--propose-only` is an operator escape hatch. It should not be treated as the default mode for this feature family.
+`skill-synthesize` is proposal-only by default. `--apply` is an explicit operator mutation request; worker execution additionally requires `applyAuthorized=true` and `proposeOnly=false`.
 
 ## Lifecycle Rules
 

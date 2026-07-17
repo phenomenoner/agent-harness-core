@@ -1,0 +1,60 @@
+{
+  "schema": "agent-harness.codex-protocol-compatibility.v1",
+  "codexVersion": "0.144.5",
+  "sourceTag": "rust-v0.144.5",
+  "sourceCommit": "87db9bc18ba5bc82c1cb4e4381b44f693ee35623",
+  "schemaBundleSha256": {
+    "ClientRequest.json": "d8474445e109c242a2cc1169ed6d8644f86df3a097230c8c52bdc107a9014efa",
+    "ServerNotification.json": "fb0d6bf6b9f192257f452340de3fdca6b4b2c8e1a216aafaf48837a006e14bea",
+    "ServerRequest.json": "886f30bd882a73600566695e0f08f8a10fcd9897742c4745ecf91710ec256f6a",
+    "codex_app_server_protocol.schemas.json": "85ea836927d6cfdd3c68a9bda17dba48d2573bbc282ab2d5775a5005e40bc9c3",
+    "codex_app_server_protocol.v2.schemas.json": "82968303c0e1555c78cdf8bc5bf8f28946665c11c4f68bae128e678652479d23"
+  },
+  "requests": [
+    {"id": 0, "method": "initialize", "params": {"clientInfo": {"name": "agent_harness", "title": "Agent Harness", "version": "0.8.1"}, "capabilities": {"experimentalApi": true}}},
+    {"method": "initialized", "params": {}},
+    {"id": 1, "method": "thread/start", "params": {}},
+    {"id": 2, "method": "thread/resume", "params": {"threadId": "thread-fixture"}},
+    {"id": 3, "method": "turn/start", "params": {"threadId": "thread-fixture", "input": [{"type": "text", "text": "fixture"}]}},
+    {"id": 4, "method": "thread/compact/start", "params": {"threadId": "thread-fixture"}},
+    {"id": 5, "method": "thread/goal/set", "params": {"threadId": "thread-fixture", "objective": "fixture objective", "status": "active", "tokenBudget": null}},
+    {"id": 6, "method": "thread/goal/get", "params": {"threadId": "thread-fixture"}},
+    {"id": 7, "method": "account/read", "params": {"refreshToken": false}},
+    {"id": 8, "method": "account/login/start", "params": {"type": "chatgpt"}},
+    {"id": 9, "method": "account/login/start", "params": {"type": "chatgptDeviceCode"}},
+    {"id": 10, "method": "account/login/start", "params": {"type": "apiKey", "apiKey": "<REDACTED>"}},
+    {"id": 11, "method": "account/login/cancel", "params": {"loginId": "login-fixture"}},
+    {"id": 12, "method": "account/logout", "params": {}},
+    {"id": 13, "method": "model/list", "params": {}},
+    {"id": 14, "method": "config/read", "params": {}},
+    {"id": 15, "method": "modelProvider/capabilities/read", "params": {}}
+  ],
+  "responses": [
+    {"id": 0, "result": {"userAgent": "Codex Desktop/0.144.5 (<PLATFORM>)", "codexHome": "<CODEX_HOME>", "platformFamily": "windows", "platformOs": "windows"}},
+    {"id": 1, "result": {"thread": {"id": "thread-fixture"}, "model": "gpt-fixture", "modelProvider": "openai", "cwd": "<WORKSPACE>", "approvalPolicy": "on-request", "approvalsReviewer": "user", "sandbox": {"type": "workspaceWrite"}}},
+    {"id": 2, "result": {"thread": {"id": "thread-fixture"}, "model": "gpt-fixture", "modelProvider": "openai", "cwd": "<WORKSPACE>", "approvalPolicy": "on-request", "approvalsReviewer": "user", "sandbox": {"type": "workspaceWrite"}}},
+    {"id": 3, "result": {"turn": {"id": "turn-fixture", "status": "inProgress", "items": [], "error": null}}},
+    {"id": 4, "result": {}},
+    {"id": 5, "result": {"goal": {"threadId": "thread-fixture", "objective": "fixture objective", "status": "active", "tokenBudget": null, "tokensUsed": 0, "timeUsedSeconds": 0, "createdAt": 1, "updatedAt": 1}}},
+    {"id": 7, "result": {"account": null, "requiresOpenaiAuth": true}},
+    {"id": 13, "result": {"data": [{"id": "gpt-fixture", "model": "gpt-fixture", "displayName": "Fixture", "description": "sanitized", "hidden": false, "supportedReasoningEfforts": [{"reasoningEffort": "medium", "description": "fixture"}], "defaultReasoningEffort": "medium", "inputModalities": ["text"], "supportsPersonality": false, "additionalSpeedTiers": [], "serviceTiers": [], "defaultServiceTier": null, "isDefault": true}], "nextCursor": null}},
+    {"id": 14, "result": {"config": {"web_search": null, "model_context_window": null}, "origins": {}}},
+    {"id": 15, "result": {"namespaceTools": true, "imageGeneration": true, "webSearch": true}},
+    {"id": 99, "result": null},
+    {"id": 100, "error": {"code": -32600, "message": "fixture error"}}
+  ],
+  "notifications": [
+    {"method": "thread/tokenUsage/updated", "params": {"threadId": "thread-fixture", "turnId": "turn-fixture", "tokenUsage": {"total": {"inputTokens": 120000, "cachedInputTokens": 0, "outputTokens": 1000, "reasoningOutputTokens": 0, "totalTokens": 121000}, "last": {"inputTokens": 2000, "cachedInputTokens": 0, "outputTokens": 100, "reasoningOutputTokens": 0, "totalTokens": 2100}, "modelContextWindow": 258400}}},
+    {"method": "thread/goal/updated", "params": {"threadId": "thread-fixture", "turnId": "turn-fixture", "goal": {"threadId": "thread-fixture", "objective": "fixture objective", "status": "active", "tokenBudget": null, "tokensUsed": 42, "timeUsedSeconds": 3, "createdAt": 1, "updatedAt": 2}}},
+    {"method": "item/completed", "params": {"threadId": "thread-fixture", "turnId": "compact-turn", "item": {"id": "compact-item", "type": "contextCompaction"}, "startedAtMs": 1, "completedAtMs": 2}},
+    {"method": "thread/compacted", "params": {"threadId": "thread-fixture", "turnId": "compact-turn"}},
+    {"method": "turn/completed", "params": {"threadId": "thread-fixture", "turn": {"id": "resume-turn", "status": "interrupted", "items": [], "error": null}, "interrupted": null}},
+    {"method": "item/started", "params": {"threadId": "thread-fixture", "turnId": "turn-fixture", "startedAtMs": 1, "item": {"id": "web-fixture", "type": "webSearch", "query": "sanitized fixture query", "action": {"type": "search", "query": "sanitized fixture query", "queries": ["sanitized fixture query"]}}}}
+  ],
+  "raceExpectation": {
+    "resumeTurnId": "resume-turn",
+    "compactTurnId": "compact-turn",
+    "unattributedInterruptedNullMustNotCompleteCompact": true,
+    "harnessCorrelationStillRequired": true
+  }
+}

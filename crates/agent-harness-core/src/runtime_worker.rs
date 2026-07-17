@@ -12,7 +12,9 @@ use std::os::windows::fs::OpenOptionsExt;
 
 use crate::backend_reasoning::{BackendReasoningPolicyV1, ReasoningPreference};
 use crate::channel_state::ChannelStateLane;
-use crate::context_rollover::{derive_virtual_session_id, root_working_session_key};
+use crate::context_rollover::{
+    derive_virtual_session_id, derive_virtual_session_id_v2, root_working_session_key,
+};
 use crate::execution_mode::{
     AuthorizedExecutionModeSnapshotV2, STANDARD_EXECUTION_MODE, is_reserved_execution_mode_effort,
 };
@@ -33,10 +35,13 @@ use crate::runtime_receipt_history::{
 };
 use crate::{
     AgentSource, HarnessLogEvent, HarnessLogLevel, InboundMediaArtifact, PromptAssemblyOptions,
-    RuntimeContinuationMetadata, append_harness_log, apply_context_rollover_before_turn,
+    RuntimeContinuationMetadata, SkillRouterV2Policy, SkillShadowRuntimeReceiptOptions,
+    VirtualSkillRuntimeObserveOptions, append_harness_log, apply_context_rollover_before_turn,
     assemble_prompt_bundle, build_runtime_skill_index, build_turn_plan_for_account,
     cron_run_runtime_dispatch_blocker, current_log_time_ms, load_agent_registry,
-    load_worker_dispatch_config, write_json_atomic, write_prompt_bundle,
+    load_worker_dispatch_config, observe_virtual_skill_runtime,
+    record_skill_shadow_runtime_receipt, virtual_skill_manifest_observation_enabled,
+    write_json_atomic, write_prompt_bundle,
 };
 use crate::{ContextRolloverBeforeTurnOptions, ContextRolloverStatus};
 
@@ -241,6 +246,10 @@ pub struct RuntimeQueuePreparedItem {
     pub planned_transcript_file: PathBuf,
     pub planned_trajectory_file: PathBuf,
     pub selected_skill_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_skill_manifest_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skill_delivery_receipt_files: Vec<PathBuf>,
     #[serde(default, flatten)]
     pub continuation: RuntimeContinuationMetadata,
 }
@@ -614,6 +623,7 @@ pub fn prepare_runtime_queue_item(
         ));
     }
     let retry_pending_run_ids = retry_pending_run_once_ids_from_index(&run_once_index);
+    let auth_deferred_run_ids = auth_deferred_run_once_ids_from_index(&run_once_index);
     let lock_runtime_class = select_lock_runtime_class(
         options.queue_id.as_deref(),
         &preliminary_pending_items,
@@ -780,6 +790,46 @@ pub fn prepare_runtime_queue_item(
             terminal_control_source: None,
             suppressed_run_once_reason: None,
             reason: "requested runtime queue item already has a terminal run receipt".to_string(),
+        };
+        append_json_line(&execution_receipts_file, &receipt)?;
+        return Ok(RuntimeQueuePrepareReport {
+            schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
+            harness_home: options.harness_home,
+            queue_file,
+            execution_receipts_file,
+            item: None,
+            receipt,
+            warnings,
+        });
+    }
+    if let Some(requested_queue_id) = options.queue_id.as_deref()
+        && auth_deferred_run_ids.contains(requested_queue_id)
+    {
+        write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+        let pending = pending_by_id
+            .get(requested_queue_id)
+            .or_else(|| preliminary_pending_by_id.get(requested_queue_id));
+        let receipt = RuntimeExecutionReceipt {
+            queue_id: Some(requested_queue_id.to_string()),
+            status: RuntimeExecutionReceiptStatus::NoPendingItem,
+            channel_lane: None,
+            runtime_class: pending.map(|item| item.runtime_class.clone()),
+            origin: pending.map(|item| item.origin.clone()),
+            cron_run_id: pending.and_then(|item| item.cron_run_id.clone()),
+            scheduled_for_ms: pending.and_then(|item| item.scheduled_for_ms),
+            execution_dir: None,
+            prompt_bundle_json: None,
+            prompt_markdown: None,
+            runtime_workspace: None,
+            inbound_media_artifacts: Vec::new(),
+            continuation: pending
+                .map(|item| item.continuation.clone())
+                .unwrap_or_else(RuntimeContinuationMetadata::legacy),
+            terminal_control_matched: None,
+            terminal_control_source: None,
+            suppressed_run_once_reason: None,
+            reason: "requested runtime queue item is waiting for operator authentication"
+                .to_string(),
         };
         append_json_line(&execution_receipts_file, &receipt)?;
         return Ok(RuntimeQueuePrepareReport {
@@ -1050,7 +1100,9 @@ pub fn prepare_runtime_queue_item(
     }
     if options.queue_id.is_none() {
         for (queue_id, prepared) in prepared_receipts.iter().filter(|(queue_id, _)| {
-            !terminal_run_ids.contains(*queue_id) && !lease_state.leases.contains_key(*queue_id)
+            !terminal_run_ids.contains(*queue_id)
+                && !auth_deferred_run_ids.contains(*queue_id)
+                && !lease_state.leases.contains_key(*queue_id)
         }) {
             if let Some(pending) = pending_by_id.get(queue_id) {
                 if pending.runtime_class != lock_runtime_class {
@@ -1179,6 +1231,7 @@ pub fn prepare_runtime_queue_item(
         options.queue_id.as_deref(),
         &prepared_ids,
         &terminal_run_ids,
+        &auth_deferred_run_ids,
         &lease_state,
         &lock_runtime_class,
         &options.harness_home,
@@ -1395,13 +1448,87 @@ pub fn prepare_runtime_queue_item(
     let (full_lane, backend_context_generation) =
         derive_prompt_runtime_context(&pending, &mut warnings)?;
     let channel_lane = channel_state_lane_for_pending(&pending)?;
+    let mut skill_shadow_runtime_receipt = None;
+    let mut skill_virtual_session_id = None;
+    if let Some(query) = plan.skill_shadow_v2_query.as_ref() {
+        match (full_lane.as_ref(), channel_lane.as_ref()) {
+            (Some(full_lane), Some(channel_lane)) => {
+                let virtual_session_id = derive_virtual_session_id_v2(
+                    channel_lane,
+                    full_lane.root_virtual_session(),
+                );
+                match record_skill_shadow_runtime_receipt(
+                    SkillShadowRuntimeReceiptOptions {
+                        harness_home: &options.harness_home,
+                        full_lane,
+                        virtual_session_id: &virtual_session_id,
+                        query,
+                        skill_index: &skill_index,
+                        active_serving_skills: &plan.selected_skills,
+                        policy: SkillRouterV2Policy::default(),
+                    },
+                ) {
+                    Ok((_, receipt)) => {
+                        skill_virtual_session_id = Some(virtual_session_id);
+                        skill_shadow_runtime_receipt = Some(receipt);
+                    }
+                    Err(error) => warnings.push(format!(
+                        "skill router v2 shadow receipt could not be written: {error}"
+                    )),
+                }
+            }
+            _ => warnings.push(
+                "skill router v2 shadow skipped because an exact account-aware lane was unavailable"
+                    .to_string(),
+            ),
+        }
+    }
     let mut prompt_options = options.prompt_options;
     prompt_options.harness_home = Some(options.harness_home.clone());
     // The queued item is the authoritative post-routing identity. Never accept
     // a caller-supplied lane or backend generation that can disagree with it.
-    prompt_options.full_lane = full_lane;
-    prompt_options.backend_context_generation = Some(backend_context_generation);
+    prompt_options.full_lane = full_lane.clone();
+    prompt_options.backend_context_generation = Some(backend_context_generation.clone());
     let bundle = assemble_prompt_bundle(&plan, prompt_options)?;
+    let mut virtual_skill_observation = None;
+    let virtual_manifest_observe_enabled =
+        match virtual_skill_manifest_observation_enabled(&options.harness_home) {
+            Ok(enabled) => enabled,
+            Err(error) => {
+                warnings.push(format!(
+                    "virtual skill manifest observation config could not be read: {error}"
+                ));
+                false
+            }
+        };
+    if virtual_manifest_observe_enabled && skill_shadow_runtime_receipt.is_none() {
+        warnings.push(
+            "virtual skill manifest observation skipped because skills.matcher.shadowV2Enabled did not produce an exact-lane routing receipt"
+                .to_string(),
+        );
+    }
+    if virtual_manifest_observe_enabled
+        && let (Some(routing_receipt), Some(full_lane), Some(virtual_session_id)) = (
+            skill_shadow_runtime_receipt.as_ref(),
+            full_lane.as_ref(),
+            skill_virtual_session_id.as_deref(),
+        )
+    {
+        match observe_virtual_skill_runtime(VirtualSkillRuntimeObserveOptions {
+            harness_home: &options.harness_home,
+            full_lane,
+            virtual_session_id,
+            backend_generation: &backend_context_generation,
+            queue_id: &pending.queue_id,
+            routing_receipt,
+            prompt_bundle: &bundle,
+        }) {
+            Ok(report) => virtual_skill_observation = Some(report),
+            Err(error) => warnings.push(format!(
+                "virtual skill manifest observation could not be written: {error}"
+            )),
+        }
+    }
 
     let execution_dir = queue_execution_dir(&options.harness_home, &pending.queue_id);
     fs::create_dir_all(&execution_dir)?;
@@ -1439,6 +1566,12 @@ pub fn prepare_runtime_queue_item(
         planned_transcript_file: pending.planned_transcript_file,
         planned_trajectory_file: pending.planned_trajectory_file,
         selected_skill_ids: actual_skill_ids,
+        virtual_skill_manifest_file: virtual_skill_observation
+            .as_ref()
+            .map(|report| report.manifest_file.clone()),
+        skill_delivery_receipt_files: virtual_skill_observation
+            .map(|report| report.delivery_receipt_files)
+            .unwrap_or_default(),
         continuation: pending.continuation.clone(),
     };
     let receipt = RuntimeExecutionReceipt {
@@ -1638,6 +1771,7 @@ pub fn inspect_runtime_queue_capacity(
         ));
     }
     let retry_pending_run_ids = retry_pending_run_once_ids_from_index(&run_once_index);
+    let auth_deferred_run_ids = auth_deferred_run_once_ids_from_index(&run_once_index);
     let pending_items = read_pending_items(&queue_file, &mut warnings)?;
     let pending_by_id = pending_items
         .iter()
@@ -1688,7 +1822,9 @@ pub fn inspect_runtime_queue_capacity(
         let prepared_candidates = prepared_receipts
             .keys()
             .filter(|queue_id| {
-                !terminal_run_ids.contains(*queue_id) && !lease_state.leases.contains_key(*queue_id)
+                !terminal_run_ids.contains(*queue_id)
+                    && !auth_deferred_run_ids.contains(*queue_id)
+                    && !lease_state.leases.contains_key(*queue_id)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -1736,6 +1872,7 @@ pub fn inspect_runtime_queue_capacity(
         {
             if prepared_ids.contains(&pending.queue_id)
                 || terminal_run_ids.contains(&pending.queue_id)
+                || auth_deferred_run_ids.contains(&pending.queue_id)
                 || simulated.leases.contains_key(&pending.queue_id)
             {
                 continue;
@@ -5084,6 +5221,7 @@ fn select_pending_item(
     requested_queue_id: Option<&str>,
     prepared_ids: &HashSet<String>,
     terminal_run_ids: &HashSet<String>,
+    auth_deferred_run_ids: &HashSet<String>,
     lease_state: &RuntimeQueueLeaseState,
     runtime_class: &str,
     harness_home: &Path,
@@ -5148,6 +5286,13 @@ fn select_pending_item(
         if terminal_run_ids.contains(&item.queue_id) {
             warnings.push(format!(
                 "runtime queue item `{}` already has a terminal run receipt; skipping",
+                item.queue_id
+            ));
+            continue;
+        }
+        if auth_deferred_run_ids.contains(&item.queue_id) {
+            warnings.push(format!(
+                "runtime queue item `{}` is waiting for operator authentication; skipping until its retry-pending wake",
                 item.queue_id
             ));
             continue;
@@ -5543,6 +5688,7 @@ pub(crate) fn runtime_queue_prior_failure_count_from_index(
                     !is_terminal_run_once_status(status)
                         && status != "completed"
                         && status != "no-work"
+                        && status != "auth-deferred"
                 })
                 .fold(0usize, |count, (_, status_count)| {
                     count.saturating_add(*status_count)
@@ -5557,6 +5703,16 @@ fn retry_pending_run_once_ids_from_index(index: &RuntimeQueueStateIndex) -> Hash
         .iter()
         .filter_map(|(queue_id, entry)| {
             (entry.latest_status.as_deref() == Some("retry-pending")).then_some(queue_id.clone())
+        })
+        .collect()
+}
+
+fn auth_deferred_run_once_ids_from_index(index: &RuntimeQueueStateIndex) -> HashSet<String> {
+    index
+        .queues
+        .iter()
+        .filter_map(|(queue_id, entry)| {
+            (entry.latest_status.as_deref() == Some("auth-deferred")).then_some(queue_id.clone())
         })
         .collect()
 }
@@ -6050,6 +6206,15 @@ fn continuation_metadata_from_value(value: &Value) -> RuntimeContinuationMetadat
             .get("continuationIndex")
             .or_else(|| value.get("continuation_index"))
             .and_then(Value::as_u64),
+        campaign_slice_generation: value
+            .get("campaignSliceGeneration")
+            .or_else(|| value.get("campaign_slice_generation"))
+            .and_then(Value::as_u64),
+        continuation_intent_key: string_field(
+            value,
+            &["continuationIntentKey", "continuation_intent_key"],
+        )
+        .map(ToString::to_string),
         completion_kind: string_field(value, &["completionKind", "completion_kind"])
             .map(ToString::to_string),
         task_terminal: value
@@ -8016,6 +8181,233 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    // Contract: SK-F1 shadow routing is observability-only at the real runtime
+    // preparation seam.
+    // Source: frozen Skill Ecosystem F1 handoff, synthetic exact-lane replay.
+    // Fails on: the dormant router is never invoked by runtime preparation.
+    // Asserts: enabling shadow writes one explainable receipt while active v4
+    // selection and the model-facing prompt remain byte-for-byte unchanged.
+    #[test]
+    fn skill_router_v2_shadow_runtime_receipt_has_zero_serving_side_effect() {
+        let root = temp_root("skill_router_v2_shadow_zero_side_effect");
+        let source = write_worker_source(&root);
+        let harness_home = root.join("harness");
+        enqueue_fixture_turn_for_account(
+            &source,
+            &harness_home,
+            "default",
+            "repair memory cron",
+            1234,
+        );
+        let off = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap()
+        .item
+        .unwrap();
+        let off_selected_skill_ids = off.selected_skill_ids;
+        let off_prompt_markdown = fs::read(&off.prompt_markdown).unwrap();
+        assert!(
+            !harness_home
+                .join("state")
+                .join("skills")
+                .join("shadow-routing")
+                .exists(),
+            "feature-off preparation must not create shadow receipts"
+        );
+
+        fs::remove_dir_all(&harness_home).unwrap();
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"skills":{"matcher":{"shadowV2Enabled":true}}}"#,
+        )
+        .unwrap();
+        enqueue_fixture_turn_for_account(
+            &source,
+            &harness_home,
+            "default",
+            "repair memory cron",
+            1234,
+        );
+        let on = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap()
+        .item
+        .unwrap();
+
+        assert_eq!(off_selected_skill_ids, on.selected_skill_ids);
+        assert_eq!(
+            off_prompt_markdown,
+            fs::read(&on.prompt_markdown).unwrap(),
+            "shadow routing must not change model-facing prompt bytes"
+        );
+        let receipt_dir = harness_home
+            .join("state")
+            .join("skills")
+            .join("shadow-routing");
+        let receipt_files = fs::read_dir(&receipt_dir)
+            .expect("shadow-enabled runtime must write a receipt")
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(receipt_files.len(), 1);
+        let receipt_bytes = fs::read(receipt_files[0].path()).unwrap();
+        let receipt_text = String::from_utf8(receipt_bytes.clone()).unwrap();
+        assert!(!receipt_text.contains("repair memory cron"));
+        assert!(!receipt_text.contains("dm-42"));
+        assert!(!receipt_text.contains("user-7"));
+        let receipt: crate::SkillRoutingReceiptV2 = serde_json::from_slice(&receipt_bytes).unwrap();
+        receipt.validate().unwrap();
+        assert!(receipt.shadow);
+        assert_eq!(receipt.channel, "telegram");
+        assert_eq!(receipt.identity.agent_id, "main");
+        assert_eq!(receipt.task_text_bytes, "repair memory cron".len());
+
+        assert!(!crate::virtual_skill_manifest_dir(&harness_home).exists());
+        assert!(
+            !harness_home
+                .join("state")
+                .join("skills")
+                .join("delivery-receipts")
+                .exists()
+        );
+
+        assert!(!crate::skill_usage_events_file(&harness_home).exists());
+        assert!(!crate::skill_proposals_file(&harness_home).exists());
+        assert!(!crate::self_improvement_review_receipts_file(&harness_home).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn virtual_skill_manifest_observer_records_delivery_without_serving_side_effect() {
+        let root = temp_root("virtual_skill_manifest_observer_zero_side_effect");
+        let source = write_worker_source(&root);
+        let harness_home = root.join("harness");
+        enqueue_fixture_turn_for_account(
+            &source,
+            &harness_home,
+            "default",
+            "repair memory cron",
+            1234,
+        );
+        let off = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap()
+        .item
+        .unwrap();
+        let off_selected_skill_ids = off.selected_skill_ids;
+        let off_prompt_markdown = fs::read(&off.prompt_markdown).unwrap();
+
+        fs::remove_dir_all(&harness_home).unwrap();
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{
+              "skills": {
+                "matcher": {"shadowV2Enabled": true},
+                "virtualManifest": {"observeEnabled": true}
+              }
+            }"#,
+        )
+        .unwrap();
+        enqueue_fixture_turn_for_account(
+            &source,
+            &harness_home,
+            "default",
+            "repair memory cron",
+            1234,
+        );
+        let on = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap()
+        .item
+        .unwrap();
+
+        assert_eq!(off_selected_skill_ids, on.selected_skill_ids);
+        assert_eq!(off_prompt_markdown, fs::read(&on.prompt_markdown).unwrap());
+        let manifest_file = on
+            .virtual_skill_manifest_file
+            .as_ref()
+            .expect("observe-enabled manifest file");
+        let manifest: crate::VirtualSkillManifestV1 =
+            serde_json::from_slice(&fs::read(manifest_file).unwrap()).unwrap();
+        manifest.validate().unwrap();
+        assert_eq!(
+            manifest
+                .skills
+                .iter()
+                .map(|entry| entry.skill_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            on.selected_skill_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            manifest.deliveries.len(),
+            on.skill_delivery_receipt_files.len()
+        );
+        assert_eq!(manifest.deliveries.len(), on.selected_skill_ids.len());
+        assert!(
+            on.skill_delivery_receipt_files
+                .iter()
+                .all(|path| path.is_file())
+        );
+        assert!(!crate::skill_usage_events_file(&harness_home).exists());
+        assert!(!crate::skill_proposals_file(&harness_home).exists());
+        assert!(!crate::self_improvement_review_receipts_file(&harness_home).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_router_v2_shadow_runtime_skips_partial_lane_without_blocking_serving() {
+        let root = temp_root("skill_router_v2_shadow_partial_lane");
+        let source = write_worker_source(&root);
+        let harness_home = root.join("harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"skills":{"matcher":{"shadowV2Enabled":true}}}"#,
+        )
+        .unwrap();
+        enqueue_fixture_turn_with_text(&source, &harness_home, "repair memory cron", 1234);
+
+        let report = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert!(report.item.is_some(), "serving preparation must continue");
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("shadow skipped") && warning.contains("exact account-aware lane")
+        }));
+        assert!(
+            !harness_home
+                .join("state")
+                .join("skills")
+                .join("shadow-routing")
+                .exists()
+        );
+        assert!(!crate::skill_usage_events_file(&harness_home).exists());
+        assert!(!crate::skill_proposals_file(&harness_home).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn prepare_runtime_queue_item_records_lease_acquired_before_prepared_receipt() {
         let root = temp_root("prepare_runtime_queue_item_records_lease_acquired_before_prepared");
@@ -9787,6 +10179,7 @@ mod tests {
         ];
         let lease_state = RuntimeQueueLeaseState::default();
         let terminal_ids = HashSet::new();
+        let auth_deferred_ids = HashSet::new();
         let mut prepared_ids = HashSet::new();
         let mut warnings = Vec::new();
 
@@ -9795,6 +10188,7 @@ mod tests {
             None,
             &prepared_ids,
             &terminal_ids,
+            &auth_deferred_ids,
             &lease_state,
             "cron",
             &harness_home,
@@ -9812,6 +10206,7 @@ mod tests {
             None,
             &prepared_ids,
             &terminal_ids,
+            &auth_deferred_ids,
             &lease_state,
             "cron",
             &harness_home,
@@ -10024,6 +10419,48 @@ mod tests {
             "{}",
             serde_json::json!({
                 "queueId": queue_id.clone(),
+                "status": "auth-deferred",
+                "reason": "needs-operator-auth"
+            })
+        )
+        .unwrap();
+
+        let deferred_capacity = inspect_runtime_queue_capacity(RuntimeQueueCapacityOptions {
+            harness_home: harness_home.clone(),
+        })
+        .unwrap();
+        assert_eq!(deferred_capacity.claimable_items, 0);
+        assert!(deferred_capacity.claimable_queue_ids.is_empty());
+        let deferred_index =
+            refresh_runtime_queue_state_index(&queue_dir(&harness_home), &mut Vec::new()).unwrap();
+        assert_eq!(
+            runtime_queue_prior_failure_count_from_index(&deferred_index, &queue_id),
+            0,
+            "auth deferral must not consume retry budget"
+        );
+        let deferred_prepare = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(queue_id.clone()),
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert!(deferred_prepare.item.is_none());
+        assert_eq!(
+            deferred_prepare.receipt.status,
+            RuntimeExecutionReceiptStatus::NoPendingItem
+        );
+        assert!(
+            deferred_prepare
+                .receipt
+                .reason
+                .contains("waiting for operator authentication")
+        );
+
+        writeln!(
+            run_once_file,
+            "{}",
+            serde_json::json!({
+                "queueId": queue_id.clone(),
                 "status": "retry-pending",
                 "reason": "transient reconnect; retry with the same session"
             })
@@ -10130,6 +10567,47 @@ mod tests {
 
     fn enqueue_fixture_turn(source: &AgentSource, harness_home: &Path) {
         enqueue_fixture_turn_with_text(source, harness_home, "repair memory cron", 1234);
+    }
+
+    fn enqueue_fixture_turn_for_account(
+        source: &AgentSource,
+        harness_home: &Path,
+        account_id: &str,
+        text: &str,
+        now_ms: i64,
+    ) {
+        let registry = load_agent_registry(source).unwrap();
+        let skills = build_source_skill_index(source).unwrap();
+        let turn = crate::build_turn_plan_for_account(
+            source,
+            &registry,
+            &skills,
+            TurnPlanInput {
+                harness_home: None,
+                platform: "telegram".to_string(),
+                channel_id: "dm-42".to_string(),
+                user_id: "user-7".to_string(),
+                text: text.to_string(),
+                inbound_context: None,
+                inbound_media_artifacts: Vec::new(),
+                requested_agent_id: Some("main".to_string()),
+                session_hint: None,
+                skill_limit: 3,
+            },
+            Some(account_id.to_string()),
+        )
+        .unwrap();
+        let step = build_channel_step(&registry, &turn);
+        enqueue_channel_step(
+            &step,
+            RuntimeQueueEnqueueOptions {
+                harness_home: harness_home.to_path_buf(),
+                runtime_workspace: None,
+                inbound_canonical_id: None,
+                now_ms,
+            },
+        )
+        .unwrap();
     }
 
     fn enqueue_fixture_turn_with_text(

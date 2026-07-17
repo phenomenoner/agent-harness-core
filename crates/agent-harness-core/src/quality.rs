@@ -154,7 +154,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I20",
-            statement: "skill ecosystem mutation is proposal-mediated but autonomous review/apply is a first-class path; selection is agent-scoped, rejects weak body-only automatic matches, deduplicates active/imported copies by original id with active-source preference, and preserves hard lifecycle/allowlist/invocation gates and receipts",
+            statement: "skill ecosystem mutation is proposal-only by default and any apply requires explicit operator or worker authorization through the lint, guard, checksum, backup, and receipt pipeline; selection is agent-scoped, rejects weak body-only automatic matches, deduplicates active/imported copies by original id with active-source preference, and preserves hard lifecycle/allowlist/invocation gates",
             owner: "skills/skill_usage/turns/skill_apply/skill_guard/skill_lint/skill_curator/prompt",
         },
         InvariantEntry {
@@ -192,6 +192,61 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
             statement: "provider-visible progress delivery is source-authoritative and stop-responsive: a non-fresh progress snapshot cannot replay cached state, historical events without a known provider surface cannot create a fresh surface, and a stop request releases unattempted fresh-send claims before provider I/O",
             owner: "progress/progress_event_index/agent-harness-cli/supervisor",
         },
+        InvariantEntry {
+            id: "I28",
+            statement: "skill routing shadow is exact-lane and observability-only, while task intent, frozen revisions, first-load versus rehydration accounting, outcomes, and terminal learning review are owned by one exact-lane virtualSessionId; shadow cannot change serving, rollover cannot rematch or double-count use, and /new inherits no prior task skill state",
+            owner: "skill_shadow_runtime/runtime_worker/virtual_skill_manifest/context_rollover/virtual_session_context/prompt/skill_usage/skill_episode/knowledge_classifier/skill_improvement/self_improvement",
+        },
+        InvariantEntry {
+            id: "I29",
+            statement: "agent-library dream and topology maintenance is proposal-first, non-indexable, idempotent, subordinate to foreground work, staged under one writer lease, and activated only at a later catalog epoch with rollback",
+            owner: "skill_dream_jobs/skill_dream_workspace/skill_dream/knowledge_classifier/skill_topology/skill_replay/cron_scheduler",
+        },
+        InvariantEntry {
+            id: "I30",
+            statement: "every candidate and live Codex backend starts from one deployment-owned canonical executable whose exact version, executable SHA-256, npm package provenance, CODEX_HOME identity, config digest, and parent/child lifecycle are fail-closed and receipted; PATH and global npm fallback are forbidden",
+            owner: "codex_backend_provenance/supervisor/codex_runtime",
+        },
+        InvariantEntry {
+            id: "I31",
+            statement: "the exact Codex 0.144.5 JSON-RPC surface is fixture-locked for initialization, thread and turn lifecycle, token/context accounting, goals, compact, auth, capabilities, web-search items, and error/null behavior; upstream completion without exact operation correlation cannot close a harness compact or goal transition",
+            owner: "codex_protocol_compat/codex_runtime/context_rollover/coordinator_resume/goal",
+        },
+        InvariantEntry {
+            id: "I32",
+            statement: "backend authentication is isolated by a current-operator-only harness-owned provider-scoped CODEX_HOME and controlled only by an interactive operator lifecycle; account and capability readiness, one-way operation correlation, cancellation/expiry, and restart reconciliation are secret-free durable state; an unready normal turn becomes nonterminal auth-deferred without delivery or retry-budget consumption and is woken exactly once only by a newer ready generation, while credentials and login challenges never enter normal channel turns, public artifacts, receipts, or logs",
+            owner: "backend_auth/codex_runtime/agent-harness-cli/runtime_worker/security",
+        },
+        InvariantEntry {
+            id: "I33",
+            statement: "backend-reported model context capacity is durable authority only for the same Codex binding, provider/model route, and backend context generation while fresh; pollution and model capability policy precede ratio policy, and the 120000 absolute guard is used only as an unknown/stale-capacity failsafe",
+            owner: "codex_runtime/virtual_session_runtime_index/context_rollover",
+        },
+        InvariantEntry {
+            id: "I34",
+            statement: "a resumed Codex thread must pass a bounded receipted settle phase before same-thread maintenance; a restored active goal turn is drained as internal continuity work, and compact success requires exact RPC/thread/compact-item correlation rather than an unrelated turn completion; error:null is absent evidence and post-ack process death is ambiguous",
+            owner: "codex_runtime/context_rollover/goal",
+        },
+        InvariantEntry {
+            id: "I35",
+            statement: "new production virtual-session and working-set writes are exact-account v2 only and emit full-lane digest plus backend-generation authority evidence; legacy accountless artifacts are readable solely through constrained default-account migration and are never wildcard authority",
+            owner: "runtime_pipeline/context_rollover/virtual_session_context/lane",
+        },
+        InvariantEntry {
+            id: "I36",
+            statement: "active backend goal rows are projected through exact-v2 lane, virtual-session, backend-generation, source thread/turn, goal-reference, checksum, and observation-order identity; one campaign has at most one runnable lineage, and duplicate/stale/orphan rows become non-runnable only through validated append-only supersession, never deletion or wrong-lane substitution",
+            owner: "goal_lineage/codex_runtime/context_rollover/runtime_pipeline",
+        },
+        InvariantEntry {
+            id: "I37",
+            statement: "every goal slice event passes one transition table before final-outbox selection; active campaigns commit one deterministic exact-lane continuation intent before enqueue, reconcile restart/replay to one child, keep campaign slice generation separate from recovery depth, and acknowledge only after child lease ownership",
+            owner: "goal_transition/goal_continuation/runtime_pipeline/context_rollover/runtime_worker",
+        },
+        InvariantEntry {
+            id: "I38",
+            statement: "Codex built-in web search is selected by explicit harness intent and exact-lane policy, never sandbox mode: ordinary turns request cached, authorized freshness requests live, and sensitive/offline/replay turns force disabled; the same-connection provider capability gates the effective mode, mode/provider/lane drift rolls over the thread, limitations are model-visible, and receipts hash queries while keeping unadmitted search content out of memory, skills, and dream artifacts",
+            owner: "codex_web_search/codex_runtime/config/memory/skill_episode/skill_learning",
+        },
     ]
 }
 
@@ -200,7 +255,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.runtime-run-once.v1",
             owner_module: "runtime_pipeline",
-            compatibility: "append-only JSONL, additive fields only in v1 including terminalControlMatched, terminalControlSource, suppressedRunOnceReason, and preparedExecutionTerminalizationReason",
+            compatibility: "append-only JSONL, additive fields and statuses only in v1 including nonterminal auth-deferred plus deterministic eventKey retry-pending wakes; auth-deferred is non-claimable, non-deliverable, and excluded from retry accounting until its wake",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.ledger-maintenance.v1",
@@ -211,6 +266,46 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             schema: "agent-harness.codex-runtime-run.v1",
             owner_module: "codex_runtime",
             compatibility: "append-only JSONL plus per-execution JSON; v1 accepts additive recovery fields such as toolUseTimeout, interruptionReason, interruptedToolUses, and contextRecovery.threadHealthStatus; productive absolute timeout classification uses bounded stdout evidence rather than eventCount alone",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.codex-backend-provenance.v1",
+            owner_module: "codex_backend_provenance",
+            compatibility: "immutable candidate/startup receipt; additive metadata only in v1, while canonical path, exact version, executable SHA-256, and ready probe result remain mandatory promotion gates",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.codex-protocol-compatibility.v1",
+            owner_module: "codex_protocol_compat",
+            compatibility: "version-locked sanitized fixture; additive cases require refreshed 0.144.5 schema hashes, while existing method/field and harness-correlation expectations cannot be removed",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.codex-web-search-decision.v1",
+            owner_module: "codex_web_search/codex_runtime",
+            compatibility: "per-execution decision receipt; requested/effective modes, explicit intent/reason, exact lane/provider, capability generation, limitation, and sandbox independence are stable while additive diagnostics are allowed",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.codex-web-search-thread-binding.v1",
+            owner_module: "codex_web_search/codex_runtime",
+            compatibility: "append-only per-thread mode binding; thread id, effective mode, provider, exact lane digest, policy digest, and capability generation are immutable in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.codex-web-search-action.v1",
+            owner_module: "codex_web_search/codex_runtime",
+            compatibility: "append-once action receipt; exact thread/turn/item ids, action, modes, capability generation, query digest, public domain when safe, citation count, and non-admission classification are stable; raw queries and private URLs are forbidden",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.backend-auth-state.v1",
+            owner_module: "backend_auth",
+            compatibility: "provider-scoped secret-free state and append-only transition receipts; lifecycle values and additive diagnostics may expand in v1, while readiness generation, exact operation correlation, and credential-bearing field exclusion remain mandatory",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.codex-backend-auth.v1",
+            owner_module: "backend_auth",
+            compatibility: "append-only secret-free provider-home receipt; provider-home digest, executable provenance receipt reference, lifecycle transition, selected operator method, one-way operation correlation, timestamps, redacted result, account/capability probe outcomes, and readiness generation are stable; credentials, challenges, account identity, and full authorization URLs are forbidden",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.backend-auth-continuation.v1",
+            owner_module: "backend_auth/runtime_worker",
+            compatibility: "provider and exact queue-scoped durable intent; waiting/resumed state and generation fence are stable, additive diagnostics only in v1; a deterministic append-once retry-pending wake must commit before the resumed mark so restart reconciliation cannot lose or duplicate the wake",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.codex-active-turn.v1",
@@ -290,7 +385,92 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.codex-context-preflight.v1",
             owner_module: "codex_runtime",
-            compatibility: "append-only JSONL plus per-execution JSON; additive fields only in v1, including threadHealthStatus",
+            compatibility: "append-only JSONL plus per-execution JSON; additive fields only in v1, including threadHealthStatus and effective model-context capacity source/freshness/observation fields; the 120k guard is an unknown/stale-capacity failsafe",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.codex-resume-settle.v1",
+            owner_module: "codex_runtime",
+            compatibility: "append-only JSONL; additive observations and statuses only in v1; exact lane digest, thread id, and backend generation remain immutable correlation axes",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.compact-attempt.v1",
+            owner_module: "codex_runtime/context_rollover",
+            compatibility: "append-only lifecycle snapshots; planned, rpc-acknowledged, compact-item-started, compacted, failed, and ambiguous states are stable; additive observations only in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.codex-goal-projection.v1",
+            owner_module: "codex_runtime/context_rollover",
+            compatibility: "append-only exact-source-thread goal projection; objective/status/token budget, completion criteria/checksums, stable goal reference, optional backend goal/turn references, observation order, and complete/incomplete classification are immutable in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.codex-goal-rehydration.v1",
+            owner_module: "codex_runtime/context_rollover",
+            compatibility: "append-only lifecycle snapshots; replacement thread/generation, projection/checkpoint checksums, echoed goal checksum/status, and verified gate are stable in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.working-set-memory.v2",
+            owner_module: "context_rollover/virtual_session_context",
+            compatibility: "exact ChannelStateLane metadata is required; additive bounded working-set fields only in v2; legacy v1 is migration input, not write authority",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.working-set-session-index.v2",
+            owner_module: "context_rollover/virtual_session_context",
+            compatibility: "exact platform/account/channel/user/agent/session identity is immutable; additive index metadata only in v2",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.virtual-session.v2",
+            owner_module: "context_rollover/virtual_session_context",
+            compatibility: "exact account-aware lane identity, root/concrete sessions, and monotonic continuation state are immutable; additive lifecycle metadata only in v2",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.virtual-session-authority.v1",
+            owner_module: "runtime_pipeline/context_rollover",
+            compatibility: "append-only production projection; full-lane digest, virtual/concrete session, working-set file, and backend generation binding are immutable in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.goal-lineage.v1",
+            owner_module: "goal_lineage",
+            compatibility: "read-only derived projection; campaign family, exact lane, virtual session, backend generation, thread/turn, checksums, observation order, and disposition are immutable identity axes in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.goal-lineage-doctor.v1",
+            owner_module: "goal_lineage/agent-harness-cli",
+            compatibility: "read-only report; additive findings and counters only in v1; doctor execution never writes receipts or repairs source rows",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.goal-lineage-supersession.v1",
+            owner_module: "goal_lineage",
+            compatibility: "append-only reviewed reconciliation; winner/loser/campaign/exact-lane/virtual-session identity is immutable and source goal rows are never deleted",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.goal-transition.v1",
+            owner_module: "goal_transition/runtime_pipeline",
+            compatibility: "append-only unified decision receipt; exact goal/lane/session/generation/source-slice identity and decision generation are immutable in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.goal-slice.v1",
+            owner_module: "goal_transition/runtime_pipeline",
+            compatibility: "logical campaign-slice identity; campaign slice generation remains independent from context recovery continuation depth",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.goal-continuation-intent.v1",
+            owner_module: "goal_continuation/runtime_pipeline",
+            compatibility: "append-only commit/enqueue/ack lifecycle; deterministic intent key and exact authority axes are immutable, and one intent owns at most one child",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.goal-terminal-outbox.v1",
+            owner_module: "runtime_pipeline",
+            compatibility: "append-only commit/append lifecycle; deterministic terminal key, delivery identity, exact campaign authority, and canonical outbound message are immutable in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.goal-campaign-budget.v1",
+            owner_module: "goal_budget/runtime_pipeline",
+            compatibility: "append-only per-slice campaign budget receipt; exact campaign authority, source slice, effective policy, cumulative counters, progress fingerprint, and boundary are immutable in v1",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.goal-campaign-status.v1",
+            owner_module: "goal_budget/agent-harness-cli",
+            compatibility: "read-only effective-policy and latest-per-campaign status report; additive report fields only in v1",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.codex-context-checkpoint.v1",
@@ -536,6 +716,76 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
             schema: "agent-harness.skill-selection.v1",
             owner_module: "skills",
             compatibility: "append-only selection receipts; matcherVersion=v4/tokenizer=mixed-v1 records lifecycle/invocation filtering, structured lexical-anchor policy, and deterministic original-id deduplication while additive skill catalog fields remain v1-compatible",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.virtual-skill-manifest.v1",
+            owner_module: "virtual_skill_manifest",
+            compatibility: "versioned state artifact; v1 freezes catalog/topology/skill revisions per exact-lane virtualSessionId and treats /new as a terminal boundary",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-routing.v2",
+            owner_module: "skill_router/skill_shadow_runtime",
+            compatibility: "idempotent privacy-safe routing receipts; v2 separates current task, bounded virtual intent, exclusions, normalized candidates, abstention, active-serving comparison ids, and shadow disclosure decisions without prompt delivery",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-delivery.v2",
+            owner_module: "prompt/virtual_skill_manifest",
+            compatibility: "append-only delivery receipts; v2 distinguishes first-load, rehydration, explicit, reference, and none under an exact backend generation",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-outcome.v1",
+            owner_module: "skill_episode",
+            compatibility: "append-only outcome receipts; verified statuses require bounded verifier references and remain separate from selection exposure",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-episode.v2",
+            owner_module: "skill_episode",
+            compatibility: "append-only exact-lane episode joins; v2 distinguishes selected-only, card, full-body, reference, and rehydration evidence without treating exposure as verified use",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-terminal-review.v1",
+            owner_module: "skill_episode",
+            compatibility: "append-once terminal review receipts; the exact virtual session and terminal source determine one idempotent review key",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-learning.v2",
+            owner_module: "skill_learning/skill_episode",
+            compatibility: "append-only proposal and activation receipts; v2 requires episode, delivery, outcome, checksum, replay, and rollback linkage",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.knowledge-classification.v1",
+            owner_module: "knowledge_classifier",
+            compatibility: "append-only classification receipts; exactly one canonical disposition is recorded and ambiguous cases defer",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-improvement-target.v1",
+            owner_module: "skill_improvement",
+            compatibility: "deterministic attribution receipt; selected-only exposure cannot become a blame target and ambiguous candidates abstain",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-improvement-proposal.v1",
+            owner_module: "skill_improvement",
+            compatibility: "append-only checksummed proposal; base checksum, semantic patch or synthesis body, rollback content, evidence joins, and non-applied state are immutable",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-dream-run.v1",
+            owner_module: "skill_dream",
+            compatibility: "append-only run receipts; reports are non-indexable, proposal-only runs cannot activate revisions, and trigger sources share one idempotent ledger",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-replay-manifest.v1",
+            owner_module: "skill_replay",
+            compatibility: "immutable named corpus manifest; fixture paths stay relative, SHA-256 checksums are mandatory, case-count drift fails closed, and every required evaluation class has a non-empty owner",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-replay-case.v1",
+            owner_module: "skill_replay",
+            compatibility: "privacy-classified labeled fixture; high-risk cases require two reviewers, private-local cases require an explicit private load mode, and only reviewed routing labels enter precision denominators",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.skill-replay-baseline.v1",
+            owner_module: "skill_replay",
+            compatibility: "immutable named metrics snapshot bound to one corpus manifest checksum and policy revision; additive metric facets only in v1",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.prompt-injection-ledger.v2",
@@ -944,6 +1194,47 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
             promotion_gate: "Run the complete skill-selection regression selector and inspect the selected-skill ledger for one active copy, no body-only false positives, and preserved explicit invocation.",
         },
         ScenarioMatrixEntry {
+            id: "skill-ecosystem-virtual-evidence",
+            title: "Skill ecosystem exact-lane virtual evidence",
+            changed_areas: vec![
+                "skill shadow runtime",
+                "virtual skill manifest",
+                "runtime worker",
+                "runtime pipeline",
+                "context rollover",
+                "skill episode",
+                "knowledge classifier",
+                "skill improvement",
+            ],
+            required_invariants: vec!["I8", "I20", "I28"],
+            required_evidence: vec![
+                "F1 shadow routing changes no active selection or model-facing prompt byte and creates no manifest, delivery, usage, or proposal evidence",
+                "F2 observation is independently activated and appends a frozen exact-lane manifest plus deterministic delivery receipts without changing serving bytes",
+                "concrete backend rollover rehydrates the frozen revision without a fresh routing link or positive-use event",
+                "/new closes the old manifest and inherits no task intent or active skill state",
+                "runtime completion joins delivery, unknown-until-verified outcome, episode, and one terminal review under the same exact virtual session",
+                "excluded, ambiguous, contradictory, and duplicate knowledge receives one deterministic non-mutating disposition",
+                "target attribution cannot blame selected-only exposure and every proposal is checksummed, reversible, reviewable, and unapplied",
+            ],
+            runnable_tests: vec![
+                "runtime_worker::tests::skill_router_v2_shadow_runtime_receipt_has_zero_serving_side_effect",
+                "runtime_worker::tests::virtual_skill_manifest_observer_records_delivery_without_serving_side_effect",
+                "virtual_skill_manifest::tests::runtime_observer_rehydrates_across_concrete_rollover_without_new_route_link",
+                "virtual_skill_manifest::tests::runtime_observer_new_virtual_session_inherits_no_skill_state",
+                "lane::tests::virtual_identity_hash_is_exact_but_stable_across_concrete_rollover",
+                "channel_state::tests::new_session_command_closes_previous_virtual_session_record",
+                "skill_episode::tests::runtime_capture_persists_joined_evidence_and_terminal_review_once",
+                "knowledge_classifier::tests::deterministic_exclusions_never_become_skill_proposals",
+                "knowledge_classifier::tests::ambiguity_and_contradiction_defer_to_one_disposition",
+                "skill_improvement::tests::target_attribution_never_blames_first_selected_only_skill",
+                "skill_improvement::tests::semantic_patch_is_checksummed_reversible_and_proposal_only",
+                "skill_improvement::tests::synthesis_requires_two_verified_episodes_and_uses_cjk_safe_name",
+                "runtime_pipeline::tests::run_runtime_queue_once_records_agent_reply_outbox",
+                "virtual_skill_manifest::tests::t3_skill_virtual_evidence_replay_is_exact_idempotent_and_proposal_only",
+            ],
+            promotion_gate: "Keep F1 and F2 disabled independently by default. Promote instrumentation only after this pack plus an integrated exact-lane multi-rollover and /new T3 replay prove byte-identical serving, append-once joins, zero rehydration use, and proposal-only learning; serving/catalog activation remains separate.",
+        },
+        ScenarioMatrixEntry {
             id: "progress-surface-volume",
             title: "Progress final surface and delivery volume",
             changed_areas: vec![
@@ -1109,6 +1400,36 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "codex_runtime::backend_reasoning_wire_tests::turn_start_effort_is_exact_and_runtime_kill_switch_is_fail_closed",
             ],
             promotion_gate: "Promote only after a current Codex capability probe authorizes the selected GPT-5.6 route, exact max survives command-to-wire verification, both aliases remain identical, and Ultra is absent from the supported effort surface and live configuration.",
+        },
+        ScenarioMatrixEntry {
+            id: "codex-web-search-policy",
+            title: "Codex built-in web-search capability, intent, and privacy boundary",
+            changed_areas: vec![
+                "Codex runtime",
+                "provider capability",
+                "exact-lane policy",
+                "memory and skill admission",
+            ],
+            required_invariants: vec!["I8", "I11", "I31", "I38"],
+            required_evidence: vec![
+                "ordinary turns explicitly send cached independent of sandbox mode",
+                "explicit freshness intent sends live only when lane policy and provider capability allow it",
+                "sensitive, offline, and replay turns force disabled",
+                "capability absence forces disabled and injects a limitation that forbids false online-verification claims",
+                "mode/provider/lane changes roll over while matching bindings resume",
+                "action receipts retain exact ids and query digests without raw queries or private URLs",
+            ],
+            runnable_tests: vec![
+                "codex_web_search::tests::classifier_is_explicit_and_sensitive_offline_replay_win",
+                "codex_web_search::tests::capability_absence_degrades_explicitly_without_sandbox_input",
+                "codex_web_search::tests::action_receipt_hashes_query_and_omits_private_url",
+                "codex_runtime::tests::run_codex_runtime_drives_fake_app_server_and_records_outputs",
+                "codex_runtime::tests::web_search_live_mode_and_redacted_action_receipt_cross_app_server_boundary",
+                "codex_runtime::tests::web_search_capability_absent_forces_disabled_and_limitation_notice",
+                "codex_runtime::tests::run_codex_runtime_resumes_existing_thread_binding",
+                "codex_runtime::tests::run_codex_runtime_rolls_over_legacy_thread_without_web_search_binding",
+            ],
+            promotion_gate: "Promote only after a 0.144.5 same-connection modelProvider/capabilities/read probe and cached/live/disabled/capability-absent/restart replay pass, receipt scans contain no raw prompt/query/private URL leakage, and built-in live search remains disabled for lanes that require hard pre-query allowlists or exact query caps.",
         },
         ScenarioMatrixEntry {
             id: "per-agent-prompt-manifest",
@@ -1402,7 +1723,10 @@ pub fn release_checklist() -> ReleaseChecklist {
             "scenario matrix gate reviewed for changed components",
             "CHANGELOG.md updated",
             "docs/skills/help stale guidance review completed",
-            "skill ecosystem changes passed per-agent source/allowlist/usage-prior isolation, selection, autonomous synthesis/apply, lint, guard, lifecycle, pack, doctor, and closed-loop scenario gates",
+            "skill ecosystem changes passed per-agent source/allowlist/usage-prior isolation, selection, proposal-only synthesis with zero mutation, separately authorized apply, lint, guard, lifecycle, pack, doctor, and closed-loop scenario gates",
+            "skill ecosystem v2 C1 joined schemas, privacy-safe baseline, query isolation, separate F1/F2 no-serving-side-effect gates, exact-lane rollover/new T3 replay, and feature-disable rollback passed while active serving remains unchanged",
+            "skill ecosystem v2 C2 router quality, progressive-disclosure budgets, frozen manifest, unknown-until-verified attributable episode/classification/proposal evidence, exact-cohort canary, policy rollback, rebaseline inventory, held-out replay, topology downgrade, and snapshot restore passed",
+            "unattended skill dream remains proposal-only and blocked until trigger equivalence, source exclusions, lease/heartbeat, foreground yield, no-change skip, artifact validation, report isolation, T3 replay, and controlled T4 staging shadow soak pass",
             "topology contract impact matrix reviewed for changed modules",
             "channel/runtime changes passed the agent-boundary scenario matrix",
             "runtime terminal-control changes passed sticky terminal, suppression idempotency, final progress surface silence, lease reconcile, prepared-terminalization, retry-fresh-id, and live ghost-queue replay checks",
@@ -1708,12 +2032,55 @@ mod tests {
     }
 
     #[test]
+    fn quality_catalogs_register_skill_virtual_evidence_contracts() {
+        let schemas = schema_registry_entries()
+            .into_iter()
+            .map(|entry| entry.schema)
+            .collect::<std::collections::HashSet<_>>();
+        for schema in [
+            "agent-harness.virtual-skill-manifest.v1",
+            "agent-harness.skill-routing.v2",
+            "agent-harness.skill-delivery.v2",
+            "agent-harness.skill-outcome.v1",
+            "agent-harness.skill-episode.v2",
+            "agent-harness.skill-terminal-review.v1",
+            "agent-harness.knowledge-classification.v1",
+            "agent-harness.skill-improvement-target.v1",
+            "agent-harness.skill-improvement-proposal.v1",
+        ] {
+            assert!(schemas.contains(schema), "missing skill schema {schema}");
+        }
+
+        let scenarios = scenario_matrix_catalog();
+        let skill = scenarios
+            .iter()
+            .find(|entry| entry.id == "skill-ecosystem-virtual-evidence")
+            .expect("skill virtual evidence scenario");
+        assert!(skill.required_invariants.contains(&"I28"));
+        assert!(skill.runnable_tests.contains(
+            &"runtime_worker::tests::skill_router_v2_shadow_runtime_receipt_has_zero_serving_side_effect"
+        ));
+        assert!(skill.runnable_tests.contains(
+            &"runtime_worker::tests::virtual_skill_manifest_observer_records_delivery_without_serving_side_effect"
+        ));
+        assert!(skill.runnable_tests.contains(
+            &"skill_episode::tests::runtime_capture_persists_joined_evidence_and_terminal_review_once"
+        ));
+        assert!(skill.runnable_tests.contains(
+            &"virtual_skill_manifest::tests::t3_skill_virtual_evidence_replay_is_exact_idempotent_and_proposal_only"
+        ));
+        assert!(skill.promotion_gate.contains("multi-rollover"));
+    }
+
+    #[test]
     fn quality_catalogs_register_gpt56_prompt_and_coordination_contracts() {
         let invariant_ids = invariant_catalog()
             .into_iter()
             .map(|entry| entry.id)
             .collect::<std::collections::HashSet<_>>();
-        for invariant in ["I21", "I22", "I23", "I24", "I25", "I26", "I27"] {
+        for invariant in [
+            "I21", "I22", "I23", "I24", "I25", "I26", "I27", "I37", "I38",
+        ] {
             assert!(
                 invariant_ids.contains(invariant),
                 "missing orchestration invariant {invariant}"
@@ -1737,6 +2104,15 @@ mod tests {
             "agent-harness.safe-resume-readiness.v1",
             "agent-harness.ledger-maintenance.v1",
             "agent-harness.progress-delivery-plan.v1",
+            "agent-harness.goal-transition.v1",
+            "agent-harness.goal-slice.v1",
+            "agent-harness.goal-continuation-intent.v1",
+            "agent-harness.goal-terminal-outbox.v1",
+            "agent-harness.goal-campaign-budget.v1",
+            "agent-harness.goal-campaign-status.v1",
+            "agent-harness.codex-web-search-decision.v1",
+            "agent-harness.codex-web-search-thread-binding.v1",
+            "agent-harness.codex-web-search-action.v1",
         ] {
             assert!(
                 schemas.contains(schema),

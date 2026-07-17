@@ -23,7 +23,8 @@ use agent_harness_core::{
     AgentProgressDeliveryPending, AgentProgressDeliveryPlanOptions,
     AgentProgressDeliveryRecordContext, AgentProgressDeliveryRecordOptions,
     AgentProgressDeliveryStatus, AgentRegistry, AgentSource, ArtifactExtractionSummary,
-    AssistantNarrationMode, BackgroundTaskListOptions, BackgroundTaskRecord,
+    AssistantNarrationMode, BackendAccountProbeOptions, BackendAuthCliAction,
+    BackendAuthCliOperationOptions, BackgroundTaskListOptions, BackgroundTaskRecord,
     BackgroundTaskUpsertOptions, BudgetAcquireOptions, BuiltinHarnessSkillSyncOptions,
     BuiltinHarnessSkillSyncReport, ChannelCommand, ChannelCommandApplyOptions,
     ChannelCommandApplyReport, ChannelDeliveryIntentKind,
@@ -33,14 +34,15 @@ use agent_harness_core::{
     ChannelIdentityLookup, ChannelIdentityResolutionStatus, ChannelOutboundAttachment,
     ChannelOutboundAttachmentKind, ChannelOutboundMessage, ChannelOutboundMessageKind,
     ChannelOutboxPlanOptions, ChannelOutboxPlanReport, ChannelReceiveOptions, ChannelReceiveReport,
-    ChannelRunOnceOptions, ChannelRunOnceReport, ChannelStep, CodexRuntimeCompletionOptions,
-    CodexRuntimeCompletionReport, CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReport,
-    CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimePreflightOptions,
-    CodexRuntimePreflightReport, CodexRuntimeRunOptions, CodexRuntimeRunReport, ConflictPolicy,
-    ContextPackParseOptions, ContextRolloverRequeuePreparedOptions,
-    ControlledCoordinatorSmokeChildV1, ControlledCoordinatorSmokeLaneV1,
-    ControlledCoordinatorSmokeOptionsV1, CreateOperationPlanOptions, CreateOperationPlanOptionsV2,
-    CronRunControlAction, CronRunControlOptions, CronRunListOptions, CronSchedulerLintStatus,
+    ChannelRunOnceOptions, ChannelRunOnceReport, ChannelStep, CodexBackendProvenanceProbeOptions,
+    CodexRuntimeCompletionOptions, CodexRuntimeCompletionReport, CodexRuntimeLaunchProbeOptions,
+    CodexRuntimeLaunchProbeReport, CodexRuntimePlanOptions, CodexRuntimePlanReport,
+    CodexRuntimePreflightOptions, CodexRuntimePreflightReport, CodexRuntimeRunOptions,
+    CodexRuntimeRunReport, ConflictPolicy, ContextPackParseOptions,
+    ContextRolloverRequeuePreparedOptions, ControlledCoordinatorSmokeChildV1,
+    ControlledCoordinatorSmokeLaneV1, ControlledCoordinatorSmokeOptionsV1,
+    CreateOperationPlanOptions, CreateOperationPlanOptionsV2, CronRunControlAction,
+    CronRunControlOptions, CronRunListOptions, CronSchedulerLintStatus,
     CronSchedulerRunOnceOptions, CronSchedulerTickStatus, DEFAULT_DREAM_DIRECTOR_MAX_CHARS,
     DEFAULT_DREAM_DIRECTOR_SOURCE_MAX_AGE_HOURS, DEFAULT_INBOUND_MEDIA_MAX_BYTES_PER_ITEM,
     DEFAULT_MEMORY_BACKFILL_BATCH_SIZE, DEFAULT_MEMORY_BACKFILL_COVERAGE_THRESHOLD_BPS,
@@ -48,18 +50,19 @@ use agent_harness_core::{
     DEFAULT_MEMORY_BACKFILL_RETRY_CAP, DEFAULT_MEMORY_BACKFILL_VECTOR_DIMENSION,
     DEFAULT_MEMORY_OWNER_HEARTBEAT_MAX_AGE_MS, DeterministicCronPlan, DeterministicCronPlanInput,
     DeterministicCronWorkerEnqueueOptions, DreamDirectorSendOptions, DriftCheckOptions,
-    DryRunImportOptions, ExecuteImportOptions, HarnessLogEvent, HarnessLogLevel,
-    HarnessLogRotationOptions, HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport,
-    HealthzOptions, ImportPhaseStatus, ImportReport, InboundMediaArtifact,
-    InboundMediaDownloadStatus, InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant,
-    LearningProposalOptions, LedgerMaintenanceRunOptions, LiveControlAction, McpRequestOptions,
-    MemoryCanvasWorkerOptions, MemoryCanvasWorkerReport, MemoryCanvasWorkerStatus,
-    MemoryCredentialsExportOptions, MemoryCredentialsExportReport, MemoryEmbeddingBackfillLane,
-    MemoryEmbeddingBackfillOptions, MemoryEmbeddingBackfillReport, MemoryHookAdapterOptions,
-    MemoryHookKind, MemoryOwnerEndpointProbeOptions, MemoryOwnerEnsureOptions,
-    MemoryOwnerHeartbeatOptions, MemoryOwnerPromotionOptions, MemoryOwnerRecoveryOptions,
-    MemoryOwnerShadowKind, MemoryOwnerShadowOptions, MemoryOwnerTrustScopeOptions,
-    MemorySearchOptions, MemorySearchReport, MemoryVectorRecallOptions, MemoryVectorRecallReport,
+    DryRunImportOptions, ExecuteImportOptions, GoalLineageDoctorOptions, GoalLineageDoctorStatus,
+    GoalLineageSupersessionOptions, HarnessLogEvent, HarnessLogLevel, HarnessLogRotationOptions,
+    HarnessMetricsOptions, HarnessStatusOptions, HarnessStatusReport, HealthzOptions,
+    ImportPhaseStatus, ImportReport, InboundMediaArtifact, InboundMediaDownloadStatus,
+    InboundMediaModelAttachmentStatus, InboundMediaSelectedVariant, LearningProposalOptions,
+    LedgerMaintenanceRunOptions, LiveControlAction, McpRequestOptions, MemoryCanvasWorkerOptions,
+    MemoryCanvasWorkerReport, MemoryCanvasWorkerStatus, MemoryCredentialsExportOptions,
+    MemoryCredentialsExportReport, MemoryEmbeddingBackfillLane, MemoryEmbeddingBackfillOptions,
+    MemoryEmbeddingBackfillReport, MemoryHookAdapterOptions, MemoryHookKind,
+    MemoryOwnerEndpointProbeOptions, MemoryOwnerEnsureOptions, MemoryOwnerHeartbeatOptions,
+    MemoryOwnerPromotionOptions, MemoryOwnerRecoveryOptions, MemoryOwnerShadowKind,
+    MemoryOwnerShadowOptions, MemoryOwnerTrustScopeOptions, MemorySearchOptions,
+    MemorySearchReport, MemoryVectorRecallOptions, MemoryVectorRecallReport,
     MemoryVectorRecallStatus, NativeCronPlan, NativeCronPlanInput, NativeCronWorkerEnqueueOptions,
     OpenClawMemLocalOwnerPrepareOptions, OpenClawMemReadPathSmokeOptions,
     OpenClawMemServiceProposeOptions, OpenClawMemServiceRecallOptions, OpenClawMemServiceStatus,
@@ -93,32 +96,35 @@ use agent_harness_core::{
     WindowsSupervisorPlanOptions, WindowsSupervisorPlanReport, WorkerCancelOptions,
     WorkerEnqueueOptions, WorkerEnqueueReport, WorkerJobKind, WorkerReapStaleOptions,
     WorkerRunOnceOptions, WorkerRunOnceReport, WorkerRunOnceStatus, WorkerStatusOptions,
-    acquire_budget, add_operation_plan_item, append_channel_outbox_message, append_harness_log,
-    append_jsonl_value, apply_channel_command_step, apply_skill_proposal, assemble_prompt_bundle,
+    acquire_budget, add_operation_plan_item, append_channel_outbox_message,
+    append_goal_lineage_supersession, append_harness_log, append_jsonl_value,
+    apply_channel_command_step, apply_skill_proposal, assemble_prompt_bundle,
     autonomous_apply_skill_proposal, block_operation_plan, build_channel_step,
     build_dry_run_report, build_harness_skill_index, build_import_plan, build_runtime_skill_index,
     build_source_skill_index, build_turn_plan, cancel_worker_job, check_activation_readiness,
     check_config_drift, check_tool_description_pin, collect_gateway_restart_status,
-    collect_harness_metrics, collect_harness_status, collect_healthz,
+    collect_goal_campaign_status, collect_harness_metrics, collect_harness_status, collect_healthz,
     collect_inbound_media_cache_report, collect_ops_cutover_status, collect_token_efficiency,
     collect_worker_status, comment_on_operation_plan, compact_runtime_queue_receipts_if_needed,
     compare_channel_turn_shadow, complete_operation_plan, control_cron_run,
     control_runtime_queue_item, create_learning_proposal, create_operation_plan,
     create_operation_plan_v2, create_ops_backup, create_skill_archive_proposal,
     create_skill_learning_proposal, current_log_time_ms, default_supervisor_child_specs,
-    delegate_operation_plan_item, enqueue_channel_step, enqueue_controlled_coordinator_smoke,
-    enqueue_deterministic_cron_workers, enqueue_native_cron_workers, enqueue_subagent_workers,
-    enqueue_worker_job, ensure_memory_owner_state, evaluate_admission, evaluate_prompt_reduction,
+    delegate_operation_plan_item, doctor_backend_auth, enqueue_channel_step,
+    enqueue_controlled_coordinator_smoke, enqueue_deterministic_cron_workers,
+    enqueue_native_cron_workers, enqueue_subagent_workers, enqueue_worker_job,
+    ensure_memory_owner_state, evaluate_admission, evaluate_prompt_reduction,
     evaluate_supervisor_children, execute_import, export_harness_registry_files,
     export_memory_credentials, export_skill_pack, get_vault_secret, handle_mcp_request,
     import_skill_pack, inspect_openclaw_mem_service, inspect_runtime_queue_capacity,
     invariant_catalog, inventory, latest_agent_progress_event_identity_for_queue,
     lint_cron_scheduler, lint_skill_file, list_background_tasks, list_cron_runs,
-    list_operation_plans, list_skill_proposals, load_agent_registry, load_deterministic_cron_store,
-    load_native_cron_store, load_subagent_ledger, parse_channel_command, parse_context_pack,
-    plan_agent_progress_delivery, plan_channel_outbox, plan_codex_runtime, plan_deterministic_cron,
-    plan_native_cron, plan_subagents, preflight_codex_runtime, prepare_openclaw_mem_local_owner,
-    prepare_runtime_queue_item, probe_codex_runtime_launch,
+    list_operation_plans, list_skill_proposals, load_agent_registry, load_backend_auth_state,
+    load_deterministic_cron_store, load_native_cron_store, load_subagent_ledger,
+    parse_channel_command, parse_context_pack, plan_agent_progress_delivery, plan_channel_outbox,
+    plan_codex_runtime, plan_deterministic_cron, plan_native_cron, plan_subagents,
+    preflight_codex_runtime, prepare_openclaw_mem_local_owner, prepare_runtime_queue_item,
+    probe_backend_account, probe_codex_backend_provenance, probe_codex_runtime_launch,
     promote_operation_plan_items_from_dependencies, propose_openclaw_mem_service_memory,
     put_vault_secret, reap_stale_worker_jobs, recall_openclaw_mem_service, receive_channel_message,
     reconcile_supervisor_inventory, record_agent_progress_delivery_with_context,
@@ -130,23 +136,26 @@ use agent_harness_core::{
     record_scoped_stop, record_subagent_lifecycle, record_supervise_deploy_canary,
     recover_memory_owner_state, reject_skill_proposal, release_agent_progress_surface_claim,
     release_checklist, remove_skill_pack, render_rich_presentation_batch_for_discord,
-    render_rich_presentation_batch_for_telegram, request_memory_owner_promotion,
-    requeue_prepared_context_rollover, resolve_channel_identity,
-    resolve_runtime_queue_typing_context_nonblocking, resolve_virtual_session_working_context,
-    restore_skill_from_archive, rotate_harness_log_if_needed, run_channel_once, run_codex_runtime,
-    run_cron_scheduler_once, run_dream_director_send,
+    render_rich_presentation_batch_for_telegram, request_backend_auth_cancel,
+    request_memory_owner_promotion, requeue_prepared_context_rollover, resolve_channel_identity,
+    resolve_or_create_provider_codex_home, resolve_runtime_queue_typing_context_nonblocking,
+    resolve_virtual_session_working_context, restore_skill_from_archive,
+    rotate_harness_log_if_needed, run_backend_auth_cli_operation, run_channel_once,
+    run_codex_runtime, run_cron_scheduler_once, run_dream_director_send, run_goal_lineage_doctor,
     run_ledger_maintenance_once as run_ledger_maintenance_once_core, run_memory_canvas_worker,
     run_memory_embedding_backfill, run_memory_hook_adapter, run_openclaw_mem_read_path_smoke,
     run_public_hygiene, run_runtime_queue_once, run_skill_doctor, run_skill_guard,
     run_skill_lifecycle_curator, run_worker_once,
-    runtime_worker::reconcile_runtime_queue_leases_for_generation, scan_security_boundaries,
-    scenario_matrix_catalog, schema_registry_entries, search_imported_memory,
-    search_imported_vector_memory, select_skills, set_skill_pin, show_operation_plan,
-    show_subagent_lifecycle, skill_curator_receipts_dir, store_openclaw_mem_service_memory,
-    subagent_lifecycle_receipts_file, subagent_lifecycle_snapshot_file,
-    sync_builtin_harness_skills, synthesize_skill, tool_description_hash, trace_harness_event,
-    update_operation_plan_item, upsert_background_task, validate_harness_config, view_skill,
-    write_channel_step, write_deterministic_cron_plan, write_json_atomic,
+    runtime_worker::reconcile_runtime_queue_leases_for_generation,
+    scan_security_boundaries, scenario_matrix_catalog, schema_registry_entries,
+    search_imported_memory, search_imported_vector_memory, select_skills, set_skill_pin,
+    show_operation_plan, show_subagent_lifecycle, skill_curator_receipts_dir,
+    skill_replay::{load_skill_replay_corpus, report_current_policy_baseline},
+    store_openclaw_mem_service_memory, subagent_lifecycle_receipts_file,
+    subagent_lifecycle_snapshot_file, sync_builtin_harness_skills, synthesize_skill,
+    tool_description_hash, trace_harness_event, update_operation_plan_item, upsert_background_task,
+    validate_harness_config, view_skill, write_channel_step,
+    write_codex_backend_provenance_receipt, write_deterministic_cron_plan, write_json_atomic,
     write_memory_search_receipt, write_memory_vector_recall_receipt, write_native_cron_plan,
     write_prompt_bundle, write_report_files, write_skill_index, write_subagent_plan,
     write_task_entity, write_turn_plan, write_windows_supervisor_plan,
@@ -208,8 +217,12 @@ fn main() {
         "tool-description-hash" => run_tool_description_hash(&rest),
         "tool-pin-check" => run_tool_pin_check(&rest),
         "invariants" => run_invariants(&rest),
+        "goal-lineage-doctor" => run_goal_lineage_doctor_cli(&rest),
+        "goal-lineage-supersede" => run_goal_lineage_supersede_cli(&rest),
+        "goal-campaign-status" => run_goal_campaign_status_cli(&rest),
         "scenario-matrix" => run_scenario_matrix(&rest),
         "schema-registry" => run_schema_registry(&rest),
+        "skill-replay-baseline" => run_skill_replay_baseline(&rest),
         "release-checklist" => run_release_checklist(&rest),
         "public-hygiene" => run_public_hygiene_cli(&rest),
         "jsonl-repair" => run_jsonl_repair(&rest),
@@ -301,6 +314,8 @@ fn main() {
         "worker-reap-stale" => run_worker_reap_stale(&rest),
         "codex-plan" => run_codex_plan(&rest),
         "codex-preflight" => run_codex_preflight(&rest),
+        "backend-auth" => run_backend_auth(&rest),
+        "codex-backend-provenance" => run_codex_backend_provenance(&rest),
         "codex-launch-probe" => run_codex_launch_probe(&rest),
         "codex-run" => run_codex_run(&rest),
         "codex-complete" => run_codex_complete(&rest),
@@ -1626,6 +1641,21 @@ fn run_schema_registry(args: &[String]) -> Result<(), String> {
     print_json(&schema_registry_entries())
 }
 
+fn run_skill_replay_baseline(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(
+        args,
+        "skill-replay-baseline",
+        &["--manifest", "--baseline-id", "--policy-revision"],
+        &["--allow-private-local"],
+    )?;
+    let manifest = PathBuf::from(options.required("--manifest")?);
+    let corpus = load_skill_replay_corpus(&manifest, options.has_flag("--allow-private-local"))?;
+    let baseline_id = options.required("--baseline-id")?;
+    let policy_revision = options.required("--policy-revision")?;
+    let baseline = report_current_policy_baseline(&corpus, &baseline_id, &policy_revision)?;
+    print_json(&baseline)
+}
+
 fn run_release_checklist(args: &[String]) -> Result<(), String> {
     SimpleOptions::parse(args, "release-checklist", &[], &[])?;
     print_json(&release_checklist())
@@ -2363,6 +2393,7 @@ fn run_skills(args: &[String]) -> Result<(), String> {
             &index,
             &SkillSelectionQuery {
                 text: query,
+                include_context_tokens: true,
                 agent_id: args.agent_id,
                 channel: args.channel,
                 workspace: args.match_workspace,
@@ -2458,7 +2489,7 @@ fn run_skill_synthesize(args: &[String]) -> Result<(), String> {
     let mut skill_id: Option<String> = None;
     let mut task_summary: Option<String> = None;
     let mut evidence = String::new();
-    let mut propose_only = false;
+    let mut propose_only = true;
     let mut index = 0usize;
     while index < args.len() {
         match args[index].as_str() {
@@ -2486,9 +2517,12 @@ fn run_skill_synthesize(args: &[String]) -> Result<(), String> {
             "--propose-only" => {
                 propose_only = true;
             }
+            "--apply" => {
+                propose_only = false;
+            }
             "--help" | "-h" => {
                 println!(
-                    "Usage: agent-harness skill-synthesize --skill <id> --summary <text> [--evidence <text>|--evidence-file <path>] [--propose-only] [--harness-home <path>]"
+                    "Usage: agent-harness skill-synthesize --skill <id> --summary <text> [--evidence <text>|--evidence-file <path>] [--propose-only|--apply] [--harness-home <path>]\nDefault: proposal-only. --apply is an explicit operator mutation request."
                 );
                 return Ok(());
             }
@@ -2562,6 +2596,61 @@ fn run_skill_doctor_cli(args: &[String]) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn run_goal_lineage_doctor_cli(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(
+        args,
+        "goal-lineage-doctor",
+        &["--lane-digest", "--virtual-session-id"],
+        &[],
+    )?;
+    let lane_digest = options.optional("--lane-digest").map(ToString::to_string);
+    let virtual_session_id = options
+        .optional("--virtual-session-id")
+        .map(ToString::to_string);
+    let report = run_goal_lineage_doctor(GoalLineageDoctorOptions {
+        harness_home: options.target_home,
+        lane_digest,
+        virtual_session_id,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&report)?;
+    if matches!(
+        report.status,
+        GoalLineageDoctorStatus::Blocked | GoalLineageDoctorStatus::ReconciliationRequired
+    ) {
+        Err("goal-lineage-doctor found unresolved or unsafe active goal rows".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn run_goal_campaign_status_cli(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(args, "goal-campaign-status", &[], &[])?;
+    let report =
+        collect_goal_campaign_status(options.target_home).map_err(|err| err.to_string())?;
+    print_json(&report)
+}
+
+fn run_goal_lineage_supersede_cli(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(
+        args,
+        "goal-lineage-supersede",
+        &["--winner", "--superseded", "--reason"],
+        &[],
+    )?;
+    let winner_lineage_id = options.required("--winner")?;
+    let superseded_lineage_id = options.required("--superseded")?;
+    let reason = options.required("--reason")?;
+    let receipt = append_goal_lineage_supersession(GoalLineageSupersessionOptions {
+        harness_home: options.target_home,
+        winner_lineage_id,
+        superseded_lineage_id,
+        reason,
+    })
+    .map_err(|err| err.to_string())?;
+    print_json(&receipt)
 }
 
 fn run_skill_lint(args: &[String]) -> Result<(), String> {
@@ -8172,6 +8261,167 @@ fn run_codex_launch_probe(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn run_codex_backend_provenance(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(
+        args,
+        "codex-backend-provenance",
+        &[
+            "--codex-exe",
+            "--owned-root",
+            "--expected-sha256",
+            "--candidate-id",
+            "--phase",
+            "--codex-home",
+            "--config-digest",
+            "--parent-supervisor-id",
+            "--parent-started-at-ms",
+            "--child-pid",
+            "--child-started-at-ms",
+            "--receipt-dir",
+        ],
+        &[],
+    )?;
+    let owned_roots = options
+        .values("--owned-root")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if owned_roots.is_empty() {
+        return Err("--owned-root is required at least once".to_string());
+    }
+    let child_pid = options
+        .optional("--child-pid")
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .map_err(|_| "--child-pid must be an unsigned 32-bit integer".to_string())
+        })
+        .transpose()?;
+    let receipt = probe_codex_backend_provenance(CodexBackendProvenanceProbeOptions {
+        configured_path: PathBuf::from(options.required("--codex-exe")?),
+        deployment_owned_roots: owned_roots,
+        expected_executable_sha256: options
+            .optional("--expected-sha256")
+            .map(ToString::to_string),
+        candidate_id: options.required("--candidate-id")?,
+        phase: options.required("--phase")?,
+        codex_home: options.optional("--codex-home").map(PathBuf::from),
+        config_digest: options.optional("--config-digest").map(ToString::to_string),
+        parent_supervisor_id: options
+            .optional("--parent-supervisor-id")
+            .map(ToString::to_string),
+        parent_started_at_ms: options.optional_i64("--parent-started-at-ms")?,
+        child_pid,
+        child_started_at_ms: options.optional_i64("--child-started-at-ms")?,
+        probed_at_ms: current_log_time_ms().map_err(|err| err.to_string())?,
+    })
+    .map_err(|err| err.to_string())?;
+    let receipt_file = write_codex_backend_provenance_receipt(
+        PathBuf::from(options.required("--receipt-dir")?),
+        &receipt,
+    )
+    .map_err(|err| err.to_string())?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "receiptFile": receipt_file,
+            "receipt": receipt,
+        }))
+        .map_err(|err| err.to_string())?
+    );
+    Ok(())
+}
+
+fn run_backend_auth(args: &[String]) -> Result<(), String> {
+    let options = SimpleOptions::parse(
+        args,
+        "backend-auth",
+        &[
+            "--action",
+            "--target-home",
+            "--provider",
+            "--codex-exe",
+            "--provenance-receipt",
+            "--timeout-ms",
+        ],
+        &[],
+    )?;
+    let action = options.required("--action")?;
+    let target_home = options.target_home.clone();
+    let provider = options.optional("--provider").unwrap_or("openai");
+    if action == "cancel" {
+        let decision =
+            request_backend_auth_cancel(&target_home, provider).map_err(|err| err.to_string())?;
+        return print_json(&decision);
+    }
+    if action == "doctor" {
+        let report = doctor_backend_auth(&target_home, provider).map_err(|err| err.to_string())?;
+        return print_json(&report);
+    }
+    let state = match action.as_str() {
+        "status" => {
+            let codex_home = resolve_or_create_provider_codex_home(&target_home, provider)
+                .map_err(|err| err.to_string())?;
+            load_backend_auth_state(&codex_home, provider).map_err(|err| err.to_string())?
+        }
+        "probe" | "refresh" => {
+            let timeout_ms = options.optional_u64("--timeout-ms")?.unwrap_or(30_000);
+            probe_backend_account(BackendAccountProbeOptions {
+                harness_home: target_home,
+                provider: provider.to_string(),
+                codex_executable: PathBuf::from(options.required("--codex-exe")?),
+                executable_provenance_receipt: options
+                    .optional("--provenance-receipt")
+                    .map(PathBuf::from),
+                timeout: Duration::from_millis(timeout_ms),
+            })
+            .map_err(|err| err.to_string())?
+        }
+        "login-browser" | "login-device-code" | "login-api-key-stdin" | "logout" => {
+            let timeout_ms = options.optional_u64("--timeout-ms")?.unwrap_or(30_000);
+            let auth_action = match action.as_str() {
+                "login-browser" => BackendAuthCliAction::BrowserLogin,
+                "login-device-code" => BackendAuthCliAction::DeviceCodeLogin,
+                "login-api-key-stdin" => BackendAuthCliAction::ApiKeyStdinLogin,
+                "logout" => BackendAuthCliAction::Logout,
+                _ => unreachable!(),
+            };
+            let api_key_stdin = if auth_action == BackendAuthCliAction::ApiKeyStdinLogin {
+                let mut bytes = Vec::new();
+                std::io::stdin()
+                    .take(16 * 1024)
+                    .read_to_end(&mut bytes)
+                    .map_err(|err| format!("failed to read API key from operator stdin: {err}"))?;
+                if bytes.iter().all(u8::is_ascii_whitespace) {
+                    bytes.fill(0);
+                    return Err("operator stdin did not contain an API key".to_string());
+                }
+                Some(bytes)
+            } else {
+                None
+            };
+            run_backend_auth_cli_operation(BackendAuthCliOperationOptions {
+                harness_home: target_home,
+                provider: provider.to_string(),
+                codex_executable: PathBuf::from(options.required("--codex-exe")?),
+                executable_provenance_receipt: options
+                    .optional("--provenance-receipt")
+                    .map(PathBuf::from),
+                action: auth_action,
+                api_key_stdin,
+                probe_timeout: Duration::from_millis(timeout_ms),
+            })
+            .map_err(|err| err.to_string())?
+        }
+        unknown => {
+            return Err(format!(
+                "unsupported --action {unknown}; expected status, probe, refresh, login-browser, login-device-code, login-api-key-stdin, cancel, logout, or doctor"
+            ));
+        }
+    };
+    print_json(&state)
+}
+
 fn run_codex_run(args: &[String]) -> Result<(), String> {
     let args = codex_run_args_from_args(args)?;
     let report = run_codex_runtime(CodexRuntimeRunOptions {
@@ -8586,6 +8836,11 @@ fn run_context_rollover(args: &[String]) -> Result<(), String> {
                     "operator requested context rollover prepared requeue".to_string()
                 }),
                 now_ms: args.now_ms,
+                preserve_continuation_index: false,
+                campaign_slice_generation: None,
+                continuation_intent_key: None,
+                completion_kind: None,
+                allow_exact_state_bootstrap: false,
             })
             .map_err(|err| err.to_string())?;
             print_json(&report)
@@ -22807,6 +23062,7 @@ fn runtime_run_once_status_label(status: RuntimeRunOnceStatus) -> &'static str {
         RuntimeRunOnceStatus::ProtocolError => "protocol-error",
         RuntimeRunOnceStatus::Timeout => "timeout",
         RuntimeRunOnceStatus::RetryPending => "retry-pending",
+        RuntimeRunOnceStatus::AuthDeferred => "auth-deferred",
         RuntimeRunOnceStatus::DeadLetter => "dead-letter",
         RuntimeRunOnceStatus::FailedTerminal => "failed-terminal",
         RuntimeRunOnceStatus::ContextExhausted => "context-exhausted",
@@ -23253,6 +23509,9 @@ fn print_help() {
     println!("  mcp-request     Handle one in-process MCP JSON-RPC request");
     println!("  security-scan   Scan prompt/shell trust-boundary inputs");
     println!("  context-pack-validate Validate bounded context-pack memory payload");
+    println!(
+        "  skill-replay-baseline Load a frozen corpus and emit immutable current-policy metrics"
+    );
     println!("  tool-description-hash Hash MCP/tool descriptions for pinning");
     println!("  tool-pin-check  Verify a pinned MCP/tool description hash");
     println!("  invariants      Print reviewed runtime invariant catalog");
@@ -23296,9 +23555,18 @@ fn print_help() {
     println!("  skills          Build a skill-first index and optionally match a task");
     println!("  skill-view      Print a skill body or support file with traversal guards");
     println!(
-        "  skill-synthesize Create an agent skill from task evidence and autonomously apply by default"
+        "  skill-synthesize Create a proposal-only agent skill from task evidence; --apply explicitly mutates"
     );
     println!("  skill-doctor    Aggregate skill lint, guard, lifecycle, and pack health");
+    println!(
+        "  goal-lineage-doctor Read-only exact-lane active-goal lineage and reconciliation report"
+    );
+    println!(
+        "  goal-lineage-supersede Append an explicit reviewed supersession without deleting goal rows"
+    );
+    println!(
+        "  goal-campaign-status Read-only goal autonomy policy and per-campaign budget status"
+    );
     println!("  skill-lint      Lint a skill body and write a lint receipt");
     println!("  skill-guard     Guard-scan skill content and write a guard receipt");
     println!(
@@ -23356,6 +23624,12 @@ fn print_help() {
     println!("  worker-reap-stale Recover expired worker leases");
     println!("  codex-plan      Plan Codex app-server invocation for prepared execution");
     println!("  codex-preflight Check a Codex runtime plan before process start");
+    println!(
+        "  backend-auth   Operate provider-scoped Codex auth without exposing credentials to turns"
+    );
+    println!(
+        "  codex-backend-provenance Verify and receipt the deployment-owned Codex path, version, and SHA-256"
+    );
     println!("  codex-launch-probe Start and stop Codex app-server without a model request");
     println!("  codex-run       Run a prepared Codex app-server turn and record completion");
     println!("  codex-complete  Record assistant output to transcript and trajectory");
@@ -23506,6 +23780,12 @@ fn print_help() {
     println!("  --queue-id <id>         Select one runtime queue item for queue-prepare");
     println!("  --execution-dir <path>  Prepared execution directory for codex-plan");
     println!("  --codex-exe <path>      Codex executable path for codex-plan/runtime-run-once");
+    println!("  --owned-root <path>     Allowed deployment-owned Codex root; repeatable");
+    println!("  --expected-sha256 <hex> Required Codex executable digest for provenance");
+    println!("  --candidate-id <id>     Candidate/build generation for provenance joins");
+    println!("  --phase <name>          Provenance phase such as candidate or startup");
+    println!("  --codex-home <path>     Provider-scoped Codex home for provenance binding");
+    println!("  --receipt-dir <path>    Private directory for provenance receipts");
     println!("  --plan-file <path>      Codex runtime plan file for codex-preflight");
     println!("  --startup-probe-ms <n>  Milliseconds to keep app-server alive for launch probe");
     println!("  --timeout-ms <n>        Milliseconds to wait for codex-run completion");
@@ -23541,6 +23821,53 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn skill_replay_cli_args(manifest: &Path, allow_private_local: bool) -> Vec<String> {
+        let mut args = vec![
+            "--manifest".to_string(),
+            manifest.display().to_string(),
+            "--baseline-id".to_string(),
+            "cli-e2e".to_string(),
+            "--policy-revision".to_string(),
+            "fixture-policy".to_string(),
+        ];
+        if allow_private_local {
+            args.push("--allow-private-local".to_string());
+        }
+        args
+    }
+
+    #[test]
+    fn skill_replay_cli_fails_closed_for_private_local_without_flag() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/skill-replay-private/manifest.json");
+        let error = run_skill_replay_baseline(&skill_replay_cli_args(&manifest, false))
+            .expect_err("private-local fixture must require explicit CLI opt-in");
+        assert!(error.contains("private-local"));
+        run_skill_replay_baseline(&skill_replay_cli_args(&manifest, true)).unwrap();
+    }
+
+    #[test]
+    fn skill_replay_cli_rejects_fixture_checksum_drift() {
+        let fixture_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/skill-replay-private");
+        let root = std::env::temp_dir().join(format!(
+            "agent-harness-cli-skill-replay-{}",
+            current_time_ms().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::copy(
+            fixture_root.join("manifest.json"),
+            root.join("manifest.json"),
+        )
+        .unwrap();
+        fs::write(root.join("cases.json"), b"[]\n").unwrap();
+        let error =
+            run_skill_replay_baseline(&skill_replay_cli_args(&root.join("manifest.json"), true))
+                .expect_err("fixture drift must fail on the CLI surface");
+        assert!(error.contains("checksum mismatch"));
+        let _ = fs::remove_dir_all(root);
+    }
 
     struct EnvVarRestore {
         name: &'static str,
@@ -26089,9 +26416,14 @@ mod tests {
     }
 
     #[test]
-    fn skill_synthesize_cli_autonomously_creates_skill_by_default() {
-        let root = cli_temp_root("skill_synthesize_cli_autonomously_creates_skill_by_default");
+    fn skill_synthesize_cli_is_proposal_only_by_default() {
+        let root = cli_temp_root("skill_synthesize_cli_is_proposal_only_by_default");
         let harness_home = root.join(".agent-harness");
+        let skill_file = harness_home
+            .join("skills")
+            .join("agent-created")
+            .join("cli-synth")
+            .join("SKILL.md");
 
         run_skill_synthesize(&[
             "--harness-home".to_string(),
@@ -26105,19 +26437,61 @@ mod tests {
         ])
         .unwrap();
 
-        assert!(
-            harness_home
-                .join("skills")
-                .join("agent-created")
-                .join("cli-synth")
-                .join("SKILL.md")
-                .is_file()
-        );
+        assert!(!skill_file.exists());
         assert!(
             harness_home
                 .join("state")
                 .join("skills")
                 .join("synthesis-receipts.jsonl")
+                .is_file()
+        );
+        assert!(
+            harness_home
+                .join("state")
+                .join("learning")
+                .join("skill-proposals.jsonl")
+                .is_file()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_synthesize_cli_apply_requires_explicit_flag() {
+        let root = cli_temp_root("skill_synthesize_cli_apply_requires_explicit_flag");
+        let harness_home = root.join(".agent-harness");
+        let skill_file = harness_home
+            .join("skills")
+            .join("agent-created")
+            .join("cli-synth-apply")
+            .join("SKILL.md");
+
+        run_skill_synthesize(&[
+            "--harness-home".to_string(),
+            harness_home.display().to_string(),
+            "--skill".to_string(),
+            "agent-created:cli-synth-apply".to_string(),
+            "--summary".to_string(),
+            "Reuse a verified explicit CLI synthesis apply workflow".to_string(),
+            "--evidence".to_string(),
+            "test evidence: explicit cli synthesis apply".to_string(),
+            "--apply".to_string(),
+        ])
+        .unwrap();
+
+        assert!(skill_file.is_file());
+        assert!(
+            harness_home
+                .join("state")
+                .join("skills")
+                .join("synthesis-receipts.jsonl")
+                .is_file()
+        );
+        assert!(
+            harness_home
+                .join("state")
+                .join("learning")
+                .join("skill-autonomous-apply-receipts.jsonl")
                 .is_file()
         );
 

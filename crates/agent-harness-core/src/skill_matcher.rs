@@ -68,6 +68,7 @@ mod tests {
             &index,
             &SkillSelectionQuery {
                 text: "/skill memory-cron rerun stale embedding jobs".to_string(),
+                include_context_tokens: true,
                 agent_id: None,
                 channel: Some("telegram".to_string()),
                 workspace: None,
@@ -114,6 +115,7 @@ mod tests {
             &index,
             &SkillSelectionQuery {
                 text: "zetaomega recovery".to_string(),
+                include_context_tokens: true,
                 agent_id: None,
                 channel: None,
                 workspace: None,
@@ -158,6 +160,7 @@ mod tests {
             &index,
             &SkillSelectionQuery {
                 text: "幫我用富邦下單".to_string(),
+                include_context_tokens: true,
                 agent_id: None,
                 channel: None,
                 workspace: None,

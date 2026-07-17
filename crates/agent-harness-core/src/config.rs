@@ -102,6 +102,7 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
         "orchestration",
         "staging",
         "codex",
+        "codexWebSearch",
         "codexContext",
         "runtime",
         "runtimeDispatch",
@@ -113,6 +114,7 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
         "channelIdentity",
         "liveControlGuard",
         "skills",
+        "backendAuth",
     ];
     let has_known_section = object
         .keys()
@@ -132,6 +134,7 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
             "orchestration" => validate_orchestration_object("$.orchestration", child, errors),
             "staging" => validate_staging_object("$.staging", child, errors),
             "codex" => validate_codex_object("$.codex", child, errors),
+            "codexWebSearch" => validate_codex_web_search_object("$.codexWebSearch", child, errors),
             "codexContext" => validate_codex_context_object("$.codexContext", child, errors),
             "runtime" => validate_runtime_object("$.runtime", child, errors),
             "runtimeDispatch" => {
@@ -149,6 +152,8 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
                 validate_live_control_guard_object("$.liveControlGuard", child, errors)
             }
             "skills" => validate_skills_object("$.skills", child, errors),
+            "backendAuth" => validate_backend_auth_object("$.backendAuth", child, errors),
+            "goalAutonomy" => validate_goal_autonomy_object("$.goalAutonomy", child, errors),
             other => errors.push(format!("unknown harness-config key `{other}` at $")),
         }
     }
@@ -158,6 +163,88 @@ fn validate_config_value(value: &Value, errors: &mut Vec<String>, warnings: &mut
             "codex/runtime security aliases are accepted for compatibility; prefer security.* keys"
                 .to_string(),
         );
+    }
+}
+
+fn validate_goal_autonomy_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "mode" => expect_enum(
+                path_key(path, key),
+                child,
+                &["disabled", "observe", "active"],
+                errors,
+            ),
+            "activeLaneDigests" => {
+                validate_string_array(path_key(path, key), child, errors);
+                if let Some(values) = child.as_array() {
+                    for (index, value) in values.iter().enumerate() {
+                        if let Some(digest) = value.as_str()
+                            && (digest.len() != 64
+                                || !digest.bytes().all(|byte| {
+                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                                }))
+                        {
+                            errors.push(format!(
+                                "{path}.activeLaneDigests[{index}] must be a 64-character SHA-256 digest"
+                            ));
+                        }
+                    }
+                }
+            }
+            "sliceHardTimeoutMs"
+            | "sliceIdleTimeoutMs"
+            | "sliceDrainWindowMs"
+            | "wallClockBudgetMs"
+            | "maxSlices"
+            | "maxTotalTokens"
+            | "maxNoProgressSlices"
+            | "maxRecoverySlices" => expect_positive_u64(path_key(path, key), child, errors),
+            other => errors.push(format!(
+                "unknown goal autonomy config key `{other}` at {path}"
+            )),
+        }
+    }
+    if object.get("mode").and_then(Value::as_str) == Some("active")
+        && object
+            .get("activeLaneDigests")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+    {
+        errors.push(format!(
+            "{path}.activeLaneDigests must name at least one exact lane when mode is active"
+        ));
+    }
+    let mut policy = crate::goal_budget::GoalCampaignPolicyV1::default();
+    if let Some(mode) = object.get("mode").and_then(Value::as_str) {
+        policy.mode = mode.to_string();
+    }
+    if let Some(values) = object.get("activeLaneDigests").and_then(Value::as_array) {
+        policy.active_lane_digests = values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+    }
+    for (key, target) in [
+        ("sliceHardTimeoutMs", &mut policy.slice_hard_timeout_ms),
+        ("sliceIdleTimeoutMs", &mut policy.slice_idle_timeout_ms),
+        ("sliceDrainWindowMs", &mut policy.slice_drain_window_ms),
+        ("wallClockBudgetMs", &mut policy.wall_clock_budget_ms),
+        ("maxSlices", &mut policy.max_slices),
+        ("maxTotalTokens", &mut policy.max_total_tokens),
+        ("maxNoProgressSlices", &mut policy.max_no_progress_slices),
+        ("maxRecoverySlices", &mut policy.max_recovery_slices),
+    ] {
+        if let Some(value) = object.get(key).and_then(Value::as_u64) {
+            *target = value;
+        }
+    }
+    if let Err(error) = policy.validate() {
+        errors.push(format!("{path} is invalid: {error}"));
     }
 }
 
@@ -459,6 +546,34 @@ fn validate_codex_object(path: &str, value: &Value, errors: &mut Vec<String>) {
                 expect_codex_sandbox_policy(path_key(path, key), child, errors)
             }
             other => errors.push(format!("unknown codex config key `{other}` at {path}")),
+        }
+    }
+}
+
+fn validate_codex_web_search_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "defaultMode" => expect_enum(
+                path_key(path, key),
+                child,
+                &["disabled", "cached", "indexed", "live"],
+                errors,
+            ),
+            "freshnessMode" => expect_enum(
+                path_key(path, key),
+                child,
+                &["cached", "indexed", "live"],
+                errors,
+            ),
+            "sensitiveMode" => expect_enum(path_key(path, key), child, &["disabled"], errors),
+            "requireCapability" | "allowLive" => expect_bool(path_key(path, key), child, errors),
+            "disabledLaneDigests" => expect_string_array(path_key(path, key), child, errors),
+            other => errors.push(format!(
+                "unknown codexWebSearch config key `{other}` at {path}"
+            )),
         }
     }
 }
@@ -935,11 +1050,42 @@ fn validate_skills_object(path: &str, value: &Value, errors: &mut Vec<String>) {
     for (key, child) in object {
         match key.as_str() {
             "matcher" => validate_skill_matcher_object(path_key(path, key), child, errors),
+            "virtualManifest" => {
+                validate_virtual_skill_manifest_object(path_key(path, key), child, errors)
+            }
             "catalog" => validate_skill_catalog_object(path_key(path, key), child, errors),
             "taxonomy" => validate_skill_taxonomy_object(path_key(path, key), child, errors),
             "guard" => validate_skill_guard_object(path_key(path, key), child, errors),
             "lint" => validate_skill_lint_object(path_key(path, key), child, errors),
             other => errors.push(format!("unknown skills config key `{other}` at {path}")),
+        }
+    }
+}
+
+fn validate_virtual_skill_manifest_object(path: String, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(&path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "observeEnabled" => expect_bool(path_key(&path, key), child, errors),
+            other => errors.push(format!(
+                "unknown skills.virtualManifest key `{other}` at {path}"
+            )),
+        }
+    }
+}
+
+fn validate_backend_auth_object(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "runtimeGateEnabled" => expect_bool(path_key(path, key), child, errors),
+            other => errors.push(format!(
+                "unknown backendAuth config key `{other}` at {path}"
+            )),
         }
     }
 }
@@ -950,7 +1096,9 @@ fn validate_skill_matcher_object(path: String, value: &Value, errors: &mut Vec<S
     };
     for (key, child) in object {
         match key.as_str() {
-            "ftsEnabled" | "usagePriorEnabled" => expect_bool(path_key(&path, key), child, errors),
+            "ftsEnabled" | "usagePriorEnabled" | "shadowV2Enabled" => {
+                expect_bool(path_key(&path, key), child, errors)
+            }
             "minScore" => expect_u64(path_key(&path, key), child, errors),
             other => errors.push(format!("unknown skills.matcher key `{other}` at {path}")),
         }
@@ -1168,6 +1316,19 @@ fn expect_string(path: impl Into<String>, value: &Value, errors: &mut Vec<String
 fn expect_bool(path: impl Into<String>, value: &Value, errors: &mut Vec<String>) {
     if !value.is_boolean() {
         errors.push(format!("{} must be a boolean", path.into()));
+    }
+}
+
+fn expect_string_array(path: impl Into<String>, value: &Value, errors: &mut Vec<String>) {
+    let path = path.into();
+    let Some(values) = value.as_array() else {
+        errors.push(format!("expected string array at {path}"));
+        return;
+    };
+    for (index, value) in values.iter().enumerate() {
+        if value.as_str().is_none() {
+            errors.push(format!("expected string at {path}[{index}]"));
+        }
     }
 }
 
@@ -2092,6 +2253,175 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.contains("only supports mode `off`"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn virtual_skill_manifest_observer_flag_is_boolean_and_fail_closed() {
+        let root = temp_root("virtual-skill-manifest-observer-flag");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"skills":{"virtualManifest":{"observeEnabled":false}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_harness_config(&harness_home).unwrap().status,
+            HarnessConfigValidationStatus::Valid
+        );
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"skills":{"virtualManifest":{"observeEnabled":"yes","serveEnabled":true}}}"#,
+        )
+        .unwrap();
+        let invalid = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(invalid.status, HarnessConfigValidationStatus::Invalid);
+        assert!(
+            invalid
+                .errors
+                .iter()
+                .any(|error| error.contains("observeEnabled"))
+        );
+        assert!(
+            invalid
+                .errors
+                .iter()
+                .any(|error| error.contains("unknown skills.virtualManifest key"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backend_auth_runtime_gate_is_boolean_and_rejects_unknown_keys() {
+        let root = temp_root("backend-auth-runtime-gate");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"backendAuth":{"runtimeGateEnabled":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_harness_config(&harness_home).unwrap().status,
+            HarnessConfigValidationStatus::Valid
+        );
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"backendAuth":{"runtimeGateEnabled":"yes","credential":"forbidden"}}"#,
+        )
+        .unwrap();
+        let invalid = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(invalid.status, HarnessConfigValidationStatus::Invalid);
+        assert!(
+            invalid
+                .errors
+                .iter()
+                .any(|error| error.contains("runtimeGateEnabled"))
+        );
+        assert!(
+            invalid
+                .errors
+                .iter()
+                .any(|error| error.contains("unknown backendAuth config key"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_web_search_policy_accepts_explicit_modes_and_rejects_sensitive_live() {
+        let root = temp_root("codex-web-search-policy");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"codexWebSearch":{"defaultMode":"cached","freshnessMode":"live","sensitiveMode":"disabled","requireCapability":true,"allowLive":true,"disabledLaneDigests":["lane-digest"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_harness_config(&harness_home).unwrap().status,
+            HarnessConfigValidationStatus::Valid
+        );
+
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"codexWebSearch":{"sensitiveMode":"live","sandboxMode":"danger-full-access"}}"#,
+        )
+        .unwrap();
+        let invalid = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(invalid.status, HarnessConfigValidationStatus::Invalid);
+        assert!(
+            invalid
+                .errors
+                .iter()
+                .any(|error| error.contains("sensitiveMode"))
+        );
+        assert!(
+            invalid
+                .errors
+                .iter()
+                .any(|error| error.contains("unknown codexWebSearch config key `sandboxMode`"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validate_harness_config_requires_exact_goal_autonomy_cohort() {
+        let root = temp_root("validate_goal_autonomy_cohort");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            format!(
+                r#"{{"goalAutonomy":{{"mode":"active","activeLaneDigests":["{}"]}}}}"#,
+                "a".repeat(64)
+            ),
+        )
+        .unwrap();
+        let valid = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(valid.status, HarnessConfigValidationStatus::Valid);
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"goalAutonomy":{"mode":"active","activeLaneDigests":[]}}"#,
+        )
+        .unwrap();
+        let invalid = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(invalid.status, HarnessConfigValidationStatus::Invalid);
+        assert!(
+            invalid
+                .errors
+                .iter()
+                .any(|error| error.contains("at least one exact lane"))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validate_harness_config_enforces_bounded_goal_campaign_policy() {
+        let root = temp_root("validate_bounded_goal_campaign_policy");
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"goalAutonomy":{"mode":"observe","activeLaneDigests":[],"sliceHardTimeoutMs":2700000,"sliceIdleTimeoutMs":600000,"sliceDrainWindowMs":180000,"wallClockBudgetMs":172800000,"maxSlices":64,"maxTotalTokens":10000000,"maxNoProgressSlices":4,"maxRecoverySlices":8}}"#,
+        )
+        .unwrap();
+        let valid = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(valid.status, HarnessConfigValidationStatus::Valid);
+
+        fs::write(
+            harness_home.join(HARNESS_CONFIG_FILE_NAME),
+            r#"{"goalAutonomy":{"mode":"observe","sliceHardTimeoutMs":2700000,"sliceDrainWindowMs":120000}}"#,
+        )
+        .unwrap();
+        let invalid = validate_harness_config(&harness_home).unwrap();
+        assert_eq!(invalid.status, HarnessConfigValidationStatus::Invalid);
+        assert!(
+            invalid
+                .errors
+                .iter()
+                .any(|error| { error.contains("sliceDrainWindowMs must equal") })
         );
         let _ = fs::remove_dir_all(root);
     }

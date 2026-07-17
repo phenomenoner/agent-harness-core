@@ -60,7 +60,7 @@ impl Default for SelfImprovementReviewConfig {
             daily_cap: SELF_IMPROVEMENT_DEFAULT_DAILY_CAP,
             max_selected_skills: SELF_IMPROVEMENT_DEFAULT_MAX_SELECTED_SKILLS,
             skill_synthesis_enabled: true,
-            skill_synthesis_autonomous_apply: true,
+            skill_synthesis_autonomous_apply: false,
             skill_synthesis_daily_cap: SKILL_SYNTHESIS_DEFAULT_DAILY_CAP,
             skill_synthesis_min_tool_calls: SKILL_SYNTHESIS_DEFAULT_MIN_TOOL_CALLS,
             skill_synthesis_min_assistant_chars: SKILL_SYNTHESIS_DEFAULT_MIN_ASSISTANT_CHARS,
@@ -216,9 +216,9 @@ pub fn load_self_improvement_review_config(
                 "auto" | "apply" | "dispatch-and-replace" | "dispatch-and-replacement" => {
                     config.skill_synthesis_autonomous_apply = true;
                 }
-                other => config
-                    .warnings
-                    .push(format!("unknown skillSynthesis mode `{other}`; using auto")),
+                other => config.warnings.push(format!(
+                    "unknown skillSynthesis mode `{other}`; using propose-only"
+                )),
             }
         }
         if let Some(cap) = section.get("dailyCap").and_then(Value::as_u64) {
@@ -473,6 +473,7 @@ fn maybe_enqueue_skill_synthesis(
         "sourceTurn": options.queue_id.clone(),
         "agentId": options.agent_id.clone(),
         "proposeOnly": !config.skill_synthesis_autonomous_apply,
+        "applyAuthorized": config.skill_synthesis_autonomous_apply,
         "toolCallCount": options.tool_call_count,
     });
     let report = enqueue_worker_job(WorkerEnqueueOptions {

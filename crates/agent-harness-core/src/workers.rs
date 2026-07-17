@@ -1979,7 +1979,13 @@ fn run_skill_synthesis_job(
     let evidence = string_path_any(&job.payload, &["evidence", "signalText", "signal_text"])
         .unwrap_or("")
         .to_string();
-    let propose_only = bool_payload(&job.payload, &["proposeOnly", "propose_only"], false);
+    let apply_authorized = bool_payload(
+        &job.payload,
+        &["applyAuthorized", "apply_authorized"],
+        false,
+    );
+    let propose_only =
+        bool_payload(&job.payload, &["proposeOnly", "propose_only"], true) || !apply_authorized;
     let report = synthesize_skill(SkillSynthesisOptions {
         harness_home: harness_home.to_path_buf(),
         skill_id,
@@ -6282,6 +6288,8 @@ mod tests {
                 "skillId": "agent-created:follow-up-debugging",
                 "taskSummary": "Debug repeated follow-up failures with focused receipts",
                 "evidence": "Tests: follow_up_debugging_replay_green",
+                "proposeOnly": false,
+                "applyAuthorized": true,
             }),
             idempotency_key: Some("skill-synthesis:queue-synth-1".to_string()),
             parent_job_id: None,
@@ -6322,6 +6330,54 @@ mod tests {
                 .is_file()
         );
         assert!(crate::skill_autonomous_apply_receipts_file(&harness_home).is_file());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_synthesis_worker_defaults_to_proposal_only_without_apply_authority() {
+        let root = temp_root("skill_synthesis_worker_defaults_to_proposal_only");
+        let harness_home = root.join(".agent-harness");
+        enqueue_worker_job(WorkerEnqueueOptions {
+            harness_home: harness_home.clone(),
+            kind: WorkerJobKind::SkillSynthesis,
+            lane: Some("skill_synthesis".to_string()),
+            payload: json!({
+                "skillId": "agent-created:proposal-only-debugging",
+                "taskSummary": "Record a reviewable debugging proposal",
+                "evidence": "Tests: proposal_only_debugging_replay_green",
+            }),
+            idempotency_key: Some("skill-synthesis:proposal-only".to_string()),
+            parent_job_id: None,
+            job_group_id: Some("queue-synth-proposal".to_string()),
+            master_agent_id: Some("main".to_string()),
+            master_session_key: Some("session-1".to_string()),
+            wake_policy: None,
+            source: Some("runtime-completion-skill-synthesis".to_string()),
+            priority: 0,
+            available_at_ms: Some(1000),
+            max_attempts: 1,
+            timeout_ms: Some(DEFAULT_TIMEOUT_MS),
+            cascade_timeout_ms: None,
+            rate_key: Some("skill-synthesis:proposal-only".to_string()),
+            concurrency_group_key: Some("skill-synthesis:proposal-only".to_string()),
+            now_ms: 1000,
+        })
+        .unwrap();
+
+        let run = run_worker_once(WorkerRunOnceOptions {
+            harness_home: harness_home.clone(),
+            lane: Some("skill_synthesis".to_string()),
+            worker_id: "test-worker".to_string(),
+            lease_ms: DEFAULT_LEASE_MS,
+            now_ms: 1001,
+        })
+        .unwrap();
+
+        assert_eq!(run.status, WorkerRunOnceStatus::Completed);
+        assert!(!harness_home.join("skills").join("agent-created").exists());
+        assert!(crate::skill_proposals_file(&harness_home).is_file());
+        assert!(!crate::skill_autonomous_apply_receipts_file(&harness_home).exists());
 
         let _ = fs::remove_dir_all(root);
     }

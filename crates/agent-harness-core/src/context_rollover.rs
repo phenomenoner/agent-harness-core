@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::channel_state::{
-    ChannelStateLane, channel_session_state_file, migrate_legacy_channel_session_state_to_v2,
+    CHANNEL_SESSION_STATE_V2_SCHEMA, ChannelSessionState, ChannelStateLane,
+    channel_session_state_file, migrate_legacy_channel_session_state_to_v2,
     read_channel_session_state, read_channel_session_state_v2, write_channel_session_state_v2,
 };
 use crate::config::HARNESS_CONFIG_FILE_NAME;
@@ -19,7 +20,10 @@ use crate::runtime_worker::{
     QueueTerminalControl, refresh_runtime_queue_state_index,
     resolve_queue_terminal_control_from_index,
 };
-use crate::{append_jsonl_value, write_json_atomic};
+use crate::{
+    VirtualSkillManifestStatus, append_jsonl_value, close_virtual_skill_manifest,
+    load_virtual_skill_manifest, persist_manifest, write_json_atomic,
+};
 
 const CONTEXT_COMPACT_COUNTER_SCHEMA: &str = "agent-harness.context-compact-counter.v1";
 const CONTEXT_COMPACT_COUNTER_V2_SCHEMA: &str = "agent-harness.context-compact-counter.v2";
@@ -89,6 +93,10 @@ pub struct RuntimeContinuationMetadata {
     pub virtual_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_slice_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_intent_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -301,6 +309,13 @@ pub struct ContextRolloverRequeuePreparedOptions {
     pub new_working_session_key: String,
     pub reason: String,
     pub now_ms: i64,
+    /// Goal slices remain in the same backend context generation. Context
+    /// rollover callers leave this false so their recovery depth still moves.
+    pub preserve_continuation_index: bool,
+    pub campaign_slice_generation: Option<u64>,
+    pub continuation_intent_key: Option<String>,
+    pub completion_kind: Option<String>,
+    pub allow_exact_state_bootstrap: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,6 +328,9 @@ pub struct ContextRolloverPreparedRequeueReport {
     pub new_working_session_key: String,
     pub virtual_session_id: Option<String>,
     pub continuation_index: u64,
+    pub campaign_slice_generation: Option<u64>,
+    pub continuation_intent_key: Option<String>,
+    pub completion_kind: String,
     pub pending_queue_file: PathBuf,
     pub run_once_receipts_file: PathBuf,
     pub prepared_execution_dir: Option<PathBuf>,
@@ -1298,6 +1316,12 @@ pub fn close_virtual_session_for_task_boundary(
     record.status = "closed".to_string();
     close_open_working_sessions(&mut record, &options.ended_by, options.now_ms);
     write_json_atomic(&file, &record)?;
+    close_skill_manifest_for_virtual_session(
+        &options.harness_home,
+        &record.virtual_session_id,
+        VirtualSkillManifestStatus::Completed,
+        &options.ended_by,
+    )?;
     Ok(Some(file))
 }
 
@@ -1345,6 +1369,12 @@ pub fn mark_virtual_session_terminal(
     record.status = "terminal-failed".to_string();
     close_open_working_sessions(&mut record, &options.ended_by, options.now_ms);
     write_json_atomic(&file, &record)?;
+    close_skill_manifest_for_virtual_session(
+        &options.harness_home,
+        &record.virtual_session_id,
+        VirtualSkillManifestStatus::TerminalFailed,
+        &options.ended_by,
+    )?;
     Ok(Some(file))
 }
 
@@ -1364,8 +1394,18 @@ pub fn close_virtual_session_for_task_boundary_for_lane(
     };
     record.status = "closed".to_string();
     close_open_working_sessions(&mut record, &options.ended_by, options.now_ms);
-    write_virtual_session_record_v2_value(&options.harness_home, &record, &options.channel_lane)
-        .map(Some)
+    let file = write_virtual_session_record_v2_value(
+        &options.harness_home,
+        &record,
+        &options.channel_lane,
+    )?;
+    close_skill_manifest_for_virtual_session(
+        &options.harness_home,
+        &record.virtual_session_id,
+        VirtualSkillManifestStatus::Completed,
+        &options.ended_by,
+    )?;
+    Ok(Some(file))
 }
 
 /// Backfills a Codex thread id only into the exact v2 lane record. The thread
@@ -1422,8 +1462,18 @@ pub fn mark_virtual_session_terminal_for_lane(
     };
     record.status = "terminal-failed".to_string();
     close_open_working_sessions(&mut record, &options.ended_by, options.now_ms);
-    write_virtual_session_record_v2_value(&options.harness_home, &record, &options.channel_lane)
-        .map(Some)
+    let file = write_virtual_session_record_v2_value(
+        &options.harness_home,
+        &record,
+        &options.channel_lane,
+    )?;
+    close_skill_manifest_for_virtual_session(
+        &options.harness_home,
+        &record.virtual_session_id,
+        VirtualSkillManifestStatus::TerminalFailed,
+        &options.ended_by,
+    )?;
+    Ok(Some(file))
 }
 
 pub fn record_completed_turn_working_set_snapshot(
@@ -1985,6 +2035,18 @@ pub fn requeue_prepared_context_rollover(
     requeue_prepared_context_rollover_legacy(options)
 }
 
+fn continuation_requeued_queue_id(options: &ContextRolloverRequeuePreparedOptions) -> String {
+    if let Some(intent_key) = options.continuation_intent_key.as_deref() {
+        let digest = sha256_hex(&canonical_identity_bytes(&[
+            "goal-continuation-child",
+            &options.queue_id,
+            intent_key,
+        ]));
+        return format!("{}:goal-cont-{}", options.queue_id, &digest[..24]);
+    }
+    format!("{}:rollover-requeue-{}", options.queue_id, options.now_ms)
+}
+
 fn requeue_prepared_context_rollover_legacy(
     options: ContextRolloverRequeuePreparedOptions,
 ) -> io::Result<ContextRolloverPreparedRequeueReport> {
@@ -2033,16 +2095,24 @@ fn requeue_prepared_context_rollover_legacy(
                     &root_session_key,
                 ))
             });
-    let continuation_index = continuation_index_from_session_key(&options.new_working_session_key)
-        .or_else(|| {
-            pending_item
-                .get("continuationIndex")
-                .or_else(|| pending_item.get("continuation_index"))
-                .and_then(Value::as_u64)
-                .map(|value| value.saturating_add(1))
-        })
-        .unwrap_or(1);
-    let requeued_queue_id = format!("{}:rollover-requeue-{}", options.queue_id, options.now_ms);
+    let pending_continuation_index = pending_item
+        .get("continuationIndex")
+        .or_else(|| pending_item.get("continuation_index"))
+        .and_then(Value::as_u64);
+    let continuation_index = if options.preserve_continuation_index {
+        pending_continuation_index
+            .or_else(|| continuation_index_from_session_key(&options.new_working_session_key))
+            .unwrap_or(0)
+    } else {
+        continuation_index_from_session_key(&options.new_working_session_key)
+            .or_else(|| pending_continuation_index.map(|value| value.saturating_add(1)))
+            .unwrap_or(1)
+    };
+    let completion_kind = options
+        .completion_kind
+        .clone()
+        .unwrap_or_else(|| "continuation-rollover".to_string());
+    let requeued_queue_id = continuation_requeued_queue_id(&options);
     let (planned_transcript_file, planned_trajectory_file) = planned_session_files(
         &options.harness_home,
         agent_id,
@@ -2109,8 +2179,20 @@ fn requeue_prepared_context_rollover_legacy(
         );
         object.insert(
             "completionKind".to_string(),
-            Value::String("continuation-rollover".to_string()),
+            Value::String(completion_kind.clone()),
         );
+        if let Some(generation) = options.campaign_slice_generation {
+            object.insert(
+                "campaignSliceGeneration".to_string(),
+                Value::Number(serde_json::Number::from(generation)),
+            );
+        }
+        if let Some(intent_key) = options.continuation_intent_key.as_ref() {
+            object.insert(
+                "continuationIntentKey".to_string(),
+                Value::String(intent_key.clone()),
+            );
+        }
         object.insert("taskTerminal".to_string(), Value::Bool(false));
         object.insert("suppressSelfImprovement".to_string(), Value::Bool(true));
         object.insert(
@@ -2235,6 +2317,9 @@ fn requeue_prepared_context_rollover_legacy(
         new_working_session_key: options.new_working_session_key,
         virtual_session_id,
         continuation_index,
+        campaign_slice_generation: options.campaign_slice_generation,
+        continuation_intent_key: options.continuation_intent_key,
+        completion_kind,
         pending_queue_file: queue_file,
         run_once_receipts_file,
         prepared_execution_dir,
@@ -2297,16 +2382,24 @@ fn requeue_prepared_context_rollover_for_lane(
     })?;
     let root_session_key = root_working_session_key(&options.new_working_session_key);
     let virtual_session_id = derive_virtual_session_id_v2(&channel_lane, &root_session_key);
-    let continuation_index = continuation_index_from_session_key(&options.new_working_session_key)
-        .or_else(|| {
-            pending_item
-                .get("continuationIndex")
-                .or_else(|| pending_item.get("continuation_index"))
-                .and_then(Value::as_u64)
-                .map(|value| value.saturating_add(1))
-        })
-        .unwrap_or(1);
-    let requeued_queue_id = format!("{}:rollover-requeue-{}", options.queue_id, options.now_ms);
+    let pending_continuation_index = pending_item
+        .get("continuationIndex")
+        .or_else(|| pending_item.get("continuation_index"))
+        .and_then(Value::as_u64);
+    let continuation_index = if options.preserve_continuation_index {
+        pending_continuation_index
+            .or_else(|| continuation_index_from_session_key(&options.new_working_session_key))
+            .unwrap_or(0)
+    } else {
+        continuation_index_from_session_key(&options.new_working_session_key)
+            .or_else(|| pending_continuation_index.map(|value| value.saturating_add(1)))
+            .unwrap_or(1)
+    };
+    let completion_kind = options
+        .completion_kind
+        .clone()
+        .unwrap_or_else(|| "continuation-rollover".to_string());
+    let requeued_queue_id = continuation_requeued_queue_id(&options);
     let (planned_transcript_file, planned_trajectory_file) = planned_session_files(
         &options.harness_home,
         channel_lane.agent_id(),
@@ -2323,12 +2416,49 @@ fn requeue_prepared_context_rollover_for_lane(
                     .state
             }
         }
+        .or_else(|| {
+            options
+                .allow_exact_state_bootstrap
+                .then(|| ChannelSessionState {
+                    schema: CHANNEL_SESSION_STATE_V2_SCHEMA.to_string(),
+                    platform: channel_lane.platform().to_string(),
+                    account_id: Some(channel_lane.account_id().to_string()),
+                    channel_id: channel_lane.channel_id().to_string(),
+                    user_id: channel_lane.user_id().to_string(),
+                    active_session_key: previous_session.to_string(),
+                    agent_id: Some(channel_lane.agent_id().to_string()),
+                    config_revision: None,
+                    provider: string_field(&pending_item, &["provider"]).map(ToString::to_string),
+                    model: string_field(&pending_item, &["model"]).map(ToString::to_string),
+                    session_topic: None,
+                    model_override: None,
+                    model_override_provider: None,
+                    model_override_model: None,
+                    thinking_enabled: false,
+                    thinking_level: None,
+                    thinking_instruction: None,
+                    reasoning_preference: None,
+                    backend_reasoning_policy: None,
+                    fast_mode: None,
+                    stop_requested: false,
+                    stop_reason: None,
+                    steering_notes: Vec::new(),
+                    btw_notes: Vec::new(),
+                    last_command: None,
+                    updated_at_ms: options.now_ms,
+                })
+        })
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 "exact v2 channel session state is unavailable; legacy migration was not eligible",
             )
         })?;
+    if options.allow_exact_state_bootstrap
+        && read_channel_session_state_v2(&options.harness_home, &channel_lane)?.is_none()
+    {
+        write_channel_session_state_v2(&options.harness_home, &channel_lane, &previous_state)?;
+    }
     let original_state = previous_state.clone();
     if previous_state.active_session_key != previous_session
         && previous_state.active_session_key != options.new_working_session_key
@@ -2374,8 +2504,20 @@ fn requeue_prepared_context_rollover_for_lane(
     );
     object.insert(
         "completionKind".to_string(),
-        Value::String("continuation-rollover".to_string()),
+        Value::String(completion_kind.clone()),
     );
+    if let Some(generation) = options.campaign_slice_generation {
+        object.insert(
+            "campaignSliceGeneration".to_string(),
+            Value::Number(serde_json::Number::from(generation)),
+        );
+    }
+    if let Some(intent_key) = options.continuation_intent_key.as_ref() {
+        object.insert(
+            "continuationIntentKey".to_string(),
+            Value::String(intent_key.clone()),
+        );
+    }
     object.insert("taskTerminal".to_string(), Value::Bool(false));
     object.insert("suppressSelfImprovement".to_string(), Value::Bool(true));
     object.insert(
@@ -2506,6 +2648,9 @@ fn requeue_prepared_context_rollover_for_lane(
         new_working_session_key: options.new_working_session_key,
         virtual_session_id: Some(virtual_session_id),
         continuation_index,
+        campaign_slice_generation: options.campaign_slice_generation,
+        continuation_intent_key: options.continuation_intent_key,
+        completion_kind,
         pending_queue_file: queue_file,
         run_once_receipts_file,
         prepared_execution_dir,
@@ -3649,6 +3794,34 @@ fn working_set_index_for_session_or_root(
     }
     read_working_set_memory_for_session(harness_home, &root_session_key)
         .map(|maybe| maybe.map(|(index, _)| index))
+}
+
+fn close_skill_manifest_for_virtual_session(
+    harness_home: &Path,
+    virtual_session_id: &str,
+    status: VirtualSkillManifestStatus,
+    ended_by: &str,
+) -> io::Result<Option<PathBuf>> {
+    let Some(mut manifest) = load_virtual_skill_manifest(harness_home, virtual_session_id)? else {
+        return Ok(None);
+    };
+    if manifest.status == status {
+        return Ok(Some(crate::virtual_skill_manifest_file(
+            harness_home,
+            virtual_session_id,
+        )));
+    }
+    if manifest.status != VirtualSkillManifestStatus::Active {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "virtual skill manifest {virtual_session_id} is already terminal as {:?}",
+                manifest.status
+            ),
+        ));
+    }
+    close_virtual_skill_manifest(&mut manifest, status, ended_by).map_err(io::Error::other)?;
+    persist_manifest(harness_home, &manifest).map(Some)
 }
 
 fn close_open_working_sessions(
@@ -4800,6 +4973,11 @@ mod tests {
             new_working_session_key: "telegram:dm:user:assistant:cont-1".to_string(),
             reason: "operator rollover recovery".to_string(),
             now_ms: 42,
+            preserve_continuation_index: false,
+            campaign_slice_generation: None,
+            continuation_intent_key: None,
+            completion_kind: None,
+            allow_exact_state_bootstrap: false,
         })
         .unwrap();
 
@@ -4930,6 +5108,11 @@ mod tests {
                 new_working_session_key: "telegram:dm:user:main:cont-1".to_string(),
                 reason: "auto polluted thread recovery".to_string(),
                 now_ms: 42,
+                preserve_continuation_index: false,
+                campaign_slice_generation: None,
+                continuation_intent_key: None,
+                completion_kind: None,
+                allow_exact_state_bootstrap: false,
             },
         )
         .unwrap_err();
@@ -5040,6 +5223,11 @@ mod tests {
                 new_working_session_key: "telegram:dm:user:main:cont-1".to_string(),
                 reason: "interrupted long-task recovery".to_string(),
                 now_ms: 42,
+                preserve_continuation_index: false,
+                campaign_slice_generation: None,
+                continuation_intent_key: None,
+                completion_kind: None,
+                allow_exact_state_bootstrap: false,
             },
         )
         .expect(

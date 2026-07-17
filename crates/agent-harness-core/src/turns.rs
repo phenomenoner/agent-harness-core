@@ -16,8 +16,8 @@ use crate::lane::FullLaneKeyV1;
 use crate::{
     AgentOverride, AgentProfile, AgentRegistry, AgentSource, ChannelCommand, ChannelCommandIntent,
     ChannelSessionState, DEFAULT_THINKING_LEVEL, InboundMediaArtifact, PROMPT_FILE_NAMES,
-    SkillIndex, SkillSelection, SkillSelectionQuery, build_runtime_skill_index,
-    build_source_skill_index, collect_skill_usage_snapshot_for_agent,
+    SkillIndex, SkillRoutingQueryV2, SkillSelection, SkillSelectionQuery,
+    build_runtime_skill_index, build_source_skill_index, collect_skill_usage_snapshot_for_agent,
     config::harness_config_candidates, parse_channel_command, read_agent_override,
     read_channel_session_state, select_skills, write_skill_selection_receipt,
 };
@@ -72,6 +72,10 @@ pub struct TurnPlan {
     pub command_intent: Option<ChannelCommandIntent>,
     pub prompt_files: Vec<TurnPromptFile>,
     pub selected_skills: Vec<SkillSelection>,
+    /// Internal-only input for the runtime shadow router. It is deliberately
+    /// excluded from the serialized turn plan and model-facing prompt.
+    #[serde(skip)]
+    pub skill_shadow_v2_query: Option<SkillRoutingQueryV2>,
     pub warnings: Vec<String>,
 }
 
@@ -366,6 +370,7 @@ pub fn build_turn_plan_for_account(
     };
     let skill_query = SkillSelectionQuery {
         text: skill_query_text,
+        include_context_tokens: true,
         agent_id: agent.as_ref().map(|agent| agent.id.clone()),
         channel: Some(input.platform.clone()),
         workspace: agent
@@ -394,6 +399,23 @@ pub fn build_turn_plan_for_account(
     } else {
         Vec::new()
     };
+    let skill_shadow_v2_query = (dispatch == TurnDispatch::AgentTurn
+        && skill_config.shadow_v2_enabled)
+        .then(|| SkillRoutingQueryV2 {
+            task_text: input.text.clone(),
+            explicit_invocations: Vec::new(),
+            agent_id: agent
+                .as_ref()
+                .map(|agent| agent.id.clone())
+                .unwrap_or_default(),
+            channel: input.platform.clone(),
+            available_tools: Vec::new(),
+            available_toolsets: Vec::new(),
+            risk_context: Vec::new(),
+            virtual_task_intent: None,
+            ambient_notes_excluded_bytes: skill_query.text.len().saturating_sub(input.text.len()),
+            usage_snapshot: skill_query.usage_snapshot.clone(),
+        });
     Ok(TurnPlan {
         schema: TURN_PLAN_SCHEMA,
         harness_home: input.harness_home,
@@ -421,6 +443,7 @@ pub fn build_turn_plan_for_account(
         command_intent,
         prompt_files,
         selected_skills,
+        skill_shadow_v2_query,
         warnings,
     })
 }
@@ -541,6 +564,7 @@ fn load_cached_model_catalog(
 struct SkillSelectionConfig {
     fts_enabled: bool,
     usage_prior_enabled: bool,
+    shadow_v2_enabled: bool,
 }
 
 impl Default for SkillSelectionConfig {
@@ -548,6 +572,7 @@ impl Default for SkillSelectionConfig {
         Self {
             fts_enabled: true,
             usage_prior_enabled: true,
+            shadow_v2_enabled: false,
         }
     }
 }
@@ -576,6 +601,9 @@ fn load_skill_selection_config(harness_home: &Path) -> io::Result<SkillSelection
     }
     if let Some(enabled) = matcher.get("usagePriorEnabled").and_then(Value::as_bool) {
         config.usage_prior_enabled = enabled;
+    }
+    if let Some(enabled) = matcher.get("shadowV2Enabled").and_then(Value::as_bool) {
+        config.shadow_v2_enabled = enabled;
     }
     Ok(config)
 }

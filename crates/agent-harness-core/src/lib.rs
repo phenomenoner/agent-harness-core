@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 pub mod activation;
 pub mod admission;
 pub mod autonomy;
+pub mod backend_auth;
 pub mod backend_reasoning;
 pub(crate) mod backend_reasoning_execution;
 pub mod background;
@@ -18,8 +19,11 @@ pub mod channel_pipeline;
 pub mod channel_runtime;
 pub mod channel_state;
 pub mod child_execution_policy;
+pub mod codex_backend_provenance;
 pub(crate) mod codex_capability;
+pub mod codex_protocol_compat;
 pub mod codex_runtime;
+pub mod codex_web_search;
 pub mod config;
 pub mod context_rollover;
 pub mod coordinator_resume;
@@ -30,10 +34,15 @@ pub mod deploy;
 pub mod deterministic_cron;
 pub mod dream_director;
 pub mod execution_mode;
+pub mod goal_budget;
+pub mod goal_continuation;
+pub mod goal_lineage;
+pub mod goal_transition;
 pub mod harness_registry;
 pub mod harness_skills;
 pub mod health;
 pub mod importer;
+pub mod knowledge_classifier;
 pub mod lane;
 pub mod latency;
 pub mod ledger_maintenance;
@@ -74,12 +83,18 @@ pub mod self_improvement;
 pub mod skill_apply;
 pub mod skill_curator;
 pub mod skill_doctor;
+pub mod skill_ecosystem_contracts;
 pub mod skill_envelope;
+pub mod skill_episode;
 pub mod skill_guard;
+pub mod skill_improvement;
 pub mod skill_learning;
 pub mod skill_lint;
 pub mod skill_matcher;
 pub mod skill_pack;
+pub mod skill_replay;
+pub mod skill_router;
+pub mod skill_shadow_runtime;
 pub mod skill_synthesis;
 pub mod skill_usage;
 pub mod skill_view;
@@ -96,6 +111,7 @@ pub mod turns;
 pub mod vault;
 pub mod virtual_session_context;
 pub(crate) mod virtual_session_runtime_index;
+pub mod virtual_skill_manifest;
 pub mod wake;
 pub mod worker_adapters;
 pub mod worker_coordination;
@@ -132,6 +148,20 @@ pub use autonomy::{
     LearningProposalOptions, LearningProposalReport, LearningProposalStatus, TaskEntity,
     TaskEntityOptions, TaskStatus, acquire_budget, check_config_drift, create_learning_proposal,
     write_task_entity,
+};
+pub use backend_auth::{
+    BACKEND_AUTH_CONTINUATION_SCHEMA, BACKEND_AUTH_STATE_SCHEMA, BackendAccountProbeOptions,
+    BackendAuthCancelDecision, BackendAuthCliAction, BackendAuthCliOperationOptions,
+    BackendAuthContinuationDecision, BackendAuthContinuationIntentV1,
+    BackendAuthContinuationStatus, BackendAuthDoctorReport, BackendAuthLifecycleState,
+    BackendAuthOperationLease, BackendAuthStateV1, BackendAuthTransition, BackendReadyDecision,
+    CODEX_BACKEND_AUTH_SCHEMA, CodexBackendAuthReceiptV1, acquire_backend_auth_operation_lease,
+    backend_auth_runtime_gate_enabled, begin_backend_auth_operation,
+    complete_backend_auth_operation, doctor_backend_auth, expire_backend_auth_operation,
+    load_backend_auth_state, persist_backend_auth_state, probe_backend_account,
+    record_backend_auth_defer_intent, request_backend_auth_cancel, require_backend_ready_for_turn,
+    resolve_or_create_provider_codex_home, resume_all_backend_auth_defer_intents,
+    resume_backend_auth_defer_intent, run_backend_auth_cli_operation,
 };
 pub use background::{
     BackgroundTaskListOptions, BackgroundTaskRecord, BackgroundTaskRegistryReport,
@@ -189,6 +219,15 @@ pub use channel_state::{
     apply_channel_command_step, bind_channel_session_state_to_lane_v2, channel_session_state_file,
     channel_session_state_v2_file, migrate_legacy_channel_session_state_to_v2, read_agent_override,
     read_channel_session_state, read_channel_session_state_v2, write_channel_session_state_v2,
+};
+pub use codex_backend_provenance::{
+    CODEX_BACKEND_PROVENANCE_SCHEMA, CodexBackendProvenanceProbeOptions,
+    CodexBackendProvenanceReceiptV1, REQUIRED_CODEX_BACKEND_VERSION,
+    probe_codex_backend_provenance, write_codex_backend_provenance_receipt,
+};
+pub use codex_protocol_compat::{
+    CODEX_PROTOCOL_COMPATIBILITY_SCHEMA, CodexProtocolCompatibilityReportV1,
+    model_context_window_from_protocol_event, validate_codex_0_144_5_protocol_fixture,
 };
 pub use codex_runtime::{
     AssistantNarrationConfig, AssistantNarrationMode, CodexApprovalPolicy,
@@ -277,6 +316,32 @@ pub use dream_director::{
     DreamDirectorSendReport, dream_director_daily_state_dir, dream_director_send_receipt_file,
     run_dream_director_send,
 };
+pub use goal_budget::{
+    GOAL_CAMPAIGN_BUDGET_SCHEMA, GOAL_CAMPAIGN_STATUS_SCHEMA, GoalCampaignBudgetBoundary,
+    GoalCampaignBudgetInput, GoalCampaignBudgetReceiptV1, GoalCampaignPolicyV1,
+    GoalCampaignStatusReportV1, collect_goal_campaign_status, current_goal_campaign_timeouts,
+    evaluate_goal_campaign_budget, goal_campaign_budget_receipts_file, load_goal_campaign_policy,
+};
+pub use goal_continuation::{
+    GOAL_CONTINUATION_INTENT_SCHEMA, GoalAutonomyActivation, GoalAutonomyMode,
+    GoalContinuationIntentStatus, GoalContinuationIntentV1,
+    acknowledge_goal_continuation_after_lease, commit_goal_continuation_intent,
+    ensure_goal_continuation_enqueued, goal_continuation_intents_file,
+    latest_goal_continuation_intent, load_goal_autonomy_activation,
+    reconcile_goal_continuation_intents,
+};
+pub use goal_lineage::{
+    GOAL_LINEAGE_DOCTOR_SCHEMA, GOAL_LINEAGE_SCHEMA, GOAL_LINEAGE_SUPERSESSION_SCHEMA,
+    GoalLineageCampaignV1, GoalLineageDisposition, GoalLineageDoctorOptions,
+    GoalLineageDoctorReport, GoalLineageDoctorStatus, GoalLineageSupersessionOptions,
+    GoalLineageSupersessionV1, GoalLineageV1, GoalProjectionHint, append_goal_lineage_supersession,
+    goal_lineage_supersessions_file, latest_goal_projection_for_queue, run_goal_lineage_doctor,
+};
+pub use goal_transition::{
+    GOAL_SLICE_SCHEMA, GOAL_TRANSITION_SCHEMA, GoalTransitionAuthority, GoalTransitionDecision,
+    GoalTransitionEventKind, GoalTransitionInput, GoalTransitionReceiptV1, GoalTransitionSurface,
+    evaluate_goal_transition, goal_transition_receipts_file, record_goal_transition,
+};
 pub use harness_registry::{
     CredentialStatus, HarnessAgent, HarnessPlugin, HarnessProvider, HarnessRegistry,
     HarnessRegistryExport, HarnessRegistryReceipt, HarnessRegistryReceiptFile,
@@ -298,6 +363,10 @@ pub use importer::{
     ImportItem, ImportItemKind, ImportItemStatus, ImportReport, ImportReportSummary,
     ImportSemantics, NativeCronSemantics, ReportFiles, SessionSemantics, build_dry_run_report,
     execute_import, write_report_files,
+};
+pub use knowledge_classifier::{
+    KnowledgeClassificationOptions, classify_knowledge_candidate,
+    knowledge_classification_receipt_dir, persist_knowledge_classification_once,
 };
 pub use ledger_maintenance::{
     LEDGER_MAINTENANCE_WAKE_LANE, LedgerMaintenanceRunOptions, LedgerMaintenanceRunReport,
@@ -583,14 +652,38 @@ pub use skill_doctor::{
     SkillDoctorFinding, SkillDoctorOptions, SkillDoctorReport, SkillDoctorStatus,
     SkillDoctorSummary, run_skill_doctor, skill_doctor_receipts_file,
 };
+pub use skill_ecosystem_contracts::{
+    CanonicalKnowledgeDispositionV1, KNOWLEDGE_CLASSIFICATION_SCHEMA,
+    KnowledgeClassificationReceiptV1, SKILL_DELIVERY_SCHEMA, SKILL_DREAM_RUN_SCHEMA,
+    SKILL_LEARNING_SCHEMA, SKILL_OUTCOME_SCHEMA, SKILL_ROUTING_SCHEMA, SkillContractError,
+    SkillDeliveryReasonV2, SkillDeliveryReceiptV2, SkillDreamRunReceiptV1, SkillDreamTriggerV1,
+    SkillEcosystemIdentity, SkillLearningReceiptV2, SkillOutcomeReceiptV1, SkillOutcomeStatusV1,
+    SkillRoutingCandidateV2, SkillRoutingReceiptV2, VIRTUAL_SKILL_MANIFEST_SCHEMA,
+    VirtualSkillDeliveryLedgerEntryV1, VirtualSkillManifestEntryV1, VirtualSkillManifestStatus,
+    VirtualSkillManifestV1, VirtualSkillState, validate_joined_identity,
+};
 pub use skill_envelope::{
     SKILL_INVOCATION_ENVELOPE_SCHEMA, SkillEnvelopeError, SkillInvocationEnvelope,
     extract_user_instruction_from_skill_envelope, render_skill_invocation_envelope,
     skill_body_checksum, strip_skill_envelopes_for_memory,
 };
+pub use skill_episode::{
+    SKILL_EPISODE_SCHEMA, SKILL_TERMINAL_REVIEW_SCHEMA, SkillEpisodeRuntimeCaptureOptions,
+    SkillEpisodeRuntimeCaptureReport, SkillEpisodeUseEvidenceV2, SkillEpisodeV2,
+    SkillTerminalReviewReceiptV1, capture_skill_episode_runtime_evidence, join_skill_episode_v2,
+    skill_episode_receipt_dir, skill_outcome_receipt_dir, skill_terminal_review_receipt_dir,
+};
 pub use skill_guard::{
     SkillGuardFinding, SkillGuardOptions, SkillGuardReport, SkillGuardVerdict, run_skill_guard,
     skill_guard_receipts_file,
+};
+pub use skill_improvement::{
+    SKILL_IMPROVEMENT_PROPOSAL_SCHEMA, SKILL_IMPROVEMENT_TARGET_SCHEMA,
+    SemanticPatchProposalOptions, SkillImprovementProposalKindV1, SkillImprovementProposalV1,
+    SkillImprovementTargetOptions, SkillImprovementTargetReasonV1, SkillImprovementTargetV1,
+    SkillSynthesisProposalOptions, attribute_skill_improvement_target,
+    persist_skill_improvement_proposal_once, propose_novel_skill_synthesis,
+    propose_semantic_skill_patch, skill_improvement_proposal_dir,
 };
 pub use skill_learning::{
     LearningReviewOptions, LearningReviewReport, SkillArchiveOptions, SkillCuratorOptions,
@@ -609,6 +702,15 @@ pub use skill_pack::{
     SkillPackLock, SkillPackManifest, SkillPackManifestSkill, SkillPackRemoveOptions,
     SkillPackReport, SkillPackStatus, export_skill_pack, import_skill_pack, remove_skill_pack,
     skill_pack_lock_file, skill_pack_receipts_file,
+};
+pub use skill_router::{
+    SKILL_ROUTER_V2_METHOD, SKILL_ROUTER_V2_VERSION, SkillRouterV2Candidate, SkillRouterV2Policy,
+    SkillRouterV2Rejection, SkillRouterV2Result, SkillRoutingQueryV2, route_skills_v2,
+    routing_feature_map, selected_original_ids,
+};
+pub use skill_shadow_runtime::{
+    SkillShadowRuntimeReceiptOptions, record_skill_shadow_runtime_receipt,
+    skill_shadow_routing_receipt_dir,
 };
 pub use skill_synthesis::{
     SkillSynthesisOptions, SkillSynthesisReport, skill_synthesis_receipts_file, synthesize_skill,
@@ -680,6 +782,14 @@ pub use virtual_session_context::{
     VirtualSessionEvidenceAnchor, VirtualSessionEvidenceAnchors, VirtualSessionLane,
     VirtualSessionScopeDecision, VirtualSessionWorkingContext,
     resolve_virtual_session_working_context, resolve_virtual_session_working_context_for_lane,
+};
+pub use virtual_skill_manifest::{
+    VirtualSkillRuntimeObserveOptions, VirtualSkillRuntimeObserveReport, activate_manifest_skill,
+    close_virtual_skill_manifest, create_virtual_skill_manifest, load_virtual_skill_manifest,
+    observe_virtual_skill_runtime, persist_manifest, record_manifest_delivery,
+    record_manifest_delivery_receipt, register_manifest_skill, rollover_virtual_skill_manifest,
+    skill_delivery_receipt_dir, virtual_skill_manifest_dir, virtual_skill_manifest_file,
+    virtual_skill_manifest_observation_enabled,
 };
 pub use worker_adapters::{
     ControlledCoordinatorSmokeChildV1, ControlledCoordinatorSmokeLaneV1,
