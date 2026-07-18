@@ -1,5 +1,5 @@
 {
-  "schema": "agent-harness.round22.queued-before-lease-progress-replay.v1",
+  "schema": "agent-harness.continuity-effects.queued-before-lease-progress-replay.v1",
   "providers": ["telegram", "discord"],
   "events": [
     { "kind": "turn-a-lease-acquired", "atMs": 1000 },

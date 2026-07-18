@@ -1,5 +1,5 @@
 {
-  "schema": "agent-harness.round22.timeout-continuation-handoff-replay.v1",
+  "schema": "agent-harness.continuity-effects.timeout-continuation-handoff-replay.v1",
   "providers": ["telegram", "discord"],
   "events": [
     { "kind": "productive-timeout", "atMs": 1000 },

@@ -6,27 +6,27 @@ use ring::digest::{SHA256, digest};
 const FIXTURES: [(&str, &str); 6] = [
     (
         "account-continuation-double-bind-replay.json",
-        "442871f7079563a8ef4f5bffa20c5b67241253318c0148818afcbd3d9100f075",
+        "15306aac954c66d0e13b0f4f9ad6cf630a9988c2cf37cce9b20854bca0204f69",
     ),
     (
         "queued-before-lease-progress-replay.json",
-        "050142909fa689a3d05afd72182427d037a34fbdb886041831b75ddec6db4c04",
+        "112934bc32a24595c8a358d3425af2732742516140c3e4849311864fbdc42968",
     ),
     (
         "server-overloaded-protocol-replay.json",
-        "16647c4e59eaa14401d8b21cf2113430994862de52b86229efc000fdb7207eb8",
+        "4af06f426df3481a877164f44ff28dff3c463f23a3fcb141df4b9ad5ed976959",
     ),
     (
         "timeout-continuation-handoff-replay.json",
-        "1174156f28293cf0c08e7f7d9e733a7c1877ce433a4515252c2cc43a1157571c",
+        "ffbf16f7223f50fd54bd5fd0d6595d28cb4b3bd12d1c6a586966aa1224a7bbd4",
     ),
     (
         "deadline-drain-operation-plan-replay.json",
-        "2baffd905d20ddc9fa349a748c30dc2fb69cdd1d24ff805530ae5d23c4846fa3",
+        "fc7e1f40c80b88b516d7c8bd80238f2ac25f39b20dff7bd4cd1a2b44fda2437a",
     ),
     (
         "mcp-elicitation-external-effect-replay.json",
-        "3e016e60d44baecfa868446c5f28e4d7ac9b14fac17b6ed4401ffba0645add74",
+        "5e784d44652996c1e62af50c189f274c8693b983fc1922cf609572a4d7653386",
     ),
 ];
 
@@ -34,7 +34,7 @@ fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
-        .join("round22")
+        .join("continuity-effects")
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -42,7 +42,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 #[test]
-fn round22_replay_fixtures_are_checksum_bound_and_sanitized() {
+fn continuity_and_effect_replay_fixtures_are_checksum_bound_and_sanitized() {
     for (name, expected_sha256) in FIXTURES {
         let bytes = fs::read(fixture_dir().join(name)).unwrap();
         assert_eq!(

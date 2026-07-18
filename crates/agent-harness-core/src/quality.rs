@@ -1213,7 +1213,7 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
             promotion_gate: "Run the focused deadline-drain, absolute-timeout, sibling-state, and compact-handshake regressions plus the broader codex-runtime/context-rollover/runtime-pipeline packs. Live promotion remains a separate operator-authorized cutover with exact-lane receipts and rollback evidence.",
         },
         ScenarioMatrixEntry {
-            id: "round22-runtime-continuity",
+            id: "channel-continuity-and-safe-recovery",
             title: "Exact-lane ingress, durable retry, and typed task continuation",
             changed_areas: vec![
                 "channel ingress and session identity",
@@ -1238,7 +1238,7 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "todo/ready, stale, wrong-lane, stopped, superseded, or breaker-exhausted plan state cannot auto-loop",
             ],
             runnable_tests: vec![
-                "round22_fixture_integrity::round22_replay_fixtures_are_checksum_bound_and_sanitized",
+                "continuity_effect_fixture_integrity::continuity_and_effect_replay_fixtures_are_checksum_bound_and_sanitized",
                 "turns::tests::account_binding_is_idempotent_for_account_bound_root",
                 "runtime_worker::tests::explicit_runtime_queue_id_cannot_overtake_older_same_session_turn",
                 "runtime_pipeline::tests::server_overloaded_no_mutation_schedules_retry_instead_of_attempt_one_terminal",
@@ -1253,7 +1253,7 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "task_transition::tests::plan_change_before_child_admission_invalidates_snapshot",
                 "runtime_pipeline::tests::deadline_drain_operation_plan_replay_creates_one_child_and_one_eventual_final",
             ],
-            promotion_gate: "Run the Round22 sanitized fixture integrity test, focused identity/FIFO/progress/retry packs, and the real app-server deadline-drain replay twice with restart and compaction evidence before candidate promotion.",
+            promotion_gate: "Run the sanitized continuity/effect fixture integrity test, focused identity/FIFO/progress/retry packs, and the real app-server deadline-drain replay twice with restart and compaction evidence before candidate promotion.",
         },
         ScenarioMatrixEntry {
             id: "external-effect-approval",

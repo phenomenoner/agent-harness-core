@@ -7,7 +7,7 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](rust-toolchain.toml)
 [![Edition 2024](https://img.shields.io/badge/edition-2024-red.svg)](Cargo.toml)
-[![Version 0.9.0](https://img.shields.io/badge/version-0.9.0-blue.svg)](crates/agent-harness-core/Cargo.toml)
+[![Version 0.10.0](https://img.shields.io/badge/version-0.10.0-blue.svg)](crates/agent-harness-core/Cargo.toml)
 [![Platform: Windows-first](https://img.shields.io/badge/platform-Windows--first-0078d4.svg)](#faq)
 [![Status: Pre-release](https://img.shields.io/badge/status-pre--release-yellow.svg)](CHANGELOG.md)
 
@@ -78,6 +78,23 @@ flowchart LR
 
 The harness owns ingress, permissions, queuing, prompt assembly, delivery, long-task continuity, and audit. **Codex owns the model**: system prompt, tool schemas, MCP, sandbox, approvals, and session continuity. That split keeps the harness small, deterministic, and testable — 1,200+ tests run without any model call, using a bundled fake Codex app-server.
 
+### v0.10.0 continuity and external-effect boundary
+
+The v0.10.0 checkpoint makes channel continuity and external mutations explicit state-machine
+contracts. Exact channel-session identity is canonicalized before dispatch, queued work remains
+distinct from leased work, continuation parents cannot impersonate logical success, and structured
+provider overload recovery is gated by durable mutation evidence and retry eligibility.
+
+Deadline-drain completion can continue unfinished OperationPlan work only from a current exact-lane,
+versioned checkpoint with bounded breakers and one deterministic child. Recognized MCP connector
+elicitations park as `WaitingForApproval`; exact-lane expiring approve/deny capabilities and
+connector-specific readback prevent ambiguous writes from being blindly resubmitted. Provider error
+diagnostics are retained without absolute request URLs or credentials.
+
+These contracts are covered by sanitized Telegram/Discord scenario replays, restart and crash-window
+matrices, terminal-index reconciliation tests, and the public invariant/schema/scenario catalogs.
+Live deployment receipts and operator runbooks remain outside the public repository surface.
+
 ### v0.9.0 runtime boundary
 
 The v0.9.0 deployment contract exact-pins Codex CLI 0.144.5 and requires the supervisor to launch a deployment-owned canonical executable whose path, version, and SHA-256 are receipted. Harness-owned protocol compatibility still serializes resume/compact operations, preserves backend-reported `modelContextWindow`, and correlates completion events to the requesting operation; upgrading Codex alone is not treated as a race fix.
@@ -136,7 +153,7 @@ One binary, `agent-harness`, grouped into clear families:
 
 ## Project Status
 
-Version **0.9.0** is the current checkpoint release. The project remains pre-1.0, so interfaces may still change; the invariant catalog, schema registry, and scenario matrix define the public verification contracts for each release.
+Version **0.10.0** is the current checkpoint release. The project remains pre-1.0, so interfaces may still change; the invariant catalog, schema registry, and scenario matrix define the public verification contracts for each release.
 
 See the [Changelog](CHANGELOG.md) and the [Roadmap & Backlog](docs/agent-harness-core-roadmap-backlog.md) for what's done, gated, and next.
 

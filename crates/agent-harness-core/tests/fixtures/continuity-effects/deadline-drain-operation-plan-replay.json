@@ -1,5 +1,5 @@
 {
-  "schema": "agent-harness.round22.deadline-drain-operation-plan-replay.v1",
+  "schema": "agent-harness.continuity-effects.deadline-drain-operation-plan-replay.v1",
   "authority": {
     "kind": "operation-plan",
     "exactLaneDigest": "sha256:synthetic-lane",

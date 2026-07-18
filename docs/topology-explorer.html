@@ -219,7 +219,7 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "86b0c597a6f0a9300c67cbd7b0a63596b7f71bcac53b79e93c1e0586c2190a98"
+      "sha256": "0a4df84cf8a2d55809bd982609b570b0363e1ab803a83134b348570d8fe0c029"
     }
   ],
   "syncCommand": "python tools/generate_topology_explorer.py",
@@ -275,10 +275,10 @@
       "label": "channel_ingress / channel_runtime",
       "group": "component",
       "state": "implemented",
-      "summary": "command-vs-agent-turn decision",
-      "reads": "inbound platform event, identity binding, channel state",
-      "writes": "runtime queue item or command outbox",
-      "invariants": "I1, I8",
+      "summary": "command-vs-agent-turn decision plus exact-lane provider-neutral external-effect approve/deny resolution",
+      "reads": "inbound platform event, identity binding, channel state, protected approval capability",
+      "writes": "runtime queue item, command outbox, or one deterministic effect continuation",
+      "invariants": "I1, I3, I5, I7, I8, I17",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -288,10 +288,10 @@
       "label": "runtime_queue / runtime_worker",
       "group": "component",
       "state": "implemented",
-      "summary": "durable queue item lifecycle and lane concurrency",
-      "reads": "pending queue, leases, runtime class config",
-      "writes": "pending/status/lease receipts",
-      "invariants": "I1, I3, I5, I6, I8",
+      "summary": "durable queue item lifecycle, canonical same-session FIFO, lane concurrency, and persisted retry eligibility",
+      "reads": "pending queue, hot/cold receipt index, leases, runtime class config",
+      "writes": "pending/status/lease receipts and typed retry schedule",
+      "invariants": "I1, I3, I5, I6, I8, I17",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -318,6 +318,19 @@
       "reads": "registry, selected agent home/workspace and shared allowlisted skill namespaces, agent workspace/config files including static MEMORY.md, dynamic per-agent memory recall, channel state, artifact summaries, full lane, backend context generation",
       "writes": "prompt bundle, prompt manifest, skill-selection receipt, and lane-scoped injection ledger",
       "invariants": "I8, I11, I20",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "label": "skill_shadow_runtime / virtual_skill_manifest / skill_episode / knowledge_classifier / skill_improvement",
+      "group": "component",
+      "state": "implemented",
+      "summary": "independently gated F1 route observation, exact-virtual-session frozen manifest and delivery ledger, joined outcome/episode/terminal-review evidence, deterministic knowledge disposition, and reversible proposal-only improvement artifacts",
+      "reads": "active v4 selection, exact full/virtual lane, route receipt, backend generation, runtime terminal evidence, bounded verifier/correction evidence",
+      "writes": "privacy-safe route receipt, virtual manifest, delivery/outcome/episode/terminal-review/classification/target/proposal receipts; never serving or skill files from the observer path",
+      "invariants": "I8, I20, I28",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -366,10 +379,36 @@
       "label": "codex_runtime",
       "group": "component",
       "state": "implemented",
-      "summary": "app-server plan/executable resolution, preflight, startup/run, completion capture, tool-timeout recovery, and interrupted-command evidence",
-      "reads": "prompt bundle, Codex config, provider request policy",
-      "writes": "execution receipts, terminal protocol-error receipts, transcripts, completions, toolUseTimeout summaries, interruptedToolUses summaries",
-      "invariants": "I2, I3, I7, I10, I19",
+      "summary": "app-server plan/executable resolution, exact 0.144.5 protocol handling, preflight, startup/run, completion capture, deadline-drain checkpoint extraction, MCP elicitation response/parking, tool-timeout recovery, interrupted-command evidence, and explicit thread-level web-search mode",
+      "reads": "prompt bundle, Codex config, connector approval policy, provider request policy, same-connection provider capabilities, exact-lane web-search policy",
+      "writes": "execution receipts, bounded protocol failures, typed drain checkpoint, external-effect intent/state, terminal protocol-error receipts, transcripts, completions, and web-search receipts",
+      "invariants": "I2, I3, I5, I6, I7, I10, I19, I31, I38",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-external-effect",
+      "label": "external_effect",
+      "group": "component",
+      "state": "implemented",
+      "summary": "exact-lane connector action authority, expiring single-use capabilities, stable opaque idempotency markers/keys, mutation evidence, and readback-before-resubmission reconciliation",
+      "reads": "recognized MCP elicitation descriptor, connector policy, exact source queue/lane, protected token snapshot, exact-bound GitHub marker or provider-idempotency readback evidence",
+      "writes": "append-only effect/transition records, fenced token state, one exact-lane continuation intent, confirmed/absent/unprovable reconciliation",
+      "invariants": "I2, I3, I5, I6, I7, I10, I17, I31",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "component-codex-web-search",
+      "label": "codex_web_search",
+      "group": "component",
+      "state": "implemented",
+      "summary": "deterministic intent/lane classification, capability-gated effective mode, thread binding, limitation surface, and privacy-safe action observation",
+      "reads": "user intent, trusted replay/offline/sensitive metadata, exact lane digest, modelProvider/capabilities/read, webSearch items",
+      "writes": "codex-web-search-decision.v1, codex-web-search-thread-binding.v1, codex-web-search-action.v1",
+      "invariants": "I8, I11, I31, I38",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -388,14 +427,14 @@
       ]
     },
     {
-      "id": "component-runtime-pipeline",
-      "label": "runtime_pipeline",
+      "id": "component-runtime-pipeline-task-transition",
+      "label": "runtime_pipeline / task_transition",
       "group": "component",
       "state": "implemented",
-      "summary": "run-once orchestration, retry/dead-letter, final outbox repair, interruption summary classification, outbound media directive parsing and artifactRef resolution",
-      "reads": "queue item, Codex receipts, channel state, media policy config",
-      "writes": "run-once receipt, dead-letter receipt, final outbox, media policy/lint receipts",
-      "invariants": "I2, I3, I7, I8, I9, I16, I19",
+      "summary": "run-once orchestration, mutation-aware retry/dead-letter, final-outbox repair, typed OperationPlan deadline-drain authority, interruption classification, outbound media resolution, and terminal skill evidence",
+      "reads": "queue item, Codex receipts, exact-lane OperationPlan/checkpoint, channel state, media policy, prepared virtual evidence",
+      "writes": "typed run-once disposition/link/retry/task/effect fields, one commit-before-enqueue continuation, dead-letter/final outbox, and terminal review",
+      "invariants": "I2, I3, I5, I7, I8, I9, I10, I13, I17, I22, I31, I35, I37",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -405,10 +444,10 @@
       "label": "channel_delivery",
       "group": "component",
       "state": "implemented",
-      "summary": "provider-native delivery, retry, outbound presentation rendering, text chunking, terminal receipt precedence, and attachment-kind-aware media upload",
-      "reads": "outbox JSONL, optional rich-message presentation payloads, policy-validated attachments",
-      "writes": "delivery receipts, per-provider rendered-unit receipts with attachment kind and per-chunk text ids",
-      "invariants": "I2, I7, I9, I14, I16, I18",
+      "summary": "provider-native delivery, retry, outbound presentation rendering, text chunking, terminal receipt precedence, attachment-kind-aware media upload, and provider-error URL/credential redaction",
+      "reads": "outbox JSONL, optional rich-message presentation payloads, policy-validated attachments, bounded provider status/transport failures",
+      "writes": "delivery receipts, per-provider rendered-unit receipts with attachment kind and per-chunk text ids, redacted provider diagnostics without request URLs or credentials",
+      "invariants": "I2, I7, I9, I11, I14, I16, I18",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -609,6 +648,17 @@
       ]
     },
     {
+      "id": "impact-retry-deadline-drain-task-continuation-mcp-elicitation-or-external-connector-effects",
+      "label": "Retry, deadline-drain task continuation, MCP elicitation, or external connector effects",
+      "group": "gate",
+      "state": "release-gate",
+      "summary": "structured failure plus mutation evidence; persisted not-before and restart/compaction retention; exact-lane OperationPlan version/checkpoint/breaker matrix; one child and one eventual final; one elicitation response; explicit approval token isolation/fencing; readback before ambiguous resubmission; Telegram/Discord waiting-for-approval parity",
+      "reviewDocs": "docs/configuration.md, docs/invariants.md, docs/schema-registry.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
       "id": "impact-presentation-media-or-artifact-hygiene",
       "label": "Presentation, media, or artifact hygiene",
       "group": "gate",
@@ -626,6 +676,17 @@
       "state": "release-gate",
       "summary": "absent non-main directory isolation; safe worker agent ids and canonical session-path confinement; exact-lane/backend-generation manifest; eight static files and aliases; tombstones; dynamic-memory separation; /new isolation",
       "reviewDocs": "docs/configuration.md, docs/invariants.md, this file",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "impact-skill-routing-virtual-manifest-episode-classification-or-improvement",
+      "label": "Skill routing, virtual manifest, episode, classification, or improvement",
+      "group": "gate",
+      "state": "release-gate",
+      "summary": "separate default-off F1/F2 activation; active-selection and prompt byte identity; exact virtual digest; rollover rehydration without route/use; /new closure; unknown-until-verified outcome; append-once episode/review joins; deterministic exclusion/defer/reference; selected-only attribution abstention; checksummed reversible proposal-only output",
+      "reviewDocs": "docs/configuration.md, docs/invariants.md, docs/schema-registry.md, this file",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -805,6 +866,19 @@
       ]
     },
     {
+      "id": "gap-virtual-session-v2-authority-gap",
+      "label": "virtual-session-v2-authority-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Exact-lane v2 virtual-session authority",
+      "designTarget": "New production completion must not create accountless v1 working-set state. The authority boundary is platform/account/channel/user/agent/runtime/root-virtual-session/concrete-session plus backend generation.",
+      "currentEvidence": "Runtime completion now calls only record_completed_turn_working_set_snapshot_for_lane, emits virtual-session-authority.v1, and resolves the result through FullLaneKeyV1. Default-account legacy migration remains explicit; non-default lanes reject it. Focused production and resolver tests verify no new legacy index, exact account/agent separation, opaque prompt references, and generation-bound diagnostics.",
+      "promotionGate": "Promote only after goal lineage, continuation intents, final gating, and virtual skill manifests consume the same authority receipt; candidate T3 must show no accountless new writes, stale-generation continuation, or cross-lane lookup.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
       "id": "gap-progress-delivery-volume-gap",
       "label": "progress-delivery-volume-gap",
       "group": "gap",
@@ -909,14 +983,53 @@
       ]
     },
     {
-      "id": "gap-context-preflight-high-usage-gap",
-      "label": "context-preflight-high-usage-gap",
+      "id": "gap-context-capacity-correlation-gap",
+      "label": "context-capacity-correlation-gap",
       "group": "gap",
       "state": "open-gap",
-      "summary": "Context preflight high-usage guard",
-      "designTarget": "Bound Codex threads with very high recorded usage or known thread-health pollution should compact, checkpoint, or rotate to a fresh thread before heavy image/external-tool continuations, even when prompt bytes are modest and no modelContextWindow ratio is configured.",
-      "currentEvidence": "Local Round10 gap closure adds codex_runtime::tests::run_codex_runtime_preflight_compacts_high_usage_bound_thread_without_model_window, which failed first for a 136602-token replay with compactBeforeTurn=false and now passes by forcing compact through highContextUsageCompactTokenLimit. Round14 backlog staging adds codex_runtime::tests::context_preflight_rolls_over_bound_thread_inline_image_bloat and codex_runtime::tests::retryable_protocol_error_after_bloated_thread_rolls_over_to_fresh_thread, proving inline-image/oversized-output polluted bound threads use fresh-thread rollover before another doomed turn/start instead of resuming or compacting the same polluted thread.",
-      "promotionGate": "Promote only after Telegram/Discord replay proves high prior bound-thread usage and polluted thread-health receipts trigger compact/checkpoint/fresh-thread before heavy continuations, fallback does not reuse the overloaded context, and final outbox/progress surfaces remain separated.",
+      "summary": "Context capacity and preflight guard",
+      "designTarget": "A backend-reported modelContextWindow is capacity authority only for the same binding, provider/model route, and backend context generation while fresh. Pollution and model auto-compact policy run first; fresh live ratio then static route ratio run before the 120000 unknown/stale-capacity failsafe.",
+      "currentEvidence": "Round20 adds durable usage/index fields for capacity source, route, generation, and observation time; preflight receipts expose effective capacity/source/freshness. codex_runtime::tests::preflight_uses_fresh_binding_route_generation_capacity_before_120k_failsafe proves 134993/258400 neither warns nor compacts and 204759/258400 warns without compacting. codex_runtime::tests::preflight_rejects_wrong_backend_generation_capacity_and_keeps_unknown_failsafe proves stale-generation capacity cannot cross into policy. Existing pollution/fresh-thread tests remain authoritative before capacity policy.",
+      "promotionGate": "Promote only after the exact compact/resume incident replay proves restart-persisted 258400 capacity stays lane/generation-bound, the 120k failsafe appears only for unknown/stale capacity, and polluted contexts still checkpoint/roll over without final-surface leakage.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-compact-resume-goal-race-gap",
+      "label": "compact-resume-goal-race-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Resume-settle, compact correlation, and verified goal rollover",
+      "designTarget": "A successful thread/resume response is not settled state. The harness drains restored goal work before maintenance, correlates compact only by its request/thread/item lifecycle, and treats post-ack death as ambiguous. Safe fallback checkpoints bounded state and projects the active goal before opening a replacement generation; no explicit fallback turn is released until the new thread acknowledges and echoes the same active backend-goal checksum.",
+      "currentEvidence": "codex-resume-settle.v1, compact-attempt.v1, codex-goal-projection.v1, and codex-goal-rehydration.v1 retain resume/goal/compact/checkpoint correlation. Focused replays cover first-incident interrupted:null, compact-wins, reordered item-before-ack, and death-after-ack followed by verified thread-fresh goal echo. Completion criteria remain harness-authoritative via a separate checksum rather than being falsely attributed to the backend goal API.",
+      "promotionGate": "Promote only after v2 exact-lane authority, unified transition/continuation/final gates, duplicate/restart T3, and candidate/live readback prove one logical next slice and no campaign-final leakage.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-goal-lineage-reconciliation-gap",
+      "label": "goal-lineage-reconciliation-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Exact-lane goal lineage and reconciliation",
+      "designTarget": "Backend goal rows are execution observations, not autonomous authority by themselves. One protocol-state observer consumes every thread/goal/updated path, including stdout crash recovery. The harness derives a campaign family from exact lane, virtual session, and objective checksum, then binds each row to backend generation, source thread/turn, stable goal reference, projection checksum, completeness, and observation order.",
+      "currentEvidence": "Status-only updates inherit only an exact same-thread prior; incomplete updates remain fail-closed. Latest terminal status cannot fall back to an older active projection. goal-lineage-doctor is read-only and joins private goal projections with virtual-session-authority.v1; multiple active rows, wrong/missing identity, malformed receipts, and conflicting/tampered reconciliation fail closed. goal-lineage-supersede appends a deterministic same-campaign receipt and never deletes backend rows.",
+      "promotionGate": "Before goal-autonomy activation, run the doctor on the stopped-state candidate copy and retain a reviewed report showing exactly one runnable lineage. GOAL transition/intent/final gates and T3 remain required.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-goal-autonomy-activation-gap",
+      "label": "goal-autonomy-activation-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Unified goal transition and exactly-once continuation",
+      "designTarget": "Every normal completion, deadline drain, timeout, compact rollover, auth defer, restart, operator stop, newer steer, older-lineage completion, and runtime failure is classified before final-outbox selection. Active goal slices are progress-only unless the authoritative goal state is terminal.",
+      "currentEvidence": "goal-transition.v1 and goal-slice.v1 bind the decision to exact lineage/lane/virtual-session/backend generation and a campaign slice generation independent from context recovery depth. In active mode, goal-continuation-intent.v1 commits a deterministic key before enqueue, revalidates the parent FullLaneKey and virtual session, reconciles commit/enqueue crashes, and acknowledges only after the child owns the runtime lane lease. Terminal goal state commits goal-terminal-outbox.v1 before append; one exact campaign/lane/virtual-session decision owns one canonical message and deterministic v2 delivery ID, so a restart or competing slice repairs the append-before-receipt window without duplicate or late final. Parent-channel ownership and current exact-session checks keep worker/child and wrong-session evidence internal. goal-campaign-budget.v1 bounds each slice to 30–45 minutes and accumulates wall-clock, slice-count, token-cost, repeated-progress-fingerprint, and recovery-count breakers; reaching any boundary prevents the next child and uses the same sanitized terminal gate. goal-campaign-status is read-only. Configuration defaults to goalAutonomy.mode=observe; active mode additionally requires an exact activeLaneDigests cohort.",
+      "promotionGate": "Keep candidate/foundation behavior observe-only. Before C2-G, replay restart/compact and the full wrong-lane/worker matrix at T3, select exactly one reviewed lane digest with one runnable lineage, and retain activation/rollback receipts.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -940,9 +1053,9 @@
       "group": "gap",
       "state": "open-gap",
       "summary": "Skill ecosystem closed loop",
-      "designTarget": "Skills should behave as runtime state with deterministic per-agent discovery/selection, guarded prompt exposure, proposal-mediated mutation, first-class autonomous review/apply, reversible lifecycle curation, checksum-locked packs, and aggregate health evidence.",
-      "currentEvidence": "Staging adds matcher v4 with mixed CJK tokenizer, category/tag scoring, exact-agent usage priors, per-agent source roots, hard agents allowlists, lifecycle and explicit/model invocation gates, catalog retrieval, skill-view, skill-lint, skill-guard, reversible curator archive/restore/pin, file-based skill packs, skill-synthesize with autonomous apply by default, skill-apply --autonomous, skill-doctor, schema entries, and invariants I8/I20. lifecycle: retired / retired_historical and a non-matching agents allowlist cannot reach prompt selection; disabled model/user invocation remains independently enforceable. Direct writes remain forbidden; autonomous apply still uses proposal ids, checksum validation, target locks, backups, lint/guard decisions, and receipts.",
-      "promotionGate": "Promote only after focused tests plus the staging closed-loop replay prove CJK selection, retired/disabled/agent frontmatter gates, a main/non-main/third-agent source and usage-prior isolation matrix, no-skill complex turn synthesis, autonomous review/apply, re-selection of the created skill, pack export/import/remove round-trip, curator dry-run, skill-doctor --json, public/private hygiene, and no live cutover until explicit operator approval.",
+      "designTarget": "Skills should behave as runtime state with deterministic per-agent discovery/selection, guarded prompt exposure, proposal-mediated mutation, explicit guarded review/apply, reversible lifecycle curation, checksum-locked packs, and aggregate health evidence.",
+      "currentEvidence": "Staging adds matcher v4 with mixed CJK tokenizer, category/tag scoring, exact-agent usage priors, per-agent source roots, hard agents allowlists, lifecycle and explicit/model invocation gates, catalog retrieval, skill-view, skill-lint, skill-guard, reversible curator archive/restore/pin, file-based skill packs, proposal-only-default skill-synthesize, explicitly authorized skill-apply --autonomous, skill-doctor, schema entries, and invariants I8/I20. lifecycle: retired / retired_historical and a non-matching agents allowlist cannot reach prompt selection; disabled model/user invocation remains independently enforceable. Direct writes remain forbidden; explicit apply still uses proposal ids, checksum validation, target locks, backups, lint/guard decisions, and receipts.",
+      "promotionGate": "Promote only after focused tests plus the staging closed-loop replay prove CJK selection, retired/disabled/agent frontmatter gates, a main/non-main/third-agent source and usage-prior isolation matrix, no-skill complex turn proposal creation, default zero mutation, explicitly authorized review/apply, re-selection of the created skill, pack export/import/remove round-trip, curator dry-run, skill-doctor --json, public/private hygiene, and no live cutover until explicit operator approval.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -1090,6 +1203,11 @@
     },
     {
       "source": "canon-topology-contract",
+      "target": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
       "target": "component-workers-child-execution-policy",
       "label": "owns boundary"
     },
@@ -1110,12 +1228,22 @@
     },
     {
       "source": "canon-topology-contract",
+      "target": "component-external-effect",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
+      "target": "component-codex-web-search",
+      "label": "owns boundary"
+    },
+    {
+      "source": "canon-topology-contract",
       "target": "component-provider-request-policy",
       "label": "owns boundary"
     },
     {
       "source": "canon-topology-contract",
-      "target": "component-runtime-pipeline",
+      "target": "component-runtime-pipeline-task-transition",
       "label": "owns boundary"
     },
     {
@@ -1275,7 +1403,17 @@
     },
     {
       "source": "axis-agentid",
+      "target": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
       "target": "component-codex-runtime",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-agentid",
+      "target": "component-codex-web-search",
       "label": "must survive through"
     },
     {
@@ -1285,7 +1423,7 @@
     },
     {
       "source": "axis-agentid",
-      "target": "component-runtime-pipeline",
+      "target": "component-runtime-pipeline-task-transition",
       "label": "must survive through"
     },
     {
@@ -1330,12 +1468,22 @@
     },
     {
       "source": "axis-sessionkey",
+      "target": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-sessionkey",
       "target": "component-codex-runtime",
       "label": "must survive through"
     },
     {
       "source": "axis-sessionkey",
-      "target": "component-runtime-pipeline",
+      "target": "component-codex-web-search",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-sessionkey",
+      "target": "component-runtime-pipeline-task-transition",
       "label": "must survive through"
     },
     {
@@ -1356,6 +1504,11 @@
     {
       "source": "axis-virtualsessionid",
       "target": "component-prompt-turns",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-virtualsessionid",
+      "target": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
       "label": "must survive through"
     },
     {
@@ -1405,6 +1558,11 @@
     },
     {
       "source": "axis-sourcequeueid",
+      "target": "component-codex-web-search",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-sourcequeueid",
       "target": "component-channel-delivery",
       "label": "must survive through"
     },
@@ -1416,6 +1574,11 @@
     {
       "source": "axis-backendcontextgeneration",
       "target": "component-prompt-turns",
+      "label": "must survive through"
+    },
+    {
+      "source": "axis-backendcontextgeneration",
+      "target": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
       "label": "must survive through"
     },
     {
@@ -1469,6 +1632,11 @@
       "label": "changes trigger"
     },
     {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
+      "label": "changes trigger"
+    },
+    {
       "source": "component-worker-result-mailbox-coordinator-resume",
       "target": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
       "label": "changes trigger"
@@ -1479,7 +1647,7 @@
       "label": "changes trigger"
     },
     {
-      "source": "component-runtime-pipeline",
+      "source": "component-runtime-pipeline-task-transition",
       "target": "impact-runtime-queue-worker-mailbox-coordinator-or-leases",
       "label": "changes trigger"
     },
@@ -1499,12 +1667,22 @@
       "label": "changes trigger"
     },
     {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
+      "label": "changes trigger"
+    },
+    {
       "source": "component-codex-runtime",
       "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
       "label": "changes trigger"
     },
     {
-      "source": "component-runtime-pipeline",
+      "source": "component-codex-web-search",
+      "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition",
       "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
       "label": "changes trigger"
     },
@@ -1516,6 +1694,21 @@
     {
       "source": "component-progress",
       "target": "impact-codex-runtime-final-outbox-delivery-or-progress",
+      "label": "changes trigger"
+    },
+    {
+      "source": "impact-retry-deadline-drain-task-continuation-mcp-elicitation-or-external-connector-effects",
+      "target": "canon-topology-contract",
+      "label": "reviewed by"
+    },
+    {
+      "source": "component-external-effect",
+      "target": "impact-retry-deadline-drain-task-continuation-mcp-elicitation-or-external-connector-effects",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition",
+      "target": "impact-retry-deadline-drain-task-continuation-mcp-elicitation-or-external-connector-effects",
       "label": "changes trigger"
     },
     {
@@ -1539,6 +1732,16 @@
       "label": "changes trigger"
     },
     {
+      "source": "impact-skill-routing-virtual-manifest-episode-classification-or-improvement",
+      "target": "canon-topology-contract",
+      "label": "reviewed by"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "impact-skill-routing-virtual-manifest-episode-classification-or-improvement",
+      "label": "changes trigger"
+    },
+    {
       "source": "impact-provider-model-request-overrides",
       "target": "canon-topology-contract",
       "label": "reviewed by"
@@ -1552,6 +1755,11 @@
       "source": "impact-memory-or-session-history-search",
       "target": "canon-topology-contract",
       "label": "reviewed by"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "impact-memory-or-session-history-search",
+      "label": "changes trigger"
     },
     {
       "source": "component-memory-session-history-retrieval",
@@ -1570,6 +1778,11 @@
     },
     {
       "source": "component-cron-scheduler-deterministic-cron",
+      "target": "impact-supervisor-task-scheduler-or-cutover-ownership",
+      "label": "changes trigger"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition",
       "target": "impact-supervisor-task-scheduler-or-cutover-ownership",
       "label": "changes trigger"
     },
@@ -1594,12 +1807,17 @@
       "label": "has gap"
     },
     {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-bounded-ledger-maintenance-live-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-codex-runtime",
       "target": "gap-bounded-ledger-maintenance-live-gap",
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline",
+      "source": "component-runtime-pipeline-task-transition",
       "target": "gap-bounded-ledger-maintenance-live-gap",
       "label": "has gap"
     },
@@ -1639,6 +1857,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-runtime-pipeline-task-transition",
+      "target": "gap-supervisor-plan-configured-loop-parity-live-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-ledger-maintenance",
       "target": "gap-supervisor-plan-configured-loop-parity-live-gap",
       "label": "has gap"
@@ -1674,6 +1897,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-workers-child-execution-policy",
       "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
       "label": "has gap"
@@ -1694,7 +1922,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline",
+      "source": "component-runtime-pipeline-task-transition",
       "target": "gap-gpt56-max-prompt-coordinator-cutover-gap",
       "label": "has gap"
     },
@@ -1754,12 +1982,22 @@
       "label": "has gap"
     },
     {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-interrupted-command-observability-live-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-codex-runtime",
       "target": "gap-interrupted-command-observability-live-gap",
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline",
+      "source": "component-codex-web-search",
+      "target": "gap-interrupted-command-observability-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition",
       "target": "gap-interrupted-command-observability-live-gap",
       "label": "has gap"
     },
@@ -1834,6 +2072,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-codex-web-search",
+      "target": "gap-channel-session-history-classification-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-provider-request-policy",
       "target": "gap-channel-session-history-classification-gap",
       "label": "has gap"
@@ -1879,6 +2122,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-worker-result-mailbox-coordinator-resume",
       "target": "gap-multi-agent-full-matrix-gap",
       "label": "has gap"
@@ -1889,12 +2137,17 @@
       "label": "has gap"
     },
     {
+      "source": "component-codex-web-search",
+      "target": "gap-multi-agent-full-matrix-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-provider-request-policy",
       "target": "gap-multi-agent-full-matrix-gap",
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline",
+      "source": "component-runtime-pipeline-task-transition",
       "target": "gap-multi-agent-full-matrix-gap",
       "label": "has gap"
     },
@@ -1939,12 +2192,22 @@
       "label": "has gap"
     },
     {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-codex-runtime",
       "target": "gap-virtual-session-continuity-gap",
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline",
+      "source": "component-codex-web-search",
+      "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition",
       "target": "gap-virtual-session-continuity-gap",
       "label": "has gap"
     },
@@ -1956,6 +2219,66 @@
     {
       "source": "component-memory-session-history-retrieval",
       "target": "gap-virtual-session-continuity-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-virtual-session-v2-authority-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-prompt-turns",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-virtual-session-v2-authority-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-virtual-session-v2-authority-gap",
       "label": "has gap"
     },
     {
@@ -2049,12 +2372,22 @@
       "label": "has gap"
     },
     {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-progress-final-surface-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-codex-runtime",
       "target": "gap-progress-final-surface-gap",
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline",
+      "source": "component-codex-web-search",
+      "target": "gap-progress-final-surface-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition",
       "target": "gap-progress-final-surface-gap",
       "label": "has gap"
     },
@@ -2084,12 +2417,32 @@
       "label": "has gap"
     },
     {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-codex-runtime",
       "target": "gap-tool-use-timeout-recovery-gap",
       "label": "has gap"
     },
     {
+      "source": "component-external-effect",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-provider-request-policy",
+      "target": "gap-tool-use-timeout-recovery-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition",
       "target": "gap-tool-use-timeout-recovery-gap",
       "label": "has gap"
     },
@@ -2124,6 +2477,16 @@
       "label": "has gap"
     },
     {
+      "source": "component-external-effect",
+      "target": "gap-codex-absolute-deadline-drain-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "gap-codex-absolute-deadline-drain-gap",
+      "label": "has gap"
+    },
+    {
       "source": "gap-codex-startup-executable-stability-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
@@ -2149,6 +2512,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-workers-child-execution-policy",
       "target": "gap-codex-startup-executable-stability-gap",
       "label": "has gap"
@@ -2159,7 +2527,12 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline",
+      "source": "component-codex-web-search",
+      "target": "gap-codex-startup-executable-stability-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition",
       "target": "gap-codex-startup-executable-stability-gap",
       "label": "has gap"
     },
@@ -2189,6 +2562,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-runtime-terminal-control-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-workers-child-execution-policy",
       "target": "gap-runtime-terminal-control-gap",
       "label": "has gap"
@@ -2199,7 +2577,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline",
+      "source": "component-runtime-pipeline-task-transition",
       "target": "gap-runtime-terminal-control-gap",
       "label": "has gap"
     },
@@ -2269,6 +2647,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-worker-result-mailbox-coordinator-resume",
       "target": "gap-external-review-loop-resilience-gap",
       "label": "has gap"
@@ -2279,7 +2662,17 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline",
+      "source": "component-external-effect",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "gap-external-review-loop-resilience-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition",
       "target": "gap-external-review-loop-resilience-gap",
       "label": "has gap"
     },
@@ -2294,33 +2687,203 @@
       "label": "has gap"
     },
     {
-      "source": "gap-context-preflight-high-usage-gap",
+      "source": "gap-context-capacity-correlation-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
     },
     {
       "source": "component-channel-ingress-channel-runtime",
-      "target": "gap-context-preflight-high-usage-gap",
+      "target": "gap-context-capacity-correlation-gap",
       "label": "has gap"
     },
     {
       "source": "component-runtime-queue-runtime-worker",
-      "target": "gap-context-preflight-high-usage-gap",
+      "target": "gap-context-capacity-correlation-gap",
       "label": "has gap"
     },
     {
-      "source": "component-prompt-turns",
-      "target": "gap-context-preflight-high-usage-gap",
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-context-capacity-correlation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-context-capacity-correlation-gap",
       "label": "has gap"
     },
     {
       "source": "component-codex-runtime",
-      "target": "gap-context-preflight-high-usage-gap",
+      "target": "gap-context-capacity-correlation-gap",
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline",
-      "target": "gap-context-preflight-high-usage-gap",
+      "source": "component-external-effect",
+      "target": "gap-context-capacity-correlation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "gap-context-capacity-correlation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-context-capacity-correlation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition",
+      "target": "gap-context-capacity-correlation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-compact-resume-goal-race-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-compact-resume-goal-race-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-compact-resume-goal-race-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "gap-compact-resume-goal-race-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime",
+      "target": "gap-compact-resume-goal-race-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-web-search",
+      "target": "gap-compact-resume-goal-race-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-provider-request-policy",
+      "target": "gap-compact-resume-goal-race-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-ledger-maintenance",
+      "target": "gap-compact-resume-goal-race-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-goal-lineage-reconciliation-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-goal-lineage-reconciliation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-goal-lineage-reconciliation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-goal-lineage-reconciliation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-goal-lineage-reconciliation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-cron-scheduler-deterministic-cron",
+      "target": "gap-goal-lineage-reconciliation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-goal-lineage-reconciliation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-goal-autonomy-activation-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-goal-autonomy-activation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-state",
+      "target": "gap-goal-autonomy-activation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime",
+      "target": "gap-goal-autonomy-activation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-goal-autonomy-activation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-goal-autonomy-activation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-goal-autonomy-activation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-cron-scheduler-deterministic-cron",
+      "target": "gap-goal-autonomy-activation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "gap-goal-autonomy-activation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime",
+      "target": "gap-goal-autonomy-activation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition",
+      "target": "gap-goal-autonomy-activation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-channel-delivery",
+      "target": "gap-goal-autonomy-activation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-progress",
+      "target": "gap-goal-autonomy-activation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "gap-goal-autonomy-activation-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-memory-session-history-retrieval",
+      "target": "gap-goal-autonomy-activation-gap",
       "label": "has gap"
     },
     {
@@ -2354,6 +2917,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-first-class-command-plane-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-workers-child-execution-policy",
       "target": "gap-first-class-command-plane-gap",
       "label": "has gap"
@@ -2374,7 +2942,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline",
+      "source": "component-runtime-pipeline-task-transition",
       "target": "gap-first-class-command-plane-gap",
       "label": "has gap"
     },
@@ -2424,6 +2992,11 @@
       "label": "has gap"
     },
     {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-skill-ecosystem-closed-loop-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-cron-scheduler-deterministic-cron",
       "target": "gap-skill-ecosystem-closed-loop-gap",
       "label": "has gap"
@@ -2434,7 +3007,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline",
+      "source": "component-runtime-pipeline-task-transition",
       "target": "gap-skill-ecosystem-closed-loop-gap",
       "label": "has gap"
     },
@@ -2470,6 +3043,11 @@
     },
     {
       "source": "component-codex-runtime",
+      "target": "gap-fast",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-web-search",
       "target": "gap-fast",
       "label": "has gap"
     },
@@ -2599,7 +3177,17 @@
       "label": "has gap"
     },
     {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-generic-artifact-context-hygiene-gap",
+      "label": "has gap"
+    },
+    {
       "source": "component-codex-runtime",
+      "target": "gap-generic-artifact-context-hygiene-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-web-search",
       "target": "gap-generic-artifact-context-hygiene-gap",
       "label": "has gap"
     },
@@ -2609,7 +3197,7 @@
       "label": "has gap"
     },
     {
-      "source": "component-runtime-pipeline",
+      "source": "component-runtime-pipeline-task-transition",
       "target": "gap-generic-artifact-context-hygiene-gap",
       "label": "has gap"
     },
@@ -2639,9 +3227,19 @@
       "label": "has gap"
     },
     {
+      "source": "component-codex-web-search",
+      "target": "gap-image-route-vs-input-classification-gap",
+      "label": "has gap"
+    },
+    {
       "source": "gap-repo-code-graph-support-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-repo-code-graph-support-gap",
+      "label": "has gap"
     },
     {
       "source": "component-cron-scheduler-deterministic-cron",
@@ -2672,6 +3270,11 @@
       "source": "gap-scenario-matrix-coverage-gap",
       "target": "canon-topology-contract",
       "label": "tracked in"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-scenario-matrix-coverage-gap",
+      "label": "has gap"
     },
     {
       "source": "component-channel-delivery",
@@ -2706,7 +3309,6 @@
         "component-runtime-queue-runtime-worker",
         "component-prompt-turns",
         "component-codex-runtime",
-        "component-runtime-pipeline",
         "component-channel-delivery"
       ],
       "steps": [
@@ -2743,7 +3345,6 @@
         "component-channel-state",
         "component-prompt-turns",
         "component-runtime-queue-runtime-worker",
-        "component-runtime-pipeline",
         "gap-multi-agent-full-matrix-gap",
         "gap-per-agent-memory-recall-compartment-gap"
       ],
@@ -2775,7 +3376,6 @@
         "component-runtime-queue-runtime-worker",
         "component-codex-runtime",
         "component-progress",
-        "component-runtime-pipeline",
         "component-channel-delivery",
         "gap-tool-use-timeout-recovery-gap",
         "gap-progress-delivery-volume-gap",

@@ -14502,7 +14502,7 @@ mod tests {
     #[test]
     fn server_overloaded_metadata_survives_protocol_parsing() {
         let fixture: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/round22/server-overloaded-protocol-replay.json"
+            "../tests/fixtures/continuity-effects/server-overloaded-protocol-replay.json"
         ))
         .unwrap();
         let failure = protocol_failure_from_value(&fixture["protocolEvent"]).unwrap();

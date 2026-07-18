@@ -1,5 +1,5 @@
 {
-  "schema": "agent-harness.round22.account-continuation-double-bind-replay.v1",
+  "schema": "agent-harness.continuity-effects.account-continuation-double-bind-replay.v1",
   "lane": {
     "platform": "telegram",
     "accountId": "account-a",
