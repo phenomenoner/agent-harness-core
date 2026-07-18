@@ -26,6 +26,7 @@ const HISTORY_FILE_NAME: &str = "run-once-receipt-history.sqlite";
 const HISTORY_STATE_STAGED: &str = "staged";
 const HISTORY_STATE_COMMITTED: &str = "committed";
 const MAX_REASON_CHARS: usize = 512;
+const MAX_DISPOSITION_JSON_CHARS: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeQueueReceiptHistoryStaging {
@@ -47,6 +48,11 @@ pub(crate) struct RuntimeQueueTerminalHistoryRecord {
     pub(crate) transcript_file: Option<PathBuf>,
     pub(crate) occurred_at_ms: Option<i64>,
     pub(crate) compacted_at_ms: i64,
+    pub(crate) terminal_disposition: Option<String>,
+    pub(crate) child_queue_id: Option<String>,
+    pub(crate) continuation_index: Option<u64>,
+    pub(crate) task_disposition: Option<String>,
+    pub(crate) effect_disposition: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -69,6 +75,11 @@ struct TerminalHistoryCandidate {
     origin: Option<String>,
     transcript_file: Option<PathBuf>,
     occurred_at_ms: Option<i64>,
+    terminal_disposition: Option<String>,
+    child_queue_id: Option<String>,
+    continuation_index: Option<u64>,
+    task_disposition: Option<String>,
+    effect_disposition: Option<String>,
 }
 
 /// Returns the SQLite history store colocated with the runtime queue ledgers.
@@ -142,8 +153,9 @@ pub(crate) fn stage_runtime_queue_receipt_history(
                 "INSERT INTO runtime_receipt_terminal_history \
                  (transaction_id, queue_id, trace_id, session_key, status, reason, \
                   terminal_control_source, runtime_class, origin, transcript_file, \
-                  occurred_at_ms, compacted_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                  occurred_at_ms, compacted_at_ms, terminal_disposition, child_queue_id, \
+                  continuation_index, task_disposition, effect_disposition) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     transaction_id,
                     record.queue_id,
@@ -160,6 +172,11 @@ pub(crate) fn stage_runtime_queue_receipt_history(
                         .map(|path| path.to_string_lossy().into_owned()),
                     record.occurred_at_ms,
                     now_ms,
+                    record.terminal_disposition,
+                    record.child_queue_id,
+                    record.continuation_index.and_then(|value| i64::try_from(value).ok()),
+                    record.task_disposition,
+                    record.effect_disposition,
                 ],
             )
             .map_err(io::Error::other)?;
@@ -405,11 +422,13 @@ pub(crate) fn find_runtime_queue_terminal_history(
     let placeholders = std::iter::repeat_n("?", identifiers.len())
         .collect::<Vec<_>>()
         .join(", ");
+    let optional_columns = terminal_history_optional_select_columns(&connection)?;
     let statement = format!(
         "SELECT history.row_id, history.queue_id, history.trace_id, history.session_key, \
                 history.status, history.reason, history.terminal_control_source, \
                 history.runtime_class, history.origin, history.transcript_file, \
-                history.occurred_at_ms, history.compacted_at_ms \
+                history.occurred_at_ms, history.compacted_at_ms, \
+                {optional_columns} \
          FROM runtime_receipt_terminal_history AS history \
          INNER JOIN runtime_receipt_history_transactions AS tx \
              ON tx.transaction_id = history.transaction_id \
@@ -452,11 +471,13 @@ pub(crate) fn find_runtime_queue_terminal_history_nonblocking(
     let placeholders = std::iter::repeat_n("?", identifiers.len())
         .collect::<Vec<_>>()
         .join(", ");
+    let optional_columns = terminal_history_optional_select_columns(&connection)?;
     let statement = format!(
         "SELECT history.row_id, history.queue_id, history.trace_id, history.session_key, \
                 history.status, history.reason, history.terminal_control_source, \
                 history.runtime_class, history.origin, history.transcript_file, \
-                history.occurred_at_ms, history.compacted_at_ms \
+                history.occurred_at_ms, history.compacted_at_ms, \
+                {optional_columns} \
          FROM runtime_receipt_terminal_history AS history \
          INNER JOIN runtime_receipt_history_transactions AS tx \
              ON tx.transaction_id = history.transaction_id \
@@ -600,6 +621,11 @@ fn initialize_history_store(connection: &Connection) -> io::Result<()> {
                  transcript_file TEXT,
                  occurred_at_ms INTEGER,
                  compacted_at_ms INTEGER NOT NULL,
+                 terminal_disposition TEXT,
+                 child_queue_id TEXT,
+                 continuation_index INTEGER,
+                 task_disposition TEXT,
+                 effect_disposition TEXT,
                  UNIQUE (transaction_id, queue_id),
                  FOREIGN KEY (transaction_id) REFERENCES runtime_receipt_history_transactions(transaction_id) ON DELETE CASCADE
              );
@@ -611,6 +637,7 @@ fn initialize_history_store(connection: &Connection) -> io::Result<()> {
                  ON runtime_receipt_terminal_history(session_key);",
         )
         .map_err(io::Error::other)?;
+    ensure_terminal_history_optional_columns(connection)?;
     let existing_schema: Option<String> = connection
         .query_row(
             "SELECT schema FROM runtime_receipt_history_meta WHERE singleton = 1",
@@ -640,6 +667,80 @@ fn initialize_history_store(connection: &Connection) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn terminal_history_column_names(connection: &Connection) -> io::Result<HashSet<String>> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(runtime_receipt_terminal_history)")
+        .map_err(io::Error::other)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(io::Error::other)?;
+    rows.collect::<Result<HashSet<_>, _>>()
+        .map_err(io::Error::other)
+}
+
+fn ensure_terminal_history_optional_columns(connection: &Connection) -> io::Result<()> {
+    let mut columns = terminal_history_column_names(connection)?;
+    for (name, sql) in [
+        (
+            "terminal_disposition",
+            "ALTER TABLE runtime_receipt_terminal_history ADD COLUMN terminal_disposition TEXT",
+        ),
+        (
+            "child_queue_id",
+            "ALTER TABLE runtime_receipt_terminal_history ADD COLUMN child_queue_id TEXT",
+        ),
+        (
+            "continuation_index",
+            "ALTER TABLE runtime_receipt_terminal_history ADD COLUMN continuation_index INTEGER",
+        ),
+        (
+            "task_disposition",
+            "ALTER TABLE runtime_receipt_terminal_history ADD COLUMN task_disposition TEXT",
+        ),
+        (
+            "effect_disposition",
+            "ALTER TABLE runtime_receipt_terminal_history ADD COLUMN effect_disposition TEXT",
+        ),
+    ] {
+        if columns.insert(name.to_string()) {
+            connection.execute(sql, []).map_err(io::Error::other)?;
+        }
+    }
+    Ok(())
+}
+
+fn terminal_history_optional_select_columns(connection: &Connection) -> io::Result<String> {
+    let columns = terminal_history_column_names(connection)?;
+    Ok([
+        if columns.contains("terminal_disposition") {
+            "history.terminal_disposition"
+        } else {
+            "NULL AS terminal_disposition"
+        },
+        if columns.contains("child_queue_id") {
+            "history.child_queue_id"
+        } else {
+            "NULL AS child_queue_id"
+        },
+        if columns.contains("continuation_index") {
+            "history.continuation_index"
+        } else {
+            "NULL AS continuation_index"
+        },
+        if columns.contains("task_disposition") {
+            "history.task_disposition"
+        } else {
+            "NULL AS task_disposition"
+        },
+        if columns.contains("effect_disposition") {
+            "history.effect_disposition"
+        } else {
+            "NULL AS effect_disposition"
+        },
+    ]
+    .join(", "))
 }
 
 fn parse_jsonl_records(bytes: &[u8]) -> Vec<Value> {
@@ -766,10 +867,42 @@ fn latest_terminal_records(
                         "at_ms",
                     ],
                 ),
+                terminal_disposition: optional_text(
+                    record,
+                    &["terminalDisposition", "terminal_disposition"],
+                ),
+                child_queue_id: record
+                    .get("continuationLink")
+                    .and_then(|link| optional_text(link, &["childQueueId", "child_queue_id"]))
+                    .or_else(|| optional_text(record, &["childQueueId", "child_queue_id"])),
+                continuation_index: record
+                    .get("continuationLink")
+                    .and_then(|link| {
+                        link.get("continuationIndex")
+                            .or_else(|| link.get("continuation_index"))
+                    })
+                    .and_then(Value::as_u64),
+                task_disposition: bounded_json_field(
+                    record,
+                    &["taskDrainEvaluation", "task_drain_evaluation"],
+                ),
+                effect_disposition: bounded_json_field(
+                    record,
+                    &["externalEffect", "external_effect"],
+                ),
             },
         );
     }
     latest
+}
+
+fn bounded_json_field(record: &Value, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| record.get(*name))
+        .filter(|value| !value.is_null())
+        .and_then(|value| serde_json::to_string(value).ok())
+        .map(|value| truncate_chars(&value, MAX_DISPOSITION_JSON_CHARS))
 }
 
 /// A schema-less receipt is a supported legacy artifact. An explicit unknown
@@ -849,6 +982,13 @@ fn read_terminal_history_rows(
                 transcript_file: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
                 occurred_at_ms: row.get(10)?,
                 compacted_at_ms: row.get(11)?,
+                terminal_disposition: row.get(12)?,
+                child_queue_id: row.get(13)?,
+                continuation_index: row
+                    .get::<_, Option<i64>>(14)?
+                    .and_then(|value| u64::try_from(value).ok()),
+                task_disposition: row.get(15)?,
+                effect_disposition: row.get(16)?,
             })
         })
         .map_err(io::Error::other)?;
@@ -886,6 +1026,13 @@ fn read_terminal_history_rows_nonblocking(
                 transcript_file: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
                 occurred_at_ms: row.get(10)?,
                 compacted_at_ms: row.get(11)?,
+                terminal_disposition: row.get(12)?,
+                child_queue_id: row.get(13)?,
+                continuation_index: row
+                    .get::<_, Option<i64>>(14)?
+                    .and_then(|value| u64::try_from(value).ok()),
+                task_disposition: row.get(15)?,
+                effect_disposition: row.get(16)?,
             })
         })
         .map_err(nonblocking_history_io_error)?;
@@ -905,6 +1052,185 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn continuation_disposition_and_link_survive_compaction() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-harness-runtime-continuation-history-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let queue_dir = root.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let original = br#"{"queueId":"parent","status":"skipped","reason":"continued","terminalDisposition":"continuation-handoff","continuationLink":{"parentQueueId":"parent","childQueueId":"child","continuationIndex":2},"taskDrainEvaluation":{"scheduleContinuation":true,"reason":"open plan"},"externalEffect":{"effectId":"effect-1","state":"confirmed","paramsDigest":"sha256:redacted"}}
+"#;
+        let staged = stage_runtime_queue_receipt_history(
+            &queue_dir,
+            "typed-continuation-transaction",
+            original,
+            b"",
+            &HashSet::new(),
+            100,
+        )
+        .unwrap();
+        commit_runtime_queue_receipt_history(&staged, 101).unwrap();
+        let records = find_runtime_queue_terminal_history(
+            &queue_dir,
+            &BTreeSet::from(["parent".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].terminal_disposition.as_deref(),
+            Some("continuation-handoff")
+        );
+        assert_eq!(records[0].child_queue_id.as_deref(), Some("child"));
+        assert_eq!(records[0].continuation_index, Some(2));
+        assert!(
+            records[0]
+                .task_disposition
+                .as_deref()
+                .is_some_and(|value| value.contains("scheduleContinuation"))
+        );
+        assert!(
+            records[0]
+                .effect_disposition
+                .as_deref()
+                .is_some_and(|value| value.contains("effect-1"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retry_lineage_and_schedule_survive_required_retention_path() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-harness-runtime-retry-retention-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        fs::write(
+            queue_dir.join("pending.jsonl"),
+            serde_json::json!({"queueId":"turn:retry","status":"queued"}).to_string(),
+        )
+        .unwrap();
+        let lineage_id = "runtime-retry:turn:retry";
+        fs::write(
+            queue_dir.join("run-once-receipts.jsonl"),
+            [
+                serde_json::json!({
+                    "schema":"agent-harness.runtime-run-once.v1",
+                    "queueId":"turn:historical",
+                    "traceId":"trace:historical",
+                    "status":"completed",
+                    "reason":"terminal history is eligible for cold storage"
+                }),
+                serde_json::json!({
+                    "schema":"agent-harness.runtime-run-once.v1",
+                    "queueId":"turn:retry",
+                    "status":"failed-retryable",
+                    "reason":"first retry failure",
+                    "retrySchedule": {
+                        "lineageId": lineage_id,
+                        "attempt": 1,
+                        "maxAttempts": 3,
+                        "delayMs": 1000,
+                        "scheduledAtMs": 100,
+                        "nextEligibleAtMs": 1100,
+                        "replayMode": "same-request-no-observable-mutation"
+                    }
+                }),
+                serde_json::json!({
+                    "schema":"agent-harness.runtime-run-once.v1",
+                    "queueId":"turn:retry",
+                    "status":"retry-pending",
+                    "reason":"retry remains runnable",
+                    "retrySchedule": {
+                        "lineageId": lineage_id,
+                        "attempt": 2,
+                        "maxAttempts": 3,
+                        "delayMs": 2000,
+                        "scheduledAtMs": 200,
+                        "nextEligibleAtMs": 2200,
+                        "replayMode": "same-request-no-observable-mutation"
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let report = crate::compact_runtime_queue_receipts_if_needed(
+            crate::RuntimeQueueReceiptCompactionOptions {
+                harness_home: harness_home.clone(),
+                max_bytes: 1,
+                max_archives: 1,
+                now_ms: 300,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            report.status,
+            crate::RuntimeQueueReceiptCompactionStatus::Compacted
+        );
+        let hot = fs::read_to_string(queue_dir.join("run-once-receipts.jsonl")).unwrap();
+        let retained = hot
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| value.get("queueId").and_then(Value::as_str) == Some("turn:retry"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained.len(),
+            2,
+            "the retry attempt sequence must stay hot"
+        );
+        assert_eq!(
+            retained[0]
+                .pointer("/retrySchedule/lineageId")
+                .and_then(Value::as_str),
+            Some(lineage_id)
+        );
+        assert_eq!(
+            retained[1]
+                .pointer("/retrySchedule/nextEligibleAtMs")
+                .and_then(Value::as_i64),
+            Some(2200)
+        );
+        let index: Value =
+            serde_json::from_slice(&fs::read(queue_dir.join("queue-state-index.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            index
+                .pointer("/queues/turn:retry/retrySchedule/lineageId")
+                .and_then(Value::as_str),
+            Some(lineage_id)
+        );
+        assert_eq!(
+            index
+                .pointer("/queues/turn:retry/retrySchedule/nextEligibleAtMs")
+                .and_then(Value::as_i64),
+            Some(2200)
+        );
+        let cold = find_runtime_queue_terminal_history(
+            &queue_dir,
+            &BTreeSet::from(["trace:historical".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(cold.len(), 1);
+        assert_eq!(cold[0].queue_id, "turn:historical");
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn staged_history_is_hidden_until_committed_and_preserves_terminal_delta() {

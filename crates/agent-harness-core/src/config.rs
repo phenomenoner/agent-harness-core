@@ -510,6 +510,9 @@ fn validate_security_object(path: &str, value: &Value, errors: &mut Vec<String>)
     };
     for (key, child) in object {
         match key.as_str() {
+            "connectorApprovalPolicy" => {
+                validate_connector_approval_policy(&path_key(path, key), child, errors)
+            }
             "codexApprovalPolicy" | "codexApprovals" => expect_string_bool_or_enum(
                 path_key(path, key),
                 child,
@@ -523,6 +526,65 @@ fn validate_security_object(path: &str, value: &Value, errors: &mut Vec<String>)
                 expect_codex_sandbox_policy(path_key(path, key), child, errors)
             }
             other => errors.push(format!("unknown security config key `{other}` at {path}")),
+        }
+    }
+}
+
+fn validate_connector_approval_policy(path: &str, value: &Value, errors: &mut Vec<String>) {
+    let Some(object) = expect_object(path, value, errors) else {
+        return;
+    };
+    for (key, child) in object {
+        match key.as_str() {
+            "default" => expect_enum(
+                path_key(path, key),
+                child,
+                &["deny", "needs-user", "explicit-action-token"],
+                errors,
+            ),
+            "rules" => {
+                let Some(rules) = child.as_array() else {
+                    errors.push(format!("expected array at {}", path_key(path, key)));
+                    continue;
+                };
+                for (index, rule) in rules.iter().enumerate() {
+                    let rule_path = format!("{}.rules[{index}]", path);
+                    let Some(rule) = expect_object(&rule_path, rule, errors) else {
+                        continue;
+                    };
+                    for (rule_key, rule_value) in rule {
+                        match rule_key.as_str() {
+                            "connector" => {
+                                expect_string(path_key(&rule_path, rule_key), rule_value, errors)
+                            }
+                            "actions" => expect_string_array(
+                                path_key(&rule_path, rule_key),
+                                rule_value,
+                                errors,
+                            ),
+                            "mode" => expect_enum(
+                                path_key(&rule_path, rule_key),
+                                rule_value,
+                                &["deny", "needs-user", "explicit-action-token"],
+                                errors,
+                            ),
+                            other => errors.push(format!(
+                                "unknown connector approval rule key `{other}` at {rule_path}"
+                            )),
+                        }
+                    }
+                    for required in ["connector", "mode"] {
+                        if !rule.contains_key(required) {
+                            errors.push(format!(
+                                "missing required connector approval rule key `{required}` at {rule_path}"
+                            ));
+                        }
+                    }
+                }
+            }
+            other => errors.push(format!(
+                "unknown connectorApprovalPolicy key `{other}` at {path}"
+            )),
         }
     }
 }
@@ -1489,7 +1551,17 @@ mod tests {
               "security": {
                 "codexApprovalPolicy": "accept",
                 "codexSandbox": "elevated",
-                "codexSandboxPolicy": "dangerFullAccess"
+                "codexSandboxPolicy": "dangerFullAccess",
+                "connectorApprovalPolicy": {
+                  "default": "needs-user",
+                  "rules": [
+                    {
+                      "connector": "github",
+                      "actions": ["create_issue"],
+                      "mode": "explicit-action-token"
+                    }
+                  ]
+                }
               },
               "workerDispatch": {
                 "globalConcurrencyLimit": 12,
@@ -1626,7 +1698,13 @@ mod tests {
                 "emojiAccentMode": "loud",
                 "progressDeliveryMode": "chatty"
               },
-              "security": { "codexApprovalPolicy": "YOLO" },
+              "security": {
+                "codexApprovalPolicy": "YOLO",
+                "connectorApprovalPolicy": {
+                  "default": "accept-all",
+                  "rules": [{ "connector": 7, "actions": "create_issue", "mode": "allow" }]
+                }
+              },
               "workerDispatch": {
                 "globalConcurrencyLimit": 2,
                 "groupConcurrencyLimit": 3,
@@ -1665,6 +1743,12 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.contains("codexApprovalPolicy"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("connectorApprovalPolicy"))
         );
         assert!(
             report

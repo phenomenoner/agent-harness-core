@@ -94,6 +94,8 @@ pub struct AgentProgressEvent {
     pub preview: String,
     pub status: AgentProgressStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<AgentProgressLifecycle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -217,6 +219,16 @@ pub enum AgentProgressStatus {
     Progress,
     Completed,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentProgressLifecycle {
+    Queued,
+    Preparing,
+    Working,
+    Continuing,
+    WaitingForApproval,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,6 +370,8 @@ pub struct AgentProgressDeliveryPending {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
     pub terminal: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<AgentProgressLifecycle>,
     pub text: String,
     pub text_hash: String,
     pub started_at_ms: i64,
@@ -448,6 +462,8 @@ pub struct AgentProgressDeliveryReceipt {
     pub event_id: Option<String>,
     pub text_hash: String,
     pub terminal: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<AgentProgressLifecycle>,
     #[serde(default)]
     pub status_surface_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -917,6 +933,7 @@ impl AgentProgressEvent {
             label: label.into(),
             preview: sanitize_progress_preview(preview.as_ref(), max_preview_chars.max(1)),
             status,
+            lifecycle: None,
             elapsed_ms: None,
             source: None,
         }
@@ -924,6 +941,11 @@ impl AgentProgressEvent {
 
     pub fn source(mut self, source: impl Into<String>) -> Self {
         self.source = Some(source.into());
+        self
+    }
+
+    pub fn lifecycle(mut self, lifecycle: AgentProgressLifecycle) -> Self {
+        self.lifecycle = Some(lifecycle);
         self
     }
 
@@ -1742,6 +1764,7 @@ pub fn plan_agent_progress_delivery(
                 event_id: valid_progress_event_id(latest.event.event_id.as_deref())
                     .map(str::to_string),
                 terminal,
+                lifecycle: effective_progress_lifecycle(&latest.event),
                 text,
                 text_hash,
                 started_at_ms: first.event.at_ms,
@@ -2014,6 +2037,8 @@ pub fn record_agent_progress_delivery_with_context(
     options: AgentProgressDeliveryRecordOptions,
     context: AgentProgressDeliveryRecordContext,
 ) -> io::Result<AgentProgressDeliveryReceipt> {
+    let (delivered_lifecycle, legacy_authoritative_working) =
+        progress_lifecycle_for_record(&options)?;
     let harness_home = options.harness_home.clone();
     let state_file = agent_progress_delivery_state_file(&options.harness_home);
     let receipts_file = agent_progress_delivery_receipts_file(&options.harness_home);
@@ -2062,6 +2087,7 @@ pub fn record_agent_progress_delivery_with_context(
         event_id,
         text_hash: options.text_hash,
         terminal: options.terminal,
+        lifecycle: delivered_lifecycle,
         status_surface_key: context.status_surface_key,
         existing_provider_message_id: context.existing_provider_message_id,
         decision,
@@ -2126,7 +2152,10 @@ pub fn record_agent_progress_delivery_with_context(
             crate::latency::LatencyStage::FirstProviderProgressSurface,
             Some(receipt.at_ms),
         );
-        if receipt.message_kind == AgentProgressDeliveryMessageKind::Status {
+        if receipt.message_kind == AgentProgressDeliveryMessageKind::Status
+            && (receipt.lifecycle == Some(AgentProgressLifecycle::Working)
+                || legacy_authoritative_working)
+        {
             let _ = crate::latency::record_latency_stage(
                 crate::latency::latency_receipts_file(&harness_home),
                 &receipt.queue_id,
@@ -2146,6 +2175,47 @@ pub fn record_agent_progress_delivery_with_context(
         );
     }
     Ok(receipt)
+}
+
+fn progress_lifecycle_for_record(
+    options: &AgentProgressDeliveryRecordOptions,
+) -> io::Result<(Option<AgentProgressLifecycle>, bool)> {
+    let mut warnings = Vec::new();
+    let Some(indexed) =
+        latest_progress_event_for_queue(&options.harness_home, &options.queue_id, &mut warnings)?
+    else {
+        return Ok((None, false));
+    };
+    let event = &indexed.event;
+    if indexed.line_number != options.event_line
+        || event.platform != options.platform
+        || event.account_id != options.account_id
+        || event.channel_id != options.channel_id
+        || event.thread_id != options.thread_id
+        || event.user_id != options.user_id
+        || event.session_key != options.session_key
+    {
+        return Ok((None, false));
+    }
+    let lifecycle = effective_progress_lifecycle(event);
+    let legacy_authoritative_working = lifecycle.is_none()
+        && matches!(
+            event.kind,
+            AgentProgressKind::Runtime
+                | AgentProgressKind::Terminal
+                | AgentProgressKind::SearchFiles
+                | AgentProgressKind::ReadFile
+                | AgentProgressKind::ExecuteCode
+                | AgentProgressKind::ToolCall
+                | AgentProgressKind::AssistantStream
+                | AgentProgressKind::AssistantNarration
+                | AgentProgressKind::MemoryRecall
+        )
+        && !(event.kind == AgentProgressKind::Runtime
+            && event.status == AgentProgressStatus::Started
+            && event.label == "queued"
+            && event.source.as_deref() == Some("channel-ingress"));
+    Ok((lifecycle, legacy_authoritative_working))
 }
 
 pub fn render_agent_progress_panel(
@@ -2227,7 +2297,13 @@ fn render_agent_progress_status(
         now_ms,
         terminal,
     ));
-    if terminal {
+    if effective_progress_lifecycle(latest) == Some(AgentProgressLifecycle::Continuing) {
+        "🔄 Continuing — moving work to a new context".to_string()
+    } else if effective_progress_lifecycle(latest)
+        == Some(AgentProgressLifecycle::WaitingForApproval)
+    {
+        "⏸️ Waiting for approval — connector action is parked".to_string()
+    } else if terminal {
         match latest.status {
             AgentProgressStatus::Failed => {
                 format!(
@@ -2236,8 +2312,16 @@ fn render_agent_progress_status(
                     quote_safe_preview(&latest.preview, max_preview_chars)
                 )
             }
+            _ if latest.label == "canceled" => format!("⏹️ Canceled — {elapsed}"),
+            _ if latest.label == "terminal-suppression" => {
+                format!("⏹️ Stopped — {elapsed}")
+            }
             _ => format!("✅ Done — {elapsed}"),
         }
+    } else if effective_progress_lifecycle(latest) == Some(AgentProgressLifecycle::Queued) {
+        format!("🕒 Queued — {elapsed} — waiting for the current session turn")
+    } else if effective_progress_lifecycle(latest) == Some(AgentProgressLifecycle::Preparing) {
+        format!("⏳ Preparing — {elapsed}")
     } else {
         let mut status = format!("⏳ Working — {} — {}", elapsed, status_phrase(latest));
         if let Some(narration) = latest_current_step_event(events) {
@@ -2260,6 +2344,16 @@ fn render_agent_progress_status(
         }
         status
     }
+}
+
+fn effective_progress_lifecycle(event: &AgentProgressEvent) -> Option<AgentProgressLifecycle> {
+    event.lifecycle.or_else(|| {
+        (event.kind == AgentProgressKind::Runtime
+            && event.status == AgentProgressStatus::Started
+            && event.label == "queued"
+            && event.source.as_deref() == Some("channel-ingress"))
+        .then_some(AgentProgressLifecycle::Queued)
+    })
 }
 
 fn is_rendered_action_event(event: &AgentProgressEvent) -> bool {
@@ -2996,10 +3090,63 @@ fn terminal_control_suppressed_progress_events(
         channel_id: latest.event.channel_id.clone(),
         user_id: latest.event.user_id.clone(),
     };
-    let preview = format!(
-        "suppressed by terminal control: {}",
-        control.source.as_str()
-    );
+    let disposition =
+        control
+            .terminal_disposition
+            .or_else(|| match control.terminal_status.as_deref() {
+                Some("completed") => Some(crate::RuntimeTerminalDispositionV1::LogicalSuccess),
+                Some("failed-terminal" | "dead-letter" | "timeout" | "protocol-error") => {
+                    Some(crate::RuntimeTerminalDispositionV1::LogicalFailure)
+                }
+                Some("canceled") => Some(crate::RuntimeTerminalDispositionV1::LogicalCanceled),
+                Some("skipped" | "suppressed") | None => {
+                    Some(crate::RuntimeTerminalDispositionV1::TerminalSuppression)
+                }
+                _ => Some(crate::RuntimeTerminalDispositionV1::TerminalSuppression),
+            });
+    let preview = match disposition {
+        Some(crate::RuntimeTerminalDispositionV1::ContinuationHandoff) => {
+            "continuation admitted; logical task is still active".to_string()
+        }
+        Some(crate::RuntimeTerminalDispositionV1::LogicalCanceled) => {
+            "canceled by terminal control".to_string()
+        }
+        Some(crate::RuntimeTerminalDispositionV1::LogicalFailure) => control.reason.clone(),
+        Some(crate::RuntimeTerminalDispositionV1::LogicalSuccess) => "completed".to_string(),
+        _ => format!(
+            "suppressed by terminal control: {}",
+            control.source.as_str()
+        ),
+    };
+    let (label, status, lifecycle) = match disposition {
+        Some(crate::RuntimeTerminalDispositionV1::ContinuationHandoff) => (
+            "continuation-handoff",
+            AgentProgressStatus::Completed,
+            Some(AgentProgressLifecycle::Continuing),
+        ),
+        Some(crate::RuntimeTerminalDispositionV1::LogicalFailure) => {
+            ("run", AgentProgressStatus::Failed, None)
+        }
+        Some(crate::RuntimeTerminalDispositionV1::LogicalCanceled) => {
+            ("canceled", AgentProgressStatus::Completed, None)
+        }
+        Some(crate::RuntimeTerminalDispositionV1::LogicalSuccess) => {
+            ("run", AgentProgressStatus::Completed, None)
+        }
+        _ => ("terminal-suppression", AgentProgressStatus::Completed, None),
+    };
+    let mut terminal_event = AgentProgressEvent::new(
+        &context,
+        AgentProgressKind::Runtime,
+        label,
+        &preview,
+        status,
+        now_ms,
+    )
+    .source("progress-delivery");
+    if let Some(lifecycle) = lifecycle {
+        terminal_event = terminal_event.lifecycle(lifecycle);
+    }
     vec![
         StoredProgressEvent {
             line_number: latest.line_number,
@@ -3015,15 +3162,7 @@ fn terminal_control_suppressed_progress_events(
         },
         StoredProgressEvent {
             line_number: latest.line_number.saturating_add(1),
-            event: AgentProgressEvent::new(
-                &context,
-                AgentProgressKind::Runtime,
-                "run",
-                preview,
-                AgentProgressStatus::Completed,
-                now_ms,
-            )
-            .source("progress-delivery"),
+            event: terminal_event,
         },
     ]
 }
@@ -3599,6 +3738,249 @@ mod tests {
     };
 
     #[test]
+    fn queued_ingress_event_never_renders_working() {
+        let event = AgentProgressEvent::new(
+            &context(),
+            AgentProgressKind::Runtime,
+            "queued",
+            "Queued; preparing your request.",
+            AgentProgressStatus::Started,
+            1_000,
+        )
+        .lifecycle(AgentProgressLifecycle::Queued)
+        .source("channel-ingress");
+        let panel = render_agent_progress_panel(&[&event], 2_000, 8, 120);
+        assert!(panel.contains("Queued"));
+        assert!(!panel.contains("Working"));
+    }
+
+    #[test]
+    fn legacy_queued_event_uses_queued_compatibility_rendering() {
+        let event = AgentProgressEvent::new(
+            &context(),
+            AgentProgressKind::Runtime,
+            "queued",
+            "Queued; preparing your request.",
+            AgentProgressStatus::Started,
+            1_000,
+        )
+        .source("channel-ingress");
+        let panel = render_agent_progress_panel(&[&event], 2_000, 8, 120);
+        assert!(panel.contains("Queued"));
+        assert!(!panel.contains("Working"));
+    }
+
+    #[test]
+    fn telegram_and_discord_waiting_for_approval_stays_distinct_from_other_lifecycles() {
+        for platform in ["telegram", "discord"] {
+            let mut event_context = context();
+            event_context.platform = platform.to_string();
+            let event = AgentProgressEvent::new(
+                &event_context,
+                AgentProgressKind::Runtime,
+                "external-effect",
+                "connector mutation parked pending explicit action token",
+                AgentProgressStatus::Progress,
+                1_000,
+            )
+            .lifecycle(AgentProgressLifecycle::WaitingForApproval)
+            .source("codex-runtime");
+            let panel = render_agent_progress_panel(&[&event], 2_000, 8, 120);
+            assert!(
+                panel.contains("Waiting for approval"),
+                "{platform}: {panel}"
+            );
+            assert!(!panel.contains("Working —"), "{platform}: {panel}");
+            assert!(!panel.contains("Queued —"), "{platform}: {panel}");
+            assert!(!panel.contains("Continuing —"), "{platform}: {panel}");
+            assert!(!panel.contains("Done —"), "{platform}: {panel}");
+        }
+    }
+
+    #[test]
+    fn continuation_handoff_never_renders_done() {
+        let latest = StoredProgressEvent {
+            line_number: 1,
+            event: AgentProgressEvent::new(
+                &context(),
+                AgentProgressKind::Runtime,
+                "runtime",
+                "waiting",
+                AgentProgressStatus::Progress,
+                1_000,
+            ),
+        };
+        let events = terminal_control_suppressed_progress_events(
+            &latest,
+            &QueueTerminalControlMatch {
+                source: crate::runtime_worker::TerminalControlSource::RunOnceTerminal,
+                reason: "parent moved to continuation".to_string(),
+                suppression_recorded: false,
+                terminal_status: Some("skipped".to_string()),
+                terminal_disposition: Some(
+                    crate::RuntimeTerminalDispositionV1::ContinuationHandoff,
+                ),
+                continuation_link: Some(crate::RuntimeContinuationLinkV1 {
+                    parent_queue_id: "turn:1".to_string(),
+                    child_queue_id: "turn:2".to_string(),
+                    continuation_index: 1,
+                    virtual_lane_digest: None,
+                }),
+            },
+            2_000,
+        );
+        let refs = events.iter().map(|event| &event.event).collect::<Vec<_>>();
+        let panel = render_agent_progress_panel(&refs, 2_000, 8, 120);
+        assert!(panel.contains("Continuing"));
+        assert!(!panel.contains("Done"));
+    }
+
+    #[test]
+    fn legacy_skipped_without_disposition_never_renders_done() {
+        let latest = StoredProgressEvent {
+            line_number: 1,
+            event: AgentProgressEvent::new(
+                &context(),
+                AgentProgressKind::Runtime,
+                "runtime",
+                "waiting",
+                AgentProgressStatus::Progress,
+                1_000,
+            ),
+        };
+        let events = terminal_control_suppressed_progress_events(
+            &latest,
+            &QueueTerminalControlMatch {
+                source: crate::runtime_worker::TerminalControlSource::RunOnceTerminal,
+                reason: "legacy skipped receipt".to_string(),
+                suppression_recorded: false,
+                terminal_status: Some("skipped".to_string()),
+                terminal_disposition: None,
+                continuation_link: None,
+            },
+            2_000,
+        );
+        let refs = events.iter().map(|event| &event.event).collect::<Vec<_>>();
+        let panel = render_agent_progress_panel(&refs, 2_000, 8, 120);
+        assert!(panel.contains("Stopped"));
+        assert!(!panel.contains("Done"));
+    }
+
+    #[test]
+    fn queued_surface_transitions_once_to_working_after_authoritative_event() {
+        let queued = AgentProgressEvent::new(
+            &context(),
+            AgentProgressKind::Runtime,
+            "queued",
+            "Queued; preparing your request.",
+            AgentProgressStatus::Started,
+            1_000,
+        )
+        .lifecycle(AgentProgressLifecycle::Queued)
+        .source("channel-ingress");
+        let working = AgentProgressEvent::new(
+            &context(),
+            AgentProgressKind::ToolCall,
+            "tool",
+            "running a synthetic tool",
+            AgentProgressStatus::Started,
+            2_000,
+        )
+        .lifecycle(AgentProgressLifecycle::Working)
+        .source("codex-runtime");
+        let panel = render_agent_progress_panel(&[&queued, &working], 2_100, 8, 120);
+        assert!(panel.contains("Working"));
+        assert!(!panel.contains("Queued —"));
+    }
+
+    #[test]
+    fn working_latency_begins_after_lease_not_queue_admission() {
+        let root = temp_root("working_latency_begins_after_lease_not_queue_admission");
+        let harness_home = root.join(".agent-harness");
+        let progress_context = context();
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &progress_context,
+                AgentProgressKind::Runtime,
+                "queued",
+                "Queued; preparing your request.",
+                AgentProgressStatus::Started,
+                1_000,
+            )
+            .lifecycle(AgentProgressLifecycle::Queued)
+            .source("channel-ingress"),
+        )
+        .unwrap();
+        let queued_plan = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 1_100,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        let queued_status = queued_plan
+            .pending
+            .iter()
+            .find(|pending| pending.message_kind == AgentProgressDeliveryMessageKind::Status)
+            .unwrap();
+        record_pending_delivery(&harness_home, queued_status, "provider-status", 1_200);
+        let queued_latency = read_latest_queue_receipt(
+            latency_receipts_file(&harness_home),
+            &progress_context.queue_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !queued_latency
+                .stages
+                .contains_key(&LatencyStage::WorkingIndicator)
+        );
+
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &progress_context,
+                AgentProgressKind::ToolCall,
+                "tool",
+                "running a synthetic tool",
+                AgentProgressStatus::Started,
+                2_000,
+            )
+            .lifecycle(AgentProgressLifecycle::Working)
+            .source("codex-runtime"),
+        )
+        .unwrap();
+        let working_plan = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+            harness_home: harness_home.clone(),
+            platform: Some("telegram".to_string()),
+            now_ms: 2_100,
+            min_update_interval_ms: 0,
+            ..AgentProgressDeliveryPlanOptions::default()
+        })
+        .unwrap();
+        let working_status = working_plan
+            .pending
+            .iter()
+            .find(|pending| pending.message_kind == AgentProgressDeliveryMessageKind::Status)
+            .unwrap();
+        record_pending_delivery(&harness_home, working_status, "provider-status", 2_200);
+        let working_latency = read_latest_queue_receipt(
+            latency_receipts_file(&harness_home),
+            &progress_context.queue_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            working_latency.stages.get(&LatencyStage::WorkingIndicator),
+            Some(&2_200)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn append_agent_progress_event_signals_delivery_wake() {
         let root = temp_root("append_agent_progress_event_signals_delivery_wake");
         let harness_home = root.join(".agent-harness");
@@ -3660,6 +4042,21 @@ mod tests {
             temp_root("delivered_status_surface_records_provider_progress_and_working_latency");
         let harness_home = root.join(".agent-harness");
         let context = context();
+
+        append_agent_progress_event(
+            &harness_home,
+            &AgentProgressEvent::new(
+                &context,
+                AgentProgressKind::Runtime,
+                "runtime",
+                "started",
+                AgentProgressStatus::Started,
+                1_500,
+            )
+            .lifecycle(AgentProgressLifecycle::Working)
+            .source("codex-runtime"),
+        )
+        .unwrap();
 
         let receipt = record_agent_progress_delivery(AgentProgressDeliveryRecordOptions {
             harness_home: harness_home.clone(),
@@ -6377,6 +6774,94 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_child_progress_is_reconstructed_from_terminal_index() {
+        for platform in ["telegram", "discord"] {
+            let root = temp_root(&format!(
+                "missing_child_progress_is_reconstructed_from_terminal_index_{platform}"
+            ));
+            let harness_home = root.join(".agent-harness");
+            let queue_dir = harness_home.join("state").join("runtime-queue");
+            fs::create_dir_all(&queue_dir).unwrap();
+            let mut progress_context = context();
+            progress_context.platform = platform.to_string();
+            progress_context.session_key = format!("{platform}:dm:user:main");
+            append_agent_progress_event(
+                &harness_home,
+                &AgentProgressEvent::new(
+                    &progress_context,
+                    AgentProgressKind::ToolCall,
+                    "tool",
+                    "synthetic work before continuation",
+                    AgentProgressStatus::Started,
+                    1_000,
+                )
+                .lifecycle(AgentProgressLifecycle::Working)
+                .source("codex-runtime"),
+            )
+            .unwrap();
+            let initial = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+                harness_home: harness_home.clone(),
+                platform: Some(platform.to_string()),
+                now_ms: 1_100,
+                min_update_interval_ms: 0,
+                ..AgentProgressDeliveryPlanOptions::default()
+            })
+            .unwrap();
+            for (index, pending) in initial.pending.iter().enumerate() {
+                record_pending_delivery(
+                    &harness_home,
+                    pending,
+                    &format!("{platform}-surface-{index}"),
+                    1_200,
+                );
+            }
+            append_json_line(
+                &queue_dir.join("run-once-receipts.jsonl"),
+                &serde_json::json!({
+                    "queueId": progress_context.queue_id.clone(),
+                    "status": "skipped",
+                    "terminalDisposition": "continuation-handoff",
+                    "continuationLink": {
+                        "parentQueueId": progress_context.queue_id.clone(),
+                        "childQueueId": "turn:child",
+                        "continuationIndex": 1
+                    },
+                    "reason": "synthetic durable continuation handoff"
+                }),
+            )
+            .unwrap();
+
+            let reconstructed = plan_agent_progress_delivery(AgentProgressDeliveryPlanOptions {
+                harness_home: harness_home.clone(),
+                platform: Some(platform.to_string()),
+                now_ms: 2_000,
+                min_update_interval_ms: 0,
+                ..AgentProgressDeliveryPlanOptions::default()
+            })
+            .unwrap();
+            assert!(!reconstructed.pending.is_empty(), "{platform}");
+            assert!(
+                reconstructed.pending.iter().all(|pending| {
+                    pending.terminal
+                        && pending.lifecycle == Some(AgentProgressLifecycle::Continuing)
+                        && !pending.text.contains("Done")
+                }),
+                "{platform}: {:#?}",
+                reconstructed.pending
+            );
+            assert!(
+                reconstructed.pending.iter().any(|pending| {
+                    pending.message_kind == AgentProgressDeliveryMessageKind::Status
+                        && pending.text.contains("Continuing")
+                }),
+                "{platform}: {:#?}",
+                reconstructed.pending
+            );
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]

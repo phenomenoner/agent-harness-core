@@ -1,0 +1,26 @@
+{
+  "schema": "agent-harness.continuity-effects.deadline-drain-operation-plan-replay.v1",
+  "authority": {
+    "kind": "operation-plan",
+    "exactLaneDigest": "sha256:synthetic-lane",
+    "virtualSessionId": "synthetic-virtual-session",
+    "planStatus": "open",
+    "planVersion": 3,
+    "activeItemStatus": "running",
+    "activeItemVersion": 2,
+    "checkpointDigest": "sha256:synthetic-checkpoint"
+  },
+  "events": [
+    { "kind": "deadline-drain-entered", "atMs": 1000 },
+    { "kind": "typed-checkpoint-durable", "atMs": 2000 },
+    { "kind": "runtime-result-completed", "atMs": 3000 },
+    { "kind": "worker-restart", "atMs": 4000 }
+  ],
+  "expected": {
+    "drainDisposition": "continuation-required",
+    "childCount": 1,
+    "parentDisposition": "continuation-handoff",
+    "parentOwnsLogicalFinal": false,
+    "logicalFinalCountAfterChildCompletion": 1
+  }
+}

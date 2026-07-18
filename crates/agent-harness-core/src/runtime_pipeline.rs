@@ -249,6 +249,20 @@ pub struct RuntimeRunOnceReceipt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child_session_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_disposition: Option<crate::RuntimeTerminalDispositionV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation_link: Option<crate::RuntimeContinuationLinkV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_failure: Option<crate::CodexProtocolFailureV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mutation_evidence: Option<crate::RuntimeMutationEvidenceClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_schedule: Option<crate::RuntimeRetryScheduleV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_drain_evaluation: Option<crate::TaskDrainEvaluationV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_effect: Option<crate::ExternalEffectIntentV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_control_matched: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_control_source: Option<String>,
@@ -263,6 +277,8 @@ pub struct RuntimeRunOnceReceipt {
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeRunOnceStatus {
     Completed,
+    NeedsUser,
+    ExternalEffectDenied,
     Suppressed,
     Skipped,
     LeaseBusy,
@@ -285,6 +301,8 @@ impl RuntimeRunOnceStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Completed => "completed",
+            Self::NeedsUser => "needs-user",
+            Self::ExternalEffectDenied => "external-effect-denied",
             Self::Suppressed => "suppressed",
             Self::Skipped => "skipped",
             Self::LeaseBusy => "lease-busy",
@@ -517,6 +535,13 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             continuation: metadata.continuation,
             child_queue_id: None,
             child_session_key: None,
+            terminal_disposition: None,
+            continuation_link: None,
+            protocol_failure: None,
+            mutation_evidence: None,
+            retry_schedule: None,
+            task_drain_evaluation: None,
+            external_effect: None,
             terminal_control_matched: None,
             terminal_control_source: None,
             suppressed_run_once_reason: None,
@@ -573,6 +598,14 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             continuation: metadata.continuation,
             child_queue_id: None,
             child_session_key: None,
+            terminal_disposition: (prepare.receipt.terminal_control_matched == Some(true))
+                .then_some(crate::RuntimeTerminalDispositionV1::TerminalSuppression),
+            continuation_link: None,
+            protocol_failure: None,
+            mutation_evidence: None,
+            retry_schedule: None,
+            task_drain_evaluation: None,
+            external_effect: None,
             terminal_control_matched: prepare.receipt.terminal_control_matched,
             terminal_control_source: prepare.receipt.terminal_control_source.clone(),
             suppressed_run_once_reason: prepare.receipt.suppressed_run_once_reason.clone(),
@@ -680,6 +713,15 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 continuation: metadata.continuation,
                 child_queue_id: None,
                 child_session_key: None,
+                terminal_disposition: Some(
+                    crate::RuntimeTerminalDispositionV1::TerminalSuppression,
+                ),
+                continuation_link: None,
+                protocol_failure: None,
+                mutation_evidence: None,
+                retry_schedule: None,
+                task_drain_evaluation: None,
+                external_effect: None,
                 terminal_control_matched: Some(true),
                 terminal_control_source: Some(control.source.as_str().to_string()),
                 suppressed_run_once_reason: Some("terminal-control-present".to_string()),
@@ -770,6 +812,13 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             continuation: prepare.receipt.continuation.clone(),
             child_queue_id: None,
             child_session_key: None,
+            terminal_disposition: None,
+            continuation_link: None,
+            protocol_failure: None,
+            mutation_evidence: None,
+            retry_schedule: None,
+            task_drain_evaluation: None,
+            external_effect: None,
             terminal_control_matched: None,
             terminal_control_source: None,
             suppressed_run_once_reason: None,
@@ -817,6 +866,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             find_queue_channel_context(&options.harness_home, queue_id, &mut warnings)?;
     }
     let channel_context_for_self_improvement = channel_context.clone();
+    let failure_channel_context = channel_context.clone();
 
     let progress_context =
         progress_context_from(&prepare, plan.plan.as_ref(), channel_context.as_ref());
@@ -869,17 +919,20 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         .queue_id
         .as_deref()
         .filter(|_| run.receipt.status != CodexRuntimeRunStatus::Completed && !auth_deferred)
+        .filter(|_| run.receipt.status != CodexRuntimeRunStatus::ApprovalRequired)
         .map(|queue_id| count_prior_runtime_failures(&options.harness_home, queue_id))
         .transpose()?
         .map(|attempts| attempts.saturating_add(1))
         .unwrap_or(0);
     let retry_policy = inspect_runtime_backoff_policy(&options.harness_home)?;
     warnings.extend(retry_policy.warnings.clone());
-    let mut receipt_status = final_run_once_status(
+    let mut receipt_status = final_run_once_status_with_protocol(
         run.receipt.status,
         queue_failure_attempts,
         &run.receipt.reason,
         retry_policy.policy.max_failure_attempts,
+        run.receipt.protocol_failure.as_ref(),
+        run.receipt.mutation_evidence,
     );
     let mut receipt_reason = final_run_once_reason(
         receipt_status,
@@ -887,6 +940,38 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         queue_failure_attempts,
         retry_policy.policy.max_failure_attempts,
         &run.receipt.reason,
+    );
+    let server_overloaded_after_mutation = matches!(
+        run.receipt
+            .protocol_failure
+            .as_ref()
+            .map(|failure| failure.class),
+        Some(crate::CodexProtocolFailureClass::ServerOverloaded)
+    ) && run.receipt.mutation_evidence
+        == Some(crate::RuntimeMutationEvidenceClass::MutationObserved);
+    if matches!(
+        run.receipt
+            .protocol_failure
+            .as_ref()
+            .map(|failure| failure.class),
+        Some(crate::CodexProtocolFailureClass::ServerOverloaded)
+    ) && run.receipt.mutation_evidence == Some(crate::RuntimeMutationEvidenceClass::Unknown)
+    {
+        receipt_reason = format!(
+            "Codex server overload was observed, but mutation evidence was incomplete; automatic prompt replay was suppressed to avoid duplicate side effects. Operator retry is required. Prior reason: {}",
+            run.receipt.reason
+        );
+    }
+    let retry_scheduled_at_ms = current_log_time_ms()?;
+    let mut retry_schedule = runtime_retry_schedule_for(
+        receipt_status,
+        run.receipt.queue_id.as_deref(),
+        queue_failure_attempts,
+        retry_policy.policy.max_failure_attempts,
+        retry_policy.policy.retry_delay_ms(queue_failure_attempts),
+        retry_scheduled_at_ms,
+        run.receipt.protocol_failure.as_ref(),
+        run.receipt.mutation_evidence,
     );
     if receipt_status == RuntimeRunOnceStatus::RetryPending {
         let delay_ms = retry_policy.policy.retry_delay_ms(queue_failure_attempts);
@@ -915,16 +1000,6 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         {
             warnings.push(hint);
         }
-    }
-    if let Some(context) = &progress_context {
-        append_runtime_progress_finished(
-            &options.harness_home,
-            context,
-            receipt_status,
-            &receipt_reason,
-            run.receipt.elapsed_ms,
-            &mut warnings,
-        );
     }
     if should_record_failed_memory_lifecycle(&receipt_status)
         && let Some(codex_plan) = plan.plan.as_ref()
@@ -967,6 +1042,67 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         "goal transition decided {:?} with {:?} surface before final-outbox selection",
         goal_transition.decision, goal_transition.surface
     ));
+    let mut task_drain_evaluation = None;
+    if goal_transition.event == GoalTransitionEventKind::DrainCompletion
+        && !goal_transition
+            .goal_status
+            .as_deref()
+            .is_some_and(is_goal_status_active)
+        && let Some(checkpoint) = run.receipt.drain_checkpoint.clone()
+    {
+        let item = prepare.item.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "typed drain checkpoint has no prepared exact-lane queue item",
+            )
+        })?;
+        let operator_stop = ChannelStateLane::new(
+            &item.platform,
+            item.account_id.as_deref(),
+            &item.channel_id,
+            &item.user_id,
+            &item.agent_id,
+        )
+        .ok()
+        .and_then(|lane| {
+            crate::read_channel_session_state_v2(&options.harness_home, &lane)
+                .ok()
+                .flatten()
+        })
+        .is_some_and(|state| state.stop_requested);
+        let newer_steer = match channel_context.as_ref() {
+            Some(context) => {
+                !channel_session_is_current(&options.harness_home, context, &mut warnings)?
+            }
+            None => true,
+        };
+        let evaluation =
+            crate::evaluate_operation_plan_drain(crate::OperationPlanAuthorityOptions {
+                harness_home: options.harness_home.clone(),
+                checkpoint,
+                exact_lane_digest: goal_authority.lane_digest.clone().unwrap_or_default(),
+                virtual_session_id: goal_authority
+                    .virtual_session_id
+                    .clone()
+                    .unwrap_or_default(),
+                working_session_key: item.session_key.clone(),
+                agent_id: item.agent_id.clone(),
+                breakers: crate::TaskContinuationBreakers {
+                    operator_stop,
+                    newer_steer,
+                    budget_exhausted: false,
+                    no_progress_exhausted: false,
+                    continuation_depth: item.continuation.continuation_index.unwrap_or(0),
+                    max_continuation_depth:
+                        crate::task_transition::DEFAULT_MAX_TASK_CONTINUATION_DEPTH,
+                },
+            });
+        warnings.push(format!(
+            "task drain transition scheduled={} disposition={:?}: {}",
+            evaluation.schedule_continuation, evaluation.disposition, evaluation.reason
+        ));
+        task_drain_evaluation = Some(evaluation);
+    }
     if goal_transition.schedule_continuation
         && goal_transition
             .goal_status
@@ -1027,6 +1163,58 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 enqueued.intent_key
             ));
         }
+    }
+    if child_queue_id.is_none()
+        && let Some(evaluation) = task_drain_evaluation.as_ref()
+        && let crate::DrainDispositionV1::ContinuationRequired(authority) = &evaluation.disposition
+    {
+        let scheduling_result = (|| -> io::Result<_> {
+            let item = prepare.item.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "task drain continuation has no prepared queue item",
+                )
+            })?;
+            let now_ms = current_log_time_ms()?;
+            let intent = crate::commit_task_continuation_intent(
+                &options.harness_home,
+                &item.queue_id,
+                &item.session_key,
+                &item.continuation,
+                authority,
+                item.continuation.campaign_slice_generation.unwrap_or(0),
+                goal_transition.decision_generation,
+                now_ms,
+            )?;
+            ensure_goal_continuation_enqueued(&options.harness_home, &intent.intent_key, now_ms)
+        })();
+        let enqueued = match scheduling_result {
+            Ok(enqueued) => enqueued,
+            Err(error) => {
+                if let Some(queue_id) = prepare.receipt.queue_id.as_deref() {
+                    let _ = release_runtime_queue_lease(&options.harness_home, queue_id);
+                }
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "OperationPlan continuation failed closed before final outbox: {error}"
+                    ),
+                ));
+            }
+        };
+        child_queue_id = enqueued.child_queue_id.clone();
+        child_session_key = Some(enqueued.working_session_key.clone());
+        receipt_status = RuntimeRunOnceStatus::Skipped;
+        receipt_reason = format!(
+            "deadline-drain task checkpoint yielded to deterministic continuation {}; childQueueId={}; priorReason={}",
+            enqueued.intent_key,
+            enqueued.child_queue_id.as_deref().unwrap_or("missing"),
+            receipt_reason
+        );
+        warnings.push(format!(
+            "OperationPlan continuation intent {} admitted one child before parent handoff",
+            enqueued.intent_key
+        ));
     }
     if goal_transition.surface == GoalTransitionSurface::TerminalNotice
         && goal_transition.campaign_family_id.is_some()
@@ -1103,7 +1291,55 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             );
         }
     } else if run.receipt.status == CodexRuntimeRunStatus::Completed
-        && !goal_transition.allow_campaign_final
+        && task_drain_evaluation.as_ref().is_some_and(|evaluation| {
+            !evaluation.schedule_continuation && !evaluation.allow_logical_final
+        })
+    {
+        receipt_status = RuntimeRunOnceStatus::FailedTerminal;
+        receipt_reason = task_drain_evaluation
+            .as_ref()
+            .map(|evaluation| evaluation.reason.clone())
+            .unwrap_or_else(|| "task continuation authority is unavailable".to_string());
+        if let Some(context) = channel_context {
+            if channel_session_is_current(&options.harness_home, &context, &mut warnings)? {
+                let mut message = ChannelOutboundMessage {
+                    platform: context.platform.clone(),
+                    account_id: context.account_id.clone(),
+                    channel_id: context.channel_id.clone(),
+                    user_id: context.user_id.clone(),
+                    session_key: context.session_key.clone(),
+                    delivery_id: None,
+                    kind: ChannelOutboundMessageKind::ErrorReply,
+                    source_queue_id: run.receipt.queue_id.clone(),
+                    source_completion_file: run.receipt.completion_file.clone(),
+                    text: "The checkpointed task could not continue because its exact plan authority changed or a safety breaker was reached. Send a new message after reviewing the current plan state."
+                        .to_string(),
+                    presentation: None,
+                    delivery_intent: delivery_intent_from_inbound_context(
+                        &context.platform,
+                        &context.channel_id,
+                        context.inbound_context.as_deref(),
+                    ),
+                    attachments: Vec::new(),
+                };
+                let (file, appended) = append_final_outbound_message_once(
+                    &options.harness_home,
+                    run.receipt.execution_dir.as_deref(),
+                    run.receipt.completion_file.as_deref(),
+                    &mut message,
+                    &mut warnings,
+                )?;
+                outbox_file = Some(file);
+                if appended {
+                    outbound_message = Some(message);
+                }
+            }
+        }
+    } else if run.receipt.status == CodexRuntimeRunStatus::Completed
+        && (!goal_transition.allow_campaign_final
+            || task_drain_evaluation
+                .as_ref()
+                .is_some_and(|evaluation| !evaluation.allow_logical_final))
     {
         warnings.push(format!(
             "completed slice final outbox suppressed by unified goal transition {:?}: {}",
@@ -1180,6 +1416,13 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                     continuation: prepare.receipt.continuation.clone(),
                                     child_queue_id: None,
                                     child_session_key: None,
+                                    terminal_disposition: None,
+                                    continuation_link: None,
+                                    protocol_failure: run.receipt.protocol_failure.clone(),
+                                    mutation_evidence: run.receipt.mutation_evidence,
+                                    retry_schedule: None,
+                                    task_drain_evaluation: None,
+                                    external_effect: run.receipt.external_effect.clone(),
                                     terminal_control_matched: None,
                                     terminal_control_source: None,
                                     suppressed_run_once_reason: None,
@@ -1338,6 +1581,13 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                                 continuation: prepare.receipt.continuation.clone(),
                                 child_queue_id: None,
                                 child_session_key: None,
+                                terminal_disposition: None,
+                                continuation_link: None,
+                                protocol_failure: run.receipt.protocol_failure.clone(),
+                                mutation_evidence: run.receipt.mutation_evidence,
+                                retry_schedule: None,
+                                task_drain_evaluation: None,
+                                external_effect: run.receipt.external_effect.clone(),
                                 terminal_control_matched: None,
                                 terminal_control_source: None,
                                 suppressed_run_once_reason: None,
@@ -1471,6 +1721,13 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 continuation: prepare.receipt.continuation.clone(),
                 child_queue_id: None,
                 child_session_key: None,
+                terminal_disposition: None,
+                continuation_link: None,
+                protocol_failure: run.receipt.protocol_failure.clone(),
+                mutation_evidence: run.receipt.mutation_evidence,
+                retry_schedule: None,
+                task_drain_evaluation: None,
+                external_effect: run.receipt.external_effect.clone(),
                 terminal_control_matched: None,
                 terminal_control_source: None,
                 suppressed_run_once_reason: None,
@@ -1490,7 +1747,35 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 .to_string(),
         );
     } else if receipt_status == RuntimeRunOnceStatus::RetryPending {
-        if let Some(rollover) = maybe_enqueue_tool_timeout_retry_continuation(
+        if let Some(rollover) = maybe_enqueue_server_overloaded_retry_continuation(
+            &options.harness_home,
+            prepare.item.as_ref(),
+            &run,
+            &mut warnings,
+        )? {
+            receipt_reason = format!(
+                "server-overloaded mutation-aware retry requeued into continuation; childQueueId={}; childSessionKey={}; priorReason={}",
+                rollover.requeued_queue_id, rollover.new_working_session_key, receipt_reason
+            );
+            child_queue_id = Some(rollover.requeued_queue_id.clone());
+            child_session_key = Some(rollover.new_working_session_key.clone());
+            warnings.push(format!(
+                "server-overloaded retry enqueued exact-lane continuation queue item {} because mutation evidence was observed",
+                rollover.requeued_queue_id
+            ));
+            receipt_status = RuntimeRunOnceStatus::Skipped;
+            retry_schedule = None;
+        } else if server_overloaded_after_mutation {
+            receipt_reason = format!(
+                "Codex server overload occurred after observable mutation, but an exact-lane continuation could not become runnable. Automatic original-prompt replay was suppressed; operator recovery is required. Prior reason: {receipt_reason}"
+            );
+            warnings.push(
+                "mutation-observed overload could not commit a runnable continuation; failing closed"
+                    .to_string(),
+            );
+            receipt_status = RuntimeRunOnceStatus::FailedTerminal;
+            retry_schedule = None;
+        } else if let Some(rollover) = maybe_enqueue_tool_timeout_retry_continuation(
             &options.harness_home,
             prepare.item.as_ref(),
             &run,
@@ -1507,6 +1792,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 rollover.requeued_queue_id
             ));
             receipt_status = RuntimeRunOnceStatus::Skipped;
+            retry_schedule = None;
         } else if let Some(rollover) = maybe_enqueue_stream_unstable_retry_continuation(
             &options.harness_home,
             prepare.item.as_ref(),
@@ -1525,6 +1811,7 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
                 rollover.requeued_queue_id
             ));
             receipt_status = RuntimeRunOnceStatus::Skipped;
+            retry_schedule = None;
         } else {
             warnings.push(format!(
                 "runtime failure for queue item will be retried; attempt {}/{}",
@@ -1538,6 +1825,96 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         ));
     }
 
+    if server_overloaded_after_mutation
+        && receipt_status == RuntimeRunOnceStatus::FailedTerminal
+        && outbound_message.is_none()
+        && let Some(context) = failure_channel_context
+    {
+        if channel_session_is_current(&options.harness_home, &context, &mut warnings)? {
+            let mut message = ChannelOutboundMessage {
+                platform: context.platform.clone(),
+                account_id: context.account_id.clone(),
+                channel_id: context.channel_id.clone(),
+                user_id: context.user_id.clone(),
+                session_key: context.session_key.clone(),
+                delivery_id: None,
+                kind: ChannelOutboundMessageKind::ErrorReply,
+                source_queue_id: run.receipt.queue_id.clone(),
+                source_completion_file: run.receipt.completion_file.clone(),
+                text: runtime_failure_reply_text(
+                    receipt_status,
+                    &runtime_failure_reply_reason(&run.receipt, &receipt_reason),
+                    run.receipt.queue_id.as_deref(),
+                ),
+                presentation: None,
+                delivery_intent: delivery_intent_from_inbound_context(
+                    &context.platform,
+                    &context.channel_id,
+                    context.inbound_context.as_deref(),
+                ),
+                attachments: Vec::new(),
+            };
+            let (file, appended) = append_final_outbound_message_once(
+                &options.harness_home,
+                run.receipt.execution_dir.as_deref(),
+                run.receipt.completion_file.as_deref(),
+                &mut message,
+                &mut warnings,
+            )?;
+            outbox_file = Some(file);
+            if appended {
+                outbound_message = Some(message);
+            }
+        } else {
+            warnings.push(
+                "mutation-observed overload terminal notification suppressed for stale exact session"
+                    .to_string(),
+            );
+        }
+    }
+
+    let continuation_link =
+        child_queue_id
+            .as_ref()
+            .map(|child_queue_id| crate::RuntimeContinuationLinkV1 {
+                parent_queue_id: run.receipt.queue_id.clone().unwrap_or_default(),
+                child_queue_id: child_queue_id.clone(),
+                continuation_index: child_session_key
+                    .as_deref()
+                    .and_then(crate::context_rollover::continuation_index_from_session_key)
+                    .unwrap_or_else(|| {
+                        prepare.receipt.continuation.continuation_index.unwrap_or(0)
+                    }),
+                virtual_lane_digest: None,
+            });
+    let terminal_disposition = if continuation_link.is_some() {
+        Some(crate::RuntimeTerminalDispositionV1::ContinuationHandoff)
+    } else {
+        match receipt_status {
+            RuntimeRunOnceStatus::Completed => {
+                Some(crate::RuntimeTerminalDispositionV1::LogicalSuccess)
+            }
+            RuntimeRunOnceStatus::Canceled => {
+                Some(crate::RuntimeTerminalDispositionV1::LogicalCanceled)
+            }
+            RuntimeRunOnceStatus::NeedsUser => Some(crate::RuntimeTerminalDispositionV1::NeedsUser),
+            RuntimeRunOnceStatus::ExternalEffectDenied => {
+                Some(crate::RuntimeTerminalDispositionV1::LogicalFailure)
+            }
+            RuntimeRunOnceStatus::DeadLetter
+            | RuntimeRunOnceStatus::FailedTerminal
+            | RuntimeRunOnceStatus::ProtocolError
+            | RuntimeRunOnceStatus::ContextExhausted
+            | RuntimeRunOnceStatus::SpawnFailed
+            | RuntimeRunOnceStatus::Timeout => {
+                Some(crate::RuntimeTerminalDispositionV1::LogicalFailure)
+            }
+            RuntimeRunOnceStatus::Suppressed | RuntimeRunOnceStatus::Skipped => {
+                Some(crate::RuntimeTerminalDispositionV1::TerminalSuppression)
+            }
+            _ => None,
+        }
+    };
     let receipt = RuntimeRunOnceReceipt {
         queue_id: run.receipt.queue_id.clone(),
         status: receipt_status,
@@ -1551,6 +1928,13 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         continuation: prepare.receipt.continuation.clone(),
         child_queue_id,
         child_session_key,
+        terminal_disposition,
+        continuation_link,
+        protocol_failure: run.receipt.protocol_failure.clone(),
+        mutation_evidence: run.receipt.mutation_evidence,
+        retry_schedule,
+        task_drain_evaluation,
+        external_effect: run.receipt.external_effect.clone(),
         terminal_control_matched: None,
         terminal_control_source: None,
         suppressed_run_once_reason: None,
@@ -1620,6 +2004,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         | RuntimeRunOnceStatus::DeadLetter
         | RuntimeRunOnceStatus::FailedTerminal => HarnessLogLevel::Error,
         RuntimeRunOnceStatus::Canceled
+        | RuntimeRunOnceStatus::NeedsUser
+        | RuntimeRunOnceStatus::ExternalEffectDenied
         | RuntimeRunOnceStatus::Suppressed
         | RuntimeRunOnceStatus::Skipped
         | RuntimeRunOnceStatus::RetryPending
@@ -1632,6 +2018,8 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
     };
     let log_event = match receipt.status {
         RuntimeRunOnceStatus::Completed => "runtime.run-once.completed",
+        RuntimeRunOnceStatus::NeedsUser => "runtime.run-once.needs-user",
+        RuntimeRunOnceStatus::ExternalEffectDenied => "runtime.run-once.external-effect-denied",
         RuntimeRunOnceStatus::Suppressed => "runtime.run-once.suppressed",
         RuntimeRunOnceStatus::Skipped => "runtime.run-once.skipped",
         RuntimeRunOnceStatus::LeaseBusy => "runtime.run-once.lease-busy",
@@ -1723,7 +2111,28 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         }
     }
 
-    write_runtime_run_once_report(
+    let progress_harness_home = options.harness_home.clone();
+    let progress_elapsed_ms = run.receipt.elapsed_ms;
+    let child_progress = receipt.continuation_link.as_ref().and_then(|link| {
+        let parent = progress_context.as_ref()?;
+        Some((
+            AgentProgressContext {
+                queue_id: link.child_queue_id.clone(),
+                agent_id: parent.agent_id.clone(),
+                account_id: parent.account_id.clone(),
+                thread_id: parent.thread_id.clone(),
+                session_key: receipt
+                    .child_session_key
+                    .clone()
+                    .unwrap_or_else(|| parent.session_key.clone()),
+                platform: parent.platform.clone(),
+                channel_id: parent.channel_id.clone(),
+                user_id: parent.user_id.clone(),
+            },
+            link.clone(),
+        ))
+    });
+    let mut report = write_runtime_run_once_report(
         RuntimeRunOnceReport {
             schema: RUNTIME_RUN_ONCE_SCHEMA,
             harness_home: options.harness_home,
@@ -1738,7 +2147,37 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
             warnings,
         },
         true,
-    )
+    )?;
+    if let Some(context) = &progress_context {
+        append_runtime_progress_finished(
+            &progress_harness_home,
+            context,
+            report.receipt.status,
+            report.receipt.terminal_disposition,
+            &report.receipt.reason,
+            progress_elapsed_ms,
+            &mut report.warnings,
+        );
+    }
+    if let Some((context, _link)) = child_progress {
+        let event = AgentProgressEvent::new(
+            &context,
+            AgentProgressKind::Runtime,
+            "continuation-handoff",
+            "Continuation admitted; waiting for the exact session lane.",
+            AgentProgressStatus::Started,
+            current_log_time_ms().unwrap_or(0),
+        )
+        .lifecycle(crate::AgentProgressLifecycle::Continuing)
+        .source("runtime-pipeline");
+        if let Err(error) = crate::append_agent_progress_event(&progress_harness_home, &event) {
+            report.warnings.push(format!(
+                "durable continuation child progress append failed after parent handoff receipt: {error}"
+            ));
+        }
+    }
+    write_json_atomic(&report.report_file, &report)?;
+    Ok(report)
 }
 
 fn progress_context_from(
@@ -1858,6 +2297,7 @@ fn append_suppressed_runtime_progress(
         harness_home,
         &context,
         RuntimeRunOnceStatus::Suppressed,
+        Some(crate::RuntimeTerminalDispositionV1::TerminalSuppression),
         reason,
         0,
         warnings,
@@ -1948,6 +2388,7 @@ fn append_runtime_progress_finished(
     harness_home: &Path,
     context: &AgentProgressContext,
     status: RuntimeRunOnceStatus,
+    disposition: Option<crate::RuntimeTerminalDispositionV1>,
     reason: &str,
     elapsed_ms: u128,
     warnings: &mut Vec<String>,
@@ -1961,31 +2402,46 @@ fn append_runtime_progress_finished(
             AgentProgressStatus::Completed
         }
         RuntimeRunOnceStatus::Skipped => AgentProgressStatus::Completed,
-        RuntimeRunOnceStatus::RetryPending | RuntimeRunOnceStatus::AuthDeferred => {
-            AgentProgressStatus::Progress
-        }
+        RuntimeRunOnceStatus::RetryPending
+        | RuntimeRunOnceStatus::AuthDeferred
+        | RuntimeRunOnceStatus::NeedsUser => AgentProgressStatus::Progress,
         _ => AgentProgressStatus::Failed,
     };
     let preview = runtime_progress_preview(status, reason);
-    append_progress_nonfatal(
-        harness_home,
-        AgentProgressEvent::new(
-            context,
-            AgentProgressKind::Runtime,
-            "run",
-            preview,
-            progress_status,
-            at_ms,
-        )
-        .elapsed_ms(elapsed_ms)
-        .source("runtime-pipeline"),
-        warnings,
-    );
+    let label = match disposition {
+        Some(crate::RuntimeTerminalDispositionV1::ContinuationHandoff) => "continuation-handoff",
+        Some(crate::RuntimeTerminalDispositionV1::LogicalCanceled) => "canceled",
+        Some(crate::RuntimeTerminalDispositionV1::NeedsUser) => "waiting-for-approval",
+        Some(crate::RuntimeTerminalDispositionV1::TerminalSuppression) => "terminal-suppression",
+        _ => "run",
+    };
+    let mut event = AgentProgressEvent::new(
+        context,
+        AgentProgressKind::Runtime,
+        label,
+        preview,
+        progress_status,
+        at_ms,
+    )
+    .elapsed_ms(elapsed_ms)
+    .source("runtime-pipeline");
+    if disposition == Some(crate::RuntimeTerminalDispositionV1::ContinuationHandoff) {
+        event = event.lifecycle(crate::AgentProgressLifecycle::Continuing);
+    } else if disposition == Some(crate::RuntimeTerminalDispositionV1::NeedsUser) {
+        event = event.lifecycle(crate::AgentProgressLifecycle::WaitingForApproval);
+    }
+    append_progress_nonfatal(harness_home, event, warnings);
 }
 
 fn runtime_progress_preview(status: RuntimeRunOnceStatus, reason: &str) -> String {
     match status {
         RuntimeRunOnceStatus::Completed => "done".to_string(),
+        RuntimeRunOnceStatus::NeedsUser => {
+            "connector action is waiting for exact, explicit approval".to_string()
+        }
+        RuntimeRunOnceStatus::ExternalEffectDenied => {
+            "connector action was denied and will not be retried".to_string()
+        }
         RuntimeRunOnceStatus::Suppressed => "suppressed by terminal control".to_string(),
         RuntimeRunOnceStatus::Skipped => "skipped because continuation work was queued".to_string(),
         RuntimeRunOnceStatus::RetryPending => {
@@ -2019,6 +2475,8 @@ fn append_progress_nonfatal(
 fn map_run_once_status(status: CodexRuntimeRunStatus) -> RuntimeRunOnceStatus {
     match status {
         CodexRuntimeRunStatus::Completed => RuntimeRunOnceStatus::Completed,
+        CodexRuntimeRunStatus::ApprovalRequired => RuntimeRunOnceStatus::NeedsUser,
+        CodexRuntimeRunStatus::ExternalEffectDenied => RuntimeRunOnceStatus::ExternalEffectDenied,
         CodexRuntimeRunStatus::PreflightBlocked => RuntimeRunOnceStatus::PreflightBlocked,
         CodexRuntimeRunStatus::NoRuntimePlan => RuntimeRunOnceStatus::NoRuntimePlan,
         CodexRuntimeRunStatus::SpawnFailed => RuntimeRunOnceStatus::SpawnFailed,
@@ -2037,6 +2495,18 @@ fn runtime_failure_reply_text(
     let queue_line = queue_id
         .map(|queue_id| format!("\nQueue: {queue_id}"))
         .unwrap_or_default();
+    if status == RuntimeRunOnceStatus::NeedsUser {
+        return format!(
+            "Waiting for approval.{queue_line}\n{}\n\nThis exact connector action is parked. Generic timeout recovery will not replay it.",
+            truncate_for_channel(reason, 720),
+        );
+    }
+    if status == RuntimeRunOnceStatus::ExternalEffectDenied {
+        return format!(
+            "Connector action denied.{queue_line}\n{}\n\nThis approval generation is terminal and will not be retried.",
+            truncate_for_channel(reason, 720),
+        );
+    }
     if status == RuntimeRunOnceStatus::Canceled {
         if reason.contains("interrupted_by_new_turn") {
             return format!(
@@ -2071,14 +2541,89 @@ fn runtime_failure_reply_text(
     )
 }
 
-fn final_run_once_status(
+#[allow(clippy::too_many_arguments)]
+fn runtime_retry_schedule_for(
+    status: RuntimeRunOnceStatus,
+    queue_id: Option<&str>,
+    attempt: usize,
+    max_attempts: usize,
+    delay_ms: i64,
+    scheduled_at_ms: i64,
+    protocol_failure: Option<&crate::CodexProtocolFailureV1>,
+    mutation_evidence: Option<crate::RuntimeMutationEvidenceClass>,
+) -> Option<crate::RuntimeRetryScheduleV1> {
+    (status == RuntimeRunOnceStatus::RetryPending).then(|| {
+        let replay_mode = if matches!(
+            protocol_failure.map(|failure| failure.class),
+            Some(crate::CodexProtocolFailureClass::ServerOverloaded)
+        ) && mutation_evidence
+            == Some(crate::RuntimeMutationEvidenceClass::NoObservableMutation)
+        {
+            crate::RuntimeRetryReplayModeV1::SameRequestNoObservableMutation
+        } else {
+            crate::RuntimeRetryReplayModeV1::SameQueueLegacyPolicy
+        };
+        crate::RuntimeRetryScheduleV1 {
+            lineage_id: format!("runtime-retry:{}", queue_id.unwrap_or("unattributed")),
+            attempt,
+            max_attempts,
+            delay_ms,
+            scheduled_at_ms,
+            next_eligible_at_ms: scheduled_at_ms.saturating_add(delay_ms),
+            replay_mode,
+        }
+    })
+}
+
+fn final_run_once_status_with_protocol(
     codex_status: CodexRuntimeRunStatus,
     failure_attempts: usize,
     reason: &str,
     max_failure_attempts: usize,
+    protocol_failure: Option<&crate::CodexProtocolFailureV1>,
+    mutation_evidence: Option<crate::RuntimeMutationEvidenceClass>,
 ) -> RuntimeRunOnceStatus {
+    if codex_status == CodexRuntimeRunStatus::ProtocolError
+        && let Some(protocol_failure) = protocol_failure
+    {
+        use crate::CodexProtocolFailureClass as Class;
+        use crate::RuntimeMutationEvidenceClass as Evidence;
+        return match protocol_failure.class {
+            Class::ServerOverloaded => match mutation_evidence {
+                Some(Evidence::NoObservableMutation) | Some(Evidence::MutationObserved)
+                    if failure_attempts < max_failure_attempts =>
+                {
+                    RuntimeRunOnceStatus::RetryPending
+                }
+                Some(Evidence::NoObservableMutation) | Some(Evidence::MutationObserved) => {
+                    RuntimeRunOnceStatus::DeadLetter
+                }
+                Some(Evidence::Unknown) | None => RuntimeRunOnceStatus::FailedTerminal,
+            },
+            Class::RateLimited => match mutation_evidence {
+                Some(Evidence::NoObservableMutation) if failure_attempts < max_failure_attempts => {
+                    RuntimeRunOnceStatus::RetryPending
+                }
+                Some(Evidence::NoObservableMutation) => RuntimeRunOnceStatus::DeadLetter,
+                Some(Evidence::MutationObserved | Evidence::Unknown) | None => {
+                    RuntimeRunOnceStatus::FailedTerminal
+                }
+            },
+            Class::StreamDisconnected if failure_attempts < max_failure_attempts => {
+                RuntimeRunOnceStatus::RetryPending
+            }
+            Class::StreamDisconnected => RuntimeRunOnceStatus::DeadLetter,
+            Class::ContextExhausted => RuntimeRunOnceStatus::ContextExhausted,
+            Class::Authentication
+            | Class::Configuration
+            | Class::InvalidRequest
+            | Class::Unknown => RuntimeRunOnceStatus::FailedTerminal,
+        };
+    }
     match codex_status {
         CodexRuntimeRunStatus::Completed => RuntimeRunOnceStatus::Completed,
+        CodexRuntimeRunStatus::ApprovalRequired => RuntimeRunOnceStatus::NeedsUser,
+        CodexRuntimeRunStatus::ExternalEffectDenied => RuntimeRunOnceStatus::ExternalEffectDenied,
         CodexRuntimeRunStatus::Canceled => RuntimeRunOnceStatus::Canceled,
         CodexRuntimeRunStatus::PreflightBlocked if reason.contains("needs-operator-auth") => {
             RuntimeRunOnceStatus::AuthDeferred
@@ -2113,6 +2658,23 @@ fn final_run_once_status(
         | CodexRuntimeRunStatus::SpawnFailed
         | CodexRuntimeRunStatus::ProtocolError => RuntimeRunOnceStatus::FailedTerminal,
     }
+}
+
+#[cfg(test)]
+fn final_run_once_status(
+    codex_status: CodexRuntimeRunStatus,
+    failure_attempts: usize,
+    reason: &str,
+    max_failure_attempts: usize,
+) -> RuntimeRunOnceStatus {
+    final_run_once_status_with_protocol(
+        codex_status,
+        failure_attempts,
+        reason,
+        max_failure_attempts,
+        None,
+        None,
+    )
 }
 
 fn is_retryable_codex_protocol_error(reason: &str) -> bool {
@@ -2201,7 +2763,9 @@ fn runtime_failure_reply_reason(
 fn should_write_failure_outbox(status: RuntimeRunOnceStatus) -> bool {
     matches!(
         status,
-        RuntimeRunOnceStatus::DeadLetter
+        RuntimeRunOnceStatus::NeedsUser
+            | RuntimeRunOnceStatus::ExternalEffectDenied
+            | RuntimeRunOnceStatus::DeadLetter
             | RuntimeRunOnceStatus::FailedTerminal
             | RuntimeRunOnceStatus::Canceled
             | RuntimeRunOnceStatus::NoRuntimePlan
@@ -2397,22 +2961,59 @@ fn continuation_candidate_for_run(
     label: &str,
     warnings: &mut Vec<String>,
 ) -> io::Result<Option<RuntimeContinuationCandidate>> {
-    if let Some(item) = item {
-        return Ok(Some(RuntimeContinuationCandidate::from_prepared_item(item)));
-    }
-    let Some(queue_id) = queue_id else {
-        warnings.push(format!(
-            "{label} skipped: runtime run receipt had no queue id"
-        ));
+    let candidate = if let Some(item) = item {
+        Some(RuntimeContinuationCandidate::from_prepared_item(item))
+    } else {
+        let Some(queue_id) = queue_id else {
+            warnings.push(format!(
+                "{label} skipped: runtime run receipt had no queue id"
+            ));
+            return Ok(None);
+        };
+        let recovered = read_pending_continuation_candidate(harness_home, queue_id, warnings)?;
+        if recovered.is_none() {
+            warnings.push(format!(
+                "{label} skipped: queue item metadata was unavailable for {queue_id}"
+            ));
+        }
+        recovered
+    };
+    let Some(mut candidate) = candidate else {
         return Ok(None);
     };
-    let recovered = read_pending_continuation_candidate(harness_home, queue_id, warnings)?;
-    if recovered.is_none() {
-        warnings.push(format!(
-            "{label} skipped: queue item metadata was unavailable for {queue_id}"
-        ));
+    if let (Some(platform), Some(channel_id), Some(user_id), Some(agent_id)) = (
+        candidate.platform.as_deref(),
+        candidate.channel_id.as_deref(),
+        candidate.user_id.as_deref(),
+        candidate.agent_id.as_deref(),
+    ) {
+        match crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+            &candidate.session_key,
+            platform,
+            candidate.account_id.as_deref().unwrap_or("default"),
+            channel_id,
+            user_id,
+            agent_id,
+        ) {
+            Ok(canonical) => {
+                let canonical_session_key = canonical.canonical_string();
+                if canonical_session_key != candidate.session_key {
+                    warnings.push(format!(
+                        "{label} normalized legacy queue session `{}` to exact-lane canonical session `{canonical_session_key}`",
+                        candidate.session_key
+                    ));
+                    candidate.session_key = canonical_session_key;
+                }
+            }
+            Err(error) => {
+                warnings.push(format!(
+                    "{label} skipped: queue session key failed exact-lane canonicalization: {error}"
+                ));
+                return Ok(None);
+            }
+        }
     }
-    Ok(recovered)
+    Ok(Some(candidate))
 }
 
 fn read_pending_continuation_candidate(
@@ -2445,6 +3046,99 @@ fn read_pending_continuation_candidate(
         }
     }
     Ok(None)
+}
+
+fn maybe_enqueue_server_overloaded_retry_continuation(
+    harness_home: &Path,
+    item: Option<&RuntimeQueuePreparedItem>,
+    run: &CodexRuntimeRunReport,
+    warnings: &mut Vec<String>,
+) -> io::Result<Option<ContextRolloverPreparedRequeueReport>> {
+    if !matches!(
+        run.receipt
+            .protocol_failure
+            .as_ref()
+            .map(|failure| failure.class),
+        Some(crate::CodexProtocolFailureClass::ServerOverloaded)
+    ) || run.receipt.mutation_evidence
+        != Some(crate::RuntimeMutationEvidenceClass::MutationObserved)
+    {
+        return Ok(None);
+    }
+    let Some(item) = continuation_candidate_for_run(
+        harness_home,
+        item,
+        run.receipt.queue_id.as_deref(),
+        "server-overloaded mutation-aware retry continuation",
+        warnings,
+    )?
+    else {
+        return Ok(None);
+    };
+    if item.runtime_class != "interactive" || !runtime_origin_is_parent_channel(&item.origin) {
+        return Ok(None);
+    }
+    let config = load_context_rollover_config(harness_home)?;
+    if config.rollover_mode == ContextRolloverMode::Disabled {
+        warnings.push(
+            "server-overloaded retry continuation skipped: context rollover disabled".to_string(),
+        );
+        return Ok(None);
+    }
+    let current_index = item.continuation.continuation_index.unwrap_or(0);
+    if current_index >= config.max_continuation_depth {
+        warnings.push(format!(
+            "server-overloaded retry continuation skipped: continuation depth {} reached configured limit {}",
+            current_index, config.max_continuation_depth
+        ));
+        mark_virtual_session_terminal_after_depth_limit(
+            harness_home,
+            &item,
+            config.max_continuation_depth,
+            warnings,
+        )?;
+        return Ok(None);
+    }
+    let next_index = current_index.saturating_add(1);
+    let root_session = root_working_session_key(&item.session_key);
+    let new_working_session_key = continuation_session_key(&root_session, next_index);
+    let now_ms = current_log_time_ms()?;
+    match requeue_prepared_context_rollover_if_no_parent_siblings(
+        ContextRolloverRequeuePreparedOptions {
+            harness_home: harness_home.to_path_buf(),
+            queue_id: item.queue_id.clone(),
+            new_working_session_key,
+            reason: format!(
+                "mutation-aware server-overloaded continuation; codexErrorInfo={}; priorReason={}",
+                run.receipt
+                    .protocol_failure
+                    .as_ref()
+                    .and_then(|failure| failure.codex_error_info.as_deref())
+                    .unwrap_or("serverOverloaded"),
+                run.receipt.reason
+            ),
+            now_ms,
+            preserve_continuation_index: false,
+            campaign_slice_generation: None,
+            continuation_intent_key: None,
+            completion_kind: None,
+            allow_exact_state_bootstrap: false,
+        },
+    ) {
+        Ok(report) => Ok(Some(report)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidData | io::ErrorKind::NotFound
+            ) =>
+        {
+            warnings.push(format!(
+                "server-overloaded retry continuation skipped: {error}"
+            ));
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn maybe_enqueue_tool_timeout_retry_continuation(
@@ -6347,6 +7041,246 @@ mod tests {
     }
 
     #[test]
+    fn deadline_drain_operation_plan_replay_creates_one_child_and_one_eventual_final() {
+        let _guard = env_lock();
+        let root = temp_root("deadline-drain-operation-plan-replay");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: Some("acct-plan".to_string()),
+            channel_id: "dm-plan".to_string(),
+            user_id: "user-plan".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "continue the exact-lane operation plan".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        let parent_queue_id = receive.queue_id.unwrap();
+        let pending_text = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        let pending: Value = pending_text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| value.get("queueId").and_then(Value::as_str) == Some(&parent_queue_id))
+            .unwrap();
+        let session_key = pending.get("sessionKey").and_then(Value::as_str).unwrap();
+        let lane_digest = crate::lane::FullLaneKeyV1::new(
+            pending.get("platform").and_then(Value::as_str).unwrap(),
+            pending.get("accountId").and_then(Value::as_str).unwrap(),
+            pending.get("channelId").and_then(Value::as_str).unwrap(),
+            pending.get("userId").and_then(Value::as_str).unwrap(),
+            pending.get("agentId").and_then(Value::as_str).unwrap(),
+            pending.get("runtimeClass").and_then(Value::as_str).unwrap(),
+            root_working_session_key(session_key),
+            session_key,
+        )
+        .unwrap()
+        .identity_hash()
+        .unwrap();
+        crate::operation_plan::create_operation_plan_v2(
+            crate::operation_plan::CreateOperationPlanOptionsV2 {
+                options: crate::operation_plan::CreateOperationPlanOptions {
+                    harness_home: harness_home.clone(),
+                    plan_id: "plan-deadline-drain".to_string(),
+                    origin_queue_id: Some(parent_queue_id.clone()),
+                    session_key: session_key.to_string(),
+                    agent_id: "main".to_string(),
+                    goal: "finish the exact-lane replay".to_string(),
+                    acceptance_criteria: None,
+                    constraints: None,
+                    max_open_items: None,
+                    max_fanout: None,
+                    now_ms: 1235,
+                },
+                lane_digest,
+            },
+        )
+        .unwrap();
+        crate::operation_plan::add_operation_plan_item(
+            crate::operation_plan::OperationPlanAddItemOptions {
+                harness_home: harness_home.clone(),
+                plan_id: "plan-deadline-drain".to_string(),
+                item_id: "item-running".to_string(),
+                title: "Run replay".to_string(),
+                body: "Remain active across the deadline drain".to_string(),
+                depends_on: Vec::new(),
+                acceptance_criteria: None,
+                risk: None,
+                now_ms: 1236,
+            },
+        )
+        .unwrap();
+        let mut item_version = 1;
+        for status in [
+            crate::operation_plan::OperationPlanItemStatus::Ready,
+            crate::operation_plan::OperationPlanItemStatus::Running,
+        ] {
+            let update = crate::operation_plan::update_operation_plan_item(
+                crate::operation_plan::OperationPlanUpdateItemOptions {
+                    harness_home: harness_home.clone(),
+                    plan_id: "plan-deadline-drain".to_string(),
+                    item_id: "item-running".to_string(),
+                    expected_item_version: Some(item_version),
+                    status: Some(status),
+                    title: None,
+                    body: None,
+                    depends_on: None,
+                    assignee: None,
+                    worker_job_id: None,
+                    queue_id: None,
+                    risk: None,
+                    evidence: None,
+                    replace_evidence: false,
+                    add_evidence: Vec::new(),
+                    now_ms: 1236 + item_version as i64,
+                },
+            )
+            .unwrap();
+            item_version = update.item.version;
+        }
+        let plan = crate::operation_plan::show_operation_plan(
+            crate::operation_plan::OperationPlanShowOptions {
+                harness_home: harness_home.clone(),
+                plan_id: "plan-deadline-drain".to_string(),
+            },
+        )
+        .unwrap();
+        let checkpoint_body = "checkpoint: replay work remains active".to_string();
+        let checkpoint = crate::TaskContinuationCheckpointV1 {
+            schema: crate::TASK_CONTINUATION_CHECKPOINT_SCHEMA.to_string(),
+            authority_kind: crate::ContinuationAuthorityKindV1::OperationPlan,
+            authority_id: "plan-deadline-drain".to_string(),
+            authority_version: plan.plan.version,
+            active_item_id: Some("item-running".to_string()),
+            active_item_version: Some(item_version),
+            checkpoint_digest: crate::task_transition::sha256_hex(checkpoint_body.as_bytes()),
+            checkpoint: checkpoint_body,
+        };
+        let assistant_text = format!(
+            "Work is checkpointed for continuation.\n{}{}{}",
+            crate::TASK_CONTINUATION_MARKER_OPEN,
+            serde_json::to_string(&checkpoint).unwrap(),
+            crate::TASK_CONTINUATION_MARKER_CLOSE,
+        );
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+        let first = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(parent_queue_id),
+            codex_executable: Some(fake_deadline_drain_checkpoint_codex_executable(
+                &root,
+                &assistant_text,
+            )),
+            timeout_ms: 5_000,
+            idle_timeout_ms: 5_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(first.receipt.status, RuntimeRunOnceStatus::Skipped);
+        assert!(first.outbox_file.is_none());
+        assert!(first.outbound_message.is_none());
+        let evaluation = first.receipt.task_drain_evaluation.as_ref().unwrap();
+        assert!(evaluation.schedule_continuation, "{}", evaluation.reason);
+        let child_queue_id = first.receipt.child_queue_id.clone().unwrap();
+        let intent = fs::read_to_string(crate::goal_continuation::goal_continuation_intents_file(
+            &harness_home,
+        ))
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            serde_json::from_str::<crate::goal_continuation::GoalContinuationIntentV1>(line).ok()
+        })
+        .find(|intent| intent.child_queue_id.as_deref() == Some(child_queue_id.as_str()))
+        .unwrap();
+        crate::goal_continuation::ensure_goal_continuation_enqueued(
+            &harness_home,
+            &intent.intent_key,
+            6000,
+        )
+        .unwrap();
+        crate::goal_continuation::reconcile_goal_continuation_intents(&harness_home, 6001).unwrap();
+        let pending_after_restart = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(
+            pending_after_restart
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|value| {
+                    value.get("continuationIntentKey").and_then(Value::as_str)
+                        == Some(intent.intent_key.as_str())
+                })
+                .count(),
+            1,
+            "restart reconciliation must preserve one logical child"
+        );
+
+        let second = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: Some(child_queue_id.clone()),
+            codex_executable: Some(fake_codex_executable(&root)),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(second.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert_eq!(
+            second
+                .outbound_message
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            Some("Pipeline fake reply.")
+        );
+        let outbox = fs::read_to_string(second.outbox_file.as_ref().unwrap()).unwrap();
+        assert_eq!(outbox.lines().count(), 1, "the lineage must emit one final");
+        let acknowledged = crate::goal_continuation::latest_goal_continuation_intent(
+            &harness_home,
+            &intent.intent_key,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            acknowledged.status,
+            crate::goal_continuation::GoalContinuationIntentStatus::Acknowledged
+        );
+        assert_eq!(
+            acknowledged.child_queue_id.as_deref(),
+            Some(child_queue_id.as_str())
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn auth_deferred_turn_has_zero_delivery_side_effects_and_wakes_once_when_ready() {
         let _guard = env_lock();
         let root = temp_root("auth_deferred_turn_zero_side_effect_replay");
@@ -7964,7 +8898,9 @@ mod tests {
         assert!(report.outbound_message.is_none());
         assert!(report.outbox_file.is_none());
         assert!(report.warnings.iter().any(|warning| {
-            warning.contains("stale session telegram:dm-42:user-7:main:stale-child suppressed")
+            warning.contains("stale session")
+                && warning.contains("stale-child")
+                && warning.contains("suppressed")
         }));
         assert!(
             !harness_home
@@ -8396,6 +9332,147 @@ mod tests {
     }
 
     #[test]
+    fn server_overloaded_retry_policy_is_mutation_aware() {
+        let failure = crate::CodexProtocolFailureV1 {
+            class: crate::CodexProtocolFailureClass::ServerOverloaded,
+            codex_error_info: Some("serverOverloaded".to_string()),
+            message: "Synthetic selected model capacity failure".to_string(),
+            additional_details: None,
+            will_retry: Some(false),
+            source_method: Some("error".to_string()),
+        };
+
+        for evidence in [
+            crate::RuntimeMutationEvidenceClass::NoObservableMutation,
+            crate::RuntimeMutationEvidenceClass::MutationObserved,
+        ] {
+            assert_eq!(
+                final_run_once_status_with_protocol(
+                    CodexRuntimeRunStatus::ProtocolError,
+                    1,
+                    &failure.message,
+                    3,
+                    Some(&failure),
+                    Some(evidence),
+                ),
+                RuntimeRunOnceStatus::RetryPending
+            );
+            assert_eq!(
+                final_run_once_status_with_protocol(
+                    CodexRuntimeRunStatus::ProtocolError,
+                    3,
+                    &failure.message,
+                    3,
+                    Some(&failure),
+                    Some(evidence),
+                ),
+                RuntimeRunOnceStatus::DeadLetter
+            );
+        }
+        assert_eq!(
+            final_run_once_status_with_protocol(
+                CodexRuntimeRunStatus::ProtocolError,
+                1,
+                &failure.message,
+                3,
+                Some(&failure),
+                Some(crate::RuntimeMutationEvidenceClass::Unknown),
+            ),
+            RuntimeRunOnceStatus::FailedTerminal
+        );
+    }
+
+    #[test]
+    fn server_overloaded_no_mutation_schedules_retry_instead_of_attempt_one_terminal() {
+        let failure = crate::CodexProtocolFailureV1 {
+            class: crate::CodexProtocolFailureClass::ServerOverloaded,
+            codex_error_info: Some("serverOverloaded".to_string()),
+            message: "synthetic overload".to_string(),
+            additional_details: None,
+            will_retry: Some(false),
+            source_method: Some("error".to_string()),
+        };
+        let status = final_run_once_status_with_protocol(
+            CodexRuntimeRunStatus::ProtocolError,
+            1,
+            &failure.message,
+            3,
+            Some(&failure),
+            Some(crate::RuntimeMutationEvidenceClass::NoObservableMutation),
+        );
+        let schedule = runtime_retry_schedule_for(
+            status,
+            Some("queue-overloaded"),
+            1,
+            3,
+            1_000,
+            10_000,
+            Some(&failure),
+            Some(crate::RuntimeMutationEvidenceClass::NoObservableMutation),
+        )
+        .unwrap();
+
+        assert_eq!(status, RuntimeRunOnceStatus::RetryPending);
+        assert_eq!(schedule.next_eligible_at_ms, 11_000);
+        assert_eq!(
+            schedule.replay_mode,
+            crate::RuntimeRetryReplayModeV1::SameRequestNoObservableMutation
+        );
+        assert_eq!(schedule.lineage_id, "runtime-retry:queue-overloaded");
+    }
+
+    #[test]
+    fn structured_protocol_negative_classification_matrix_fails_closed() {
+        for class in [
+            crate::CodexProtocolFailureClass::Authentication,
+            crate::CodexProtocolFailureClass::Configuration,
+            crate::CodexProtocolFailureClass::InvalidRequest,
+            crate::CodexProtocolFailureClass::Unknown,
+        ] {
+            let failure = crate::CodexProtocolFailureV1 {
+                class,
+                codex_error_info: None,
+                message: "reconnecting... synthetic text must not override structured class"
+                    .to_string(),
+                additional_details: None,
+                will_retry: Some(true),
+                source_method: Some("error".to_string()),
+            };
+            assert_eq!(
+                final_run_once_status_with_protocol(
+                    CodexRuntimeRunStatus::ProtocolError,
+                    1,
+                    &failure.message,
+                    3,
+                    Some(&failure),
+                    Some(crate::RuntimeMutationEvidenceClass::NoObservableMutation),
+                ),
+                RuntimeRunOnceStatus::FailedTerminal,
+                "structured class {class:?} must override retry-like legacy message text"
+            );
+        }
+        let context_failure = crate::CodexProtocolFailureV1 {
+            class: crate::CodexProtocolFailureClass::ContextExhausted,
+            codex_error_info: Some("contextWindowExceeded".to_string()),
+            message: "synthetic context exhaustion".to_string(),
+            additional_details: None,
+            will_retry: None,
+            source_method: Some("error".to_string()),
+        };
+        assert_eq!(
+            final_run_once_status_with_protocol(
+                CodexRuntimeRunStatus::ProtocolError,
+                1,
+                &context_failure.message,
+                3,
+                Some(&context_failure),
+                Some(crate::RuntimeMutationEvidenceClass::NoObservableMutation),
+            ),
+            RuntimeRunOnceStatus::ContextExhausted
+        );
+    }
+
+    #[test]
     fn interrupted_verification_not_counted_as_test_failure() {
         let receipt = crate::CodexRuntimeRunReceipt {
             queue_id: Some("queue-interrupted".to_string()),
@@ -8429,6 +9506,10 @@ mod tests {
                 reason: "interrupted before exit code".to_string(),
             }],
             backend_reasoning_execution: None,
+            protocol_failure: None,
+            mutation_evidence: None,
+            external_effect: None,
+            drain_checkpoint: None,
         };
         let reason = runtime_failure_reply_reason(
             &receipt,
@@ -8600,7 +9681,7 @@ mod tests {
         assert_eq!(terminal_result.queue_id, queue_id);
         assert_eq!(
             terminal_result.new_working_session_key,
-            "discord:dm-42:user-7:main:cont-1"
+            canonical_test_continuation(session_key, 1)
         );
 
         fs::write(
@@ -8629,6 +9710,79 @@ mod tests {
     }
 
     #[test]
+    fn server_overloaded_mutation_retry_requeues_exact_lane_continuation() {
+        let root = temp_root("server_overloaded_mutation_retry_requeues_exact_lane_continuation");
+        let harness_home = root.join(".agent-harness");
+        let queue_id = "queue-overloaded";
+        let canonical = crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+            "discord:dm-42:user-7:main",
+            "discord",
+            "default",
+            "dm-42",
+            "user-7",
+            "main",
+        )
+        .unwrap();
+        let session_key = canonical.canonical_string();
+        let expected_child_session_key = canonical.continuation(1).unwrap().canonical_string();
+        seed_prepared_pending_for_stream_retry(&harness_home, queue_id, &session_key);
+        let item = prepared_test_item(queue_id, &session_key, None);
+        let mut run = stream_unstable_failed_run(queue_id, None, false);
+        run.receipt.protocol_failure = Some(crate::CodexProtocolFailureV1 {
+            class: crate::CodexProtocolFailureClass::ServerOverloaded,
+            codex_error_info: Some("serverOverloaded".to_string()),
+            message: "Synthetic selected model capacity failure".to_string(),
+            additional_details: None,
+            will_retry: Some(false),
+            source_method: Some("error".to_string()),
+        });
+        run.receipt.mutation_evidence = Some(crate::RuntimeMutationEvidenceClass::MutationObserved);
+
+        let mut warnings = Vec::new();
+        let rollover = maybe_enqueue_server_overloaded_retry_continuation(
+            &harness_home,
+            Some(&item),
+            &run,
+            &mut warnings,
+        )
+        .unwrap()
+        .unwrap_or_else(|| {
+            panic!("mutation-observed overload should requeue a continuation: {warnings:?}")
+        });
+        assert_eq!(rollover.queue_id, queue_id);
+        assert_eq!(rollover.new_working_session_key, expected_child_session_key);
+        let pending = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        assert!(pending.contains("\"requeuedFromQueueId\":\"queue-overloaded\""));
+        assert!(pending.contains("mutation-aware server-overloaded continuation"));
+
+        let mut no_mutation_run = run.clone();
+        no_mutation_run.receipt.mutation_evidence =
+            Some(crate::RuntimeMutationEvidenceClass::NoObservableMutation);
+        assert!(
+            maybe_enqueue_server_overloaded_retry_continuation(
+                &harness_home,
+                Some(&item),
+                &no_mutation_run,
+                &mut Vec::new(),
+            )
+            .unwrap()
+            .is_none()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn server_overloaded_after_mutation_uses_continuation_not_prompt_replay() {
+        server_overloaded_mutation_retry_requeues_exact_lane_continuation();
+    }
+
+    #[test]
     fn tool_timeout_fallback_failure_retry_requeues_continuation() {
         let root = temp_root("tool_timeout_fallback_failure_retry_requeues_continuation");
         let harness_home = root.join(".agent-harness");
@@ -8651,12 +9805,14 @@ mod tests {
             &mut warnings,
         )
         .unwrap()
-        .expect("tool-timeout fallback failure should requeue continuation");
+        .unwrap_or_else(|| {
+            panic!("tool-timeout fallback failure should requeue continuation: {warnings:?}")
+        });
 
         assert_eq!(rollover.queue_id, queue_id);
         assert_eq!(
             rollover.new_working_session_key,
-            "discord:dm-42:user-7:main:cont-1"
+            canonical_test_continuation(session_key, 1)
         );
         let pending = fs::read_to_string(
             harness_home
@@ -8677,7 +9833,12 @@ mod tests {
                 .join("outbox.jsonl")
                 .exists()
         );
-        assert!(warnings.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("normalized legacy queue session"))
+        );
+        assert!(!warnings.iter().any(|warning| warning.contains("skipped")));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -8707,7 +9868,7 @@ mod tests {
         assert_eq!(rollover.queue_id, queue_id);
         assert_eq!(
             rollover.new_working_session_key,
-            "discord:dm-42:user-7:main:cont-1"
+            canonical_test_continuation(session_key, 1)
         );
         let pending = fs::read_to_string(
             harness_home
@@ -8718,7 +9879,12 @@ mod tests {
         .unwrap();
         assert!(pending.contains("interrupted long-task"));
         assert!(!pending.contains("polluted-thread"));
-        assert!(warnings.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| { warning.contains("normalized legacy queue session") })
+        );
+        assert!(!warnings.iter().any(|warning| warning.contains("skipped")));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -8753,7 +9919,12 @@ mod tests {
         )
         .unwrap();
         assert!(!pending.contains("\"requeuedFromQueueId\":\"queue-provider-timeout\""));
-        assert!(warnings.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.contains("normalized legacy queue session")),
+            "{warnings:#?}"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -8798,7 +9969,7 @@ mod tests {
         assert_eq!(rollover.queue_id, queue_id);
         assert_eq!(
             rollover.new_working_session_key,
-            "discord:dm-42:user-7:main:cont-1"
+            canonical_test_continuation(session_key, 1)
         );
         let pending = fs::read_to_string(
             harness_home
@@ -8809,8 +9980,50 @@ mod tests {
         .unwrap();
         assert_eq!(pending.matches("rollover-requeue").count(), 1);
         assert!(pending.contains("interrupted long-task"));
+        let parent_receipts = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("run-once-receipts.jsonl"),
+        )
+        .unwrap();
+        let handoff = parent_receipts
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| {
+                value.get("terminalDisposition").and_then(Value::as_str)
+                    == Some("continuation-handoff")
+                    && value
+                        .get("childQueueId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|child| child.contains("rollover-requeue"))
+            })
+            .expect("typed continuation handoff receipt must name the admitted child");
+        let child_queue_id = handoff
+            .get("childQueueId")
+            .and_then(Value::as_str)
+            .expect("handoff childQueueId");
+        assert_ne!(child_queue_id, queue_id);
+        assert_eq!(
+            handoff
+                .pointer("/continuationLink/parentQueueId")
+                .and_then(Value::as_str),
+            Some(queue_id)
+        );
+        assert_eq!(
+            handoff
+                .pointer("/continuationLink/childQueueId")
+                .and_then(Value::as_str),
+            Some(child_queue_id)
+        );
+        assert!(!crate::agent_progress_events_file(&harness_home).exists());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn productive_timeout_commits_typed_continuation_handoff_before_progress_projection() {
+        productive_absolute_timeout_retry_requeues_continuation_instead_of_replaying_parent();
     }
 
     #[test]
@@ -8893,12 +10106,12 @@ mod tests {
 
         assert_eq!(rollover.queue_id, queue_id);
         assert_eq!(
-            rollover.previous_working_session_key.as_deref(),
-            Some(session_key)
+            rollover.previous_working_session_key,
+            Some(canonical_test_session(session_key))
         );
         assert_eq!(
             rollover.new_working_session_key,
-            "discord:dm-42:user-7:main:cont-1"
+            canonical_test_continuation(session_key, 1)
         );
         assert_eq!(rollover.continuation_index, 1);
         assert!(
@@ -8923,7 +10136,12 @@ mod tests {
                 .join("outbox.jsonl")
                 .exists()
         );
-        assert!(warnings.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| { warning.contains("normalized legacy queue session") })
+        );
+        assert!(!warnings.iter().any(|warning| warning.contains("skipped")));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -9060,7 +10278,12 @@ mod tests {
                 .requeued_queue_id
                 .starts_with("queue-stream:rollover-requeue-")
         );
-        assert!(warnings.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.contains("normalized legacy queue session")),
+            "{warnings:#?}"
+        );
         let pending = fs::read_to_string(
             harness_home
                 .join("state")
@@ -9136,6 +10359,7 @@ mod tests {
         .unwrap();
         assert_eq!(first.receipt.status, RuntimeRunOnceStatus::RetryPending);
         assert!(first.outbound_message.is_none());
+        force_retry_eligible(&harness_home, &queue_id);
 
         let second = run_runtime_queue_once(RuntimeRunOnceOptions {
             harness_home: harness_home.clone(),
@@ -9267,6 +10491,7 @@ mod tests {
         .unwrap();
         assert_eq!(first.receipt.status, RuntimeRunOnceStatus::RetryPending);
         assert!(first.outbound_message.is_none());
+        force_retry_eligible(&harness_home, &parent_queue_id);
 
         let second = run_runtime_queue_once(RuntimeRunOnceOptions {
             harness_home: harness_home.clone(),
@@ -9403,6 +10628,7 @@ mod tests {
                 .reason
                 .contains("stream disconnected before completion")
         );
+        force_retry_eligible(&harness_home, &queue_id);
 
         let second = run_runtime_queue_once(RuntimeRunOnceOptions {
             harness_home: harness_home.clone(),
@@ -9419,6 +10645,7 @@ mod tests {
         assert_eq!(second.receipt.status, RuntimeRunOnceStatus::RetryPending);
         assert_eq!(second.receipt.queue_id.as_deref(), Some(queue_id.as_str()));
         assert!(second.outbound_message.is_none());
+        force_retry_eligible(&harness_home, &queue_id);
 
         let third = run_runtime_queue_once(RuntimeRunOnceOptions {
             harness_home: harness_home.clone(),
@@ -9711,7 +10938,7 @@ mod tests {
     }
 
     #[test]
-    fn run_runtime_queue_once_suppresses_owner_mismatched_agent_final_outbox() {
+    fn run_runtime_queue_once_quarantines_owner_mismatched_agent_before_final_outbox() {
         let _guard = env_lock();
         let root =
             temp_root("run_runtime_queue_once_suppresses_owner_mismatched_agent_final_outbox");
@@ -9776,16 +11003,20 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Completed);
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::NoWork);
+        assert!(report.plan.is_none());
+        assert!(report.run.is_none());
         assert!(report.outbound_message.is_none());
         assert!(report.outbox_file.is_none());
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("classified as InternalEvidence")),
-            "owner-mismatched completed output must be classified as internal evidence"
-        );
+        let quarantine = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("execution-receipts.jsonl"),
+        )
+        .unwrap();
+        assert!(quarantine.contains("invalid-canonical-lane-quarantined"));
+        assert!(quarantine.contains("session identity is invalid for its exact lane"));
         assert!(
             !harness_home
                 .join("state")
@@ -9804,7 +11035,8 @@ mod tests {
             log_text
                 .matches("runtime.run-once.final-outbox-suppressed")
                 .count(),
-            1
+            0,
+            "invalid ownership must be quarantined before runtime or final-outbox planning"
         );
 
         let _ = fs::remove_dir_all(root);
@@ -10255,7 +11487,7 @@ mod tests {
         assert!(
             first.pending.iter().any(|pending| {
                 pending.message_kind == AgentProgressDeliveryMessageKind::Status
-                    && pending.text.contains("Done")
+                    && pending.text.contains("Stopped")
             }),
             "{:#?}",
             first.pending
@@ -10326,6 +11558,36 @@ mod tests {
         );
     }
 
+    fn canonical_test_session(session_key: &str) -> String {
+        let platform = session_key.split(':').next().unwrap_or("telegram");
+        crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+            session_key,
+            platform,
+            "default",
+            "dm-42",
+            "user-7",
+            "main",
+        )
+        .unwrap()
+        .canonical_string()
+    }
+
+    fn canonical_test_continuation(session_key: &str, index: u64) -> String {
+        let platform = session_key.split(':').next().unwrap_or("telegram");
+        crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+            session_key,
+            platform,
+            "default",
+            "dm-42",
+            "user-7",
+            "main",
+        )
+        .unwrap()
+        .continuation(index)
+        .unwrap()
+        .canonical_string()
+    }
+
     fn prepared_test_item(
         queue_id: &str,
         session_key: &str,
@@ -10340,7 +11602,11 @@ mod tests {
             origin: "channel".to_string(),
             cron_run_id: None,
             scheduled_for_ms: None,
-            platform: "telegram".to_string(),
+            platform: session_key
+                .split(':')
+                .next()
+                .unwrap_or("telegram")
+                .to_string(),
             account_id: None,
             channel_id: "dm-42".to_string(),
             user_id: "user-7".to_string(),
@@ -10413,6 +11679,10 @@ mod tests {
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
                 backend_reasoning_execution: None,
+                protocol_failure: None,
+                mutation_evidence: None,
+                external_effect: None,
+                drain_checkpoint: None,
             },
             completion: None,
             stdout_log: None,
@@ -10476,6 +11746,10 @@ mod tests {
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
                 backend_reasoning_execution: None,
+                protocol_failure: None,
+                mutation_evidence: None,
+                external_effect: None,
+                drain_checkpoint: None,
             },
             completion: None,
             stdout_log: None,
@@ -10543,6 +11817,10 @@ mod tests {
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
                 backend_reasoning_execution: None,
+                protocol_failure: None,
+                mutation_evidence: None,
+                external_effect: None,
+                drain_checkpoint: None,
             },
             completion: None,
             stdout_log: None,
@@ -10835,6 +12113,55 @@ while ($true) {
         )
         .unwrap();
         let cmd = root.join("fake-active-goal-codex.cmd");
+        fs::write(
+            &cmd,
+            format!(
+                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        cmd
+    }
+
+    #[cfg(windows)]
+    fn fake_deadline_drain_checkpoint_codex_executable(
+        root: &Path,
+        assistant_text: &str,
+    ) -> PathBuf {
+        let assistant_text = serde_json::to_string(assistant_text).unwrap();
+        let script = root.join("fake-deadline-drain-checkpoint-app-server.ps1");
+        fs::write(
+            &script,
+            format!(
+                r#"
+while ($true) {{
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) {{ break }}
+    try {{ $msg = $line | ConvertFrom-Json }} catch {{ continue }}
+    if ($msg.id -eq 0) {{
+        [Console]::Out.WriteLine('{{"id":0,"result":{{"ok":true}}}}')
+    }} elseif ($msg.method -eq 'modelProvider/capabilities/read') {{
+        [Console]::Out.WriteLine('{{"id":8900,"result":{{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}}}')
+    }} elseif ($msg.method -eq 'thread/start') {{
+        [Console]::Out.WriteLine('{{"id":1,"result":{{"thread":{{"id":"thread-deadline-plan"}}}}}}')
+    }} elseif ($msg.method -eq 'turn/start') {{
+        [Console]::Out.WriteLine('{{"method":"turn/started","params":{{"threadId":"thread-deadline-plan","turn":{{"id":"turn-deadline-plan","kind":"regular"}}}}}}')
+        [Console]::Out.Flush()
+    }} elseif ($msg.method -eq 'turn/steer') {{
+        [Console]::Out.WriteLine((ConvertTo-Json @{{id=$msg.id;result=@{{turnId='turn-deadline-plan'}}}} -Compress))
+        [Console]::Out.WriteLine('{{"method":"item/agentMessage/delta","params":{{"delta":{assistant_text}}}}}')
+        [Console]::Out.WriteLine('{{"method":"turn/completed","params":{{"threadId":"thread-deadline-plan","turn":{{"id":"turn-deadline-plan","status":"completed"}}}}}}')
+        [Console]::Out.Flush()
+        break
+    }}
+    [Console]::Out.Flush()
+}}
+"#,
+            ),
+        )
+        .unwrap();
+        let cmd = root.join("fake-deadline-drain-checkpoint-codex.cmd");
         fs::write(
             &cmd,
             format!(
@@ -11290,6 +12617,54 @@ done
     }
 
     #[cfg(not(windows))]
+    fn fake_deadline_drain_checkpoint_codex_executable(
+        root: &Path,
+        assistant_text: &str,
+    ) -> PathBuf {
+        let assistant_text = serde_json::to_string(assistant_text).unwrap();
+        let script = root.join("fake-deadline-drain-checkpoint-codex");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*)
+            printf '%s\n' '{{"id":0,"result":{{"ok":true}}}}'
+            ;;
+        *'"method":"modelProvider/capabilities/read"'*)
+            printf '%s\n' '{{"id":8900,"result":{{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}}}'
+            ;;
+        *'"method":"thread/start"'*)
+            printf '%s\n' '{{"id":1,"result":{{"thread":{{"id":"thread-deadline-plan"}}}}}}'
+            ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{{"method":"turn/started","params":{{"threadId":"thread-deadline-plan","turn":{{"id":"turn-deadline-plan","kind":"regular"}}}}}}'
+            ;;
+        *'"method":"turn/steer"'*)
+            rpc_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+            printf '%s\n' "{{\"id\":${{rpc_id}},\"result\":{{\"turnId\":\"turn-deadline-plan\"}}}}"
+            printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"delta":{assistant_text}}}}}'
+            printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"thread-deadline-plan","turn":{{"id":"turn-deadline-plan","status":"completed"}}}}}}'
+            exit 0
+            ;;
+    esac
+done
+"#,
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+        script
+    }
+
+    #[cfg(not(windows))]
     fn fake_terminal_goal_codex_executable(
         root: &Path,
         status: &str,
@@ -11631,6 +13006,36 @@ done
             "agent-harness-runtime-pipeline-{test_name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn force_retry_eligible(harness_home: &Path, queue_id: &str) {
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        let receipts_file = queue_dir.join("run-once-receipts.jsonl");
+        let receipts = fs::read_to_string(&receipts_file).unwrap();
+        let mut rows = receipts
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let receipt = rows
+            .iter_mut()
+            .rev()
+            .find(|receipt| {
+                string_field(receipt, &["queueId"]) == Some(queue_id)
+                    && string_field(receipt, &["status"]) == Some("retry-pending")
+            })
+            .expect("retry-pending receipt must exist before forcing eligibility");
+        receipt["retrySchedule"]["nextEligibleAtMs"] = Value::from(0);
+        let mut rewritten = rows
+            .into_iter()
+            .map(|row| serde_json::to_string(&row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        rewritten.push('\n');
+        fs::write(&receipts_file, rewritten).unwrap();
+        let index_file = queue_dir.join("queue-state-index.json");
+        if index_file.is_file() {
+            fs::remove_file(index_file).unwrap();
+        }
     }
 
     fn rewrite_pending_queue_identity(

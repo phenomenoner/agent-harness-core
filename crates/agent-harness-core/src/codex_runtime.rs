@@ -35,6 +35,11 @@ use crate::codex_web_search::{
     persist_codex_web_search_thread_binding, plan_codex_web_search,
     read_codex_web_search_thread_binding, unavailable_codex_web_search_capability,
 };
+use crate::external_effect::{
+    ExternalEffectAdmissionV1, ExternalEffectIntentV1, ExternalEffectRequestContextV1,
+    ExternalEffectStateV1, begin_external_effect_request, load_connector_approval_policy,
+    parse_mcp_elicitation_descriptor, transition_external_effect,
+};
 use crate::runtime_execution_receipt_index::latest_prepared_execution_dir_from_index;
 use crate::virtual_session_runtime_index::latest_codex_runtime_usage as latest_codex_runtime_usage_from_index;
 use crate::{
@@ -53,7 +58,7 @@ use crate::{
     },
     current_log_time_ms,
     live_control::{classify_approval_request, is_live_harness_home},
-    plan_inbound_media_inputs, write_json_atomic,
+    plan_inbound_media_inputs, sanitize_progress_preview, write_json_atomic,
 };
 
 const CODEX_RUNTIME_PLAN_SCHEMA: &str = "agent-harness.codex-runtime-plan.v1";
@@ -124,7 +129,7 @@ const CODEX_CAPABILITY_HANDSHAKE_TIMEOUT_MS: u64 = 30_000;
 const CODEX_WEB_SEARCH_CAPABILITY_TIMEOUT_MS: u64 = 5_000;
 const CODEX_DEADLINE_DRAIN_MAX_WINDOW_MS: u64 = 180_000;
 const CODEX_DEADLINE_DRAIN_DIVISOR: u64 = 10;
-const CODEX_DEADLINE_DRAIN_MESSAGE: &str = "Runtime deadline guard: this turn entered its final drain window. Do not start new long-running commands. Finish the current bounded action, persist checkpoint and verification receipts, summarize remaining work, and return a continuation handoff before the hard deadline.";
+const CODEX_DEADLINE_DRAIN_MESSAGE: &str = "Runtime deadline guard: this turn entered its final drain window. Do not start new long-running commands. Finish the current bounded action, persist checkpoint and verification receipts, summarize remaining work, and return a continuation handoff before the hard deadline. If an exact-lane OperationPlan remains open with a running/review item, append exactly one <agent-harness-continuation-checkpoint> JSON marker using schema agent-harness.task-continuation-checkpoint.v1, authorityKind operation-plan, the current plan/item ids and versions, a bounded checkpoint string, and its lowercase SHA-256 checkpointDigest. Do not emit this marker for todo/ready, blocked, completed, canceled, needs-user, or needs-authority work.";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum OwnedCodexEventsRolloutMode {
@@ -650,6 +655,50 @@ pub struct CodexRuntimeRunReceipt {
     pub interrupted_tool_uses: Vec<CodexInterruptedToolUse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_reasoning_execution: Option<CodexBackendReasoningExecutionReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_failure: Option<CodexProtocolFailureV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_evidence: Option<RuntimeMutationEvidenceClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_effect: Option<ExternalEffectIntentV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_checkpoint: Option<crate::TaskContinuationCheckpointV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexProtocolFailureClass {
+    ServerOverloaded,
+    RateLimited,
+    StreamDisconnected,
+    Authentication,
+    Configuration,
+    ContextExhausted,
+    InvalidRequest,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexProtocolFailureV1 {
+    pub class: CodexProtocolFailureClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_error_info: Option<String>,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additional_details: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub will_retry: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_method: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeMutationEvidenceClass {
+    NoObservableMutation,
+    MutationObserved,
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1135,6 +1184,8 @@ struct CodexContextRolloverReceipt {
 #[serde(rename_all = "kebab-case")]
 pub enum CodexRuntimeRunStatus {
     Completed,
+    ApprovalRequired,
+    ExternalEffectDenied,
     PreflightBlocked,
     NoRuntimePlan,
     SpawnFailed,
@@ -2041,6 +2092,10 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
                 backend_reasoning_execution: None,
+                protocol_failure: None,
+                mutation_evidence: None,
+                external_effect: None,
+                drain_checkpoint: None,
             };
             append_codex_run_log(
                 &options.harness_home,
@@ -2089,6 +2144,10 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 interruption_reason: None,
                 interrupted_tool_uses: Vec::new(),
                 backend_reasoning_execution: None,
+                protocol_failure: None,
+                mutation_evidence: None,
+                external_effect: None,
+                drain_checkpoint: None,
             };
             append_codex_run_log(
                 &options.harness_home,
@@ -2140,6 +2199,10 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             interruption_reason: None,
             interrupted_tool_uses: Vec::new(),
             backend_reasoning_execution: None,
+            protocol_failure: None,
+            mutation_evidence: None,
+            external_effect: None,
+            drain_checkpoint: None,
         };
         append_codex_run_log(
             &options.harness_home,
@@ -2197,6 +2260,10 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             backend_reasoning_execution: run_file
                 .as_deref()
                 .and_then(read_prior_backend_reasoning_execution_reference),
+            protocol_failure: None,
+            mutation_evidence: None,
+            external_effect: None,
+            drain_checkpoint: None,
         };
         append_codex_run_log(
             &options.harness_home,
@@ -2406,6 +2473,41 @@ fn finish_codex_runtime_run(
     let mut status = run_result.status;
     let mut reason = run_result.reason.clone();
     warnings.append(&mut run_result.warnings);
+    let mut drain_checkpoint = None;
+    if run_result
+        .assistant_message
+        .contains(crate::TASK_CONTINUATION_MARKER_OPEN)
+    {
+        match crate::extract_task_continuation_checkpoint(&run_result.assistant_message) {
+            Ok((visible, checkpoint)) => {
+                run_result.assistant_message = visible;
+                if run_result
+                    .assistant_raw_message
+                    .contains(crate::TASK_CONTINUATION_MARKER_OPEN)
+                    && let Ok((visible_raw, _)) = crate::extract_task_continuation_checkpoint(
+                        &run_result.assistant_raw_message,
+                    )
+                {
+                    run_result.assistant_raw_message = visible_raw;
+                }
+                if status == CodexRuntimeRunStatus::Completed
+                    && reason.contains("completed after deadline drain")
+                {
+                    drain_checkpoint = checkpoint;
+                } else {
+                    status = CodexRuntimeRunStatus::ProtocolError;
+                    reason = "typed task continuation checkpoint appeared outside an accepted deadline-drain completion"
+                        .to_string();
+                    warnings.push(reason.clone());
+                }
+            }
+            Err(error) => {
+                status = CodexRuntimeRunStatus::ProtocolError;
+                reason = format!("invalid typed task continuation checkpoint: {error}");
+                warnings.push(reason.clone());
+            }
+        }
+    }
     let raw_fallback_forbidden = !run_result.assistant_final_found
         && !run_result.assistant_raw_message.trim().is_empty()
         && narration_config.mode == AssistantNarrationMode::ProgressPanel
@@ -2455,6 +2557,8 @@ fn finish_codex_runtime_run(
     } else {
         None
     };
+    let (protocol_failure, protocol_mutation_evidence) =
+        inspect_protocol_failure_evidence(run_result.stdout_log.as_deref());
     if should_rotate_stale_stdout_log(&status, &run_result)
         && let Some(stale_stdout_log) = rotate_stale_stdout_log(
             run_result.stdout_log.as_deref(),
@@ -2470,6 +2574,14 @@ fn finish_codex_runtime_run(
         usage.backend_context_generation = plan.prompt_authority.backend_context_generation.clone();
         usage.observed_at_ms.get_or_insert(finished_at_ms);
     }
+    let external_effect = external_effect_id_from_reason(&reason)
+        .map(|effect_id| crate::load_external_effect_intent(harness_home, effect_id))
+        .transpose()?
+        .flatten();
+    let mutation_evidence = external_effect
+        .as_ref()
+        .map(|effect| crate::external_effect_mutation_evidence(effect.state))
+        .or(protocol_mutation_evidence);
     let receipt = CodexRuntimeRunReceipt {
         queue_id: plan.queue_id.clone(),
         status,
@@ -2499,6 +2611,10 @@ fn finish_codex_runtime_run(
         interruption_reason: run_result.interruption_reason,
         interrupted_tool_uses: run_result.interrupted_tool_uses,
         backend_reasoning_execution: run_result.backend_reasoning_execution,
+        protocol_failure,
+        mutation_evidence,
+        external_effect,
+        drain_checkpoint,
     };
     let log_level = match receipt.status {
         CodexRuntimeRunStatus::Completed => HarnessLogLevel::Info,
@@ -2506,6 +2622,9 @@ fn finish_codex_runtime_run(
         | CodexRuntimeRunStatus::ProtocolError
         | CodexRuntimeRunStatus::ContextExhausted => HarnessLogLevel::Error,
         CodexRuntimeRunStatus::Canceled => HarnessLogLevel::Warn,
+        CodexRuntimeRunStatus::ApprovalRequired | CodexRuntimeRunStatus::ExternalEffectDenied => {
+            HarnessLogLevel::Warn
+        }
         CodexRuntimeRunStatus::SpawnFailed
         | CodexRuntimeRunStatus::PreflightBlocked
         | CodexRuntimeRunStatus::NoRuntimePlan => HarnessLogLevel::Warn,
@@ -2519,6 +2638,8 @@ fn finish_codex_runtime_run(
         CodexRuntimeRunStatus::PreflightBlocked => "codex.run.preflight-blocked",
         CodexRuntimeRunStatus::NoRuntimePlan => "codex.run.no-plan",
         CodexRuntimeRunStatus::Canceled => "codex.run.canceled",
+        CodexRuntimeRunStatus::ApprovalRequired => "codex.run.approval-required",
+        CodexRuntimeRunStatus::ExternalEffectDenied => "codex.run.external-effect-denied",
     };
     append_codex_run_log(
         harness_home,
@@ -4249,6 +4370,7 @@ fn drive_codex_app_server(
     let mut timeouts = CodexProtocolTimeouts::new(timeout_ms, idle_timeout_ms);
     let mut state = CodexProtocolState {
         goal_projection_observer: Some(CodexGoalProjectionObserver::new(harness_home, plan)?),
+        external_effect_context: codex_external_effect_runtime_context(harness_home, plan)?,
         ..CodexProtocolState::default()
     };
     let cancel_check =
@@ -5925,6 +6047,13 @@ fn drive_codex_app_server(
             });
         }
         ProtocolWait::Canceled(reason) => {
+            let parked_status = if reason.starts_with("external-effect-parked:needs-user:") {
+                Some(CodexRuntimeRunStatus::ApprovalRequired)
+            } else if reason.starts_with("external-effect-parked:denied:") {
+                Some(CodexRuntimeRunStatus::ExternalEffectDenied)
+            } else {
+                None
+            };
             let interrupted_tool_uses = interrupted_tool_uses_for_cancel(
                 &state,
                 &reason,
@@ -5950,7 +6079,7 @@ fn drive_codex_app_server(
                 "turn canceled",
             );
             return Ok(CodexAppServerRunResult {
-                status: CodexRuntimeRunStatus::Canceled,
+                status: parked_status.unwrap_or(CodexRuntimeRunStatus::Canceled),
                 reason,
                 assistant_message: state.assistant_message_with_harness_notices(),
                 assistant_narration: state.assistant_narration_records(),
@@ -6008,13 +6137,26 @@ fn drive_codex_app_server(
         &mut state.warnings,
         "turn completed",
     );
+    let completion_reason = state
+        .active_external_effect
+        .as_ref()
+        .map(|effect| {
+            format!(
+                "; effectId={}; externalEffectState={:?}",
+                effect.effect_id, effect.state
+            )
+        })
+        .unwrap_or_default();
     Ok(CodexAppServerRunResult {
         status,
         reason: if deadline_drain_sent {
-            "codex app-server turn completed after deadline drain and assistant output was captured"
-                .to_string()
+            format!(
+                "codex app-server turn completed after deadline drain and assistant output was captured{completion_reason}"
+            )
         } else {
-            "codex app-server turn completed and assistant output was captured".to_string()
+            format!(
+                "codex app-server turn completed and assistant output was captured{completion_reason}"
+            )
         },
         assistant_message,
         assistant_narration,
@@ -7836,9 +7978,30 @@ fn official_compact_rollover_lane_from_pending(
             ));
             return Ok(None);
         }
-        let session_key = string_field(&value, &["sessionKey", "session_key"])
-            .unwrap_or(plan_session_key)
-            .to_string();
+        let platform = string_field(&value, &["platform"]).unwrap_or("unknown");
+        let account_id = string_field(&value, &["accountId", "account_id"]).unwrap_or("default");
+        let channel_id = string_field(&value, &["channelId", "channel_id"]).unwrap_or("unknown");
+        let user_id = string_field(&value, &["userId", "user_id"]).unwrap_or("unknown");
+        let agent_id = string_field(&value, &["agentId", "agent_id"]).unwrap_or("main");
+        let raw_session_key =
+            string_field(&value, &["sessionKey", "session_key"]).unwrap_or(plan_session_key);
+        let session_key =
+            match crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+                raw_session_key,
+                platform,
+                account_id,
+                channel_id,
+                user_id,
+                agent_id,
+            ) {
+                Ok(session) => session.canonical_string(),
+                Err(error) => {
+                    warnings.push(format!(
+                    "official compact rollover accounting skipped queue `{queue_id}` because its exact-lane session identity was invalid: {error}"
+                ));
+                    return Ok(None);
+                }
+            };
         if session_key != plan_session_key {
             warnings.push(format!(
                 "official compact rollover accounting skipped queue `{queue_id}` because plan session `{plan_session_key}` did not match pending session `{session_key}`"
@@ -7847,18 +8010,10 @@ fn official_compact_rollover_lane_from_pending(
         }
         return Ok(Some(ContextRolloverLane {
             runtime_class,
-            agent_id: string_field(&value, &["agentId", "agent_id"])
-                .unwrap_or("main")
-                .to_string(),
-            platform: string_field(&value, &["platform"])
-                .unwrap_or("unknown")
-                .to_string(),
-            channel_id: string_field(&value, &["channelId", "channel_id"])
-                .unwrap_or("unknown")
-                .to_string(),
-            user_id: string_field(&value, &["userId", "user_id"])
-                .unwrap_or("unknown")
-                .to_string(),
+            agent_id: agent_id.to_string(),
+            platform: platform.to_string(),
+            channel_id: channel_id.to_string(),
+            user_id: user_id.to_string(),
             working_session_key: session_key,
             virtual_session_id: value
                 .get("virtualSessionId")
@@ -8204,6 +8359,26 @@ struct CodexProtocolState {
     backend_reasoning_execution: Option<CodexBackendReasoningExecutionReference>,
     goal_projection_observer: Option<CodexGoalProjectionObserver>,
     web_search_observer: Option<CodexWebSearchObserver>,
+    external_effect_context: Option<CodexExternalEffectRuntimeContext>,
+    active_external_effect: Option<ExternalEffectIntentV1>,
+    parked_external_effect: Option<ExternalEffectIntentV1>,
+    external_effect_protocol_failure: Option<String>,
+}
+
+fn external_effect_id_from_reason(reason: &str) -> Option<&str> {
+    let suffix = reason.split("effectId=").nth(1)?;
+    let effect_id = suffix
+        .split(|ch: char| ch == ';' || ch == ',' || ch.is_whitespace())
+        .next()?;
+    (effect_id.len() == 64 && effect_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(effect_id)
+}
+
+#[derive(Clone)]
+struct CodexExternalEffectRuntimeContext {
+    harness_home: PathBuf,
+    request: ExternalEffectRequestContextV1,
+    policy: crate::ConnectorApprovalPolicyV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8263,30 +8438,48 @@ impl CodexProtocolState {
 
     fn assistant_message_with_harness_notices(&self) -> String {
         let mut message = self.assistant_message();
-        if self.denied_approval_requests.is_empty() {
-            return message;
+        let mut notices = Vec::new();
+        if !self.denied_approval_requests.is_empty() {
+            let mut notice = format!(
+                "[Harness safety] {} Codex approval request(s) were cancelled by codexApprovalPolicy=deny.",
+                self.denied_approval_requests.len()
+            );
+            if let Some(first) = self.denied_approval_requests.first() {
+                notice.push_str(" First cancelled request: ");
+                notice.push_str(first);
+                notice.push('.');
+            }
+            notice.push_str(
+                " Set AGENT_HARNESS_CODEX_APPROVAL_POLICY=accept or security.codexApprovalPolicy=\"accept\" in harness-config.json to allow unattended tool execution.",
+            );
+            notices.push(notice);
         }
-
-        let mut notice = format!(
-            "[Harness safety] {} Codex approval request(s) were cancelled by codexApprovalPolicy=deny.",
-            self.denied_approval_requests.len()
-        );
-        if let Some(first) = self.denied_approval_requests.first() {
-            notice.push_str(" First cancelled request: ");
-            notice.push_str(first);
-            notice.push('.');
+        if let Some(effect) = self.parked_external_effect.as_ref() {
+            let disposition = if effect.state == ExternalEffectStateV1::Denied {
+                format!(
+                    "[Harness safety] Connector action denied: {}. Effect {} is terminal for approval generation {}.",
+                    effect.action_summary, effect.effect_id, effect.approval_generation
+                )
+            } else {
+                let token = effect
+                    .approval_token
+                    .as_ref()
+                    .map(|token| token.token.as_str())
+                    .unwrap_or("unavailable");
+                format!(
+                    "[Harness approval required] {}. Approve or deny this exact action with token {}. Effect {}; generation {}. The connector mutation is parked and will not be replayed by generic timeout recovery.",
+                    effect.action_summary, token, effect.effect_id, effect.approval_generation
+                )
+            };
+            notices.push(disposition);
         }
-        notice.push_str(
-            " Set AGENT_HARNESS_CODEX_APPROVAL_POLICY=accept or security.codexApprovalPolicy=\"accept\" in harness-config.json to allow unattended tool execution.",
-        );
-
-        if message.trim().is_empty() {
-            notice
-        } else {
-            message.push_str("\n\n");
+        for notice in notices {
+            if !message.trim().is_empty() {
+                message.push_str("\n\n");
+            }
             message.push_str(&notice);
-            message
         }
+        message
     }
 
     fn assistant_narration_records(&self) -> Vec<CodexAssistantNarration> {
@@ -8344,6 +8537,10 @@ fn emit_codex_runtime_status(
         status,
         at_ms,
     )
+    .lifecycle(match status {
+        AgentProgressStatus::Started => crate::AgentProgressLifecycle::Preparing,
+        _ => crate::AgentProgressLifecycle::Working,
+    })
     .source("codex-runtime");
     if let Err(error) = emitter.append(event) {
         warnings.push(format!("runtime progress write failed: {error}"));
@@ -8393,6 +8590,23 @@ fn observe_codex_active_tool_use(value: &Value, state: &mut CodexProtocolState) 
         .filter(|text| !text.is_empty());
 
     if method == "item/completed" {
+        if let (Some(context), Some(effect)) = (
+            state.external_effect_context.as_ref(),
+            state.active_external_effect.take(),
+        ) {
+            match transition_external_effect(
+                &context.harness_home,
+                &effect.effect_id,
+                ExternalEffectStateV1::Confirmed,
+                "Codex app-server emitted item/completed after the accepted connector action",
+            ) {
+                Ok(confirmed) => state.active_external_effect = Some(confirmed),
+                Err(error) => state.warnings.push(format!(
+                    "external effect {} completion could not be persisted: {error}",
+                    effect.effect_id
+                )),
+            }
+        }
         if should_clear_active_tool(
             &state.active_tool_use,
             item_id.as_deref(),
@@ -8570,6 +8784,7 @@ fn codex_progress_event_from_json(
             AgentProgressStatus::Started,
             at_ms,
         )
+        .lifecycle(crate::AgentProgressLifecycle::Working)
         .source("codex-runtime"),
     )
 }
@@ -8992,6 +9207,37 @@ enum ProtocolWait {
         reason: String,
         tool: CodexToolUseTimeout,
     },
+}
+
+fn external_effect_protocol_wait(state: &CodexProtocolState) -> Option<ProtocolWait> {
+    if let Some(reason) = state.external_effect_protocol_failure.clone() {
+        return Some(ProtocolWait::Failed(reason));
+    }
+    let effect = state.parked_external_effect.as_ref()?;
+    let disposition = if effect.state == ExternalEffectStateV1::Denied {
+        "denied"
+    } else {
+        "needs-user"
+    };
+    let token = effect
+        .approval_token
+        .as_ref()
+        .map(|token| token.token.as_str())
+        .unwrap_or("none");
+    let reason = format!(
+        "{}; actionSummary={}; effectId={}; approvalGeneration={}; approvalToken={}",
+        effect
+            .reason
+            .as_deref()
+            .unwrap_or("connector action is waiting for explicit authority"),
+        effect.action_summary,
+        effect.effect_id,
+        effect.approval_generation,
+        token,
+    );
+    Some(ProtocolWait::Canceled(format!(
+        "external-effect-parked:{disposition}:{reason}"
+    )))
 }
 
 struct InFlightCodexTurnSteer {
@@ -9776,6 +10022,35 @@ fn wait_for_thread_start(
                 }
                 emit_codex_progress(progress, &value, state);
                 if answer_unattended_server_request(&value, stdin, state, approval_policy)? {
+                    if let Some(reason) = state.external_effect_protocol_failure.clone() {
+                        return Ok(ProtocolWait::Failed(reason));
+                    }
+                    if let Some(effect) = state.parked_external_effect.as_ref() {
+                        let disposition = if effect.state == ExternalEffectStateV1::Denied {
+                            "denied"
+                        } else {
+                            "needs-user"
+                        };
+                        let token = effect
+                            .approval_token
+                            .as_ref()
+                            .map(|token| token.token.as_str())
+                            .unwrap_or("none");
+                        let reason = format!(
+                            "{}; actionSummary={}; effectId={}; approvalGeneration={}; approvalToken={}",
+                            effect
+                                .reason
+                                .as_deref()
+                                .unwrap_or("connector action is waiting for explicit authority"),
+                            effect.action_summary,
+                            effect.effect_id,
+                            effect.approval_generation,
+                            token,
+                        );
+                        return Ok(ProtocolWait::Canceled(format!(
+                            "external-effect-parked:{disposition}:{reason}"
+                        )));
+                    }
                     continue;
                 }
                 if json_id(&value) == Some(1) {
@@ -10759,6 +11034,9 @@ fn wait_for_turn_completed(
                 }
                 emit_codex_progress(progress, &value, state);
                 if answer_unattended_server_request(&value, stdin, state, approval_policy)? {
+                    if let Some(wait) = external_effect_protocol_wait(state) {
+                        return Ok(wait);
+                    }
                     continue;
                 }
                 collect_agent_output(&value, state, progress, narration_config);
@@ -11073,6 +11351,30 @@ fn json_method(value: &Value) -> Option<&str> {
     value.get("method").and_then(Value::as_str)
 }
 
+fn codex_external_effect_runtime_context(
+    harness_home: &Path,
+    plan: &CodexRuntimePlanFile,
+) -> io::Result<Option<CodexExternalEffectRuntimeContext>> {
+    let Some(lane) = plan.channel_lane.as_ref() else {
+        return Ok(None);
+    };
+    let lineage_source = plan
+        .continuation
+        .virtual_session_id
+        .as_deref()
+        .unwrap_or(&plan.session_key);
+    let source_queue = plan.queue_id.as_deref().unwrap_or("unattributed-queue");
+    Ok(Some(CodexExternalEffectRuntimeContext {
+        harness_home: harness_home.to_path_buf(),
+        request: ExternalEffectRequestContextV1 {
+            exact_lane_digest: lane.exact_lane_digest(),
+            logical_lineage_id: sha256_prefixed(lineage_source.as_bytes()),
+            source_queue_id: source_queue.to_string(),
+        },
+        policy: load_connector_approval_policy(harness_home)?,
+    }))
+}
+
 fn answer_unattended_server_request(
     value: &Value,
     stdin: &mut impl Write,
@@ -11085,6 +11387,9 @@ fn answer_unattended_server_request(
     let Some(id) = value.get("id").cloned() else {
         return Ok(false);
     };
+    if method == "mcpServer/elicitation/request" {
+        return answer_mcp_elicitation_request(value, id, stdin, state);
+    }
     if let Some(intent) = classify_approval_request(value) {
         if intent.action.destructive() {
             let Some(result) = unattended_approval_result(value, CodexApprovalPolicy::Deny) else {
@@ -11128,6 +11433,118 @@ fn answer_unattended_server_request(
             state.warnings.push(format!(
                 "auto-accepted Codex app-server request {method} by approval policy accept"
             ));
+        }
+    }
+    Ok(true)
+}
+
+fn answer_mcp_elicitation_request(
+    value: &Value,
+    id: Value,
+    stdin: &mut impl Write,
+    state: &mut CodexProtocolState,
+) -> io::Result<bool> {
+    let preview = state
+        .active_tool_use
+        .as_ref()
+        .and_then(|tool| tool.preview.clone());
+    let descriptor = match parse_mcp_elicitation_descriptor(value, preview.as_deref()) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            write_json_rpc(
+                stdin,
+                &json!({
+                    "id": id,
+                    "result": {"action": "cancel", "content": null, "_meta": null}
+                }),
+            )?;
+            state.external_effect_protocol_failure = Some(format!(
+                "malformed or unsupported MCP elicitation failed closed: {error}"
+            ));
+            return Ok(true);
+        }
+    };
+    let Some(context) = state.external_effect_context.clone() else {
+        write_json_rpc(
+            stdin,
+            &json!({
+                "id": id,
+                "result": {"action": "cancel", "content": null, "_meta": null}
+            }),
+        )?;
+        state.external_effect_protocol_failure = Some(
+            "MCP elicitation has no exact channel lane; connector action was cancelled".to_string(),
+        );
+        return Ok(true);
+    };
+    match begin_external_effect_request(
+        &context.harness_home,
+        &context.request,
+        &descriptor,
+        &context.policy,
+    )? {
+        ExternalEffectAdmissionV1::Authorized(intent) => {
+            let submitted = transition_external_effect(
+                &context.harness_home,
+                &intent.effect_id,
+                ExternalEffectStateV1::Submitted,
+                "durable acceptance commitment recorded before the protocol response",
+            )?;
+            write_json_rpc(
+                stdin,
+                &json!({
+                    "id": id,
+                    "result": {"action": "accept", "content": {}, "_meta": null}
+                }),
+            )?;
+            state.active_external_effect = Some(submitted);
+            state.warnings.push(format!(
+                "accepted lane-bound connector action under durable effect {}",
+                intent.effect_id
+            ));
+        }
+        ExternalEffectAdmissionV1::NeedsUser { intent, .. } => {
+            write_json_rpc(
+                stdin,
+                &json!({
+                    "id": id,
+                    "result": {"action": "cancel", "content": null, "_meta": null}
+                }),
+            )?;
+            state.parked_external_effect = Some(intent);
+        }
+        ExternalEffectAdmissionV1::Denied(intent) => {
+            write_json_rpc(
+                stdin,
+                &json!({
+                    "id": id,
+                    "result": {"action": "decline", "content": null, "_meta": null}
+                }),
+            )?;
+            state.parked_external_effect = Some(intent);
+        }
+        ExternalEffectAdmissionV1::AlreadyConfirmed(intent) => {
+            write_json_rpc(
+                stdin,
+                &json!({
+                    "id": id,
+                    "result": {"action": "cancel", "content": null, "_meta": null}
+                }),
+            )?;
+            state.external_effect_protocol_failure = Some(format!(
+                "connector effect {} was already confirmed; duplicate submission was blocked",
+                intent.effect_id
+            ));
+        }
+        ExternalEffectAdmissionV1::Ambiguous(intent) => {
+            write_json_rpc(
+                stdin,
+                &json!({
+                    "id": id,
+                    "result": {"action": "cancel", "content": null, "_meta": null}
+                }),
+            )?;
+            state.parked_external_effect = Some(intent);
         }
     }
     Ok(true)
@@ -11885,6 +12302,134 @@ fn protocol_error(value: &Value) -> Option<String> {
         value.get("error")?
     };
     (!error.is_null()).then(|| render_protocol_error(error))
+}
+
+fn protocol_failure_from_value(value: &Value) -> Option<CodexProtocolFailureV1> {
+    let source_method = json_method(value).map(|method| bounded_protocol_text(method, 96));
+    let error = if matches!(json_method(value), Some("error")) {
+        value
+            .pointer("/params/error")
+            .or_else(|| value.get("error"))
+            .or_else(|| value.get("params"))
+            .unwrap_or(value)
+    } else {
+        value.get("error")?
+    };
+    if error.is_null() {
+        return None;
+    }
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| error.as_str())
+        .map(|value| bounded_protocol_text(value, 512))
+        .unwrap_or_else(|| "Codex protocol error".to_string());
+    let codex_error_info = error
+        .get("codexErrorInfo")
+        .and_then(Value::as_str)
+        .map(|value| bounded_protocol_text(value, 96));
+    let additional_details = error
+        .get("additionalDetails")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| bounded_protocol_text(value, 512));
+    let will_retry = value
+        .pointer("/params/willRetry")
+        .and_then(Value::as_bool)
+        .or_else(|| value.get("willRetry").and_then(Value::as_bool));
+    let normalized_code = codex_error_info
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let normalized_message = message.to_ascii_lowercase();
+    let class = if normalized_code == "serveroverloaded"
+        || normalized_message.contains("selected model is at capacity")
+        || normalized_message.contains("server overloaded")
+    {
+        CodexProtocolFailureClass::ServerOverloaded
+    } else if normalized_code.contains("ratelimit") || normalized_message.contains("rate limit") {
+        CodexProtocolFailureClass::RateLimited
+    } else if normalized_code.contains("auth")
+        || normalized_message.contains("unauthorized")
+        || normalized_message.contains("authentication")
+    {
+        CodexProtocolFailureClass::Authentication
+    } else if is_context_window_exhaustion(&message) {
+        CodexProtocolFailureClass::ContextExhausted
+    } else if normalized_message.contains("websocket")
+        || normalized_message.contains("reconnecting")
+        || normalized_message.contains("stream disconnected")
+    {
+        CodexProtocolFailureClass::StreamDisconnected
+    } else if normalized_code.contains("invalidrequest")
+        || normalized_message.contains("invalid request")
+    {
+        CodexProtocolFailureClass::InvalidRequest
+    } else if normalized_code.contains("config") || normalized_message.contains("configuration") {
+        CodexProtocolFailureClass::Configuration
+    } else {
+        CodexProtocolFailureClass::Unknown
+    };
+    Some(CodexProtocolFailureV1 {
+        class,
+        codex_error_info,
+        message,
+        additional_details,
+        will_retry,
+        source_method,
+    })
+}
+
+fn inspect_protocol_failure_evidence(
+    stdout_log: Option<&Path>,
+) -> (
+    Option<CodexProtocolFailureV1>,
+    Option<RuntimeMutationEvidenceClass>,
+) {
+    let Some(stdout_log) = stdout_log else {
+        return (None, None);
+    };
+    let Ok(text) = fs::read_to_string(stdout_log) else {
+        return (None, Some(RuntimeMutationEvidenceClass::Unknown));
+    };
+    let mut failure = None;
+    let mut mutation_observed = false;
+    let mut complete = true;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            complete = false;
+            continue;
+        };
+        let method_lower = json_method(&value).unwrap_or_default().to_ascii_lowercase();
+        let item_type = value
+            .pointer("/params/item/type")
+            .or_else(|| value.pointer("/params/itemType"))
+            .or_else(|| value.pointer("/params/type"))
+            .and_then(Value::as_str);
+        if is_tool_like_item(item_type, &method_lower) {
+            mutation_observed = true;
+        }
+        if let Some(parsed) = protocol_failure_from_value(&value) {
+            failure = Some(parsed);
+        }
+    }
+    let mutation_evidence = failure.as_ref().map(|_| {
+        if mutation_observed {
+            RuntimeMutationEvidenceClass::MutationObserved
+        } else if complete {
+            RuntimeMutationEvidenceClass::NoObservableMutation
+        } else {
+            RuntimeMutationEvidenceClass::Unknown
+        }
+    });
+    (failure, mutation_evidence)
+}
+
+fn bounded_protocol_text(value: &str, max_chars: usize) -> String {
+    sanitize_progress_preview(value, max_chars)
+        .chars()
+        .take(max_chars)
+        .collect()
 }
 
 fn codex_status_for_protocol_failure(reason: &str) -> CodexRuntimeRunStatus {
@@ -13943,18 +14488,118 @@ fn normalize_key_part(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
-        CompletedTurnWorkingSetSnapshotOptions, ContextVirtualSessionRecord,
-        InboundMediaModelAttachmentStatus, PromptAssemblyOptions, RuntimeQueueEnqueueOptions,
-        RuntimeQueuePrepareOptions, TurnPlanInput, build_channel_step, build_source_skill_index,
-        build_turn_plan,
+        ContextVirtualSessionRecord, InboundMediaModelAttachmentStatus, PromptAssemblyOptions,
+        RuntimeQueueEnqueueOptions, RuntimeQueuePrepareOptions, TurnPlanInput, build_channel_step,
+        build_source_skill_index, build_turn_plan,
         context_rollover::{
             ContextCompactCounter, ContextRolloverLane, context_compact_counter_file,
         },
         enqueue_channel_step, load_agent_registry, prepare_runtime_queue_item,
-        record_completed_turn_working_set_snapshot,
         runtime_worker::release_runtime_queue_lease,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn server_overloaded_metadata_survives_protocol_parsing() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/continuity-effects/server-overloaded-protocol-replay.json"
+        ))
+        .unwrap();
+        let failure = protocol_failure_from_value(&fixture["protocolEvent"]).unwrap();
+
+        assert_eq!(failure.class, CodexProtocolFailureClass::ServerOverloaded);
+        assert_eq!(
+            failure.codex_error_info.as_deref(),
+            Some("serverOverloaded")
+        );
+        assert_eq!(failure.will_retry, Some(false));
+        assert_eq!(failure.source_method.as_deref(), Some("error"));
+    }
+
+    #[test]
+    fn protocol_failure_evidence_distinguishes_safe_replay_from_mutation() {
+        let root = temp_root("protocol_failure_evidence_distinguishes_safe_replay_from_mutation");
+        fs::create_dir_all(&root).unwrap();
+        let log = root.join("stdout.jsonl");
+        let error = json!({
+            "method": "error",
+            "params": {
+                "error": {
+                    "message": "Synthetic capacity failure",
+                    "codexErrorInfo": "serverOverloaded"
+                },
+                "willRetry": false
+            }
+        });
+        fs::write(
+            &log,
+            format!("{}\n", serde_json::to_string(&error).unwrap()),
+        )
+        .unwrap();
+        let (_, evidence) = inspect_protocol_failure_evidence(Some(&log));
+        assert_eq!(
+            evidence,
+            Some(RuntimeMutationEvidenceClass::NoObservableMutation)
+        );
+
+        let tool = json!({
+            "method": "item/started",
+            "params": {"item": {"type": "commandExecution", "id": "cmd-1"}}
+        });
+        fs::write(
+            &log,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&tool).unwrap(),
+                serde_json::to_string(&error).unwrap()
+            ),
+        )
+        .unwrap();
+        let (_, evidence) = inspect_protocol_failure_evidence(Some(&log));
+        assert_eq!(
+            evidence,
+            Some(RuntimeMutationEvidenceClass::MutationObserved)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn protocol_failure_receipt_bounds_and_sanitizes_details() {
+        let value = json!({
+            "method": "error",
+            "params": {"error": {
+                "message": "selected model is at capacity",
+                "codexErrorInfo": "serverOverloaded",
+                "additionalDetails": "x".repeat(4096)
+            }}
+        });
+        let failure = protocol_failure_from_value(&value).unwrap();
+        assert!(failure.message.chars().count() <= 512);
+        assert!(
+            failure
+                .additional_details
+                .as_deref()
+                .unwrap()
+                .chars()
+                .count()
+                <= 512
+        );
+        let sensitive = json!({
+            "method": "error",
+            "params": {"error": {
+                "message": "selected model is at capacity",
+                "codexErrorInfo": "serverOverloaded",
+                "additionalDetails": "OPENAI_API_KEY=sk-test-value"
+            }}
+        });
+        let sensitive_failure = protocol_failure_from_value(&sensitive).unwrap();
+        assert!(
+            !sensitive_failure
+                .additional_details
+                .unwrap()
+                .contains("sk-test-value")
+        );
+    }
 
     #[test]
     fn prompt_authority_uses_trusted_runtime_class_and_redacted_manifest_metadata() {
@@ -16452,8 +17097,10 @@ mod tests {
         assert!(!transcript.contains("CHILD FINAL MUST BE QUARANTINED"));
         assert!(!transcript.contains("CROSS THREAD CHILD TEXT"));
 
-        let active_binding_file =
-            codex_active_turn_binding_file(&harness_home, "telegram:dm-42:user-7:main");
+        let active_binding_file = codex_active_turn_binding_file(
+            &harness_home,
+            &canonical_test_session("telegram:dm-42:user-7:main"),
+        );
         let active_binding: Value =
             serde_json::from_slice(&fs::read(active_binding_file).unwrap()).unwrap();
         assert_eq!(active_binding["activeTurnId"], "turn-parent");
@@ -16523,7 +17170,7 @@ mod tests {
         let binding: Value = serde_json::from_slice(
             &fs::read(codex_active_turn_binding_file(
                 &harness_home,
-                "telegram:dm-42:user-7:main",
+                &canonical_test_session("telegram:dm-42:user-7:main"),
             ))
             .unwrap(),
         )
@@ -16668,7 +17315,7 @@ mod tests {
         let binding: Value = serde_json::from_slice(
             &fs::read(codex_active_turn_binding_file(
                 &harness_home,
-                "telegram:dm-42:user-7:main",
+                &canonical_test_session("telegram:dm-42:user-7:main"),
             ))
             .unwrap(),
         )
@@ -17115,13 +17762,28 @@ mod tests {
         assert_eq!(report.receipt.status, CodexRuntimeRunStatus::Completed);
         let events_file = crate::agent_progress_events_file(&harness_home);
         let events = fs::read_to_string(events_file).unwrap();
-        let first: Value = serde_json::from_str(events.lines().next().unwrap()).unwrap();
+        let events = events
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let startup_index = events
+            .iter()
+            .position(|event| event["preview"] == "starting Codex app-server")
+            .expect("managed runtime startup progress");
+        let first = &events[startup_index];
         assert_eq!(first["kind"], serde_json::json!("runtime"));
         assert_eq!(first["label"], serde_json::json!("runtime"));
         assert_eq!(first["status"], serde_json::json!("started"));
+        assert_eq!(first["lifecycle"], serde_json::json!("preparing"));
         assert_eq!(
             first["preview"],
             serde_json::json!("starting Codex app-server")
+        );
+        assert!(
+            events[..startup_index]
+                .iter()
+                .any(|event| event["lifecycle"] == "preparing"),
+            "lease/preparation must precede managed runtime startup"
         );
 
         let _ = fs::remove_dir_all(root);
@@ -17288,6 +17950,7 @@ mod tests {
             codex_executable: Some(std::env::current_exe().unwrap()),
         })
         .unwrap();
+        let session_key = plan_report.plan.as_ref().unwrap().session_key.clone();
         let plan_file = plan_report.plan_file.as_ref().unwrap();
         replace_env_requirements(plan_file, serde_json::json!([]));
         let capture_file = root.join("captured-turn-steer.json");
@@ -17295,9 +17958,10 @@ mod tests {
         replace_invocation(plan_file, executable, arguments);
 
         let queue_harness_home = harness_home.clone();
+        let queue_session_key = session_key.clone();
         let queue_thread = thread::spawn(move || {
-            let session_key = "telegram:dm-42:user-7:main";
-            let binding_file = codex_active_turn_binding_file(&queue_harness_home, session_key);
+            let session_key = queue_session_key;
+            let binding_file = codex_active_turn_binding_file(&queue_harness_home, &session_key);
             for _ in 0..300 {
                 if let Ok(Some(binding)) = read_codex_active_turn_binding(&binding_file)
                     && binding.active_turn_id.as_deref() == Some("turn-test")
@@ -17307,7 +17971,7 @@ mod tests {
                         platform: "telegram".to_string(),
                         channel_id: "dm-42".to_string(),
                         user_id: "user-7".to_string(),
-                        session_key: session_key.to_string(),
+                        session_key: session_key.clone(),
                         agent_id: Some("main".to_string()),
                         text: "include the late steering note".to_string(),
                         client_user_message_id: Some("telegram:message:99".to_string()),
@@ -17351,10 +18015,9 @@ mod tests {
         let receipts = fs::read_to_string(codex_turn_steer_receipts_file(&harness_home)).unwrap();
         assert!(receipts.contains("queued-same-turn"));
         assert!(receipts.contains("\"status\":\"accepted\""));
-        let active: CodexActiveTurnBindingRecord = read_json_file_as(
-            &codex_active_turn_binding_file(&harness_home, "telegram:dm-42:user-7:main"),
-        )
-        .unwrap();
+        let active: CodexActiveTurnBindingRecord =
+            read_json_file_as(&codex_active_turn_binding_file(&harness_home, &session_key))
+                .unwrap();
         assert_eq!(active.status, CodexActiveTurnStatus::Completed);
 
         let _ = fs::remove_dir_all(root);
@@ -19304,16 +19967,16 @@ mod tests {
             codex_executable: Some(std::env::current_exe().unwrap()),
         })
         .unwrap();
+        let session_key = plan_report.plan.as_ref().unwrap().session_key.clone();
         let plan_file = plan_report.plan_file.as_ref().unwrap();
         replace_env_requirements(plan_file, serde_json::json!([]));
         let (executable, arguments) = fake_app_server_command(&root);
         replace_invocation(plan_file, executable, arguments);
-        let session_key = "telegram:dm-42:user-7:main";
         let cancel_file = harness_home
             .join("state")
             .join("runtime-queue")
             .join("cancel-requests")
-            .join(format!("{}.json", normalize_key_part(session_key)));
+            .join(format!("{}.json", normalize_key_part(&session_key)));
         write_json_atomic(
             &cancel_file,
             &serde_json::json!({
@@ -19363,14 +20026,14 @@ mod tests {
             codex_executable: Some(std::env::current_exe().unwrap()),
         })
         .unwrap();
+        let session_key = plan_report.plan.as_ref().unwrap().session_key.clone();
         let plan_file = plan_report.plan_file.as_ref().unwrap();
         replace_env_requirements(plan_file, serde_json::json!([]));
-        let session_key = "telegram:dm-42:user-7:main";
         let cancel_file = harness_home
             .join("state")
             .join("runtime-queue")
             .join("cancel-requests")
-            .join(format!("{}.json", normalize_key_part(session_key)));
+            .join(format!("{}.json", normalize_key_part(&session_key)));
         let (executable, arguments) =
             interrupted_command_app_server_command(&root, &cancel_file, &source.workspace);
         replace_invocation(plan_file, executable, arguments);
@@ -19532,6 +20195,257 @@ mod tests {
             serde_json::from_slice(String::from_utf8(out).unwrap().trim().as_bytes()).unwrap();
         assert_eq!(response["id"], 8);
         assert_eq!(response["result"]["decision"], "accept");
+    }
+
+    #[test]
+    fn mcp_elicitation_is_answered_once_and_parked_as_approval_required() {
+        let root = temp_root("mcp_elicitation_is_answered_once_and_parked");
+        let harness_home = root.join(".agent-harness");
+        let mut state = CodexProtocolState::default();
+        state.external_effect_context = Some(CodexExternalEffectRuntimeContext {
+            harness_home: harness_home.clone(),
+            request: ExternalEffectRequestContextV1 {
+                exact_lane_digest: format!("sha256:{}", "1".repeat(64)),
+                logical_lineage_id: format!("sha256:{}", "2".repeat(64)),
+                source_queue_id: format!("sha256:{}", "3".repeat(64)),
+            },
+            policy: crate::ConnectorApprovalPolicyV1::default(),
+        });
+        let mut out = Vec::new();
+
+        let handled = answer_unattended_server_request(
+            &serde_json::json!({
+                "id": 9,
+                "method": "mcpServer/elicitation/request",
+                "params": {
+                    "threadId": "thread-fixture",
+                    "turnId": "turn-fixture",
+                    "serverName": "github",
+                    "mode": "form",
+                    "_meta": {"actionName": "create_issue"},
+                    "message": "Approve the sanitized connector action",
+                    "requestedSchema": {"type": "object", "properties": {}}
+                }
+            }),
+            &mut out,
+            &mut state,
+            CodexApprovalPolicy::Deny,
+        )
+        .unwrap();
+
+        assert!(handled);
+        let response: Value =
+            serde_json::from_slice(String::from_utf8(out).unwrap().trim().as_bytes()).unwrap();
+        assert_eq!(response["id"], 9);
+        assert_eq!(response["result"]["action"], "cancel");
+        assert_eq!(response["result"]["content"], Value::Null);
+        let parked = state.parked_external_effect.as_ref().unwrap();
+        assert_eq!(parked.state, ExternalEffectStateV1::ApprovalRequired);
+        assert!(parked.approval_token.is_some());
+        assert!(
+            state
+                .assistant_message_with_harness_notices()
+                .contains("generic timeout recovery")
+        );
+        assert!(state.external_effect_protocol_failure.is_none());
+        let transitions =
+            fs::read_to_string(crate::external_effect_transition_file(&harness_home)).unwrap();
+        assert_eq!(transitions.lines().count(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_elicitation_fake_app_server_parks_then_submits_exactly_once() {
+        let root = temp_root("mcp_elicitation_fake_app_server_parks_then_submits_exactly_once");
+        let source = write_codex_runtime_source(&root);
+        let harness_home = root.join(".agent-harness");
+        enqueue_and_prepare(&source, &harness_home);
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            codex_executable: Some(std::env::current_exe().unwrap()),
+        })
+        .unwrap();
+        let plan_file = plan_report.plan_file.as_ref().unwrap();
+        replace_env_requirements(plan_file, serde_json::json!([]));
+        let (executable, arguments) = mcp_elicitation_app_server_command(&root);
+        replace_invocation(plan_file, executable.clone(), arguments.clone());
+
+        let first = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: Some(plan_file.clone()),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+        assert_eq!(
+            first.receipt.status,
+            CodexRuntimeRunStatus::ApprovalRequired
+        );
+        assert!(first.receipt.elapsed_ms < 10_000);
+        let parked = first.receipt.external_effect.as_ref().unwrap();
+        assert_eq!(parked.state, ExternalEffectStateV1::ApprovalRequired);
+        let token = parked
+            .approval_token
+            .as_ref()
+            .map(|token| token.token.clone())
+            .unwrap();
+        let lane_digest = parked.exact_lane_digest.clone();
+        let effect_id = parked.effect_id.clone();
+        let responses = fs::read_to_string(root.join("mcp-app-server-responses.jsonl")).unwrap();
+        assert_eq!(responses.lines().count(), 1);
+        assert!(responses.contains(r#""action":"cancel""#));
+        assert!(!root.join("mcp-app-server-mutations.jsonl").exists());
+
+        crate::resolve_external_effect_approval(
+            &harness_home,
+            &token,
+            &lane_digest,
+            crate::ExternalEffectApprovalDecisionV1::Approve,
+        )
+        .unwrap();
+        replace_invocation(plan_file, executable, arguments);
+        let second = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: Some(plan_file.clone()),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+        assert_eq!(second.receipt.status, CodexRuntimeRunStatus::Completed);
+        let confirmed = second.receipt.external_effect.as_ref().unwrap();
+        assert_eq!(confirmed.effect_id, effect_id);
+        assert_eq!(confirmed.state, ExternalEffectStateV1::Confirmed);
+        let mutations = fs::read_to_string(root.join("mcp-app-server-mutations.jsonl")).unwrap();
+        assert_eq!(mutations.lines().count(), 1);
+        let responses = fs::read_to_string(root.join("mcp-app-server-responses.jsonl")).unwrap();
+        assert_eq!(responses.lines().count(), 2);
+        assert!(responses.contains(r#""action":"accept""#));
+
+        let third = run_codex_runtime(CodexRuntimeRunOptions {
+            harness_home: harness_home.clone(),
+            execution_dir: None,
+            plan_file: Some(plan_file.clone()),
+            timeout_ms: 30_000,
+            idle_timeout_ms: 30_000,
+            progress_context: None,
+        })
+        .unwrap();
+        assert_eq!(third.receipt.status, CodexRuntimeRunStatus::Completed);
+        let mutations = fs::read_to_string(root.join("mcp-app-server-mutations.jsonl")).unwrap();
+        assert_eq!(mutations.lines().count(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approved_mcp_elicitation_submits_once_and_item_completion_confirms() {
+        let root = temp_root("approved_mcp_elicitation_submits_once");
+        let harness_home = root.join(".agent-harness");
+        let request_context = ExternalEffectRequestContextV1 {
+            exact_lane_digest: format!("sha256:{}", "4".repeat(64)),
+            logical_lineage_id: format!("sha256:{}", "5".repeat(64)),
+            source_queue_id: format!("sha256:{}", "6".repeat(64)),
+        };
+        let runtime_context = CodexExternalEffectRuntimeContext {
+            harness_home: harness_home.clone(),
+            request: request_context.clone(),
+            policy: crate::ConnectorApprovalPolicyV1::default(),
+        };
+        let request = serde_json::json!({
+            "id": 10,
+            "method": "mcpServer/elicitation/request",
+            "params": {
+                "threadId": "thread-fixture",
+                "turnId": "turn-fixture",
+                "serverName": "github",
+                "mode": "form",
+                "_meta": {"actionName": "create_issue"},
+                "message": "Approve the sanitized connector action",
+                "requestedSchema": {"type": "object", "properties": {}}
+            }
+        });
+        let mut first_state = CodexProtocolState {
+            external_effect_context: Some(runtime_context.clone()),
+            ..CodexProtocolState::default()
+        };
+        answer_unattended_server_request(
+            &request,
+            &mut Vec::new(),
+            &mut first_state,
+            CodexApprovalPolicy::Accept,
+        )
+        .unwrap();
+        let token = first_state
+            .parked_external_effect
+            .as_ref()
+            .and_then(|effect| effect.approval_token.as_ref())
+            .map(|token| token.token.clone())
+            .unwrap();
+        crate::resolve_external_effect_approval(
+            &harness_home,
+            &token,
+            &request_context.exact_lane_digest,
+            crate::ExternalEffectApprovalDecisionV1::Approve,
+        )
+        .unwrap();
+
+        let mut resumed_state = CodexProtocolState {
+            external_effect_context: Some(runtime_context),
+            ..CodexProtocolState::default()
+        };
+        let mut out = Vec::new();
+        answer_unattended_server_request(
+            &request,
+            &mut out,
+            &mut resumed_state,
+            CodexApprovalPolicy::Deny,
+        )
+        .unwrap();
+        let response: Value =
+            serde_json::from_slice(String::from_utf8(out).unwrap().trim().as_bytes()).unwrap();
+        assert_eq!(response["result"]["action"], "accept");
+        let submitted = resumed_state.active_external_effect.as_ref().unwrap();
+        assert_eq!(submitted.state, ExternalEffectStateV1::Submitted);
+        let effect_id = submitted.effect_id.clone();
+        observe_codex_active_tool_use(
+            &serde_json::json!({
+                "method": "item/completed",
+                "params": {"item": {"id": "mcp-1", "type": "mcpToolCall"}}
+            }),
+            &mut resumed_state,
+        );
+        let confirmed = crate::load_external_effect_intent(&harness_home, &effect_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(confirmed.state, ExternalEffectStateV1::Confirmed);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_mcp_elicitation_fails_closed_without_timeout() {
+        let mut state = CodexProtocolState::default();
+        let mut out = Vec::new();
+        assert!(
+            answer_unattended_server_request(
+                &serde_json::json!({
+                    "id": 11,
+                    "method": "mcpServer/elicitation/request",
+                    "params": {"serverName": "github"}
+                }),
+                &mut out,
+                &mut state,
+                CodexApprovalPolicy::Accept,
+            )
+            .unwrap()
+        );
+        let response: Value =
+            serde_json::from_slice(String::from_utf8(out).unwrap().trim().as_bytes()).unwrap();
+        assert_eq!(response["result"]["action"], "cancel");
+        assert!(state.external_effect_protocol_failure.is_some());
     }
 
     #[test]
@@ -19785,30 +20699,30 @@ mod tests {
         let source = write_codex_runtime_source(&root);
         let harness_home = root.join(".agent-harness");
         enqueue_and_prepare(&source, &harness_home);
-        plan_codex_runtime(CodexRuntimePlanOptions {
+        let plan_report = plan_codex_runtime(CodexRuntimePlanOptions {
             harness_home: harness_home.clone(),
             execution_dir: None,
             codex_executable: Some(PathBuf::from("custom-codex.exe")),
         })
         .unwrap();
+        let plan = plan_report.plan.as_ref().unwrap();
         let working_set_snapshot =
-            record_completed_turn_working_set_snapshot(CompletedTurnWorkingSetSnapshotOptions {
-                harness_home: harness_home.clone(),
-                platform: "telegram".to_string(),
-                channel_id: "dm-42".to_string(),
-                user_id: "user-7".to_string(),
-                agent_id: "main".to_string(),
-                working_session_key: "telegram:dm-42:user-7:main".to_string(),
-                queue_id: Some("queue-before-completion".to_string()),
-                message_text: Some(
-                    "record completion backfills virtual session thread".to_string(),
-                ),
-                status: "completed".to_string(),
-                run_once_receipt_file: None,
-                outbox_file: None,
-                completion_file: None,
-                now_ms: 12344,
-            })
+            crate::context_rollover::record_completed_turn_working_set_snapshot_for_lane(
+                crate::context_rollover::CompletedTurnWorkingSetSnapshotV2Options {
+                    harness_home: harness_home.clone(),
+                    channel_lane: plan.channel_lane.clone().unwrap(),
+                    working_session_key: plan.session_key.clone(),
+                    queue_id: Some("queue-before-completion".to_string()),
+                    message_text: Some(
+                        "record completion backfills virtual session thread".to_string(),
+                    ),
+                    status: "completed".to_string(),
+                    run_once_receipt_file: None,
+                    outbox_file: None,
+                    completion_file: None,
+                    now_ms: 12344,
+                },
+            )
             .unwrap();
 
         let report = record_codex_runtime_completion(CodexRuntimeCompletionOptions {
@@ -19840,7 +20754,8 @@ mod tests {
         assert!(transcript.contains("Recorded assistant reply."));
         let binding: Value = serde_json::from_slice(&fs::read(binding_file).unwrap()).unwrap();
         assert_eq!(binding["schema"], CODEX_BINDING_SCHEMA);
-        assert_eq!(binding["sessionKey"], "telegram:dm-42:user-7:main");
+        let canonical_session = canonical_test_session("telegram:dm-42:user-7:main");
+        assert_eq!(binding["sessionKey"], canonical_session);
         assert_eq!(binding["threadId"], "thread-recorded");
         let virtual_session: ContextVirtualSessionRecord =
             serde_json::from_slice(&fs::read(&working_set_snapshot.virtual_session_file).unwrap())
@@ -19848,7 +20763,7 @@ mod tests {
         let working_session = virtual_session
             .working_sessions
             .iter()
-            .find(|session| session.session_key == "telegram:dm-42:user-7:main")
+            .find(|session| session.session_key == canonical_session)
             .expect("working session ref");
         assert_eq!(
             working_session.codex_thread_id.as_deref(),
@@ -20228,6 +21143,69 @@ while ($true) {
 "#,
         );
         fs::write(&script, script_text).unwrap();
+        let system_powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let executable = if system_powershell.is_file() {
+            system_powershell
+        } else {
+            PathBuf::from("powershell.exe")
+        };
+        (
+            executable,
+            vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ],
+        )
+    }
+
+    #[cfg(windows)]
+    fn mcp_elicitation_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("mcp-elicitation-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+$responses = Join-Path $PSScriptRoot 'mcp-app-server-responses.jsonl'
+$mutations = Join-Path $PSScriptRoot 'mcp-app-server-mutations.jsonl'
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'thread/start' -or $msg.method -eq 'thread/resume') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-test"}}}')
+        [Console]::Out.Flush()
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}')
+        [Console]::Out.WriteLine('{"method":"item/started","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"mcp-1","type":"mcpToolCall","toolName":"create_issue"}}}')
+        [Console]::Out.WriteLine('{"method":"thread/status/changed","params":{"threadId":"thread-test","turnId":"turn-test","status":{"activeFlags":["waitingOnApproval"]}}}')
+        [Console]::Out.WriteLine('{"id":16,"method":"mcpServer/elicitation/request","params":{"threadId":"thread-test","turnId":"turn-test","serverName":"github","mode":"form","_meta":{"actionName":"create_issue"},"message":"Approve the sanitized connector action","requestedSchema":{"type":"object","properties":{}}}}')
+        [Console]::Out.Flush()
+        $responseLine = [Console]::In.ReadLine()
+        if ($null -eq $responseLine) { break }
+        Add-Content -LiteralPath $responses -Value $responseLine
+        try { $response = $responseLine | ConvertFrom-Json } catch { break }
+        if ($response.result.action -eq 'accept') {
+            Add-Content -LiteralPath $mutations -Value 'confirmed-mutation'
+            [Console]::Out.WriteLine('{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"mcp-1","type":"mcpToolCall"}}}')
+            [Console]::Out.WriteLine('{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"agent-final","type":"agentMessage","text":"Connector mutation confirmed once.","phase":"final_answer"}}}')
+            [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}')
+            [Console]::Out.Flush()
+            break
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
         let system_powershell =
             PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
         let executable = if system_powershell.is_file() {
@@ -21487,6 +22465,51 @@ done
         (PathBuf::from("sh"), vec![script.display().to_string()])
     }
     #[cfg(not(windows))]
+    fn mcp_elicitation_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
+        let script = root.join("mcp-elicitation-app-server.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+responses="$(dirname "$0")/mcp-app-server-responses.jsonl"
+mutations="$(dirname "$0")/mcp-app-server-mutations.jsonl"
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":0'*) printf '%s\n' '{"id":0,"result":{"ok":true}}' ;;
+        *'"method":"modelProvider/capabilities/read"'*) printf '%s\n' '{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}' ;;
+        *'"method":"thread/start"'*|*'"method":"thread/resume"'*) printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-test"}}}' ;;
+        *'"method":"turn/start"'*)
+            printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test","kind":"regular"}}}'
+            printf '%s\n' '{"method":"item/started","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"mcp-1","type":"mcpToolCall","toolName":"create_issue"}}}'
+            printf '%s\n' '{"method":"thread/status/changed","params":{"threadId":"thread-test","turnId":"turn-test","status":{"activeFlags":["waitingOnApproval"]}}}'
+            printf '%s\n' '{"id":16,"method":"mcpServer/elicitation/request","params":{"threadId":"thread-test","turnId":"turn-test","serverName":"github","mode":"form","_meta":{"actionName":"create_issue"},"message":"Approve the sanitized connector action","requestedSchema":{"type":"object","properties":{}}}}'
+            IFS= read -r response || exit 0
+            printf '%s\n' "$response" >> "$responses"
+            case "$response" in
+                *'"action":"accept"'*)
+                    printf '%s\n' confirmed-mutation >> "$mutations"
+                    printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"mcp-1","type":"mcpToolCall"}}}'
+                    printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"agent-final","type":"agentMessage","text":"Connector mutation confirmed once.","phase":"final_answer"}}}'
+                    printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test","status":"completed","usage":{"inputTokens":30,"outputTokens":12,"totalTokens":42}}}}'
+                    exit 0
+                    ;;
+            esac
+            ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+        (PathBuf::from("sh"), vec![script.display().to_string()])
+    }
+
+    #[cfg(not(windows))]
     fn interleaved_parent_child_app_server_command(root: &Path) -> (PathBuf, Vec<String>) {
         let script = root.join("interleaved-parent-child-app-server.sh");
         fs::write(
@@ -22296,6 +23319,20 @@ done
             "agent-harness-codex-runtime-{test_name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn canonical_test_session(session_key: &str) -> String {
+        let platform = session_key.split(':').next().unwrap_or("telegram");
+        crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+            session_key,
+            platform,
+            "default",
+            "dm-42",
+            "user-7",
+            "main",
+        )
+        .unwrap()
+        .canonical_string()
     }
 
     #[cfg(windows)]

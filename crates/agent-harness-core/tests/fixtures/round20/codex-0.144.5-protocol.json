@@ -43,13 +43,20 @@
     {"id": 99, "result": null},
     {"id": 100, "error": {"code": -32600, "message": "fixture error"}}
   ],
+  "serverRequests": [
+    {"id": 16, "method": "mcpServer/elicitation/request", "params": {"threadId": "thread-fixture", "turnId": "turn-fixture", "serverName": "github", "mode": "form", "_meta": {"actionName": "create_issue"}, "message": "Approve the sanitized connector action", "requestedSchema": {"type": "object", "properties": {}}}}
+  ],
+  "serverRequestResponses": [
+    {"id": 16, "result": {"action": "cancel", "content": null, "_meta": null}}
+  ],
   "notifications": [
     {"method": "thread/tokenUsage/updated", "params": {"threadId": "thread-fixture", "turnId": "turn-fixture", "tokenUsage": {"total": {"inputTokens": 120000, "cachedInputTokens": 0, "outputTokens": 1000, "reasoningOutputTokens": 0, "totalTokens": 121000}, "last": {"inputTokens": 2000, "cachedInputTokens": 0, "outputTokens": 100, "reasoningOutputTokens": 0, "totalTokens": 2100}, "modelContextWindow": 258400}}},
     {"method": "thread/goal/updated", "params": {"threadId": "thread-fixture", "turnId": "turn-fixture", "goal": {"threadId": "thread-fixture", "objective": "fixture objective", "status": "active", "tokenBudget": null, "tokensUsed": 42, "timeUsedSeconds": 3, "createdAt": 1, "updatedAt": 2}}},
     {"method": "item/completed", "params": {"threadId": "thread-fixture", "turnId": "compact-turn", "item": {"id": "compact-item", "type": "contextCompaction"}, "startedAtMs": 1, "completedAtMs": 2}},
     {"method": "thread/compacted", "params": {"threadId": "thread-fixture", "turnId": "compact-turn"}},
     {"method": "turn/completed", "params": {"threadId": "thread-fixture", "turn": {"id": "resume-turn", "status": "interrupted", "items": [], "error": null}, "interrupted": null}},
-    {"method": "item/started", "params": {"threadId": "thread-fixture", "turnId": "turn-fixture", "startedAtMs": 1, "item": {"id": "web-fixture", "type": "webSearch", "query": "sanitized fixture query", "action": {"type": "search", "query": "sanitized fixture query", "queries": ["sanitized fixture query"]}}}}
+    {"method": "item/started", "params": {"threadId": "thread-fixture", "turnId": "turn-fixture", "startedAtMs": 1, "item": {"id": "web-fixture", "type": "webSearch", "query": "sanitized fixture query", "action": {"type": "search", "query": "sanitized fixture query", "queries": ["sanitized fixture query"]}}}},
+    {"method": "thread/status/changed", "params": {"threadId": "thread-fixture", "status": {"activeFlags": ["waitingOnApproval"]}}}
   ],
   "raceExpectation": {
     "resumeTurnId": "resume-turn",

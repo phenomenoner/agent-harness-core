@@ -20,6 +20,7 @@ pub enum LatencyStage {
     InboundReceived,
     TurnPlanned,
     RuntimeEnqueued,
+    QueueAccepted,
     CapacityFirstSeen,
     LeaseAcquired,
     PromptBundleStart,
@@ -41,10 +42,11 @@ pub enum LatencyStage {
     DeliveryDone,
 }
 
-pub const DEFAULT_LATENCY_STAGE_ORDER: [LatencyStage; 22] = [
+pub const DEFAULT_LATENCY_STAGE_ORDER: [LatencyStage; 23] = [
     LatencyStage::InboundReceived,
     LatencyStage::TurnPlanned,
     LatencyStage::RuntimeEnqueued,
+    LatencyStage::QueueAccepted,
     LatencyStage::CapacityFirstSeen,
     LatencyStage::LeaseAcquired,
     LatencyStage::PromptBundleStart,
@@ -278,6 +280,7 @@ fn latency_stage_key(stage: LatencyStage) -> &'static str {
         LatencyStage::InboundReceived => "inbound-received",
         LatencyStage::TurnPlanned => "turn-planned",
         LatencyStage::RuntimeEnqueued => "runtime-enqueued",
+        LatencyStage::QueueAccepted => "queue-accepted",
         LatencyStage::CapacityFirstSeen => "capacity-first-seen",
         LatencyStage::LeaseAcquired => "lease-acquired",
         LatencyStage::PromptBundleStart => "prompt-bundle-start",

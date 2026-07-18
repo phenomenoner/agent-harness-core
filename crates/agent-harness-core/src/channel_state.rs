@@ -124,6 +124,10 @@ impl ChannelStateLane {
         &self.agent_id
     }
 
+    pub fn exact_lane_digest(&self) -> String {
+        format!("sha256:{}", channel_state_lane_v2_key(self))
+    }
+
     fn has_default_account(&self) -> bool {
         self.account_id == DEFAULT_CHANNEL_STATE_ACCOUNT_ID
     }
@@ -533,10 +537,25 @@ pub fn read_channel_session_state_v2(
     lane: &ChannelStateLane,
 ) -> io::Result<Option<ChannelSessionState>> {
     let state_file = channel_session_state_v2_file(harness_home, lane);
-    let Some(state) = read_channel_state(&state_file)? else {
+    let Some(mut state) = read_channel_state(&state_file)? else {
         return Ok(None);
     };
     validate_channel_session_state_v2_lane(&state, lane)?;
+    let parsed = crate::channel_session_key::CanonicalChannelSessionKey::parse_for_lane(
+        &state.active_session_key,
+        lane.platform(),
+        lane.account_id(),
+        lane.channel_id(),
+        lane.user_id(),
+        lane.agent_id(),
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if parsed.normalization()
+        == crate::channel_session_key::SessionKeyNormalization::LegacyDuplicateAccountCollapsed
+    {
+        state.active_session_key = parsed.canonical_string();
+        write_json_atomic(&state_file, &state)?;
+    }
     Ok(Some(state))
 }
 
@@ -556,6 +575,16 @@ pub fn bind_channel_session_state_to_lane_v2(
     state.channel_id = lane.channel_id.clone();
     state.user_id = lane.user_id.clone();
     state.agent_id = Some(lane.agent_id.clone());
+    if let Ok(session_key) = crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+        &state.active_session_key,
+        lane.platform(),
+        lane.account_id(),
+        lane.channel_id(),
+        lane.user_id(),
+        lane.agent_id(),
+    ) {
+        state.active_session_key = session_key.canonical_string();
+    }
 }
 
 /// Writes one state object after checking that its persisted identity exactly
@@ -567,6 +596,24 @@ pub fn write_channel_session_state_v2(
     state: &ChannelSessionState,
 ) -> io::Result<PathBuf> {
     validate_channel_session_state_v2_lane(state, lane)?;
+    let parsed = crate::channel_session_key::CanonicalChannelSessionKey::parse_for_lane(
+        &state.active_session_key,
+        lane.platform(),
+        lane.account_id(),
+        lane.channel_id(),
+        lane.user_id(),
+        lane.agent_id(),
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if parsed.normalization()
+        != crate::channel_session_key::SessionKeyNormalization::AlreadyCanonical
+        || parsed.canonical_string() != state.active_session_key
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "new channel session state writes require a canonical exact-lane session key",
+        ));
+    }
     let harness_home = harness_home.as_ref();
     let state_file = channel_session_state_v2_file(harness_home, lane);
     if state_file.is_file() {
@@ -939,6 +986,12 @@ fn apply_effect(
             topic,
             new_session_key,
         } => {
+            fence_channel_external_effects(
+                harness_home,
+                state,
+                "new session superseded pending connector approval",
+                warnings,
+            )?;
             let close_result = match (state.account_id.as_deref(), state.agent_id.as_deref()) {
                 (Some(account_id), Some(agent_id)) => match ChannelStateLane::new(
                     &state.platform,
@@ -1133,6 +1186,12 @@ fn apply_effect(
             }
         }
         ChannelCommandEffect::StopCurrentRun { reason } => {
+            fence_channel_external_effects(
+                harness_home,
+                state,
+                "operator stop fenced pending connector approval",
+                warnings,
+            )?;
             state.stop_requested = true;
             state.stop_reason = reason.clone();
             write_runtime_cancel_request(harness_home, state, reason.clone(), now_ms)?;
@@ -1143,6 +1202,12 @@ fn apply_effect(
         ChannelCommandEffect::RestartGateway { .. } => {}
         ChannelCommandEffect::RestartStatus { .. } => {}
         ChannelCommandEffect::AddSteering { instruction } => {
+            fence_channel_external_effects(
+                harness_home,
+                state,
+                "newer steering input fenced pending connector approval",
+                warnings,
+            )?;
             state.steering_notes.push(ChannelSessionNote {
                 at_ms: now_ms,
                 text: instruction.clone(),
@@ -1240,6 +1305,10 @@ fn apply_effect(
                 &snapshot.current_model,
             );
         }
+        // The durable effect ledger and exact-lane continuation queue are the
+        // authorities for this command. Channel session state only records
+        // the command name below; it must not mutate conversational controls.
+        ChannelCommandEffect::ResolveExternalEffect { .. } => {}
         ChannelCommandEffect::UnknownCommand { .. } => {}
     }
 
@@ -1247,6 +1316,33 @@ fn apply_effect(
         warnings.push("model override target did not include a usable model name".to_string());
     }
     Ok(stop_applied_queue_ids)
+}
+
+fn fence_channel_external_effects(
+    harness_home: &Path,
+    state: &ChannelSessionState,
+    reason: &str,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    let Some(agent_id) = state.agent_id.as_deref() else {
+        return Ok(());
+    };
+    let lane = ChannelStateLane::new(
+        &state.platform,
+        state.account_id.as_deref(),
+        &state.channel_id,
+        &state.user_id,
+        agent_id,
+    )?;
+    let fenced =
+        crate::fence_external_effects_for_lane(harness_home, &lane.exact_lane_digest(), reason)?;
+    if !fenced.is_empty() {
+        warnings.push(format!(
+            "fenced {} pending external effect(s) for the exact lane",
+            fenced.len()
+        ));
+    }
+    Ok(())
 }
 
 fn active_session_key_agent_segment(session_key: &str) -> Option<String> {
@@ -1465,6 +1561,10 @@ fn command_name(effect: &ChannelCommandEffect) -> &'static str {
         ChannelCommandEffect::ShowFast { .. } => "fast",
         ChannelCommandEffect::SwitchFast { .. } => "fast",
         ChannelCommandEffect::ShowStatus { .. } => "status",
+        ChannelCommandEffect::ResolveExternalEffect { approved: true, .. } => "approve",
+        ChannelCommandEffect::ResolveExternalEffect {
+            approved: false, ..
+        } => "deny",
         ChannelCommandEffect::UnknownCommand { .. } => "unknown-command",
     }
 }

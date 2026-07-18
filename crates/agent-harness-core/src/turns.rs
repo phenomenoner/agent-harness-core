@@ -8,11 +8,11 @@ use serde_json::Value;
 use crate::backend_reasoning::{
     BackendReasoningPolicyV1, BackendReasoningSource, ReasoningPreference,
 };
+use crate::channel_session_key::CanonicalChannelSessionKey;
 use crate::channel_state::{
     ChannelSessionStateV2MigrationStatus, ChannelStateLane,
     migrate_legacy_channel_session_state_to_v2, read_channel_session_state_v2,
 };
-use crate::lane::FullLaneKeyV1;
 use crate::{
     AgentOverride, AgentProfile, AgentRegistry, AgentSource, ChannelCommand, ChannelCommandIntent,
     ChannelSessionState, DEFAULT_THINKING_LEVEL, InboundMediaArtifact, PROMPT_FILE_NAMES,
@@ -302,33 +302,29 @@ pub fn build_turn_plan_for_account(
         input.harness_home.as_deref(),
     );
     let session_key = if let Some(account_id) = account_id.as_deref() {
-        input
-            .session_hint
-            .clone()
-            .or_else(|| {
-                channel_state
-                    .as_ref()
-                    .map(|state| state.active_session_key.clone())
-            })
-            .map(|session_key| {
-                bind_session_key_to_account(
-                    &session_key,
-                    &input.platform,
-                    account_id,
-                    &input.channel_id,
-                    &input.user_id,
-                    agent.as_ref().map(|agent| agent.id.as_str()),
-                )
-            })
-            .unwrap_or_else(|| {
-                session_key_for_account(
-                    &input.platform,
-                    account_id,
-                    &input.channel_id,
-                    &input.user_id,
-                    agent.as_ref().map(|agent| agent.id.as_str()),
-                )
-            })
+        let existing_session_key = input.session_hint.clone().or_else(|| {
+            channel_state
+                .as_ref()
+                .map(|state| state.active_session_key.clone())
+        });
+        if let Some(existing_session_key) = existing_session_key {
+            bind_session_key_to_account_checked(
+                &existing_session_key,
+                &input.platform,
+                account_id,
+                &input.channel_id,
+                &input.user_id,
+                agent.as_ref().map(|agent| agent.id.as_str()),
+            )?
+        } else {
+            session_key_for_account(
+                &input.platform,
+                account_id,
+                &input.channel_id,
+                &input.user_id,
+                agent.as_ref().map(|agent| agent.id.as_str()),
+            )
+        }
     } else {
         input
             .session_hint
@@ -1122,38 +1118,35 @@ pub(crate) fn bind_session_key_to_account(
     user_id: &str,
     agent_id: Option<&str>,
 ) -> String {
-    let suffix = account_session_suffix(platform, account_id, channel_id, user_id, agent_id);
-    let suffix_with_separator = format!(":{suffix}");
-    if session_key.ends_with(&suffix_with_separator) {
-        session_key.to_string()
-    } else {
-        format!("{session_key}{suffix_with_separator}")
-    }
+    bind_session_key_to_account_checked(
+        session_key,
+        platform,
+        account_id,
+        channel_id,
+        user_id,
+        agent_id,
+    )
+    .unwrap_or_else(|_| session_key.to_string())
 }
 
-fn account_session_suffix(
+fn bind_session_key_to_account_checked(
+    session_key: &str,
     platform: &str,
     account_id: &str,
     channel_id: &str,
     user_id: &str,
     agent_id: Option<&str>,
-) -> String {
-    let fallback = format!("acct-{}", normalize_key_part(account_id));
-    let Ok(lane) = FullLaneKeyV1::new(
+) -> io::Result<String> {
+    CanonicalChannelSessionKey::bind_for_lane(
+        session_key,
         platform,
         account_id,
         channel_id,
         user_id,
         agent_id.unwrap_or("unassigned"),
-        "interactive",
-        "channel-session",
-        "channel-session",
-    ) else {
-        return fallback;
-    };
-    lane.identity_hash()
-        .map(|identity_hash| format!("acct-{identity_hash}"))
-        .unwrap_or(fallback)
+    )
+    .map(|key| key.canonical_string())
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn normalize_key_part(value: &str) -> String {
@@ -1181,6 +1174,60 @@ mod tests {
         record_skill_usage_event,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn account_binding_is_idempotent_for_account_bound_root() {
+        let bound = bind_session_key_to_account(
+            "synthetic-root",
+            "telegram",
+            "account-a",
+            "channel-a",
+            "user-a",
+            Some("main"),
+        );
+        assert_eq!(
+            bind_session_key_to_account(
+                &bound,
+                "telegram",
+                "account-a",
+                "channel-a",
+                "user-a",
+                Some("main"),
+            ),
+            bound
+        );
+    }
+
+    #[test]
+    fn account_binding_is_idempotent_for_continuation() {
+        let bound = bind_session_key_to_account(
+            "synthetic-root",
+            "telegram",
+            "account-a",
+            "channel-a",
+            "user-a",
+            Some("main"),
+        );
+        let continuation = crate::context_rollover::continuation_session_key(&bound, 1);
+        let rebound = bind_session_key_to_account(
+            &continuation,
+            "telegram",
+            "account-a",
+            "channel-a",
+            "user-a",
+            Some("main"),
+        );
+
+        assert_eq!(rebound, continuation);
+        assert_eq!(
+            crate::context_rollover::root_working_session_key(&rebound),
+            bound
+        );
+        assert_eq!(
+            crate::context_rollover::continuation_index_from_session_key(&rebound),
+            Some(1)
+        );
+    }
 
     #[test]
     fn turn_plan_routes_message_to_agent_and_skills() {

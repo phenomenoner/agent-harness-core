@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+## v0.10.0 - 2026-07-18
+
+### Added
+
+- Added canonical exact-lane channel session identities, typed queue/progress/terminal lifecycle
+  states, and restart-safe parent/child continuation correlation with one logical final owner.
+- Added typed OperationPlan deadline-drain checkpoints and deterministic commit-before-enqueue
+  continuation with version, checksum, lane, stop, steer, budget, no-progress, and depth guards.
+- Added a durable external-effect state machine for recognized MCP connector elicitations, including
+  `WaitingForApproval`, exact-lane expiring approve/deny capabilities, stable idempotency markers or
+  keys, and connector-specific readback before ambiguous resubmission.
+
+### Changed
+
+- Structured provider overload failures now retain mutation evidence and use persisted bounded retry
+  eligibility. No-observed-mutation work may retry in place, observed mutation uses exact-lane
+  continuation, and unknown evidence fails closed.
+- Runtime selection normalizes the exact legacy duplicate-account continuation shape before
+  dispatch, quarantines other identity mismatches, and treats typed hot/cold terminal evidence as
+  authoritative during lease and index reconciliation.
+- Progress surfaces now distinguish queued, preparing, working, continuing, waiting-for-approval,
+  and terminal states instead of projecting queue terminality as logical task success.
+
+### Security
+
+- Provider status and transport diagnostics omit absolute request URLs, URL userinfo, bot tokens,
+  credentials, and provider hosts from durable errors and user-visible fallback text.
+- Approval bearer values remain in protected latest-state snapshots only; generic receipts and
+  public serialization retain bounded digests and effect states instead of raw tokens or parameters.
+
+### Verification
+
+- Added six sanitized continuity and external-effect replay fixtures covering queued-before-lease presentation, structured
+  overload recovery, duplicate continuation binding, timeout handoff, OperationPlan deadline drain,
+  and MCP elicitation/external-effect crash boundaries.
+- Passed the full serial workspace suite, all integration and documentation tests, end-to-end
+  continuity replays across Telegram and Discord lanes, fixture integrity checks, catalog readback, and
+  tracked-file public-export hygiene before release.
+- Completed a guarded live cutover with an operator-confirmed one-time migration of abandoned legacy
+  continuation rows, followed by ten consecutive clean passive samples with all required services
+  healthy and no runnable runtime, cron, or worker work.
+
 ## v0.9.0 - 2026-07-17
 
 ### Added

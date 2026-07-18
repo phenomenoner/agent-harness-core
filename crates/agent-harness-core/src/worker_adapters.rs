@@ -1891,10 +1891,17 @@ mod tests {
         write_controlled_coordinator_smoke_source_marker(&source);
         let harness_home = root.join("harness");
         write_authoritative_model_catalog_fixture(&harness_home);
-        write_controlled_coordinator_smoke_active_session(
-            &harness_home,
+        let session_key = crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
             "telegram:channel-1:user-1:main:t4-smoke",
-        );
+            "telegram",
+            "account-1",
+            "channel-1",
+            "user-1",
+            "main",
+        )
+        .unwrap()
+        .canonical_string();
+        write_controlled_coordinator_smoke_active_session(&harness_home, &session_key);
 
         let report = enqueue_controlled_coordinator_smoke(ControlledCoordinatorSmokeOptionsV1 {
             harness_home: harness_home.clone(),
@@ -1906,7 +1913,7 @@ mod tests {
                 channel_id: "channel-1".to_string(),
                 user_id: "user-1".to_string(),
                 agent_id: "main".to_string(),
-                session_key: "telegram:channel-1:user-1:main:t4-smoke".to_string(),
+                session_key,
             },
             children: vec![
                 ControlledCoordinatorSmokeChildV1 {

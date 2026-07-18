@@ -12,10 +12,12 @@ use crate::backend_reasoning::{
 };
 use crate::execution_mode::{ExecutionModePolicyV1, ExecutionModePreference};
 use crate::{
-    AgentRegistry, ChannelCommandIntent, DEFAULT_THINKING_LEVEL, FastCommandMode,
+    AgentRegistry, ChannelCommandIntent, DEFAULT_THINKING_LEVEL, ExternalEffectApprovalDecisionV1,
+    ExternalEffectContinuationV1, ExternalEffectIntentV1, FastCommandMode,
     GatewayRestartStatusReport, InboundMediaArtifact, RichMessagePresentation, THINKING_LEVELS,
     TurnDispatch, TurnPlan, XHIGH_THINKING_LEVEL, collect_gateway_restart_status,
-    inspect_codex_approval_policy, inspect_codex_sandbox, inspect_codex_sandbox_policy,
+    ensure_external_effect_continuation, inspect_codex_approval_policy, inspect_codex_sandbox,
+    inspect_codex_sandbox_policy, resolve_external_effect_approval,
 };
 
 const CHANNEL_STEP_SCHEMA: &str = "agent-harness.channel-step.v1";
@@ -191,6 +193,15 @@ pub enum ChannelCommandEffect {
     ShowStatus {
         scope: Option<String>,
         snapshot: ChannelStatusSnapshot,
+    },
+    ResolveExternalEffect {
+        approved: bool,
+        status: String,
+        detail: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        intent: Option<ExternalEffectIntentV1>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        continuation: Option<ExternalEffectContinuationV1>,
     },
     UnknownCommand {
         name: String,
@@ -562,11 +573,123 @@ fn command_effect(
             snapshot: status_snapshot(registry, turn, scope.clone()),
             scope,
         },
+        ChannelCommandIntent::ResolveExternalEffect { approve, token } => {
+            external_effect_approval_effect(turn, approve, token, warnings)
+        }
         ChannelCommandIntent::UnknownCommand { name, rest } => {
             ChannelCommandEffect::UnknownCommand {
                 name,
                 rest,
                 detail: "unsupported channel command; no model turn was started".to_string(),
+            }
+        }
+    }
+}
+
+fn external_effect_approval_effect(
+    turn: &TurnPlan,
+    approve: bool,
+    token: Option<String>,
+    warnings: &mut Vec<String>,
+) -> ChannelCommandEffect {
+    let failure = |status: &str, detail: String| ChannelCommandEffect::ResolveExternalEffect {
+        approved: approve,
+        status: status.to_string(),
+        detail,
+        intent: None,
+        continuation: None,
+    };
+    let Some(token) = token.filter(|value| {
+        let mut parts = value.split_whitespace();
+        parts.next().is_some_and(|part| part.starts_with("ahx1_")) && parts.next().is_none()
+    }) else {
+        return failure(
+            "invalid-token",
+            format!(
+                "/{} requires exactly one connector action token beginning with `ahx1_`",
+                if approve { "approve" } else { "deny" }
+            ),
+        );
+    };
+    let Some(harness_home) = turn.harness_home.as_deref() else {
+        return failure(
+            "missing-harness-home",
+            "external-effect approval requires a harness home".to_string(),
+        );
+    };
+    let Some(agent_id) = turn.agent.as_ref().map(|agent| agent.id.as_str()) else {
+        return failure(
+            "missing-agent",
+            "external-effect approval requires the exact agent lane".to_string(),
+        );
+    };
+    let lane = match crate::ChannelStateLane::new(
+        &turn.platform,
+        turn.account_id.as_deref(),
+        &turn.channel_id,
+        &turn.user_id,
+        agent_id,
+    ) {
+        Ok(lane) => lane,
+        Err(error) => return failure("invalid-lane", error.to_string()),
+    };
+    let decision = if approve {
+        ExternalEffectApprovalDecisionV1::Approve
+    } else {
+        ExternalEffectApprovalDecisionV1::Deny
+    };
+    let intent = match resolve_external_effect_approval(
+        harness_home,
+        &token,
+        &lane.exact_lane_digest(),
+        decision,
+    ) {
+        Ok(intent) => intent,
+        Err(error) => {
+            warnings.push(format!("external-effect approval failed closed: {error}"));
+            return failure("failed-closed", error.to_string());
+        }
+    };
+    if !approve {
+        return ChannelCommandEffect::ResolveExternalEffect {
+            approved: false,
+            status: "denied".to_string(),
+            detail: format!(
+                "External effect `{}` was denied and fenced; no connector mutation was submitted.",
+                intent.effect_id
+            ),
+            intent: Some(intent),
+            continuation: None,
+        };
+    }
+    match ensure_external_effect_continuation(harness_home, &intent) {
+        Ok(continuation) => ChannelCommandEffect::ResolveExternalEffect {
+            approved: true,
+            status: if continuation.requeued {
+                "approved-and-requeued"
+            } else {
+                "already-approved-and-requeued"
+            }
+            .to_string(),
+            detail: format!(
+                "External effect `{}` was approved for one exact-lane continuation `{}`.",
+                intent.effect_id, continuation.child_queue_id
+            ),
+            intent: Some(intent),
+            continuation: Some(continuation),
+        },
+        Err(error) => {
+            warnings.push(format!(
+                "external effect was approved but continuation scheduling failed: {error}"
+            ));
+            ChannelCommandEffect::ResolveExternalEffect {
+                approved: true,
+                status: "approved-continuation-failed".to_string(),
+                detail: format!(
+                    "Approval was recorded, but exact-lane continuation scheduling failed closed: {error}. Repeating the same /approve command will retry scheduling without approving twice."
+                ),
+                intent: Some(intent),
+                continuation: None,
             }
         }
     }
@@ -2228,6 +2351,9 @@ fn command_reply_text(effect: &ChannelCommandEffect) -> String {
             )
         }
         ChannelCommandEffect::ShowStatus { snapshot, .. } => status_reply_text(snapshot),
+        ChannelCommandEffect::ResolveExternalEffect { status, detail, .. } => {
+            format!("External-effect approval status: {status}\n{detail}")
+        }
         ChannelCommandEffect::UnknownCommand { name, rest, detail } => {
             let mut text = format!("Unknown or unsupported command: /{name}");
             if let Some(rest) = rest {
@@ -2697,6 +2823,195 @@ mod tests {
                     && snapshot.discord_configured
                     && snapshot.telegram_configured
         ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn channel_external_effect_commands_are_exact_lane_bound_and_idempotent() {
+        let root =
+            temp_root("channel_external_effect_commands_are_exact_lane_bound_and_idempotent");
+        let source = write_channel_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let registry = load_agent_registry(&source).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+        let lane =
+            crate::ChannelStateLane::new("discord", None, "dm#42", "user#7", "main").unwrap();
+        let request_context = crate::ExternalEffectRequestContextV1 {
+            exact_lane_digest: lane.exact_lane_digest(),
+            logical_lineage_id: "lineage-1".to_string(),
+            source_queue_id: "queue-approval-source".to_string(),
+        };
+        let session_key = crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+            "discord:dm#42:user#7:main",
+            "discord",
+            "default",
+            "dm#42",
+            "user#7",
+            "main",
+        )
+        .unwrap()
+        .canonical_string();
+        crate::write_channel_session_state_v2(
+            &harness_home,
+            &lane,
+            &crate::ChannelSessionState {
+                schema: crate::channel_state::CHANNEL_SESSION_STATE_V2_SCHEMA.to_string(),
+                platform: "discord".to_string(),
+                account_id: Some("default".to_string()),
+                channel_id: "dm#42".to_string(),
+                user_id: "user#7".to_string(),
+                active_session_key: session_key.clone(),
+                agent_id: Some("main".to_string()),
+                config_revision: None,
+                provider: None,
+                model: None,
+                session_topic: None,
+                model_override: None,
+                model_override_provider: None,
+                model_override_model: None,
+                thinking_enabled: false,
+                thinking_level: None,
+                thinking_instruction: None,
+                reasoning_preference: None,
+                backend_reasoning_policy: None,
+                fast_mode: None,
+                stop_requested: false,
+                stop_reason: None,
+                steering_notes: Vec::new(),
+                btw_notes: Vec::new(),
+                last_command: None,
+                updated_at_ms: 1,
+            },
+        )
+        .unwrap();
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        crate::append_jsonl_value(
+            &queue_dir.join("pending.jsonl"),
+            &serde_json::json!({
+                "queueId": request_context.source_queue_id,
+                "status": "queued",
+                "runtimeClass": "interactive",
+                "origin": "channel",
+                "platform": "discord",
+                "accountId": "default",
+                "channelId": "dm#42",
+                "userId": "user#7",
+                "agentId": "main",
+                "sessionKey": session_key,
+                "continuationIndex": 0,
+                "message": "submit the protected connector action"
+            }),
+        )
+        .unwrap();
+        crate::append_jsonl_value(
+            &queue_dir.join("execution-receipts.jsonl"),
+            &serde_json::json!({
+                "queueId": "queue-approval-source",
+                "status": "prepared",
+                "runtimeClass": "interactive",
+                "origin": "channel",
+                "executionDir": harness_home.join("execution").display().to_string()
+            }),
+        )
+        .unwrap();
+        let descriptor = crate::McpElicitationDescriptorV1 {
+            connector: "github".to_string(),
+            action: "create_issue".to_string(),
+            params_digest: format!("sha256:{}", "2".repeat(64)),
+            action_summary: "github/create_issue: create a tracked issue".to_string(),
+            mode: "form".to_string(),
+        };
+        let token = match crate::begin_external_effect_request(
+            &harness_home,
+            &request_context,
+            &descriptor,
+            &crate::ConnectorApprovalPolicyV1::default(),
+        )
+        .unwrap()
+        {
+            crate::ExternalEffectAdmissionV1::NeedsUser { token, .. } => token,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+
+        let build = |platform: &str, text: String| {
+            build_turn_plan(
+                &source,
+                &registry,
+                &skills,
+                TurnPlanInput {
+                    harness_home: Some(harness_home.clone()),
+                    platform: platform.to_string(),
+                    channel_id: "dm#42".to_string(),
+                    user_id: "user#7".to_string(),
+                    text,
+                    inbound_context: None,
+                    inbound_media_artifacts: Vec::new(),
+                    requested_agent_id: Some("main".to_string()),
+                    session_hint: None,
+                    skill_limit: 3,
+                },
+            )
+            .unwrap()
+        };
+
+        let wrong_lane = build("telegram", format!("/approve {token}"));
+        let wrong_lane_step = build_channel_step(&registry, &wrong_lane);
+        assert!(matches!(
+            wrong_lane_step.command_effect,
+            Some(ChannelCommandEffect::ResolveExternalEffect {
+                ref status,
+                intent: None,
+                ..
+            }) if status == "failed-closed"
+        ));
+
+        let first = build("discord", format!("/approve {token}"));
+        let first_step = build_channel_step(&registry, &first);
+        assert!(matches!(
+            first_step.command_effect,
+            Some(ChannelCommandEffect::ResolveExternalEffect {
+                approved: true,
+                ref status,
+                ref intent,
+                ref continuation,
+                ..
+            }) if status == "approved-and-requeued"
+                && intent.as_ref().is_some_and(|intent| intent.state == crate::ExternalEffectStateV1::Approved)
+                && continuation.as_ref().is_some_and(|continuation| continuation.requeued)
+        ));
+        let first_child = match first_step.command_effect.as_ref().unwrap() {
+            ChannelCommandEffect::ResolveExternalEffect {
+                continuation: Some(continuation),
+                ..
+            } => continuation.child_queue_id.clone(),
+            other => panic!("unexpected first approval effect: {other:?}"),
+        };
+
+        let repeated = build("discord", format!("/approve {token}"));
+        let repeated_step = build_channel_step(&registry, &repeated);
+        assert!(matches!(
+            repeated_step.command_effect,
+            Some(ChannelCommandEffect::ResolveExternalEffect {
+                approved: true,
+                ref status,
+                ref continuation,
+                ..
+            }) if status == "already-approved-and-requeued"
+                && continuation.as_ref().is_some_and(|continuation| {
+                    !continuation.requeued && continuation.child_queue_id == first_child
+                })
+        ));
+        let transitions =
+            fs::read_to_string(crate::external_effect_transition_file(&harness_home)).unwrap();
+        assert_eq!(
+            transitions
+                .lines()
+                .filter(|line| line.contains("\"toState\":\"approved\""))
+                .count(),
+            1
+        );
 
         let _ = fs::remove_dir_all(root);
     }

@@ -1,0 +1,1826 @@
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use ring::digest;
+use ring::rand::{SecureRandom, SystemRandom};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::{current_log_time_ms, write_json_atomic};
+
+pub const EXTERNAL_EFFECT_INTENT_SCHEMA: &str = "agent-harness.external-effect-intent.v1";
+pub const EXTERNAL_EFFECT_TRANSITION_SCHEMA: &str = "agent-harness.external-effect-transition.v1";
+pub const CONNECTOR_APPROVAL_TOKEN_SCHEMA: &str = "agent-harness.connector-approval-token.v1";
+pub const GITHUB_ISSUE_READBACK_EVIDENCE_SCHEMA: &str =
+    "agent-harness.github-issue-readback-evidence.v1";
+pub const PROVIDER_IDEMPOTENCY_READBACK_EVIDENCE_SCHEMA: &str =
+    "agent-harness.provider-idempotency-readback-evidence.v1";
+const DEFAULT_APPROVAL_TOKEN_TTL_MS: i64 = 15 * 60 * 1_000;
+const MAX_CONNECTOR_BYTES: usize = 96;
+const MAX_ACTION_BYTES: usize = 160;
+const MAX_SUMMARY_BYTES: usize = 240;
+const MAX_EFFECT_RECORD_BYTES: u64 = 32 * 1024;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConnectorApprovalModeV1 {
+    Deny,
+    #[default]
+    NeedsUser,
+    ExplicitActionToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConnectorApprovalRuleV1 {
+    pub connector: String,
+    #[serde(default)]
+    pub actions: Vec<String>,
+    pub mode: ConnectorApprovalModeV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConnectorApprovalPolicyV1 {
+    #[serde(default)]
+    pub default: ConnectorApprovalModeV1,
+    #[serde(default)]
+    pub rules: Vec<ConnectorApprovalRuleV1>,
+}
+
+impl Default for ConnectorApprovalPolicyV1 {
+    fn default() -> Self {
+        Self {
+            default: ConnectorApprovalModeV1::NeedsUser,
+            rules: Vec::new(),
+        }
+    }
+}
+
+impl ConnectorApprovalPolicyV1 {
+    pub fn mode_for(&self, connector: &str, action: &str) -> ConnectorApprovalModeV1 {
+        self.rules
+            .iter()
+            .find(|rule| {
+                rule.connector.eq_ignore_ascii_case(connector)
+                    && (rule.actions.is_empty()
+                        || rule
+                            .actions
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(action)))
+            })
+            .map(|rule| rule.mode)
+            .unwrap_or(self.default)
+    }
+
+    pub fn validate(&self) -> io::Result<()> {
+        for rule in &self.rules {
+            validate_bounded_identifier(&rule.connector, "connector", MAX_CONNECTOR_BYTES)?;
+            for action in &rule.actions {
+                validate_bounded_identifier(action, "action", MAX_ACTION_BYTES)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExternalEffectStateV1 {
+    Requested,
+    ApprovalRequired,
+    Approved,
+    Denied,
+    Submitted,
+    Confirmed,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectorApprovalTokenV1 {
+    pub schema: String,
+    /// Raw capability material is retained only in the protected latest-state
+    /// snapshot. Generic receipts and command effects serialize the digest and
+    /// binding metadata, never the bearer token itself.
+    #[serde(skip_serializing)]
+    pub token: String,
+    pub token_digest: String,
+    pub effect_id: String,
+    pub exact_lane_digest: String,
+    pub params_digest: String,
+    pub approval_generation: u64,
+    pub expires_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumed_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalEffectIntentV1 {
+    pub schema: String,
+    pub effect_id: String,
+    pub exact_lane_digest: String,
+    pub logical_lineage_id: String,
+    pub source_queue_id: String,
+    pub connector: String,
+    pub action: String,
+    pub params_digest: String,
+    pub approval_generation: u64,
+    pub state: ExternalEffectStateV1,
+    pub action_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_token: Option<ConnectorApprovalTokenV1>,
+    pub requested_at_ms: i64,
+    pub updated_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalEffectTransitionV1 {
+    pub schema: String,
+    pub effect_id: String,
+    pub from_state: Option<ExternalEffectStateV1>,
+    pub to_state: ExternalEffectStateV1,
+    pub approval_generation: u64,
+    pub at_ms: i64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalEffectRequestContextV1 {
+    pub exact_lane_digest: String,
+    pub logical_lineage_id: String,
+    pub source_queue_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalEffectContinuationV1 {
+    pub effect_id: String,
+    pub source_queue_id: String,
+    pub child_queue_id: String,
+    pub exact_lane_digest: String,
+    pub requeued: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpElicitationDescriptorV1 {
+    pub connector: String,
+    pub action: String,
+    pub params_digest: String,
+    pub action_summary: String,
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalEffectAdmissionV1 {
+    Authorized(ExternalEffectIntentV1),
+    NeedsUser {
+        intent: ExternalEffectIntentV1,
+        token: String,
+    },
+    Denied(ExternalEffectIntentV1),
+    AlreadyConfirmed(ExternalEffectIntentV1),
+    Ambiguous(ExternalEffectIntentV1),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalEffectApprovalDecisionV1 {
+    Approve,
+    Deny,
+}
+
+pub fn external_effect_mutation_evidence(
+    state: ExternalEffectStateV1,
+) -> crate::RuntimeMutationEvidenceClass {
+    match state {
+        ExternalEffectStateV1::Requested
+        | ExternalEffectStateV1::ApprovalRequired
+        | ExternalEffectStateV1::Approved
+        | ExternalEffectStateV1::Denied => {
+            crate::RuntimeMutationEvidenceClass::NoObservableMutation
+        }
+        ExternalEffectStateV1::Submitted | ExternalEffectStateV1::Ambiguous => {
+            crate::RuntimeMutationEvidenceClass::Unknown
+        }
+        ExternalEffectStateV1::Confirmed => crate::RuntimeMutationEvidenceClass::MutationObserved,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalEffectReadbackV1 {
+    Present,
+    Absent,
+    Unprovable,
+}
+
+pub trait ExternalEffectReadbackAdapter {
+    fn readback(&self, intent: &ExternalEffectIntentV1) -> io::Result<ExternalEffectReadbackV1>;
+}
+
+/// Sanitized result of a complete or partial GitHub issue marker lookup.
+///
+/// The adapter deliberately accepts no title, body, repository URL, issue id,
+/// or account metadata. A caller that cannot prove its marker query covered the
+/// exact approved scope must leave `query_complete` false, which can never
+/// authorize a resubmission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GithubIssueReadbackEvidenceV1 {
+    pub schema: String,
+    pub params_digest: String,
+    pub query_complete: bool,
+    #[serde(default)]
+    pub observed_effect_markers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubIssueReadbackAdapterV1 {
+    evidence: GithubIssueReadbackEvidenceV1,
+}
+
+impl GithubIssueReadbackAdapterV1 {
+    pub fn new(evidence: GithubIssueReadbackEvidenceV1) -> io::Result<Self> {
+        if evidence.schema != GITHUB_ISSUE_READBACK_EVIDENCE_SCHEMA {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported GitHub issue readback evidence schema",
+            ));
+        }
+        validate_digest(&evidence.params_digest, "GitHub readback parameter digest")?;
+        if evidence.observed_effect_markers.len() > 256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "GitHub issue readback evidence contains too many markers",
+            ));
+        }
+        for marker in &evidence.observed_effect_markers {
+            validate_effect_marker(marker)?;
+        }
+        Ok(Self { evidence })
+    }
+}
+
+impl ExternalEffectReadbackAdapter for GithubIssueReadbackAdapterV1 {
+    fn readback(&self, intent: &ExternalEffectIntentV1) -> io::Result<ExternalEffectReadbackV1> {
+        if !intent.connector.eq_ignore_ascii_case("github")
+            || !matches!(
+                intent.action.to_ascii_lowercase().as_str(),
+                "create_issue" | "create-issue" | "issue/create"
+            )
+        {
+            return Ok(ExternalEffectReadbackV1::Unprovable);
+        }
+        if self.evidence.params_digest != intent.params_digest {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "GitHub issue readback evidence belongs to different parameters",
+            ));
+        }
+        let marker = github_issue_effect_marker(intent).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "GitHub issue effect has no deterministic readback marker",
+            )
+        })?;
+        if self
+            .evidence
+            .observed_effect_markers
+            .iter()
+            .any(|observed| observed == &marker)
+        {
+            return Ok(ExternalEffectReadbackV1::Present);
+        }
+        Ok(if self.evidence.query_complete {
+            ExternalEffectReadbackV1::Absent
+        } else {
+            ExternalEffectReadbackV1::Unprovable
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderIdempotencyReadbackStateV1 {
+    Present,
+    Absent,
+    Unknown,
+}
+
+/// Sanitized readback from a connector that natively supports an idempotency
+/// key. The stable key and parameter digest must both match the durable effect;
+/// a mismatched observation is rejected instead of being treated as absence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderIdempotencyReadbackEvidenceV1 {
+    pub schema: String,
+    pub connector: String,
+    pub action: String,
+    pub params_digest: String,
+    pub idempotency_key: String,
+    pub state: ProviderIdempotencyReadbackStateV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderIdempotencyReadbackAdapterV1 {
+    evidence: ProviderIdempotencyReadbackEvidenceV1,
+}
+
+impl ProviderIdempotencyReadbackAdapterV1 {
+    pub fn new(evidence: ProviderIdempotencyReadbackEvidenceV1) -> io::Result<Self> {
+        if evidence.schema != PROVIDER_IDEMPOTENCY_READBACK_EVIDENCE_SCHEMA {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported provider idempotency readback evidence schema",
+            ));
+        }
+        validate_bounded_identifier(&evidence.connector, "connector", MAX_CONNECTOR_BYTES)?;
+        validate_bounded_identifier(&evidence.action, "action", MAX_ACTION_BYTES)?;
+        validate_digest(
+            &evidence.params_digest,
+            "provider readback parameter digest",
+        )?;
+        validate_bounded_identifier(&evidence.idempotency_key, "idempotency key", 96)?;
+        Ok(Self { evidence })
+    }
+}
+
+impl ExternalEffectReadbackAdapter for ProviderIdempotencyReadbackAdapterV1 {
+    fn readback(&self, intent: &ExternalEffectIntentV1) -> io::Result<ExternalEffectReadbackV1> {
+        if !self
+            .evidence
+            .connector
+            .eq_ignore_ascii_case(&intent.connector)
+            || !self.evidence.action.eq_ignore_ascii_case(&intent.action)
+            || self.evidence.params_digest != intent.params_digest
+            || self.evidence.idempotency_key != external_effect_idempotency_key(intent)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "provider idempotency readback evidence is not bound to the durable effect",
+            ));
+        }
+        Ok(match self.evidence.state {
+            ProviderIdempotencyReadbackStateV1::Present => ExternalEffectReadbackV1::Present,
+            ProviderIdempotencyReadbackStateV1::Absent => ExternalEffectReadbackV1::Absent,
+            ProviderIdempotencyReadbackStateV1::Unknown => ExternalEffectReadbackV1::Unprovable,
+        })
+    }
+}
+
+pub fn external_effect_idempotency_key(intent: &ExternalEffectIntentV1) -> String {
+    format!("ahx-{}", intent.effect_id)
+}
+
+pub fn github_issue_effect_marker(intent: &ExternalEffectIntentV1) -> Option<String> {
+    (intent.connector.eq_ignore_ascii_case("github")
+        && matches!(
+            intent.action.to_ascii_lowercase().as_str(),
+            "create_issue" | "create-issue" | "issue/create"
+        ))
+    .then(|| {
+        format!(
+            "<!-- agent-harness-effect:{} -->",
+            external_effect_idempotency_key(intent)
+        )
+    })
+}
+
+pub fn load_connector_approval_policy(
+    harness_home: &Path,
+) -> io::Result<ConnectorApprovalPolicyV1> {
+    let config_file = harness_home.join("harness-config.json");
+    let text = match fs::read_to_string(&config_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ConnectorApprovalPolicyV1::default());
+        }
+        Err(error) => return Err(error),
+    };
+    let root: Value = serde_json::from_str(&text).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid harness config {}: {error}", config_file.display()),
+        )
+    })?;
+    let Some(value) = root.pointer("/security/connectorApprovalPolicy") else {
+        return Ok(ConnectorApprovalPolicyV1::default());
+    };
+    let policy: ConnectorApprovalPolicyV1 =
+        serde_json::from_value(value.clone()).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid security.connectorApprovalPolicy: {error}"),
+            )
+        })?;
+    policy.validate()?;
+    Ok(policy)
+}
+
+pub fn parse_mcp_elicitation_descriptor(
+    value: &Value,
+    active_tool_preview: Option<&str>,
+) -> io::Result<McpElicitationDescriptorV1> {
+    if value.get("method").and_then(Value::as_str) != Some("mcpServer/elicitation/request") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not an MCP elicitation request",
+        ));
+    }
+    let params = value.get("params").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MCP elicitation params are missing",
+        )
+    })?;
+    let connector = first_string(
+        params,
+        &["/serverName", "/server", "/connectorName", "/connector"],
+    )
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MCP elicitation serverName is missing",
+        )
+    })?;
+    let mode = first_string(params, &["/mode"]).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MCP elicitation mode is missing",
+        )
+    })?;
+    if !matches!(mode.as_str(), "form" | "openai/form" | "url") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported MCP elicitation mode {mode}"),
+        ));
+    }
+    let action = first_string(
+        params,
+        &[
+            "/_meta/actionName",
+            "/_meta/action",
+            "/actionName",
+            "/action",
+        ],
+    )
+    .or_else(|| active_tool_preview.map(str::to_string))
+    .unwrap_or_else(|| format!("{mode}-elicitation"));
+    validate_bounded_identifier(&connector, "connector", MAX_CONNECTOR_BYTES)?;
+    let action = sanitize_bounded(&action, MAX_ACTION_BYTES, "connector-action");
+    let params_bytes = serde_json::to_vec(params).map_err(io::Error::other)?;
+    let params_digest = sha256_tagged(&params_bytes);
+    let message = first_string(params, &["/message"])
+        .unwrap_or_else(|| "connector action approval".to_string());
+    let action_summary = sanitize_bounded(
+        &format!("{connector}/{action}: {message}"),
+        MAX_SUMMARY_BYTES,
+        "connector approval",
+    );
+    Ok(McpElicitationDescriptorV1 {
+        connector,
+        action,
+        params_digest,
+        action_summary,
+        mode,
+    })
+}
+
+pub fn begin_external_effect_request(
+    harness_home: &Path,
+    context: &ExternalEffectRequestContextV1,
+    descriptor: &McpElicitationDescriptorV1,
+    policy: &ConnectorApprovalPolicyV1,
+) -> io::Result<ExternalEffectAdmissionV1> {
+    validate_digest(&context.exact_lane_digest, "exact lane digest")?;
+    validate_digest(&descriptor.params_digest, "parameter digest")?;
+    let effect_id = effect_id(context, descriptor);
+    if let Some(latest) = load_external_effect_intent(harness_home, &effect_id)? {
+        return match latest.state {
+            ExternalEffectStateV1::Approved => Ok(ExternalEffectAdmissionV1::Authorized(latest)),
+            ExternalEffectStateV1::Requested => {
+                advance_requested_external_effect(harness_home, latest, policy)
+            }
+            ExternalEffectStateV1::ApprovalRequired => {
+                let token = latest
+                    .approval_token
+                    .as_ref()
+                    .map(|token| token.token.clone())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "approval-required effect is missing its action token",
+                        )
+                    })?;
+                Ok(ExternalEffectAdmissionV1::NeedsUser {
+                    intent: latest,
+                    token,
+                })
+            }
+            ExternalEffectStateV1::Denied => Ok(ExternalEffectAdmissionV1::Denied(latest)),
+            ExternalEffectStateV1::Confirmed => {
+                Ok(ExternalEffectAdmissionV1::AlreadyConfirmed(latest))
+            }
+            ExternalEffectStateV1::Submitted | ExternalEffectStateV1::Ambiguous => {
+                Ok(ExternalEffectAdmissionV1::Ambiguous(latest))
+            }
+        };
+    }
+
+    let now = current_log_time_ms()?;
+    let intent = ExternalEffectIntentV1 {
+        schema: EXTERNAL_EFFECT_INTENT_SCHEMA.to_string(),
+        effect_id,
+        exact_lane_digest: context.exact_lane_digest.clone(),
+        logical_lineage_id: sanitize_bounded(&context.logical_lineage_id, 160, "logical-lineage"),
+        source_queue_id: sanitize_bounded(&context.source_queue_id, 160, "source-queue"),
+        connector: descriptor.connector.clone(),
+        action: descriptor.action.clone(),
+        params_digest: descriptor.params_digest.clone(),
+        approval_generation: 1,
+        state: ExternalEffectStateV1::Requested,
+        action_summary: descriptor.action_summary.clone(),
+        approval_token: None,
+        requested_at_ms: now,
+        updated_at_ms: now,
+        reason: Some("MCP elicitation observed before any protocol response".to_string()),
+    };
+    persist_transition(harness_home, None, &intent)?;
+
+    advance_requested_external_effect(harness_home, intent, policy)
+}
+
+fn advance_requested_external_effect(
+    harness_home: &Path,
+    mut intent: ExternalEffectIntentV1,
+    policy: &ConnectorApprovalPolicyV1,
+) -> io::Result<ExternalEffectAdmissionV1> {
+    if intent.state != ExternalEffectStateV1::Requested {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only a requested external effect can advance through approval policy",
+        ));
+    }
+    let now = current_log_time_ms()?;
+    let mode =
+        if protected_connector_action(&intent.connector, &intent.action, &intent.action_summary) {
+            ConnectorApprovalModeV1::Deny
+        } else {
+            policy.mode_for(&intent.connector, &intent.action)
+        };
+    match mode {
+        ConnectorApprovalModeV1::Deny => {
+            intent.state = ExternalEffectStateV1::Denied;
+            intent.updated_at_ms = current_log_time_ms()?;
+            intent.reason = Some("connector approval policy denied the action".to_string());
+            persist_transition(
+                harness_home,
+                Some(ExternalEffectStateV1::Requested),
+                &intent,
+            )?;
+            Ok(ExternalEffectAdmissionV1::Denied(intent))
+        }
+        ConnectorApprovalModeV1::NeedsUser | ConnectorApprovalModeV1::ExplicitActionToken => {
+            let token = new_approval_token(&intent, now + DEFAULT_APPROVAL_TOKEN_TTL_MS)?;
+            let raw = token.token.clone();
+            intent.approval_token = Some(token);
+            intent.state = ExternalEffectStateV1::ApprovalRequired;
+            intent.updated_at_ms = current_log_time_ms()?;
+            intent.reason = Some("explicit lane-bound user approval is required".to_string());
+            persist_transition(
+                harness_home,
+                Some(ExternalEffectStateV1::Requested),
+                &intent,
+            )?;
+            Ok(ExternalEffectAdmissionV1::NeedsUser { intent, token: raw })
+        }
+    }
+}
+
+pub fn resolve_external_effect_approval(
+    harness_home: &Path,
+    token: &str,
+    exact_lane_digest: &str,
+    decision: ExternalEffectApprovalDecisionV1,
+) -> io::Result<ExternalEffectIntentV1> {
+    validate_digest(exact_lane_digest, "exact lane digest")?;
+    let token_digest = sha256_tagged(token.as_bytes());
+    let mut intent =
+        find_external_effect_by_token(harness_home, &token_digest)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "connector approval token was not found",
+            )
+        })?;
+    if intent.exact_lane_digest != exact_lane_digest {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "connector approval token belongs to another exact lane",
+        ));
+    }
+    let now = current_log_time_ms()?;
+    let approval_token = intent.approval_token.as_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "effect approval token is missing",
+        )
+    })?;
+    if approval_token.token_digest != token_digest
+        || approval_token.params_digest != intent.params_digest
+        || approval_token.approval_generation != intent.approval_generation
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "connector approval token binding does not match the effect",
+        ));
+    }
+    if approval_token.expires_at_ms < now {
+        approval_token.consumed_at_ms = Some(now);
+        let from = intent.state;
+        intent.state = ExternalEffectStateV1::Denied;
+        intent.updated_at_ms = now;
+        intent.reason = Some("connector approval token expired and was fenced".to_string());
+        persist_transition(harness_home, Some(from), &intent)?;
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "connector approval token has expired",
+        ));
+    }
+    if approval_token.consumed_at_ms.is_some() {
+        let same_decision = matches!(
+            (decision, intent.state),
+            (
+                ExternalEffectApprovalDecisionV1::Approve,
+                ExternalEffectStateV1::Approved
+            ) | (
+                ExternalEffectApprovalDecisionV1::Deny,
+                ExternalEffectStateV1::Denied
+            )
+        );
+        if same_decision {
+            return Ok(intent);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "connector approval token was already consumed for another disposition",
+        ));
+    }
+    if intent.state != ExternalEffectStateV1::ApprovalRequired {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "connector approval token has been fenced by a later effect state",
+        ));
+    }
+    approval_token.consumed_at_ms = Some(now);
+    let from = intent.state;
+    intent.state = match decision {
+        ExternalEffectApprovalDecisionV1::Approve => ExternalEffectStateV1::Approved,
+        ExternalEffectApprovalDecisionV1::Deny => ExternalEffectStateV1::Denied,
+    };
+    intent.updated_at_ms = now;
+    intent.reason = Some(match decision {
+        ExternalEffectApprovalDecisionV1::Approve => {
+            "explicit action token approved once".to_string()
+        }
+        ExternalEffectApprovalDecisionV1::Deny => {
+            "explicit action token denied and fenced".to_string()
+        }
+    });
+    persist_transition(harness_home, Some(from), &intent)?;
+    Ok(intent)
+}
+
+pub fn fence_external_effects_for_lane(
+    harness_home: &Path,
+    exact_lane_digest: &str,
+    reason: &str,
+) -> io::Result<Vec<ExternalEffectIntentV1>> {
+    validate_digest(exact_lane_digest, "exact lane digest")?;
+    let dir = external_effect_latest_dir(harness_home);
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let now = current_log_time_ms()?;
+    let mut fenced = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() || entry.metadata()?.len() > MAX_EFFECT_RECORD_BYTES {
+            continue;
+        }
+        let text = fs::read_to_string(entry.path())?;
+        let Ok(mut intent) = serde_json::from_str::<ExternalEffectIntentV1>(&text) else {
+            continue;
+        };
+        if intent.exact_lane_digest != exact_lane_digest
+            || !matches!(
+                intent.state,
+                ExternalEffectStateV1::ApprovalRequired | ExternalEffectStateV1::Approved
+            )
+        {
+            continue;
+        }
+        let from = intent.state;
+        if let Some(token) = intent.approval_token.as_mut() {
+            token.consumed_at_ms = Some(now);
+        }
+        intent.state = ExternalEffectStateV1::Denied;
+        intent.updated_at_ms = now;
+        intent.reason = Some(sanitize_bounded(reason, MAX_SUMMARY_BYTES, "fenced"));
+        persist_transition(harness_home, Some(from), &intent)?;
+        fenced.push(intent);
+    }
+    Ok(fenced)
+}
+
+pub fn ensure_external_effect_continuation(
+    harness_home: &Path,
+    intent: &ExternalEffectIntentV1,
+) -> io::Result<ExternalEffectContinuationV1> {
+    if intent.state != ExternalEffectStateV1::Approved {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only an approved external effect can schedule a continuation",
+        ));
+    }
+    let queue_file = harness_home
+        .join("state")
+        .join("runtime-queue")
+        .join("pending.jsonl");
+    let text = fs::read_to_string(&queue_file)?;
+    let mut parent_session_key = None;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let value: Value = serde_json::from_str(line).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid runtime pending queue JSONL: {error}"),
+            )
+        })?;
+        if value.get("continuationIntentKey").and_then(Value::as_str)
+            == Some(intent.effect_id.as_str())
+        {
+            let child_queue_id = value
+                .get("queueId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "external-effect continuation has no queueId",
+                    )
+                })?;
+            return Ok(ExternalEffectContinuationV1 {
+                effect_id: intent.effect_id.clone(),
+                source_queue_id: intent.source_queue_id.clone(),
+                child_queue_id: child_queue_id.to_string(),
+                exact_lane_digest: intent.exact_lane_digest.clone(),
+                requeued: false,
+            });
+        }
+        if value.get("queueId").and_then(Value::as_str) == Some(intent.source_queue_id.as_str()) {
+            let lane = crate::ChannelStateLane::new(
+                value.get("platform").and_then(Value::as_str).unwrap_or(""),
+                value.get("accountId").and_then(Value::as_str),
+                value.get("channelId").and_then(Value::as_str).unwrap_or(""),
+                value.get("userId").and_then(Value::as_str).unwrap_or(""),
+                value.get("agentId").and_then(Value::as_str).unwrap_or(""),
+            )?;
+            if lane.exact_lane_digest() != intent.exact_lane_digest {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "external effect source queue moved to another exact lane",
+                ));
+            }
+            parent_session_key = value
+                .get("sessionKey")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+    }
+    let parent_session_key = parent_session_key.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "external effect source queue was not found",
+        )
+    })?;
+    let idempotency_instruction = github_issue_effect_marker(intent)
+        .map(|marker| format!("; preserve this opaque marker in the issue body: {marker}"))
+        .unwrap_or_else(|| {
+            format!(
+                "; preserve provider idempotency key {} when the connector supports one",
+                external_effect_idempotency_key(intent)
+            )
+        });
+    let report =
+        crate::requeue_prepared_context_rollover(crate::ContextRolloverRequeuePreparedOptions {
+            harness_home: harness_home.to_path_buf(),
+            queue_id: intent.source_queue_id.clone(),
+            new_working_session_key: parent_session_key,
+            reason: format!(
+                "approved external effect {} resumes once in the exact lane{}",
+                intent.effect_id, idempotency_instruction
+            ),
+            now_ms: current_log_time_ms()?,
+            preserve_continuation_index: true,
+            campaign_slice_generation: None,
+            continuation_intent_key: Some(intent.effect_id.clone()),
+            completion_kind: Some("external-effect-continuation".to_string()),
+            allow_exact_state_bootstrap: false,
+        })?;
+    Ok(ExternalEffectContinuationV1 {
+        effect_id: intent.effect_id.clone(),
+        source_queue_id: intent.source_queue_id.clone(),
+        child_queue_id: report.requeued_queue_id,
+        exact_lane_digest: intent.exact_lane_digest.clone(),
+        requeued: report.requeued,
+    })
+}
+
+pub fn transition_external_effect(
+    harness_home: &Path,
+    effect_id: &str,
+    next: ExternalEffectStateV1,
+    reason: &str,
+) -> io::Result<ExternalEffectIntentV1> {
+    let mut intent = load_external_effect_intent(harness_home, effect_id)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "external effect intent was not found",
+        )
+    })?;
+    if intent.state == next {
+        return Ok(intent);
+    }
+    if !valid_transition(intent.state, next) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "invalid external effect transition {:?} -> {next:?}",
+                intent.state
+            ),
+        ));
+    }
+    let from = intent.state;
+    intent.state = next;
+    intent.updated_at_ms = current_log_time_ms()?;
+    intent.reason = Some(sanitize_bounded(reason, 240, "effect-transition"));
+    persist_transition(harness_home, Some(from), &intent)?;
+    Ok(intent)
+}
+
+pub fn reconcile_external_effect(
+    harness_home: &Path,
+    effect_id: &str,
+    adapter: &impl ExternalEffectReadbackAdapter,
+) -> io::Result<ExternalEffectIntentV1> {
+    let intent = load_external_effect_intent(harness_home, effect_id)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "external effect intent was not found",
+        )
+    })?;
+    if !matches!(
+        intent.state,
+        ExternalEffectStateV1::Submitted | ExternalEffectStateV1::Ambiguous
+    ) {
+        return Ok(intent);
+    }
+    match adapter.readback(&intent)? {
+        ExternalEffectReadbackV1::Present => transition_external_effect(
+            harness_home,
+            effect_id,
+            ExternalEffectStateV1::Confirmed,
+            "connector readback confirmed the stable external effect",
+        ),
+        ExternalEffectReadbackV1::Absent => transition_external_effect(
+            harness_home,
+            effect_id,
+            ExternalEffectStateV1::Approved,
+            "connector readback proved absence; one bounded resubmission is authorized",
+        ),
+        ExternalEffectReadbackV1::Unprovable => transition_external_effect(
+            harness_home,
+            effect_id,
+            ExternalEffectStateV1::Ambiguous,
+            "connector readback could not prove presence or absence; user authority is required",
+        ),
+    }
+}
+
+pub fn load_external_effect_intent(
+    harness_home: &Path,
+    effect_id: &str,
+) -> io::Result<Option<ExternalEffectIntentV1>> {
+    let file = external_effect_latest_dir(harness_home).join(format!("{effect_id}.json"));
+    let text = match fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if text.len() as u64 > MAX_EFFECT_RECORD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "external effect snapshot exceeds the bounded record limit",
+        ));
+    }
+    let intent: ExternalEffectIntentV1 = serde_json::from_str(&text).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid external effect snapshot {}: {error}",
+                file.display()
+            ),
+        )
+    })?;
+    validate_intent(&intent)?;
+    Ok(Some(intent))
+}
+
+pub fn external_effect_transition_file(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("external-effects")
+        .join("transitions.jsonl")
+}
+
+fn external_effect_latest_dir(harness_home: &Path) -> PathBuf {
+    harness_home
+        .join("state")
+        .join("external-effects")
+        .join("latest")
+}
+
+fn persist_transition(
+    harness_home: &Path,
+    from_state: Option<ExternalEffectStateV1>,
+    intent: &ExternalEffectIntentV1,
+) -> io::Result<()> {
+    validate_intent(intent)?;
+    let transition = ExternalEffectTransitionV1 {
+        schema: EXTERNAL_EFFECT_TRANSITION_SCHEMA.to_string(),
+        effect_id: intent.effect_id.clone(),
+        from_state,
+        to_state: intent.state,
+        approval_generation: intent.approval_generation,
+        at_ms: intent.updated_at_ms,
+        reason: intent.reason.clone().unwrap_or_default(),
+    };
+    let file = external_effect_transition_file(harness_home);
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let line = serde_json::to_vec(&transition).map_err(io::Error::other)?;
+    if line.len() as u64 > MAX_EFFECT_RECORD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "external effect transition exceeds the bounded record limit",
+        ));
+    }
+    let mut handle = OpenOptions::new().create(true).append(true).open(&file)?;
+    handle.write_all(&line)?;
+    handle.write_all(b"\n")?;
+    handle.sync_all()?;
+    let snapshot =
+        external_effect_latest_dir(harness_home).join(format!("{}.json", intent.effect_id));
+    let mut protected_snapshot = serde_json::to_value(intent).map_err(io::Error::other)?;
+    if let Some(approval_token) = intent.approval_token.as_ref()
+        && let Some(token_object) = protected_snapshot
+            .get_mut("approvalToken")
+            .and_then(Value::as_object_mut)
+    {
+        token_object.insert(
+            "token".to_string(),
+            Value::String(approval_token.token.clone()),
+        );
+    }
+    write_json_atomic(&snapshot, &protected_snapshot)?;
+    Ok(())
+}
+
+fn find_external_effect_by_token(
+    harness_home: &Path,
+    token_digest: &str,
+) -> io::Result<Option<ExternalEffectIntentV1>> {
+    let dir = external_effect_latest_dir(harness_home);
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        if entry.metadata()?.len() > MAX_EFFECT_RECORD_BYTES {
+            continue;
+        }
+        let text = fs::read_to_string(entry.path())?;
+        let Ok(intent) = serde_json::from_str::<ExternalEffectIntentV1>(&text) else {
+            continue;
+        };
+        if intent
+            .approval_token
+            .as_ref()
+            .is_some_and(|token| token.token_digest == token_digest)
+        {
+            return Ok(Some(intent));
+        }
+    }
+    Ok(None)
+}
+
+fn new_approval_token(
+    intent: &ExternalEffectIntentV1,
+    expires_at_ms: i64,
+) -> io::Result<ConnectorApprovalTokenV1> {
+    let mut bytes = [0_u8; 24];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| io::Error::other("secure connector approval token generation failed"))?;
+    let token = format!("ahx1_{}", hex(&bytes));
+    Ok(ConnectorApprovalTokenV1 {
+        schema: CONNECTOR_APPROVAL_TOKEN_SCHEMA.to_string(),
+        token_digest: sha256_tagged(token.as_bytes()),
+        token,
+        effect_id: intent.effect_id.clone(),
+        exact_lane_digest: intent.exact_lane_digest.clone(),
+        params_digest: intent.params_digest.clone(),
+        approval_generation: intent.approval_generation,
+        expires_at_ms,
+        consumed_at_ms: None,
+    })
+}
+
+fn effect_id(
+    context: &ExternalEffectRequestContextV1,
+    descriptor: &McpElicitationDescriptorV1,
+) -> String {
+    let mut bytes = Vec::new();
+    for value in [
+        context.exact_lane_digest.as_str(),
+        context.logical_lineage_id.as_str(),
+        context.source_queue_id.as_str(),
+        descriptor.connector.as_str(),
+        descriptor.action.as_str(),
+        descriptor.params_digest.as_str(),
+        "1",
+    ] {
+        bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+    hex(digest::digest(&digest::SHA256, &bytes).as_ref())
+}
+
+fn valid_transition(from: ExternalEffectStateV1, to: ExternalEffectStateV1) -> bool {
+    matches!(
+        (from, to),
+        (
+            ExternalEffectStateV1::Requested,
+            ExternalEffectStateV1::ApprovalRequired
+        ) | (
+            ExternalEffectStateV1::Requested,
+            ExternalEffectStateV1::Denied
+        ) | (
+            ExternalEffectStateV1::ApprovalRequired,
+            ExternalEffectStateV1::Approved
+        ) | (
+            ExternalEffectStateV1::ApprovalRequired,
+            ExternalEffectStateV1::Denied
+        ) | (
+            ExternalEffectStateV1::Approved,
+            ExternalEffectStateV1::Denied
+        ) | (
+            ExternalEffectStateV1::Approved,
+            ExternalEffectStateV1::Submitted
+        ) | (
+            ExternalEffectStateV1::Submitted,
+            ExternalEffectStateV1::Confirmed
+        ) | (
+            ExternalEffectStateV1::Submitted,
+            ExternalEffectStateV1::Ambiguous
+        ) | (
+            ExternalEffectStateV1::Submitted,
+            ExternalEffectStateV1::Approved
+        ) | (
+            ExternalEffectStateV1::Ambiguous,
+            ExternalEffectStateV1::Approved
+        ) | (
+            ExternalEffectStateV1::Ambiguous,
+            ExternalEffectStateV1::Confirmed
+        )
+    )
+}
+
+fn validate_intent(intent: &ExternalEffectIntentV1) -> io::Result<()> {
+    if intent.schema != EXTERNAL_EFFECT_INTENT_SCHEMA {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported external effect intent schema",
+        ));
+    }
+    if intent.effect_id.len() != 64
+        || !intent
+            .effect_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "external effect id is not a SHA-256 hex digest",
+        ));
+    }
+    validate_digest(&intent.exact_lane_digest, "exact lane digest")?;
+    validate_digest(&intent.params_digest, "parameter digest")?;
+    validate_bounded_identifier(&intent.connector, "connector", MAX_CONNECTOR_BYTES)?;
+    if intent.action.is_empty() || intent.action.len() > MAX_ACTION_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "external effect action is empty or unbounded",
+        ));
+    }
+    if intent.action_summary.len() > MAX_SUMMARY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "external effect action summary is unbounded",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_digest(value: &str, label: &str) -> io::Result<()> {
+    let hex = value.strip_prefix("sha256:").unwrap_or(value);
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} must be a SHA-256 digest"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_effect_marker(value: &str) -> io::Result<()> {
+    let Some(key) = value
+        .strip_prefix("<!-- agent-harness-effect:ahx-")
+        .and_then(|value| value.strip_suffix(" -->"))
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "connector effect marker is not canonical",
+        ));
+    };
+    if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "connector effect marker does not contain an exact effect digest",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bounded_identifier(value: &str, label: &str, max: usize) -> io::Result<()> {
+    if value.trim() != value
+        || value.is_empty()
+        || value.len() > max
+        || value.chars().any(char::is_control)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} is empty, unbounded, or not normalized"),
+        ));
+    }
+    Ok(())
+}
+
+fn first_string(value: &Value, pointers: &[&str]) -> Option<String> {
+    pointers.iter().find_map(|pointer| {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn sanitize_bounded(value: &str, max: usize, fallback: &str) -> String {
+    let flattened = value
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flattened.is_empty() {
+        return fallback.to_string();
+    }
+    flattened.chars().take(max).collect()
+}
+
+fn protected_connector_action(connector: &str, action: &str, summary: &str) -> bool {
+    let text = format!("{connector} {action} {summary}").to_ascii_lowercase();
+    [
+        "gateway restart",
+        "gateway stop",
+        "live cutover",
+        "live rollback",
+        "agent-harness restart",
+        "agent harness restart",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn sha256_tagged(bytes: &[u8]) -> String {
+    format!(
+        "sha256:{}",
+        hex(digest::digest(&digest::SHA256, bytes).as_ref())
+    )
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(HEX[usize::from(*byte >> 4)]));
+        out.push(char::from(HEX[usize::from(*byte & 0x0f)]));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "agent-harness-external-effect-{name}-{}",
+            std::process::id()
+        ))
+    }
+
+    fn context() -> ExternalEffectRequestContextV1 {
+        ExternalEffectRequestContextV1 {
+            exact_lane_digest: format!("sha256:{}", "1".repeat(64)),
+            logical_lineage_id: "virtual-session-1".to_string(),
+            source_queue_id: "queue-1".to_string(),
+        }
+    }
+
+    fn descriptor() -> McpElicitationDescriptorV1 {
+        McpElicitationDescriptorV1 {
+            connector: "github".to_string(),
+            action: "create_issue".to_string(),
+            params_digest: format!("sha256:{}", "2".repeat(64)),
+            action_summary: "github/create_issue: create a tracked issue".to_string(),
+            mode: "form".to_string(),
+        }
+    }
+
+    #[test]
+    fn missing_authority_persists_one_stable_approval_required_effect() {
+        let root = root("missing-authority");
+        let harness_home = root.join(".agent-harness");
+        let first = begin_external_effect_request(
+            &harness_home,
+            &context(),
+            &descriptor(),
+            &ConnectorApprovalPolicyV1::default(),
+        )
+        .unwrap();
+        let second = begin_external_effect_request(
+            &harness_home,
+            &context(),
+            &descriptor(),
+            &ConnectorApprovalPolicyV1::default(),
+        )
+        .unwrap();
+        let (first_intent, first_token) = match first {
+            ExternalEffectAdmissionV1::NeedsUser { intent, token } => (intent, token),
+            other => panic!("unexpected admission {other:?}"),
+        };
+        let (second_intent, second_token) = match second {
+            ExternalEffectAdmissionV1::NeedsUser { intent, token } => (intent, token),
+            other => panic!("unexpected admission {other:?}"),
+        };
+        assert_eq!(first_intent.effect_id, second_intent.effect_id);
+        assert_eq!(first_token, second_token);
+        assert_eq!(first_intent.state, ExternalEffectStateV1::ApprovalRequired);
+        let public_receipt = serde_json::to_string(&first_intent).unwrap();
+        assert!(!public_receipt.contains(&first_token));
+        let protected_snapshot = fs::read_to_string(
+            external_effect_latest_dir(&harness_home)
+                .join(format!("{}.json", first_intent.effect_id)),
+        )
+        .unwrap();
+        assert!(protected_snapshot.contains(&first_token));
+        let transitions =
+            fs::read_to_string(external_effect_transition_file(&harness_home)).unwrap();
+        assert_eq!(transitions.lines().count(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restart_at_every_effect_state_converges_without_duplicate_submission() {
+        struct Fake(ExternalEffectReadbackV1);
+        impl ExternalEffectReadbackAdapter for Fake {
+            fn readback(
+                &self,
+                _intent: &ExternalEffectIntentV1,
+            ) -> io::Result<ExternalEffectReadbackV1> {
+                Ok(self.0)
+            }
+        }
+
+        let root = root("every-state-restart");
+        let harness_home = root.join(".agent-harness");
+        let request_context = context();
+        let request_descriptor = descriptor();
+        let now = current_log_time_ms().unwrap();
+        let requested = ExternalEffectIntentV1 {
+            schema: EXTERNAL_EFFECT_INTENT_SCHEMA.to_string(),
+            effect_id: effect_id(&request_context, &request_descriptor),
+            exact_lane_digest: request_context.exact_lane_digest.clone(),
+            logical_lineage_id: request_context.logical_lineage_id.clone(),
+            source_queue_id: request_context.source_queue_id.clone(),
+            connector: request_descriptor.connector.clone(),
+            action: request_descriptor.action.clone(),
+            params_digest: request_descriptor.params_digest.clone(),
+            approval_generation: 1,
+            state: ExternalEffectStateV1::Requested,
+            action_summary: request_descriptor.action_summary.clone(),
+            approval_token: None,
+            requested_at_ms: now,
+            updated_at_ms: now,
+            reason: Some("synthetic crash after requested snapshot".to_string()),
+        };
+        persist_transition(&harness_home, None, &requested).unwrap();
+        assert_eq!(
+            load_external_effect_intent(&harness_home, &requested.effect_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ExternalEffectStateV1::Requested
+        );
+
+        let admission = begin_external_effect_request(
+            &harness_home,
+            &request_context,
+            &request_descriptor,
+            &ConnectorApprovalPolicyV1::default(),
+        )
+        .unwrap();
+        let (effect_id, token) = match admission {
+            ExternalEffectAdmissionV1::NeedsUser { intent, token } => {
+                assert_eq!(intent.state, ExternalEffectStateV1::ApprovalRequired);
+                (intent.effect_id, token)
+            }
+            other => panic!("requested recovery did not park safely: {other:?}"),
+        };
+        let replayed_token = match begin_external_effect_request(
+            &harness_home,
+            &request_context,
+            &request_descriptor,
+            &ConnectorApprovalPolicyV1::default(),
+        )
+        .unwrap()
+        {
+            ExternalEffectAdmissionV1::NeedsUser { token, .. } => token,
+            other => panic!("approval-required restart changed disposition: {other:?}"),
+        };
+        assert_eq!(replayed_token, token);
+
+        let approved = resolve_external_effect_approval(
+            &harness_home,
+            &token,
+            &request_context.exact_lane_digest,
+            ExternalEffectApprovalDecisionV1::Approve,
+        )
+        .unwrap();
+        assert_eq!(approved.state, ExternalEffectStateV1::Approved);
+        assert!(matches!(
+            begin_external_effect_request(
+                &harness_home,
+                &request_context,
+                &request_descriptor,
+                &ConnectorApprovalPolicyV1::default(),
+            )
+            .unwrap(),
+            ExternalEffectAdmissionV1::Authorized(_)
+        ));
+
+        transition_external_effect(
+            &harness_home,
+            &effect_id,
+            ExternalEffectStateV1::Submitted,
+            "synthetic connector submission",
+        )
+        .unwrap();
+        assert!(matches!(
+            begin_external_effect_request(
+                &harness_home,
+                &request_context,
+                &request_descriptor,
+                &ConnectorApprovalPolicyV1::default(),
+            )
+            .unwrap(),
+            ExternalEffectAdmissionV1::Ambiguous(_)
+        ));
+        let ambiguous = reconcile_external_effect(
+            &harness_home,
+            &effect_id,
+            &Fake(ExternalEffectReadbackV1::Unprovable),
+        )
+        .unwrap();
+        assert_eq!(ambiguous.state, ExternalEffectStateV1::Ambiguous);
+        assert!(matches!(
+            begin_external_effect_request(
+                &harness_home,
+                &request_context,
+                &request_descriptor,
+                &ConnectorApprovalPolicyV1::default(),
+            )
+            .unwrap(),
+            ExternalEffectAdmissionV1::Ambiguous(_)
+        ));
+
+        let confirmed = reconcile_external_effect(
+            &harness_home,
+            &effect_id,
+            &Fake(ExternalEffectReadbackV1::Present),
+        )
+        .unwrap();
+        assert_eq!(confirmed.state, ExternalEffectStateV1::Confirmed);
+        assert!(matches!(
+            begin_external_effect_request(
+                &harness_home,
+                &request_context,
+                &request_descriptor,
+                &ConnectorApprovalPolicyV1::default(),
+            )
+            .unwrap(),
+            ExternalEffectAdmissionV1::AlreadyConfirmed(_)
+        ));
+
+        let transitions = fs::read_to_string(external_effect_transition_file(&harness_home))
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<ExternalEffectTransitionV1>(line)
+                    .unwrap()
+                    .to_state
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            transitions,
+            vec![
+                ExternalEffectStateV1::Requested,
+                ExternalEffectStateV1::ApprovalRequired,
+                ExternalEffectStateV1::Approved,
+                ExternalEffectStateV1::Submitted,
+                ExternalEffectStateV1::Ambiguous,
+                ExternalEffectStateV1::Confirmed,
+            ]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn action_token_is_exact_lane_expiring_and_single_use() {
+        let root = root("single-use");
+        let harness_home = root.join(".agent-harness");
+        let admission = begin_external_effect_request(
+            &harness_home,
+            &context(),
+            &descriptor(),
+            &ConnectorApprovalPolicyV1::default(),
+        )
+        .unwrap();
+        let token = match admission {
+            ExternalEffectAdmissionV1::NeedsUser { token, .. } => token,
+            other => panic!("unexpected admission {other:?}"),
+        };
+        let wrong_lane = format!("sha256:{}", "9".repeat(64));
+        assert!(
+            resolve_external_effect_approval(
+                &harness_home,
+                &token,
+                &wrong_lane,
+                ExternalEffectApprovalDecisionV1::Approve,
+            )
+            .is_err()
+        );
+        let approved = resolve_external_effect_approval(
+            &harness_home,
+            &token,
+            &context().exact_lane_digest,
+            ExternalEffectApprovalDecisionV1::Approve,
+        )
+        .unwrap();
+        assert_eq!(approved.state, ExternalEffectStateV1::Approved);
+        let repeated = resolve_external_effect_approval(
+            &harness_home,
+            &token,
+            &context().exact_lane_digest,
+            ExternalEffectApprovalDecisionV1::Approve,
+        )
+        .unwrap();
+        assert_eq!(repeated.state, ExternalEffectStateV1::Approved);
+        assert!(
+            resolve_external_effect_approval(
+                &harness_home,
+                &token,
+                &context().exact_lane_digest,
+                ExternalEffectApprovalDecisionV1::Deny,
+            )
+            .is_err()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn denied_connector_action_is_terminal_for_its_generation() {
+        let root = root("denied");
+        let harness_home = root.join(".agent-harness");
+        let policy = ConnectorApprovalPolicyV1 {
+            default: ConnectorApprovalModeV1::Deny,
+            rules: Vec::new(),
+        };
+        let first =
+            begin_external_effect_request(&harness_home, &context(), &descriptor(), &policy)
+                .unwrap();
+        let effect_id = match first {
+            ExternalEffectAdmissionV1::Denied(intent) => {
+                assert_eq!(intent.state, ExternalEffectStateV1::Denied);
+                intent.effect_id
+            }
+            other => panic!("unexpected admission {other:?}"),
+        };
+        let second = begin_external_effect_request(
+            &harness_home,
+            &context(),
+            &descriptor(),
+            &ConnectorApprovalPolicyV1::default(),
+        )
+        .unwrap();
+        match second {
+            ExternalEffectAdmissionV1::Denied(intent) => assert_eq!(intent.effect_id, effect_id),
+            other => panic!("denied generation was not terminal: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submitted_effect_requires_readback_before_resubmission() {
+        struct Fake(ExternalEffectReadbackV1);
+        impl ExternalEffectReadbackAdapter for Fake {
+            fn readback(
+                &self,
+                _intent: &ExternalEffectIntentV1,
+            ) -> io::Result<ExternalEffectReadbackV1> {
+                Ok(self.0)
+            }
+        }
+
+        let root = root("readback");
+        let harness_home = root.join(".agent-harness");
+        let admission = begin_external_effect_request(
+            &harness_home,
+            &context(),
+            &descriptor(),
+            &ConnectorApprovalPolicyV1::default(),
+        )
+        .unwrap();
+        let (effect_id, token) = match admission {
+            ExternalEffectAdmissionV1::NeedsUser { intent, token } => (intent.effect_id, token),
+            other => panic!("unexpected admission {other:?}"),
+        };
+        resolve_external_effect_approval(
+            &harness_home,
+            &token,
+            &context().exact_lane_digest,
+            ExternalEffectApprovalDecisionV1::Approve,
+        )
+        .unwrap();
+        transition_external_effect(
+            &harness_home,
+            &effect_id,
+            ExternalEffectStateV1::Submitted,
+            "protocol acceptance written",
+        )
+        .unwrap();
+        let absent = reconcile_external_effect(
+            &harness_home,
+            &effect_id,
+            &Fake(ExternalEffectReadbackV1::Absent),
+        )
+        .unwrap();
+        assert_eq!(absent.state, ExternalEffectStateV1::Approved);
+        transition_external_effect(
+            &harness_home,
+            &effect_id,
+            ExternalEffectStateV1::Submitted,
+            "one bounded resubmission after proven absence",
+        )
+        .unwrap();
+        let ambiguous = reconcile_external_effect(
+            &harness_home,
+            &effect_id,
+            &Fake(ExternalEffectReadbackV1::Unprovable),
+        )
+        .unwrap();
+        assert_eq!(ambiguous.state, ExternalEffectStateV1::Ambiguous);
+        let confirmed = reconcile_external_effect(
+            &harness_home,
+            &effect_id,
+            &Fake(ExternalEffectReadbackV1::Present),
+        )
+        .unwrap();
+        assert_eq!(confirmed.state, ExternalEffectStateV1::Confirmed);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn connector_specific_readback_adapters_are_exactly_bound_and_fail_closed() {
+        let root = root("connector-readback-adapters");
+        let harness_home = root.join(".agent-harness");
+        let admission = begin_external_effect_request(
+            &harness_home,
+            &context(),
+            &descriptor(),
+            &ConnectorApprovalPolicyV1::default(),
+        )
+        .unwrap();
+        let intent = match admission {
+            ExternalEffectAdmissionV1::NeedsUser { intent, .. } => intent,
+            other => panic!("unexpected admission {other:?}"),
+        };
+        let marker = github_issue_effect_marker(&intent).unwrap();
+        assert_eq!(
+            marker,
+            format!(
+                "<!-- agent-harness-effect:{} -->",
+                external_effect_idempotency_key(&intent)
+            )
+        );
+
+        let github_present = GithubIssueReadbackAdapterV1::new(GithubIssueReadbackEvidenceV1 {
+            schema: GITHUB_ISSUE_READBACK_EVIDENCE_SCHEMA.to_string(),
+            params_digest: intent.params_digest.clone(),
+            query_complete: true,
+            observed_effect_markers: vec![marker],
+        })
+        .unwrap();
+        assert_eq!(
+            github_present.readback(&intent).unwrap(),
+            ExternalEffectReadbackV1::Present
+        );
+        let github_absent = GithubIssueReadbackAdapterV1::new(GithubIssueReadbackEvidenceV1 {
+            schema: GITHUB_ISSUE_READBACK_EVIDENCE_SCHEMA.to_string(),
+            params_digest: intent.params_digest.clone(),
+            query_complete: true,
+            observed_effect_markers: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            github_absent.readback(&intent).unwrap(),
+            ExternalEffectReadbackV1::Absent
+        );
+        let github_partial = GithubIssueReadbackAdapterV1::new(GithubIssueReadbackEvidenceV1 {
+            schema: GITHUB_ISSUE_READBACK_EVIDENCE_SCHEMA.to_string(),
+            params_digest: intent.params_digest.clone(),
+            query_complete: false,
+            observed_effect_markers: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            github_partial.readback(&intent).unwrap(),
+            ExternalEffectReadbackV1::Unprovable
+        );
+
+        for (state, expected) in [
+            (
+                ProviderIdempotencyReadbackStateV1::Present,
+                ExternalEffectReadbackV1::Present,
+            ),
+            (
+                ProviderIdempotencyReadbackStateV1::Absent,
+                ExternalEffectReadbackV1::Absent,
+            ),
+            (
+                ProviderIdempotencyReadbackStateV1::Unknown,
+                ExternalEffectReadbackV1::Unprovable,
+            ),
+        ] {
+            let adapter =
+                ProviderIdempotencyReadbackAdapterV1::new(ProviderIdempotencyReadbackEvidenceV1 {
+                    schema: PROVIDER_IDEMPOTENCY_READBACK_EVIDENCE_SCHEMA.to_string(),
+                    connector: intent.connector.clone(),
+                    action: intent.action.clone(),
+                    params_digest: intent.params_digest.clone(),
+                    idempotency_key: external_effect_idempotency_key(&intent),
+                    state,
+                })
+                .unwrap();
+            assert_eq!(adapter.readback(&intent).unwrap(), expected);
+        }
+        let wrong_key =
+            ProviderIdempotencyReadbackAdapterV1::new(ProviderIdempotencyReadbackEvidenceV1 {
+                schema: PROVIDER_IDEMPOTENCY_READBACK_EVIDENCE_SCHEMA.to_string(),
+                connector: intent.connector.clone(),
+                action: intent.action.clone(),
+                params_digest: intent.params_digest.clone(),
+                idempotency_key: format!("ahx-{}", "f".repeat(64)),
+                state: ProviderIdempotencyReadbackStateV1::Absent,
+            })
+            .unwrap();
+        assert_eq!(
+            wrong_key.readback(&intent).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stop_or_expiry_fences_pending_capabilities_without_cross_lane_effects() {
+        let root = root("fencing");
+        let harness_home = root.join(".agent-harness");
+        let admission = begin_external_effect_request(
+            &harness_home,
+            &context(),
+            &descriptor(),
+            &ConnectorApprovalPolicyV1::default(),
+        )
+        .unwrap();
+        let (intent, token) = match admission {
+            ExternalEffectAdmissionV1::NeedsUser { intent, token } => (intent, token),
+            other => panic!("unexpected admission {other:?}"),
+        };
+        assert!(
+            fence_external_effects_for_lane(
+                &harness_home,
+                &format!("sha256:{}", "9".repeat(64)),
+                "another lane stopped",
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let fenced = fence_external_effects_for_lane(
+            &harness_home,
+            &context().exact_lane_digest,
+            "operator stop",
+        )
+        .unwrap();
+        assert_eq!(fenced.len(), 1);
+        assert_eq!(fenced[0].state, ExternalEffectStateV1::Denied);
+        assert!(
+            resolve_external_effect_approval(
+                &harness_home,
+                &token,
+                &context().exact_lane_digest,
+                ExternalEffectApprovalDecisionV1::Approve,
+            )
+            .is_err()
+        );
+
+        let mut second_descriptor = descriptor();
+        second_descriptor.params_digest = format!("sha256:{}", "3".repeat(64));
+        let second = begin_external_effect_request(
+            &harness_home,
+            &context(),
+            &second_descriptor,
+            &ConnectorApprovalPolicyV1::default(),
+        )
+        .unwrap();
+        let (second_intent, second_token) = match second {
+            ExternalEffectAdmissionV1::NeedsUser { intent, token } => (intent, token),
+            other => panic!("unexpected admission {other:?}"),
+        };
+        let snapshot = external_effect_latest_dir(&harness_home)
+            .join(format!("{}.json", second_intent.effect_id));
+        let mut value: Value = serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
+        value["approvalToken"]["expiresAtMs"] = Value::from(0);
+        write_json_atomic(&snapshot, &value).unwrap();
+        let error = resolve_external_effect_approval(
+            &harness_home,
+            &second_token,
+            &context().exact_lane_digest,
+            ExternalEffectApprovalDecisionV1::Approve,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            load_external_effect_intent(&harness_home, &second_intent.effect_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ExternalEffectStateV1::Denied
+        );
+        assert_eq!(intent.state, ExternalEffectStateV1::ApprovalRequired);
+        let _ = fs::remove_dir_all(root);
+    }
+}
