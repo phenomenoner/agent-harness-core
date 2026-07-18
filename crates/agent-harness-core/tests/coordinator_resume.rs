@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agent_harness_core::channel_session_key::CanonicalChannelSessionKey;
 use agent_harness_core::lane::FullLaneKeyV1;
 use agent_harness_core::worker_coordination::{
     WorkerCoordinatorWaitCreateOptionsV1, WorkerCoordinatorWaitStateV1,
@@ -363,6 +364,16 @@ fn released_parent_schedules_one_durable_coordinator_resume_and_no_master_wakeup
         .unwrap();
     assert_eq!(omitted["envelope"]["outcome"], "failed");
 
+    let canonical_session_key = CanonicalChannelSessionKey::bind_for_lane(
+        "discord:channel:user:main",
+        "discord",
+        "account",
+        "channel",
+        "user",
+        "main",
+    )
+    .unwrap()
+    .canonical_string();
     let interleaving_lease_file = queue_dir
         .join("classes")
         .join("interactive")
@@ -382,7 +393,7 @@ fn released_parent_schedules_one_durable_coordinator_resume_and_no_master_wakeup
                     "accountId": "account",
                     "channelId": "channel",
                     "userId": "user",
-                    "sessionKey": "discord:channel:user:main",
+                    "sessionKey": canonical_session_key,
                     "virtualSessionId": "discord:channel:user:main:vsession-babfeafb4a118dbd",
                     "owner": format!("pid:{}", std::process::id()),
                     "startedAtMs": 100_020,

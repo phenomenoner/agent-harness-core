@@ -1,0 +1,28 @@
+{
+  "schema": "agent-harness.round22.server-overloaded-protocol-replay.v1",
+  "protocolEvent": {
+    "method": "error",
+    "params": {
+      "error": {
+        "message": "Synthetic selected model capacity failure.",
+        "codexErrorInfo": "serverOverloaded",
+        "additionalDetails": null
+      },
+      "willRetry": false
+    }
+  },
+  "variants": [
+    {
+      "mutationEvidence": "no-observable-mutation",
+      "expectedAction": "retry-after-backoff"
+    },
+    {
+      "mutationEvidence": "mutation-observed",
+      "expectedAction": "continuation-handoff"
+    },
+    {
+      "mutationEvidence": "unknown",
+      "expectedAction": "fail-closed"
+    }
+  ]
+}

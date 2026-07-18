@@ -477,6 +477,53 @@ An active goal slice writes a unified transition before final-outbox selection. 
 
 Goal slices are bounded to 30–45 minutes. `sliceIdleTimeoutMs` must be at least one minute and below the hard timeout. `sliceDrainWindowMs` is deliberately derived and must equal the smaller of 10% of the hard timeout or 180000 ms, matching the runtime deadline-drain guard. `wallClockBudgetMs` cannot exceed 48 hours. Slice-count, cumulative token-cost, repeated-progress-fingerprint, and recovery-count breakers are positive hard boundaries; reaching one stops continuation through the unified transition and emits at most one sanitized terminal notice. `goal-campaign-status --target-home <staging-home>` is read-only and reports the effective policy plus the latest append-only budget receipt for each campaign.
 
+## Connector Approval Policy
+
+Side-effecting MCP connector elicitations use `security.connectorApprovalPolicy`; this is separate
+from Codex command/file approval and sandbox configuration. The default is `needs-user`.
+
+```json
+{
+  "security": {
+    "connectorApprovalPolicy": {
+      "default": "needs-user",
+      "rules": [
+        {
+          "connector": "github",
+          "actions": ["create_issue"],
+          "mode": "explicit-action-token"
+        }
+      ]
+    }
+  }
+}
+```
+
+Valid modes are `deny`, `needs-user`, and `explicit-action-token`. Rules are matched by connector
+and, when non-empty, action name. `deny` returns one protocol-valid denial and terminalizes that
+effect generation. The two approval modes park the turn promptly, emit a distinct
+`WaitingForApproval` progress state, and mint a short-lived capability bound to the exact
+platform/account/channel/user/agent lane, action, parameter digest, and effect generation.
+Protected live-control actions remain denied even if a rule would otherwise allow approval.
+
+The provider-neutral channel commands are `/approve <ahx1_...>` and `/deny <ahx1_...>`. They are
+command-only replies and never enqueue a new model request directly. A valid approval commits one
+exact-lane continuation; repeating the same decision reuses the same child. Wrong-lane, expired,
+opposite-decision, stopped, superseded, or digest-mismatched capabilities fail closed. Raw bearer
+tokens are stored only in the protected latest-state snapshot and are excluded from generic
+receipts, command effects, public serialization, and logs.
+
+If a process stops after the initial `Requested` snapshot but before the approval disposition is
+durable, restart re-applies the same connector policy under the stable effect id and creates one
+protected approval capability or a denial before any remote submission.
+
+Approved GitHub issue creation resumes with a stable opaque `agent-harness-effect` marker that the
+connector action must preserve in the issue body. Recovery uses only an exact marker lookup bound
+to the approved parameter digest: a complete query may prove absence, while a partial query remains
+unprovable. Connectors with native idempotency support use the stable `ahx-<effect-id>` key and must
+return readback evidence bound to the same connector, action, and parameter digest. Unsupported or
+mismatched readback stays `ambiguous`; it never authorizes blind resubmission.
+
 ## Backend Authentication
 
 Each backend provider uses a canonical harness-owned Codex home. The default OpenAI provider uses `<harness-home>/codex-home`; named providers use `<harness-home>/codex-home-providers/<provider>`. The runtime never falls back to `~/.codex`, `%USERPROFILE%/.codex`, a global `CODEX_HOME`, or global npm authentication.

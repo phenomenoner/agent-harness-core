@@ -2372,14 +2372,52 @@ fn requeue_prepared_context_rollover_for_lane(
             },
         )?;
 
-    let previous_working_session_key =
+    let mut previous_working_session_key =
         string_field(&pending_item, &["sessionKey", "session_key"]).map(ToString::to_string);
-    let previous_session = previous_working_session_key.as_deref().ok_or_else(|| {
+    let raw_previous_session = previous_working_session_key.as_deref().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "pending queue item has no sessionKey; refusing exact-lane prepared rollover requeue",
         )
     })?;
+    let canonical_previous = crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+        raw_previous_session,
+        channel_lane.platform(),
+        channel_lane.account_id(),
+        channel_lane.channel_id(),
+        channel_lane.user_id(),
+        channel_lane.agent_id(),
+    )
+    .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "pending queue session failed exact-lane canonicalization before rollover: {error}"
+            ),
+        )
+    })?;
+    let canonical_new = crate::channel_session_key::CanonicalChannelSessionKey::parse_for_lane(
+        &options.new_working_session_key,
+        channel_lane.platform(),
+        channel_lane.account_id(),
+        channel_lane.channel_id(),
+        channel_lane.user_id(),
+        channel_lane.agent_id(),
+    )
+    .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("new rollover session was not exact-lane canonical: {error}"),
+        )
+    })?;
+    previous_working_session_key = Some(canonical_previous.canonical_string());
+    let previous_session = previous_working_session_key
+        .as_deref()
+        .expect("canonical previous session is present");
+    debug_assert_eq!(
+        canonical_new.canonical_string(),
+        options.new_working_session_key
+    );
     let root_session_key = root_working_session_key(&options.new_working_session_key);
     let virtual_session_id = derive_virtual_session_id_v2(&channel_lane, &root_session_key);
     let pending_continuation_index = pending_item
@@ -2577,6 +2615,15 @@ fn requeue_prepared_context_rollover_for_lane(
             "userId": channel_lane.user_id(),
             "agentId": channel_lane.agent_id(),
             "sessionKey": previous_session,
+            "childQueueId": requeued_queue_id.clone(),
+            "childSessionKey": options.new_working_session_key.clone(),
+            "terminalDisposition": "continuation-handoff",
+            "continuationLink": {
+                "parentQueueId": options.queue_id.clone(),
+                "childQueueId": requeued_queue_id.clone(),
+                "continuationIndex": continuation_index,
+                "virtualLaneDigest": Value::Null
+            },
             "executionDir": prepared_execution_dir
                 .as_ref()
                 .map(|path| path.display().to_string()),
@@ -2810,12 +2857,9 @@ pub fn continuation_session_key(root_session_key: &str, continuation_index: u64)
 }
 
 pub fn root_working_session_key(session_key: &str) -> String {
-    if let Some((root, suffix)) = session_key.rsplit_once(":cont-")
-        && suffix.chars().all(|ch| ch.is_ascii_digit())
-    {
-        return root.to_string();
-    }
-    session_key.to_string()
+    crate::channel_session_key::structural_root_and_continuation(session_key)
+        .map(|(root, _)| root)
+        .unwrap_or_else(|_| session_key.to_string())
 }
 
 pub fn is_rollover_completion_kind(value: Option<&str>) -> bool {
@@ -4357,8 +4401,9 @@ fn path_string_field(value: &Value, names: &[&str]) -> Option<PathBuf> {
 }
 
 pub(crate) fn continuation_index_from_session_key(session_key: &str) -> Option<u64> {
-    let (_, suffix) = session_key.rsplit_once(":cont-")?;
-    suffix.parse::<u64>().ok()
+    crate::channel_session_key::structural_root_and_continuation(session_key)
+        .ok()
+        .and_then(|(_, index)| (index > 0).then_some(index))
 }
 
 fn predecessor_session_key(root_session_key: &str, continuation_index: u64) -> Option<String> {
@@ -4485,6 +4530,36 @@ mod tests {
     use super::*;
     use crate::channel_state::ChannelSessionState;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn canonical_root_and_index_survive_repeated_account_binding() {
+        let bound = crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+            "telegram:dm:user:main",
+            "telegram",
+            "account-a",
+            "dm",
+            "user",
+            "main",
+        )
+        .unwrap();
+        let continuation = bound.continuation(7).unwrap().canonical_string();
+        let rebound = crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+            &continuation,
+            "telegram",
+            "account-a",
+            "dm",
+            "user",
+            "main",
+        )
+        .unwrap();
+
+        assert_eq!(rebound.canonical_string(), continuation);
+        assert_eq!(continuation_index_from_session_key(&continuation), Some(7));
+        assert_eq!(
+            root_working_session_key(&continuation),
+            bound.canonical_string()
+        );
+    }
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

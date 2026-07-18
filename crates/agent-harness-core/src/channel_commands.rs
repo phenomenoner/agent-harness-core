@@ -34,6 +34,10 @@ pub enum ChannelCommand {
     Status {
         scope: Option<String>,
     },
+    ExternalEffectApproval {
+        approve: bool,
+        token: Option<String>,
+    },
     Unknown {
         name: String,
         rest: Option<String>,
@@ -86,6 +90,10 @@ pub enum ChannelCommandIntent {
     ShowStatus {
         scope: Option<String>,
     },
+    ResolveExternalEffect {
+        approve: bool,
+        token: Option<String>,
+    },
     UnknownCommand {
         name: String,
         rest: Option<String>,
@@ -111,6 +119,8 @@ impl ChannelCommand {
             ChannelCommand::Model { .. } => "model",
             ChannelCommand::Fast { .. } => "fast",
             ChannelCommand::Status { .. } => "status",
+            ChannelCommand::ExternalEffectApproval { approve: true, .. } => "approve",
+            ChannelCommand::ExternalEffectApproval { approve: false, .. } => "deny",
             ChannelCommand::Unknown { .. } => "unknown-command",
         }
     }
@@ -138,6 +148,9 @@ impl ChannelCommand {
             }
             ChannelCommand::Fast { mode, global } => ChannelCommandIntent::Fast { mode, global },
             ChannelCommand::Status { scope } => ChannelCommandIntent::ShowStatus { scope },
+            ChannelCommand::ExternalEffectApproval { approve, token } => {
+                ChannelCommandIntent::ResolveExternalEffect { approve, token }
+            }
             ChannelCommand::Unknown { name, rest } => {
                 ChannelCommandIntent::UnknownCommand { name, rest }
             }
@@ -185,6 +198,14 @@ pub fn parse_channel_command(input: &str) -> Option<ChannelCommand> {
         "fast" => parse_fast_mode(rest).map(|(mode, global)| ChannelCommand::Fast { mode, global }),
         "status" => Some(ChannelCommand::Status {
             scope: optional_text(rest),
+        }),
+        "approve" => Some(ChannelCommand::ExternalEffectApproval {
+            approve: true,
+            token: optional_text(rest),
+        }),
+        "deny" => Some(ChannelCommand::ExternalEffectApproval {
+            approve: false,
+            token: optional_text(rest),
         }),
         _ => None,
     };
@@ -580,6 +601,20 @@ mod tests {
             parse_channel_command_intent("/btw check cron state"),
             Some(ChannelCommandIntent::AddBtwNote {
                 note: "check cron state".to_string()
+            })
+        );
+        assert_eq!(
+            parse_channel_command_intent("/approve ahx1_example"),
+            Some(ChannelCommandIntent::ResolveExternalEffect {
+                approve: true,
+                token: Some("ahx1_example".to_string())
+            })
+        );
+        assert_eq!(
+            parse_channel_command_intent("/deny ahx1_example"),
+            Some(ChannelCommandIntent::ResolveExternalEffect {
+                approve: false,
+                token: Some("ahx1_example".to_string())
             })
         );
     }

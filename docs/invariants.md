@@ -1,6 +1,6 @@
 # Agent Harness Core Invariants
 
-Date: 2026-07-17
+Date: 2026-07-18
 
 This catalog is the release-gate source for deterministic simulation, scenario replay, and review evidence. The same invariant IDs are exposed by `agent-harness invariants` through `agent_harness_core::quality::invariant_catalog`.
 
@@ -44,6 +44,37 @@ This catalog is the release-gate source for deterministic simulation, scenario r
 | I36 | Active backend goal rows are projected through exact-v2 lane, virtual-session, backend-generation, source thread/turn, goal reference, checksum, and observation-order identity. A campaign has at most one runnable lineage; duplicate, stale, or orphan rows remain auditable and become non-runnable only through validated append-only supersession, never deletion or wrong-lane substitution. | `goal_lineage/codex_runtime/context_rollover/runtime_pipeline` | `goal_projection_observer_captures_normal_and_status_only_updates_fail_closed` covers all-path observer state, stable goal/turn references, status-only inheritance, and incomplete fail-closed evidence; `latest_completed_goal_projection_cannot_rehydrate_an_older_active_goal` prevents terminal-to-active resurrection. `goal_lineage::tests::doctor_is_read_only_and_requires_explicit_supersession_for_three_active_rows` proves the doctor changes neither source bytes nor file set and converges three active rows to one runnable row through append-only receipts. The stale-generation/tamper and wrong-lane/cross-campaign fixtures cover ledger and identity rejection. | Run the doctor against the stopped-state candidate copy, reconcile only after operator review, then include duplicate/restart/rollover T3 and preserve the receipt ledger in rollback evidence. |
 | I37 | Every goal slice event is evaluated by one transition table before final-outbox selection. An active campaign may create at most one logical continuation child from a deterministic exact-lane intent committed before enqueue; restart/replay reconcile that same child, campaign slice generation never increments context-recovery depth, and acknowledgement occurs only after the child owns the runtime lane lease. An authoritative terminal campaign surface likewise commits one exact campaign/lane/virtual-session message and deterministic delivery identity before append; stale lineages, wrong sessions, and child/worker runs cannot own it. Every slice is bounded to 30–45 minutes and an append-only campaign ledger enforces wall-clock, slice-count, token-cost, repeated-no-progress, and recovery-count boundaries before continuation. | `goal_transition/goal_continuation/goal_budget/runtime_pipeline/context_rollover/runtime_worker/channel_delivery_index` | `goal_transition::tests::unified_transition_table_covers_all_incident_events` covers the event matrix. `goal_continuation::tests::intent_key_is_idempotent_and_slice_count_is_not_recovery_depth` and `committed_intent_reconciles_after_restart_without_duplicate_child` cover stable keys and the continuation commit/enqueue crash window. `runtime_pipeline::tests::active_goal_continuation_is_exactly_once_and_acknowledged_after_child_lease` runs two active slices, proves one child per intent, no final outbox, unchanged recovery depth, and post-lease acknowledgement. `active_goal_completed_slice_is_transitioned_before_final_outbox`, `paused_goal_emits_one_sanitized_terminal_notice`, and `goal_terminal_outbox_is_exactly_once_across_source_queues` cover older-completion suppression, sanitized terminal delivery, and append-before-receipt replay with one physical outbox row. `goal_budget::tests` covers the 48-hour/96-slice default, timeout clamping, idempotent cumulative ledger, and every breaker; `active_goal_budget_boundary_blocks_continuation_and_emits_one_notice` proves a production active slice cannot enqueue beyond its boundary. | Keep `goalAutonomy.mode=observe` in the candidate foundation. Before C2-G, select one exact lane digest, prove one runnable lineage, run restart/compact plus full wrong-lane/worker T3, and retain activation/rollback evidence. |
 | I38 | Codex built-in web search is selected by explicit harness intent and exact-lane policy, never sandbox mode. Ordinary turns request cached, authorized freshness intent requests live, and sensitive/offline/replay turns force disabled. The same-connection provider `webSearch` capability gates the effective mode; capability absence is model-visible, and mode/provider/lane drift rolls over the thread. Receipts retain exact IDs and query digests without raw queries/private URLs, and untrusted results cannot enter memory, skills, or dream artifacts without their separate admission gates. | `codex_web_search/codex_runtime/config/memory/skill_episode/skill_learning` | Fixed classifier corpus; cached/live/capability-absent app-server boundary tests; matching-binding resume and legacy-binding rollover tests; action receipt query/private-URL leak scan; exact 0.144.5 `modelProvider/capabilities/read` staging probe. | Run the WEB T3 cached/live/disabled/capability-absent/restart corpus from the stopped-state candidate, retain receipt scans, and keep built-in live disabled on any lane requiring hard pre-query allowlists or exact query caps. |
+
+## Round22 Continuity And External-Effect Bindings
+
+The following bindings extend the named rows without changing their stable IDs:
+
+- I2, I3, I7, and I9 require a typed distinction between logical success/failure, needs-user,
+  continuation handoff, and terminal suppression. A parent handoff cannot render `Done` or emit the
+  logical final; restart/compaction must retain its child link, and the eventual child owns the one
+  final/error surface.
+- I3, I5, I6, I7, I10, and I17 require structured provider failure plus mutation evidence before
+  retry. A no-observable-mutation overload may persist a bounded same-request not-before schedule;
+  mutation-observed recovery uses exact-lane continuation; unknown evidence fails closed. Retry
+  lineage, attempt, delay, and eligibility remain reconstructable through restart and hot-ledger
+  compaction without blocking another lane.
+- I5, I7, I13, I17, I22, I35, and I37 bind deadline-drain task continuation to a current exact-lane
+  OperationPlan, running/review item, typed bounded checkpoint, plan/item versions, and checksum.
+  The intent commits before one deterministic child enqueue and revalidates stop, newer steer,
+  budget, no-progress, depth, lane, version, and checksum before admission. Todo/ready/terminal or
+  stale plans never become implicit autonomous Goals.
+- I2, I3, I5, I6, I7, I9, I10, I17, I31, and I37 bind recognized MCP elicitations to exactly one
+  protocol-valid response and an append-only external-effect state machine. Missing authority parks
+  promptly as `WaitingForApproval`; approve/deny capabilities are exact-lane, action/parameter,
+  expiry, and generation bound; stop/newer steer/expiry fence them. Restart from an intermediate
+  `Requested` snapshot re-applies the same policy under the stable effect id before any submission.
+  Submitted/ambiguous effects use
+  an exact-bound GitHub opaque-marker or provider-idempotency readback adapter before any
+  resubmission. Only a complete query can prove absence; mismatched or unprovable evidence needs
+  user authority.
+- I31 now fixture-locks the 0.144.5 MCP elicitation request/response shape in addition to the prior
+  compact/goal/web-search surface. Generic receipts may retain effect id/state/digests, but never
+  raw approval bearer tokens or raw connector parameters.
 
 Round16-1 progress ordering binding: I9 requires progress delivery to preserve visible progress/final ordering by using queue-local wake freshness, continuing past stale non-terminal edits instead of dropping the whole pending batch, exempting first-surface sends from preemption, and reclaiming same-queue providerless surface claims without waiting for TTL. I17 requires progress delivery to consume durable terminal-control evidence before rendering cached non-terminal progress, emit at most one terminal close for existing provider surfaces, receipt `progressSuppressedReason=terminal-control-present`, and keep normal terminal cursor context intact for late-event monotonicity and retryable lane failures.
 

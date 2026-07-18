@@ -23051,6 +23051,8 @@ fn runtime_run_once_report_is_idle(report: &RuntimeRunOnceReport) -> bool {
 fn runtime_run_once_status_label(status: RuntimeRunOnceStatus) -> &'static str {
     match status {
         RuntimeRunOnceStatus::Completed => "completed",
+        RuntimeRunOnceStatus::NeedsUser => "needs-user",
+        RuntimeRunOnceStatus::ExternalEffectDenied => "external-effect-denied",
         RuntimeRunOnceStatus::Suppressed => "suppressed",
         RuntimeRunOnceStatus::Skipped => "skipped",
         RuntimeRunOnceStatus::LeaseBusy => "lease-busy",
@@ -23843,7 +23845,10 @@ mod tests {
             .join("tests/fixtures/skill-replay-private/manifest.json");
         let error = run_skill_replay_baseline(&skill_replay_cli_args(&manifest, false))
             .expect_err("private-local fixture must require explicit CLI opt-in");
-        assert!(error.contains("private-local"));
+        assert!(
+            error.contains("private-local"),
+            "expected private-local opt-in error, got: {error}"
+        );
         run_skill_replay_baseline(&skill_replay_cli_args(&manifest, true)).unwrap();
     }
 
@@ -24686,6 +24691,7 @@ mod tests {
             event_id: None,
             event_line: 1,
             terminal: false,
+            lifecycle: None,
             text: "progress".to_string(),
             text_hash: "hash".to_string(),
             started_at_ms: 1,
@@ -26655,6 +26661,13 @@ mod tests {
                     continuation: agent_harness_core::RuntimeContinuationMetadata::legacy(),
                     child_queue_id: None,
                     child_session_key: None,
+                    terminal_disposition: None,
+                    continuation_link: None,
+                    protocol_failure: None,
+                    mutation_evidence: None,
+                    retry_schedule: None,
+                    task_drain_evaluation: None,
+                    external_effect: None,
                     terminal_control_matched: None,
                     terminal_control_source: None,
                     suppressed_run_once_reason: None,

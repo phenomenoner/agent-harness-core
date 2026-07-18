@@ -336,10 +336,22 @@ pub fn receive_channel_message(options: ChannelReceiveOptions) -> io::Result<Cha
                         AgentProgressStatus::Started,
                         options.now_ms,
                     )
+                    .lifecycle(crate::AgentProgressLifecycle::Queued)
                     .source("channel-ingress");
                     if let Err(error) = append_agent_progress_event(&options.harness_home, &event) {
                         warnings.push(format!(
                         "failed to append immediate queued progress event for `{queue_id}`: {error}"
+                    ));
+                    }
+                    if let Err(error) = record_latency_stage(
+                        latency_receipts_file(&options.harness_home),
+                        queue_id,
+                        "channel-ingress",
+                        LatencyStage::QueueAccepted,
+                        Some(options.now_ms),
+                    ) {
+                        warnings.push(format!(
+                        "failed to record queue-accepted latency stage for `{queue_id}`: {error}"
                     ));
                     }
                 }
@@ -668,6 +680,51 @@ mod tests {
     };
     use serde_json::Value;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn durable_queue_append_precedes_queued_progress_event() {
+        let root = temp_root("durable_queue_append_precedes_queued_progress_event");
+        let source = write_receive_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let progress_file = crate::agent_progress_events_file(&harness_home);
+        fs::create_dir_all(&progress_file).unwrap();
+        let skills = build_source_skill_index(&source).unwrap();
+
+        let report = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: Some("account-a".to_string()),
+            channel_id: "dm".to_string(),
+            user_id: "user".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "synthetic queued work".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1_000,
+        })
+        .unwrap();
+
+        assert_eq!(report.status, ChannelReceiveStatus::AgentTurnQueued);
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("failed to append immediate queued progress event")
+        }));
+        let pending = fs::read_to_string(
+            harness_home
+                .join("state")
+                .join("runtime-queue")
+                .join("pending.jsonl"),
+        )
+        .unwrap();
+        assert!(pending.contains(report.queue_id.as_deref().unwrap()));
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn channel_receive_applies_command_and_writes_outbox() {

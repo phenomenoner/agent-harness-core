@@ -19,6 +19,7 @@ pub struct CodexProtocolCompatibilityReportV1 {
     pub request_count: usize,
     pub response_count: usize,
     pub notification_count: usize,
+    pub server_request_count: usize,
     pub observed_model_context_window: u64,
     pub compact_resume_race_owned_by_harness: bool,
 }
@@ -30,6 +31,8 @@ pub fn validate_codex_0_144_5_protocol_fixture() -> io::Result<CodexProtocolComp
     let requests = require_array(&fixture, "/requests")?;
     let responses = require_array(&fixture, "/responses")?;
     let notifications = require_array(&fixture, "/notifications")?;
+    let server_requests = require_array(&fixture, "/serverRequests")?;
+    let server_request_responses = require_array(&fixture, "/serverRequestResponses")?;
 
     let request_methods = requests
         .iter()
@@ -142,6 +145,46 @@ pub fn validate_codex_0_144_5_protocol_fixture() -> io::Result<CodexProtocolComp
     if web_item.is_none() {
         return Err(io::Error::other("0.144.5 fixture has no webSearch item"));
     }
+    let elicitation = server_requests
+        .iter()
+        .find(|value| {
+            value.get("method").and_then(Value::as_str) == Some("mcpServer/elicitation/request")
+        })
+        .ok_or_else(|| io::Error::other("0.144.5 fixture has no MCP elicitation request"))?;
+    if elicitation
+        .pointer("/params/serverName")
+        .and_then(Value::as_str)
+        != Some("github")
+        || elicitation.pointer("/params/mode").and_then(Value::as_str) != Some("form")
+    {
+        return Err(io::Error::other(
+            "MCP elicitation fixture omitted the exact serverName/mode shape",
+        ));
+    }
+    if !server_request_responses.iter().any(|value| {
+        value.get("id") == elicitation.get("id")
+            && value.pointer("/result/action").and_then(Value::as_str) == Some("cancel")
+            && value.pointer("/result/content") == Some(&Value::Null)
+    }) {
+        return Err(io::Error::other(
+            "MCP elicitation fixture has no protocol-valid action response",
+        ));
+    }
+    if !notifications.iter().any(|value| {
+        value.get("method").and_then(Value::as_str) == Some("thread/status/changed")
+            && value
+                .pointer("/params/status/activeFlags")
+                .and_then(Value::as_array)
+                .is_some_and(|flags| {
+                    flags
+                        .iter()
+                        .any(|flag| flag.as_str() == Some("waitingOnApproval"))
+                })
+    }) {
+        return Err(io::Error::other(
+            "0.144.5 fixture has no waitingOnApproval status notification",
+        ));
+    }
 
     let compact_resume_race_owned_by_harness = fixture
         .pointer("/raceExpectation/harnessCorrelationStillRequired")
@@ -174,6 +217,7 @@ pub fn validate_codex_0_144_5_protocol_fixture() -> io::Result<CodexProtocolComp
         request_count: requests.len(),
         response_count: responses.len(),
         notification_count: notifications.len(),
+        server_request_count: server_requests.len(),
         observed_model_context_window,
         compact_resume_race_owned_by_harness,
     })
@@ -227,6 +271,7 @@ mod tests {
         assert!(report.request_count >= 16);
         assert!(report.response_count >= 11);
         assert!(report.notification_count >= 6);
+        assert!(report.server_request_count >= 1);
     }
 
     #[test]

@@ -1,0 +1,18 @@
+{
+  "schema": "agent-harness.round22.timeout-continuation-handoff-replay.v1",
+  "providers": ["telegram", "discord"],
+  "events": [
+    { "kind": "productive-timeout", "atMs": 1000 },
+    { "kind": "child-pending-durable", "atMs": 2000 },
+    { "kind": "parent-handoff-receipt", "atMs": 3000 },
+    { "kind": "worker-restart", "atMs": 4000 },
+    { "kind": "child-progress", "atMs": 5000 },
+    { "kind": "child-success", "atMs": 6000 }
+  ],
+  "expected": {
+    "parentDisposition": "continuation-handoff",
+    "parentRendersDone": false,
+    "childLifecycle": "continuing",
+    "logicalFinalCount": 1
+  }
+}

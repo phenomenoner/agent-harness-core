@@ -1,0 +1,26 @@
+{
+  "schema": "agent-harness.round22.account-continuation-double-bind-replay.v1",
+  "lane": {
+    "platform": "telegram",
+    "accountId": "account-a",
+    "channelId": "channel-a",
+    "userId": "user-a",
+    "agentId": "main",
+    "runtimeClass": "interactive"
+  },
+  "rootSessionKey": "synthetic-root",
+  "continuationIndex": 1,
+  "events": [
+    { "kind": "parent-admitted", "atMs": 1000 },
+    { "kind": "continuation-created", "atMs": 2000 },
+    { "kind": "continuation-lease-acquired", "atMs": 3000 },
+    { "kind": "ordinary-follow-up-admitted", "atMs": 4000 },
+    { "kind": "worker-restart", "atMs": 5000 },
+    { "kind": "continuation-terminal", "atMs": 6000 }
+  ],
+  "expected": {
+    "followUpUsesCanonicalContinuation": true,
+    "overlappingLeases": 0,
+    "followUpStartCount": 1
+  }
+}

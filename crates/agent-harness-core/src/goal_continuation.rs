@@ -21,6 +21,7 @@ use crate::lane::FullLaneKeyV1;
 use crate::runtime_worker::RuntimeQueuePreparedItem;
 
 pub const GOAL_CONTINUATION_INTENT_SCHEMA: &str = "agent-harness.goal-continuation-intent.v1";
+pub const TASK_CONTINUATION_INTENT_SCHEMA: &str = "agent-harness.task-continuation-intent.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -66,6 +67,20 @@ pub struct GoalContinuationIntentV1 {
     pub campaign_slice_generation: u64,
     pub recovery_continuation_index: u64,
     pub decision: GoalTransitionDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_kind: Option<crate::ContinuationAuthorityKindV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_checksum: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_item_version: Option<u64>,
     pub reason: String,
     pub observed_at_ms: i64,
 }
@@ -213,7 +228,86 @@ pub fn commit_goal_continuation_intent(
         campaign_slice_generation,
         recovery_continuation_index,
         decision: transition.decision,
+        authority_kind: Some(crate::ContinuationAuthorityKindV1::Goal),
+        authority_id: Some(lineage_id.to_string()),
+        authority_version: Some(source_slice_generation),
+        authority_checksum: Some(goal_checksum.to_string()),
+        checkpoint_digest: None,
+        active_item_id: None,
+        active_item_version: None,
         reason: "continuation intent committed before child enqueue".to_string(),
+        observed_at_ms: now_ms,
+    };
+    if let Some(existing) =
+        latest_goal_continuation_intent(harness_home.as_ref(), &receipt.intent_key)?
+    {
+        ensure_same_intent(&existing, &receipt)?;
+        return Ok(existing);
+    }
+    append_jsonl_value(&goal_continuation_intents_file(harness_home), &receipt)?;
+    Ok(receipt)
+}
+
+pub fn commit_task_continuation_intent(
+    harness_home: impl AsRef<Path>,
+    parent_queue_id: &str,
+    working_session_key: &str,
+    continuation: &RuntimeContinuationMetadata,
+    authority: &crate::ContinuationAuthoritySnapshotV1,
+    source_slice_generation: u64,
+    decision_generation: u64,
+    now_ms: i64,
+) -> io::Result<GoalContinuationIntentV1> {
+    if parent_queue_id.trim().is_empty() || working_session_key.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "task continuation requires parent queue and working session identities",
+        ));
+    }
+    let campaign_slice_generation = source_slice_generation.saturating_add(1);
+    let recovery_continuation_index = continuation.continuation_index.unwrap_or(0);
+    let authority_kind = match authority.kind {
+        crate::ContinuationAuthorityKindV1::Goal => "goal",
+        crate::ContinuationAuthorityKindV1::OperationPlan => "operation-plan",
+        crate::ContinuationAuthorityKindV1::ExplicitCheckpoint => "explicit-checkpoint",
+    };
+    let intent_key = sha256_hex(&canonical_identity_bytes(&[
+        "task-continuation-intent-v1",
+        &authority.exact_lane_digest,
+        &authority.virtual_session_id,
+        parent_queue_id,
+        &source_slice_generation.to_string(),
+        authority_kind,
+        &authority.authority_id,
+        &authority.authority_version.to_string(),
+        &authority.checkpoint_digest,
+    ]));
+    let receipt = GoalContinuationIntentV1 {
+        schema: TASK_CONTINUATION_INTENT_SCHEMA.to_string(),
+        intent_key,
+        status: GoalContinuationIntentStatus::Committed,
+        parent_queue_id: parent_queue_id.to_string(),
+        child_queue_id: None,
+        working_session_key: working_session_key.to_string(),
+        lane_digest: authority.exact_lane_digest.clone(),
+        virtual_session_id: authority.virtual_session_id.clone(),
+        lineage_id: authority.authority_id.clone(),
+        goal_checksum: authority.authority_checksum.clone(),
+        campaign_family_id: format!("task:{}", authority.authority_id),
+        backend_context_generation: authority.checkpoint_digest.clone(),
+        source_slice_generation,
+        decision_generation,
+        campaign_slice_generation,
+        recovery_continuation_index,
+        decision: GoalTransitionDecision::Continue,
+        authority_kind: Some(authority.kind),
+        authority_id: Some(authority.authority_id.clone()),
+        authority_version: Some(authority.authority_version),
+        authority_checksum: Some(authority.authority_checksum.clone()),
+        checkpoint_digest: Some(authority.checkpoint_digest.clone()),
+        active_item_id: authority.active_item_id.clone(),
+        active_item_version: authority.active_item_version,
+        reason: "task continuation intent committed before child enqueue".to_string(),
         observed_at_ms: now_ms,
     };
     if let Some(existing) =
@@ -262,14 +356,21 @@ pub fn ensure_goal_continuation_enqueued(
         queue_id: latest.parent_queue_id.clone(),
         new_working_session_key: latest.working_session_key.clone(),
         reason: format!(
-            "goal continuation intent {} for campaign slice {}",
+            "task continuation intent {} for campaign slice {}",
             latest.intent_key, latest.campaign_slice_generation
         ),
         now_ms,
         preserve_continuation_index: true,
         campaign_slice_generation: Some(latest.campaign_slice_generation),
         continuation_intent_key: Some(latest.intent_key.clone()),
-        completion_kind: Some("goal-continuation".to_string()),
+        completion_kind: Some(
+            if latest.schema == TASK_CONTINUATION_INTENT_SCHEMA {
+                "operation-plan-continuation"
+            } else {
+                "goal-continuation"
+            }
+            .to_string(),
+        ),
         allow_exact_state_bootstrap: true,
     })?;
     append_intent_state(
@@ -363,7 +464,10 @@ fn latest_intents(harness_home: &Path) -> io::Result<BTreeMap<String, GoalContin
                 ),
             )
         })?;
-        if receipt.schema == GOAL_CONTINUATION_INTENT_SCHEMA {
+        if matches!(
+            receipt.schema.as_str(),
+            GOAL_CONTINUATION_INTENT_SCHEMA | TASK_CONTINUATION_INTENT_SCHEMA
+        ) {
             latest.insert(receipt.intent_key.clone(), receipt);
         }
     }
@@ -480,6 +584,49 @@ fn validate_parent_lane_for_intent(
             "goal continuation intent does not match the exact parent lane/virtual session",
         ));
     }
+    if intent.schema == TASK_CONTINUATION_INTENT_SCHEMA {
+        crate::task_transition::revalidate_operation_plan_snapshot(
+            harness_home,
+            &crate::ContinuationAuthoritySnapshotV1 {
+                kind: intent.authority_kind.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "task intent has no authority kind",
+                    )
+                })?,
+                authority_id: intent.authority_id.clone().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "task intent has no authority id",
+                    )
+                })?,
+                authority_version: intent.authority_version.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "task intent has no authority version",
+                    )
+                })?,
+                authority_checksum: intent.authority_checksum.clone().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "task intent has no authority checksum",
+                    )
+                })?,
+                exact_lane_digest: intent.lane_digest.clone(),
+                virtual_session_id: intent.virtual_session_id.clone(),
+                active_item_id: intent.active_item_id.clone(),
+                active_item_version: intent.active_item_version,
+                checkpoint_digest: intent.checkpoint_digest.clone().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "task intent has no checkpoint digest",
+                    )
+                })?,
+            },
+            session_key,
+            channel_lane.agent_id(),
+        )?;
+    }
     Ok(())
 }
 
@@ -515,6 +662,13 @@ fn ensure_same_intent(
         || existing.source_slice_generation != candidate.source_slice_generation
         || existing.decision_generation != candidate.decision_generation
         || existing.recovery_continuation_index != candidate.recovery_continuation_index
+        || existing.authority_kind != candidate.authority_kind
+        || existing.authority_id != candidate.authority_id
+        || existing.authority_version != candidate.authority_version
+        || existing.authority_checksum != candidate.authority_checksum
+        || existing.checkpoint_digest != candidate.checkpoint_digest
+        || existing.active_item_id != candidate.active_item_id
+        || existing.active_item_version != candidate.active_item_version
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -618,6 +772,16 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let queue_dir = root.join("state").join("runtime-queue");
         fs::create_dir_all(&queue_dir).unwrap();
+        let session_key = crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+            "telegram:dm-a:user-a:main",
+            "telegram",
+            "acct-a",
+            "dm-a",
+            "user-a",
+            "main",
+        )
+        .unwrap()
+        .canonical_string();
         append_jsonl_value(
             &queue_dir.join("pending.jsonl"),
             &serde_json::json!({
@@ -630,7 +794,7 @@ mod tests {
                 "channelId": "dm-a",
                 "userId": "user-a",
                 "agentId": "main",
-                "sessionKey": "telegram:dm-a:user-a:main",
+                "sessionKey": session_key,
                 "continuationIndex": 5,
                 "message": "continue"
             }),
@@ -657,20 +821,18 @@ mod tests {
             "user-a",
             "main",
             "interactive",
-            "telegram:dm-a:user-a:main",
-            "telegram:dm-a:user-a:main",
+            crate::context_rollover::root_working_session_key(&session_key),
+            &session_key,
         )
         .unwrap();
         let mut transition = transition();
         transition.lane_digest = Some(full_lane.identity_hash().unwrap());
-        transition.virtual_session_id = Some(derive_virtual_session_id_v2(
-            &channel_lane,
-            "telegram:dm-a:user-a:main",
-        ));
+        transition.virtual_session_id =
+            Some(derive_virtual_session_id_v2(&channel_lane, &session_key));
         let committed = commit_goal_continuation_intent(
             &root,
             &transition,
-            "telegram:dm-a:user-a:main",
+            &session_key,
             &RuntimeContinuationMetadata {
                 continuation_index: Some(5),
                 campaign_slice_generation: Some(3),

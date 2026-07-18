@@ -52,7 +52,7 @@ const RUNTIME_QUEUE_LEASE_RECONCILIATION_SCHEMA: &str =
 const RUNTIME_QUEUE_LEASE_OBSERVATION_SCHEMA: &str =
     "agent-harness.runtime-queue-lease-observation.v1";
 const RUNTIME_QUEUE_STATE_INDEX_SCHEMA: &str = "agent-harness.runtime-queue-state-index.v1";
-const RUNTIME_QUEUE_STATE_INDEX_REVISION: u32 = 3;
+const RUNTIME_QUEUE_STATE_INDEX_REVISION: u32 = 4;
 const RUNTIME_QUEUE_RECEIPT_COMPACTION_SCHEMA: &str =
     "agent-harness.runtime-queue-receipt-compaction.v1";
 const RUNTIME_QUEUE_RECEIPT_COMPACTION_PENDING_SCHEMA: &str =
@@ -299,6 +299,9 @@ pub enum RuntimeExecutionReceiptStatus {
     StaleOwnerReaped,
     LeaseBusy,
     NoPendingItem,
+    CanonicalCollisionReconciled,
+    InvalidCanonicalLaneQuarantined,
+    SessionIdentityNormalized,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +328,9 @@ pub struct QueueTerminalControlMatch {
     pub source: TerminalControlSource,
     pub reason: String,
     pub suppression_recorded: bool,
+    pub terminal_status: Option<String>,
+    pub terminal_disposition: Option<crate::RuntimeTerminalDispositionV1>,
+    pub continuation_link: Option<crate::RuntimeContinuationLinkV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,6 +402,12 @@ pub(crate) struct RuntimeQueueStateIndexEntry {
     terminal_transcript_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal_occurred_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_disposition: Option<crate::RuntimeTerminalDispositionV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    continuation_link: Option<crate::RuntimeContinuationLinkV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_schedule: Option<crate::RuntimeRetryScheduleV1>,
 }
 
 /// One exact queue record materialized from the append-only hot receipt index.
@@ -568,6 +580,52 @@ pub struct RuntimeQueueLeaseReconciledItem {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeSessionIdentityInventoryStatus {
+    Canonical,
+    NeedsNormalization,
+    MissingAccountIdentity,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeSessionIdentityInventorySource {
+    Pending,
+    Lease,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeSessionIdentityInventoryEntry {
+    pub queue_id: String,
+    pub source: RuntimeSessionIdentityInventorySource,
+    pub status: RuntimeSessionIdentityInventoryStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_lane_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeSessionIdentityCollisionGroup {
+    pub canonical_lane_digest: String,
+    pub queue_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeSessionIdentityInventoryReport {
+    pub schema: &'static str,
+    pub harness_home: PathBuf,
+    pub inspected_at_ms: i64,
+    pub entries: Vec<RuntimeSessionIdentityInventoryEntry>,
+    pub collision_groups: Vec<RuntimeSessionIdentityCollisionGroup>,
+    pub warnings: Vec<String>,
+}
+
 struct RuntimeQueueLeaseLock {
     path: PathBuf,
     file: Option<fs::File>,
@@ -590,7 +648,14 @@ pub fn prepare_runtime_queue_item(
 
     let mut warnings = Vec::new();
     let now_ms = current_log_time_ms()?;
-    let preliminary_pending_items = read_pending_items(&queue_file, &mut warnings)?;
+    let mut preliminary_pending_items = read_pending_items(&queue_file, &mut warnings)?;
+    canonicalize_pending_items_for_dispatch(
+        &options.harness_home,
+        &execution_receipts_file,
+        &mut preliminary_pending_items,
+        now_ms,
+        &mut warnings,
+    )?;
     // A terminal-control marker may cause the derived active index to prune a
     // row before this invocation reaches its requested-item branch. Keep the
     // bounded, source-authoritative snapshot from immediately before that
@@ -681,7 +746,14 @@ pub fn prepare_runtime_queue_item(
         Some(&execution_receipts_file),
         &mut warnings,
     )?;
-    let pending_items = read_pending_items(&queue_file, &mut warnings)?;
+    let mut pending_items = read_pending_items(&queue_file, &mut warnings)?;
+    canonicalize_pending_items_for_dispatch(
+        &options.harness_home,
+        &execution_receipts_file,
+        &mut pending_items,
+        now_ms,
+        &mut warnings,
+    )?;
     let pending_by_id = pending_items
         .iter()
         .cloned()
@@ -931,6 +1003,40 @@ pub fn prepare_runtime_queue_item(
         let mut acquired_prepared_lease = None;
         if let Some(pending) = pending_by_id.get(requested_queue_id) {
             if let Some(blocker) =
+                retry_schedule_dispatch_blocker(&run_once_index, requested_queue_id, now_ms)
+            {
+                let receipt = RuntimeExecutionReceipt {
+                    queue_id: Some(requested_queue_id.to_string()),
+                    status: RuntimeExecutionReceiptStatus::NoPendingItem,
+                    channel_lane: None,
+                    runtime_class: Some(pending.runtime_class.clone()),
+                    origin: Some(pending.origin.clone()),
+                    cron_run_id: pending.cron_run_id.clone(),
+                    scheduled_for_ms: pending.scheduled_for_ms,
+                    execution_dir: None,
+                    prompt_bundle_json: None,
+                    prompt_markdown: None,
+                    runtime_workspace: None,
+                    inbound_media_artifacts: Vec::new(),
+                    continuation: pending.continuation.clone(),
+                    terminal_control_matched: None,
+                    terminal_control_source: None,
+                    suppressed_run_once_reason: None,
+                    reason: blocker,
+                };
+                write_runtime_queue_leases(&queue_dir, &lock_runtime_class, &lease_state)?;
+                append_json_line(&execution_receipts_file, &receipt)?;
+                return Ok(RuntimeQueuePrepareReport {
+                    schema: RUNTIME_QUEUE_PREPARE_REPORT_SCHEMA,
+                    harness_home: options.harness_home,
+                    queue_file,
+                    execution_receipts_file,
+                    item: None,
+                    receipt,
+                    warnings,
+                });
+            }
+            if let Some(blocker) =
                 cron_runtime_dispatch_blocker_for_item(&options.harness_home, pending, now_ms)?
             {
                 tombstone_runtime_queue_item_skipped(&queue_dir, pending, &blocker)?;
@@ -1108,6 +1214,14 @@ pub fn prepare_runtime_queue_item(
                 if pending.runtime_class != lock_runtime_class {
                     continue;
                 }
+                if let Some(blocker) =
+                    retry_schedule_dispatch_blocker(&run_once_index, queue_id, now_ms)
+                {
+                    warnings.push(format!(
+                        "prepared runtime queue item `{queue_id}` blocked by {blocker}; checking queued items"
+                    ));
+                    continue;
+                }
                 if let QueueTerminalControl::Terminal(control) = resolve_queue_terminal_control(
                     &options.harness_home,
                     &pending.queue_id,
@@ -1232,6 +1346,7 @@ pub fn prepare_runtime_queue_item(
         &prepared_ids,
         &terminal_run_ids,
         &auth_deferred_run_ids,
+        &run_once_index,
         &lease_state,
         &lock_runtime_class,
         &options.harness_home,
@@ -1343,6 +1458,9 @@ pub fn prepare_runtime_queue_item(
             source: TerminalControlSource::Quarantine,
             reason,
             suppression_recorded: false,
+            terminal_status: None,
+            terminal_disposition: None,
+            continuation_link: None,
         };
         record_terminal_control_suppression(
             &options.harness_home,
@@ -1398,6 +1516,48 @@ pub fn prepare_runtime_queue_item(
             "runtime queue lease acquired before prompt bundle preparation",
         ),
     )?;
+    if pending.origin == "channel" {
+        let progress_context = crate::AgentProgressContext {
+            queue_id: pending.queue_id.clone(),
+            agent_id: Some(pending.agent_id.clone()),
+            account_id: pending.account_id.clone(),
+            thread_id: None,
+            session_key: pending.session_key.clone(),
+            platform: pending.platform.clone(),
+            channel_id: pending.channel_id.clone(),
+            user_id: pending.user_id.clone(),
+        };
+        let preparing_event = crate::AgentProgressEvent::new(
+            &progress_context,
+            crate::AgentProgressKind::Runtime,
+            "preparing",
+            "Lease acquired; preparing runtime context.",
+            crate::AgentProgressStatus::Started,
+            now_ms,
+        )
+        .lifecycle(crate::AgentProgressLifecycle::Preparing)
+        .source("runtime-worker");
+        if let Err(error) =
+            crate::append_agent_progress_event(&options.harness_home, &preparing_event)
+        {
+            warnings.push(format!(
+                "failed to append preparing progress event for `{}`: {error}",
+                pending.queue_id
+            ));
+        }
+    }
+    if let Err(error) = crate::latency::record_latency_stage(
+        crate::latency::latency_receipts_file(&options.harness_home),
+        &pending.queue_id,
+        &pending.runtime_class,
+        crate::latency::LatencyStage::LeaseAcquired,
+        Some(now_ms),
+    ) {
+        warnings.push(format!(
+            "failed to record lease-acquired latency stage for `{}`: {error}",
+            pending.queue_id
+        ));
+    }
 
     let prompt_workspace = prompt_source_workspace(&pending.source_home, &pending.source_workspace);
     if !paths_equivalent(&prompt_workspace, &pending.source_workspace) {
@@ -2349,6 +2509,150 @@ fn runtime_queue_lease_lock_is_stale(lock_file: &Path, now_ms: i64) -> bool {
         .is_some_and(|age| age.as_millis() > u128::from(RUNTIME_LEASE_LOCK_STALE_MS as u64))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn runtime_session_identity_inventory_entry(
+    queue_id: &str,
+    source: RuntimeSessionIdentityInventorySource,
+    runtime_class: &str,
+    agent_id: &str,
+    platform: &str,
+    account_id: Option<&str>,
+    channel_id: &str,
+    user_id: &str,
+    session_key: &str,
+) -> RuntimeSessionIdentityInventoryEntry {
+    let Some(account_id) = account_id.filter(|value| !value.trim().is_empty()) else {
+        return RuntimeSessionIdentityInventoryEntry {
+            queue_id: queue_id.to_string(),
+            source,
+            status: RuntimeSessionIdentityInventoryStatus::MissingAccountIdentity,
+            canonical_lane_digest: None,
+            reason: Some(
+                "accountId is unavailable; exact-lane canonicalization is not safe".to_string(),
+            ),
+        };
+    };
+    match crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+        session_key,
+        platform,
+        account_id,
+        channel_id,
+        user_id,
+        agent_id,
+    ) {
+        Ok(canonical) => {
+            let canonical_session = canonical.canonical_string();
+            let lane = runtime_session_lane_key(
+                runtime_class,
+                agent_id,
+                platform,
+                Some(account_id),
+                channel_id,
+                user_id,
+                &canonical_session,
+            );
+            RuntimeSessionIdentityInventoryEntry {
+                queue_id: queue_id.to_string(),
+                source,
+                status: if canonical_session == session_key {
+                    RuntimeSessionIdentityInventoryStatus::Canonical
+                } else {
+                    RuntimeSessionIdentityInventoryStatus::NeedsNormalization
+                },
+                canonical_lane_digest: Some(format!(
+                    "{:016x}",
+                    runtime_queue_bytes_digest(lane.as_bytes())
+                )),
+                reason: (canonical_session != session_key).then(|| {
+                    "legacy session key maps unambiguously to one exact canonical lane".to_string()
+                }),
+            }
+        }
+        Err(error) => RuntimeSessionIdentityInventoryEntry {
+            queue_id: queue_id.to_string(),
+            source,
+            status: RuntimeSessionIdentityInventoryStatus::Invalid,
+            canonical_lane_digest: None,
+            reason: Some(error.to_string()),
+        },
+    }
+}
+
+pub fn inspect_runtime_session_identity(
+    harness_home: impl AsRef<Path>,
+) -> io::Result<RuntimeSessionIdentityInventoryReport> {
+    let harness_home = harness_home.as_ref().to_path_buf();
+    let queue_dir = harness_home.join("state").join("runtime-queue");
+    let mut warnings = Vec::new();
+    let pending = read_pending_items(&queue_dir.join("pending.jsonl"), &mut warnings)?;
+    let mut entries = pending
+        .iter()
+        .map(|item| {
+            runtime_session_identity_inventory_entry(
+                &item.queue_id,
+                RuntimeSessionIdentityInventorySource::Pending,
+                &item.runtime_class,
+                &item.agent_id,
+                &item.platform,
+                item.account_id.as_deref(),
+                &item.channel_id,
+                &item.user_id,
+                &item.session_key,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut active_by_digest = BTreeMap::<String, Vec<String>>::new();
+    for runtime_class in runtime_classes_for_release(&queue_dir) {
+        let state = read_runtime_queue_leases(&queue_dir, &runtime_class, &mut warnings)?;
+        for lease in state.leases.values() {
+            let entry = runtime_session_identity_inventory_entry(
+                &lease.queue_id,
+                RuntimeSessionIdentityInventorySource::Lease,
+                &lease.runtime_class,
+                &lease.agent_id,
+                &lease.platform,
+                lease.account_id.as_deref(),
+                &lease.channel_id,
+                lease.user_id.as_deref().unwrap_or(""),
+                &lease.session_key,
+            );
+            if let Some(digest) = entry.canonical_lane_digest.as_ref() {
+                active_by_digest
+                    .entry(digest.clone())
+                    .or_default()
+                    .push(lease.queue_id.clone());
+            }
+            entries.push(entry);
+        }
+    }
+    entries.sort_by(|left, right| {
+        left.queue_id
+            .cmp(&right.queue_id)
+            .then_with(|| left.source.cmp(&right.source))
+    });
+    let collision_groups = active_by_digest
+        .into_iter()
+        .filter_map(|(canonical_lane_digest, mut queue_ids)| {
+            if queue_ids.len() < 2 {
+                return None;
+            }
+            queue_ids.sort();
+            Some(RuntimeSessionIdentityCollisionGroup {
+                canonical_lane_digest,
+                queue_ids,
+            })
+        })
+        .collect();
+    Ok(RuntimeSessionIdentityInventoryReport {
+        schema: "agent-harness.runtime-session-identity-inventory.v1",
+        harness_home,
+        inspected_at_ms: current_log_time_ms()?,
+        entries,
+        collision_groups,
+        warnings,
+    })
+}
+
 fn read_runtime_queue_leases(
     queue_dir: &Path,
     runtime_class: &str,
@@ -2441,6 +2745,120 @@ fn purge_runtime_queue_leases(
                     "reason": reason
                 }),
             )?;
+        }
+    }
+    reconcile_canonical_lease_collisions(state, now_ms, receipts_file, warnings)?;
+    Ok(())
+}
+
+fn reconcile_canonical_lease_collisions(
+    state: &mut RuntimeQueueLeaseState,
+    now_ms: i64,
+    receipts_file: Option<&Path>,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    let mut groups = BTreeMap::<String, Vec<String>>::new();
+    let mut invalid = Vec::<(String, String)>::new();
+    for (queue_id, lease) in &state.leases {
+        let lane = if let Some(account_id) = lease.account_id.as_deref() {
+            match crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+                &lease.session_key,
+                &lease.platform,
+                account_id,
+                &lease.channel_id,
+                lease.user_id.as_deref().unwrap_or(""),
+                &lease.agent_id,
+            ) {
+                Ok(canonical) => runtime_session_lane_key(
+                    &lease.runtime_class,
+                    &lease.agent_id,
+                    &lease.platform,
+                    Some(account_id),
+                    &lease.channel_id,
+                    lease.user_id.as_deref().unwrap_or(""),
+                    &canonical.canonical_string(),
+                ),
+                Err(error) => {
+                    invalid.push((queue_id.clone(), error.to_string()));
+                    continue;
+                }
+            }
+        } else {
+            runtime_session_lane_key(
+                &lease.runtime_class,
+                &lease.agent_id,
+                &lease.platform,
+                None,
+                &lease.channel_id,
+                lease.user_id.as_deref().unwrap_or(""),
+                &lease.session_key,
+            )
+        };
+        groups.entry(lane).or_default().push(queue_id.clone());
+    }
+
+    for (queue_id, error) in invalid {
+        let Some(lease) = state.leases.remove(&queue_id) else {
+            continue;
+        };
+        let reason = format!(
+            "runtime lease removed from active ownership because its exact-lane session key failed canonicalization: {error}"
+        );
+        warnings.push(format!(
+            "runtime queue lease `{queue_id}` quarantined: {reason}"
+        ));
+        if let Some(receipts_file) = receipts_file {
+            append_json_line(
+                receipts_file,
+                &serde_json::json!({
+                    "queueId": queue_id,
+                    "status": RuntimeExecutionReceiptStatus::InvalidCanonicalLaneQuarantined,
+                    "runtimeClass": lease.runtime_class,
+                    "origin": lease.origin,
+                    "atMs": now_ms,
+                    "reason": reason,
+                }),
+            )?;
+        }
+    }
+
+    for (lane, mut queue_ids) in groups {
+        if queue_ids.len() < 2 {
+            continue;
+        }
+        queue_ids.sort_by(|left, right| {
+            state.leases[left]
+                .started_at_ms
+                .cmp(&state.leases[right].started_at_ms)
+                .then_with(|| left.cmp(right))
+        });
+        let retained_queue_id = queue_ids.remove(0);
+        let lane_digest = format!("{:016x}", runtime_queue_bytes_digest(lane.as_bytes()));
+        for queue_id in queue_ids {
+            let Some(lease) = state.leases.remove(&queue_id) else {
+                continue;
+            };
+            let reason = format!(
+                "duplicate canonical active lease reconciled into retained queue `{retained_queue_id}`; canonicalLaneDigest={lane_digest}"
+            );
+            warnings.push(format!(
+                "runtime queue lease `{queue_id}` reconciled: {reason}"
+            ));
+            if let Some(receipts_file) = receipts_file {
+                append_json_line(
+                    receipts_file,
+                    &serde_json::json!({
+                        "queueId": queue_id,
+                        "status": RuntimeExecutionReceiptStatus::CanonicalCollisionReconciled,
+                        "runtimeClass": lease.runtime_class,
+                        "origin": lease.origin,
+                        "retainedQueueId": retained_queue_id.clone(),
+                        "canonicalLaneDigest": lane_digest.clone(),
+                        "atMs": now_ms,
+                        "reason": reason,
+                    }),
+                )?;
+            }
         }
     }
     Ok(())
@@ -3006,17 +3424,41 @@ pub fn resolve_queue_terminal_control(
         return Ok(control);
     }
     let requested_queue_ids = std::iter::once(queue_id.to_string()).collect::<BTreeSet<_>>();
-    let cold_reasons = cold_terminal_history_reasons(&queue_dir, &requested_queue_ids)?;
-    let Some(reason) = cold_reasons.get(queue_id) else {
+    let cold_records = find_runtime_queue_terminal_history(&queue_dir, &requested_queue_ids)?;
+    let Some(record) = cold_records
+        .into_iter()
+        .find(|record| record.queue_id == queue_id)
+    else {
         return Ok(QueueTerminalControl::Runnable);
     };
+    let reason = record
+        .reason
+        .unwrap_or_else(|| format!("historical terminal run-once status `{}`", record.status));
+    let terminal_disposition = record.terminal_disposition.as_deref().and_then(|value| {
+        serde_json::from_value::<crate::RuntimeTerminalDispositionV1>(Value::String(
+            value.to_string(),
+        ))
+        .ok()
+    });
+    let continuation_link =
+        record
+            .child_queue_id
+            .map(|child_queue_id| crate::RuntimeContinuationLinkV1 {
+                parent_queue_id: record.queue_id.clone(),
+                child_queue_id,
+                continuation_index: record.continuation_index.unwrap_or(0),
+                virtual_lane_digest: None,
+            });
     Ok(QueueTerminalControl::Terminal(QueueTerminalControlMatch {
         source: TerminalControlSource::RunOnceTerminal,
-        reason: reason.clone(),
+        reason,
         suppression_recorded: index
             .queues
             .get(queue_id)
             .is_some_and(|entry| entry.suppression_recorded),
+        terminal_status: Some(record.status),
+        terminal_disposition,
+        continuation_link,
     }))
 }
 
@@ -3054,6 +3496,9 @@ pub(crate) fn resolve_queue_terminal_control_from_index(
             source: TerminalControlSource::Quarantine,
             reason,
             suppression_recorded,
+            terminal_status: None,
+            terminal_disposition: None,
+            continuation_link: None,
         }));
     }
     if let Some(reason) = scoped_stop_marker_reason(&queue_dir, queue_id, session_key)? {
@@ -3061,6 +3506,9 @@ pub(crate) fn resolve_queue_terminal_control_from_index(
             source: TerminalControlSource::ScopedStop,
             reason,
             suppression_recorded,
+            terminal_status: Some("canceled".to_string()),
+            terminal_disposition: Some(crate::RuntimeTerminalDispositionV1::LogicalCanceled),
+            continuation_link: None,
         }));
     }
     if let Some(reason) = queue_skip_control_reason(&queue_dir, queue_id)? {
@@ -3068,6 +3516,9 @@ pub(crate) fn resolve_queue_terminal_control_from_index(
             source: TerminalControlSource::QueueSkip,
             reason,
             suppression_recorded,
+            terminal_status: Some("skipped".to_string()),
+            terminal_disposition: Some(crate::RuntimeTerminalDispositionV1::TerminalSuppression),
+            continuation_link: None,
         }));
     }
     if let Some(entry) = indexed
@@ -3082,6 +3533,9 @@ pub(crate) fn resolve_queue_terminal_control_from_index(
             source: TerminalControlSource::RunOnceTerminal,
             reason,
             suppression_recorded,
+            terminal_status: entry.terminal_status.clone(),
+            terminal_disposition: entry.terminal_disposition,
+            continuation_link: entry.continuation_link.clone(),
         }));
     }
     Ok(QueueTerminalControl::Runnable)
@@ -3219,6 +3673,9 @@ fn pending_terminal_control_ids(
                         .queues
                         .get(&item.queue_id)
                         .is_some_and(|entry| entry.suppression_recorded),
+                    terminal_status: None,
+                    terminal_disposition: None,
+                    continuation_link: None,
                 })
             }),
             QueueTerminalControl::Terminal(control) => {
@@ -3689,6 +4146,10 @@ fn apply_runtime_queue_receipt_to_index(index: &mut RuntimeQueueStateIndex, valu
             "planned_transcript_file",
         ],
     );
+    entry.retry_schedule = value
+        .get("retrySchedule")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
     let status_count = entry
         .run_once_status_counts
         .entry(status.to_string())
@@ -3733,6 +4194,14 @@ fn apply_runtime_queue_receipt_to_index(index: &mut RuntimeQueueStateIndex, valu
                 "at_ms",
             ],
         );
+        entry.terminal_disposition = value
+            .get("terminalDisposition")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok());
+        entry.continuation_link = value
+            .get("continuationLink")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok());
         entry
             .terminal_control_source
             .get_or_insert_with(|| TerminalControlSource::RunOnceTerminal.as_str().to_string());
@@ -5059,17 +5528,35 @@ fn runtime_session_lane_key(
     runtime_class: &str,
     agent_id: &str,
     platform: &str,
+    account_id: Option<&str>,
     channel_id: &str,
     user_id: &str,
     session_key: &str,
 ) -> String {
+    let canonical_session_key = account_id
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|account_id| {
+            crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+                session_key,
+                platform,
+                account_id,
+                channel_id,
+                user_id,
+                agent_id,
+            )
+            .ok()
+            .map(|key| key.canonical_string())
+        })
+        .unwrap_or_else(|| session_key.to_string());
     [
+        "v2".to_string(),
         normalize_key_part(runtime_class),
         normalize_key_part(agent_id),
         normalize_key_part(platform),
+        normalize_key_part(account_id.unwrap_or("legacy-default")),
         normalize_key_part(channel_id),
         normalize_key_part(user_id),
-        normalize_key_part(session_key),
+        normalize_key_part(&canonical_session_key),
     ]
     .join(":")
 }
@@ -5133,6 +5620,7 @@ fn item_session_lane_key(
             &item.runtime_class,
             &item.agent_id,
             &item.platform,
+            item.account_id.as_deref(),
             &item.channel_id,
             &item.user_id,
             &item.session_key,
@@ -5155,7 +5643,7 @@ fn lease_session_lane_key(
     if let Some(key) = lease
         .session_lane_key
         .as_ref()
-        .filter(|key| !key.trim().is_empty())
+        .filter(|key| key.starts_with("v2:"))
     {
         return Some(key.clone());
     }
@@ -5163,6 +5651,7 @@ fn lease_session_lane_key(
         &lease.runtime_class,
         &lease.agent_id,
         &lease.platform,
+        lease.account_id.as_deref(),
         &lease.channel_id,
         lease.user_id.as_deref().unwrap_or(""),
         &lease.session_key,
@@ -5205,6 +5694,27 @@ fn same_session_fifo_blocker(
         })
 }
 
+fn retry_schedule_dispatch_blocker(
+    index: &RuntimeQueueStateIndex,
+    queue_id: &str,
+    now_ms: i64,
+) -> Option<String> {
+    let entry = index.queues.get(queue_id)?;
+    if entry.latest_status.as_deref() != Some("retry-pending") {
+        return None;
+    }
+    let schedule = entry.retry_schedule.as_ref()?;
+    (now_ms < schedule.next_eligible_at_ms).then(|| {
+        format!(
+            "durable retry backoff until {} (lineage `{}`; attempt {}/{})",
+            schedule.next_eligible_at_ms,
+            schedule.lineage_id,
+            schedule.attempt,
+            schedule.max_attempts
+        )
+    })
+}
+
 fn cron_runtime_dispatch_blocker_for_item(
     harness_home: &Path,
     item: &PendingQueueItem,
@@ -5222,6 +5732,7 @@ fn select_pending_item(
     prepared_ids: &HashSet<String>,
     terminal_run_ids: &HashSet<String>,
     auth_deferred_run_ids: &HashSet<String>,
+    run_once_index: &RuntimeQueueStateIndex,
     lease_state: &RuntimeQueueLeaseState,
     runtime_class: &str,
     harness_home: &Path,
@@ -5297,6 +5808,15 @@ fn select_pending_item(
             ));
             continue;
         }
+        if let Some(blocker) =
+            retry_schedule_dispatch_blocker(run_once_index, &item.queue_id, now_ms)
+        {
+            warnings.push(format!(
+                "runtime queue item `{}` blocked by {}; skipping",
+                item.queue_id, blocker
+            ));
+            continue;
+        }
         if lease_state.leases.contains_key(&item.queue_id) {
             warnings.push(format!(
                 "runtime queue item `{}` is already leased; skipping",
@@ -5360,6 +5880,134 @@ fn cron_agent_rounds(pending_items: &[PendingQueueItem]) -> HashMap<String, usiz
         *round += 1;
     }
     round_by_queue_id
+}
+
+fn execution_receipt_status_exists(
+    receipts_file: &Path,
+    queue_id: &str,
+    status: RuntimeExecutionReceiptStatus,
+) -> bool {
+    let Ok(text) = fs::read_to_string(receipts_file) else {
+        return false;
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|value| {
+            string_field(&value, &["queueId", "queue_id"]) == Some(queue_id)
+                && value
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| {
+                        serde_json::from_value::<RuntimeExecutionReceiptStatus>(Value::String(
+                            value.to_string(),
+                        ))
+                        .ok()
+                            == Some(status)
+                    })
+        })
+}
+
+fn canonicalize_pending_items_for_dispatch(
+    harness_home: &Path,
+    execution_receipts_file: &Path,
+    items: &mut Vec<PendingQueueItem>,
+    now_ms: i64,
+    warnings: &mut Vec<String>,
+) -> io::Result<()> {
+    let mut canonical = Vec::with_capacity(items.len());
+    for mut item in items.drain(..) {
+        let account_id = item
+            .account_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("default")
+            .to_string();
+        match crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+            &item.session_key,
+            &item.platform,
+            &account_id,
+            &item.channel_id,
+            &item.user_id,
+            &item.agent_id,
+        ) {
+            Ok(parsed) => {
+                let canonical_session_key = parsed.canonical_string();
+                let changed = canonical_session_key != item.session_key
+                    || item.account_id.as_deref() != Some(account_id.as_str());
+                item.session_key = canonical_session_key.clone();
+                item.account_id = Some(account_id.clone());
+                if changed
+                    && !execution_receipt_status_exists(
+                        execution_receipts_file,
+                        &item.queue_id,
+                        RuntimeExecutionReceiptStatus::SessionIdentityNormalized,
+                    )
+                {
+                    let lane = runtime_session_lane_key(
+                        &item.runtime_class,
+                        &item.agent_id,
+                        &item.platform,
+                        Some(&account_id),
+                        &item.channel_id,
+                        &item.user_id,
+                        &canonical_session_key,
+                    );
+                    append_json_line(
+                        execution_receipts_file,
+                        &serde_json::json!({
+                            "queueId": item.queue_id.clone(),
+                            "status": RuntimeExecutionReceiptStatus::SessionIdentityNormalized,
+                            "runtimeClass": item.runtime_class.clone(),
+                            "origin": item.origin.clone(),
+                            "canonicalLaneDigest": format!(
+                                "{:016x}",
+                                runtime_queue_bytes_digest(lane.as_bytes())
+                            ),
+                            "atMs": now_ms,
+                            "reason": "legacy pending session normalized to exact canonical lane before dispatch"
+                        }),
+                    )?;
+                    warnings.push(format!(
+                        "runtime queue item `{}` session identity normalized before dispatch",
+                        item.queue_id
+                    ));
+                }
+                canonical.push(item);
+            }
+            Err(error) => {
+                let reason = format!(
+                    "runtime queue item `{}` session identity is invalid for its exact lane: {error}",
+                    item.queue_id
+                );
+                write_runtime_queue_quarantine_marker(
+                    harness_home,
+                    &item.queue_id,
+                    &reason,
+                    now_ms,
+                )?;
+                if !execution_receipt_status_exists(
+                    execution_receipts_file,
+                    &item.queue_id,
+                    RuntimeExecutionReceiptStatus::InvalidCanonicalLaneQuarantined,
+                ) {
+                    append_json_line(
+                        execution_receipts_file,
+                        &serde_json::json!({
+                            "queueId": item.queue_id.clone(),
+                            "status": RuntimeExecutionReceiptStatus::InvalidCanonicalLaneQuarantined,
+                            "runtimeClass": item.runtime_class.clone(),
+                            "origin": item.origin.clone(),
+                            "atMs": now_ms,
+                            "reason": reason,
+                        }),
+                    )?;
+                }
+                warnings.push(reason);
+            }
+        }
+    }
+    *items = canonical;
+    Ok(())
 }
 
 fn read_pending_items(
@@ -6702,6 +7350,15 @@ mod tests {
                     "status": status,
                     "reason": reason,
                     "terminalControlSource": "run-once-terminal",
+                    "retrySchedule": (status == "retry-pending").then(|| serde_json::json!({
+                        "lineageId": "runtime-retry:turn:retry",
+                        "attempt": 1,
+                        "maxAttempts": 3,
+                        "delayMs": 1000,
+                        "scheduledAtMs": 1000,
+                        "nextEligibleAtMs": 2000,
+                        "replayMode": "same-request-no-observable-mutation"
+                    })),
                     "padding": "receipt-compaction-regression-padding".repeat(32)
                 }),
             )
@@ -6748,6 +7405,13 @@ mod tests {
         assert!(!rebuilt.queues.contains_key("turn:terminal"));
         assert!(!rebuilt.queues.contains_key("turn:suppressed"));
         assert!(retry_pending_run_once_ids_from_index(&rebuilt).contains("turn:retry"));
+        assert_eq!(
+            rebuilt.queues["turn:retry"]
+                .retry_schedule
+                .as_ref()
+                .map(|schedule| schedule.next_eligible_at_ms),
+            Some(2_000)
+        );
         let compacted_pending = fs::read_to_string(&pending_file).unwrap();
         assert!(compacted_pending.contains("turn:retry"));
         assert!(!compacted_pending.contains("turn:terminal"));
@@ -8373,7 +9037,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_router_v2_shadow_runtime_skips_partial_lane_without_blocking_serving() {
+    fn skill_router_v2_shadow_runtime_canonicalizes_partial_lane_without_blocking_serving() {
         let root = temp_root("skill_router_v2_shadow_partial_lane");
         let source = write_worker_source(&root);
         let harness_home = root.join("harness");
@@ -8392,11 +9056,14 @@ mod tests {
         })
         .unwrap();
         assert!(report.item.is_some(), "serving preparation must continue");
-        assert!(report.warnings.iter().any(|warning| {
-            warning.contains("shadow skipped") && warning.contains("exact account-aware lane")
-        }));
         assert!(
-            !harness_home
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("shadow skipped"))
+        );
+        assert!(
+            harness_home
                 .join("state")
                 .join("skills")
                 .join("shadow-routing")
@@ -8432,7 +9099,15 @@ mod tests {
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .map(|value| value["status"].as_str().unwrap().to_string())
             .collect::<Vec<_>>();
-        assert_eq!(statuses.first().map(String::as_str), Some("lease-acquired"));
+        let normalized = statuses
+            .iter()
+            .position(|status| status == "session-identity-normalized")
+            .expect("legacy fixture identity is normalized before lease acquisition");
+        let leased = statuses
+            .iter()
+            .position(|status| status == "lease-acquired")
+            .expect("lease acquisition receipt");
+        assert!(normalized < leased);
         assert_eq!(statuses.last().map(String::as_str), Some("prepared"));
         assert_eq!(
             statuses
@@ -8942,6 +9617,399 @@ mod tests {
             Some(queue_ids[0].as_str())
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn queue_terminal_control_preserves_continuation_disposition() {
+        let root = temp_root("queue_terminal_control_preserves_continuation_disposition");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        fs::write(
+            queue_dir.join("run-once-receipts.jsonl"),
+            r#"{"queueId":"parent","status":"skipped","reason":"continued","terminalDisposition":"continuation-handoff","continuationLink":{"parentQueueId":"parent","childQueueId":"child","continuationIndex":1}}
+"#,
+        )
+        .unwrap();
+        rebuild_runtime_queue_state_index(&queue_dir, &mut Vec::new()).unwrap();
+
+        let QueueTerminalControl::Terminal(control) =
+            resolve_queue_terminal_control(&harness_home, "parent", None).unwrap()
+        else {
+            panic!("typed skipped receipt must be terminal queue control");
+        };
+        assert_eq!(
+            control.terminal_disposition,
+            Some(crate::RuntimeTerminalDispositionV1::ContinuationHandoff)
+        );
+        assert_eq!(
+            control
+                .continuation_link
+                .as_ref()
+                .map(|link| link.child_queue_id.as_str()),
+            Some("child")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn canonical_continuation_followup_cannot_bypass_active_limit_or_fifo() {
+        let root = temp_root("canonical_continuation_followup_cannot_bypass_active_limit_or_fifo");
+        let source = write_worker_source(&root);
+        let harness_home = root.join(".agent-harness");
+        fs::create_dir_all(&harness_home).unwrap();
+        fs::write(
+            harness_home.join("harness-config.json"),
+            r#"{"workerDispatch":{"globalConcurrencyLimit":3,"groupConcurrencyLimit":3,"channelConcurrencyLimit":3,"laneConcurrencyLimits":{"llm":3}}}"#,
+        )
+        .unwrap();
+
+        let bound = crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+            "synthetic-root",
+            "telegram",
+            "account-a",
+            "dm-42",
+            "user-7",
+            "main",
+        )
+        .unwrap();
+        let continuation = bound.continuation(1).unwrap().canonical_string();
+        let legacy_duplicate = format!(
+            "{continuation}:{}",
+            crate::channel_session_key::expected_account_binding(
+                "telegram",
+                "account-a",
+                "dm-42",
+                "user-7",
+                "main",
+            )
+        );
+        enqueue_fixture_turn_for_account_with_session(
+            &source,
+            &harness_home,
+            "account-a",
+            Some(&continuation),
+            "continuation",
+            1234,
+        );
+        enqueue_fixture_turn_for_account_with_session(
+            &source,
+            &harness_home,
+            "account-a",
+            Some(&legacy_duplicate),
+            "ordinary follow-up",
+            1235,
+        );
+
+        let pending = fs::read_to_string(queue_dir(&harness_home).join("pending.jsonl")).unwrap();
+        let rows = pending
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["sessionKey"], continuation);
+        assert_eq!(rows[1]["sessionKey"], continuation);
+
+        let first = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        let first_queue_id = first.receipt.queue_id.clone().unwrap();
+        assert_eq!(
+            first.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+
+        let blocked = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert!(blocked.item.is_none());
+        assert!(
+            blocked
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("session-active"))
+        );
+
+        release_runtime_queue_lease(&harness_home, &first_queue_id).unwrap();
+        fs::write(
+            queue_dir(&harness_home).join("run-once-receipts.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "queueId": first_queue_id,
+                    "status": "completed",
+                    "reason": "synthetic continuation completed"
+                })
+            ),
+        )
+        .unwrap();
+
+        let follow_up = prepare_runtime_queue_item(RuntimeQueuePrepareOptions {
+            harness_home: harness_home.clone(),
+            queue_id: None,
+            prompt_options: PromptAssemblyOptions::default(),
+        })
+        .unwrap();
+        assert_eq!(
+            follow_up.receipt.status,
+            RuntimeExecutionReceiptStatus::Prepared
+        );
+        assert_ne!(follow_up.receipt.queue_id, Some(first_queue_id));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lease_reconcile_groups_legacy_duplicate_key_under_one_canonical_lane() {
+        let root =
+            temp_root("lease_reconcile_groups_legacy_duplicate_key_under_one_canonical_lane");
+        let queue_dir = root.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let receipts_file = queue_dir.join("execution-receipts.jsonl");
+        let bound = crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+            "synthetic-root",
+            "telegram",
+            "account-a",
+            "channel-a",
+            "user-a",
+            "main",
+        )
+        .unwrap();
+        let continuation = bound.continuation(1).unwrap().canonical_string();
+        let duplicate = format!(
+            "{continuation}:{}",
+            crate::channel_session_key::expected_account_binding(
+                "telegram",
+                "account-a",
+                "channel-a",
+                "user-a",
+                "main",
+            )
+        );
+        let lease = |queue_id: &str, session_key: String, started_at_ms: i64| RuntimeQueueLease {
+            queue_id: queue_id.to_string(),
+            agent_id: "main".to_string(),
+            runtime_class: "interactive".to_string(),
+            origin: "channel".to_string(),
+            cron_run_id: None,
+            platform: "telegram".to_string(),
+            account_id: Some("account-a".to_string()),
+            channel_id: "channel-a".to_string(),
+            user_id: Some("user-a".to_string()),
+            session_key,
+            virtual_session_id: None,
+            session_lane_key: None,
+            owner: RuntimeQueueLeaseOwner::Legacy("synthetic-owner".to_string()),
+            started_at_ms,
+            lease_expires_at_ms: 10_000,
+        };
+        let mut state = RuntimeQueueLeaseState {
+            schema: runtime_queue_leases_schema(),
+            leases: BTreeMap::from([
+                (
+                    "queue-first".to_string(),
+                    lease("queue-first", continuation, 1_000),
+                ),
+                (
+                    "queue-duplicate".to_string(),
+                    lease("queue-duplicate", duplicate, 1_001),
+                ),
+            ]),
+        };
+
+        let mut warnings = Vec::new();
+        purge_runtime_queue_leases(
+            &mut state,
+            2_000,
+            &HashSet::new(),
+            &HashSet::new(),
+            Some(&receipts_file),
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert_eq!(state.leases.len(), 1);
+        assert!(state.leases.contains_key("queue-first"));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("duplicate canonical active lease reconciled"))
+        );
+        let receipts = fs::read_to_string(receipts_file).unwrap();
+        assert!(receipts.contains("canonical-collision-reconciled"));
+        assert!(receipts.contains("canonicalLaneDigest"));
+        assert!(!receipts.contains("synthetic-root"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_identity_inventory_is_read_only_and_privacy_safe() {
+        let root = temp_root("session_identity_inventory_is_read_only_and_privacy_safe");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let bound = crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+            "private-synthetic-root",
+            "telegram",
+            "account-a",
+            "channel-a",
+            "user-a",
+            "main",
+        )
+        .unwrap();
+        let canonical = bound.continuation(1).unwrap().canonical_string();
+        let duplicate = format!(
+            "{canonical}:{}",
+            crate::channel_session_key::expected_account_binding(
+                "telegram",
+                "account-a",
+                "channel-a",
+                "user-a",
+                "main",
+            )
+        );
+        let pending_file = queue_dir.join("pending.jsonl");
+        append_json_line(
+            &pending_file,
+            &serde_json::json!({
+                "queueId": "queue-pending",
+                "status": "queued",
+                "createdAtMs": 1,
+                "agentId": "main",
+                "sessionKey": "private-synthetic-root",
+                "runtimeClass": "interactive",
+                "origin": "channel",
+                "platform": "telegram",
+                "accountId": "account-a",
+                "channelId": "channel-a",
+                "userId": "user-a",
+                "messageText": "synthetic",
+                "source": {
+                    "sourceHome": ".",
+                    "sourceWorkspace": "."
+                },
+                "plannedTranscriptFile": "transcript.jsonl",
+                "plannedTrajectoryFile": "trajectory.jsonl"
+            }),
+        )
+        .unwrap();
+        let lease = |queue_id: &str, session_key: String| RuntimeQueueLease {
+            queue_id: queue_id.to_string(),
+            agent_id: "main".to_string(),
+            runtime_class: "interactive".to_string(),
+            origin: "channel".to_string(),
+            cron_run_id: None,
+            platform: "telegram".to_string(),
+            account_id: Some("account-a".to_string()),
+            channel_id: "channel-a".to_string(),
+            user_id: Some("user-a".to_string()),
+            session_key,
+            virtual_session_id: None,
+            session_lane_key: None,
+            owner: RuntimeQueueLeaseOwner::Legacy("synthetic-owner".to_string()),
+            started_at_ms: 1,
+            lease_expires_at_ms: 10_000,
+        };
+        let lease_state = RuntimeQueueLeaseState {
+            schema: runtime_queue_leases_schema(),
+            leases: BTreeMap::from([
+                ("queue-a".to_string(), lease("queue-a", canonical)),
+                ("queue-b".to_string(), lease("queue-b", duplicate)),
+            ]),
+        };
+        write_runtime_queue_leases(&queue_dir, "interactive", &lease_state).unwrap();
+        let pending_before = fs::read(&pending_file).unwrap();
+        let leases_file = runtime_queue_leases_file(&queue_dir, "interactive");
+        let leases_before = fs::read(&leases_file).unwrap();
+
+        let report = inspect_runtime_session_identity(&harness_home).unwrap();
+        assert_eq!(report.collision_groups.len(), 1);
+        assert!(
+            report.entries.iter().any(|entry| {
+                entry.queue_id == "queue-pending"
+                    && entry.status == RuntimeSessionIdentityInventoryStatus::NeedsNormalization
+            }),
+            "inventory entries: {:?}; warnings: {:?}",
+            report.entries,
+            report.warnings
+        );
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(!serialized.contains("private-synthetic-root"));
+        assert_eq!(fs::read(&pending_file).unwrap(), pending_before);
+        assert_eq!(fs::read(&leases_file).unwrap(), leases_before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_session_identity_normalizes_before_dispatch_and_mismatch_fails_closed() {
+        let root = temp_root(
+            "pending_session_identity_normalizes_before_dispatch_and_mismatch_fails_closed",
+        );
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = queue_dir(&harness_home);
+        fs::create_dir_all(&queue_dir).unwrap();
+        let mut value = queued_item_value("queue-normalize");
+        let object = value.as_object_mut().unwrap();
+        object.insert(
+            "platform".to_string(),
+            Value::String("telegram".to_string()),
+        );
+        object.insert(
+            "accountId".to_string(),
+            Value::String("account-a".to_string()),
+        );
+        object.insert(
+            "channelId".to_string(),
+            Value::String("channel-a".to_string()),
+        );
+        object.insert("userId".to_string(), Value::String("user-a".to_string()));
+        object.insert("agentId".to_string(), Value::String("main".to_string()));
+        object.insert(
+            "sessionKey".to_string(),
+            Value::String("synthetic-root".to_string()),
+        );
+        let valid = parse_pending_item(&value).unwrap();
+        let mut invalid_value = value;
+        invalid_value["queueId"] = Value::String("queue-invalid".to_string());
+        invalid_value["sessionKey"] = Value::String("synthetic-root:acct-other".to_string());
+        let invalid = parse_pending_item(&invalid_value).unwrap();
+        let execution_receipts_file = queue_dir.join("execution-receipts.jsonl");
+        let mut items = vec![valid, invalid];
+        let mut warnings = Vec::new();
+
+        canonicalize_pending_items_for_dispatch(
+            &harness_home,
+            &execution_receipts_file,
+            &mut items,
+            2_000,
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].queue_id, "queue-normalize");
+        assert!(items[0].session_key.contains(":acct-"));
+        let receipts = fs::read_to_string(execution_receipts_file).unwrap();
+        assert!(receipts.contains("session-identity-normalized"));
+        assert!(receipts.contains("invalid-canonical-lane-quarantined"));
+        assert!(!receipts.contains("synthetic-root"));
+        assert!(matches!(
+            resolve_queue_terminal_control(
+                &harness_home,
+                "queue-invalid",
+                Some("synthetic-root:acct-other")
+            )
+            .unwrap(),
+            QueueTerminalControl::Terminal(_)
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9565,14 +10633,23 @@ mod tests {
             r#"{"codexContext":{"maxSuccessfulCompactsBeforeRollover":1}}"#,
         )
         .unwrap();
-        let old_session = "telegram:dm-42:user-7:main";
+        let old_session = crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+            "telegram:dm-42:user-7:main",
+            "telegram",
+            "default",
+            "dm-42",
+            "user-7",
+            "main",
+        )
+        .unwrap()
+        .canonical_string();
         enqueue_fixture_turn_with_session(
             &source,
             &harness_home,
             "telegram",
             "dm-42",
             "user-7",
-            old_session,
+            &old_session,
             "continue after compact",
             1234,
         );
@@ -9643,7 +10720,10 @@ mod tests {
             RuntimeExecutionReceiptStatus::Prepared
         );
         let item = report.item.unwrap();
-        assert_eq!(item.session_key, "telegram:dm-42:user-7:main:cont-1");
+        assert_eq!(
+            item.session_key,
+            crate::context_rollover::continuation_session_key(&old_session, 1)
+        );
         assert_eq!(item.continuation.continuation_index, Some(1));
         assert_eq!(
             item.continuation.completion_kind.as_deref(),
@@ -10180,6 +11260,7 @@ mod tests {
         let lease_state = RuntimeQueueLeaseState::default();
         let terminal_ids = HashSet::new();
         let auth_deferred_ids = HashSet::new();
+        let run_once_index = RuntimeQueueStateIndex::default();
         let mut prepared_ids = HashSet::new();
         let mut warnings = Vec::new();
 
@@ -10189,6 +11270,7 @@ mod tests {
             &prepared_ids,
             &terminal_ids,
             &auth_deferred_ids,
+            &run_once_index,
             &lease_state,
             "cron",
             &harness_home,
@@ -10207,6 +11289,7 @@ mod tests {
             &prepared_ids,
             &terminal_ids,
             &auth_deferred_ids,
+            &run_once_index,
             &lease_state,
             "cron",
             &harness_home,
@@ -10219,6 +11302,111 @@ mod tests {
         assert_eq!(second.queue_id, "cron-b-1");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_retry_schedule_survives_restart_and_does_not_block_other_lanes() {
+        let root =
+            temp_root("durable_retry_schedule_survives_restart_and_does_not_block_other_lanes");
+        let harness_home = root.join(".agent-harness");
+        let queue_dir = harness_home.join("state").join("runtime-queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        let mut index = RuntimeQueueStateIndex {
+            schema: runtime_queue_state_index_schema(),
+            revision: RUNTIME_QUEUE_STATE_INDEX_REVISION,
+            ..RuntimeQueueStateIndex::default()
+        };
+        index.queues.insert(
+            "cron-delayed".to_string(),
+            RuntimeQueueStateIndexEntry {
+                latest_status: Some("retry-pending".to_string()),
+                retry_schedule: Some(crate::RuntimeRetryScheduleV1 {
+                    lineage_id: "runtime-retry:cron-delayed".to_string(),
+                    attempt: 1,
+                    max_attempts: 3,
+                    delay_ms: 1_000,
+                    scheduled_at_ms: 1_000,
+                    next_eligible_at_ms: 2_000,
+                    replay_mode: crate::RuntimeRetryReplayModeV1::SameRequestNoObservableMutation,
+                }),
+                ..RuntimeQueueStateIndexEntry::default()
+            },
+        );
+        write_runtime_queue_state_index(&queue_dir, &index).unwrap();
+
+        let restarted = read_runtime_queue_state_index(&queue_dir).unwrap().unwrap();
+        assert!(retry_schedule_dispatch_blocker(&restarted, "cron-delayed", 1_500).is_some());
+        let pending = vec![
+            pending_cron_item("cron-delayed", "agent-a", 1_000),
+            pending_cron_item("cron-ready", "agent-b", 1_001),
+        ];
+        let selected = select_pending_item(
+            pending.clone(),
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &restarted,
+            &RuntimeQueueLeaseState::default(),
+            "cron",
+            &harness_home,
+            &queue_dir,
+            1_500,
+            &mut Vec::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.queue_id, "cron-ready");
+
+        let selected_after_backoff = select_pending_item(
+            pending,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &restarted,
+            &RuntimeQueueLeaseState::default(),
+            "cron",
+            &harness_home,
+            &queue_dir,
+            2_000,
+            &mut Vec::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected_after_backoff.queue_id, "cron-delayed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retry_pending_item_is_ineligible_until_persisted_not_before() {
+        let index = RuntimeQueueStateIndex {
+            queues: BTreeMap::from([(
+                "queue-retry".to_string(),
+                RuntimeQueueStateIndexEntry {
+                    latest_status: Some("retry-pending".to_string()),
+                    retry_schedule: Some(crate::RuntimeRetryScheduleV1 {
+                        lineage_id: "runtime-retry:queue-retry".to_string(),
+                        attempt: 1,
+                        max_attempts: 3,
+                        delay_ms: 1_000,
+                        scheduled_at_ms: 1_000,
+                        next_eligible_at_ms: 2_000,
+                        replay_mode:
+                            crate::RuntimeRetryReplayModeV1::SameRequestNoObservableMutation,
+                    }),
+                    ..RuntimeQueueStateIndexEntry::default()
+                },
+            )]),
+            ..RuntimeQueueStateIndex::default()
+        };
+        assert!(retry_schedule_dispatch_blocker(&index, "queue-retry", 1_999).is_some());
+        assert!(retry_schedule_dispatch_blocker(&index, "queue-retry", 2_000).is_none());
+    }
+
+    #[test]
+    fn retry_not_before_survives_restart_and_does_not_block_other_lane() {
+        durable_retry_schedule_survives_restart_and_does_not_block_other_lanes();
     }
 
     #[test]
@@ -10576,6 +11764,24 @@ mod tests {
         text: &str,
         now_ms: i64,
     ) {
+        enqueue_fixture_turn_for_account_with_session(
+            source,
+            harness_home,
+            account_id,
+            None,
+            text,
+            now_ms,
+        );
+    }
+
+    fn enqueue_fixture_turn_for_account_with_session(
+        source: &AgentSource,
+        harness_home: &Path,
+        account_id: &str,
+        session_key: Option<&str>,
+        text: &str,
+        now_ms: i64,
+    ) {
         let registry = load_agent_registry(source).unwrap();
         let skills = build_source_skill_index(source).unwrap();
         let turn = crate::build_turn_plan_for_account(
@@ -10591,7 +11797,7 @@ mod tests {
                 inbound_context: None,
                 inbound_media_artifacts: Vec::new(),
                 requested_agent_id: Some("main".to_string()),
-                session_hint: None,
+                session_hint: session_key.map(ToString::to_string),
                 skill_limit: 3,
             },
             Some(account_id.to_string()),
@@ -10923,6 +12129,17 @@ mod tests {
         )
         .unwrap();
 
+        let old_root_session =
+            crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+                "session-root-a",
+                "telegram",
+                "account-a",
+                "dm-a",
+                "user-a",
+                "main",
+            )
+            .unwrap()
+            .canonical_string();
         let old_root_lane = FullLaneKeyV1::new(
             "telegram",
             "account-a",
@@ -10930,8 +12147,8 @@ mod tests {
             "user-a",
             "main",
             "interactive",
-            "session-root-a",
-            "session-root-a",
+            root_working_session_key(&old_root_session),
+            &old_root_session,
         )
         .unwrap();
         crate::operation_plan::create_operation_plan_v2(
@@ -10940,7 +12157,7 @@ mod tests {
                     harness_home: harness_home.clone(),
                     plan_id: "old-root-plan".to_string(),
                     origin_queue_id: None,
-                    session_key: "session-root-a".to_string(),
+                    session_key: old_root_session.clone(),
                     agent_id: "main".to_string(),
                     goal: "old root only".to_string(),
                     acceptance_criteria: None,
@@ -11332,6 +12549,17 @@ mod tests {
             serde_json::from_slice(&fs::read(&item.prompt_bundle_json).unwrap()).unwrap();
         let manifest: crate::AgentPromptManifestV1 =
             serde_json::from_value(bundle["promptManifest"].clone()).unwrap();
+        let canonical_session =
+            crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+                session_key,
+                platform,
+                account_id,
+                channel_id,
+                user_id,
+                agent_id,
+            )
+            .unwrap()
+            .canonical_string();
         let expected_lane = FullLaneKeyV1::new(
             platform,
             account_id,
@@ -11339,8 +12567,8 @@ mod tests {
             user_id,
             agent_id,
             "interactive",
-            root_working_session_key(session_key),
-            session_key,
+            root_working_session_key(&canonical_session),
+            &canonical_session,
         )
         .unwrap();
         let expected_lane_digest = expected_lane.identity_hash().unwrap();

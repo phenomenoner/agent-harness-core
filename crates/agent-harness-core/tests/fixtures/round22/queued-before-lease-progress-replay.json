@@ -1,0 +1,17 @@
+{
+  "schema": "agent-harness.round22.queued-before-lease-progress-replay.v1",
+  "providers": ["telegram", "discord"],
+  "events": [
+    { "kind": "turn-a-lease-acquired", "atMs": 1000 },
+    { "kind": "turn-b-durable-admission", "atMs": 2000 },
+    { "kind": "turn-a-terminal", "atMs": 3000 },
+    { "kind": "turn-b-lease-acquired", "atMs": 4000 },
+    { "kind": "turn-b-managed-start", "atMs": 5000 }
+  ],
+  "expected": {
+    "beforeLeaseLifecycle": "queued",
+    "beforeLeaseManagedStarts": 0,
+    "workingIndicatorAtMs": 5000,
+    "providerSurfaceCountPerProvider": 1
+  }
+}

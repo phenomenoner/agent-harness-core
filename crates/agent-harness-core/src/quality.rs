@@ -64,12 +64,12 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I2",
-            statement: "every completed turn has exactly one delivery, explicit error notification, or dead-letter notification",
+            statement: "every logical turn lineage has exactly one delivery, explicit error notification, needs-user surface, or dead-letter notification; a continuation handoff is not a completed final",
             owner: "runtime_pipeline/channel_delivery",
         },
         InvariantEntry {
             id: "I3",
-            statement: "terminal states are irreversible, pending or retryable worker jobs already at their attempt cap become terminal before selection or lease, and append-only queued admission rows cannot override effective terminal state in sibling guards",
+            statement: "terminal states are irreversible, pending or retryable work at its attempt cap becomes terminal before selection or lease, append-only queued admission rows cannot override effective terminal state, and typed continuation/external-effect states never resurrect a fenced parent generation",
             owner: "runtime_pipeline/workers",
         },
         InvariantEntry {
@@ -79,8 +79,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I5",
-            statement: "crash recovery loses no work and duplicates no side effects",
-            owner: "queue_shadow/supervision",
+            statement: "crash recovery loses no work and duplicates no side effects; retry schedules, task/effect dispositions, commit-before-enqueue continuation intents, and readback-required ambiguous mutations remain reconstructable",
+            owner: "queue_shadow/supervision/runtime_worker/runtime_pipeline/goal_continuation/external_effect",
         },
         InvariantEntry {
             id: "I6",
@@ -104,8 +104,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I10",
-            statement: "active Codex tool-use idle timeouts and productive absolute turn timeouts are routed through bounded recovery or virtual-session continuation; the final deadline window drains work and defers late steering instead of starting another long action",
-            owner: "codex_runtime/runtime_pipeline/trace/context_rollover/prompt",
+            statement: "active Codex tool-use idle timeouts, productive absolute turn timeouts, and approval-required MCP elicitations are routed through bounded typed recovery; the final deadline window drains work to exact task authority and defers late steering instead of starting another long action",
+            owner: "codex_runtime/runtime_pipeline/task_transition/external_effect/trace/context_rollover/prompt",
         },
         InvariantEntry {
             id: "I11",
@@ -139,8 +139,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I17",
-            statement: "durable control artifacts are authoritative before runtime execution, progress delivery, restart consumption, and sender-class cron notification; deterministic cron uses one exact source, timezone/calendar evaluation, bounded per-entry execution policy, stable occurrence identity, and explicit catch-up authority",
-            owner: "runtime_worker/runtime_pipeline/runtime_queue/progress/channel_runtime/dream_director/cron_scheduler/deterministic_cron",
+            statement: "durable control artifacts are authoritative before runtime execution, retry eligibility, task/effect continuation, progress delivery, restart consumption, and sender-class cron notification; stop/newer steer/expiry fence connector capabilities and exact task authority is revalidated before child admission",
+            owner: "runtime_worker/runtime_pipeline/runtime_queue/progress/channel_runtime/task_transition/external_effect/dream_director/cron_scheduler/deterministic_cron",
         },
         InvariantEntry {
             id: "I18",
@@ -209,8 +209,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I31",
-            statement: "the exact Codex 0.144.5 JSON-RPC surface is fixture-locked for initialization, thread and turn lifecycle, token/context accounting, goals, compact, auth, capabilities, web-search items, and error/null behavior; upstream completion without exact operation correlation cannot close a harness compact or goal transition",
-            owner: "codex_protocol_compat/codex_runtime/context_rollover/coordinator_resume/goal",
+            statement: "the exact Codex 0.144.5 JSON-RPC surface is fixture-locked for initialization, thread and turn lifecycle, token/context accounting, goals, compact, auth, capabilities, web-search items, MCP elicitation responses, and error/null behavior; upstream completion without exact correlation cannot close compact, task/goal transition, or external mutation",
+            owner: "codex_protocol_compat/codex_runtime/context_rollover/coordinator_resume/goal/task_transition/external_effect",
         },
         InvariantEntry {
             id: "I32",
@@ -239,8 +239,8 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I37",
-            statement: "every goal slice event passes one transition table before final-outbox selection; active campaigns commit one deterministic exact-lane continuation intent before enqueue, reconcile restart/replay to one child, keep campaign slice generation separate from recovery depth, and acknowledge only after child lease ownership",
-            owner: "goal_transition/goal_continuation/runtime_pipeline/context_rollover/runtime_worker",
+            statement: "every goal or typed deadline-drain task completion passes transition authority before final-outbox selection; authorized work commits one deterministic exact-lane continuation intent before enqueue, reconciles restart/replay to one child, keeps campaign generation separate from recovery depth, and acknowledges only after child lease ownership",
+            owner: "goal_transition/task_transition/goal_continuation/runtime_pipeline/context_rollover/runtime_worker",
         },
         InvariantEntry {
             id: "I38",
@@ -255,7 +255,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.runtime-run-once.v1",
             owner_module: "runtime_pipeline",
-            compatibility: "append-only JSONL, additive fields and statuses only in v1 including nonterminal auth-deferred plus deterministic eventKey retry-pending wakes; auth-deferred is non-claimable, non-deliverable, and excluded from retry accounting until its wake",
+            compatibility: "append-only JSONL, additive fields and statuses only in v1 including terminalDisposition, continuationLink, retrySchedule, taskDrainEvaluation, externalEffect, nonterminal auth-deferred, and deterministic eventKey retry-pending wakes; active retry sequences remain hot through compaction while terminal summaries use nullable cold-history disposition columns",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.ledger-maintenance.v1",
@@ -265,7 +265,7 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.codex-runtime-run.v1",
             owner_module: "codex_runtime",
-            compatibility: "append-only JSONL plus per-execution JSON; v1 accepts additive recovery fields such as toolUseTimeout, interruptionReason, interruptedToolUses, and contextRecovery.threadHealthStatus; productive absolute timeout classification uses bounded stdout evidence rather than eventCount alone",
+            compatibility: "append-only JSONL plus per-execution JSON; v1 accepts bounded additive recovery fields such as toolUseTimeout, interruptionReason, interruptedToolUses, protocolFailure, drainCheckpoint, externalEffect, and contextRecovery.threadHealthStatus; productive absolute timeout classification uses bounded stdout evidence rather than eventCount alone",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.codex-backend-provenance.v1",
@@ -455,7 +455,42 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.goal-continuation-intent.v1",
             owner_module: "goal_continuation/runtime_pipeline",
-            compatibility: "append-only commit/enqueue/ack lifecycle; deterministic intent key and exact authority axes are immutable, and one intent owns at most one child",
+            compatibility: "append-only commit/enqueue/ack lifecycle shared by goal, OperationPlan deadline-drain, and external-effect continuations; deterministic intent key and exact authority axes are immutable, and one intent owns at most one child",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.task-continuation-checkpoint.v1",
+            owner_module: "task_transition/codex_runtime",
+            compatibility: "bounded typed assistant marker; authority kind/id/version, active item id/version, checkpoint body, and lowercase SHA-256 digest are immutable; the marker is removed from visible assistant output after validation",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.task-transition.v1",
+            owner_module: "task_transition/runtime_pipeline",
+            compatibility: "additive drain evaluation embedded in runtime receipts; exact-lane authority snapshot and breaker disposition are immutable for one source completion",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.external-effect-intent.v1",
+            owner_module: "external_effect/codex_runtime/runtime_pipeline",
+            compatibility: "append-only effect generation keyed by exact lane, logical lineage, source queue, connector/action, and parameter digest; state transitions are monotonic/fenced and public serialization excludes bearer approval tokens",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.external-effect-transition.v1",
+            owner_module: "external_effect",
+            compatibility: "append-only transition evidence; effect id, prior/next state, exact lane digest, and parameter digest remain stable while bounded reasons are additive",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.connector-approval-token.v1",
+            owner_module: "external_effect/channel_runtime",
+            compatibility: "protected latest-state capability only; token digest, exact lane/action/parameter binding, expiry, and consumption are immutable, raw bearer values are forbidden from generic receipts and public serialization",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.github-issue-readback-evidence.v1",
+            owner_module: "external_effect",
+            compatibility: "bounded connector-specific readback evidence contains only the approved parameter digest, query-completeness bit, and opaque effect markers; incomplete queries can never prove absence",
+        },
+        SchemaRegistryEntry {
+            schema: "agent-harness.provider-idempotency-readback-evidence.v1",
+            owner_module: "external_effect",
+            compatibility: "bounded provider readback evidence is exact-bound to connector, action, parameter digest, and stable effect-derived idempotency key; any mismatch fails closed",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.goal-terminal-outbox.v1",
@@ -1176,6 +1211,84 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
                 "codex_runtime::tests::managed_reasoning_ignores_late_compact_turn_completed_during_capability_handshake",
             ],
             promotion_gate: "Run the focused deadline-drain, absolute-timeout, sibling-state, and compact-handshake regressions plus the broader codex-runtime/context-rollover/runtime-pipeline packs. Live promotion remains a separate operator-authorized cutover with exact-lane receipts and rollback evidence.",
+        },
+        ScenarioMatrixEntry {
+            id: "round22-runtime-continuity",
+            title: "Exact-lane ingress, durable retry, and typed task continuation",
+            changed_areas: vec![
+                "channel ingress and session identity",
+                "runtime queue ordering",
+                "progress lifecycle",
+                "provider retry",
+                "OperationPlan deadline drain",
+                "terminal history",
+            ],
+            required_invariants: vec![
+                "I2", "I3", "I5", "I7", "I9", "I10", "I13", "I17", "I22", "I31", "I35", "I37",
+            ],
+            required_evidence: vec![
+                "account and canonical session identity survive ingress, state, prompt, queue, and restart without cross-lane fallback",
+                "same-session work remains FIFO and queued/working/continuing/terminal progress states remain distinct",
+                "structured server overload with no observable mutation persists a bounded not-before schedule while other lanes remain runnable",
+                "mutation-observed overload uses exact-lane continuation instead of blind request replay",
+                "retry lineage, attempt, and eligibility survive restart and the required hot-retention compaction path",
+                "a deadline-drain checkpoint for an open exact-lane OperationPlan running/review item commits one intent, reconciles one child after restart, and emits one eventual final",
+                "todo/ready, stale, wrong-lane, stopped, superseded, or breaker-exhausted plan state cannot auto-loop",
+            ],
+            runnable_tests: vec![
+                "round22_fixture_integrity::round22_replay_fixtures_are_checksum_bound_and_sanitized",
+                "turns::tests::account_binding_is_idempotent_for_account_bound_root",
+                "runtime_worker::tests::explicit_runtime_queue_id_cannot_overtake_older_same_session_turn",
+                "runtime_pipeline::tests::server_overloaded_no_mutation_schedules_retry_instead_of_attempt_one_terminal",
+                "runtime_pipeline::tests::server_overloaded_after_mutation_uses_continuation_not_prompt_replay",
+                "runtime_worker::tests::retry_not_before_survives_restart_and_does_not_block_other_lane",
+                "runtime_receipt_history::tests::retry_lineage_and_schedule_survive_required_retention_path",
+                "task_transition::tests::open_operation_plan_running_item_and_typed_checkpoint_require_continuation",
+                "task_transition::tests::todo_ready_or_terminal_plan_work_does_not_auto_loop",
+                "task_transition::tests::wrong_lane_stale_authority_or_breakers_fail_closed",
+                "task_transition::tests::blocked_completed_or_canceled_plan_never_auto_loops",
+                "task_transition::tests::plan_change_before_child_admission_invalidates_snapshot",
+                "runtime_pipeline::tests::deadline_drain_operation_plan_replay_creates_one_child_and_one_eventual_final",
+            ],
+            promotion_gate: "Run the Round22 sanitized fixture integrity test, focused identity/FIFO/progress/retry packs, and the real app-server deadline-drain replay twice with restart and compaction evidence before candidate promotion.",
+        },
+        ScenarioMatrixEntry {
+            id: "external-effect-approval",
+            title: "MCP elicitation authority and exactly-once external effects",
+            changed_areas: vec![
+                "Codex app-server MCP protocol",
+                "connector approval policy",
+                "channel command authority",
+                "external mutation retry",
+                "progress and terminal delivery",
+            ],
+            required_invariants: vec![
+                "I2", "I3", "I5", "I6", "I7", "I9", "I10", "I17", "I31", "I37",
+            ],
+            required_evidence: vec![
+                "recognized MCP elicitation receives exactly one protocol-valid response and parks promptly instead of reaching generic tool idle timeout",
+                "missing authority creates one token-bound NeedsUser surface with zero mutation and zero blind retry",
+                "approve/deny commands are exact-lane bound, bearer tokens are absent from public receipts, and repeated approval schedules at most one child",
+                "approved resume submits once and connector completion confirms once across restart/replay",
+                "stop, newer steer, expiry, wrong lane, or digest mismatch fences the capability",
+                "submitted but unconfirmed effects require connector readback; unprovable absence becomes ambiguous and needs user authority",
+                "WaitingForApproval is distinct from queued, working, continuing, done, and error on Telegram and Discord",
+            ],
+            runnable_tests: vec![
+                "codex_protocol_compat::tests::exact_0_144_5_protocol_fixture_covers_cross_cutting_contracts",
+                "codex_runtime::tests::mcp_elicitation_is_answered_once_and_parked_as_approval_required",
+                "codex_runtime::tests::mcp_elicitation_fake_app_server_parks_then_submits_exactly_once",
+                "codex_runtime::tests::approved_mcp_elicitation_submits_once_and_item_completion_confirms",
+                "codex_runtime::tests::malformed_mcp_elicitation_fails_closed_without_timeout",
+                "channel_runtime::tests::channel_external_effect_commands_are_exact_lane_bound_and_idempotent",
+                "external_effect::tests::action_token_is_exact_lane_expiring_and_single_use",
+                "external_effect::tests::submitted_effect_requires_readback_before_resubmission",
+                "external_effect::tests::restart_at_every_effect_state_converges_without_duplicate_submission",
+                "external_effect::tests::connector_specific_readback_adapters_are_exactly_bound_and_fail_closed",
+                "external_effect::tests::stop_or_expiry_fences_pending_capabilities_without_cross_lane_effects",
+                "progress::tests::telegram_and_discord_waiting_for_approval_stays_distinct_from_other_lifecycles",
+            ],
+            promotion_gate: "Run the exact 0.144.5 fixture plus the fake MCP server park/approve/submit/confirm replay, channel token isolation matrix, readback ambiguity matrix, and provider progress renderers; live connector mutation requires an explicitly authorized bounded smoke and readback receipt.",
         },
         ScenarioMatrixEntry {
             id: "skill-selection-anchor-dedupe",

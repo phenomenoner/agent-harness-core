@@ -17,6 +17,7 @@ pub mod channel_identity;
 pub mod channel_ingress;
 pub mod channel_pipeline;
 pub mod channel_runtime;
+pub mod channel_session_key;
 pub mod channel_state;
 pub mod child_execution_policy;
 pub mod codex_backend_provenance;
@@ -34,6 +35,7 @@ pub mod deploy;
 pub mod deterministic_cron;
 pub mod dream_director;
 pub mod execution_mode;
+pub mod external_effect;
 pub mod goal_budget;
 pub mod goal_continuation;
 pub mod goal_lineage;
@@ -77,6 +79,7 @@ pub mod runtime_pipeline;
 pub mod runtime_policy;
 pub mod runtime_queue;
 pub(crate) mod runtime_receipt_history;
+pub mod runtime_terminal;
 pub mod runtime_worker;
 pub mod security;
 pub mod self_improvement;
@@ -105,6 +108,7 @@ pub mod subagents;
 pub mod supervision;
 pub mod supervisor;
 pub mod supervisor_inventory;
+pub mod task_transition;
 pub mod token_efficiency;
 pub mod trace;
 pub mod turns;
@@ -233,20 +237,21 @@ pub use codex_runtime::{
     AssistantNarrationConfig, AssistantNarrationMode, CodexApprovalPolicy,
     CodexApprovalPolicyInspection, CodexAssistantNarration,
     CodexBackendReasoningExecutionReference, CodexEnvRequirement, CodexInvocationPlan,
-    CodexOutputPlan, CodexPromptAuthority, CodexPromptAuthorityRole, CodexProviderConfig,
-    CodexRuntimeCompletionOptions, CodexRuntimeCompletionReceipt, CodexRuntimeCompletionReport,
-    CodexRuntimeCompletionStatus, CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReceipt,
-    CodexRuntimeLaunchProbeReport, CodexRuntimeLaunchProbeStatus, CodexRuntimeLaunchProcess,
-    CodexRuntimePlan, CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimePreflightCheck,
+    CodexOutputPlan, CodexPromptAuthority, CodexPromptAuthorityRole, CodexProtocolFailureClass,
+    CodexProtocolFailureV1, CodexProviderConfig, CodexRuntimeCompletionOptions,
+    CodexRuntimeCompletionReceipt, CodexRuntimeCompletionReport, CodexRuntimeCompletionStatus,
+    CodexRuntimeLaunchProbeOptions, CodexRuntimeLaunchProbeReceipt, CodexRuntimeLaunchProbeReport,
+    CodexRuntimeLaunchProbeStatus, CodexRuntimeLaunchProcess, CodexRuntimePlan,
+    CodexRuntimePlanOptions, CodexRuntimePlanReport, CodexRuntimePreflightCheck,
     CodexRuntimePreflightCheckStatus, CodexRuntimePreflightOptions, CodexRuntimePreflightReceipt,
     CodexRuntimePreflightReport, CodexRuntimePreflightStatus, CodexRuntimeReceipt,
     CodexRuntimeReceiptStatus, CodexRuntimeRunOptions, CodexRuntimeRunReceipt,
     CodexRuntimeRunReport, CodexRuntimeRunStatus, CodexSandboxInspection, CodexTransportPlan,
     CodexTurnSteerQueueStatus, CodexTurnSteerRequestOptions, CodexTurnSteerRequestReport,
-    inspect_codex_approval_policy, inspect_codex_sandbox, inspect_codex_sandbox_policy,
-    load_assistant_narration_config, plan_codex_runtime, preflight_codex_runtime,
-    probe_codex_runtime_launch, queue_codex_turn_steer_request, record_codex_runtime_completion,
-    run_codex_runtime,
+    RuntimeMutationEvidenceClass, inspect_codex_approval_policy, inspect_codex_sandbox,
+    inspect_codex_sandbox_policy, load_assistant_narration_config, plan_codex_runtime,
+    preflight_codex_runtime, probe_codex_runtime_launch, queue_codex_turn_steer_request,
+    record_codex_runtime_completion, run_codex_runtime,
 };
 pub use config::{
     HARNESS_CONFIG_FILE_NAME, HarnessConfigValidationReport, HarnessConfigValidationStatus,
@@ -316,6 +321,22 @@ pub use dream_director::{
     DreamDirectorSendReport, dream_director_daily_state_dir, dream_director_send_receipt_file,
     run_dream_director_send,
 };
+pub use external_effect::{
+    CONNECTOR_APPROVAL_TOKEN_SCHEMA, ConnectorApprovalModeV1, ConnectorApprovalPolicyV1,
+    ConnectorApprovalRuleV1, ConnectorApprovalTokenV1, EXTERNAL_EFFECT_INTENT_SCHEMA,
+    EXTERNAL_EFFECT_TRANSITION_SCHEMA, ExternalEffectAdmissionV1, ExternalEffectApprovalDecisionV1,
+    ExternalEffectContinuationV1, ExternalEffectIntentV1, ExternalEffectReadbackAdapter,
+    ExternalEffectReadbackV1, ExternalEffectRequestContextV1, ExternalEffectStateV1,
+    ExternalEffectTransitionV1, GITHUB_ISSUE_READBACK_EVIDENCE_SCHEMA,
+    GithubIssueReadbackAdapterV1, GithubIssueReadbackEvidenceV1, McpElicitationDescriptorV1,
+    PROVIDER_IDEMPOTENCY_READBACK_EVIDENCE_SCHEMA, ProviderIdempotencyReadbackAdapterV1,
+    ProviderIdempotencyReadbackEvidenceV1, ProviderIdempotencyReadbackStateV1,
+    begin_external_effect_request, ensure_external_effect_continuation,
+    external_effect_idempotency_key, external_effect_mutation_evidence,
+    external_effect_transition_file, fence_external_effects_for_lane, github_issue_effect_marker,
+    load_connector_approval_policy, load_external_effect_intent, parse_mcp_elicitation_descriptor,
+    reconcile_external_effect, resolve_external_effect_approval, transition_external_effect,
+};
 pub use goal_budget::{
     GOAL_CAMPAIGN_BUDGET_SCHEMA, GOAL_CAMPAIGN_STATUS_SCHEMA, GoalCampaignBudgetBoundary,
     GoalCampaignBudgetInput, GoalCampaignBudgetReceiptV1, GoalCampaignPolicyV1,
@@ -324,10 +345,10 @@ pub use goal_budget::{
 };
 pub use goal_continuation::{
     GOAL_CONTINUATION_INTENT_SCHEMA, GoalAutonomyActivation, GoalAutonomyMode,
-    GoalContinuationIntentStatus, GoalContinuationIntentV1,
+    GoalContinuationIntentStatus, GoalContinuationIntentV1, TASK_CONTINUATION_INTENT_SCHEMA,
     acknowledge_goal_continuation_after_lease, commit_goal_continuation_intent,
-    ensure_goal_continuation_enqueued, goal_continuation_intents_file,
-    latest_goal_continuation_intent, load_goal_autonomy_activation,
+    commit_task_continuation_intent, ensure_goal_continuation_enqueued,
+    goal_continuation_intents_file, latest_goal_continuation_intent, load_goal_autonomy_activation,
     reconcile_goal_continuation_intents,
 };
 pub use goal_lineage::{
@@ -546,8 +567,8 @@ pub use progress::{
     AgentProgressDeliveryStatus, AgentProgressEvent, AgentProgressEventIdentity,
     AgentProgressHistoryCompactionOptions, AgentProgressHistoryCompactionReport,
     AgentProgressHistoryLookupReport, AgentProgressHistoryRecord, AgentProgressHistoryStorage,
-    AgentProgressKind, AgentProgressSessionSupersedeOptions, AgentProgressSessionSupersedeReport,
-    AgentProgressStatus, DEFAULT_AGENT_PROGRESS_HOT_MAX_BYTES,
+    AgentProgressKind, AgentProgressLifecycle, AgentProgressSessionSupersedeOptions,
+    AgentProgressSessionSupersedeReport, AgentProgressStatus, DEFAULT_AGENT_PROGRESS_HOT_MAX_BYTES,
     DEFAULT_AGENT_PROGRESS_HOT_RETAINED_TERMINAL_QUEUES, agent_progress_delivery_receipts_file,
     agent_progress_delivery_state_file, agent_progress_events_file, agent_progress_history_file,
     agent_progress_history_maintenance_state_file, agent_progress_history_marker_file,
@@ -611,6 +632,10 @@ pub use runtime_queue::{
     RuntimeQueueReceiptStatus, RuntimeQueueSource, RuntimeQueueSourceKind,
     control_runtime_queue_item, enqueue_channel_step, enqueue_channel_step_v2,
 };
+pub use runtime_terminal::{
+    RuntimeContinuationLinkV1, RuntimeRetryReplayModeV1, RuntimeRetryScheduleV1,
+    RuntimeTerminalDispositionV1,
+};
 pub use runtime_worker::{
     RuntimeDispatchClassConfig, RuntimeDispatchConfig, RuntimeExecutionReceipt,
     RuntimeExecutionReceiptStatus, RuntimeQueueCapacityOptions, RuntimeQueueCapacityReport,
@@ -619,10 +644,12 @@ pub use runtime_worker::{
     RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeQueuePreparedItem,
     RuntimeQueueReceiptCompactionOptions, RuntimeQueueReceiptCompactionReport,
     RuntimeQueueReceiptCompactionStatus, RuntimeQueueTypingContext,
-    compact_runtime_queue_receipts_if_needed, inspect_runtime_queue_capacity,
-    load_runtime_dispatch_config, observe_runtime_queue_lease, prepare_runtime_queue_item,
-    release_runtime_queue_lease, resolve_runtime_queue_terminal_ids,
-    resolve_runtime_queue_terminal_ids_nonblocking,
+    RuntimeSessionIdentityCollisionGroup, RuntimeSessionIdentityInventoryEntry,
+    RuntimeSessionIdentityInventoryReport, RuntimeSessionIdentityInventorySource,
+    RuntimeSessionIdentityInventoryStatus, compact_runtime_queue_receipts_if_needed,
+    inspect_runtime_queue_capacity, inspect_runtime_session_identity, load_runtime_dispatch_config,
+    observe_runtime_queue_lease, prepare_runtime_queue_item, release_runtime_queue_lease,
+    resolve_runtime_queue_terminal_ids, resolve_runtime_queue_terminal_ids_nonblocking,
     resolve_runtime_queue_typing_context_nonblocking, write_runtime_queue_quarantine_marker,
 };
 pub use security::{SecurityScanOptions, SecurityScanReport, scan_security_boundaries};
@@ -762,6 +789,13 @@ pub use supervisor_inventory::{
     SupervisorInventoryOptions, SupervisorInventoryReport, SupervisorInventoryServiceConfig,
     SupervisorInventoryServiceSummary, SupervisorInventoryStatus, SupervisorLaunchCommand,
     reconcile_supervisor_inventory,
+};
+pub use task_transition::{
+    ContinuationAuthorityKindV1, ContinuationAuthoritySnapshotV1, DrainDispositionV1,
+    OperationPlanAuthorityOptions, TASK_CONTINUATION_CHECKPOINT_SCHEMA,
+    TASK_CONTINUATION_MARKER_CLOSE, TASK_CONTINUATION_MARKER_OPEN, TASK_TRANSITION_SCHEMA,
+    TaskContinuationBreakers, TaskContinuationCheckpointV1, TaskDrainEvaluationV1,
+    evaluate_operation_plan_drain, extract_task_continuation_checkpoint, logical_complete_drain,
 };
 pub use token_efficiency::{
     PromptReductionOptions, PromptReductionReport, TokenEfficiencyOptions, TokenEfficiencyReport,
