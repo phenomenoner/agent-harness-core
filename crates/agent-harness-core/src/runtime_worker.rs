@@ -9972,10 +9972,29 @@ mod tests {
         );
         object.insert("userId".to_string(), Value::String("user-a".to_string()));
         object.insert("agentId".to_string(), Value::String("main".to_string()));
-        object.insert(
-            "sessionKey".to_string(),
-            Value::String("synthetic-root".to_string()),
+        let canonical = crate::channel_session_key::CanonicalChannelSessionKey::bind_for_lane(
+            "synthetic-root",
+            "telegram",
+            "account-a",
+            "channel-a",
+            "user-a",
+            "main",
+        )
+        .unwrap()
+        .continuation(1)
+        .unwrap()
+        .canonical_string();
+        let legacy_duplicate = format!(
+            "{canonical}:{}",
+            crate::channel_session_key::expected_account_binding(
+                "telegram",
+                "account-a",
+                "channel-a",
+                "user-a",
+                "main",
+            )
         );
+        object.insert("sessionKey".to_string(), Value::String(legacy_duplicate));
         let valid = parse_pending_item(&value).unwrap();
         let mut invalid_value = value;
         invalid_value["queueId"] = Value::String("queue-invalid".to_string());
@@ -9996,7 +10015,8 @@ mod tests {
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].queue_id, "queue-normalize");
-        assert!(items[0].session_key.contains(":acct-"));
+        assert_eq!(items[0].session_key, canonical);
+        assert_eq!(items[0].session_key.matches(":acct-").count(), 1);
         let receipts = fs::read_to_string(execution_receipts_file).unwrap();
         assert!(receipts.contains("session-identity-normalized"));
         assert!(receipts.contains("invalid-canonical-lane-quarantined"));

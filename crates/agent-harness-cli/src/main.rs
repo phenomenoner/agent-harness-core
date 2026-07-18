@@ -19964,9 +19964,12 @@ fn multipart_http_error(service: &str, error: ureq::Error) -> String {
     match error {
         ureq::Error::Status(code, response) => {
             let body = response.into_string().unwrap_or_default();
-            format!("{service} HTTP status {code}: {body}")
+            format!(
+                "{service} HTTP status {code}: {}",
+                redact_provider_error_urls(&body)
+            )
         }
-        ureq::Error::Transport(error) => format!("{service} transport error: {error}"),
+        ureq::Error::Transport(error) => provider_transport_error(service, &error),
     }
 }
 
@@ -19974,10 +19977,60 @@ fn telegram_http_error(error: ureq::Error) -> String {
     match error {
         ureq::Error::Status(code, response) => {
             let body = response.into_string().unwrap_or_default();
-            format!("Telegram HTTP status {code}: {body}")
+            format!(
+                "Telegram HTTP status {code}: {}",
+                redact_provider_error_urls(&body)
+            )
         }
-        ureq::Error::Transport(error) => format!("Telegram transport error: {error}"),
+        ureq::Error::Transport(error) => provider_transport_error("Telegram", &error),
     }
+}
+
+fn provider_transport_error(service: &str, error: &ureq::Transport) -> String {
+    let mut detail = error.kind().to_string();
+    if let Some(message) = error
+        .message()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        detail.push_str(": ");
+        detail.push_str(message);
+    }
+    if let Some(source) = std::error::Error::source(error) {
+        let source = source.to_string();
+        if !source.trim().is_empty() {
+            detail.push_str(": ");
+            detail.push_str(&source);
+        }
+    }
+    format!(
+        "{service} transport error: {}",
+        redact_provider_error_urls(&detail)
+    )
+}
+
+fn redact_provider_error_urls(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut remaining = value;
+    loop {
+        let next_http = remaining.find("http://");
+        let next_https = remaining.find("https://");
+        let next = match (next_http, next_https) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(index), None) | (None, Some(index)) => Some(index),
+            (None, None) => None,
+        };
+        let Some(start) = next else {
+            output.push_str(remaining);
+            break;
+        };
+        output.push_str(&remaining[..start]);
+        let url = &remaining[start..];
+        let end = url.find(char::is_whitespace).unwrap_or(url.len());
+        output.push_str("[redacted-provider-url]");
+        remaining = &url[end..];
+    }
+    output
 }
 
 fn discord_bot_token(harness_home: &Path, account_id: Option<&str>) -> Result<String, String> {
@@ -20897,9 +20950,12 @@ fn discord_http_error(error: ureq::Error) -> String {
     match error {
         ureq::Error::Status(code, response) => {
             let body = response.into_string().unwrap_or_default();
-            format!("Discord HTTP status {code}: {body}")
+            format!(
+                "Discord HTTP status {code}: {}",
+                redact_provider_error_urls(&body)
+            )
         }
-        ureq::Error::Transport(error) => format!("Discord transport error: {error}"),
+        ureq::Error::Transport(error) => provider_transport_error("Discord", &error),
     }
 }
 
@@ -27663,6 +27719,24 @@ mod tests {
             ChannelDeliveryPresentationFallbackReason::ProviderFallback
         );
         assert!(presentation.full_text_preserved);
+    }
+
+    #[test]
+    fn provider_error_url_redaction_removes_transport_credentials() {
+        let secret = "123456789:synthetic-secret";
+        let error = format!(
+            "request https://provider.invalid/private/{secret}: Network Error; retry http://user:password@example.invalid/private"
+        );
+
+        let redacted = redact_provider_error_urls(&error);
+
+        assert_eq!(
+            redacted,
+            "request [redacted-provider-url] Network Error; retry [redacted-provider-url]"
+        );
+        assert!(!redacted.contains(secret));
+        assert!(!redacted.contains("password"));
+        assert!(!redacted.contains("provider.invalid"));
     }
 
     #[test]
