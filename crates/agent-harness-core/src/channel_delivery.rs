@@ -304,12 +304,12 @@ pub struct ChannelDeliveryPresentationReceipt {
 }
 
 impl ChannelDeliveryPresentationReceipt {
-    pub fn rendered(provider_render_mode: impl Into<String>) -> Self {
+    pub fn rendered(provider_render_mode: impl Into<String>, full_text_preserved: bool) -> Self {
         Self {
             present: true,
             provider_render_mode: Some(provider_render_mode.into()),
             fallback_reason: ChannelDeliveryPresentationFallbackReason::None,
-            full_text_preserved: true,
+            full_text_preserved,
         }
     }
 
@@ -1719,6 +1719,7 @@ mod tests {
             ],
             presentation: Some(ChannelDeliveryPresentationReceipt::rendered(
                 "telegram:parse_mode=HTML",
+                true,
             )),
         })
         .unwrap();
@@ -2120,5 +2121,26 @@ mod tests {
                 allow_fallback_text: true,
             },
         }
+    }
+
+    #[test]
+    fn rendered_presentation_receipt_keeps_explicit_preservation_proof() {
+        let proven = ChannelDeliveryPresentationReceipt::rendered(
+            "discord:safe-markdown;allowed_mentions.parse=[]",
+            true,
+        );
+        let unproven = ChannelDeliveryPresentationReceipt::rendered(
+            "discord:safe-markdown;allowed_mentions.parse=[]",
+            false,
+        );
+
+        assert!(proven.present);
+        assert!(proven.full_text_preserved);
+        assert!(unproven.present);
+        assert!(!unproven.full_text_preserved);
+        assert_eq!(
+            serde_json::to_value(unproven).unwrap()["fullTextPreserved"],
+            false
+        );
     }
 }

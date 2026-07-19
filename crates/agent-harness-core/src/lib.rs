@@ -606,12 +606,14 @@ pub use response_tone::{
     load_response_tone_config, parse_emoji_accent_mode,
 };
 pub use rich_presentation::{
+    PlainFinalBridgeLossReason, PlainFinalBridgePlan, PlainFinalPresentationAssessment,
     RICH_MESSAGE_PRESENTATION_SCHEMA, RenderedDiscordPresentation, RenderedRichBatch,
     RenderedRichUnit, RenderedRichUnitKind, RenderedTelegramPresentation, RichMessagePresentation,
     RichPresentationAction, RichPresentationActionKind, RichPresentationAtomicity,
     RichPresentationBlock, RichPresentationDeliveryPolicy, RichPresentationField,
     RichPresentationLinkPreview, RichPresentationLinkPreviewMode, RichPresentationMediaRef,
     RichPresentationTextStyle, RichPresentationValidationError, RichPresentationValidationOptions,
+    assess_plain_final_presentation, plan_plain_final_presentation,
     render_rich_presentation_batch_for_discord, render_rich_presentation_batch_for_telegram,
     render_rich_presentation_for_discord, render_rich_presentation_for_telegram,
     rich_presentation_from_plain_final, rich_presentation_from_plain_final_with_attachment_count,

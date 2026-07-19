@@ -15,6 +15,30 @@ const MAX_FIELD_VALUE_CHARS: usize = 1_000;
 const MAX_ACTION_LABEL_CHARS: usize = 80;
 const DISCORD_CONTENT_LIMIT: usize = 2_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlainFinalBridgeLossReason {
+    BlockLimit,
+    ParagraphBudget,
+    CodeBudget,
+    ListBudget,
+    ListItemLimit,
+    IncompleteBufferedContent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlainFinalBridgePlan {
+    Empty,
+    Rich(RichMessagePresentation),
+    PlainFallback(PlainFinalBridgeLossReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlainFinalPresentationAssessment {
+    ProvenComplete,
+    LegacyLossy(PlainFinalBridgeLossReason),
+    NotAutomaticPlainBridge,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RichMessagePresentation {
@@ -279,12 +303,22 @@ pub fn rich_presentation_from_plain_final_with_attachment_count(
     text: &str,
     attachment_count: usize,
 ) -> Option<RichMessagePresentation> {
+    match plan_plain_final_presentation(text, attachment_count) {
+        PlainFinalBridgePlan::Rich(presentation) => Some(presentation),
+        PlainFinalBridgePlan::Empty | PlainFinalBridgePlan::PlainFallback(_) => None,
+    }
+}
+
+pub fn plan_plain_final_presentation(text: &str, attachment_count: usize) -> PlainFinalBridgePlan {
     let text = text.trim();
     if text.is_empty() {
-        return None;
+        return PlainFinalBridgePlan::Empty;
     }
     let fallback_text = truncate_chars(text, MAX_FALLBACK_TEXT_CHARS);
-    let blocks = rich_blocks_from_plain_final(text);
+    let blocks = match rich_blocks_from_plain_final(text) {
+        Ok(blocks) => blocks,
+        Err(reason) => return PlainFinalBridgePlan::PlainFallback(reason),
+    };
     let media = (0..attachment_count)
         .map(|index| RichPresentationMediaRef {
             attachment_index: Some(index),
@@ -309,8 +343,36 @@ pub fn rich_presentation_from_plain_final_with_attachment_count(
             ..RichPresentationValidationOptions::default()
         },
     )
-    .ok()
-    .map(|_| presentation)
+    .map(|_| PlainFinalBridgePlan::Rich(presentation))
+    .unwrap_or(PlainFinalBridgePlan::PlainFallback(
+        PlainFinalBridgeLossReason::IncompleteBufferedContent,
+    ))
+}
+
+pub fn assess_plain_final_presentation(
+    canonical_text: &str,
+    attachment_count: usize,
+    presentation: &RichMessagePresentation,
+) -> PlainFinalPresentationAssessment {
+    match plan_plain_final_presentation(canonical_text, attachment_count) {
+        PlainFinalBridgePlan::Rich(expected) if expected == *presentation => {
+            PlainFinalPresentationAssessment::ProvenComplete
+        }
+        PlainFinalBridgePlan::PlainFallback(reason)
+            if looks_like_automatic_plain_bridge(
+                canonical_text,
+                attachment_count,
+                presentation,
+            ) =>
+        {
+            PlainFinalPresentationAssessment::LegacyLossy(reason)
+        }
+        PlainFinalBridgePlan::Empty
+        | PlainFinalBridgePlan::Rich(_)
+        | PlainFinalBridgePlan::PlainFallback(_) => {
+            PlainFinalPresentationAssessment::NotAutomaticPlainBridge
+        }
+    }
 }
 
 pub fn render_rich_presentation_for_telegram(
@@ -637,7 +699,9 @@ fn validate_media_ref(
     Ok(())
 }
 
-fn rich_blocks_from_plain_final(text: &str) -> Vec<RichPresentationBlock> {
+fn rich_blocks_from_plain_final(
+    text: &str,
+) -> Result<Vec<RichPresentationBlock>, PlainFinalBridgeLossReason> {
     let mut blocks = Vec::new();
     let mut paragraph = Vec::new();
     let mut code = Vec::new();
@@ -650,20 +714,17 @@ fn rich_blocks_from_plain_final(text: &str) -> Vec<RichPresentationBlock> {
         let trimmed = line.trim();
         if let Some(fence) = trimmed.strip_prefix("```") {
             if in_code {
-                push_code_block(&mut blocks, code_language.take(), &mut code);
+                push_code_block(&mut blocks, code_language.take(), &mut code)?;
                 in_code = false;
             } else {
-                push_paragraph_blocks(&mut blocks, &mut paragraph);
-                push_list_block(&mut blocks, &mut list_ordered, &mut list_items);
+                push_paragraph_blocks(&mut blocks, &mut paragraph)?;
+                push_list_block(&mut blocks, &mut list_ordered, &mut list_items)?;
                 code_language = fence
                     .split_whitespace()
                     .next()
                     .filter(|value| !value.is_empty())
                     .map(|value| value.to_string());
                 in_code = true;
-            }
-            if blocks.len() >= MAX_BLOCKS {
-                break;
             }
             continue;
         }
@@ -674,48 +735,43 @@ fn rich_blocks_from_plain_final(text: &str) -> Vec<RichPresentationBlock> {
         }
 
         if trimmed.is_empty() {
-            push_paragraph_blocks(&mut blocks, &mut paragraph);
-            push_list_block(&mut blocks, &mut list_ordered, &mut list_items);
-            if blocks.len() >= MAX_BLOCKS {
-                break;
-            }
+            push_paragraph_blocks(&mut blocks, &mut paragraph)?;
+            push_list_block(&mut blocks, &mut list_ordered, &mut list_items)?;
             continue;
         }
         if let Some((ordered, item)) = parse_list_marker(line) {
-            push_paragraph_blocks(&mut blocks, &mut paragraph);
+            if char_count(item.trim()) > MAX_LIST_ITEM_CHARS {
+                return Err(PlainFinalBridgeLossReason::ListItemLimit);
+            }
+            push_paragraph_blocks(&mut blocks, &mut paragraph)?;
             if list_ordered.is_some_and(|current| current != ordered) {
-                push_list_block(&mut blocks, &mut list_ordered, &mut list_items);
+                push_list_block(&mut blocks, &mut list_ordered, &mut list_items)?;
             }
             list_ordered = Some(ordered);
             list_items.push(item.to_string());
             if list_items.len() >= MAX_LIST_ITEMS {
-                push_list_block(&mut blocks, &mut list_ordered, &mut list_items);
-            }
-            if blocks.len() >= MAX_BLOCKS {
-                break;
+                push_list_block(&mut blocks, &mut list_ordered, &mut list_items)?;
             }
             continue;
         }
-        push_list_block(&mut blocks, &mut list_ordered, &mut list_items);
+        push_list_block(&mut blocks, &mut list_ordered, &mut list_items)?;
+        if blocks.len() >= MAX_BLOCKS {
+            return Err(PlainFinalBridgeLossReason::BlockLimit);
+        }
         paragraph.push(line.to_string());
     }
 
-    if blocks.len() < MAX_BLOCKS {
-        if in_code {
-            push_code_block(&mut blocks, code_language, &mut code);
-        } else {
-            push_list_block(&mut blocks, &mut list_ordered, &mut list_items);
-            push_paragraph_blocks(&mut blocks, &mut paragraph);
-        }
+    if in_code {
+        push_code_block(&mut blocks, code_language, &mut code)?;
+    } else {
+        push_list_block(&mut blocks, &mut list_ordered, &mut list_items)?;
+        push_paragraph_blocks(&mut blocks, &mut paragraph)?;
     }
 
     if blocks.is_empty() {
-        blocks.push(RichPresentationBlock::Paragraph {
-            text: truncate_chars(text, MAX_PARAGRAPH_CHARS),
-        });
+        return Err(PlainFinalBridgeLossReason::IncompleteBufferedContent);
     }
-    blocks.truncate(MAX_BLOCKS);
-    blocks
+    Ok(blocks)
 }
 
 fn parse_list_marker(line: &str) -> Option<(bool, &str)> {
@@ -742,63 +798,84 @@ fn parse_list_marker(line: &str) -> Option<(bool, &str)> {
     Some((true, item.trim()))
 }
 
-fn push_paragraph_blocks(blocks: &mut Vec<RichPresentationBlock>, paragraph: &mut Vec<String>) {
-    if paragraph.is_empty() || blocks.len() >= MAX_BLOCKS {
-        paragraph.clear();
-        return;
+fn push_paragraph_blocks(
+    blocks: &mut Vec<RichPresentationBlock>,
+    paragraph: &mut Vec<String>,
+) -> Result<(), PlainFinalBridgeLossReason> {
+    if paragraph.is_empty() {
+        return Ok(());
     }
     let text = paragraph.join("\n").trim().to_string();
-    paragraph.clear();
+    if text.is_empty() {
+        paragraph.clear();
+        return Ok(());
+    }
+    let remaining = MAX_BLOCKS.saturating_sub(blocks.len());
+    let required = char_count(&text).div_ceil(MAX_PARAGRAPH_CHARS);
+    if required > remaining {
+        return Err(if remaining == 0 {
+            PlainFinalBridgeLossReason::BlockLimit
+        } else {
+            PlainFinalBridgeLossReason::ParagraphBudget
+        });
+    }
     for chunk in chunk_chars(&text, MAX_PARAGRAPH_CHARS) {
-        if blocks.len() >= MAX_BLOCKS {
-            break;
-        }
         if !chunk.trim().is_empty() {
             blocks.push(RichPresentationBlock::Paragraph { text: chunk });
         }
     }
+    paragraph.clear();
+    Ok(())
 }
 
 fn push_code_block(
     blocks: &mut Vec<RichPresentationBlock>,
     language: Option<String>,
     code: &mut Vec<String>,
-) {
-    if code.is_empty() || blocks.len() >= MAX_BLOCKS {
-        code.clear();
-        return;
+) -> Result<(), PlainFinalBridgeLossReason> {
+    if code.is_empty() {
+        return Ok(());
     }
     let text = code.join("\n");
-    code.clear();
+    let remaining = MAX_BLOCKS.saturating_sub(blocks.len());
+    let required = char_count(&text).div_ceil(MAX_CODE_CHARS);
+    if required > remaining {
+        return Err(if remaining == 0 {
+            PlainFinalBridgeLossReason::BlockLimit
+        } else {
+            PlainFinalBridgeLossReason::CodeBudget
+        });
+    }
     for chunk in chunk_chars(&text, MAX_CODE_CHARS) {
-        if blocks.len() >= MAX_BLOCKS {
-            break;
-        }
         blocks.push(RichPresentationBlock::Code {
             language: language.clone(),
             text: chunk,
         });
     }
+    code.clear();
+    Ok(())
 }
 
 fn push_list_block(
     blocks: &mut Vec<RichPresentationBlock>,
     list_ordered: &mut Option<bool>,
     list_items: &mut Vec<String>,
-) {
+) -> Result<(), PlainFinalBridgeLossReason> {
     let Some(ordered) = *list_ordered else {
         list_items.clear();
-        return;
+        return Ok(());
     };
-    if list_items.is_empty() || blocks.len() >= MAX_BLOCKS {
-        list_items.clear();
+    if list_items.is_empty() {
         *list_ordered = None;
-        return;
+        return Ok(());
+    }
+    if blocks.len() >= MAX_BLOCKS {
+        return Err(PlainFinalBridgeLossReason::ListBudget);
     }
     let items = list_items
         .drain(..)
         .filter_map(|item| {
-            let item = truncate_chars(item.trim(), MAX_LIST_ITEM_CHARS);
+            let item = item.trim().to_string();
             (!item.trim().is_empty()).then_some(item)
         })
         .collect::<Vec<_>>();
@@ -806,6 +883,29 @@ fn push_list_block(
     if !items.is_empty() {
         blocks.push(RichPresentationBlock::List { ordered, items });
     }
+    Ok(())
+}
+
+fn looks_like_automatic_plain_bridge(
+    canonical_text: &str,
+    attachment_count: usize,
+    presentation: &RichMessagePresentation,
+) -> bool {
+    let canonical_text = canonical_text.trim();
+    presentation.schema == RICH_MESSAGE_PRESENTATION_SCHEMA
+        && !canonical_text.is_empty()
+        && presentation.fallback_text == truncate_chars(canonical_text, MAX_FALLBACK_TEXT_CHARS)
+        && presentation.blocks.len() <= MAX_BLOCKS
+        && presentation.actions.is_empty()
+        && presentation.link_preview == RichPresentationLinkPreview::default()
+        && presentation.delivery_policy == RichPresentationDeliveryPolicy::default()
+        && presentation.media.len() == attachment_count
+        && presentation.media.iter().enumerate().all(|(index, media)| {
+            media.attachment_index == Some(index)
+                && media.artifact_ref.is_none()
+                && media.caption.is_none()
+                && media.role.is_none()
+        })
 }
 
 fn append_media_units(units: &mut Vec<RenderedRichUnit>, presentation: &RichMessagePresentation) {
@@ -1343,6 +1443,112 @@ mod tests {
         assert!(discord_text.contains("1. ordered [link](https://example.invalid/ordered)"));
         assert!(discord_text.contains("<script>alert\\(1\\)</script>"));
         assert!(discord.allowed_mentions_parse.is_empty());
+    }
+
+    #[test]
+    fn plain_final_bridge_refuses_loss_after_sixteen_mixed_blocks() {
+        let mut sections = Vec::new();
+        for index in 0..20 {
+            let sentinel = format!("ISSUE9_SENTINEL_{index:02}");
+            let filler = "x".repeat(110);
+            let section = match index % 4 {
+                0 => format!("Paragraph {sentinel} {filler}"),
+                1 => format!("- list {sentinel} {filler}"),
+                2 => format!("1. ordered {sentinel} {filler}"),
+                _ => format!("```text\ncode {sentinel} {filler}\n```"),
+            };
+            sections.push(section);
+        }
+        let canonical = sections.join("\n\n");
+
+        assert!(canonical.chars().count() > 2_000);
+        assert!(
+            rich_presentation_from_plain_final(&canonical).is_none(),
+            "an automatic rich bridge must decline a projection that cannot represent the final sentinel"
+        );
+    }
+
+    #[test]
+    fn plain_final_bridge_accepts_sixteen_blocks_and_rejects_seventeen() {
+        let sixteen = (0..16)
+            .map(|index| format!("boundary sentinel {index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let seventeen = format!("{sixteen}\n\nboundary sentinel 16");
+
+        assert!(matches!(
+            plan_plain_final_presentation(&sixteen, 0),
+            PlainFinalBridgePlan::Rich(_)
+        ));
+        assert_eq!(
+            plan_plain_final_presentation(&seventeen, 0),
+            PlainFinalBridgePlan::PlainFallback(PlainFinalBridgeLossReason::BlockLimit)
+        );
+    }
+
+    #[test]
+    fn plain_final_bridge_rejects_overlong_list_item_without_truncating_it() {
+        let canonical = format!("- ISSUE9_LIST_START{}ISSUE9_LIST_END", "x".repeat(1_001));
+
+        assert_eq!(
+            plan_plain_final_presentation(&canonical, 0),
+            PlainFinalBridgePlan::PlainFallback(PlainFinalBridgeLossReason::ListItemLimit)
+        );
+    }
+
+    #[test]
+    fn bounded_fallback_does_not_disqualify_complete_multi_block_projection() {
+        let canonical = format!("ISSUE9_HEAD{}ISSUE9_TAIL", "x".repeat(4_500));
+        let PlainFinalBridgePlan::Rich(presentation) = plan_plain_final_presentation(&canonical, 0)
+        else {
+            panic!("a complete projection above the fallback cap must remain eligible");
+        };
+
+        assert_eq!(presentation.fallback_text.chars().count(), 4_096);
+        let projected = presentation
+            .blocks
+            .iter()
+            .map(|block| match block {
+                RichPresentationBlock::Paragraph { text } => text.as_str(),
+                _ => panic!("fixture should project as paragraph chunks"),
+            })
+            .collect::<String>();
+        assert_eq!(projected, canonical);
+    }
+
+    #[test]
+    fn legacy_lossy_automatic_bridge_is_detected_from_canonical_text() {
+        let canonical = (0..17)
+            .map(|index| format!("legacy sentinel {index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let presentation = RichMessagePresentation {
+            schema: RICH_MESSAGE_PRESENTATION_SCHEMA.to_string(),
+            fallback_text: canonical.clone(),
+            blocks: (0..16)
+                .map(|index| RichPresentationBlock::Paragraph {
+                    text: format!("legacy sentinel {index:02}"),
+                })
+                .collect(),
+            actions: Vec::new(),
+            media: Vec::new(),
+            link_preview: RichPresentationLinkPreview::default(),
+            delivery_policy: RichPresentationDeliveryPolicy::default(),
+        };
+
+        assert_eq!(
+            assess_plain_final_presentation(&canonical, 0, &presentation),
+            PlainFinalPresentationAssessment::LegacyLossy(PlainFinalBridgeLossReason::BlockLimit)
+        );
+    }
+
+    #[test]
+    fn custom_rich_projection_is_not_promoted_to_canonical_preservation_proof() {
+        let presentation = fixture_presentation();
+        assert_eq!(
+            assess_plain_final_presentation("different canonical text", 0, &presentation),
+            PlainFinalPresentationAssessment::NotAutomaticPlainBridge
+        );
     }
 
     #[test]
