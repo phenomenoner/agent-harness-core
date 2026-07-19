@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Fixed
+
+- Long Telegram and Discord finals no longer lose content when automatic rich presentation would
+  exceed its bounded semantic block budget. Persisted affected outbox rows fall back to canonical
+  provider-safe text chunks before rich delivery.
+- Delivery receipts now report full-text preservation only after all required ordered text units
+  are represented and accepted; partial fallback failures remain explicit and retryable.
+
+### Verification
+
+- Added 16/17-block boundary tests, both-provider legacy fallback and chunk-failure seams, and a
+  durable outbox re-open/terminal-receipt replay that proves completed delivery is not duplicated.
+
 ## v0.10.0 - 2026-07-18
 
 ### Added

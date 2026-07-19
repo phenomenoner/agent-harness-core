@@ -124,7 +124,7 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I14",
-            statement: "rich outbound presentation is rendered by provider adapters from a trusted semantic payload; model-authored raw Telegram/Discord syntax is not the safety boundary, and media units carry provider delivery receipts with attachment-kind accounting",
+            statement: "rich outbound presentation is rendered by provider adapters only from a trusted semantic payload with proven complete canonical text coverage; otherwise provider-safe canonical fallback occurs before any rich unit, fullTextPreserved=true requires all required ordered text units to be accepted, and media units retain attachment-kind accounting",
             owner: "runtime_pipeline/channel_delivery/progress/media/trace",
         },
         InvariantEntry {
@@ -540,12 +540,12 @@ pub fn schema_registry_entries() -> Vec<SchemaRegistryEntry> {
         SchemaRegistryEntry {
             schema: "agent-harness.rich-message-presentation.v1",
             owner_module: "rich_presentation",
-            compatibility: "optional field on channel outbound messages; old outbox JSON without presentation remains plain text, v1 is additive, validates bounded semantic blocks including lists, and provider senders may honor it with adapter-rendered Telegram HTML or Discord safe Markdown while callbacks stay gated",
+            compatibility: "optional field on channel outbound messages; old outbox JSON without presentation remains plain text, v1 is additive, automatic projection is admitted only with complete bounded canonical coverage, and persisted auto-bridge-like lossy rows use canonical provider-safe fallback without ledger rewrite",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.channel-delivery-receipt.v1",
             owner_module: "channel_delivery",
-            compatibility: "append-only delivery receipts; presentation/renderedUnits and renderedUnits.attachmentKind are additive and legacy receipts without presentation remain readable",
+            compatibility: "append-only delivery receipts; presentation/renderedUnits and renderedUnits.attachmentKind are additive, legacy receipts without presentation remain readable, and fullTextPreserved=true requires complete accepted ordered canonical text units",
         },
         SchemaRegistryEntry {
             schema: "agent-harness.channel-restart-request.v1",
@@ -1702,6 +1702,39 @@ pub fn scenario_matrix_catalog() -> Vec<ScenarioMatrixEntry> {
             promotion_gate: "Promote Package D only after schema/validation/render fixtures, default final-to-presentation bridge tests, rendered-batch accounting, provider-rich text/media delivery integration, partial-failure receipt semantics, and action capability gates pass. Live Telegram inline callbacks, Discord components, clicked-action ingress re-entry, artifact/provider URL redaction coverage for generated presentation payloads, and live preview remain separate gates.",
         },
         ScenarioMatrixEntry {
+            id: "rich-final-fidelity-and-fallback",
+            title: "Canonical rich-final fidelity and legacy fallback replay",
+            changed_areas: vec![
+                "runtime pipeline",
+                "rich presentation bridge",
+                "final outbox",
+                "Telegram delivery",
+                "Discord delivery",
+                "delivery receipts",
+            ],
+            required_invariants: vec!["I2", "I7", "I9", "I14", "I16", "I18"],
+            required_evidence: vec![
+                "automatic plain-final projection declines any 17th semantic block instead of truncating canonical text",
+                "persisted legacy 16-block projections are detected before the first rich provider unit",
+                "Discord canonical fallback reconstructs ordered text from <=2000-character chunks with mentions disabled",
+                "Telegram canonical fallback reconstructs ordered UTF-16-safe chunk bodies while retaining thread routing",
+                "failed required text chunks report fullTextPreserved=false",
+                "durable outbox re-open followed by a terminal receipt suppresses duplicate replay",
+            ],
+            runnable_tests: vec![
+                "rich_presentation::tests::plain_final_bridge_refuses_loss_after_sixteen_mixed_blocks",
+                "rich_presentation::tests::plain_final_bridge_accepts_sixteen_blocks_and_rejects_seventeen",
+                "rich_presentation::tests::legacy_lossy_automatic_bridge_is_detected_from_canonical_text",
+                "channel_delivery::tests::rendered_presentation_receipt_keeps_explicit_preservation_proof",
+                "agent-harness-cli::tests::discord_legacy_lossy_plain_bridge_falls_back_before_first_rich_send",
+                "agent-harness-cli::tests::telegram_legacy_lossy_plain_bridge_falls_back_before_first_rich_send",
+                "agent-harness-cli::tests::discord_legacy_lossy_plain_bridge_chunk_failure_is_not_preserved",
+                "agent-harness-cli::tests::telegram_legacy_lossy_plain_bridge_chunk_failure_is_not_preserved",
+                "agent-harness-cli::tests::rich_final_fidelity_and_fallback_restart_replay_is_idempotent",
+            ],
+            promotion_gate: "Promote only after the loss-aware admission tests, both provider fallback seams, partial-failure receipts, and the durable outbox re-open/idempotency replay pass. Live provider observation remains a separately authorized T4 gate.",
+        },
+        ScenarioMatrixEntry {
             id: "channel-media-delivery",
             title: "Channel media directive, policy, and provider delivery",
             changed_areas: vec![
@@ -1852,6 +1885,7 @@ pub fn release_checklist() -> ReleaseChecklist {
             "openclaw-mem bridge ownership changes passed configured-bridge and fallback gates",
             "response/runtime changes passed final-surface separation checks, including stdout recovery without final_answer, read-only review evidence suppression, and skipped-permanent retirement for invalid final outbox rows",
             "rich-message presentation changes passed adapter-rendering, no-ping, escaping, multi-unit receipt, and action re-entry verified-or-deferred checks",
+            "rich-final fidelity changes passed loss-aware admission, legacy pre-send fallback, both-provider chunk reconstruction, partial-failure receipt truth, and durable outbox replay checks",
             "channel media delivery changes passed parser/policy, provider batching, inbound artifact hygiene, referenced-media, and native-image bloat scenario checks",
             "context rollover changes passed official-compact accounting and polluted-thread recovery checks",
             "virtual-session working-context changes passed resolver exact-lane, CLI read surface, root snapshot enrichment, and carry-forward inheritance checks",
@@ -1948,6 +1982,11 @@ mod tests {
                 .any(|entry| entry.id == "rich-message-presentation")
         );
         assert!(
+            scenario_matrix
+                .iter()
+                .any(|entry| entry.id == "rich-final-fidelity-and-fallback")
+        );
+        assert!(
             schema_registry_entries()
                 .iter()
                 .any(|entry| entry.schema == "agent-harness.encrypted-vault.v1")
@@ -1996,6 +2035,11 @@ mod tests {
             release_checklist()
                 .required_items
                 .contains(&"rich-message presentation changes passed adapter-rendering, no-ping, escaping, multi-unit receipt, and action re-entry verified-or-deferred checks")
+        );
+        assert!(
+            release_checklist()
+                .required_items
+                .contains(&"rich-final fidelity changes passed loss-aware admission, legacy pre-send fallback, both-provider chunk reconstruction, partial-failure receipt truth, and durable outbox replay checks")
         );
         assert!(
             release_checklist()

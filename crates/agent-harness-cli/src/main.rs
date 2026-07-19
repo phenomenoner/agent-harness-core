@@ -72,9 +72,9 @@ use agent_harness_core::{
     OperationPlanPromoteDependenciesOptions, OperationPlanShowOptions,
     OperationPlanUpdateItemOptions, OpsBackupOptions, OpsControlAction, OpsControlOptions,
     OpsCutoverApplyOptions, OpsCutoverApproveOptions, OpsCutoverReceiptOptions,
-    OpsCutoverRequestOptions, OpsCutoverStatusOptions, PromptAssemblyOptions, PromptBundle,
-    PromptReductionOptions, PublicHygieneOptions, QueueShadowCompareOptions,
-    QueueShadowRecordOptions, RenderedRichUnit, RenderedRichUnitKind,
+    OpsCutoverRequestOptions, OpsCutoverStatusOptions, PlainFinalPresentationAssessment,
+    PromptAssemblyOptions, PromptBundle, PromptReductionOptions, PublicHygieneOptions,
+    QueueShadowCompareOptions, QueueShadowRecordOptions, RenderedRichUnit, RenderedRichUnitKind,
     RichPresentationValidationOptions, RuntimeQueueCapacityOptions, RuntimeQueueControlAction,
     RuntimeQueueControlOptions, RuntimeQueueEnqueueOptions, RuntimeQueueEnqueueReport,
     RuntimeQueuePrepareOptions, RuntimeQueuePrepareReport, RuntimeQueueReceiptCompactionOptions,
@@ -99,13 +99,14 @@ use agent_harness_core::{
     acquire_budget, add_operation_plan_item, append_channel_outbox_message,
     append_goal_lineage_supersession, append_harness_log, append_jsonl_value,
     apply_channel_command_step, apply_skill_proposal, assemble_prompt_bundle,
-    autonomous_apply_skill_proposal, block_operation_plan, build_channel_step,
-    build_dry_run_report, build_harness_skill_index, build_import_plan, build_runtime_skill_index,
-    build_source_skill_index, build_turn_plan, cancel_worker_job, check_activation_readiness,
-    check_config_drift, check_tool_description_pin, collect_gateway_restart_status,
-    collect_goal_campaign_status, collect_harness_metrics, collect_harness_status, collect_healthz,
-    collect_inbound_media_cache_report, collect_ops_cutover_status, collect_token_efficiency,
-    collect_worker_status, comment_on_operation_plan, compact_runtime_queue_receipts_if_needed,
+    assess_plain_final_presentation, autonomous_apply_skill_proposal, block_operation_plan,
+    build_channel_step, build_dry_run_report, build_harness_skill_index, build_import_plan,
+    build_runtime_skill_index, build_source_skill_index, build_turn_plan, cancel_worker_job,
+    check_activation_readiness, check_config_drift, check_tool_description_pin,
+    collect_gateway_restart_status, collect_goal_campaign_status, collect_harness_metrics,
+    collect_harness_status, collect_healthz, collect_inbound_media_cache_report,
+    collect_ops_cutover_status, collect_token_efficiency, collect_worker_status,
+    comment_on_operation_plan, compact_runtime_queue_receipts_if_needed,
     compare_channel_turn_shadow, complete_operation_plan, control_cron_run,
     control_runtime_queue_item, create_learning_proposal, create_operation_plan,
     create_operation_plan_v2, create_ops_backup, create_skill_archive_proposal,
@@ -18617,6 +18618,15 @@ fn telegram_message_chunks(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn telegram_message_chunk_bodies_preserve_canonical(text: &str) -> bool {
+    if text.encode_utf16().count() <= TELEGRAM_MESSAGE_TEXT_LIMIT {
+        return true;
+    }
+    let body_limit =
+        TELEGRAM_MESSAGE_TEXT_LIMIT.saturating_sub(TELEGRAM_MESSAGE_CHUNK_HEADROOM_UTF16);
+    split_telegram_message_body_chunks(text, body_limit.max(1)).concat() == text
+}
+
 fn split_telegram_message_body_chunks(text: &str, max_utf16_units: usize) -> Vec<String> {
     if text.is_empty() {
         return vec![String::new()];
@@ -18773,6 +18783,23 @@ where
             rendered_units: Vec::new(),
             presentation: None,
         })?;
+    let full_text_preserved = match assess_plain_final_presentation(
+        &message.text,
+        message.attachments.len(),
+        presentation,
+    ) {
+        PlainFinalPresentationAssessment::ProvenComplete => true,
+        PlainFinalPresentationAssessment::LegacyLossy(reason) => {
+            return telegram_send_plain_fallback_with_senders(
+                message,
+                ChannelDeliveryPresentationFallbackReason::UnsupportedPlainBridge,
+                format!("legacy automatic rich presentation was incomplete: {reason:?}"),
+                &mut send_text,
+                &mut send_attachment,
+            );
+        }
+        PlainFinalPresentationAssessment::NotAutomaticPlainBridge => false,
+    };
     let batch = match render_rich_presentation_batch_for_telegram(
         presentation,
         &RichPresentationValidationOptions {
@@ -19070,6 +19097,7 @@ where
         rendered_units,
         presentation: Some(ChannelDeliveryPresentationReceipt::rendered(
             "telegram:parse_mode=HTML",
+            full_text_preserved,
         )),
     })
 }
@@ -19086,7 +19114,8 @@ where
     AttachmentSender: FnMut(&ChannelOutboundAttachment) -> Result<Option<String>, String>,
 {
     let text = format_channel_reply_text(&message.text);
-    let full_text_preserved = text == message.text.trim();
+    let full_text_preserved =
+        text == message.text.trim() && telegram_message_chunk_bodies_preserve_canonical(&text);
     let mut provider_message_ids = Vec::new();
     let mut rendered_units = Vec::new();
     let fallback_presentation = Some(ChannelDeliveryPresentationReceipt::fallback(
@@ -19106,7 +19135,11 @@ where
                 "text:fallback",
                 send_text,
                 &mut provider_message_ids,
-                fallback_presentation.clone(),
+                Some(ChannelDeliveryPresentationReceipt::fallback(
+                    reason,
+                    "telegram:plain-text",
+                    false,
+                )),
             )
             .map_err(|mut error| {
                 error.message = format!(
@@ -20089,24 +20122,37 @@ fn discord_send_outbound_message(
     let mut provider_message_ids = Vec::new();
     let text = format_channel_reply_text(&message.text);
     if !message.attachments.is_empty() {
-        let mut first_batch = true;
-        for batch in message.attachments.chunks(10) {
-            let content = if first_batch { text.as_str() } else { "" };
-            let reference = first_batch
-                .then(|| discord_message_reference(message))
-                .flatten();
-            if let Some(provider_message_id) = discord_send_attachments_batch(
-                token,
-                &message.channel_id,
-                content,
-                reference,
-                batch,
-            )
-            .map_err(ChannelSendError::from)?
+        let text_chunks = discord_message_chunks(&text, DISCORD_MESSAGE_CONTENT_LIMIT);
+        let mut attachment_batches = message.attachments.chunks(10);
+        let first_batch = attachment_batches
+            .next()
+            .expect("non-empty attachments have a first batch");
+        if let Some(provider_message_id) = discord_send_attachments_batch(
+            token,
+            &message.channel_id,
+            text_chunks.first().map(String::as_str).unwrap_or_default(),
+            discord_message_reference(message),
+            first_batch,
+        )
+        .map_err(ChannelSendError::from)?
+        {
+            provider_message_ids.push(provider_message_id);
+        }
+        for chunk in text_chunks.iter().skip(1) {
+            if let Some(provider_message_id) =
+                discord_send_message(token, &message.channel_id, chunk, None)
+                    .map_err(ChannelSendError::from)?
             {
                 provider_message_ids.push(provider_message_id);
             }
-            first_batch = false;
+        }
+        for batch in attachment_batches {
+            if let Some(provider_message_id) =
+                discord_send_attachments_batch(token, &message.channel_id, "", None, batch)
+                    .map_err(ChannelSendError::from)?
+            {
+                provider_message_ids.push(provider_message_id);
+            }
         }
     } else if !text.trim().is_empty() {
         if let Some(provider_message_id) = discord_send_message_chunks(
@@ -20169,6 +20215,23 @@ where
             rendered_units: Vec::new(),
             presentation: None,
         })?;
+    let full_text_preserved = match assess_plain_final_presentation(
+        &message.text,
+        message.attachments.len(),
+        presentation,
+    ) {
+        PlainFinalPresentationAssessment::ProvenComplete => true,
+        PlainFinalPresentationAssessment::LegacyLossy(reason) => {
+            return discord_send_plain_fallback_with_senders(
+                message,
+                ChannelDeliveryPresentationFallbackReason::UnsupportedPlainBridge,
+                format!("legacy automatic rich presentation was incomplete: {reason:?}"),
+                &mut send_text,
+                &mut send_attachment,
+            );
+        }
+        PlainFinalPresentationAssessment::NotAutomaticPlainBridge => false,
+    };
     let batch = match render_rich_presentation_batch_for_discord(
         presentation,
         &RichPresentationValidationOptions {
@@ -20323,6 +20386,7 @@ where
         rendered_units,
         presentation: Some(ChannelDeliveryPresentationReceipt::rendered(
             "discord:safe-markdown;allowed_mentions.parse=[]",
+            full_text_preserved,
         )),
     })
 }
@@ -20339,38 +20403,32 @@ where
     AttachmentSender: FnMut(&ChannelOutboundAttachment) -> Result<Option<String>, String>,
 {
     let text = format_channel_reply_text(&message.text);
-    let full_text_preserved = text == message.text.trim();
+    let full_text_preserved = text == message.text.trim()
+        && discord_message_chunks(&text, DISCORD_MESSAGE_CONTENT_LIMIT).concat() == text;
     let mut provider_message_ids = Vec::new();
     let mut rendered_units = Vec::new();
     if !text.trim().is_empty() || message.attachments.is_empty() {
-        match send_text(&text, discord_message_reference(message)) {
-            Ok(provider_message_id) => {
-                if let Some(id) = provider_message_id.clone() {
-                    provider_message_ids.push(id);
-                }
-                rendered_units.push(ChannelDeliveryRenderedUnitReceipt {
-                    unit_id: "text:fallback".to_string(),
-                    kind: ChannelDeliveryRenderedUnitKind::Text,
-                    attachment_kind: None,
-                    status: ChannelDeliveryUnitStatus::Delivered,
-                    provider_message_id,
-                    error: None,
-                });
-            }
-            Err(error) => {
-                return Err(ChannelSendError {
-                    message: format!("{source_error}; Discord plain fallback failed: {error}"),
-                    permanent: false,
-                    provider_message_id: joined_provider_ids(&provider_message_ids),
-                    rendered_units,
-                    presentation: Some(ChannelDeliveryPresentationReceipt::fallback(
-                        reason,
-                        "discord:plain-text",
-                        false,
-                    )),
-                });
-            }
-        }
+        rendered_units.extend(
+            discord_send_text_chunks_with_senders(
+                &text,
+                discord_message_reference(message),
+                "text:fallback",
+                send_text,
+                &mut provider_message_ids,
+                Some(ChannelDeliveryPresentationReceipt::fallback(
+                    reason,
+                    "discord:plain-text",
+                    false,
+                )),
+            )
+            .map_err(|mut error| {
+                error.message = format!(
+                    "{source_error}; Discord plain fallback failed: {}",
+                    error.message
+                );
+                error
+            })?,
+        );
     }
     for attachment in &message.attachments {
         match send_attachment(attachment) {
@@ -20403,6 +20461,72 @@ where
             full_text_preserved,
         )),
     })
+}
+
+fn discord_send_text_chunks_with_senders<TextSender>(
+    text: &str,
+    message_reference: Option<serde_json::Value>,
+    unit_id: &str,
+    send_text: &mut TextSender,
+    provider_message_ids: &mut Vec<String>,
+    error_presentation: Option<ChannelDeliveryPresentationReceipt>,
+) -> Result<Vec<ChannelDeliveryRenderedUnitReceipt>, ChannelSendError>
+where
+    TextSender: FnMut(&str, Option<serde_json::Value>) -> Result<Option<String>, String>,
+{
+    let chunks = discord_message_chunks(text, DISCORD_MESSAGE_CONTENT_LIMIT);
+    if chunks.concat() != text {
+        return Err(ChannelSendError {
+            message: "Discord chunking failed to preserve canonical text".to_string(),
+            permanent: false,
+            provider_message_id: joined_provider_ids(provider_message_ids),
+            rendered_units: Vec::new(),
+            presentation: error_presentation,
+        });
+    }
+    let total = chunks.len();
+    let mut rendered_units = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let chunk_unit_id = if total <= 1 {
+            unit_id.to_string()
+        } else {
+            format!("{unit_id}:chunk-{}", index + 1)
+        };
+        let reference = (index == 0).then(|| message_reference.clone()).flatten();
+        match send_text(chunk, reference) {
+            Ok(provider_message_id) => {
+                if let Some(id) = provider_message_id.clone() {
+                    provider_message_ids.push(id);
+                }
+                rendered_units.push(ChannelDeliveryRenderedUnitReceipt {
+                    unit_id: chunk_unit_id,
+                    kind: ChannelDeliveryRenderedUnitKind::Text,
+                    attachment_kind: None,
+                    status: ChannelDeliveryUnitStatus::Delivered,
+                    provider_message_id,
+                    error: None,
+                });
+            }
+            Err(error) => {
+                rendered_units.push(ChannelDeliveryRenderedUnitReceipt {
+                    unit_id: chunk_unit_id,
+                    kind: ChannelDeliveryRenderedUnitKind::Text,
+                    attachment_kind: None,
+                    status: ChannelDeliveryUnitStatus::Failed,
+                    provider_message_id: None,
+                    error: Some(error.clone()),
+                });
+                return Err(ChannelSendError {
+                    message: error,
+                    permanent: false,
+                    provider_message_id: joined_provider_ids(provider_message_ids),
+                    rendered_units,
+                    presentation: error_presentation,
+                });
+            }
+        }
+    }
+    Ok(rendered_units)
 }
 
 fn collect_telegram_rich_image_group(
@@ -27157,6 +27281,42 @@ mod tests {
         }
     }
 
+    fn issue9_legacy_lossy_outbound_message(platform: &str) -> ChannelOutboundMessage {
+        let sections = (0..20)
+            .map(|index| {
+                let sentinel = format!("ISSUE9_PROVIDER_SENTINEL_{index:02}");
+                let filler = "x".repeat(220);
+                match index % 4 {
+                    0 => format!("Paragraph {sentinel} {filler}"),
+                    1 => format!("- list {sentinel} {filler}"),
+                    2 => format!("1. ordered {sentinel} {filler}"),
+                    _ => format!("```text\ncode {sentinel} {filler}\n```"),
+                }
+            })
+            .collect::<Vec<_>>();
+        let canonical = sections.join("\n\n");
+        let presentation = agent_harness_core::RichMessagePresentation {
+            schema: agent_harness_core::RICH_MESSAGE_PRESENTATION_SCHEMA.to_string(),
+            fallback_text: canonical.chars().take(4_096).collect(),
+            blocks: sections
+                .iter()
+                .take(16)
+                .map(
+                    |text| agent_harness_core::RichPresentationBlock::Paragraph {
+                        text: text.clone(),
+                    },
+                )
+                .collect(),
+            actions: Vec::new(),
+            media: Vec::new(),
+            link_preview: agent_harness_core::RichPresentationLinkPreview::default(),
+            delivery_policy: agent_harness_core::RichPresentationDeliveryPolicy::default(),
+        };
+        let mut message = rich_outbound_message(platform, &canonical);
+        message.presentation = Some(presentation);
+        message
+    }
+
     fn test_image_attachment(filename: &str, caption: Option<&str>) -> ChannelOutboundAttachment {
         ChannelOutboundAttachment {
             kind: ChannelOutboundAttachmentKind::Image,
@@ -27217,6 +27377,82 @@ mod tests {
             ChannelDeliveryPresentationFallbackReason::None
         );
         assert!(presentation.full_text_preserved);
+    }
+
+    #[test]
+    fn telegram_legacy_lossy_plain_bridge_falls_back_before_first_rich_send() {
+        let message = issue9_legacy_lossy_outbound_message("telegram");
+        let mut sends = Vec::new();
+
+        let attempt = telegram_send_rich_outbound_message_with_senders(
+            &message,
+            |text, options| {
+                sends.push((text.to_string(), options.formatting_mode));
+                Ok(Some(format!("tg-{}", sends.len())))
+            },
+            |_attachment| -> Result<Option<String>, String> {
+                panic!("text-only legacy fixture must not send attachments")
+            },
+            |_attachments, _options| -> Result<Option<String>, String> {
+                panic!("text-only legacy fixture must not send media groups")
+            },
+        )
+        .unwrap();
+
+        assert!(sends.len() > 1);
+        let reconstructed = sends
+            .iter()
+            .map(|(text, _)| {
+                text.split_once('\n')
+                    .map_or(text.as_str(), |(_, body)| body)
+            })
+            .collect::<String>();
+        assert_eq!(reconstructed, message.text.trim());
+        assert!(
+            sends
+                .iter()
+                .all(|(_, mode)| *mode == TelegramFormattingMode::Plain)
+        );
+        let presentation = attempt.presentation.unwrap();
+        assert!(!presentation.present);
+        assert_eq!(
+            presentation.fallback_reason,
+            ChannelDeliveryPresentationFallbackReason::UnsupportedPlainBridge
+        );
+        assert!(presentation.full_text_preserved);
+        assert!(attempt.rendered_units.len() > 1);
+    }
+
+    #[test]
+    fn telegram_legacy_lossy_plain_bridge_chunk_failure_is_not_preserved() {
+        let message = issue9_legacy_lossy_outbound_message("telegram");
+        let mut send_count = 0usize;
+
+        let error = telegram_send_rich_outbound_message_with_senders(
+            &message,
+            |_text, _options| {
+                send_count += 1;
+                if send_count == 2 {
+                    Err("fixture chunk failure".to_string())
+                } else {
+                    Ok(Some("tg-1".to_string()))
+                }
+            },
+            |_attachment| -> Result<Option<String>, String> { Ok(None) },
+            |_attachments, _options| -> Result<Option<String>, String> { Ok(None) },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.rendered_units.len(), 2);
+        assert_eq!(
+            error.rendered_units[0].status,
+            ChannelDeliveryUnitStatus::Delivered
+        );
+        assert_eq!(
+            error.rendered_units[1].status,
+            ChannelDeliveryUnitStatus::Failed
+        );
+        assert!(!error.presentation.unwrap().full_text_preserved);
     }
 
     #[test]
@@ -27910,6 +28146,162 @@ mod tests {
             ChannelDeliveryPresentationFallbackReason::None
         );
         assert!(presentation.full_text_preserved);
+    }
+
+    #[test]
+    fn discord_legacy_lossy_plain_bridge_falls_back_before_first_rich_send() {
+        let message = issue9_legacy_lossy_outbound_message("discord");
+        let mut sends = Vec::new();
+
+        let attempt = discord_send_rich_outbound_message_with_senders(
+            &message,
+            |text, reference| {
+                sends.push((text.to_string(), reference));
+                Ok(Some(format!("dc-{}", sends.len())))
+            },
+            |_attachment| -> Result<Option<String>, String> {
+                panic!("text-only legacy fixture must not send attachments")
+            },
+        )
+        .unwrap();
+
+        assert!(sends.len() > 2);
+        assert!(sends.iter().all(|(text, _)| text.chars().count() <= 2_000));
+        assert_eq!(
+            sends
+                .iter()
+                .map(|(text, _)| text.as_str())
+                .collect::<String>(),
+            message.text.trim()
+        );
+        assert!(sends[0].1.is_none());
+        assert!(
+            sends
+                .iter()
+                .skip(1)
+                .all(|(_, reference)| reference.is_none())
+        );
+        let presentation = attempt.presentation.unwrap();
+        assert!(!presentation.present);
+        assert_eq!(
+            presentation.fallback_reason,
+            ChannelDeliveryPresentationFallbackReason::UnsupportedPlainBridge
+        );
+        assert!(presentation.full_text_preserved);
+        assert_eq!(attempt.rendered_units.len(), sends.len());
+    }
+
+    #[test]
+    fn discord_legacy_lossy_plain_bridge_chunk_failure_is_not_preserved() {
+        let message = issue9_legacy_lossy_outbound_message("discord");
+        let mut send_count = 0usize;
+
+        let error = discord_send_rich_outbound_message_with_senders(
+            &message,
+            |_text, _reference| {
+                send_count += 1;
+                if send_count == 2 {
+                    Err("fixture chunk failure".to_string())
+                } else {
+                    Ok(Some("dc-1".to_string()))
+                }
+            },
+            |_attachment| -> Result<Option<String>, String> { Ok(None) },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.rendered_units.len(), 2);
+        assert_eq!(
+            error.rendered_units[0].status,
+            ChannelDeliveryUnitStatus::Delivered
+        );
+        assert_eq!(
+            error.rendered_units[1].status,
+            ChannelDeliveryUnitStatus::Failed
+        );
+        assert!(!error.presentation.unwrap().full_text_preserved);
+    }
+
+    #[test]
+    fn rich_final_fidelity_and_fallback_restart_replay_is_idempotent() {
+        for platform in ["discord", "telegram"] {
+            let root = cli_temp_root(&format!(
+                "rich_final_fidelity_and_fallback_restart_replay_{platform}"
+            ));
+            let harness_home = root.join(".agent-harness");
+            let mut message = issue9_legacy_lossy_outbound_message(platform);
+            append_channel_outbox_message(&harness_home, &mut message).unwrap();
+
+            let first_plan = plan_channel_outbox(ChannelOutboxPlanOptions {
+                harness_home: harness_home.clone(),
+                platform: Some(platform.to_string()),
+                limit: 10,
+            })
+            .unwrap();
+            let reopened_plan = plan_channel_outbox(ChannelOutboxPlanOptions {
+                harness_home: harness_home.clone(),
+                platform: Some(platform.to_string()),
+                limit: 10,
+            })
+            .unwrap();
+            assert_eq!(first_plan.pending.len(), 1);
+            assert_eq!(reopened_plan.pending.len(), 1);
+            assert_eq!(
+                first_plan.pending[0].delivery_id,
+                reopened_plan.pending[0].delivery_id
+            );
+            let pending = reopened_plan.pending[0].clone();
+
+            let attempt = if platform == "discord" {
+                discord_send_rich_outbound_message_with_senders(
+                    &pending.message,
+                    |_text, _reference| Ok(Some("dc-replay".to_string())),
+                    |_attachment| -> Result<Option<String>, String> { Ok(None) },
+                )
+                .unwrap()
+            } else {
+                telegram_send_rich_outbound_message_with_senders(
+                    &pending.message,
+                    |_text, _options| Ok(Some("tg-replay".to_string())),
+                    |_attachment| -> Result<Option<String>, String> { Ok(None) },
+                    |_attachments, _options| -> Result<Option<String>, String> { Ok(None) },
+                )
+                .unwrap()
+            };
+            let receipt = record_channel_delivery(ChannelDeliveryRecordOptions {
+                harness_home: harness_home.clone(),
+                delivery_id: pending.delivery_id,
+                status: ChannelDeliveryStatus::Delivered,
+                platform: pending.message.platform.clone(),
+                account_id: pending.message.account_id.clone(),
+                channel_id: pending.message.channel_id.clone(),
+                user_id: pending.message.user_id.clone(),
+                session_key: pending.message.session_key.clone(),
+                provider_message_id: attempt.provider_message_id,
+                error: None,
+                now_ms: 1_784_384_000_000,
+                rendered_units: attempt.rendered_units,
+                presentation: attempt.presentation,
+            })
+            .unwrap();
+            assert_eq!(
+                receipt.presentation.as_ref().unwrap().fallback_reason,
+                ChannelDeliveryPresentationFallbackReason::UnsupportedPlainBridge
+            );
+            assert!(receipt.presentation.as_ref().unwrap().full_text_preserved);
+
+            for _ in 0..2 {
+                let replay_plan = plan_channel_outbox(ChannelOutboxPlanOptions {
+                    harness_home: harness_home.clone(),
+                    platform: Some(platform.to_string()),
+                    limit: 10,
+                })
+                .unwrap();
+                assert!(replay_plan.pending.is_empty());
+                assert_eq!(replay_plan.summary.delivered, 1);
+            }
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
