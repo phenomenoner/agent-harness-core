@@ -135,7 +135,7 @@ const PRODUCTIVE_DEADLINE_EVIDENCE_WINDOW_MS: u64 = 5 * 60 * 1_000;
 const PRODUCTIVE_DEADLINE_HARD_CAP_MS: u64 = 2 * 60 * 60 * 1_000;
 const PRODUCTIVE_DEADLINE_MAX_RENEWALS: u32 = 6;
 const PRODUCTIVE_DEADLINE_RECEIPT_SCHEMA: &str = "agent-harness.codex-deadline-renewal.v1";
-const CODEX_DEADLINE_DRAIN_MESSAGE: &str = "Runtime deadline guard: this responsive turn is yielding control. Do not start new long-running actions. Finish only the current bounded action and append exactly one <agent-harness-drain-disposition> JSON marker using schema agent-harness.drain-disposition.v1. Choose one disposition: logical-complete only when completion criteria are satisfied; continuation-required with exact authority and a bounded checkpoint plus lowercase SHA-256 digest; needs-user with a bounded question/reasonCode; needs-authority with a bounded reasonCode; or blocked with a bounded reasonCode/recoveryHint. The marker, not a Markdown file, controls continuation. Preserve approval, idempotency, and ambiguous-effect readback boundaries.";
+const CODEX_DEADLINE_DRAIN_MESSAGE: &str = "Runtime bounded-yield guard: the harness has committed this slice to yield. Do not start a new tool or external effect. Finish only an already-started atomic action when it is safe to do so. If this steer is observed with enough runway, you may append one <agent-harness-drain-disposition> JSON marker using schema agent-harness.drain-disposition.v1: logical-complete only when completion criteria are satisfied; continuation-required with exact authority and a bounded checkpoint plus lowercase SHA-256 digest; needs-user with a bounded question/reasonCode; needs-authority with a bounded reasonCode; or blocked with a bounded reasonCode/recoveryHint. The marker is advisory: the harness owns the primary outcome, recovery action, budgets, authority, and exactly-once boundary. Preserve approval, idempotency, and ambiguous-effect readback boundaries.";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -806,6 +806,50 @@ pub struct CodexRuntimeRunReceipt {
     pub drain_disposition: Option<crate::DrainDispositionMarkerV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain_disposition_error: Option<String>,
+    #[serde(default)]
+    pub primary_outcome: CodexRuntimePrimaryOutcomeV1,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secondary_diagnostics: Vec<CodexRuntimeSecondaryDiagnosticV1>,
+    #[serde(default)]
+    pub work_authority_class: WorkAuthorityClassV1,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexRuntimePrimaryOutcomeV1 {
+    Completed,
+    DeadlineYielded,
+    AbsoluteTimeout,
+    IdleTimeout,
+    Interrupted,
+    OwnershipLost,
+    ProviderProtocolFailure,
+    #[default]
+    RuntimeFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexRuntimeSecondaryDiagnosticV1 {
+    DispositionMissing,
+    DispositionPartial,
+    DispositionMultiple,
+    DispositionMalformed,
+    DispositionNotApplicable,
+    SteerNotObserved,
+    SteerObservedLate,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkAuthorityClassV1 {
+    OrdinaryTaskFamily,
+    GoalCampaign,
+    OperationPlan,
+    ExternalEffectOperation,
+    BackgroundWorker,
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2264,6 +2308,9 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 drain_checkpoint: None,
                 drain_disposition: None,
                 drain_disposition_error: None,
+                primary_outcome: CodexRuntimePrimaryOutcomeV1::RuntimeFailure,
+                secondary_diagnostics: Vec::new(),
+                work_authority_class: WorkAuthorityClassV1::Unknown,
             };
             append_codex_run_log(
                 &options.harness_home,
@@ -2318,6 +2365,9 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
                 drain_checkpoint: None,
                 drain_disposition: None,
                 drain_disposition_error: None,
+                primary_outcome: CodexRuntimePrimaryOutcomeV1::RuntimeFailure,
+                secondary_diagnostics: Vec::new(),
+                work_authority_class: WorkAuthorityClassV1::Unknown,
             };
             append_codex_run_log(
                 &options.harness_home,
@@ -2375,6 +2425,9 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             drain_checkpoint: None,
             drain_disposition: None,
             drain_disposition_error: None,
+            primary_outcome: CodexRuntimePrimaryOutcomeV1::RuntimeFailure,
+            secondary_diagnostics: Vec::new(),
+            work_authority_class: WorkAuthorityClassV1::Unknown,
         };
         append_codex_run_log(
             &options.harness_home,
@@ -2438,6 +2491,9 @@ pub fn run_codex_runtime(options: CodexRuntimeRunOptions) -> io::Result<CodexRun
             drain_checkpoint: None,
             drain_disposition: None,
             drain_disposition_error: None,
+            primary_outcome: CodexRuntimePrimaryOutcomeV1::Completed,
+            secondary_diagnostics: Vec::new(),
+            work_authority_class: prepared_work_authority_class(&plan, None),
         };
         append_codex_run_log(
             &options.harness_home,
@@ -2631,6 +2687,59 @@ fn read_prior_backend_reasoning_execution_reference(
     serde_json::from_value(value.pointer("/receipt/backendReasoningExecution")?.clone()).ok()
 }
 
+fn suppress_incomplete_control_fragment(text: &str) -> String {
+    [
+        crate::DRAIN_DISPOSITION_MARKER_OPEN,
+        crate::TASK_CONTINUATION_MARKER_OPEN,
+    ]
+    .iter()
+    .filter_map(|marker| text.find(marker))
+    .min()
+    .map(|index| text[..index].trim_end().to_string())
+    .unwrap_or_else(|| text.to_string())
+}
+
+fn disposition_secondary_diagnostic(reason_code: &str) -> CodexRuntimeSecondaryDiagnosticV1 {
+    if reason_code.contains("multiple") {
+        CodexRuntimeSecondaryDiagnosticV1::DispositionMultiple
+    } else if reason_code.contains("not-closed") || reason_code.contains("unbalanced") {
+        CodexRuntimeSecondaryDiagnosticV1::DispositionPartial
+    } else {
+        CodexRuntimeSecondaryDiagnosticV1::DispositionMalformed
+    }
+}
+
+fn primary_runtime_outcome(
+    status: CodexRuntimeRunStatus,
+    reason: &str,
+    accepted_deadline_drain: bool,
+    protocol_failure: Option<&CodexProtocolFailureV1>,
+) -> CodexRuntimePrimaryOutcomeV1 {
+    match status {
+        CodexRuntimeRunStatus::Completed if accepted_deadline_drain => {
+            CodexRuntimePrimaryOutcomeV1::DeadlineYielded
+        }
+        CodexRuntimeRunStatus::Completed => CodexRuntimePrimaryOutcomeV1::Completed,
+        CodexRuntimeRunStatus::Timeout
+            if reason.contains("JSONL event") || reason.contains("inactivity") =>
+        {
+            CodexRuntimePrimaryOutcomeV1::IdleTimeout
+        }
+        CodexRuntimeRunStatus::Timeout => CodexRuntimePrimaryOutcomeV1::AbsoluteTimeout,
+        CodexRuntimeRunStatus::Canceled => CodexRuntimePrimaryOutcomeV1::Interrupted,
+        CodexRuntimeRunStatus::ProtocolError if protocol_failure.is_some() => {
+            CodexRuntimePrimaryOutcomeV1::ProviderProtocolFailure
+        }
+        CodexRuntimeRunStatus::ApprovalRequired
+        | CodexRuntimeRunStatus::ExternalEffectDenied
+        | CodexRuntimeRunStatus::ContextExhausted
+        | CodexRuntimeRunStatus::SpawnFailed
+        | CodexRuntimeRunStatus::PreflightBlocked
+        | CodexRuntimeRunStatus::NoRuntimePlan
+        | CodexRuntimeRunStatus::ProtocolError => CodexRuntimePrimaryOutcomeV1::RuntimeFailure,
+    }
+}
+
 fn finish_codex_runtime_run(
     harness_home: &Path,
     plan: &CodexRuntimePlanFile,
@@ -2650,6 +2759,7 @@ fn finish_codex_runtime_run(
     let mut drain_checkpoint = None;
     let mut drain_disposition = None;
     let mut drain_disposition_error = None;
+    let mut secondary_diagnostics = Vec::new();
     let accepted_deadline_drain = status == CodexRuntimeRunStatus::Completed
         && reason.contains("completed after deadline drain");
     let accepted_disposition_recovery = status == CodexRuntimeRunStatus::Completed
@@ -2657,17 +2767,48 @@ fn finish_codex_runtime_run(
             .continuation
             .disposition_recovery_depth
             .is_some_and(|depth| depth > 0);
-    let accepted_disposition_capture = accepted_deadline_drain || accepted_disposition_recovery;
-    let (visible, disposition_capture) =
-        crate::extract_drain_disposition_marker(&run_result.assistant_message);
-    if !matches!(
-        disposition_capture,
-        crate::DrainDispositionCaptureV1::Missing
-    ) {
+    let deadline_drain_prompt_observed = read_codex_active_turn_binding(
+        &codex_active_turn_binding_file(harness_home, &plan.session_key),
+    )?
+    .is_some_and(|binding| {
+        binding.queue_id == plan.queue_id
+            && binding.session_key == plan.session_key
+            && binding.drain_state == "prompt-observed"
+    });
+    let accepted_disposition_capture = accepted_disposition_recovery
+        || ((accepted_deadline_drain || status == CodexRuntimeRunStatus::Timeout)
+            && deadline_drain_prompt_observed);
+    let (visible, disposition_capture) = if run_result.assistant_final_found {
+        crate::extract_drain_disposition_marker(&run_result.assistant_message)
+    } else {
+        (
+            suppress_incomplete_control_fragment(&run_result.assistant_message),
+            crate::DrainDispositionCaptureV1::Missing,
+        )
+    };
+    let raw_has_disposition_open = run_result
+        .assistant_raw_message
+        .contains(crate::DRAIN_DISPOSITION_MARKER_OPEN);
+    if run_result.assistant_final_found
+        && !matches!(
+            disposition_capture,
+            crate::DrainDispositionCaptureV1::Missing
+        )
+    {
         run_result.assistant_message = visible;
         let (visible_raw, _) =
             crate::extract_drain_disposition_marker(&run_result.assistant_raw_message);
         run_result.assistant_raw_message = visible_raw;
+    } else if !run_result.assistant_final_found && raw_has_disposition_open {
+        run_result.assistant_message = visible;
+        run_result.assistant_raw_message =
+            suppress_incomplete_control_fragment(&run_result.assistant_raw_message);
+        drain_disposition_error = Some("disposition-partial".to_string());
+        secondary_diagnostics.push(CodexRuntimeSecondaryDiagnosticV1::DispositionPartial);
+        warnings.push(
+            "incomplete assistant final contained a partial advisory disposition; primary runtime outcome was preserved"
+                .to_string(),
+        );
     }
     match disposition_capture {
         crate::DrainDispositionCaptureV1::Missing => {}
@@ -2675,29 +2816,25 @@ fn finish_codex_runtime_run(
             drain_disposition = Some(marker);
         }
         crate::DrainDispositionCaptureV1::Valid(_) => {
-            status = CodexRuntimeRunStatus::ProtocolError;
-            reason =
-                "typed drain disposition appeared outside an accepted deadline-drain completion"
-                    .to_string();
-            warnings.push(reason.clone());
-        }
-        crate::DrainDispositionCaptureV1::Invalid { reason_code }
-            if accepted_disposition_capture =>
-        {
-            warnings.push(format!(
-                "accepted deadline drain returned indeterminate disposition: {reason_code}"
-            ));
-            drain_disposition_error = Some(reason_code);
+            drain_disposition_error = Some("disposition-not-applicable".to_string());
+            secondary_diagnostics.push(CodexRuntimeSecondaryDiagnosticV1::DispositionNotApplicable);
+            warnings.push(
+                "typed drain disposition appeared outside an accepted bounded-yield outcome and was ignored"
+                    .to_string(),
+            );
         }
         crate::DrainDispositionCaptureV1::Invalid { reason_code } => {
-            status = CodexRuntimeRunStatus::ProtocolError;
-            reason = format!("invalid typed drain disposition: {reason_code}");
-            warnings.push(reason.clone());
+            warnings.push(format!(
+                "advisory deadline disposition was indeterminate and did not replace the primary runtime outcome: {reason_code}"
+            ));
+            secondary_diagnostics.push(disposition_secondary_diagnostic(&reason_code));
+            drain_disposition_error = Some(reason_code);
         }
     }
-    if run_result
-        .assistant_message
-        .contains(crate::TASK_CONTINUATION_MARKER_OPEN)
+    if run_result.assistant_final_found
+        && run_result
+            .assistant_message
+            .contains(crate::TASK_CONTINUATION_MARKER_OPEN)
     {
         match crate::extract_task_continuation_checkpoint(&run_result.assistant_message) {
             Ok((visible, checkpoint)) => {
@@ -2714,18 +2851,32 @@ fn finish_codex_runtime_run(
                 if accepted_deadline_drain {
                     drain_checkpoint = checkpoint;
                 } else {
-                    status = CodexRuntimeRunStatus::ProtocolError;
-                    reason = "typed task continuation checkpoint appeared outside an accepted deadline-drain completion"
-                        .to_string();
-                    warnings.push(reason.clone());
+                    secondary_diagnostics
+                        .push(CodexRuntimeSecondaryDiagnosticV1::DispositionNotApplicable);
+                    warnings.push(
+                        "typed task continuation checkpoint appeared outside an accepted bounded-yield completion and was ignored"
+                            .to_string(),
+                    );
                 }
             }
             Err(error) => {
-                status = CodexRuntimeRunStatus::ProtocolError;
-                reason = format!("invalid typed task continuation checkpoint: {error}");
-                warnings.push(reason.clone());
+                secondary_diagnostics.push(CodexRuntimeSecondaryDiagnosticV1::DispositionMalformed);
+                warnings.push(format!(
+                    "invalid advisory task continuation checkpoint did not replace the primary runtime outcome: {error}"
+                ));
             }
         }
+    } else if !run_result.assistant_final_found
+        && run_result
+            .assistant_raw_message
+            .contains(crate::TASK_CONTINUATION_MARKER_OPEN)
+    {
+        run_result.assistant_message =
+            suppress_incomplete_control_fragment(&run_result.assistant_message);
+        run_result.assistant_raw_message =
+            suppress_incomplete_control_fragment(&run_result.assistant_raw_message);
+        secondary_diagnostics.push(CodexRuntimeSecondaryDiagnosticV1::DispositionPartial);
+        drain_disposition_error.get_or_insert_with(|| "disposition-partial".to_string());
     }
     if accepted_disposition_capture
         && drain_disposition.is_none()
@@ -2733,6 +2884,7 @@ fn finish_codex_runtime_run(
         && drain_disposition_error.is_none()
     {
         drain_disposition_error = Some("missing-drain-disposition".to_string());
+        secondary_diagnostics.push(CodexRuntimeSecondaryDiagnosticV1::DispositionMissing);
         warnings.push(
             "accepted drain or disposition-recovery turn returned no typed disposition; treating outcome as indeterminate"
                 .to_string(),
@@ -2812,6 +2964,13 @@ fn finish_codex_runtime_run(
         .as_ref()
         .map(|effect| crate::external_effect_mutation_evidence(effect.state))
         .or(protocol_mutation_evidence);
+    let primary_outcome = primary_runtime_outcome(
+        status,
+        &reason,
+        accepted_deadline_drain,
+        protocol_failure.as_ref(),
+    );
+    let work_authority_class = prepared_work_authority_class(plan, None);
     let receipt = CodexRuntimeRunReceipt {
         queue_id: plan.queue_id.clone(),
         status,
@@ -2847,6 +3006,9 @@ fn finish_codex_runtime_run(
         drain_checkpoint,
         drain_disposition,
         drain_disposition_error,
+        primary_outcome,
+        secondary_diagnostics,
+        work_authority_class,
     };
     let log_level = match receipt.status {
         CodexRuntimeRunStatus::Completed => HarnessLogLevel::Info,
@@ -8526,6 +8688,7 @@ struct AssistantOutputItem {
     text: String,
     started_at_ms: Option<i64>,
     completed_at_ms: Option<i64>,
+    completed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8605,6 +8768,7 @@ impl AssistantOutputCapture {
             item.phase = phase;
         }
         item.completed_at_ms = at_ms.or(item.completed_at_ms);
+        item.completed = true;
         if let Some(text) = text {
             item.text = text;
         }
@@ -8615,7 +8779,11 @@ impl AssistantOutputCapture {
         self.items
             .iter()
             .rev()
-            .find(|item| item.phase == AssistantOutputPhase::Final && !item.text.trim().is_empty())
+            .find(|item| {
+                item.phase == AssistantOutputPhase::Final
+                    && item.completed
+                    && !item.text.trim().is_empty()
+            })
             .map(|item| item.text.clone())
     }
 
@@ -8659,6 +8827,7 @@ impl AssistantOutputCapture {
             text: String::new(),
             started_at_ms: None,
             completed_at_ms: None,
+            completed: false,
         });
         self.items.last_mut().unwrap()
     }
@@ -9699,6 +9868,26 @@ fn codex_task_family_for_plan(
     .map(Some)
 }
 
+fn prepared_work_authority_class(
+    plan: &CodexRuntimePlanFile,
+    task_family: Option<&crate::TaskFamilyV1>,
+) -> WorkAuthorityClassV1 {
+    if plan.continuation.campaign_slice_generation.is_some() || plan.goal_rehydration.is_some() {
+        WorkAuthorityClassV1::GoalCampaign
+    } else if plan.prompt_authority.role == CodexPromptAuthorityRole::SubagentWorker {
+        WorkAuthorityClassV1::BackgroundWorker
+    } else if task_family.is_some()
+        || (plan.queue_id.is_some()
+            && plan.agent_id.is_some()
+            && plan.channel_lane.is_some()
+            && plan.prompt_authority.lane_digest.is_some())
+    {
+        WorkAuthorityClassV1::OrdinaryTaskFamily
+    } else {
+        WorkAuthorityClassV1::Unknown
+    }
+}
+
 struct CodexTurnSteerBridge {
     harness_home: PathBuf,
     binding_file: PathBuf,
@@ -9707,12 +9896,16 @@ struct CodexTurnSteerBridge {
     next_rpc_id: i64,
     in_flight: BTreeMap<i64, InFlightCodexTurnSteer>,
     deadline_drain_rpc: Option<(i64, String)>,
+    deadline_drain_request_id: Option<String>,
     deadline_drain_sent: bool,
+    deadline_drain_rpc_accepted: bool,
+    deadline_drain_prompt_observed: bool,
     rollout_mode: OwnedCodexEventsRolloutMode,
     owned_turn_id: Option<String>,
     owned_item_ids: Vec<String>,
     divergent_event_count: usize,
     task_family: Option<crate::TaskFamilyV1>,
+    work_authority_class: WorkAuthorityClassV1,
 }
 
 impl CodexTurnSteerBridge {
@@ -9774,6 +9967,7 @@ impl CodexTurnSteerBridge {
         };
         write_codex_active_turn_binding(&binding_file, &binding)?;
         let task_family = codex_task_family_for_plan(harness_home, plan)?;
+        let work_authority_class = prepared_work_authority_class(plan, task_family.as_ref());
         Ok(Self {
             harness_home: harness_home.to_path_buf(),
             binding_file,
@@ -9782,12 +9976,16 @@ impl CodexTurnSteerBridge {
             next_rpc_id: 10_000,
             in_flight: BTreeMap::new(),
             deadline_drain_rpc: None,
+            deadline_drain_request_id: None,
             deadline_drain_sent: false,
+            deadline_drain_rpc_accepted: false,
+            deadline_drain_prompt_observed: false,
             rollout_mode: owned_codex_events_rollout_mode(harness_home, plan.agent_id.as_deref()),
             owned_turn_id: None,
             owned_item_ids: Vec::new(),
             divergent_event_count: 0,
             task_family,
+            work_authority_class,
         })
     }
 
@@ -9933,6 +10131,26 @@ impl CodexTurnSteerBridge {
                 self.set_active_turn_id(turn_id)?;
             }
         }
+        if self.deadline_drain_rpc_accepted
+            && !self.deadline_drain_prompt_observed
+            && is_deadline_drain_prompt_observation(value)
+        {
+            self.deadline_drain_prompt_observed = true;
+            self.binding.drain_state = "prompt-observed".to_string();
+            self.binding.updated_at_ms = current_log_time_ms()?;
+            self.binding.reason =
+                "deadline bounded-yield steer was observed in the owned turn".to_string();
+            write_codex_active_turn_binding(&self.binding_file, &self.binding)?;
+            if let Some(request_id) = self.deadline_drain_request_id.clone() {
+                self.write_deadline_drain_receipt(
+                    &request_id,
+                    "observed-deadline-drain",
+                    "same-turn-deadline-drain-prompt-observed",
+                    self.binding.active_turn_id.clone(),
+                    "Codex app-server emitted the owned bounded-yield user message".to_string(),
+                )?;
+            }
+        }
         Ok(false)
     }
 
@@ -10002,6 +10220,7 @@ impl CodexTurnSteerBridge {
                 timeouts.drain_cause
             ),
         )?;
+        self.deadline_drain_request_id = Some(request_id.clone());
         self.deadline_drain_rpc = Some((rpc_id, request_id));
         self.deadline_drain_sent = true;
         self.binding.updated_at_ms = at_ms;
@@ -10154,6 +10373,12 @@ impl CodexTurnSteerBridge {
                     error,
                 )?;
             } else {
+                self.deadline_drain_rpc_accepted = true;
+                self.binding.drain_state = "rpc-accepted".to_string();
+                self.binding.updated_at_ms = current_log_time_ms()?;
+                self.binding.reason =
+                    "deadline bounded-yield RPC accepted; awaiting prompt observation".to_string();
+                write_codex_active_turn_binding(&self.binding_file, &self.binding)?;
                 self.write_deadline_drain_receipt(
                     &request_id,
                     "accepted-deadline-drain",
@@ -10202,8 +10427,12 @@ impl CodexTurnSteerBridge {
     fn finish(&mut self, status: CodexActiveTurnStatus, reason: &str) -> io::Result<()> {
         self.finish_pending(reason)?;
         self.binding.status = status;
-        self.binding.drain_state = if self.deadline_drain_sent {
-            "disposition-pending-validation".to_string()
+        self.binding.drain_state = if self.deadline_drain_prompt_observed {
+            "prompt-observed".to_string()
+        } else if self.deadline_drain_rpc_accepted {
+            "rpc-accepted-no-prompt".to_string()
+        } else if self.deadline_drain_sent {
+            "sent-no-ack".to_string()
         } else {
             "not-drained".to_string()
         };
@@ -10398,6 +10627,8 @@ struct ProductiveDeadlineDecisionReceipt {
     blocker_codes: Vec<&'static str>,
     queue_lease_renewal_id: Option<String>,
     policy_digest: String,
+    work_authority_class: WorkAuthorityClassV1,
+    goal_projection_active: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10413,6 +10644,7 @@ fn record_productive_deadline_decision(
     lease_renewal_id: Option<String>,
     decision: &'static str,
     reason_code: &'static str,
+    goal_projection_active: bool,
 ) -> io::Result<()> {
     let at_ms = current_log_time_ms()?;
     let now = Instant::now();
@@ -10470,6 +10702,8 @@ fn record_productive_deadline_decision(
                 .unwrap_or_default(),
             queue_lease_renewal_id: lease_renewal_id,
             policy_digest: timeouts.productive_config.policy_digest(),
+            work_authority_class: bridge.work_authority_class,
+            goal_projection_active,
         },
     )?;
     Ok(())
@@ -10744,14 +10978,21 @@ impl CodexProtocolTimeouts {
         now: Instant,
         pending_exact_lane_work: bool,
         task_budget_exhausted: bool,
-        active_goal: bool,
+        work_authority_class: WorkAuthorityClassV1,
     ) -> &'static str {
         if self.productive_config.mode == ProductiveDeadlineRolloutMode::Off {
             "legacy-fixed-deadline"
         } else if self.productive_config.mode == ProductiveDeadlineRolloutMode::Shadow {
             "legacy-fixed-deadline"
-        } else if active_goal {
-            "active-goal-policy"
+        } else if work_authority_class != WorkAuthorityClassV1::OrdinaryTaskFamily {
+            match work_authority_class {
+                WorkAuthorityClassV1::GoalCampaign => "goal-campaign-slice-boundary",
+                WorkAuthorityClassV1::OperationPlan => "operation-plan-policy",
+                WorkAuthorityClassV1::ExternalEffectOperation => "external-effect-boundary",
+                WorkAuthorityClassV1::BackgroundWorker => "background-worker-policy",
+                WorkAuthorityClassV1::Unknown => "unknown-work-authority",
+                WorkAuthorityClassV1::OrdinaryTaskFamily => "renewal-ineligible",
+            }
         } else if task_budget_exhausted {
             "task-budget-exhausted"
         } else if pending_exact_lane_work
@@ -11836,21 +12077,33 @@ fn handle_codex_deadline_boundary(
         .map(RuntimeCancelCheck::has_pending_exact_lane_work)
         .transpose()?
         .unwrap_or(false);
-    let task_budget_exhausted = bridge
-        .task_family
-        .as_ref()
-        .map(|family| crate::task_budget_status(&bridge.harness_home, &family.family_id))
-        .transpose()?
-        .is_some_and(|status| status.exhausted);
+    let ordinary_authority =
+        bridge.work_authority_class == WorkAuthorityClassV1::OrdinaryTaskFamily;
+    let task_budget_exhausted = if ordinary_authority {
+        bridge
+            .task_family
+            .as_ref()
+            .map(|family| crate::task_budget_status(&bridge.harness_home, &family.family_id))
+            .transpose()?
+            .is_some_and(|status| status.exhausted)
+    } else {
+        false
+    };
     if task_budget_exhausted {
         state
             .warnings
             .push("productive deadline renewal denied by ordinary task budget".to_string());
     }
-    let active_goal = state
+    let goal_projection_active = state
         .goal_projection_observer
         .as_ref()
         .is_some_and(CodexGoalProjectionObserver::has_active_goal);
+    if goal_projection_active && ordinary_authority {
+        state.warnings.push(
+            "active streamed goal projection observed as advisory telemetry; prepared ordinary task authority remains authoritative for this grant"
+                .to_string(),
+        );
+    }
     let prior_deadline = timeouts.absolute_deadline;
     let progress_watermark_before = timeouts.progress_watermark;
     let evidence = timeouts.productive_evidence_summary(now);
@@ -11858,13 +12111,13 @@ fn handle_codex_deadline_boundary(
         now,
         pending_exact_lane_work,
         task_budget_exhausted,
-        active_goal,
+        bridge.work_authority_class,
     );
     let mut drain_cause = drain_cause_code.to_string();
     match timeouts.productive_deadline_decision(
         now,
         pending_exact_lane_work,
-        task_budget_exhausted || active_goal,
+        task_budget_exhausted || !ordinary_authority,
     ) {
         ProductiveDeadlineDecision::Renew { proposed_deadline } => {
             let renewal_id =
@@ -11900,6 +12153,7 @@ fn handle_codex_deadline_boundary(
                     Some(lease.renewal_id),
                     "applied",
                     "recent-owned-productive-evidence",
+                    goal_projection_active,
                 )?;
                 bridge.drain_pending(stdin, state, false)?;
                 return Ok(());
@@ -11918,6 +12172,7 @@ fn handle_codex_deadline_boundary(
                 None,
                 "failed",
                 "queue-lease-proof-unavailable",
+                goal_projection_active,
             )?;
             drain_cause = "queue-lease-proof-unavailable".to_string();
         }
@@ -11941,6 +12196,7 @@ fn handle_codex_deadline_boundary(
                     None,
                     "would-renew",
                     "recent-owned-productive-evidence",
+                    goal_projection_active,
                 )?;
                 if let Some(evidence) = evidence.as_ref() {
                     timeouts.consume_productive_evidence(evidence);
@@ -11964,6 +12220,7 @@ fn handle_codex_deadline_boundary(
                     None,
                     "denied",
                     drain_cause_code,
+                    goal_projection_active,
                 )?;
             }
         }
@@ -12340,6 +12597,22 @@ fn json_id(value: &Value) -> Option<i64> {
 
 fn json_method(value: &Value) -> Option<&str> {
     value.get("method").and_then(Value::as_str)
+}
+
+fn is_deadline_drain_prompt_observation(value: &Value) -> bool {
+    if !matches!(json_method(value), Some("item/started" | "item/completed")) {
+        return false;
+    }
+    let Some(item) = value.pointer("/params/item") else {
+        return false;
+    };
+    if string_field(item, &["type"]) != Some("userMessage") {
+        return false;
+    }
+    string_or_nested_text(item).is_some_and(|text| {
+        text.trim_start()
+            .starts_with("Runtime bounded-yield guard:")
+    })
 }
 
 fn codex_external_effect_runtime_context(
@@ -19182,7 +19455,12 @@ mod tests {
             "fresh progress cannot extend the turn beyond its hard cap"
         );
         assert_eq!(
-            timeouts.renewal_denial_reason(observed_at, false, false, false),
+            timeouts.renewal_denial_reason(
+                observed_at,
+                false,
+                false,
+                WorkAuthorityClassV1::OrdinaryTaskFamily,
+            ),
             "hard-cap-reached"
         );
     }
@@ -21974,6 +22252,51 @@ mod tests {
         );
         assert!(!state.assistant_final_found());
         assert!(state.assistant_narration_records().is_empty());
+    }
+
+    #[test]
+    fn assistant_output_capture_requires_completed_final_boundary() {
+        let mut state = CodexProtocolState::default();
+        let mut progress = None;
+        let config = AssistantNarrationConfig::default();
+
+        for value in [
+            serde_json::json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-owned",
+                    "turnId": "turn-owned",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "msg-partial-final",
+                        "text": "",
+                        "phase": "final_answer"
+                    },
+                    "startedAtMs": 200
+                }
+            }),
+            serde_json::json!({
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "thread-owned",
+                    "turnId": "turn-owned",
+                    "itemId": "msg-partial-final",
+                    "delta": "A partial final <agent-harness-drain-disposition>{\"schema\":\"agent-harness.drain-disposition.v1\""
+                }
+            }),
+        ] {
+            collect_agent_output(&value, &mut state, &mut progress, &config);
+        }
+
+        assert!(
+            !state.assistant_final_found(),
+            "I9/I10 fail-first: an item/started final with deltas but no item/completed boundary is not a completed final"
+        );
+        assert!(
+            state
+                .assistant_message_with_harness_notices()
+                .contains("partial final")
+        );
     }
 
     #[test]

@@ -88,8 +88,9 @@ provider overload recovery is gated by durable mutation evidence and retry eligi
 Eligible ordinary interactive turns can use a default-off productive-deadline policy: exact-owned,
 deduplicated progress may extend a bounded deadline only after the runtime proves queue-lease coverage,
 while pending same-lane work, hard caps, task budgets, and control boundaries reclaim the lane. Once
-drain begins it is irreversible; a generation-bound typed disposition selects exactly one logical final,
-deterministic continuation child, parked notice, or one bounded observation-only recovery child.
+bounded yield begins it is irreversible. The harness owns the primary outcome and selects exactly one
+logical final, deterministic continuation child, parked notice, or one bounded observation-only recovery
+child; any generation-bound model disposition is advisory evidence rather than outcome authority.
 OperationPlan continuation still requires a current exact-lane, versioned checkpoint. Recognized MCP connector
 elicitations park as `WaitingForApproval`; exact-lane expiring approve/deny capabilities and
 connector-specific readback prevent ambiguous writes from being blindly resubmitted. Provider error

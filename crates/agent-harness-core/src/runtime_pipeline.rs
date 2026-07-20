@@ -1050,7 +1050,9 @@ pub fn run_runtime_queue_once(options: RuntimeRunOnceOptions) -> io::Result<Runt
         .is_some_and(|depth| depth > 0);
     let accepted_ordinary_drain = (goal_transition.event
         == GoalTransitionEventKind::DrainCompletion
-        || disposition_recovery_run)
+        || disposition_recovery_run
+        || (goal_transition.event == GoalTransitionEventKind::AbsoluteTimeout
+            && run.receipt.drain_disposition_error.is_some()))
         && !goal_transition
             .goal_status
             .as_deref()
@@ -4209,6 +4211,26 @@ fn schedule_disposition_recovery_child(
                 "indeterminate drain has no harness-owned task family",
             )
         })?;
+    let prepared_virtual_session_id = goal_authority
+        .virtual_session_id
+        .clone()
+        .or_else(|| item.continuation.virtual_session_id.clone())
+        .or_else(|| {
+            ChannelStateLane::new(
+                &item.platform,
+                item.account_id.as_deref(),
+                &item.channel_id,
+                &item.user_id,
+                &item.agent_id,
+            )
+            .ok()
+            .map(|lane| {
+                crate::context_rollover::derive_virtual_session_id_v2(
+                    &lane,
+                    &root_working_session_key(&item.session_key),
+                )
+            })
+        });
     if item
         .continuation
         .task_family_id
@@ -4219,7 +4241,7 @@ fn schedule_disposition_recovery_child(
             .task_family_version
             .is_some_and(|value| value != family.authority_version)
         || goal_authority.lane_digest.as_deref() != Some(family.exact_lane_digest.as_str())
-        || goal_authority.virtual_session_id.as_deref() != Some(family.virtual_session_id.as_str())
+        || prepared_virtual_session_id.as_deref() != Some(family.virtual_session_id.as_str())
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -7921,7 +7943,8 @@ mod tests {
     }
 
     #[test]
-    fn productive_deadline_authoritative_replay_renews_lease_before_timer() {
+    fn productive_deadline_authoritative_replay_uses_prepared_authority_and_renews_lease_before_timer()
+     {
         let _guard = env_lock();
         let root = temp_root("productive-renewal");
         let source = write_pipeline_source(&root);
@@ -8016,6 +8039,78 @@ mod tests {
                     .contains("sent-deadline-drain")
             );
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn partial_final_at_bounded_yield_preserves_timeout_and_one_recovery_replay() {
+        let _guard = env_lock();
+        let replay: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/continuity-effects/bounded-yield-partial-final-replay.json"
+        ))
+        .unwrap();
+        assert_eq!(replay["expected"]["primaryOutcome"], "absolute-timeout");
+        let root = temp_root("bounded-yield-partial-final-replay");
+        let source = write_pipeline_source(&root);
+        let harness_home = root.join(".agent-harness");
+        let skills = build_source_skill_index(&source).unwrap();
+        let receive = receive_channel_message(ChannelReceiveOptions {
+            source,
+            runtime_workspace: None,
+            harness_home: harness_home.clone(),
+            skill_index: skills,
+            platform: "telegram".to_string(),
+            account_id: Some("acct-yield".to_string()),
+            channel_id: "dm-yield".to_string(),
+            user_id: "user-yield".to_string(),
+            agent_id: Some("main".to_string()),
+            session_key: None,
+            message: "continue a bounded task whose cooperative final may be partial".to_string(),
+            inbound_context: None,
+            inbound_media_artifacts: Vec::new(),
+            inbound_event_kind: None,
+            inbound_event_id: None,
+            skill_limit: 3,
+            now_ms: 1234,
+        })
+        .unwrap();
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "{}").unwrap();
+        let _env = EnvGuard::set("CODEX_HOME", codex_home.into_os_string());
+
+        let report = run_runtime_queue_once(RuntimeRunOnceOptions {
+            harness_home: harness_home.clone(),
+            queue_id: receive.queue_id,
+            codex_executable: Some(fake_partial_final_bounded_yield_codex_executable(&root)),
+            timeout_ms: 4_000,
+            idle_timeout_ms: 10_000,
+            prompt_options: PromptAssemblyOptions {
+                harness_home: Some(harness_home.clone()),
+                ..PromptAssemblyOptions::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.run.as_ref().unwrap().receipt.status,
+            CodexRuntimeRunStatus::Timeout,
+            "I9/I10: advisory marker syntax cannot replace the primary absolute-timeout outcome"
+        );
+        assert_eq!(report.receipt.status, RuntimeRunOnceStatus::Skipped);
+        assert!(report.receipt.child_queue_id.is_some());
+        assert!(report.outbound_message.is_none());
+        assert_ne!(
+            report
+                .run
+                .as_ref()
+                .unwrap()
+                .receipt
+                .drain_disposition_error
+                .as_deref(),
+            Some("multiple-or-unbalanced-disposition-markers")
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -10251,6 +10346,9 @@ mod tests {
             drain_checkpoint: None,
             drain_disposition: None,
             drain_disposition_error: None,
+            primary_outcome: crate::CodexRuntimePrimaryOutcomeV1::Interrupted,
+            secondary_diagnostics: Vec::new(),
+            work_authority_class: crate::WorkAuthorityClassV1::Unknown,
         };
         let reason = runtime_failure_reply_reason(
             &receipt,
@@ -12427,6 +12525,9 @@ mod tests {
                 drain_checkpoint: None,
                 drain_disposition: None,
                 drain_disposition_error: None,
+                primary_outcome: crate::CodexRuntimePrimaryOutcomeV1::RuntimeFailure,
+                secondary_diagnostics: Vec::new(),
+                work_authority_class: crate::WorkAuthorityClassV1::Unknown,
             },
             completion: None,
             stdout_log: None,
@@ -12496,6 +12597,9 @@ mod tests {
                 drain_checkpoint: None,
                 drain_disposition: None,
                 drain_disposition_error: None,
+                primary_outcome: crate::CodexRuntimePrimaryOutcomeV1::ProviderProtocolFailure,
+                secondary_diagnostics: Vec::new(),
+                work_authority_class: crate::WorkAuthorityClassV1::Unknown,
             },
             completion: None,
             stdout_log: None,
@@ -12569,6 +12673,13 @@ mod tests {
                 drain_checkpoint: None,
                 drain_disposition: None,
                 drain_disposition_error: None,
+                primary_outcome: if status == CodexRuntimeRunStatus::Timeout {
+                    crate::CodexRuntimePrimaryOutcomeV1::AbsoluteTimeout
+                } else {
+                    crate::CodexRuntimePrimaryOutcomeV1::RuntimeFailure
+                },
+                secondary_diagnostics: Vec::new(),
+                work_authority_class: crate::WorkAuthorityClassV1::Unknown,
             },
             completion: None,
             stdout_log: None,
@@ -12898,7 +13009,8 @@ while ($true) {{
         [Console]::Out.Flush()
     }} elseif ($msg.method -eq 'turn/steer') {{
         [Console]::Out.WriteLine((ConvertTo-Json @{{id=$msg.id;result=@{{turnId='turn-deadline-plan'}}}} -Compress))
-        [Console]::Out.WriteLine('{{"method":"item/agentMessage/delta","params":{{"delta":{assistant_text}}}}}')
+        [Console]::Out.WriteLine('{{"method":"item/completed","params":{{"threadId":"thread-deadline-plan","turnId":"turn-deadline-plan","item":{{"id":"yield-prompt","type":"userMessage","text":"Runtime bounded-yield guard: observed"}}}}}}')
+        [Console]::Out.WriteLine('{{"method":"item/completed","params":{{"threadId":"thread-deadline-plan","turnId":"turn-deadline-plan","item":{{"id":"yield-final","type":"agentMessage","phase":"final_answer","text":{assistant_text}}}}}}}')
         [Console]::Out.WriteLine('{{"method":"turn/completed","params":{{"threadId":"thread-deadline-plan","turn":{{"id":"turn-deadline-plan","status":"completed"}}}}}}')
         [Console]::Out.Flush()
         break
@@ -12964,7 +13076,8 @@ while ($true) {{
         }} | ConvertTo-Json -Compress
         $assistant = 'Ordinary work is checkpointed.' + [Environment]::NewLine + '<agent-harness-drain-disposition>' + $disposition + '</agent-harness-drain-disposition>'
         [Console]::Out.WriteLine((@{{id=$msg.id;result=@{{turnId='turn-explicit-task'}}}} | ConvertTo-Json -Compress))
-        [Console]::Out.WriteLine((@{{method='item/agentMessage/delta';params=@{{delta=$assistant}}}} | ConvertTo-Json -Compress -Depth 8))
+        [Console]::Out.WriteLine('{{"method":"item/completed","params":{{"threadId":"thread-explicit-task","turnId":"turn-explicit-task","item":{{"id":"yield-prompt","type":"userMessage","text":"Runtime bounded-yield guard: observed"}}}}}}')
+        [Console]::Out.WriteLine((@{{method='item/completed';params=@{{threadId='thread-explicit-task';turnId='turn-explicit-task';item=@{{id='yield-final';type='agentMessage';phase='final_answer';text=$assistant}}}}}} | ConvertTo-Json -Compress -Depth 8))
         [Console]::Out.WriteLine('{{"method":"turn/completed","params":{{"threadId":"thread-explicit-task","turn":{{"id":"turn-explicit-task","status":"completed"}}}}}}')
         [Console]::Out.Flush()
         break
@@ -13005,11 +13118,13 @@ while ($true) {
         [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-productive"}}}')
     } elseif ($msg.method -eq 'turn/start') {
         [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-productive","turn":{"id":"turn-productive","kind":"regular"}}}')
+        [Console]::Out.WriteLine('{"method":"thread/goal/updated","params":{"threadId":"thread-productive","turnId":"turn-productive","goal":{"id":"goal-telemetry-only","objective":"track productive work","status":"active","completionCriteria":["finish"]}}}')
         [Console]::Out.Flush()
         Start-Sleep -Milliseconds 45000
         [Console]::Out.WriteLine('{"method":"item/completed","params":{"threadId":"thread-productive","turnId":"turn-productive","item":{"id":"cmd-productive","type":"commandExecution","status":"completed"}}}')
         [Console]::Out.Flush()
         Start-Sleep -Milliseconds 17000
+        [Console]::Out.WriteLine('{"method":"thread/goal/updated","params":{"threadId":"thread-productive","turnId":"turn-productive","goal":{"id":"goal-telemetry-only","objective":"track productive work","status":"completed","completionCriteria":["finish"]}}}')
         [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"threadId":"thread-productive","turnId":"turn-productive","delta":"Productive task completed after the original deadline."}}')
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-productive","turn":{"id":"turn-productive","status":"completed"}}}')
         [Console]::Out.Flush()
@@ -13021,6 +13136,50 @@ while ($true) {
         )
         .unwrap();
         let cmd = root.join("fake-productive-deadline-renewal-codex.cmd");
+        fs::write(
+            &cmd,
+            format!(
+                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        cmd
+    }
+
+    #[cfg(windows)]
+    fn fake_partial_final_bounded_yield_codex_executable(root: &Path) -> PathBuf {
+        let script = root.join("fake-partial-final-bounded-yield-app-server.ps1");
+        fs::write(
+            &script,
+            r#"
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    try { $msg = $line | ConvertFrom-Json } catch { continue }
+    if ($msg.id -eq 0) {
+        [Console]::Out.WriteLine('{"id":0,"result":{"ok":true}}')
+    } elseif ($msg.method -eq 'modelProvider/capabilities/read') {
+        [Console]::Out.WriteLine('{"id":8900,"result":{"namespaceTools":true,"imageGeneration":true,"webSearch":true}}')
+    } elseif ($msg.method -eq 'thread/start') {
+        [Console]::Out.WriteLine('{"id":1,"result":{"thread":{"id":"thread-partial-yield"}}}')
+    } elseif ($msg.method -eq 'turn/start') {
+        [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-partial-yield","turn":{"id":"turn-partial-yield","kind":"regular"}}}')
+    } elseif ($msg.method -eq 'turn/steer') {
+        [Console]::Out.WriteLine((@{id=$msg.id;result=@{turnId='turn-partial-yield'}} | ConvertTo-Json -Compress))
+        [Console]::Out.WriteLine('{"method":"item/started","params":{"threadId":"thread-partial-yield","turnId":"turn-partial-yield","item":{"id":"yield-prompt","type":"userMessage","text":"Runtime bounded-yield guard: observed"}}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"threadId":"thread-partial-yield","turnId":"turn-partial-yield","item":{"id":"yield-prompt","type":"userMessage","text":"Runtime bounded-yield guard: observed"}}}')
+        [Console]::Out.WriteLine('{"method":"item/started","params":{"threadId":"thread-partial-yield","turnId":"turn-partial-yield","item":{"id":"partial-final","type":"agentMessage","phase":"final_answer","text":""}}}')
+        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"threadId":"thread-partial-yield","turnId":"turn-partial-yield","itemId":"partial-final","delta":"Checkpointing before yield. <agent-harness-drain-disposition>{\"schema\":\"agent-harness.drain-disposition.v1\",\"disposition\":\"continuation-required\""}}')
+        [Console]::Out.Flush()
+        Start-Sleep -Milliseconds 1200
+    }
+    [Console]::Out.Flush()
+}
+"#,
+        )
+        .unwrap();
+        let cmd = root.join("fake-partial-final-bounded-yield-codex.cmd");
         fs::write(
             &cmd,
             format!(
@@ -13052,7 +13211,8 @@ while ($true) {
         [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-missing-disposition","turn":{"id":"turn-missing-disposition","kind":"regular"}}}')
     } elseif ($msg.method -eq 'turn/steer') {
         [Console]::Out.WriteLine((@{id=$msg.id;result=@{turnId='turn-missing-disposition'}} | ConvertTo-Json -Compress))
-        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"delta":"The task outcome could not be classified."}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"threadId":"thread-missing-disposition","turnId":"turn-missing-disposition","item":{"id":"yield-prompt","type":"userMessage","text":"Runtime bounded-yield guard: observed"}}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"threadId":"thread-missing-disposition","turnId":"turn-missing-disposition","item":{"id":"yield-final","type":"agentMessage","phase":"final_answer","text":"The task outcome could not be classified."}}}')
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-missing-disposition","turn":{"id":"turn-missing-disposition","status":"completed"}}}')
         [Console]::Out.Flush()
         break
@@ -13092,7 +13252,7 @@ while ($true) {
         [Console]::Out.WriteLine((@{id=$msg.id;result=@{thread=@{id='thread-disposition-recovery'}}} | ConvertTo-Json -Compress -Depth 8))
     } elseif ($msg.method -eq 'turn/start') {
         [Console]::Out.WriteLine('{"method":"turn/started","params":{"threadId":"thread-disposition-recovery","turn":{"id":"turn-disposition-recovery","kind":"regular"}}}')
-        [Console]::Out.WriteLine('{"method":"item/agentMessage/delta","params":{"delta":"The bounded recovery pass still could not classify the outcome."}}')
+        [Console]::Out.WriteLine('{"method":"item/completed","params":{"threadId":"thread-disposition-recovery","turnId":"turn-disposition-recovery","item":{"id":"recovery-final","type":"agentMessage","phase":"final_answer","text":"The bounded recovery pass still could not classify the outcome."}}}')
         [Console]::Out.WriteLine('{"method":"turn/completed","params":{"threadId":"thread-disposition-recovery","turn":{"id":"turn-disposition-recovery","status":"completed"}}}')
         [Console]::Out.Flush()
         break
@@ -13337,9 +13497,11 @@ while IFS= read -r line; do
         *'"method":"thread/start"'*) printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-productive"}}}' ;;
         *'"method":"turn/start"'*)
             printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-productive","turn":{"id":"turn-productive","kind":"regular"}}}'
+            printf '%s\n' '{"method":"thread/goal/updated","params":{"threadId":"thread-productive","turnId":"turn-productive","goal":{"id":"goal-telemetry-only","objective":"track productive work","status":"active","completionCriteria":["finish"]}}}'
             sleep 13.8
             printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread-productive","turnId":"turn-productive","item":{"id":"cmd-productive","type":"commandExecution","status":"completed"}}}'
             sleep 4.5
+            printf '%s\n' '{"method":"thread/goal/updated","params":{"threadId":"thread-productive","turnId":"turn-productive","goal":{"id":"goal-telemetry-only","objective":"track productive work","status":"completed","completionCriteria":["finish"]}}}'
             printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-productive","turnId":"turn-productive","delta":"Productive task completed after the original deadline."}}'
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-productive","turn":{"id":"turn-productive","status":"completed"}}}'
             exit 0 ;;
@@ -13379,7 +13541,8 @@ while IFS= read -r line; do
             rpc_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
             [ -n "$family" ] && [ -n "$generation" ] || exit 23
             printf '%s\n' "{{\"id\":${{rpc_id}},\"result\":{{\"turnId\":\"turn-explicit-task\"}}}}"
-            printf '%s\n' "{{\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"Ordinary work is checkpointed.\\n<agent-harness-drain-disposition>{{\\\"schema\\\":\\\"agent-harness.drain-disposition.v1\\\",\\\"disposition\\\":\\\"continuation-required\\\",\\\"observedDeadlineGeneration\\\":$generation,\\\"authorityKind\\\":\\\"explicit-checkpoint\\\",\\\"authorityId\\\":\\\"$family\\\",\\\"authorityVersion\\\":1,\\\"taskFamilyId\\\":\\\"$family\\\",\\\"taskFamilyVersion\\\":1,\\\"activeItemId\\\":null,\\\"activeItemVersion\\\":null,\\\"checkpoint\\\":\\\"{checkpoint}\\\",\\\"checkpointDigest\\\":\\\"{checkpoint_digest}\\\",\\\"completionEvidenceDigests\\\":[]}}</agent-harness-drain-disposition>\"}}}}"
+            printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"thread-explicit-task","turnId":"turn-explicit-task","item":{{"id":"yield-prompt","type":"userMessage","text":"Runtime bounded-yield guard: observed"}}}}}}'
+            printf '%s\n' "{{\"method\":\"item/completed\",\"params\":{{\"threadId\":\"thread-explicit-task\",\"turnId\":\"turn-explicit-task\",\"item\":{{\"id\":\"yield-final\",\"type\":\"agentMessage\",\"phase\":\"final_answer\",\"text\":\"Ordinary work is checkpointed.\\n<agent-harness-drain-disposition>{{\\\"schema\\\":\\\"agent-harness.drain-disposition.v1\\\",\\\"disposition\\\":\\\"continuation-required\\\",\\\"observedDeadlineGeneration\\\":$generation,\\\"authorityKind\\\":\\\"explicit-checkpoint\\\",\\\"authorityId\\\":\\\"$family\\\",\\\"authorityVersion\\\":1,\\\"taskFamilyId\\\":\\\"$family\\\",\\\"taskFamilyVersion\\\":1,\\\"activeItemId\\\":null,\\\"activeItemVersion\\\":null,\\\"checkpoint\\\":\\\"{checkpoint}\\\",\\\"checkpointDigest\\\":\\\"{checkpoint_digest}\\\",\\\"completionEvidenceDigests\\\":[]}}</agent-harness-drain-disposition>\"}}}}}}"
             printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"thread-explicit-task","turn":{{"id":"turn-explicit-task","status":"completed"}}}}}}'
             exit 0 ;;
     esac
@@ -13659,7 +13822,8 @@ while IFS= read -r line; do
         *'"method":"turn/steer"'*)
             rpc_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
             printf '%s\n' "{{\"id\":${{rpc_id}},\"result\":{{\"turnId\":\"turn-deadline-plan\"}}}}"
-            printf '%s\n' '{{"method":"item/agentMessage/delta","params":{{"delta":{assistant_text}}}}}'
+            printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"thread-deadline-plan","turnId":"turn-deadline-plan","item":{{"id":"yield-prompt","type":"userMessage","text":"Runtime bounded-yield guard: observed"}}}}}}'
+            printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"thread-deadline-plan","turnId":"turn-deadline-plan","item":{{"id":"yield-final","type":"agentMessage","phase":"final_answer","text":{assistant_text}}}}}}}'
             printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"thread-deadline-plan","turn":{{"id":"turn-deadline-plan","status":"completed"}}}}}}'
             exit 0
             ;;

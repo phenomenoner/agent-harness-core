@@ -12,9 +12,10 @@
 
 ### Changed
 
-- Cooperative deadline drain is now an irreversible reclaim boundary with cause-specific guidance.
-  A responsive drained turn selects exactly one logical final, continuation child, parked notice,
-  or one observation-only disposition recovery before parking.
+- Bounded yield is now an irreversible, harness-owned reclaim boundary with cause-specific guidance.
+  The optional steer and model disposition are advisory; prepared work authority and the primary
+  runtime outcome select exactly one logical final, continuation child, parked notice, or one
+  observation-only disposition recovery before parking.
 - Queue leases for active runs can heartbeat atomically without recreating missing, expired,
   terminal, legacy-owner, wrong-lane, or wrong-generation ownership.
 - Runtime-loop shutdown is bounded while an in-process task is active. Service stop allows a
@@ -39,6 +40,12 @@
   are represented and accepted; partial fallback failures remain explicit and retryable.
 - Productive long-running work no longer has to be stopped solely because its initial absolute
   deadline was reached when bounded renewal is explicitly enabled and every safety gate passes.
+- Streamed active-goal projections no longer deny bounded renewal to a prepared ordinary task.
+  Goal campaigns, workers, external-effect operations, and unknown authority remain outside this
+  ordinary renewal path.
+- Partial or late disposition markers can no longer rewrite an absolute timeout as a protocol error.
+  Only a completed final item after exact-owned prompt observation is eligible as advisory control
+  data; runtime receipts retain the primary outcome and separate bounded diagnostics.
 
 ### Security
 
@@ -53,6 +60,10 @@
 - Added sanitized replay fixtures and focused scenarios for lease-before-timer renewal, exact task
   continuation with one eventual final, bounded disposition recovery, hard caps, and non-resurrecting
   queue ownership.
+- Added a sanitized absolute-timeout replay with an acknowledged and observed bounded-yield steer,
+  an incomplete final-item marker, one commit-before-enqueue recovery child, and zero external-effect
+  authority. A separate real-timer replay proves renewal still occurs while a streamed goal projection
+  is active because the prepared work authority remains ordinary.
 
 ## v0.10.0 - 2026-07-18
 

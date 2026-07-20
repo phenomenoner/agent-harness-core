@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use ring::digest::{SHA256, digest};
 
-const FIXTURES: [(&str, &str); 9] = [
+const FIXTURES: [(&str, &str); 10] = [
     (
         "account-continuation-double-bind-replay.json",
         "15306aac954c66d0e13b0f4f9ad6cf630a9988c2cf37cce9b20854bca0204f69",
@@ -39,6 +39,10 @@ const FIXTURES: [(&str, &str); 9] = [
     (
         "ordinary-task-drain-recovery-replay.json",
         "bbd2fd5de20cb8568a2f047a60de735909e14f817536bd2a851e584b0665d59d",
+    ),
+    (
+        "bounded-yield-partial-final-replay.json",
+        "a2f01619350b8903c2ab34dcb0618aa62da824f44f9b656b9211937bf3ce9385",
     ),
 ];
 
