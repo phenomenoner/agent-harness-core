@@ -4,7 +4,7 @@
   "sourceFiles": [
     {
       "path": "docs/agent-harness-topology-contract.md",
-      "sha256": "99e4d3e67be60c4286837d5bb7b53781e53c7bb4f5c31df65bfbd4cd7525a954"
+      "sha256": "b7aeee341430fbb33a83dc961add91bfdddf31f7f20a6530ace20b03aaead132"
     }
   ],
   "syncCommand": "python tools/generate_topology_explorer.py",
@@ -932,6 +932,32 @@
       "designTarget": "healthz, status --json, and supervisor-reconcile should present one canonical managed-service health view or explicitly label when service registry metadata is non-authoritative behind a fresher loop heartbeat.",
       "currentEvidence": "A 2026-06-28 Round10 post-cutover readback showed healthz ready=true live=true, fresh discord-gateway-loop heartbeat, and supervisor-reconcile --all --dry-run with no missing/stale services, while healthz.supervisorServices still exposed an older discord-gateway-loop service record as status=spawning / stale=true. Local follow-up staging adds status::tests::loop_status_prefers_fresh_loop_heartbeat_over_spawning_service_state and health::tests::healthz_prefers_fresh_loop_heartbeat_over_spawning_service_state, aligning status/healthz read models with reconcile precedence for a fresh alive Discord gateway heartbeat.",
       "promotionGate": "Promote only after service-state, loop-heartbeat, healthz, status --json, and reconcile output use the same precedence rules or surface stale service metadata as historical/non-authoritative, with a Discord gateway spawn-boundary scenario proving no false stale alarm when the Node heartbeat is fresh.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-supervisor-process-instance-fencing-live-gap",
+      "label": "supervisor-process-instance-fencing-live-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Supervisor process-instance fencing",
+      "designTarget": "A stale service record may block a replacement only when its PID and recorded process-start identity still refer to the same live process instance. PID existence alone is not ownership because Windows can reuse a terminated loop's PID for an unrelated process.",
+      "currentEvidence": "supervisor_launch_guard_ignores_reused_pid_from_stale_generation is fail-first coverage for a stale worker record whose PID now belongs to a different process instance; existing live-owner tests still reject a matching current owner.",
+      "promotionGate": "A controlled cutover must reproduce a stale service record with a reused live PID, reconcile exactly one replacement generation, and finish with fresh heartbeats plus no missing, stale, or launch actions.",
+      "refs": [
+        "docs/agent-harness-topology-contract.md"
+      ]
+    },
+    {
+      "id": "gap-active-runtime-stop-recovery-live-gap",
+      "label": "active-runtime-stop-recovery-live-gap",
+      "group": "gap",
+      "state": "open-gap",
+      "summary": "Active runtime-task stop recovery",
+      "designTarget": "A scoped stop or service stop must not depend indefinitely on an in-process runtime task returning. The runtime loop polls exact active queue terminal control, waits a bounded cooperative grace, then exits: non-zero for terminal-control restart and cleanly for service shutdown. The next supervised generation reaps only the exited generation's fenced lease and re-evaluates durable terminal control before execution.",
+      "currentEvidence": "Focused core coverage proves nonblocking scoped-stop visibility; CLI coverage fixes the default and configurable grace boundary. Queue lease and supervisor process-instance regressions cover the recovery fences.",
+      "promotionGate": "Promote only after a controlled active task ignores cooperative cancellation, scoped stop causes one bounded runtime-loop restart, the dead generation's lease is reaped, the target is terminally suppressed, unrelated lanes remain runnable, and service stop also completes within the configured grace.",
       "refs": [
         "docs/agent-harness-topology-contract.md"
       ]
@@ -3059,6 +3085,71 @@
     {
       "source": "component-supervisor-plan-reconcile",
       "target": "gap-supervisor-service-health-precedence-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-supervisor-process-instance-fencing-live-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-identity",
+      "target": "gap-supervisor-process-instance-fencing-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-supervisor-process-instance-fencing-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-worker-result-mailbox-coordinator-resume",
+      "target": "gap-supervisor-process-instance-fencing-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "gap-supervisor-process-instance-fencing-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "gap-active-runtime-stop-recovery-live-gap",
+      "target": "canon-topology-contract",
+      "label": "tracked in"
+    },
+    {
+      "source": "component-channel-ingress-channel-runtime",
+      "target": "gap-active-runtime-stop-recovery-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-queue-runtime-worker",
+      "target": "gap-active-runtime-stop-recovery-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-skill-shadow-runtime-virtual-skill-manifest-skill-episode-knowledge-classifier-skill-improvement",
+      "target": "gap-active-runtime-stop-recovery-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-workers-child-execution-policy",
+      "target": "gap-active-runtime-stop-recovery-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-codex-runtime",
+      "target": "gap-active-runtime-stop-recovery-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-runtime-pipeline-task-transition-task-budget",
+      "target": "gap-active-runtime-stop-recovery-live-gap",
+      "label": "has gap"
+    },
+    {
+      "source": "component-supervisor-plan-reconcile",
+      "target": "gap-active-runtime-stop-recovery-live-gap",
       "label": "has gap"
     },
     {

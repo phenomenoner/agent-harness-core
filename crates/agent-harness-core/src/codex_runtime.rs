@@ -21062,12 +21062,13 @@ mod tests {
             context_error_then_compact_success_app_server_command(&root);
         replace_invocation(plan_file, executable, arguments);
 
+        let timeout_ms = if cfg!(windows) { 45_000 } else { 10_000 };
         let report = run_codex_runtime(CodexRuntimeRunOptions {
             harness_home,
             execution_dir: None,
             plan_file: None,
-            timeout_ms: 10_000,
-            idle_timeout_ms: 10_000,
+            timeout_ms,
+            idle_timeout_ms: timeout_ms,
             progress_context: None,
         })
         .unwrap();

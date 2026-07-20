@@ -3897,6 +3897,31 @@ pub fn resolve_queue_terminal_control(
     }))
 }
 
+/// Resolves live terminal control for an exact queue without waiting behind a
+/// receipt-index maintenance transaction. Marker-backed controls remain
+/// authoritative even when the hot receipt index is momentarily busy. Cold
+/// compacted history is intentionally omitted because this path is used only
+/// to interrupt a queue item already owned by the current runtime process.
+pub fn resolve_queue_terminal_control_nonblocking(
+    harness_home: impl AsRef<Path>,
+    queue_id: &str,
+    session_key: Option<&str>,
+) -> io::Result<QueueTerminalControl> {
+    let queue_dir = harness_home.as_ref().join("state").join("runtime-queue");
+    let mut warnings = Vec::new();
+    let index = match refresh_runtime_queue_state_index_nonblocking(&queue_dir, &mut warnings) {
+        Ok(index) => Some(index),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+        Err(error) => return Err(error),
+    };
+    resolve_queue_terminal_control_from_index(
+        &queue_dir,
+        queue_id,
+        session_key,
+        index.as_ref().and_then(|index| index.queues.get(queue_id)),
+    )
+}
+
 fn cold_terminal_history_reasons(
     queue_dir: &Path,
     queue_ids: &BTreeSet<String>,
@@ -11125,6 +11150,35 @@ mod tests {
         assert!(report.receipt.reason.contains("terminal control"));
         let leases = read_runtime_queue_leases(&queue_dir, "interactive", &mut Vec::new()).unwrap();
         assert!(!leases.leases.contains_key(&queue_id));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nonblocking_terminal_control_observes_active_queue_scoped_stop() {
+        let root = temp_root("nonblocking_terminal_control_observes_active_queue_scoped_stop");
+        let harness_home = root.join(".agent-harness");
+        record_scoped_stop(ScopedStopOptions {
+            harness_home: harness_home.clone(),
+            target: ScopedStopTarget::QueueItem {
+                queue_id: "queue-active".to_string(),
+            },
+            reason: "operator stop".to_string(),
+            now_ms: 10,
+        })
+        .unwrap();
+
+        let control =
+            resolve_queue_terminal_control_nonblocking(&harness_home, "queue-active", None)
+                .unwrap();
+        let QueueTerminalControl::Terminal(control) = control else {
+            panic!("scoped stop must be visible to the active runtime-loop watchdog");
+        };
+        assert_eq!(control.source, TerminalControlSource::ScopedStop);
+        assert_eq!(
+            control.terminal_disposition,
+            Some(crate::RuntimeTerminalDispositionV1::LogicalCanceled)
+        );
 
         let _ = fs::remove_dir_all(root);
     }

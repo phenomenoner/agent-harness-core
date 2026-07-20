@@ -17,12 +17,21 @@
   or one observation-only disposition recovery before parking.
 - Queue leases for active runs can heartbeat atomically without recreating missing, expired,
   terminal, legacy-owner, wrong-lane, or wrong-generation ownership.
+- Runtime-loop shutdown is bounded while an in-process task is active. Service stop allows a
+  cooperative grace and then exits cleanly; exact queue terminal control allows the same grace and
+  then exits non-zero so the supervisor can restart, reap the dead generation's lease, and apply
+  the durable stop without manual state edits.
 
 ### Fixed
 
 - Supervisor recovery now validates a recorded process start time before treating an alive Windows
   PID as the same loop owner, so PID reuse by an unrelated process cannot permanently fence stale
   service reconciliation.
+- Scoped stop no longer depends on a stuck runtime task returning to the loop before supervisor
+  recovery can begin.
+- Windows backend-auth cancellation and account-probe cleanup now terminate the selected child
+  process tree before waiting for the wrapper, preventing inherited pipe handles from stranding
+  operator login, logout, or readiness probes.
 - Long Telegram and Discord finals no longer lose content when automatic rich presentation would
   exceed its bounded semantic block budget. Persisted affected outbox rows fall back to canonical
   provider-safe text chunks before rich delivery.

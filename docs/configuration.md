@@ -18,6 +18,8 @@ Use `--source-home` for imported prompt files, registry, skills, and legacy cont
 
 `supervisor-plan` generates the Windows Task Scheduler start/stop bundle from the authoritative harness configuration. Do not hand-edit generated runner scripts: regenerate the bundle after changing supervised loop configuration, first using `supervisor-reconcile --all --dry-run` to review ownership.
 
+`runtime-loop` polls durable terminal control for its active queue items. `--active-task-shutdown-grace-ms` controls the bounded cooperative grace (15 seconds by default). If an exact queue stop remains active after the grace, the loop exits non-zero so `supervisor-run` restarts it and existing generation-fenced lease reconciliation can suppress the stopped item. A watched service stop uses the same grace but exits cleanly so an operator stop does not trigger restart.
+
 An enabled secondary Telegram lane is declared under `supervisor.telegramLoops`. Each entry needs a distinct safe `serviceId` with a `telegram-loop-` prefix and an account selector; `agent` is optional:
 
 ```json

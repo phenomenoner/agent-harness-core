@@ -74,12 +74,12 @@ pub fn invariant_catalog() -> Vec<InvariantEntry> {
         },
         InvariantEntry {
             id: "I4",
-            statement: "cancel only affects the requested turn, queue item, job, declared scope, or the selected deterministic job's descendant process tree",
-            owner: "admission/channel_state/workers",
+            statement: "cancel only affects the requested turn, queue item, job, declared scope, or the selected child process tree; active runtime tasks receive bounded cooperative shutdown before exact queue terminal control restarts only the runtime-loop process, and Windows backend-auth cleanup terminates its selected descendants",
+            owner: "admission/channel_state/runtime_worker/agent-harness-cli/backend_auth/workers",
         },
         InvariantEntry {
             id: "I5",
-            statement: "crash recovery loses no work and duplicates no side effects; retry schedules, task/effect dispositions, commit-before-enqueue continuation intents, readback-required ambiguous mutations, and supervisor process-instance fencing remain reconstructable",
+            statement: "crash recovery loses no work and duplicates no side effects; retry schedules, task/effect dispositions, commit-before-enqueue continuation intents, readback-required ambiguous mutations, supervisor process-instance fencing, and dead-generation lease recovery after bounded active-task shutdown remain reconstructable",
             owner: "queue_shadow/supervision/runtime_worker/runtime_pipeline/goal_continuation/external_effect",
         },
         InvariantEntry {
